@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Project } from '@/types/generated'
-import type { ProjectEnvironmentCheckResult } from '@/types/generated/bindings/ProjectEnvironmentCheckResult'
+import type { MachineEnvironmentRecheckResult } from '@/types/generated/bindings/MachineEnvironmentRecheckResult'
 import {
   ProjectEnvironmentPauseNotice,
   ProjectFlowHeader,
@@ -13,7 +13,7 @@ const mutation = vi.hoisted(() => ({
   isPending: false,
   isError: false,
   error: null as Error | null,
-  data: undefined as { checks: ProjectEnvironmentCheckResult[]; project: Project } | undefined,
+  data: undefined as { machines: MachineEnvironmentRecheckResult[]; project: Project } | undefined,
 }))
 const query = vi.hoisted(() => ({ data: undefined as Project | undefined }))
 vi.mock('@/api/hooks', () => ({
@@ -28,6 +28,13 @@ const pausedProject = {
   system_pause_reason: 'environment_not_ready',
   slots: { limit: 5, active: 4, parked: 3, queued: 7 },
   environment_pause: {
+    machine: {
+      id: 'server',
+      name: 'Server host',
+      owner_kind: 'server',
+      daemon_id: null,
+      runtime_id: null,
+    },
     checks: ['disk', 'browser'],
     role: 'coder',
     output: 'root free: 7G',
@@ -63,7 +70,7 @@ describe('Project flow status', () => {
     expect(output.open).toBe(false)
     expect(output.querySelector('pre')?.textContent).toContain('root free: 7G')
     fireEvent.click(screen.getByRole('button', { name: 'Check now' }))
-    expect(mutation.mutate).toHaveBeenCalledWith('project-1')
+    expect(mutation.mutate).toHaveBeenCalledWith({ projectId: 'project-1' })
   })
 
   it('updates relative time while the project remains paused', () => {
@@ -79,9 +86,21 @@ describe('Project flow status', () => {
     mutation.isPending = true
     mutation.data = {
       project: pausedProject,
-      checks: [
-        { name: 'disk', passed: false, exit_code: 1, output_tail: 'root free: 7G' },
-        { name: 'browser', passed: true, exit_code: 0, output_tail: '' },
+      machines: [
+        {
+          machine: {
+            id: 'server',
+            name: 'Server host',
+            owner_kind: 'server',
+            daemon_id: null,
+            runtime_id: null,
+          },
+          error: null,
+          checks: [
+            { name: 'disk', passed: false, exit_code: 1, output_tail: 'root free: 7G' },
+            { name: 'browser', passed: true, exit_code: 0, output_tail: '' },
+          ],
+        },
       ],
     }
     render(<ProjectEnvironmentPauseNotice project={pausedProject} />)
@@ -102,11 +121,23 @@ describe('Project flow status', () => {
     }
     mutation.data = {
       project: resumed,
-      checks: [{ name: 'disk', passed: true, exit_code: 0, output_tail: 'root free: 17G' }],
+      machines: [
+        {
+          machine: {
+            id: 'server',
+            name: 'Server host',
+            owner_kind: 'server',
+            daemon_id: null,
+            runtime_id: null,
+          },
+          error: null,
+          checks: [{ name: 'disk', passed: true, exit_code: 0, output_tail: 'root free: 17G' }],
+        },
+      ],
     }
     render(<ProjectEnvironmentPauseNotice project={resumed} />)
     expect(screen.queryByText('Environment paused')).toBeNull()
-    expect(screen.getByText('Checks passed. Project is resumed.')).toBeTruthy()
+    expect(screen.getByText('Checks finished. Project is running.')).toBeTruthy()
     expect(screen.getByText('disk: Passed (exit 0)')).toBeTruthy()
   })
 

@@ -48,6 +48,7 @@ const project: Project = {
 }
 
 vi.mock('@/api/hooks', () => ({
+  useRecheckProjectEnvironment: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useProjectQuery: () => ({ data: query.data, isLoading: false, isError: false }),
   useWorkflowQuery: () => ({ data: { roles: [] }, isLoading: false }),
   useAgentsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false }),

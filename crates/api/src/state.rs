@@ -30,8 +30,8 @@ pub struct AppState {
     /// One process-wide models.dev client per AppState. Clones share the
     /// client's single-flight refresh gate and its fixed endpoint transport.
     pub models_dev_client: Arc<services::pricing::ModelsDevClient>,
-    /// Memoized lifetime usage per agent, shared by the agent routes.
-    pub agent_usage_cache: Arc<services::usage_projection::AgentUsageAggregateCache>,
+    /// Shared incremental usage index for Operations and Agent reads.
+    pub usage_ledger_index: Arc<services::usage_projection::UsageLedgerIndex>,
     /// Display-only Project slot counts. Never shared with admission services.
     pub project_slots_memo: Arc<crate::project_slots::ProjectSlotsMemo>,
     pub task_service: Arc<TaskService>,
@@ -189,7 +189,7 @@ impl AppState {
             db: Arc::clone(&runtime.db),
             pricing_repository: Arc::clone(&runtime.pricing_repository),
             models_dev_client: Arc::clone(&runtime.models_dev_client),
-            agent_usage_cache: Arc::default(),
+            usage_ledger_index: runtime.operator_status_service.usage_ledger_index(),
             project_slots_memo: Arc::default(),
             task_service: Arc::clone(&runtime.task_service),
             workspace_backend_router: Arc::clone(&runtime.workspace_backend_router),

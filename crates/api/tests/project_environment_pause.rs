@@ -82,7 +82,7 @@ async fn owner_environment_recheck_reports_all_checks_and_resumes() {
     )
     .await;
     assert_eq!(
-        visible.environment_pause.as_ref().unwrap().checks,
+        visible.environment_pause.as_ref().unwrap().detail.checks,
         vec!["disk"]
     );
     assert_eq!(
@@ -90,6 +90,7 @@ async fn owner_environment_recheck_reports_all_checks_and_resumes() {
             .environment_pause
             .as_ref()
             .unwrap()
+            .detail
             .workspace_id
             .as_deref(),
         Some("deleted-workspace")
@@ -113,28 +114,45 @@ async fn owner_environment_recheck_reports_all_checks_and_resumes() {
     let mut events = harness.state.event_bus.subscribe();
     let failed: ProjectEnvironmentRecheckResponse =
         common::empty_request(&harness.app, Method::POST, &uri, StatusCode::OK).await;
-    assert_eq!(failed.checks.len(), 2);
-    assert!(!failed.checks[0].passed);
-    assert_eq!(failed.checks[0].exit_code, Some(1));
-    assert!(failed.checks[0].output_tail.contains("root free: 7G"));
+    assert_eq!(failed.machines.len(), 1);
+    assert_eq!(failed.machines[0].machine.id, "server");
+    assert_eq!(failed.project.environment_readiness.len(), 1);
+    assert_eq!(
+        failed.project.environment_readiness[0].status,
+        api_types::EnvironmentReadinessStatus::NotReady
+    );
+    assert_eq!(failed.machines[0].checks.len(), 2);
+    assert!(!failed.machines[0].checks[0].passed);
+    assert_eq!(failed.machines[0].checks[0].exit_code, Some(1));
+    assert!(failed.machines[0].checks[0]
+        .output_tail
+        .contains("root free: 7G"));
     assert!(
-        failed.checks[1].passed,
+        failed.machines[0].checks[1].passed,
         "role-scoped checks run regardless of role"
     );
-    assert_eq!(failed.checks[1].exit_code, Some(0));
-    assert_eq!(failed.checks[1].output_tail, "[REDACTED] ready");
+    assert_eq!(failed.machines[0].checks[1].exit_code, Some(0));
+    assert_eq!(failed.machines[0].checks[1].output_tail, "[REDACTED] ready");
     assert!(repo.join("browser-checked").exists());
     assert!(failed.project.paused);
     assert_eq!(
-        failed.project.environment_pause.as_ref().unwrap().checks,
+        failed
+            .project
+            .environment_pause
+            .as_ref()
+            .unwrap()
+            .detail
+            .checks,
         vec!["disk"]
     );
     assert_eq!(events.try_recv().unwrap().event_type, "project.updated");
     std::fs::write(repo.join("recovered"), "yes").unwrap();
     let passed: ProjectEnvironmentRecheckResponse =
         common::empty_request(&harness.app, Method::POST, &uri, StatusCode::OK).await;
-    assert!(passed.checks.iter().all(|check| check.passed));
-    assert!(passed.checks[0].output_tail.contains("root free: 17G"));
+    assert!(passed.machines[0].checks.iter().all(|check| check.passed));
+    assert!(passed.machines[0].checks[0]
+        .output_tail
+        .contains("root free: 17G"));
     assert!(!passed.project.paused);
     assert!(passed.project.environment_pause.is_none());
     assert!(passed.project.system_pause_reason.is_none());
@@ -173,7 +191,7 @@ async fn manual_resume_clears_environment_pause_and_check_now_preserves_user_pau
         StatusCode::OK,
     )
     .await;
-    assert!(checked.checks.iter().all(|check| check.passed));
+    assert!(checked.machines[0].checks.iter().all(|check| check.passed));
     assert_eq!(checked.project.paused_at, paused.paused_at);
     assert!(checked.project.system_pause_reason.is_none());
     assert!(checked.project.environment_pause.is_none());

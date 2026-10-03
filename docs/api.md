@@ -172,6 +172,19 @@ database for historical provenance.
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 
+Agent responses include `runnable_on: {count, machines?}`. Admins receive
+`machines`, an array of `{id, name, owner_kind, daemon_id, runtime_id}`; other
+users receive only `count`. The server host has `id: "server"`, name "Server
+host", and null daemon/runtime IDs. Daemon machines use their runtime ID as
+`id` and hostname as `name`. These are executor-fit facts: installed,
+authenticated and enabled on a reachable owner, restricted by an explicit pin.
+They do not guarantee repository/environment fit or free capacity.
+`daemon_id` remains admin-only (null for other users). Only admins may set or
+clear the pin; PATCH with `{"version": <version>, "daemon_id": null}` clears it.
+
+Agent daemon pins (`daemon_id`) are admin-only in both the account Agent list
+and `GET /api/v1/projects/{id}/agents`; non-admin responses return `null`.
+
 Agent responses report two different counts, and only one of them is a capacity
 ratio:
 
@@ -2309,61 +2322,106 @@ ten-minute review at a time:
   no new execution launches while the Project is paused. A user or repository
   pause is never overwritten.
 - `recheck_interval_seconds` defaults to 600 and accepts 60–86400 seconds.
-  While environment-paused, Forge automatically re-runs the recorded failing
-  checks in the primary checkout for embedded workspaces, or through the recorded
-  daemon owner in the ready workspace that failed, with the Project `env` and without
-  copying assets. Checks run in background jobs, at most one per Project, so dispatcher
-  ticks and operations refresh do not wait for them. Role-scoped checks that
-  triggered the pause are included. Every check
-  passing clears only the environment pause; Tasks then re-dispatch in their
-  current states. If the recorded workspace is missing or cannot be resolved,
-  or its daemon placement is not ready or its owner is unreachable, re-checks
-  fall back to the primary checkout. Another failure, including a re-check error,
-  updates the output and schedules the next check at the same interval.
-  Checks that depend on worktree assets may pass here and fail at launch,
-  which pauses the Project again. A daemon run-policy denial pauses with a clear
-  `purpose_denied` reason and no automatic re-check. Enable `environment_setup`
-  on that owner and use **Check now**. An asset-copy failure or a pause with no
-  re-runnable check stays paused; its output explains that the owner must fix
-  the environment and resume, or configure a real check.
+  Scheduled checks retry named failures on the machine that failed. Host checks
+  use the primary checkout; daemon checks use only the failure's recorded ready
+  workspace. Unreachable owners retain their readiness facts and reschedule.
+- A failure marks that machine `not_ready`. The Project pauses only when every
+  otherwise eligible connected machine fails the applicable environment checks.
+  A pinned or already placed Task can wait on its machine while other work runs.
+  Passing checks clear matching waits and environment pauses; user and repository
+  pauses are preserved. Assets are still verified at launch.
 
-`ProjectResponse.environment_pause` is `null` when there is no environment
-pause detail. `workspace_id` records the workspace used at failure and is nullable
-for checkout-only checks. Its persisted shape is:
+Project list pages load their readiness records in one bounded statement, then
+resolve daemon names and legacy pause owners in at most one additional statement.
+Response assembly runs in memory; a Project without readiness adds no per-Project
+query. Single-Project responses share the same assembly. Agent list pages load
+`runnable_on` facts once for the page (daemon/runtime names, native health and CLI
+policy), instead of querying per Agent. Profile/session lists return their own
+DTOs and do not compute Agent machine fit per row. Compact Task list items use
+the batched Task list projection and never call the full Task placement-diagnostics
+loader per item.
+
+`ProjectResponse.environment_readiness` is an array available to anyone who can
+read the Project. Projects without checks have no rows (`[]`). Each entry is:
 
 ```json
 {
-  "workspace_id": "<workspace-id>",
+  "machine": {"id": "server", "name": "Server host", "owner_kind": "server", "daemon_id": null, "runtime_id": null},
+  "status": "not_ready",
+  "failing_checks": [{"name": "disk", "output_tail": "root free: 7G"}],
+  "output_tail": "disk: root free: 7G",
+  "scope_covered": "full",
+  "checked_at": "2026-10-02T05:30:00Z",
+  "next_check_at": "2026-10-02T05:40:00Z"
+}
+```
+
+Status is `ready`, `not_ready` or `unknown`; times are nullable, `scope_covered`
+is `machine` or `full`, and output tails are bounded and redacted. The row's
+`output_tail` also represents an unnamed launch failure. The settings table
+shows per-machine **Check now**. These are recorded facts; launch preflight
+remains authoritative.
+
+`ProjectResponse.environment_pause` is null without pause detail. Its shape now
+includes the machine (a breaking addition); workspace ID is nullable for a
+checkout-only failure:
+
+```json
+{
+  "machine": {"id": "server", "name": "Server host", "owner_kind": "server", "daemon_id": null, "runtime_id": null},
+  "workspace_id": null,
   "checks": ["disk"],
   "role": "coder",
   "output": "disk: exit 1\nroot free: 7G",
-  "paused_at": "2026-09-30T05:30:00Z",
-  "last_checked_at": "2026-09-30T05:30:00Z",
-  "next_check_at": "2026-09-30T05:40:00Z"
+  "paused_at": "2026-10-02T05:30:00Z",
+  "last_checked_at": "2026-10-02T05:30:00Z",
+  "next_check_at": "2026-10-02T05:40:00Z"
 }
 ```
 
-The project list and header show **Environment paused**, the failing checks,
-collapsible output, the relative next check time, and **Check now**.
-`POST /api/v1/projects/{id}/environment/recheck` runs every configured check
-immediately (including role-scoped checks), with no request fields. It returns
-`{checks, project}`: each check has `name`, `passed`, nullable `exit_code`, and
-bounded `output_tail`; `project` is the updated `ProjectResponse`. If
-at least one check runs and all checks pass, an environment pause is cleared. A user or repository pause remains
-in place. If a scheduled or manual re-check is already running for this Project,
-the endpoint returns HTTP 409 immediately. For example:
+`POST /api/v1/projects/{id}/environment/recheck` accepts an empty body or `{}`
+for all targets, or `{"machine": "server"}` / `{"machine": "<runtime-id>"}` for
+one. It runs every configured check regardless of role. Targets are the union
+of readiness records and ready repository locations, including the primary
+host checkout. An unknown runtime selector returns HTTP 404 `machine not found`. Selecting
+`server` without recorded readiness or a ready repository location returns HTTP 404,
+but names the missing Project repository location rather than claiming that the
+server machine does not exist. Authority is unchanged:
+authentication is required; the endpoint has no additional owner/admin gate.
+A concurrent check of a selected machine returns HTTP 409. Projects without
+checks return `machines: []`, without creating rows or clearing a pause.
+
+The breaking response shape is `{machines, project}`:
 
 ```json
 {
-  "checks": [{"name": "disk", "passed": true, "exit_code": 0, "output_tail": "root free: 17G"}],
-  "project": {"id": "<project-id>", "paused": false, "system_pause_reason": null, "environment_pause": null, "...": "other ProjectResponse fields"}
+  "machines": [{
+    "machine": {"id": "server", "name": "Server host", "owner_kind": "server", "daemon_id": null, "runtime_id": null},
+    "checks": [{"name": "disk", "passed": true, "exit_code": 0, "output_tail": "root free: 17G"}],
+    "error": null
+  }],
+  "project": {"id": "<project-id>", "paused": false, "system_pause_reason": null, "environment_pause": null, "environment_readiness": [], "...": "other ProjectResponse fields"}
 }
 ```
 
-Manual Project resume also clears the environment pause. If the host is still
-not ready, the next launch pauses it again. Migration V202610010410 clears legacy Task
-`environment_not_ready` blocking annotations so those Tasks re-enter normal
-dispatch; no per-Task recovery is needed.
+A machine that cannot be checked has `checks: []` and a non-null `error`; its
+facts remain unchanged and a failed row's next check is rescheduled. Daemons
+without a recorded ready failure workspace cannot be checked by this build;
+they never receive substitute host results. A successful machine result may
+resume an environment pause; user/repository pauses remain. Empty checks do not
+resume asset-only failures. Manual Project resume clears an environment pause
+and resets failed readiness to unknown for immediate retry.
+
+Task detail responses include `placement_diagnostics`, an array of
+`{machine, filter_codes, failing_checks}`. It projects recorded environment
+waits, pending host probes, machine-capacity waits and the selected placement's
+rejected candidates. `machine` is null when a capacity wait did not record its
+identity. The placement panel displays pending probes as **Checking machine
+Server host…**, environment failures with check names, and machine capacity
+using the same status rows. Complete rejected-candidate identities are not
+persisted for every dispatch refusal; the response does not invent them.
+`placement_unavailable` error details retain `rejected_candidates`, including
+`filter_codes` and `failing_checks`.
 
 `PATCH /api/v1/projects/{id}` refuses an environment whose variable names are
 invalid or reserved, whose asset source is not absolute or whose target

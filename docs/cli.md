@@ -271,24 +271,37 @@ The update uses the current Project version; a concurrent edit returns 409.
 Project settings also accept `placement.provision = when_verified` (default)
 or `never`, editable in the web Environment settings.
 
-### Project environment re-check
+### Project environment readiness and re-check
 
 ```bash
+forge-ctl project env-status <PROJECT_ID>
 forge-ctl project env-recheck <PROJECT_ID>
-forge-ctl --output json project env-recheck <PROJECT_ID>
+forge-ctl project env-recheck <PROJECT_ID> --machine server
+forge-ctl project env-recheck <PROJECT_ID> --machine <RUNTIME_ID>
+forge-ctl --output json project env-status <PROJECT_ID>
+forge-ctl --output json project env-recheck <PROJECT_ID> --machine server
 ```
 
-Runs every configured environment check immediately via
-`POST /api/v1/projects/{id}/environment/recheck`. Table output lists each
-check's passed/failed status, exit code, output tail, and the updated Project;
-JSON output returns `{checks, project}`. All checks passing resumes an
-environment-paused Project. User and repository pauses are left in place.
-Scheduled re-checks use `settings.environment.recheck_interval_seconds`
-(default 600 seconds); this command does not wait for the next scheduled check.
-A daemon-owned environment pause re-checks through the recorded owner. If its
-`environment_setup` run policy refuses a check, the pause explains the refusal
-and disables scheduled re-checks. Enable that purpose on the owner and invoke
-this command to check again.
+`env-status` reads the Project's recorded `environment_readiness`. Table output
+shows machine name/ID, status, failing checks, output, and checked/next-check
+times; no rows produce an empty-state message. JSON output is the readiness
+array. This read does not start checks.
+
+`env-recheck` runs every configured check through
+`POST /api/v1/projects/{id}/environment/recheck`, on all known machines or the
+selected machine. `server` names the host; daemon machines use runtime IDs from
+`env-status`. Table output groups checks and unavailable-machine errors by
+machine, followed by the updated Project. JSON output is `{machines, project}`.
+Passing a machine resumes a matching environment pause; user/repository pauses
+remain. A manual re-check on a daemon runs in a ready workspace recorded on that
+machine (placement probes are separate); a machine without one returns an
+unavailable result and keeps its facts.
+
+Both commands exit 0 after a successful API response, including checks that
+report failure or unavailability. Inspect `passed` and `error` for those
+outcomes. Request/HTTP errors exit 1, and invalid CLI arguments exit 2. Authority
+is the same as the API. This command does not wait for the scheduled re-check
+interval (default 600 seconds).
 
 ### Repository locations
 

@@ -20,7 +20,10 @@ import type { TokenCounters } from './bindings/TokenCounters'
 import type { UsageAggregate } from './bindings/UsageAggregate'
 import type { UsageBreakdown } from './bindings/UsageBreakdown'
 import type { WorkflowDefinition as GeneratedWorkflowDefinition } from './bindings/WorkflowDefinition'
-import type { ProjectEnvironmentPause } from './bindings/ProjectEnvironmentPause'
+import type { EnvironmentPauseResponse } from './bindings/EnvironmentPauseResponse'
+import type { ProjectEnvironmentReadiness } from './bindings/ProjectEnvironmentReadiness'
+import type { AgentRunnableOn } from './bindings/AgentRunnableOn'
+import type { TaskPlacementDiagnostic } from './bindings/TaskPlacementDiagnostic'
 import type { ProjectSlots } from './bindings/ProjectSlots'
 
 export type TaskStatus = string
@@ -586,6 +589,7 @@ export interface PaginatedResponse<T> {
 // --- Task (matches api_types::TaskResponse) ---
 
 export interface Task {
+  placement_diagnostics?: TaskPlacementDiagnostic[]
   id: string
   project_id: string
   parent_task_id?: string | null
@@ -770,6 +774,7 @@ export interface TaskRelationsResponse {
 // --- Agent (matches api_types::AgentResponse) ---
 
 export interface Agent {
+  runnable_on?: AgentRunnableOn
   id: string
   name: string
   description: string | null
@@ -818,7 +823,8 @@ export interface Project {
   workflow_template_name?: string | null
   paused_at: string | null
   system_pause_reason?: string | null
-  environment_pause: ProjectEnvironmentPause | null
+  environment_pause: EnvironmentPauseResponse | null
+  environment_readiness?: ProjectEnvironmentReadiness[]
   slots: ProjectSlots
   paused: boolean
   charter_status: string
