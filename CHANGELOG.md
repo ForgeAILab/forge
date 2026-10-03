@@ -281,6 +281,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Forge uses agent-runtime `fec6dc2` (was `ca6c17e`): runtime failure
+  classes, a bounded window of turn manifests, cache diagnostics and cheaper
+  history and LCM accounting per provider call. A turn that fails before
+  Forge sees a provider attempt is now classified from the runtime's failure
+  class (authority, context overflow, configuration, usage limit with its
+  reset time, provider rejection, turn limit) instead of only transient or
+  unclassified; a class never grants a retry by itself. Agent sessions keep
+  turn manifests for the last 32 planned steps, and protected checkpoints no
+  longer store them, so they no longer count toward the session-state digest:
+  each existing session is written once more on its next save. Rolling back
+  to an earlier build may fail to resume an agent session checkpointed by
+  this one.
 - Runs no longer compete with the server for every core. Each process Forge
   starts for a run (CLI agents and everything they launch, native tool
   commands, review checks, Project hooks, environment checks and setup, on
