@@ -572,6 +572,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Admins can replay or dismiss a dead-lettered event (an event a durable
+  worker gave up on after its retries). `GET /api/v1/operations/dead-letters`
+  lists them (open or resolved, by consumer, keyset pages);
+  `POST …/{id}/replay` re-delivers that one event to its own consumer
+  through the normal commit path (the cursor never moves, no other consumer
+  sees it) and `POST …/{id}/dismiss` resolves it with an optional reason.
+  Only whole-event rows can be replayed (`replayable`); per-item rows
+  (one commitment or inbox item, wake retries) can only be dismissed. Replay
+  finishes even if the client disconnects; a repeat failure reopens the row.
+  Replay applies an old event on top of newer ones, so the list shows its age
+  and how many later events the consumer has processed. Resolved rows stay
+  for audit and leave the open counts. Also `forge-ctl operations
+  dead-letters list|replay|dismiss` and Replay/Dismiss on the Operations page.
+  Migration V202610030300.
+
 - Operator status `periodic_workers` lists each supervised background loop
   with running state, last tick, last error, restart count and an over-budget
   warning. A failing or over-budget loop adds a `recent_errors` entry with
