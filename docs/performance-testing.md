@@ -423,7 +423,17 @@ and publish it only when complete, skip historical changed-row markers, and
 check the singleton's maxima against `MAX(rowid)` before building. A mismatch
 logs an error and rebuilds from the actual rowids.
 
-The summary index has a 128 MiB charged budget. Hash-table capacity, owned
+The summary index defaults to a 128 MiB charged budget, configurable with
+`server.usage_index_budget_mb`, `FORGE_SERVER_USAGE_INDEX_BUDGET_MB`,
+`forge --usage-index-budget-mb N`, or Forge Settings → Server. Unset/null uses
+128 MiB; `0` disables indexing and always takes the memoized full-read path.
+Settings updates apply on the next read: a fitting index stays warm, a lowered
+budget discards an oversized index, and changing the budget after discard
+retries a cold build. Operations reports `usage_index.current_size_bytes`,
+`budget_bytes`, and `fallback`; the current size is an estimated charge, not RSS.
+The separate fallback memo retains its existing 32 MiB limit.
+
+Hash-table capacity, owned
 strings/reason vectors, distinct provenance variants, ordered winners, and
 public caches, a 50% allowance for allocator retention, and an 8 MiB reserve
 for retained read batches/driver caches are charged. Capacity growth is checked before insertion, and
@@ -442,8 +452,8 @@ revision header and deletion generation; unchanged polls read only constant
 size metadata. Event/reprice deltas invalidate just their affected Agent
 responses, while execution statistics survive unrelated ledger appends. The
 index remembers a failed fit and retries only after the trigger-maintained row
-counts shrink by at least 25%, or after process restart. A successful retry is
-logged. Internal invariant failures log an error and use the fresh reference.
+counts shrink by at least 25%, its effective budget changes, or after process
+restart. A successful retry is logged. Internal invariant failures log an error and use the fresh reference.
 Public response size still determines the cost of copying distinct sources.
 
 The release RSS probes on this machine charged approximately 99.2 MiB for
@@ -452,6 +462,12 @@ The release RSS probes on this machine charged approximately 99.2 MiB for
 111–113 MiB growth, for both reported and estimated cost. With three attempts
 and events per run, both fixtures fit at 41,400 events and discard at 43,200
 when the run map grows; this is a capacity boundary, not an event-count limit.
+For this fixture, a rough planning ratio is 41,400 events / 128 MiB ≈ 323
+events per MiB. Budget scaling is approximate: subtract the fixed 8 MiB reserve,
+allow for hash-table growth steps, and account for attribution/provenance width
+and events per invocation. A budget below the fixed reserve may use fallback
+even for a small non-empty ledger; repeated events sharing an invocation and
+provenance can consume much less memory than distinct runs.
 The charged cost averages roughly 7–8 KiB per run after subtracting the fixed
 8 MiB reserve, and varies with map capacity/Agent attribution. Adding 500
 events with the same invocation/provenance in the focused test adds under

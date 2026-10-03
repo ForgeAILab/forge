@@ -3,11 +3,11 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionBlockerProjection,
+    AgentStatus, CanonicalPhase, ExecutionBehavior, ExecutionBlockerProjection,
     ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, InterruptionMetadata,
-    PlanArtifactDetail, PlanProgressSummary, RecoveryAction, ResumePolicy, StopReason,
-    TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate,
-    UsageBreakdown, WorkflowDefinition, WorkflowExceptionSummary, WorkflowHealthSummary,
+    PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason, TaskAnnotation,
+    TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate, UsageBreakdown,
+    WorkflowDefinition, WorkflowExceptionSummary, WorkflowHealthSummary,
     WorkspacePlacementResponse, WorkspaceResponse,
 };
 
@@ -39,24 +39,143 @@ pub struct ExecutionInterruptionResponse {
     pub created_at: String,
 }
 
+/// The closed set of Task condition commands. Session launches use the session API.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(tag = "verb", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(export, tag = "verb", rename_all = "snake_case")]
+pub enum TaskAction {
+    Start,
+    Hold {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+    Release {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+    Retry {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        fresh_session: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        refresh_workspace: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reset_budget: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        guidance: Option<String>,
+    },
+    SendBack {
+        guidance: String,
+    },
+    Approve {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+        #[serde(rename = "override", default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional, rename = "override")]
+        override_checks: Option<bool>,
+    },
+    Restart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+    Cancel {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        reason: Option<String>,
+    },
+}
+
+impl TaskAction {
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Hold { .. } => "hold",
+            Self::Release { .. } => "release",
+            Self::Retry { .. } => "retry",
+            Self::SendBack { .. } => "send_back",
+            Self::Approve { .. } => "approve",
+            Self::Restart { .. } => "restart",
+            Self::Cancel { .. } => "cancel",
+        }
+    }
+
+    pub fn retry() -> Self {
+        Self::Retry {
+            reason: None,
+            fresh_session: None,
+            refresh_workspace: None,
+            reset_budget: None,
+            guidance: None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.verb())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
-pub enum TaskAction {
-    Start,
-    Pause,
-    Resume,
-    Submit,
-    RequestChanges,
-    Approve,
-    Cancel,
+pub enum ActionAuthority {
+    Owner,
+    AssignedAgent,
+    ProjectAgent,
+    Reviewer,
+}
+
+/// A parameter is required when another offered boolean has this value.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ActionParameterRequirement {
+    pub parameter: String,
+    pub value: bool,
+}
+
+/// One executable offer. Parameters name the inputs meaningful in this snapshot;
+/// `action` supplies defaults. Authority is filtered before this value is exposed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ActionParameter {
+    pub name: String,
+    pub required: bool,
+    pub boolean_values: Option<Vec<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub required_when: Option<ActionParameterRequirement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct Offer {
+    pub action: TaskAction,
+    pub parameters: Vec<ActionParameter>,
+    pub authority: Vec<ActionAuthority>,
+    pub reason: String,
+    pub label: String,
+    pub target_execution_id: Option<String>,
+    #[serde(default)]
+    pub propagates: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskActionsResponse {
-    pub available_actions: Vec<TaskAction>,
-    pub recovery_actions: Vec<RecoveryAction>,
+    pub available_actions: Vec<Offer>,
+    #[ts(type = "number")]
+    pub version: i64,
 }
 
 /// Identifies where a Task's effective coder assignment is stored.
@@ -96,7 +215,7 @@ pub struct TaskResponse {
     #[ts(type = "Record<string, number>")]
     pub remaining_retries: std::collections::HashMap<String, i64>,
     #[serde(default)]
-    pub execution_actions: Vec<ExecutionAction>,
+    pub available_actions: Vec<Offer>,
     pub error_annotation: Option<TaskAnnotation>,
     pub blocked: Option<InterruptionMetadata>,
     pub failed: Option<InterruptionMetadata>,
@@ -493,6 +612,21 @@ pub struct PromptPreviewResponse {
     pub system: String,
     pub user: String,
     pub tools: Option<Vec<String>>,
+}
+
+/// Transport schemas share this closed command shape (REST serde, MCP, typed tools).
+pub fn task_action_schema() -> serde_json::Value {
+    use serde_json::json;
+    let mut variants = Vec::new();
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"start"}}, "required":["verb"], "additionalProperties":false}));
+    for verb in ["hold", "release", "restart"] {
+        variants.push(json!({"type":"object", "properties":{"verb":{"const":verb},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
+    }
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"cancel"},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"retry"},"reason":{"type":"string","minLength":1}, "fresh_session":{"type":"boolean"}, "refresh_workspace":{"type":"boolean"}, "reset_budget":{"type":"boolean"}, "guidance":{"type":"string"}}, "required":["verb"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"send_back"}, "guidance":{"type":"string","minLength":1}}, "required":["verb","guidance"], "additionalProperties":false}));
+    variants.push(json!({"type":"object", "properties":{"verb":{"const":"approve"}, "override":{"type":"boolean"},"reason":{"type":"string","minLength":1}}, "required":["verb"], "additionalProperties":false}));
+    json!({"oneOf":variants})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]

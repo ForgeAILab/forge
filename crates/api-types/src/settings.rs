@@ -43,19 +43,26 @@ pub struct UpdateForgePathsRequest {
 pub struct UpdateServerSettingsRequest {
     #[serde(
         default,
-        deserialize_with = "deserialize_run_cap_update",
+        deserialize_with = "deserialize_optional_u32_update",
         skip_serializing_if = "Option::is_none"
     )]
     #[ts(optional, type = "number | null")]
     pub max_concurrent_runs: Option<Option<u32>>,
     #[serde(
         default,
-        deserialize_with = "deserialize_run_cap_update",
+        deserialize_with = "deserialize_optional_u32_update",
         skip_serializing_if = "Option::is_none"
     )]
     #[ts(optional, type = "number | null")]
     pub build_jobs_per_run: Option<Option<u32>>,
     pub run_nice: Option<u32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_u32_update",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional, type = "number | null")]
+    pub usage_index_budget_mb: Option<Option<u32>>,
     pub bind: Option<String>,
     pub mcp_enabled: Option<bool>,
 }
@@ -75,8 +82,40 @@ pub struct UpdateAgentSettingsRequest {
     pub max_missed_heartbeats: Option<u32>,
 }
 
-fn deserialize_run_cap_update<'de, D: serde::Deserializer<'de>>(
+fn deserialize_optional_u32_update<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Option<u32>>, D::Error> {
     Option::<u32>::deserialize(deserializer).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn usage_index_budget_distinguishes_omitted_default_and_zero() {
+        for (body, expected) in [
+            ("{}", None),
+            (r#"{"usage_index_budget_mb":null}"#, Some(None)),
+            (r#"{"usage_index_budget_mb":0}"#, Some(Some(0))),
+            (r#"{"usage_index_budget_mb":64}"#, Some(Some(64))),
+        ] {
+            let update: UpdateServerSettingsRequest = serde_json::from_str(body).unwrap();
+            assert_eq!(update.usage_index_budget_mb, expected);
+            assert_eq!(
+                serde_json::to_value(update)
+                    .unwrap()
+                    .get("usage_index_budget_mb")
+                    .is_some(),
+                expected.is_some()
+            );
+        }
+        for value in ["-1", "1.5", "4294967296", r#""64""#] {
+            assert!(
+                serde_json::from_str::<UpdateServerSettingsRequest>(&format!(
+                    r#"{{"usage_index_budget_mb":{value}}}"#
+                ))
+                .is_err()
+            );
+        }
+    }
 }

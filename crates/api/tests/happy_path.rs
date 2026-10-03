@@ -347,9 +347,9 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
 
     let approved: TaskResponse = versioned_task_request(
         &harness.app,
-        &format!("/api/v1/tasks/{}/gates/review/approve", task.id),
+        &format!("/api/v1/tasks/{}/actions", task.id),
         &task.id,
-        json!({ "version": review_task.version, "reason": "human approval" }),
+        json!({ "version": review_task.version, "action": { "verb":"approve", "override":false } }),
     )
     .await;
     assert!(matches!(approved.status.as_str(), "merging" | "done"));
@@ -426,9 +426,9 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     let ci_review = poll_until_task_awaiting_human(&harness.app, &ci_failure_task.id).await;
     let ci_approved: TaskResponse = versioned_task_request(
         &harness.app,
-        &format!("/api/v1/tasks/{}/gates/review/approve", ci_failure_task.id),
+        &format!("/api/v1/tasks/{}/actions", ci_failure_task.id),
         &ci_failure_task.id,
-        json!({ "version": ci_review.version, "reason": "human approval" }),
+        json!({ "version": ci_review.version, "action": { "verb": "approve", "override": false } }),
     )
     .await;
     assert!(matches!(ci_approved.status.as_str(), "merging" | "done"));
@@ -469,13 +469,22 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     let second_execution = single_execution_for_task(&harness.app, &second_task.id).await;
     let second_review = poll_until_task_awaiting_human(&harness.app, &second_task.id).await;
 
+    // Production consumes condition commands through this dispatcher. A long
+    // interval makes this also prove that the post-commit wake starts the worker.
+    let dispatcher = Arc::new(services::TaskDispatcher::with_check_interval(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.event_bus),
+        Arc::clone(&harness.state.task_service),
+        std::time::Duration::from_secs(3600),
+    ));
+    let dispatch_loop = Arc::clone(&dispatcher).start();
     let rejected: TaskResponse = versioned_task_request(
         &harness.app,
-        &format!("/api/v1/tasks/{}/gates/review/reject", second_task.id),
+        &format!("/api/v1/tasks/{}/actions", second_task.id),
         &second_task.id,
         json!({
             "version": second_review.version,
-            "reason": "Please add evidence for the requested behavior"
+            "action": { "verb": "send_back", "guidance": "Please add evidence for the requested behavior" }
         }),
     )
     .await;
@@ -488,6 +497,8 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
         resumed.parent_execution_id.as_deref(),
         Some(second_execution.id.as_str())
     );
+    dispatcher.stop();
+    dispatch_loop.await.expect("dispatcher exits");
 }
 
 struct TestHarness {
@@ -990,6 +1001,7 @@ async fn versioned_task_request<T>(app: &Router, uri: &str, task_id: &str, mut b
 where
     T: DeserializeOwned,
 {
+    let mut last_snapshot = None;
     for _ in 0..40 {
         let response = raw_json_request(app, Method::POST, uri, body.clone()).await;
         if response.status() != StatusCode::CONFLICT {
@@ -1003,9 +1015,12 @@ where
         )
         .await;
         body["version"] = json!(current.version);
+        last_snapshot = Some(current);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("versioned request to {uri} never won the version race");
+    panic!(
+        "versioned request to {uri} never won the version race; last snapshot: {last_snapshot:?}"
+    );
 }
 
 async fn empty_request<T>(app: &Router, method: Method, uri: &str, expected_status: StatusCode) -> T

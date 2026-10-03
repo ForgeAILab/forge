@@ -1,7 +1,9 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import type { Review, Task, WorkflowExceptionAction } from '@/types/generated'
+import type { Review, Task, Offer } from '@/types/generated'
 import { TaskReviewTab } from './TaskReviewTab'
+
+vi.mock('@/api/hooks', () => ({ useTaskAction: () => ({ mutate: vi.fn(), isPending: false }) }))
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children: React.ReactNode }) => <a href="#review">{children}</a>,
@@ -14,7 +16,7 @@ describe('Needs owner review', () => {
   ] as const)(
     'derives the %s badge from the latest assessment when the message has no routing prefix',
     (fixableBy, repeat, badge) => {
-      const actions: WorkflowExceptionAction[] = []
+      const actions: Offer[] = []
       const task = {
         id: 'task-48',
         status: 'review',
@@ -66,17 +68,7 @@ describe('Needs owner review', () => {
           reviews={[review]}
           latestReview={review}
           reviewsLoading={false}
-          transitionPending={false}
-          triggerReviewPending={false}
-          recoverPending={false}
-          cancelPending={false}
-          terminal={false}
           expandedHistoryAttempts={new Set()}
-          onRerunReview={vi.fn()}
-          onStatusChange={vi.fn()}
-          onRecover={vi.fn()}
-          onOpenWorkflowExceptionAction={vi.fn()}
-          onCancelTask={vi.fn()}
           onToggleHistoryAttempt={vi.fn()}
         />,
       )

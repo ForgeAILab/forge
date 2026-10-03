@@ -115,6 +115,9 @@ pub struct ServerConfig {
     pub build_jobs_per_run: Option<u32>,
     #[serde(default = "crate::default_run_nice")]
     pub run_nice: u32,
+    /// Observation index budget in MiB; unset uses 128, zero disables indexing.
+    #[serde(default)]
+    pub usage_index_budget_mb: Option<u32>,
     pub bind: String,
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -248,6 +251,7 @@ pub struct ConfigOverrides {
     pub server_max_concurrent_runs: Option<u32>,
     pub server_build_jobs_per_run: Option<u32>,
     pub server_run_nice: Option<u32>,
+    pub server_usage_index_budget_mb: Option<u32>,
     pub server_bind: Option<String>,
     pub server_public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,
@@ -394,6 +398,7 @@ impl ForgeConfig {
                 max_concurrent_runs: None,
                 build_jobs_per_run: None,
                 run_nice: crate::default_run_nice(),
+                usage_index_budget_mb: None,
                 bind: DEFAULT_SERVER_BIND.to_owned(),
                 public_base_url: None,
                 mcp_enabled: true,

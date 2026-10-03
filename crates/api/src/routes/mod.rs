@@ -20,13 +20,9 @@ use services::{
     plan_artifact::{read_plan_with_router, PlanArtifactError},
     task_diagnostics::{
         compare_running_execution_authority, count_gate_rejections_since_boundary,
-        derive_workflow_exception_with_running_interactive, derive_workflow_health,
-        disable_recovery_while_running,
+        derive_workflow_health,
     },
-    task_service::action_resolver::{
-        has_open_interactive_launch_authority, list_execution_action_authority,
-        resolve_execution_actions, select_open_interactive_target,
-    },
+    task_service::action_resolver::list_execution_action_authority,
 };
 use sqlx::Row;
 
@@ -427,7 +423,6 @@ async fn task_response_inner(
     let task_projection::TaskDiagnosticProjection {
         canonical_phase,
         remaining_retries,
-        execution_actions,
         error_annotation,
         workflow_health,
         workflow_exception,
@@ -442,7 +437,6 @@ async fn task_response_inner(
             execution_authority: &execution_authority,
             running_executions: &running_executions,
         },
-        include_actions,
         awaiting_human,
     );
     let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
@@ -453,6 +447,21 @@ async fn task_response_inner(
     let (execution_evidence, execution_blocker) =
         services::load_task_execution_blocker(db, &task).await?;
 
+    let (offers, workflow_exception) = if include_actions {
+        let snapshot = services::task_actions::load_snapshot(
+            db,
+            task.clone(),
+            workflow.clone(),
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+            router.daemon_connections(),
+        )
+        .await?;
+        let offers = services::available_actions(&snapshot);
+        let exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
+        (offers, exception)
+    } else {
+        (Vec::new(), workflow_exception)
+    };
     let placement_diagnostics = services::environment_surfaces::task_placement_diagnostics(
         db,
         &task,
@@ -479,7 +488,7 @@ async fn task_response_inner(
         effective_coder,
         effective_coder_source,
         remaining_retries,
-        execution_actions,
+        available_actions: offers,
         error_annotation,
         blocked: task
             .blocked_json
@@ -541,26 +550,10 @@ fn blocking_annotation_for_projection<'a>(
     if task.failed_json.is_some() {
         return None;
     }
-    if error_annotation.is_some_and(|annotation| !annotation.recovery_actions.is_empty()) {
-        return error_annotation;
-    }
-
-    // Keep the legacy fallback in lockstep with TaskService::recovery_annotation:
-    // only the known retry/merge blocker shapes override an empty typed
-    // annotation. A generic blocked row must not widen an explicit empty
-    // annotation into actions that recovery will reject.
-    let blocked_is_recoverable_legacy = blocked_metadata.is_some_and(|annotation| {
-        annotation.annotation_type.is_retry_exhausted_metadata()
-            || (task.status == services::workflow::default_states::MERGING
-                && annotation.annotation_type == api_types::FailureKind::TargetRepoDirty)
-            || (task.status == services::workflow::default_states::MERGE_FAILED
-                && annotation.annotation_type.is_merge_recoverable())
-    });
-    if blocked_is_recoverable_legacy {
-        return blocked_metadata;
-    }
-
-    error_annotation.or(blocked_metadata)
+    error_annotation
+        .filter(|annotation| annotation.annotation_type != api_types::FailureKind::Unknown)
+        .or(blocked_metadata)
+        .or(error_annotation)
 }
 
 fn retry_budget_exhausted_for_state(
@@ -633,7 +626,7 @@ mod retry_projection_tests {
         }
     }
 
-    fn annotation(actions: Vec<api_types::RecoveryAction>) -> api_types::TaskBlockingAnnotation {
+    fn annotation(_actions: Vec<api_types::TaskAction>) -> api_types::TaskBlockingAnnotation {
         api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::RecoveryRequired,
             blocking_reason: "test blocker".to_owned(),
@@ -643,7 +636,6 @@ mod retry_projection_tests {
             artifact: None,
             message: None,
             hook: None,
-            recovery_actions: actions,
         }
     }
 
@@ -653,14 +645,14 @@ mod retry_projection_tests {
             status: services::workflow::default_states::IN_PROGRESS.to_owned(),
             ..test_task()
         };
-        let mut legacy = annotation(vec![api_types::RecoveryAction::CancelTask]);
+        let mut legacy = annotation(vec![api_types::TaskAction::Cancel { reason: None }]);
         legacy.annotation_type = api_types::FailureKind::TargetRepoDirty;
-        let typed = annotation(vec![api_types::RecoveryAction::ResetToInitial]);
+        let typed = annotation(vec![api_types::TaskAction::Restart { reason: None }]);
 
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&typed))
             .expect("one blocker selected");
 
-        assert_eq!(selected.recovery_actions, typed.recovery_actions);
+        assert_eq!(selected.annotation_type, typed.annotation_type);
     }
 
     #[test]
@@ -669,26 +661,33 @@ mod retry_projection_tests {
             status: services::workflow::default_states::MERGING.to_owned(),
             ..test_task()
         };
-        let mut legacy = annotation(vec![api_types::RecoveryAction::CancelTask]);
+        let mut legacy = annotation(vec![api_types::TaskAction::Cancel { reason: None }]);
         legacy.annotation_type = api_types::FailureKind::TargetRepoDirty;
-        let empty_typed = annotation(Vec::new());
+        let mut empty_typed = annotation(Vec::new());
+        empty_typed.annotation_type = api_types::FailureKind::Unknown;
 
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&empty_typed))
             .expect("one blocker selected");
 
-        assert_eq!(selected.recovery_actions, legacy.recovery_actions);
+        assert_eq!(
+            selected.annotation_type,
+            api_types::FailureKind::TargetRepoDirty
+        );
     }
 
     #[test]
     fn generic_legacy_blocker_does_not_override_empty_typed_annotation() {
         let task = test_task();
-        let legacy = annotation(vec![api_types::RecoveryAction::CancelTask]);
+        let legacy = annotation(vec![api_types::TaskAction::Cancel { reason: None }]);
         let empty_typed = annotation(Vec::new());
 
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&empty_typed))
             .expect("typed annotation remains authoritative");
 
-        assert!(selected.recovery_actions.is_empty());
+        assert_eq!(
+            selected.annotation_type,
+            api_types::FailureKind::RecoveryRequired
+        );
     }
 
     #[test]
@@ -706,7 +705,10 @@ mod retry_projection_tests {
 
         let parsed = blocked_metadata_annotation(&task).expect("legacy blocker parses");
         assert_eq!(parsed.annotation_type, api_types::FailureKind::Unknown);
-        assert!(parsed.recovery_actions.is_empty());
+        assert!(serde_json::to_value(&parsed)
+            .unwrap()
+            .get("recovery_actions")
+            .is_none());
     }
 
     #[test]
@@ -724,15 +726,13 @@ mod retry_projection_tests {
 
         let parsed = blocked_metadata_annotation(&task).expect("legacy blocker parses");
         assert_eq!(
-            parsed.recovery_actions,
-            vec![
-                api_types::RecoveryAction::RetryHook,
-                api_types::RecoveryAction::ResumeProcess,
-                api_types::RecoveryAction::ResetRetryWindow,
-                api_types::RecoveryAction::OpenInteractive,
-                api_types::RecoveryAction::CancelTask,
-            ]
+            parsed.annotation_type,
+            api_types::FailureKind::RetryExhausted
         );
+        assert!(serde_json::to_value(parsed)
+            .unwrap()
+            .get("recovery_actions")
+            .is_none());
     }
 
     fn test_task() -> db::Task {
@@ -784,7 +784,6 @@ mod retry_projection_tests {
             artifact: None,
             message: None,
             hook: None,
-            recovery_actions: vec![],
         };
 
         assert!(retry_budget_exhausted_for_state(
@@ -811,46 +810,6 @@ fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
         .get("execution_id")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    // Match TaskService::recovery_annotation's fixed legacy allowlists. The
-    // persisted list is historical data, not an authority source: trusting it
-    // here can advertise ResumeSession or retry actions that recovery will
-    // reject for the same metadata row.
-    let recovery_actions = if kind == api_types::FailureKind::Unknown {
-        Vec::new()
-    } else if kind.is_retry_exhausted_metadata() {
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::ResumeProcess,
-            api_types::RecoveryAction::ResetRetryWindow,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ]
-    } else if task.status == services::workflow::default_states::MERGING
-        && kind == api_types::FailureKind::TargetRepoDirty
-    {
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ]
-    } else if task.status == services::workflow::default_states::MERGE_FAILED
-        && kind.is_merge_recoverable()
-    {
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ]
-    } else {
-        vec![
-            api_types::RecoveryAction::ResumeSession,
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::ResetToInitial,
-            api_types::RecoveryAction::CancelTask,
-        ]
-    };
-
     Some(TaskBlockingAnnotation {
         annotation_type: kind,
         blocking_reason: reason.clone(),
@@ -873,7 +832,6 @@ fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
         }),
         message: Some(reason),
         hook: metadata.get("hook").cloned(),
-        recovery_actions,
     })
 }
 

@@ -33,6 +33,12 @@ vi.mock('@/api/hooks', () => {
           restart_required: false,
         },
         { key: 'server.run_nice', value: 10, effective_value: 10, restart_required: false },
+        {
+          key: 'server.usage_index_budget_mb',
+          value: null,
+          effective_value: 128,
+          restart_required: false,
+        },
       ],
     },
   }
@@ -64,6 +70,44 @@ describe('ForgeSettingsPage run resources', () => {
     fireEvent.change(screen.getByLabelText('Run niceness'), { target: { value: '0' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     expect(mutate.mock.calls[1][0].server).toMatchObject({ build_jobs_per_run: 0, run_nice: 0 })
+  })
+  it('shows and saves the usage budget alongside build jobs and niceness', () => {
+    render(<ForgeSettingsPage />)
+    expect(screen.getByText('In effect: 128 MiB')).toBeTruthy()
+    fireEvent.change(screen.getByLabelText('Usage index memory budget'), {
+      target: { value: '64' },
+    })
+    fireEvent.change(screen.getByLabelText('Build jobs per run'), { target: { value: '3' } })
+    fireEvent.change(screen.getByLabelText('Run niceness'), { target: { value: '7' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate.mock.calls[0][0].server).toMatchObject({
+      usage_index_budget_mb: 64,
+      build_jobs_per_run: 3,
+      run_nice: 7,
+    })
+    fireEvent.change(screen.getByLabelText('Usage index memory budget'), { target: { value: '0' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate.mock.calls[1][0].server).toMatchObject({
+      usage_index_budget_mb: 0,
+      build_jobs_per_run: 3,
+      run_nice: 7,
+    })
+    fireEvent.change(screen.getByLabelText('Usage index memory budget'), { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate.mock.calls[2][0].server).toMatchObject({
+      usage_index_budget_mb: null,
+      build_jobs_per_run: 3,
+      run_nice: 7,
+    })
+    mutate.mockClear()
+    fireEvent.change(screen.getByLabelText('Usage index memory budget'), {
+      target: { value: '-1' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate).not.toHaveBeenCalled()
+    expect(toastError).toHaveBeenCalledWith(
+      'Usage index budget must be a non-negative integer in MiB',
+    )
   })
   it('saves blank jobs as automatic and rejects invalid values', () => {
     render(<ForgeSettingsPage />)

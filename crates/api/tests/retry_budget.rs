@@ -204,8 +204,8 @@ async fn gate_reject(app: &Router, task: &TaskResponse) -> TaskResponse {
     json_request(
         app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/gates/review/reject", task.id),
-        json!({ "version": task.version, "reason": "needs another pass" }),
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "action": {"verb":"send_back","guidance":"needs another pass"},  "version": task.version}),
         StatusCode::OK,
     )
     .await

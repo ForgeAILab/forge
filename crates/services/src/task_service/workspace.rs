@@ -272,7 +272,7 @@ impl TaskService {
         let annotation = expired.then(|| {
             json!({"type": "recovery_required", "blocking_reason": "owner_disconnected_timeout",
             "message": reason, "blocked_at": now.to_rfc3339(), "blocked_by": "system:workflow",
-            "recovery_actions": ["reexecute", "cancel_task"]})
+})
             .to_string()
         });
         let unchanged_reason = !expired

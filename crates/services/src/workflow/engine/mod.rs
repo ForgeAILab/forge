@@ -56,11 +56,10 @@ const MAX_CASCADE_DEPTH: u8 = 8;
 
 fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
     serde_json::json!({
-        "type": DISPATCH_FAILED_ANNOTATION,
+        "type": api_types::FailureKind::DispatchFailed,
         "message": message,
         "state": state,
         "detected_at": now_rfc3339(),
-        "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
     })
     .to_string()
 }
@@ -1120,7 +1119,7 @@ impl WorkflowEngine {
         skip(self, workflow),
         fields(task_id = %task_id, target_state = %target_state, version = version, actor = %actor, reason = %reason)
     )]
-    pub async fn reset_to_initial(
+    pub async fn restart(
         &self,
         task_id: &str,
         target_state: &str,
@@ -1160,7 +1159,7 @@ impl WorkflowEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn reset_to_initial_with_authority(
+    pub async fn restart_with_authority(
         &self,
         task_id: &str,
         target_state: &str,
@@ -1538,7 +1537,7 @@ impl WorkflowEngine {
             let mut cascade: Option<(String, String)> = None;
             // Set when a failed dispatch hook rolls the task back to the
             // workflow's initial state: the rollback must not be blocked by
-            // the active state's exit guards (reset_to_initial idiom).
+            // the active state's exit guards (restart allowance).
             let mut cascade_skip_before_exit = false;
             let mut before_enter_rejection_cascade = false;
             let mut skip_target_enter_hooks = false;
@@ -1937,22 +1936,21 @@ impl WorkflowEngine {
                 };
             drop(cleanup_guard);
 
-            let should_defer_dispatch = defer_dispatch_until.is_some()
-                && to_state.kind != StateKind::Active
+            let action_dispatch = crate::TaskService::task_action_command_active();
+            let should_defer_dispatch = (defer_dispatch_until.is_some() || action_dispatch)
+                && (to_state.kind != StateKind::Active || action_dispatch)
                 && to_state
                     .hooks
                     .on_enter
                     .iter()
-                    .any(|hook| hook.action == "dispatch_role_agent");
+                    .any(|hook| matches!(hook.action.as_str(), "dispatch_role_agent" | "dispatch_fix_agent" | "dispatch_executor"));
             if should_defer_dispatch {
                 deferred_dispatch::set(
                     &self.db,
                     &task,
                     &target_state,
-                    defer_dispatch_until
-                        .as_deref()
-                        .expect("deferred dispatch timestamp exists"),
-                    "board drag dispatch cooldown",
+                    defer_dispatch_until.as_deref().unwrap_or(&now_rfc3339()),
+                    if action_dispatch { "task action dispatch" } else { "board drag dispatch cooldown" },
                 )
                 .await?;
             } else if deferred_dispatch::pending_until(&task).is_some() {
@@ -2285,9 +2283,9 @@ impl WorkflowEngine {
                         );
                         continue;
                     }
-                    if should_defer_dispatch && hook.action == "dispatch_role_agent" {
+                    if should_defer_dispatch && matches!(hook.action.as_str(), "dispatch_role_agent" | "dispatch_fix_agent" | "dispatch_executor") {
                         let result = HookResult::Skipped {
-                            reason: "dispatch deferred after board drag".to_owned(),
+                            reason: "dispatch deferred to Task dispatcher".to_owned(),
                         };
                         log_hook_result(
                             &task.id,

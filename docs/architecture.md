@@ -1578,7 +1578,7 @@ carry `retry: {action: "none", retryable: false, scope: "session", ...}` and
 say that repeating the call will be refused while its cause holds. Other
 specific causes apply to the request for the turn and are neither cached nor
 recorded. A paused target Agent returns `target_agent_paused`; a Project
-pause on `task.recover` is turn-scoped because it does not block every recovery
+pause on `task.action` is turn-scoped because it does not block every recovery
 action. Neither withdraws the operation. Unknown prose maps to `unspecified`:
 a neutral turn-scoped refusal with `retry.action: none` and `retryable: false`.
 Subsequent calls are evaluated normally; only invalid arguments suggest
@@ -1651,16 +1651,13 @@ adapter calls `TaskService` directly, so no `AgentAction` or
 receipt/event identity, source and affected Task ids, board revision, and
 `replayed`; receipt-first exact replay bypasses mutable governance checks,
 while a new command is authorized and validated inside the shared transaction.
-A ReadyOnly Project Agent may also invoke `task.cancel` for any non-terminal
-Task in its bound Project, including healthy queued or running work. The closed
-payload carries `action: "cancel"`, the Task id, its exact version, and a
-reason. The adapter derives Project and actor authority, TaskService verifies
-the current Project Agent binding and Project ownership, then the ordinary
-cancellation path stops active executions and transitions to the workflow's
-cancellation state. Agent actors may traverse a system-triggered edge only
-when its target is that declared cancellation state; all other system-only
-edges remain unavailable. An already-cancelled retry is an outcome-idempotent
-success, while a changed non-terminal Task returns its current version.
+A ReadyOnly Project Agent uses caller-filtered `task.action` offers for the
+Tasks in its bound Project. Each command carries the Task id, exact version,
+and a closed action object. Cancellation stops active executions and enters
+the workflow's cancellation state. Only the owner may override a gate. Missing
+or unauthorized offers return `action_unavailable` with current offers; stale
+versions remain version conflicts. Recovery commits its condition change and
+wakes the existing dispatcher, which waits for execution capacity.
 A Project's coordination/chat state, repository setup, and execution projection remain
 independent projections. Each setup response carries per-dimension freshness;
 an unavailable source is returned with a bounded retry action and never
@@ -2101,7 +2098,7 @@ in the policy layer) and whether a Project target is derived for it before
 dispatch. Both previously failed silently when a new operation was missed —
 `policy_denied: the operation is not admitted for the current Forge scope`, or
 `direct command has no canonical target derivation` — messages that name
-neither the operation nor the list; `task.recover` and `task.dependency` each
+neither the operation nor the list; `task.action` and `task.dependency` each
 shipped with that bug. What the row still cannot supply is the payload schema
 and the dispatch body, so those remain per-operation code, guarded by
 `scope_composition_drives_every_migrated_main_project_and_task_operation`,
@@ -3221,7 +3218,7 @@ Placement and transport failures do not spend the Task retry budget.
 `owner_disconnected` suspends work; timeout or a lost execution offers recovery
 on the same owner. `stale_generation` and `wrong_owner` refuse the operation and
 surface an Attention item. Users may wait, retry on the same owner, or cancel;
-cross-machine migration is outside this change. `resume_session` requires the
+cross-machine migration is outside this change. `retry { fresh_session: false }` requires the
 owner to be online and advertise `resume` for the snapshot's executor.
 
 Cleanup goes through the placement backend. An offline owner's placement stays
@@ -3394,6 +3391,26 @@ retry window and conflicts on coordination roots, whose aggregate branch stays
 on the manual path. There, the recovery action creates a
 marked review-refresh transition, clears the old approval, and runs the
 repaired result through fresh checks and review before merge.
+
+### Task condition actions
+
+`services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, existing interruption columns, entry-barrier/flow-control metadata, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
+
+The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Each offer carries meaningful parameters, allowed boolean values, authority, reason, label, cancellation propagation, and a pinned resumable execution. Required operator reasons and send-back guidance are supplied by the caller and retained in review records, comments, follow-up Tasks and transition logs. Commands check the version and select a current offer. A missing offer produces one `action_unavailable` error with current offers. Gate overrides remain owner-only.
+
+Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Annotation, blocked, failed and entry-barrier columns remain separate.
+
+Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
+
+Task action conditions precede generic review decisions. In `review`, ordinary
+approval requires an awaiting-human Review and no condition. Re-running review requires
+a completed implementation candidate; entry-check retries and budget resets remain
+independent controls. Dependency cancellation uses the writer's
+`workflow_guard_rejected` annotation with `blocking_reason:"dependency_cancelled"`
+and offers cancellation only. A queued action always offers Hold alongside cancel,
+even when a newer condition appears. Restart follows the resolver's explicit set
+of resettable condition kinds. Pause refusals preserve the typed wait cause and
+turn retry scope across REST, MCP, and native tools.
 
 ### Root Tasks and ordered subtasks
 
@@ -3731,7 +3748,7 @@ cascade's intentional no-op into a reconciliation receipt.
 engine does not leave the task there looking in-flight. It records the
 dispatch error on `task.error_annotation` (type `dispatch_failed`) and
 cascades the task back to the workflow's initial state, skipping the active
-state's exit guards (the `reset_to_initial` allowance). Both the failed hook
+state's exit guards (the `restart` allowance). Both the failed hook
 and the rollback transition land in `transition_log`. The task dispatcher
 treats a `dispatch_failed` annotation as blocking, so a task whose dispatch
 deterministically fails — e.g. governance rejects it because the Project has no
@@ -3794,7 +3811,7 @@ only when a role/agent is assigned. Override transitions are audited as
 separate from `manual_override_transition_with_authority`, a system-triggered
 primitive with `skip_before_exit=true` used by
 `TaskService::advance_to_next_state`.
-An authenticated Project Agent cancellation is narrower: `task.cancel` may
+An authenticated Project Agent cancellation is narrower: `task.action` with the cancel offer may
 cross a system-triggered edge only when the destination is the workflow's
 declared cancellation state. It receives no general routing override.
 
@@ -3881,8 +3898,8 @@ Audit-log derived. Gate states may set `gate_config.max_rejections`;
 `check_retry_budget` counts `transition_log` rows with `from_state = gate` and
 `rejection = true`, then cascades to `blocked` when exhausted. Generic
 user-triggered gate-to-active bounces are logged with `rejection = false` and
-do not consume budget. Both `reset_retry_window` and the stronger
-`reset_to_initial` recovery action establish a new audit boundary, so a full
+do not consume budget. Both `retry { reset_budget: true }` and the stronger
+`restart` recovery action establish a new audit boundary, so a full
 Task reset restores every gate's retry window rather than carrying an exhausted
 merge/review budget back to `todo`.
 
@@ -3901,7 +3918,7 @@ state. Command timeout, repository mismatch, and not-ready/failed/cleaned
 workspaces are permanent runner refusals, not infrastructure retries. Unbounded
 daemon CI accepts truncated output while preserving its exit-code verdict;
 output pressure does not make a successful command fail. Reset-required workspaces offer
-`reset_to_initial`. Embedded authority-loss cancellation and user review-entry
+`restart`. Embedded authority-loss cancellation and user review-entry
 behavior retain their existing routing; genuine CI failures charge a rejection.
 
 When a reviewer execution fails, Forge first schedules the next bounded execution
@@ -3939,7 +3956,7 @@ row also cannot auto-cascade unless the Task still carries current
 `review_passed_at` authority. The Task remains in review with explicit recovery
 actions; an execution failure does not count as a reviewer verdict rejecting the
 work.
-`resume_session` is exposed only when the stopped execution has a session/config
+`retry { fresh_session: false }` is exposed only when the stopped execution has a session/config
 snapshot and its agent still owns the exact Task role. For a daemon placement,
 the owner must also be online and advertise `resume` for that executor.
 
@@ -4001,8 +4018,7 @@ predicates (`is_retry_exhausted_metadata`, `is_budget_exhausted_annotation`,
 `is_merge_recoverable`, …). Reason/message prose carries no classification
 weight anywhere. Legacy database rows were normalized once by migration
 `V056__normalize_failure_kinds`; kinds that migration could not map
-deserialize to a read-only `Unknown` variant that renders info-only with no
-recovery actions. Producers must never construct `Unknown`. The web client
+deserialize to an `Unknown` variant. Legacy/unknown annotations retain reset and re-execution offers where a valid apply plan exists. `dispatch_failed` has its own typed kind. Producers must never construct `Unknown`. The web client
 likewise derives no failure semantics from workflow state names — gate
 reject/bounce targets come only from explicit `reject`/`fail` trigger edges or
 `gate_config.reject_target`.
@@ -4016,14 +4032,14 @@ resolve a `progress_warning`); it does not notify or wake by itself.
 Graceful-shutdown recoveries auto-resume at the next startup and are not
 notified. In the derived `workflow_exception` summary, a hard failure
 supersedes any blocking annotation — `recover_task` only accepts
-`reset_to_initial`/`cancel_task` once `failed_json` is set, so only those
+`restart`/`cancel` once `failed_json` is set, so only those
 actions are offered. The web UI renders one actionable recovery surface,
 `WorkflowExceptionPanel`, on both the task page and the board modal;
 `TaskBlockingBanner` is an informational fallback for interruption states
 without recovery actions. Generic execution follow-ups remain non-propagating
 side sessions: they can preserve an agent conversation, but they cannot settle
 a Review or advance Task state and are not shown beside an active workflow
-exception. Review guidance is submitted through the exception's `reexecute`
+exception. Review guidance is submitted through the exception's offered `retry {guidance}`
 action so the replacement reviewer execution is bound to the authoritative
 Review attempt and may propagate its result.
 
@@ -4375,7 +4391,7 @@ coder's feedback. `blocked` — the environment, not the code, stopped the
 reviewer — becomes `blocked`: the Review finishes failed and the Task is parked
 with a `review_blocked` blocking annotation for its owner, because neither the
 coder nor another reviewer can install a missing toolchain. The owner can retry
-the authoritative reviewer with required guidance (`reexecute` plus `context`),
+the authoritative reviewer with optional guidance (`retry` with `guidance`),
 or manually pass with a required reason. A manual pass appends a new passed
 Review attempt with user provenance; it never rewrites the failed attempt.
 A reply with no readable result block, or a review whose context or commit
@@ -4394,10 +4410,12 @@ crashes, unverified results, and CI-only failures are not prior findings. The di
 uses this same routing for stranded failed Reviews after the base's recovery
 grace and authority fences; failed non-user review-entry CI still consumes the
 review retry budget and records exhaustion when appropriate. Owner recovery
-actions are `reexecute` with guidance, `mark_reviewed` with a reason,
-`defer_to_follow_up`, `open_interactive`, and `cancel_task`.
-Deferring requires a reason and atomically creates a linked backlog Task carrying
-the finding and records a manual pass naming it, allowing the original to merge.
+offers include `retry` with guidance, `approve`, and `cancel`; side-session
+launches remain separate. For an owner finding, `approve { override: false }`
+creates a linked backlog Task carrying the finding and records a manual pass
+naming it, allowing the original to merge. `approve { override: true }` passes
+the review without creating that follow-up. The owner decision is recorded in
+the manual pass; the closed approval command has no separate reason field.
 The follow-up uses normal service insertion, including current-Charter governance
 and a Project work-epoch increment, in that same transaction.
 

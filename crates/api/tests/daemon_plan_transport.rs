@@ -573,7 +573,7 @@ async fn daemon_plan_dispatch_coder_first_existing_completion_and_subtask() {
             .harness
             .state
             .task_service
-            .cancel_execution(&execution.id, "send back".into())
+            .stop_execution(&execution.id, "send back".into())
             .await
             .unwrap();
     }
@@ -603,7 +603,7 @@ async fn daemon_plan_dispatch_coder_first_existing_completion_and_subtask() {
         .harness
         .state
         .task_service
-        .cancel_execution(
+        .stop_execution(
             restarted["execution_id"].as_str().unwrap(),
             "prepare child".into(),
         )
@@ -1190,7 +1190,7 @@ async fn daemon_plan_dispatch_late_plan_after_cancel_is_acknowledged_without_pub
         .harness
         .state
         .task_service
-        .cancel_execution(
+        .stop_execution(
             start["execution_id"].as_str().unwrap(),
             "operator cancellation".into(),
         )

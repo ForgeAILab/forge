@@ -44,10 +44,17 @@ pub async fn update_settings(
         .as_ref()
         .and_then(|server| server.build_jobs_per_run);
     let nice_update = request.server.as_ref().and_then(|server| server.run_nice);
+    let budget_update = request
+        .server
+        .as_ref()
+        .and_then(|server| server.usage_index_budget_mb);
     let path = state.config_path.as_path();
     let mut config = read_yaml_config(path).await?;
     apply_update(&mut config, request)?;
     write_yaml_config(path, &config).await?;
+    if let Some(budget) = budget_update {
+        state.usage_ledger_index.set_budget_mb(budget);
+    }
     if let Some(cap) = cap_update {
         state.db.server_run_cap.set(
             cap,
@@ -99,6 +106,12 @@ async fn settings_response(state: &AppState) -> ApiResult<SettingsResponse> {
             key: "server.run_nice".into(),
             value: serde_json::json!(budget.run_nice),
             effective_value: serde_json::json!(budget.run_nice),
+            restart_required: false,
+        },
+        ForgeSettingResponse {
+            key: "server.usage_index_budget_mb".to_owned(),
+            value: serde_json::json!(state.usage_ledger_index.configured_budget_mb()),
+            effective_value: serde_json::json!(state.usage_ledger_index.budget_mb()),
             restart_required: false,
         },
         ForgeSettingResponse {
@@ -188,6 +201,7 @@ fn has_updates(request: &UpdateSettingsRequest) -> bool {
                 || server.max_concurrent_runs.is_some()
                 || server.build_jobs_per_run.is_some()
                 || server.run_nice.is_some()
+                || server.usage_index_budget_mb.is_some()
         })
         || request.workspace.as_ref().is_some_and(|workspace| {
             workspace.root.is_some() || workspace.cleanup_delay_seconds.is_some()
@@ -291,6 +305,13 @@ fn apply_update(config: &mut Value, request: UpdateSettingsRequest) -> ApiResult
         }
         if let Some(nice) = server.run_nice {
             set_path(config, &["server", "run_nice"], yaml_number(nice)?)?;
+        }
+        if let Some(budget) = server.usage_index_budget_mb {
+            set_path(
+                config,
+                &["server", "usage_index_budget_mb"],
+                yaml_number(budget)?,
+            )?;
         }
         if let Some(cap) = server.max_concurrent_runs {
             set_path(

@@ -750,3 +750,11 @@ impl Drop for TestDir {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
+
+/// Tests explicitly place this version in the command body. The transport
+/// helper never repairs missing command fields.
+pub async fn task_action_version(app: &Router, uri: &str) -> i64 {
+    let response = raw_empty_request(app, Method::GET, uri).await;
+    let offers: api_types::TaskActionsResponse = parse_response(response, StatusCode::OK).await;
+    offers.version
+}

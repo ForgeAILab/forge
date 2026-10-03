@@ -96,8 +96,8 @@ async fn claim_allows_human_on_paused_project() {
     let response = common::raw_json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/cancel", task.id),
-        json!({}),
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{}/actions", task.id)).await, "action": {"verb":"cancel"} }),
     )
     .await;
 

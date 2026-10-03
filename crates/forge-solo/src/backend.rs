@@ -322,6 +322,7 @@ pub struct TaskSnapshot {
     pub commit: Option<CommitEvidence>,
     pub blocker: Option<FailureSnapshot>,
     pub retryable: bool,
+    pub review_actions: Vec<api_types::Offer>,
 }
 
 /// Typed attention kind.  The renderer should use this kind and
@@ -492,6 +493,7 @@ pub struct ReviewDecisionRequest {
     pub expected_version: i64,
     pub target_digest: String,
     pub decision: ReviewDecision,
+    pub guidance: Option<String>,
     pub idempotency_key: IdempotencyKey,
 }
 

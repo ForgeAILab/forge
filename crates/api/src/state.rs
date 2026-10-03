@@ -186,6 +186,10 @@ impl AppState {
     }
 
     pub fn from_runtime_arc(runtime: Arc<services::ForgeRuntime>, mcp_enabled: bool) -> Self {
+        runtime
+            .operator_status_service
+            .usage_ledger_index()
+            .set_budget_mb(runtime.effective_config.server.usage_index_budget_mb);
         Self {
             db: Arc::clone(&runtime.db),
             pricing_repository: Arc::clone(&runtime.pricing_repository),
@@ -253,6 +257,8 @@ impl AppState {
             Some(config.server.build_jobs_per_run),
             Some(config.server.run_nice),
         );
+        self.usage_ledger_index
+            .set_budget_mb(config.server.usage_index_budget_mb);
         self.db.server_run_cap.set(
             config.server.max_concurrent_runs,
             config::resolved_run_cap(config.server.max_concurrent_runs),

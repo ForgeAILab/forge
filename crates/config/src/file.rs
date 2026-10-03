@@ -54,6 +54,7 @@ pub(crate) struct FileServerConfig {
     pub max_concurrent_runs: Option<u32>,
     pub build_jobs_per_run: Option<u32>,
     pub run_nice: Option<u32>,
+    pub usage_index_budget_mb: Option<u32>,
     pub bind: Option<String>,
     pub public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,

@@ -161,6 +161,7 @@ enum WakeDecisionEvent {
 #[derive(Clone)]
 pub struct AttentionService {
     db: Arc<SqliteDb>,
+    action_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     event_bus: Option<Arc<events::EventBus>>,
 }
 
@@ -169,7 +170,18 @@ impl AttentionService {
         Self {
             db,
             event_bus: None,
+            action_connections: None,
         }
+    }
+
+    /// Offer construction uses the same live owner resume facts as Task reads.
+    #[must_use]
+    pub fn with_action_connections(
+        mut self,
+        connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+    ) -> Self {
+        self.action_connections = Some(connections);
+        self
     }
 
     /// Attach the event bus so an autonomy stall reaches the user. Without it
@@ -1622,7 +1634,7 @@ impl AttentionService {
 
     /// A Task entering `review` is only attention when a person must decide
     /// the gate. A review run by the workflow's reviewer Agent settles itself;
-    /// waking the Project Agent for it sends the Agent to a `task.review`
+    /// waking the Project Agent for it sends the Agent to a `task.action`
     /// action the gate rejects, which wastes the turn and reports a blocker
     /// that does not exist. A Task that no longer exists is nobody's review.
     async fn review_needs_a_person(&self, event: &DomainEvent) -> Result<bool> {
@@ -1786,11 +1798,48 @@ impl AttentionService {
                 .get("interruption")
                 .cloned()
                 .unwrap_or(Value::Null);
-            let recovery_actions = interruption
-                .get("recovery_actions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            let available_actions = if event.entity_type == "task" {
+                if let Some(task) =
+                    db::TaskRepo::get_by_id(&*self.db, &event.entity_id, false).await?
+                {
+                    if let Some(project) =
+                        db::ProjectRepo::get_by_id(&*self.db, &task.project_id).await?
+                    {
+                        let actor = match db::ProjectAgentBindingRepo::get_active_project_binding(
+                            &*self.db,
+                            &task.project_id,
+                        )
+                        .await?
+                        .filter(|binding| binding.state == "active")
+                        .and_then(|binding| binding.identity_id)
+                        {
+                            Some(agent_id) => api_types::Actor::agent(agent_id),
+                            None => api_types::Actor::system(api_types::SystemComponent::Workflow),
+                        };
+                        let workflow =
+                            crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+                                &task,
+                                &project.workflow_definition,
+                                &actor,
+                            );
+                        let snapshot = crate::task_actions::load_snapshot(
+                            &self.db,
+                            task,
+                            workflow,
+                            &actor,
+                            self.action_connections.as_deref(),
+                        )
+                        .await?;
+                        crate::available_actions(&snapshot)
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
             let requires_intervention = event_payload
                 .get("requires_intervention")
                 .and_then(Value::as_bool)
@@ -1814,7 +1863,7 @@ impl AttentionService {
                 "interruption": interruption,
                 "recovery": {
                     "requires_intervention": requires_intervention,
-                    "actions": recovery_actions,
+                    "actions": available_actions,
                     "automatic_retry": false,
                 },
             }))

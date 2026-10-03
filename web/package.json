@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint . --max-warnings=0",
     "test": "vitest run --exclude 'e2e/**'",
-    "e2e": "playwright test e2e/smoke.spec.ts",
+    "e2e": "playwright test e2e/smoke.spec.ts e2e/task-actions-contract.spec.ts",
     "e2e:media": "playwright test e2e/task-media.spec.ts",
     "e2e:terminal": "playwright test e2e/task-terminal.spec.ts",
     "e2e:board": "playwright test e2e/board-interactions.spec.ts",

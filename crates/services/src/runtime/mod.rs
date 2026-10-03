@@ -753,7 +753,9 @@ impl ForgeRuntimeBuilder {
         let coordination_consumer =
             Arc::new(CoordinationOutcomeConsumer::new(Arc::clone(&self.db)));
         let attention_projection = Arc::new(
-            AttentionService::new(Arc::clone(&self.db)).with_event_bus(Arc::clone(&self.event_bus)),
+            AttentionService::new(Arc::clone(&self.db))
+                .with_event_bus(Arc::clone(&self.event_bus))
+                .with_action_connections(Arc::clone(&daemon_connections)),
         );
         let wake_turn_consumer = Arc::new(WakeTurnConsumer::new(Arc::clone(&self.db)));
         let domain_event_broadcast = Arc::new(DomainEventBroadcastConsumer::new(

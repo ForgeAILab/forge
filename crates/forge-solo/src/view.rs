@@ -1155,6 +1155,14 @@ fn review_text(card: &crate::app::ReviewCard) -> (Text<'static>, Color) {
         "Merge: {}",
         card.merge_commit.as_deref().unwrap_or("not recorded")
     )));
+    if card.editing_guidance {
+        lines.push(Line::from(if card.requires_reason {
+            "Reason (required): type your reason, then Enter to send"
+        } else {
+            "Guidance (required): type the changes, then Enter to send"
+        }));
+        lines.push(Line::from(card.guidance.clone()));
+    }
     lines.push(Line::from(""));
     for (index, action) in card.permitted_actions.iter().enumerate() {
         lines.push(Line::from(vec![
@@ -1174,7 +1182,11 @@ fn review_text(card: &crate::app::ReviewCard) -> (Text<'static>, Color) {
         ]));
     }
     lines.push(Line::from(Span::styled(
-        "↑↓ choose    Enter execute    Esc close",
+        if card.editing_guidance {
+            "Type text    Backspace edit    Shift-Enter new line    Enter send    Esc close"
+        } else {
+            "↑↓ choose    Enter execute    Esc close"
+        },
         Style::default().fg(WARNING),
     )));
     (Text::from(lines), WARNING)

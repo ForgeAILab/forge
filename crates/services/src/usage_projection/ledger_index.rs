@@ -3,10 +3,14 @@
 //! counts; provenance is an ordered set (last event wins), not an additive sum.
 use super::*;
 use sqlx::Row;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 const REASONS: usize = 10;
-const MAX_INDEX_BYTES: usize = 128 * 1024 * 1024;
+#[cfg(test)]
+const MAX_INDEX_BYTES: usize = config::DEFAULT_USAGE_INDEX_BUDGET_MB as usize * 1024 * 1024;
 const READ_MEMORY_RESERVE: usize = 8 * 1024 * 1024;
 const REASON_CODES: [CostCoverageReasonCode; REASONS] = [
     CostCoverageReasonCode::Pending,
@@ -973,13 +977,14 @@ impl State {
                 READ_MEMORY_RESERVE
             }
     }
-    fn bound(&self) -> bool {
-        self.charged_bytes() > MAX_INDEX_BYTES
+    fn bound(&self, budget: usize) -> bool {
+        self.charged_bytes() > budget
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Overflow {
+    budget: usize,
     header: Watermarks,
     rows: i64,
 }
@@ -1030,6 +1035,8 @@ impl Fallback {
 /// partial delta. Oversized ledgers use separately memoized fresh aggregates.
 #[derive(Debug)]
 pub struct UsageLedgerIndex {
+    // u64::MAX represents an unset setting; all u32 budgets remain valid.
+    configured_budget_mb: AtomicU64,
     db: Arc<db::SqliteDb>,
     state: tokio::sync::Mutex<State>,
     fallback: tokio::sync::Mutex<Fallback>,
@@ -1040,10 +1047,39 @@ impl UsageLedgerIndex {
     pub fn new(db: Arc<db::SqliteDb>) -> Self {
         Self {
             db,
+            configured_budget_mb: AtomicU64::new(u64::MAX),
             state: tokio::sync::Mutex::new(State::default()),
             fallback: tokio::sync::Mutex::new(Fallback::default()),
             operations_fill: tokio::sync::Mutex::new(()),
             agents_fill: tokio::sync::Mutex::new(()),
+        }
+    }
+    /// Update the setting immediately; observation allocations are reconciled on the next read.
+    pub fn set_budget_mb(&self, budget: Option<u32>) {
+        self.configured_budget_mb
+            .store(budget.map_or(u64::MAX, u64::from), Ordering::SeqCst);
+    }
+    pub fn configured_budget_mb(&self) -> Option<u32> {
+        u32::try_from(self.configured_budget_mb.load(Ordering::SeqCst)).ok()
+    }
+    pub fn budget_mb(&self) -> u32 {
+        self.configured_budget_mb()
+            .unwrap_or(config::DEFAULT_USAGE_INDEX_BUDGET_MB)
+    }
+    fn budget_bytes(&self) -> usize {
+        usize::try_from(u64::from(self.budget_mb()) * 1024 * 1024).unwrap_or(usize::MAX)
+    }
+    pub async fn status(&self) -> api_types::UsageIndexStatus {
+        let state = self.state.lock().await;
+        let budget = self.budget_bytes();
+        api_types::UsageIndexStatus {
+            current_size_bytes: if state.watermarks.is_some() {
+                state.charged_bytes() as u64
+            } else {
+                0
+            },
+            budget_bytes: budget as u64,
+            fallback: budget == 0 || state.overflow.is_some() || state.bound(budget),
         }
     }
     pub async fn operations(&self) -> Result<UsageAggregate> {
@@ -1355,25 +1391,29 @@ impl UsageLedgerIndex {
         *state = State {
             observed_header: Some(header),
             overflow: Some(Overflow {
+                budget: self.budget_bytes(),
                 header,
                 rows: header.rows.iter().sum(),
             }),
             ..State::default()
         };
     }
-    fn discard(&self, state: &mut State, header: Watermarks, charge: usize) {
-        tracing::warn!(
-            charge,
-            bound = MAX_INDEX_BYTES,
-            invocations = header.rows[0],
-            events = header.rows[1],
-            estimates = header.rows[2],
-            executions = header.rows[3],
-            "usage index discarded at memory bound"
-        );
+    fn discard(&self, state: &mut State, header: Watermarks, charge: usize, budget: usize) {
+        if budget > 0 {
+            tracing::warn!(
+                charge,
+                bound = budget,
+                invocations = header.rows[0],
+                events = header.rows[1],
+                estimates = header.rows[2],
+                executions = header.rows[3],
+                "usage index discarded at memory bound"
+            );
+        }
         *state = State {
             observed_header: Some(header),
             overflow: Some(Overflow {
+                budget,
                 header,
                 rows: header.rows.iter().sum(),
             }),
@@ -1392,6 +1432,7 @@ impl UsageLedgerIndex {
         observed: Watermarks,
         cold: bool,
         was_overflow: bool,
+        budget: usize,
     ) {
         #[cfg(test)]
         let audit = match &staged {
@@ -1406,8 +1447,8 @@ impl UsageLedgerIndex {
                     remaining -= change.staging_bytes();
                     // Published summaries plus still-private rows share one
                     // budget, including a hash-table capacity growth step.
-                    if state.projected_charge(&change) + remaining > MAX_INDEX_BYTES {
-                        self.discard(state, observed, state.charged_bytes());
+                    if state.projected_charge(&change).saturating_add(remaining) > budget {
+                        self.discard(state, observed, state.charged_bytes(), budget);
                         return;
                     }
                     if let Err(error) = change.apply(state) {
@@ -1450,8 +1491,8 @@ impl UsageLedgerIndex {
             state.audit = audit;
             state.audit.attempt_updates = updates;
         }
-        if state.bound() {
-            self.discard(state, observed, state.charged_bytes());
+        if state.bound(budget) {
+            self.discard(state, observed, state.charged_bytes(), budget);
         } else if cold {
             tracing::info!(
                 charge = state.charged_bytes(),
@@ -1467,6 +1508,7 @@ impl UsageLedgerIndex {
     }
 
     async fn sync(&self, state: &mut State) -> Result<Watermarks> {
+        let budget = self.budget_bytes();
         #[cfg(test)]
         {
             state.audit = Audit {
@@ -1478,18 +1520,31 @@ impl UsageLedgerIndex {
             let mut connection = self.db.pool().acquire().await?;
             Watermarks::read(&mut connection).await?
         };
-        if state.bound() {
-            self.discard(state, header, state.charged_bytes());
+        if budget == 0 {
+            if state.overflow.is_none_or(|overflow| overflow.budget != 0) {
+                self.discard(state, header, state.charged_bytes(), budget);
+            } else {
+                state.observed_header = Some(header);
+            }
             return Ok(header);
         }
-        if state.observed_header == Some(header) {
+        if state.bound(budget) {
+            self.discard(state, header, state.charged_bytes(), budget);
+            return Ok(header);
+        }
+        if state.observed_header == Some(header)
+            && state
+                .overflow
+                .is_none_or(|overflow| overflow.budget == budget)
+        {
             return Ok(header);
         }
         if let Some(overflow) = state.overflow {
             // Counts are trigger-maintained, so this fit probe is O(1). A tiny
             // deletion does not repeat an expensive, known-oversized build.
-            if header.deletion_generation == overflow.header.deletion_generation
-                || header.rows.iter().sum::<i64>() > overflow.rows * 3 / 4
+            if overflow.budget == budget
+                && (header.deletion_generation == overflow.header.deletion_generation
+                    || header.rows.iter().sum::<i64>() > overflow.rows * 3 / 4)
             {
                 state.observed_header = Some(header);
                 return Ok(header);
@@ -1544,8 +1599,8 @@ impl UsageLedgerIndex {
                 tracing::error!("usage row count advanced without its rowid cursor; rebuilding observation index");
             }
             let minimum = Self::minimum_charge(observed);
-            if minimum > MAX_INDEX_BYTES {
-                self.discard(state, observed, minimum);
+            if minimum > budget {
+                self.discard(state, observed, minimum, budget);
                 return Ok(observed);
             }
         }
@@ -1574,7 +1629,7 @@ impl UsageLedgerIndex {
                 audit: Audit::default(),
             }
         };
-        let result = read_delta(&mut staged, &mut tx, old, actual, cold).await;
+        let result = read_delta(&mut staged, &mut tx, old, actual, cold, budget).await;
         if let Err(error) = result {
             if matches!(error, ServiceError::Db(db::DbError::InvalidTransition)) {
                 self.invariant_failure(state, observed, &error);
@@ -1583,14 +1638,14 @@ impl UsageLedgerIndex {
             return Err(error);
         }
         let charge = staged.charged_bytes();
-        if staged.overflowed() {
-            self.discard(state, observed, charge);
+        if staged.overflowed(budget) {
+            self.discard(state, observed, charge, budget);
             return Ok(observed);
         }
         let repairs = if cold {
             Vec::new()
         } else {
-            match citation_repairs(state, &staged, &mut tx, actual).await {
+            match citation_repairs(state, &staged, &mut tx, actual, budget).await {
                 Ok(CitationRepairs::Ready(repairs, reserved)) => {
                     if let Staged::Delta { bytes, .. } = &mut staged {
                         // Completed repair buffers remain alive while changes
@@ -1600,7 +1655,7 @@ impl UsageLedgerIndex {
                     repairs
                 }
                 Ok(CitationRepairs::Overflow(charge)) => {
-                    self.discard(state, observed, charge);
+                    self.discard(state, observed, charge, budget);
                     return Ok(observed);
                 }
                 Err(error) if matches!(error, ServiceError::Db(db::DbError::InvalidTransition)) => {
@@ -1612,7 +1667,16 @@ impl UsageLedgerIndex {
         };
         // Finish every fallible/awaiting read before touching published state.
         tx.commit().await?;
-        self.publish(state, staged, repairs, actual, observed, cold, was_overflow);
+        self.publish(
+            state,
+            staged,
+            repairs,
+            actual,
+            observed,
+            cold,
+            was_overflow,
+            budget,
+        );
         Ok(observed)
     }
 }
@@ -1819,6 +1883,7 @@ async fn citation_repairs(
     staged: &Staged,
     connection: &mut sqlx::SqliteConnection,
     through: Watermarks,
+    budget: usize,
 ) -> Result<CitationRepairs> {
     let Staged::Delta { changes, .. } = staged else {
         return Ok(CitationRepairs::Ready(Vec::new(), 0));
@@ -1912,7 +1977,7 @@ async fn citation_repairs(
                             },
                         ),
                     );
-                    if charge > MAX_INDEX_BYTES {
+                    if charge > budget {
                         return Ok(CitationRepairs::Overflow(charge));
                     }
                     requests.push((
@@ -2096,7 +2161,7 @@ impl Change {
                     + e.source.as_ref().map_or(0, |(key, reference)| {
                         key.capacity()
                             + serde_json::to_string(reference)
-                                .map_or(MAX_INDEX_BYTES, |s| s.len() * 2 + 256)
+                                .map_or(usize::MAX / 2, |s| s.len() * 2 + 256)
                     })
             }
             Self::Execution(row) => ["id", "agent_id", "status", "created_at", "updated_at"]
@@ -2156,16 +2221,16 @@ impl Staged {
             Self::Delta { bytes, .. } => *bytes,
         }
     }
-    fn overflowed(&self) -> bool {
-        self.charged_bytes() > MAX_INDEX_BYTES
+    fn overflowed(&self, budget: usize) -> bool {
+        self.charged_bytes() > budget
     }
-    fn push(&mut self, change: Change) -> Result<()> {
+    fn push(&mut self, change: Change, budget: usize) -> Result<()> {
         match self {
             Self::Cold {
                 state,
                 discard_charge,
             } => {
-                if !state.fits_next(&change) {
+                if !state.fits_next(&change, budget) {
                     *discard_charge = Some(state.projected_charge(&change));
                     return Ok(());
                 }
@@ -2175,7 +2240,7 @@ impl Staged {
                 // A staged row includes strings/SQL row storage; its generous
                 // allowance bounds even a burst of changes before publication.
                 *bytes += change.staging_bytes();
-                if *bytes <= MAX_INDEX_BYTES {
+                if *bytes <= budget {
                     changes.push(change);
                 }
                 Ok(())
@@ -2191,8 +2256,8 @@ impl Staged {
     }
 }
 impl State {
-    fn fits_next(&self, change: &Change) -> bool {
-        self.projected_charge(change) <= MAX_INDEX_BYTES
+    fn fits_next(&self, change: &Change, budget: usize) -> bool {
+        self.projected_charge(change) <= budget
     }
     fn projected_charge(&self, change: &Change) -> usize {
         fn growth<K, V>(len: usize, capacity: usize, add: usize) -> usize {
@@ -2235,6 +2300,7 @@ async fn read_delta(
     old: Watermarks,
     new: Watermarks,
     cold: bool,
+    budget: usize,
 ) -> Result<()> {
     let mut position = old.invocation_rowid;
     while position < new.invocation_rowid {
@@ -2250,8 +2316,8 @@ async fn read_delta(
         }
         for (rowid, row) in rows {
             position = rowid;
-            staged.push(Change::Invocation(Box::new(row)))?;
-            if staged.overflowed() {
+            staged.push(Change::Invocation(Box::new(row)), budget)?;
+            if staged.overflowed(budget) {
                 return Ok(());
             }
         }
@@ -2280,8 +2346,8 @@ async fn read_delta(
             staged.audit().payload_rows += rows.len();
         }
         for row in rows {
-            staged.push(Change::Invocation(Box::new(row)))?;
-            if staged.overflowed() {
+            staged.push(Change::Invocation(Box::new(row)), budget)?;
+            if staged.overflowed(budget) {
                 return Ok(());
             }
         }
@@ -2305,8 +2371,8 @@ async fn read_delta(
             staged.audit().payload_rows += events.len();
         }
         for event in effective_events(connection, events, new.estimate_rowid).await? {
-            staged.push(Change::Event(Box::new(event), 1))?;
-            if staged.overflowed() {
+            staged.push(Change::Event(Box::new(event), 1), budget)?;
+            if staged.overflowed(budget) {
                 return Ok(());
             }
         }
@@ -2340,7 +2406,7 @@ async fn read_delta(
                         ..
                     } => {
                         *staged_bytes = staged_bytes.saturating_add(bytes);
-                        *staged_bytes > MAX_INDEX_BYTES
+                        *staged_bytes > budget
                     }
                     Staged::Cold { .. } => false,
                 };
@@ -2358,14 +2424,14 @@ async fn read_delta(
             staged.audit().payload_rows += 3 * events.len();
         }
         for event in effective_events(connection, events.clone(), old.estimate_rowid).await? {
-            staged.push(Change::Event(Box::new(event), -1))?;
-            if staged.overflowed() {
+            staged.push(Change::Event(Box::new(event), -1), budget)?;
+            if staged.overflowed(budget) {
                 return Ok(());
             }
         }
         for event in effective_events(connection, events, new.estimate_rowid).await? {
-            staged.push(Change::Event(Box::new(event), 1))?;
-            if staged.overflowed() {
+            staged.push(Change::Event(Box::new(event), 1), budget)?;
+            if staged.overflowed(budget) {
                 return Ok(());
             }
         }
@@ -2384,8 +2450,8 @@ async fn read_delta(
         }
         for row in rows {
             position = row.try_get("execution_rowid")?;
-            staged.push(Change::Execution(row))?;
-            if staged.overflowed() {
+            staged.push(Change::Execution(row), budget)?;
+            if staged.overflowed(budget) {
                 return Ok(());
             }
         }
@@ -2411,12 +2477,12 @@ async fn read_delta(
             last_id = row.try_get("id")?;
             if let Some(id) = row.try_get::<Option<String>, _>("present_id")? {
                 let _ = id;
-                staged.push(Change::Execution(row))?;
-                if staged.overflowed() {
+                staged.push(Change::Execution(row), budget)?;
+                if staged.overflowed(budget) {
                     return Ok(());
                 }
             } else {
-                staged.push(Change::RemoveExecution(last_id.clone()))?;
+                staged.push(Change::RemoveExecution(last_id.clone()), budget)?;
             }
         }
     }

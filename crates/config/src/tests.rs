@@ -665,6 +665,7 @@ fn trusted_web_origins_use_the_public_base_url_origin_when_configured() {
 
 fn clear_forge_env() {
     for key in [
+        "FORGE_SERVER_USAGE_INDEX_BUDGET_MB",
         "FORGE_EVENT_CONSUMER_STALL_SECONDS",
         "FORGE_SERVER_BIND",
         "FORGE_SERVER_BUILD_JOBS_PER_RUN",
@@ -812,6 +813,49 @@ fn default_data_dir_tripwire_panics_in_test_binary() {
         Ok("1")
     );
     let _ = default_data_dir();
+}
+
+#[test]
+fn usage_index_budget_obeys_file_env_cli_precedence() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("forge.yaml");
+    let load = |budget| {
+        ForgeConfig::load(
+            Some(&path),
+            ConfigOverrides {
+                server_usage_index_budget_mb: budget,
+                ..test_overrides(dir.path())
+            },
+        )
+    };
+    assert_eq!(load(None).unwrap().server.usage_index_budget_mb, None);
+    assert_eq!(crate::DEFAULT_USAGE_INDEX_BUDGET_MB, 128);
+    fs::write(&path, "server:\n  usage_index_budget_mb: 64\n").unwrap();
+    assert_eq!(load(None).unwrap().server.usage_index_budget_mb, Some(64));
+    env::set_var("FORGE_SERVER_USAGE_INDEX_BUDGET_MB", "256");
+    assert_eq!(load(None).unwrap().server.usage_index_budget_mb, Some(256));
+    assert_eq!(load(Some(0)).unwrap().server.usage_index_budget_mb, Some(0));
+    env::set_var("FORGE_SERVER_USAGE_INDEX_BUDGET_MB", "0");
+    assert_eq!(load(None).unwrap().server.usage_index_budget_mb, Some(0));
+    assert_eq!(
+        load(Some(32)).unwrap().server.usage_index_budget_mb,
+        Some(32)
+    );
+    for invalid in ["-1", "1.5", "4294967296", "no"] {
+        env::set_var("FORGE_SERVER_USAGE_INDEX_BUDGET_MB", invalid);
+        assert!(load(None).is_err(), "{invalid}");
+    }
+    clear_forge_env();
+    for invalid in ["-1", "1.5", "4294967296"] {
+        fs::write(
+            &path,
+            format!("server:\n  usage_index_budget_mb: {invalid}\n"),
+        )
+        .unwrap();
+        assert!(load(None).is_err(), "{invalid}");
+    }
 }
 
 #[test]

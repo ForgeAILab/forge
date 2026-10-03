@@ -306,6 +306,7 @@ impl OperatorStatusService {
             workspace_cleanup,
             retry_pressure,
             usage_summary,
+            usage_index: self.usage_cache.status().await,
             recent_errors,
             event_consumers,
             event_relay,

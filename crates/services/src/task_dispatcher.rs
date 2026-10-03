@@ -85,6 +85,7 @@ impl TaskDispatcher {
                     tokio::select! {
                         _ = tokio::time::sleep(self.check_interval) => {}
                         _ = self.stop_notify.notified() => {}
+                        _ = self.task_service.dispatch_wake.notified() => {}
                     }
                 }
                 tracing::info!("task dispatcher stopped");

@@ -132,9 +132,9 @@ async fn task_interruption_changes_are_atomic_and_bounded() {
         512
     );
     assert_eq!(first["interruption"]["execution_id"], "execution-1");
-    assert_eq!(
-        first["interruption"]["recovery_actions"],
-        serde_json::json!(["resume_session", "retry_execution"])
+    assert!(
+        first["interruption"].get("recovery_actions").is_none(),
+        "interruption evidence must not persist an action allowlist"
     );
     let expected_dedupe = format!("task-interruption-update:{task_id}:{}", updated.version);
     assert_eq!(
@@ -4555,6 +4555,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
             crate::RestoreQueuedRecovery {
                 task_id: task_id.clone(),
                 expected_version,
+                failed_json: None,
                 queued_recovery_id: queued_recovery_id.to_owned(),
                 error_annotation: Some("stale blocker".to_owned()),
                 blocked_json: None,
@@ -10823,7 +10824,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@18".to_owned(),
+                "forge.project.orchestration/v1@19".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -10831,7 +10832,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@18'",
+         WHERE id = 'forge.project.orchestration/v1@19'",
     )
     .fetch_one(db.pool())
     .await
@@ -10845,7 +10846,9 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     assert!(body.contains("OPERATING DOCTRINE (on-demand skill sections)"));
     assert!(body.contains("skill.section"));
     assert!(body.contains("read `project.charter` and `project.current_state`"));
-    assert!(body.contains("cancel a non-terminal Task only through versioned `task.cancel`"));
+    assert!(body.contains(
+        "cancel a non-terminal Task only through the versioned `task.action` cancel offer"
+    ));
     assert!(body.contains("`parent_task_id` establishes one-level coordination"));
     assert!(
         body.contains("Dependency edges only gate execution, never hierarchy or Workspace sharing")
