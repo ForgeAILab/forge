@@ -49,26 +49,23 @@ impl SharedMediaCleanupScheduler {
         &self.media_root
     }
 
-    pub fn spawn(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            if let Err(error) = self.cleanup_now().await {
-                warn!(%error, "shared media startup reconciliation failed");
-            }
-            let mut ticker = interval(TICK_INTERVAL);
-            // Tokio intervals tick immediately. Consume that initial tick so
-            // startup reconciliation is followed by a full interval rather
-            // than performing the same work twice in a row.
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        if let Err(error) = self.cleanup_now().await {
-                            warn!(%error, "shared media cleanup tick failed");
-                        }
-                    }
-                    result = shutdown_rx.changed() => {
-                        if result.is_err() || *shutdown_rx.borrow() {
-                            break;
+    pub fn spawn(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
+        workers.worker("shared-media-cleanup").start(shutdown, || false, move |worker, mut shutdown_rx| {
+            let scheduler = Arc::clone(&self);
+            async move {
+                let _ = worker.tick(scheduler.cleanup_now()).await;
+                let mut ticker = interval(TICK_INTERVAL);
+                // Start the original Burst interval AFTER startup reconciliation.
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => { let _ = worker.tick(scheduler.cleanup_now()).await; }
+                        result = shutdown_rx.changed() => {
+                            if result.is_err() || *shutdown_rx.borrow() { return Ok(()); }
                         }
                     }
                 }

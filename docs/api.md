@@ -3201,6 +3201,12 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `event_consumers[].stalled` | Pending subscribed events and checkpoint/initialization progress are older than `server.event_consumer_stall_seconds` (default 300). Idle, caught-up and newly initialized consumers are never stalled. |
 | `event_consumers[].dead_letter_count` | Total retained quarantines for that worker, without an age cutoff. |
 | `event_consumers[].recent_dead_letters` | Most recent five retained quarantines, without an age cutoff: opaque `id`, `item_key`, optional `event_sequence`, bounded `reason`, and `occurred_at`. Includes per-commitment/inbox failures as well as event quarantines. |
+| `periodic_workers[]` | Source-free supervised workers registered by this process, including server-only maintenance/reporting. Entries remain visible after shutdown; no cursor or dead-letter fields. |
+| `periodic_workers[].worker_name` | Stable worker-health identity. |
+| `periodic_workers[].running` | Live child loop is running; false during restart backoff and after shutdown. Persisted health alone never implies running. |
+| `periodic_workers[].last_tick_at` | Process-local RFC3339 time the most recent tick started; null before its first tick. |
+| `periodic_workers[].last_error`, `.last_error_at` | Nullable bounded error and RFC3339 time from existing worker health. Successful ticks clear tick/runtime causes. Faults also enter `recent_errors` as `periodic_worker` and raise severity to attention. |
+| `periodic_workers[].restart_count` | Persisted total unexpected loop exits/panics/cancellations; normal shutdown does not increment it. |
 | `event_relay` | Separate supervised SSE tail status: `running`, nullable in-memory `position` and live `head`, bounded `last_error` and `last_error_at`. No durable consumer cursor. |
 
 Dead-letter history remains visible after the one-hour degraded-health window.

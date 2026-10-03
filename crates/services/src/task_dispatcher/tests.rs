@@ -8949,3 +8949,89 @@ mod environment_placement;
 
 #[path = "tests/environment_parity.rs"]
 mod environment_parity;
+
+#[tokio::test]
+async fn supervised_dispatcher_recovers_panic_and_timeout_keeps_wakes_and_stops() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Cancelled(Arc<Notify>);
+    impl Drop for Cancelled {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+    let db = Arc::new(sqlite_db().await);
+    let root = TempDir::new().unwrap();
+    let (mut built, _launches) = build_dispatcher(db, root.path()).await;
+    built.check_interval = Duration::from_secs(300);
+    let dispatcher = Arc::new(built);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(Notify::new());
+    let success = Arc::new(Notify::new());
+    let handle = Arc::clone(&dispatcher).start_with_check(Duration::from_millis(250), {
+        let calls = Arc::clone(&calls);
+        let cancelled = Arc::clone(&cancelled);
+        let success = Arc::clone(&success);
+        move |dispatcher| {
+            let calls = Arc::clone(&calls);
+            let cancelled = Arc::clone(&cancelled);
+            let success = Arc::clone(&success);
+            async move {
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => panic!("dispatcher tick panic"),
+                    1 => {
+                        let _cancelled = Cancelled(cancelled);
+                        std::future::pending::<()>().await;
+                    }
+                    _ => {
+                        success.notify_one();
+                    }
+                }
+                dispatcher.check_once().await
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), cancelled.notified())
+        .await
+        .unwrap();
+    // Cancellation occurs before health persistence; wait for the actual report.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = dispatcher.periodic_workers.status().await.unwrap();
+            if status.iter().any(|row| {
+                row.worker_name == "task-dispatcher"
+                    && row
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("tick timed out"))
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    dispatcher.task_service.dispatch_wake.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), success.notified())
+        .await
+        .unwrap();
+    dispatcher.stop_notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), success.notified())
+        .await
+        .unwrap();
+    dispatcher.stop();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap();
+    let status = dispatcher.periodic_workers.status().await.unwrap();
+    let row = status
+        .iter()
+        .find(|row| row.worker_name == "task-dispatcher")
+        .unwrap();
+    assert!(!row.running);
+    assert!(row.last_tick_at.is_some());
+    assert_eq!(row.restart_count, 1);
+    assert!(row.last_error.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+}

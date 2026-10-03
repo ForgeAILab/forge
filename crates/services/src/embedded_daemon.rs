@@ -20,8 +20,7 @@ use std::{
 };
 use tokio::process::Command;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -85,19 +84,31 @@ impl EmbeddedDaemon {
         }
     }
 
-    pub fn start(self: Arc<Self>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            while !self.stop_requested.load(Ordering::SeqCst) {
-                if let Err(error) = self.scan_and_report().await {
-                    tracing::warn!(%error, "embedded daemon report failed");
+    pub fn start(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+    ) -> tokio::task::JoinHandle<()> {
+        let stop = Arc::clone(&self);
+        workers.worker("embedded-daemon").start_stoppable(
+            move || stop.stop_requested.load(Ordering::SeqCst),
+            move |worker| {
+                let monitor = Arc::clone(&self);
+                async move {
+                    worker
+                        .run(
+                            || monitor.stop_requested.load(Ordering::SeqCst),
+                            || monitor.scan_and_report(),
+                            || async {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(monitor.report_interval) => {}
+                                    _ = monitor.stop_notify.notified() => {}
+                                }
+                            },
+                        )
+                        .await
                 }
-
-                tokio::select! {
-                    () = sleep(self.report_interval) => {}
-                    () = self.stop_notify.notified() => {}
-                }
-            }
-        })
+            },
+        )
     }
 
     pub fn stop(&self) {

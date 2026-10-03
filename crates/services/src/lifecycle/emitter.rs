@@ -60,13 +60,43 @@ impl LifecycleEventEmitter {
         self
     }
 
+    pub fn start(
+        self: Arc<Self>,
+        bus: Arc<events::EventBus>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let initial = std::sync::Mutex::new(Some(bus.subscribe()));
+        workers
+            .worker("lifecycle-projection")
+            .with_tick_timeout(std::time::Duration::from_secs(3600))
+            .start(
+                shutdown,
+                || false,
+                move |worker, shutdown| {
+                    let emitter = Arc::clone(&self);
+                    let rx = initial
+                        .lock()
+                        .expect("lifecycle receiver")
+                        .take()
+                        .unwrap_or_else(|| bus.subscribe());
+                    async move {
+                        emitter
+                            .run_until_shutdown(rx, Some(shutdown), Some(worker))
+                            .await;
+                        Ok(())
+                    }
+                },
+            )
+    }
+
     /// Run the emitter until the event bus closes.
     ///
     /// This is retained for callers that own the receiver directly. Runtime
     /// assembly should prefer [`Self::run_with_shutdown`] so the receiver
     /// loop has an explicit lifecycle boundary.
     pub async fn run(&self, rx: broadcast::Receiver<ForgeEvent>) {
-        self.run_until_shutdown(rx, None).await;
+        self.run_until_shutdown(rx, None, None).await;
     }
 
     /// Run the emitter until the event bus closes or shutdown is requested.
@@ -78,13 +108,14 @@ impl LifecycleEventEmitter {
         rx: broadcast::Receiver<ForgeEvent>,
         shutdown: watch::Receiver<bool>,
     ) {
-        self.run_until_shutdown(rx, Some(shutdown)).await;
+        self.run_until_shutdown(rx, Some(shutdown), None).await;
     }
 
     async fn run_until_shutdown(
         &self,
         mut rx: broadcast::Receiver<ForgeEvent>,
         shutdown: Option<watch::Receiver<bool>>,
+        worker: Option<crate::worker_runtime::PeriodicWorker>,
     ) {
         if shutdown.as_ref().is_some_and(|receiver| *receiver.borrow()) {
             return;
@@ -103,7 +134,11 @@ impl LifecycleEventEmitter {
                 result = rx.recv() => {
                     match result {
                         Ok(event) => {
-                            if let Err(error) = self.handle_event(event).await {
+                            if let Some(worker) = &worker {
+                                let _ = worker.tick(async {
+                                    self.handle_event(event).await.map_err(crate::ServiceError::invalid_operation)
+                                }).await;
+                            } else if let Err(error) = self.handle_event(event).await {
                                 warn!(%error, "lifecycle event emitter failed");
                             }
                         }

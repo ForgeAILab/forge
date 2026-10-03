@@ -229,7 +229,8 @@ impl SoloStartup {
             )
             .await?,
         );
-        let daemon_handle = Arc::clone(&daemon).start();
+        let daemon_handle =
+            Arc::clone(&daemon).start(&runtime.operator_status_service.periodic_workers());
         let daemon_record = match wait_for_embedded_daemon(&db).await {
             Ok(record) => record,
             Err(error) => {

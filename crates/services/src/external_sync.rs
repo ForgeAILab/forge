@@ -9,7 +9,6 @@ use std::{
     },
     time::Duration,
 };
-use tokio::task::JoinHandle;
 
 pub struct ExternalSyncService {
     db: Arc<SqliteDb>,
@@ -38,16 +37,37 @@ impl ExternalSyncService {
         }
     }
 
-    pub fn start(self: Arc<Self>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            while !self.is_stopped() {
-                self.tick().await;
-                tokio::select! {
-                    _ = tokio::time::sleep(self.tick_interval) => {}
-                    _ = self.stop_notify.notified() => {}
-                }
-            }
-        })
+    pub fn start(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+    ) -> tokio::task::JoinHandle<()> {
+        let stop = Arc::clone(&self);
+        workers
+            .worker("external-sync")
+            .with_tick_timeout(Duration::from_secs(3600))
+            .start_stoppable(
+                move || stop.is_stopped(),
+                move |worker| {
+                    let monitor = Arc::clone(&self);
+                    async move {
+                        worker
+                            .run(
+                                || monitor.is_stopped(),
+                                || async {
+                                    monitor.tick().await;
+                                    Ok(())
+                                },
+                                || async {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(monitor.tick_interval) => {}
+                                        _ = monitor.stop_notify.notified() => {}
+                                    }
+                                },
+                            )
+                            .await
+                    }
+                },
+            )
     }
 
     pub fn stop(&self) {

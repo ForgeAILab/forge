@@ -1,12 +1,14 @@
 //! Ordered event execution assembled from a durable source and reusable,
 //! source-neutral DB health, poison policy and loop supervision.
 mod event_source;
+mod periodic;
 mod policy;
 mod supervisor;
 
 pub use db::EventSubscription as Subscription;
 pub use db::{FailureState, HealthErrorKind, PoisonDecision, RetryPolicy, WorkItem, WorkerHealth};
 pub use event_source::DurableEventSource;
+pub use periodic::{PeriodicWorker, PeriodicWorkers};
 pub use policy::{consumer_error, consumer_error_kind, Outcome, WorkerError, WorkerErrorKind};
 pub use supervisor::{SupervisorPolicy, WorkerSupervisor};
 

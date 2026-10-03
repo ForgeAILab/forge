@@ -80,9 +80,24 @@ pub struct OperatorStatusResponse {
     pub usage_index: UsageIndexStatus,
     pub recent_errors: Vec<RecentErrorSummary>,
     pub event_consumers: Vec<EventConsumerStatus>,
+    pub periodic_workers: Vec<PeriodicWorkerStatus>,
     pub event_relay: EventRelayStatus,
     pub database: DatabaseStorageStatus,
     pub computed_at: String,
+}
+
+/// Source-free workers use the same health identity, bounded errors and
+/// persisted restart count as durable workers, without a cursor or quarantine.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PeriodicWorkerStatus {
+    pub worker_name: String,
+    pub running: bool,
+    pub last_tick_at: Option<String>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+    #[ts(type = "number")]
+    pub restart_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

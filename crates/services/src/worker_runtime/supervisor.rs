@@ -22,6 +22,8 @@ impl Default for SupervisorPolicy {
 pub struct WorkerSupervisor {
     health: WorkerHealth,
     policy: SupervisorPolicy,
+    stopped: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    shutdown_grace: Option<Duration>,
     #[cfg(test)]
     child_abort: Option<Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>>,
     #[cfg(test)]
@@ -32,11 +34,24 @@ impl WorkerSupervisor {
         Self {
             health,
             policy,
+            stopped: None,
+            shutdown_grace: None,
             #[cfg(test)]
             child_abort: None,
             #[cfg(test)]
             backoff_entered: None,
         }
+    }
+    pub(super) fn with_stop(mut self, stopped: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.stopped = Some(Arc::new(stopped));
+        self
+    }
+    pub(super) fn with_shutdown_grace(mut self, grace: Duration) -> Self {
+        self.shutdown_grace = Some(grace);
+        self
+    }
+    fn is_stopped(&self) -> bool {
+        self.stopped.as_ref().is_some_and(|stopped| stopped())
     }
     #[cfg(test)]
     pub(super) fn with_backoff_signal(mut self, signal: Arc<tokio::sync::Notify>) -> Self {
@@ -60,13 +75,21 @@ impl WorkerSupervisor {
         tokio::spawn(async move {
             let mut backoff = self.policy.initial_backoff;
             loop {
-                if *shutdown.borrow_and_update() {
+                if *shutdown.borrow_and_update() || self.is_stopped() {
                     return;
                 }
                 let started = Instant::now();
                 let child_run = Arc::clone(&run);
                 let child_shutdown = shutdown.clone();
                 let mut child = tokio::spawn(async move { child_run(child_shutdown).await });
+                // Aborting the owning supervisor must never detach its child.
+                struct AbortChild(tokio::task::AbortHandle);
+                impl Drop for AbortChild {
+                    fn drop(&mut self) {
+                        self.0.abort();
+                    }
+                }
+                let _abort_child = AbortChild(child.abort_handle());
                 #[cfg(test)]
                 if let Some(slot) = &self.child_abort {
                     *slot.lock().unwrap() = Some(child.abort_handle());
@@ -75,11 +98,16 @@ impl WorkerSupervisor {
                 // A false watch change stays in this select with the SAME child.
                 let exit = tokio::select! {
                         _ = shutdown_signal(&mut shutdown) => {
+                            if let Some(grace) = self.shutdown_grace {
+                                if tokio::time::timeout(grace, &mut child).await.is_ok() {
+                                    return;
+                                }
+                            }
                             child.abort(); let _ = child.await; return;
                         }
                         result = &mut child => result,
                 };
-                if *shutdown.borrow_and_update() {
+                if *shutdown.borrow_and_update() || self.is_stopped() {
                     return;
                 }
                 if started.elapsed() >= self.policy.healthy_period {

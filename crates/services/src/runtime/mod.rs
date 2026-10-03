@@ -733,11 +733,14 @@ impl ForgeRuntimeBuilder {
             Arc::clone(&embedded_agent_service),
             effective_config.trusted_web_origins(),
         ));
-        let task_dispatcher = Arc::new(TaskDispatcher::new(
-            Arc::clone(&self.db),
-            Arc::clone(&self.event_bus),
-            Arc::clone(&task_service),
-        ));
+        let task_dispatcher = Arc::new(
+            TaskDispatcher::new(
+                Arc::clone(&self.db),
+                Arc::clone(&self.event_bus),
+                Arc::clone(&task_service),
+            )
+            .with_periodic_workers(operator_status_service.periodic_workers()),
+        );
         let heartbeat_monitor = Arc::new(
             HeartbeatMonitor::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
                 .with_max_disconnect(Duration::from_secs(
@@ -948,21 +951,20 @@ impl RuntimeSupervisor {
             self.handles
                 .push((RuntimeWorker::NotificationProjection, handle));
         }
+        let periodic_workers = self.runtime.operator_status_service.periodic_workers();
         self.handles.push((
             RuntimeWorker::OperatorStatusProjection,
-            Arc::clone(&self.runtime.operator_status_emitter).start(shutdown.clone()),
+            Arc::clone(&self.runtime.operator_status_emitter)
+                .start(&periodic_workers, shutdown.clone()),
         ));
 
-        let lifecycle_emitter = Arc::clone(&self.runtime.lifecycle_emitter);
-        let lifecycle_events = self.runtime.event_bus.subscribe();
-        let lifecycle_shutdown = shutdown.clone();
         self.handles.push((
             RuntimeWorker::LifecycleProjection,
-            tokio::spawn(async move {
-                lifecycle_emitter
-                    .run_with_shutdown(lifecycle_events, lifecycle_shutdown)
-                    .await
-            }),
+            Arc::clone(&self.runtime.lifecycle_emitter).start(
+                Arc::clone(&self.runtime.event_bus),
+                &periodic_workers,
+                shutdown.clone(),
+            ),
         ));
         self.handles.push((
             RuntimeWorker::TaskDispatcher,
@@ -970,11 +972,12 @@ impl RuntimeSupervisor {
         ));
         self.handles.push((
             RuntimeWorker::HeartbeatMonitor,
-            Arc::clone(&self.runtime.heartbeat_monitor).start(),
+            Arc::clone(&self.runtime.heartbeat_monitor).start(&periodic_workers),
         ));
         self.handles.push((
             RuntimeWorker::AgentChatTurns,
-            Arc::clone(&self.runtime.agent_chat_turn_worker).start(shutdown.clone()),
+            Arc::clone(&self.runtime.agent_chat_turn_worker)
+                .start(&periodic_workers, shutdown.clone()),
         ));
         self.handles.push((
             RuntimeWorker::Memory,
@@ -998,7 +1001,7 @@ impl RuntimeSupervisor {
         ));
         self.handles.push((
             RuntimeWorker::WorkspaceCleanup,
-            Arc::clone(&self.runtime.cleanup_scheduler).spawn(shutdown.clone()),
+            Arc::clone(&self.runtime.cleanup_scheduler).spawn(&periodic_workers, shutdown.clone()),
         ));
         self.handles.push((
             RuntimeWorker::DomainEventBroadcast,
@@ -1006,7 +1009,7 @@ impl RuntimeSupervisor {
         ));
         self.handles.push((
             RuntimeWorker::StorageMaintenance,
-            Arc::clone(&self.runtime.storage_maintenance).start(shutdown),
+            Arc::clone(&self.runtime.storage_maintenance).start(&periodic_workers, shutdown),
         ));
         self.runtime.operator_status_service.set_runtime_workers(
             &self
@@ -1235,6 +1238,65 @@ mod tests {
         let mut rejected = RuntimeSupervisor::new(second_runtime, RuntimeAssemblyMode::Solo);
         rejected.request_shutdown();
         assert!(rejected.start().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn periodic_runtime_workers_share_operator_registry_and_stop() {
+        let (_data_dir, runtime) = runtime().await;
+        let mut supervisor =
+            RuntimeSupervisor::new(Arc::clone(&runtime), RuntimeAssemblyMode::Solo);
+        supervisor.start().await.unwrap();
+        let expected = [
+            "operator-status-emitter",
+            "lifecycle-projection",
+            "task-dispatcher",
+            "heartbeat-monitor",
+            "agent-chat-turns",
+            "workspace-cleanup",
+            "storage-maintenance",
+            "environment-settings-observer",
+        ];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let rows = runtime
+                    .operator_status_service
+                    .periodic_workers()
+                    .status()
+                    .await
+                    .unwrap();
+                if expected.iter().all(|name| {
+                    rows.iter()
+                        .any(|row| row.worker_name == *name && row.running)
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = runtime
+            .operator_status_service
+            .compute_status()
+            .await
+            .unwrap();
+        assert_eq!(status.periodic_workers.len(), expected.len());
+        supervisor.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime
+                .operator_status_service
+                .periodic_workers()
+                .status()
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.running)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

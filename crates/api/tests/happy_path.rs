@@ -170,7 +170,10 @@ PY"# }
     assert!(worktree_path.exists(), "transition does not delete inline");
 
     let (cleanup_shutdown, cleanup_shutdown_rx) = tokio::sync::watch::channel(false);
-    let cleanup_worker = Arc::clone(&harness.state.cleanup_scheduler).spawn(cleanup_shutdown_rx);
+    let cleanup_worker = Arc::clone(&harness.state.cleanup_scheduler).spawn(
+        &harness.state.operator_status_service.periodic_workers(),
+        cleanup_shutdown_rx,
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         while workspaces_root.path().join(&task_id).exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;

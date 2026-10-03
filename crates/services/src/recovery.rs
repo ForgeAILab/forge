@@ -419,32 +419,35 @@ impl HeartbeatMonitor {
         self
     }
 
-    pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(
+    pub fn start(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+    ) -> tokio::task::JoinHandle<()> {
+        let stop = Arc::clone(&self);
+        workers.worker("heartbeat-monitor").start_stoppable(move || stop.is_stopped(), move |worker| {
+            let monitor = Arc::clone(&self);
             async move {
-                tracing::info!(
-                    check_interval_seconds = self.check_interval.as_secs(),
-                    "heartbeat monitor started"
-                );
-                while !self.is_stopped() {
-                    if let Err(error) = self.check_timeouts().await {
-                        tracing::warn!(%error, "heartbeat monitor check failed");
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(self.check_interval) => {}
-                        _ = self.stop_notify.notified() => {}
-                        _ = async {
-                            match self.daemon_connections.as_ref() {
-                                Some(registry) => registry.reconciliation_notify().notified().await,
-                                None => std::future::pending::<()>().await,
-                            }
-                        } => {}
-                    }
-                }
+                tracing::info!(check_interval_seconds = monitor.check_interval.as_secs(), "heartbeat monitor started");
+                let result = worker.run(
+                    || monitor.is_stopped(),
+                    || monitor.check_timeouts(),
+                    || async {
+                        tokio::select! {
+                            _ = tokio::time::sleep(monitor.check_interval) => {}
+                            _ = monitor.stop_notify.notified() => {}
+                            _ = async {
+                                match monitor.daemon_connections.as_ref() {
+                                    Some(registry) => registry.reconciliation_notify().notified().await,
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {}
+                        }
+                    },
+                ).await;
                 tracing::info!("heartbeat monitor stopped");
-            }
-            .instrument(tracing::info_span!("heartbeat.monitor")),
-        )
+                result
+            }.instrument(tracing::info_span!("heartbeat.monitor"))
+        })
     }
 
     #[tracing::instrument(skip(self))]
@@ -4436,12 +4439,14 @@ pub(crate) mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let monitor = Arc::new(HeartbeatMonitor::with_check_interval(
-            db,
+            Arc::clone(&db),
             event_bus,
             Duration::from_millis(1),
         ));
 
-        let handle = Arc::clone(&monitor).start();
+        let handle = Arc::clone(&monitor).start(&crate::worker_runtime::PeriodicWorkers::new(
+            Arc::clone(&db),
+        ));
         monitor.stop();
         handle.await.expect("monitor task joins");
         assert!(monitor.is_stopped());

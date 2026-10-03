@@ -239,7 +239,10 @@ async fn run() {
             .expect("embedded daemon init"),
         ))
     };
-    let _embedded_handle = embedded_daemon.as_ref().map(|d| Arc::clone(d).start());
+    let periodic_workers = runtime.operator_status_service.periodic_workers();
+    let _embedded_handle = embedded_daemon
+        .as_ref()
+        .map(|d| Arc::clone(d).start(&periodic_workers));
 
     // 5. Build app state and start server
     if !effective_config.server.mcp_enabled {
@@ -279,18 +282,18 @@ async fn run() {
         Arc::clone(&db),
         Arc::clone(&event_bus),
     ));
-    let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start();
+    let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start(&periodic_workers);
     let state =
         api::AppState::from_runtime_arc(Arc::clone(&runtime), effective_config.server.mcp_enabled);
     executors::run_process::install_machine_policy(Arc::clone(&state.run_process_policy));
-    let shared_media_cleanup_handle =
-        Arc::clone(&shared_media_cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
+    let shared_media_cleanup_handle = Arc::clone(&shared_media_cleanup_scheduler)
+        .spawn(&periodic_workers, state.shutdown_signal.subscribe());
     let external_sync = Arc::new(services::ExternalSyncService::new(
         Arc::clone(&state.db),
         Arc::clone(&state.event_bus),
         Arc::clone(&state.task_service),
     ));
-    let _external_sync_handle = Arc::clone(&external_sync).start();
+    let _external_sync_handle = Arc::clone(&external_sync).start(&periodic_workers);
 
     // 6. Install graceful shutdown. The shared supervisor owns the core
     // signal and joins its worker handles; this loop only coordinates the

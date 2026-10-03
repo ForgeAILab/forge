@@ -3713,41 +3713,71 @@ impl AgentChatTurnWorker {
         }
     }
 
-    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let cancellation = CancellationToken::new();
-            let mut active = tokio::task::JoinSet::new();
-            let mut poll = tokio::time::interval(POLL_INTERVAL);
-            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow_and_update() { break; }
-                    }
-                    _ = poll.tick(), if active.len() < MAX_ACTIVE_TURNS => {
-                        match self.claim_available(MAX_ACTIVE_TURNS - active.len()).await {
-                            Ok(jobs) => for job in jobs {
-                                let worker = Arc::clone(&self);
-                                let token = cancellation.child_token();
-                                active.spawn(async move { worker.process_claimed(job, token).await; });
-                            },
-                            Err(error) => tracing::warn!(error = %error, "Agent Chat turn polling failed"),
+    pub fn start(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
+        self.start_with_claim(
+            workers,
+            shutdown,
+            Duration::from_secs(300),
+            |worker, capacity| async move { worker.claim_available(capacity).await },
+        )
+    }
+
+    fn start_with_claim<F, Fut>(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+        timeout: Duration,
+        claim: F,
+    ) -> JoinHandle<()>
+    where
+        F: Fn(Arc<Self>, usize) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Vec<AgentChatTurnJob>>> + Send + 'static,
+    {
+        let claim = Arc::new(claim);
+        workers.worker("agent-chat-turns").with_tick_timeout(timeout)
+            .start(shutdown, || false, move |periodic, mut shutdown| {
+                let self_worker = Arc::clone(&self);
+                let claim = Arc::clone(&claim);
+                async move {
+                    let cancellation = CancellationToken::new();
+                    let mut active = tokio::task::JoinSet::new();
+                    let mut poll = tokio::time::interval(POLL_INTERVAL);
+                    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow_and_update() { break; }
+                            }
+                            _ = poll.tick(), if active.len() < MAX_ACTIVE_TURNS => {
+                                match periodic.tick(claim(Arc::clone(&self_worker), MAX_ACTIVE_TURNS - active.len())).await {
+                                    Ok(jobs) => for job in jobs {
+                                        let worker = Arc::clone(&self_worker);
+                                        let token = cancellation.child_token();
+                                        active.spawn(async move { worker.process_claimed(job, token).await; });
+                                    },
+                                    Err(error) => tracing::warn!(error = %error, "Agent Chat turn polling failed"),
+                                }
+                            }
+                            Some(result) = active.join_next(), if !active.is_empty() => {
+                                if let Err(error) = result {
+                                    tracing::warn!(error = %error, "Agent Chat worker task stopped unexpectedly");
+                                }
+                            }
                         }
                     }
-                    Some(result) = active.join_next(), if !active.is_empty() => {
+                    cancellation.cancel();
+                    while let Some(result) = active.join_next().await {
                         if let Err(error) = result {
-                            tracing::warn!(error = %error, "Agent Chat worker task stopped unexpectedly");
+                            tracing::warn!(error = %error, "Agent Chat worker task stopped during shutdown");
                         }
                     }
+                    Ok(())
                 }
-            }
-            cancellation.cancel();
-            while let Some(result) = active.join_next().await {
-                if let Err(error) = result {
-                    tracing::warn!(error = %error, "Agent Chat worker task stopped during shutdown");
-                }
-            }
-        })
+            })
     }
 
     pub async fn run_once(&self) -> Result<usize> {
@@ -6195,6 +6225,129 @@ mod tests {
             .expect("in-memory pool");
         db::run_migrations(&pool).await.expect("migrations apply");
         Arc::new(SqliteDb::new(pool))
+    }
+
+    #[tokio::test]
+    async fn supervised_chat_poller_restarts_panic_cancels_timeout_and_stops() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct Cancelled(Arc<AtomicBool>);
+        impl Drop for Cancelled {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let db = worker_test_db().await;
+        let workers = crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db));
+        let worker = Arc::new(AgentChatTurnWorker::with_runner(
+            db,
+            Arc::new(AuthorityOnlyRunner),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = watch::channel(false);
+        let handle = worker.start_with_claim(&workers, rx, Duration::from_millis(100), {
+            let calls = Arc::clone(&calls);
+            let cancelled = Arc::clone(&cancelled);
+            let entered = Arc::clone(&entered);
+            let resume = Arc::clone(&resume);
+            move |_, capacity| {
+                let calls = Arc::clone(&calls);
+                let cancelled = Arc::clone(&cancelled);
+                let entered = Arc::clone(&entered);
+                let resume = Arc::clone(&resume);
+                async move {
+                    assert_eq!(capacity, MAX_ACTIVE_TURNS);
+                    match calls.fetch_add(1, Ordering::SeqCst) {
+                        0 => panic!("chat admission tick panic"),
+                        1 => {
+                            let _cancelled = Cancelled(cancelled);
+                            std::future::pending::<()>().await;
+                        }
+                        _ => {
+                            entered.notify_one();
+                            resume.notified().await;
+                        }
+                    }
+                    Ok(Vec::new())
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert!(cancelled.load(Ordering::SeqCst));
+        let status = workers.status().await.unwrap().remove(0);
+        assert!(status.running);
+        assert_eq!(status.restart_count, 1);
+        assert!(status.last_error.unwrap().contains("tick timed out"));
+        // Shutdown during admission completes that poll before the unchanged drain.
+        tx.send(true).unwrap();
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!workers.status().await.unwrap()[0].running);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn supervised_chat_shutdown_drains_and_refunds_active_claim() {
+        let db = worker_test_db().await;
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES ('shutdown-owner', 'shutdown@example.test', 'test', ?, ?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let chat = db::AgentChatRepo::get_main_chat(&*db, "shutdown-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("INSERT INTO agent_chat_message (id, chat_id, sequence, author_type, author_id, content, status, correlation_id, created_at) VALUES ('shutdown-message', ?, 1, 'user', 'shutdown-owner', 'hello', 'complete', 'shutdown-correlation', ?)")
+            .bind(&chat.id).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO agent_chat_turn_job (id, chat_id, triggering_message_id, canonical_scope_type, canonical_scope_id, dedupe_key, correlation_id, created_at, updated_at) VALUES ('shutdown-turn', ?, 'shutdown-message', 'agent_chat', ?, 'shutdown-key', 'shutdown-correlation', ?, ?)")
+            .bind(&chat.id).bind(&chat.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let workers = crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db));
+        let worker = Arc::new(AgentChatTurnWorker::with_runner(
+            Arc::clone(&db),
+            Arc::new(AuthorityOnlyRunner),
+        ));
+        let claimed = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = watch::channel(false);
+        let handle = worker.start_with_claim(&workers, rx, Duration::from_secs(5), {
+            let claimed = Arc::clone(&claimed);
+            let resume = Arc::clone(&resume);
+            move |worker, capacity| {
+                let claimed = Arc::clone(&claimed);
+                let resume = Arc::clone(&resume);
+                async move {
+                    let jobs = worker.claim_available(capacity).await?;
+                    assert_eq!(jobs.len(), 1);
+                    claimed.notify_one();
+                    resume.notified().await;
+                    Ok(jobs)
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), claimed.notified())
+            .await
+            .unwrap();
+        tx.send(true).unwrap();
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let job = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, "shutdown-turn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, db::AgentChatTurnState::Queued);
+        assert_eq!(job.attempt_count, 0);
+        assert_eq!(job.invocation_count, 1);
+        assert!(job.lease_owner.is_none());
+        assert!(!workers.status().await.unwrap()[0].running);
     }
 
     #[test]
