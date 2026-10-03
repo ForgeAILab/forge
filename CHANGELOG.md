@@ -511,6 +511,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Dropdown menus near the bottom of the window open upwards instead of
+  off-screen, and their height is capped to the space available.
 - An event that a consumer can never apply no longer blocks every later event
   for that consumer. Previously a Task outcome for a commitment that had been
   cancelled was retried forever, and every later outcome for every Agent
