@@ -281,6 +281,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Runs no longer compete with the server for every core. Each process Forge
+  starts for a run (CLI agents and everything they launch, native tool
+  commands, review checks, Project hooks, environment checks and setup, on
+  the server and on daemons) gets `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`,
+  `MAKEFLAGS=-j<k>`, `CMAKE_BUILD_PARALLEL_LEVEL` and `GOFLAGS=-p=<k>`, where
+  `k` is the machine's cores divided by its run cap (at least 1), and starts
+  with a Unix niceness increment of 10 so the server, web UI and daemon stay
+  responsive. A value set in the Project's environment, an Agent profile's
+  environment or the server's own environment wins over the budget. Windows
+  priority is unchanged.
+
 - The web app renders every Task action from server offers: forms show
   required reasons and guidance, explain fixed parameters and subtask
   cancellation, and refresh after a conflict. Row and bulk actions load
@@ -546,6 +557,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     workspace.
   - Project settings, Environment tab: per-check scope and the provisioning
     policy. `forge-ctl project env-check --scope workspace|machine`.
+- Build budget and run priority settings on every machine:
+  `build_jobs_per_run` (unset = automatic, `0` = Forge sets none of the
+  variables, `n` = exactly `n`) and `run_nice` (default 10, `0` = off). Server:
+  `server.build_jobs_per_run` / `server.run_nice` in the config file,
+  `FORGE_SERVER_BUILD_JOBS_PER_RUN` / `FORGE_SERVER_RUN_NICE`,
+  `forge --build-jobs-per-run N` / `--run-nice N`, the Settings API and the
+  Forge Settings page (applies to the next run without a restart). Daemons:
+  `build_jobs_per_run` / `run_nice` in `daemon.yaml` or the same flags on
+  `forge-daemon` and `forge-ctl daemon link|start`. Forge Settings and
+  Operations show the machine's cores and the effective values.
 - Machine run caps.
   - Server host: `server.max_concurrent_runs` in the config file,
     `FORGE_SERVER_MAX_CONCURRENT_RUNS`, `forge --max-concurrent-runs N`, the
