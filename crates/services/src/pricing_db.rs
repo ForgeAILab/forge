@@ -2514,7 +2514,7 @@ async fn create_unmatched_revision(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pricing::{
         parse_models_dev_catalog, preview_retrospective_estimates, CatalogRefreshOutcome,
@@ -2724,7 +2724,7 @@ mod tests {
         }
     }
 
-    async fn subject_fixture(db: &db::SqliteDb) -> (String, String, String) {
+    pub(crate) async fn subject_fixture(db: &db::SqliteDb) -> (String, String, String) {
         let now = db_time(at(100));
         UserRepo::create_user(
             db,
@@ -3402,6 +3402,10 @@ mod tests {
                 .expect("run count after rejected preview"),
             0
         );
+        let index = crate::usage_projection::UsageLedgerIndex::new(db.clone());
+        let before_agent = index.agent(FIXTURE_AGENT_ID).await.unwrap();
+        let _ = index.operations().await.unwrap();
+        assert!(before_agent.cost.estimated.is_none());
         let committed = repository
             .commit_retrospective_preview(preview.clone(), request.clone(), at(111))
             .await
@@ -3469,6 +3473,19 @@ mod tests {
         let operations = crate::usage_projection::usage_aggregate_for_operations(&db)
             .await
             .expect("operations aggregate");
+        assert_eq!(
+            serde_json::to_value(index.operations().await.unwrap()).unwrap(),
+            serde_json::to_value(&operations).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(index.agent(FIXTURE_AGENT_ID).await.unwrap()).unwrap(),
+            serde_json::to_value(
+                crate::usage_projection::usage_aggregate_for_agent(&db, FIXTURE_AGENT_ID)
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+        );
         assert!(operations.cost.estimated.is_some());
         assert!(operations.cost.provider_reported.is_some());
         assert!(operations
@@ -3508,57 +3525,6 @@ mod tests {
             .expect("revisions remain immutable")
             .len(),
             1
-        );
-    }
-
-    #[tokio::test]
-    async fn agent_usage_cache_reuses_until_the_ledger_moves() {
-        let db = database().await;
-        let _ = subject_fixture(&db).await;
-        let project_id = project_fixture(&db).await;
-        usage_event_fixture(
-            &db,
-            &project_id,
-            "cache-first",
-            Some(EventTokenCounts::new(1, 0, 0, 0)),
-            None,
-        )
-        .await;
-        let cache = crate::usage_projection::AgentUsageAggregateCache::default();
-        let first = cache.get(&db, FIXTURE_AGENT_ID).await.expect("aggregate");
-        assert_eq!(first.tokens.input_tokens, 1);
-
-        // An unchanged ledger is served from the cache, not recomputed.
-        let mut sentinel = first.clone();
-        sentinel.tokens.input_tokens = 999;
-        cache.replace_cached_aggregate(FIXTURE_AGENT_ID, sentinel);
-        assert_eq!(
-            cache
-                .get(&db, FIXTURE_AGENT_ID)
-                .await
-                .expect("hit")
-                .tokens
-                .input_tokens,
-            999
-        );
-
-        // A new event moves the fingerprint and forces a recompute.
-        usage_event_fixture(
-            &db,
-            &project_id,
-            "cache-second",
-            Some(EventTokenCounts::new(2, 0, 0, 0)),
-            None,
-        )
-        .await;
-        assert_eq!(
-            cache
-                .get(&db, FIXTURE_AGENT_ID)
-                .await
-                .expect("miss")
-                .tokens
-                .input_tokens,
-            3
         );
     }
 }

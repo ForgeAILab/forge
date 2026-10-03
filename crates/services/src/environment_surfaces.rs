@@ -345,7 +345,11 @@ pub async fn runnable_on_for_agents(
     for agent in agents {
         // Same installed/authenticated/enabled inputs as server_executor_facts;
         // avoid another SQL health read for every native Agent on the page.
-        let available = if agent.backend_kind == "native" {
+        let available = if agent.paused {
+            // Paused identities cannot contribute either host or remote
+            // machines. CLI probes can spawn processes; their result is unused.
+            false
+        } else if agent.backend_kind == "native" {
             healthy.contains(&agent.profile_id)
         } else {
             *availability
@@ -695,6 +699,87 @@ pub async fn task_placement_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct CountedAvailability(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl executors::CodingExecutorAdapter for CountedAvailability {
+        fn kind(&self) -> executors::ExecutorKind {
+            executors::ExecutorKind::Shell
+        }
+        fn check_availability(&self) -> executors::AvailabilityInfo {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            executors::AvailabilityInfo {
+                status: executors::AvailabilityStatus::Authenticated,
+                authenticated_at: None,
+                config_path: None,
+            }
+        }
+        async fn discover_options(
+            &self,
+            _: executors::DiscoverContext,
+        ) -> std::result::Result<executors::DiscoveredOptions, executors::ExecutorError> {
+            unreachable!()
+        }
+        async fn execute(
+            &self,
+            _: executors::ExecutionContext,
+        ) -> std::result::Result<executors::ExecutionResult, executors::ExecutorError> {
+            unreachable!()
+        }
+        async fn cancel(&self, _: &str) -> std::result::Result<(), executors::ExecutorError> {
+            unreachable!()
+        }
+    }
+    #[tokio::test]
+    async fn paused_agent_pages_skip_unused_cli_probes() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = SqliteDb::new(pool);
+        let fixture_registry = cli_adapters::test_support::test_registry();
+        let mut agent = crate::ensure_default_agents(&db, &fixture_registry)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|agent| agent.executor_type == "shell")
+            .unwrap();
+        agent.paused = true;
+        agent.daemon_id = None;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mut registry = executors::AdapterRegistry::new();
+        registry.register(Box::new(CountedAvailability(probes.clone())));
+        let connections = crate::daemon_transport::DaemonConnectionRegistry::without_handlers();
+        let mut page = (0..20)
+            .map(|n| {
+                let mut copy = agent.clone();
+                copy.id = format!("paused-{n}");
+                copy
+            })
+            .collect::<Vec<_>>();
+        for admin in [true, false] {
+            let result = runnable_on_for_agents(&db, &page, &registry, &connections, admin)
+                .await
+                .unwrap();
+            assert!(result.values().all(|value| value.count == 0));
+            assert_eq!(
+                probes.load(Ordering::Relaxed),
+                0,
+                "paused page cannot need CLI installation/auth probes"
+            );
+        }
+        page[19].paused = false;
+        let result = runnable_on_for_agents(&db, &page, &registry, &connections, true)
+            .await
+            .unwrap();
+        assert_eq!(result["paused-19"].count, 1);
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "an active Agent still probes once per executor family"
+        );
+    }
     #[tokio::test]
     async fn runnable_batch_preserves_native_health_policy_pins_and_visibility() {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();

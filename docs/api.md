@@ -175,6 +175,9 @@ They do not guarantee repository/environment fit or free capacity.
 `daemon_id` remains admin-only (null for other users). Only admins may set or
 clear the pin; PATCH with `{"version": <version>, "daemon_id": null}` clears it.
 
+Agent daemon pins (`daemon_id`) are admin-only in both the account Agent list
+and `GET /api/v1/projects/{id}/agents`; non-admin responses return `null`.
+
 Agent responses report two different counts, and only one of them is a capacity
 ratio:
 
