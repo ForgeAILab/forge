@@ -2339,8 +2339,9 @@ Agent Chat keeps its existing 250 ms capacity-gated poller and active-turn
 JoinSet. Only admission polling has a warning budget; individual turn execution
 is outside it. The set is outside the poller's unwind boundary: a panic cancels
 and drains the old turns before it is rethrown to the supervisor for restart.
-Panic cleanup uses the same 10-second grace as shutdown, then aborts and joins
-non-cooperative turns before restarting. Cooperative shutdown uses the same
+Panic cleanup waits 15 seconds (the CLI executor's 10-second SIGTERM grace
+before SIGKILL, plus 5), so a CLI turn's process group is killed before any
+abort, then aborts and joins non-cooperative turns before restarting. Cooperative shutdown uses the same
 cancel-and-drain path under the existing runtime shutdown deadline. Turn-lifetime drop guards cancel both the provider
 signal and lease-renewal token on every exit, including panic and hard abort,
 so an unfinished lease can expire rather than being renewed indefinitely.

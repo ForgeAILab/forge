@@ -75,6 +75,12 @@ use crate::{
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
+/// A poller panic drains in-flight turns before restarting. A CLI turn's
+/// cancel waits up to the executor's SIGTERM grace before it SIGKILLs the
+/// process group, so the drain must outlast that wait or an abort could land
+/// first and leave the CLI process running.
+const PANIC_DRAIN_TIMEOUT: Duration =
+    Duration::from_secs(executors::shell::DEFAULT_CANCEL_GRACE_PERIOD.as_secs() + 5);
 const TURN_LEASE_SECONDS: i64 = 120;
 const MAX_ACTIVE_TURNS: usize = 32;
 const MAX_HISTORY: i64 = 100;
@@ -3670,6 +3676,7 @@ pub struct AgentChatTurnWorker {
     chat_service: Arc<AgentChatService<SqliteDb>>,
     runner: Arc<dyn AgentChatTurnRunner>,
     lease_owner: String,
+    lease_renew_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -3710,7 +3717,14 @@ impl AgentChatTurnWorker {
             db,
             runner,
             lease_owner: format!("agent-chat-worker:{}", db::new_uuid_v4()),
+            lease_renew_interval: LEASE_RENEW_INTERVAL,
         }
+    }
+
+    #[cfg(test)]
+    fn with_lease_renew_interval(mut self, interval: Duration) -> Self {
+        self.lease_renew_interval = interval;
+        self
     }
 
     pub fn start(
@@ -3792,17 +3806,17 @@ impl AgentChatTurnWorker {
                             }
                         }
                     };
-                    // Shutdown is bounded by the owning supervisor. Give panic
-                    // cleanup the same grace: a non-cooperative turn must not
+                    // Shutdown is bounded by the owning supervisor. Panic cleanup is
+                    // bounded by PANIC_DRAIN_TIMEOUT: a non-cooperative turn must not
                     // prevent restart while renewing its lease indefinitely.
                     let drained = if exit.is_err() {
-                        tokio::time::timeout(Duration::from_secs(10), drain).await.is_ok()
+                        tokio::time::timeout(PANIC_DRAIN_TIMEOUT, drain).await.is_ok()
                     } else {
                         drain.await;
                         true
                     };
                     if !drained {
-                        tracing::warn!(worker = periodic.name(), "Agent Chat turn drain timed out after 10s");
+                        tracing::warn!(worker = periodic.name(), timeout_secs = PANIC_DRAIN_TIMEOUT.as_secs(), "Agent Chat turn drain timed out");
                         active.abort_all();
                         while let Some(result) = active.join_next().await {
                             if let Err(error) = result {
@@ -4963,8 +4977,9 @@ impl AgentChatTurnWorker {
     ) -> JoinHandle<()> {
         let db = Arc::clone(&self.db);
         let owner = self.lease_owner.clone();
+        let renew_every = self.lease_renew_interval;
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(LEASE_RENEW_INTERVAL);
+            let mut interval = tokio::time::interval(renew_every);
             interval.tick().await;
             loop {
                 tokio::select! {
@@ -6428,21 +6443,26 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_turn_cancels_driver_and_stops_renewing_its_lease() {
-        struct ClockAnchor(JoinHandle<()>);
-        impl Drop for ClockAnchor {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
+        const RENEW: Duration = Duration::from_millis(50);
+        async fn lease_version(db: &SqliteDb) -> i64 {
+            db::AgentChatTurnJobRepo::get_agent_chat_turn_job(db, "aborted-turn")
+                .await
+                .unwrap()
+                .unwrap()
+                .version
         }
         let db = worker_test_db().await;
         let chat = seed_restart_chat(&db).await;
         seed_restart_job(&db, &chat, "aborted-turn").await;
         let (entered, mut turns) = tokio::sync::mpsc::unbounded_channel();
         let (cancelled, _cancellations) = tokio::sync::mpsc::unbounded_channel();
-        let worker = Arc::new(AgentChatTurnWorker::with_runner(
-            Arc::clone(&db),
-            Arc::new(BlockingTurnRunner { entered, cancelled }),
-        ));
+        let worker = Arc::new(
+            AgentChatTurnWorker::with_runner(
+                Arc::clone(&db),
+                Arc::new(BlockingTurnRunner { entered, cancelled }),
+            )
+            .with_lease_renew_interval(RENEW),
+        );
         let job = worker.claim_one().await.unwrap().unwrap();
         let handle = tokio::spawn(async move {
             worker.process_claimed(job, CancellationToken::new()).await;
@@ -6451,34 +6471,31 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // The renewer is live while the turn runs, so the check below can
+        // only pass because the abort stopped it.
+        let claimed = lease_version(&db).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lease_version(&db).await == claimed {
+                tokio::time::sleep(RENEW).await;
+            }
+        })
+        .await
+        .expect("the lease is renewed while the turn runs");
         handle.abort();
         assert!(handle.await.unwrap_err().is_cancelled());
         assert!(
             token.is_cancelled(),
             "the provider driver also follows turn lifetime"
         );
-        let before = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, "aborted-turn")
-            .await
-            .unwrap()
-            .unwrap();
-        // Prevent Tokio's paused clock auto-advance while real SQLite I/O runs.
-        let _clock_anchor = ClockAnchor(tokio::spawn(async {
-            loop {
-                tokio::task::yield_now().await;
-            }
-        }));
-        tokio::time::pause();
-        tokio::time::advance(LEASE_RENEW_INTERVAL * 2).await;
-        let after = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, "aborted-turn")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(after.leased_until, before.leased_until);
+        // Let a renewal that was already in flight at the abort finish.
+        tokio::time::sleep(RENEW * 3).await;
+        let settled = lease_version(&db).await;
+        tokio::time::sleep(RENEW * 10).await;
         assert_eq!(
-            after.version, before.version,
+            lease_version(&db).await,
+            settled,
             "no leaked renewal after turn abort"
         );
-        tokio::time::resume();
         sqlx::query("UPDATE agent_chat_turn_job SET leased_until = '2000-01-01T00:00:00Z' WHERE id = 'aborted-turn'").execute(db.pool()).await.unwrap();
         let recovering =
             AgentChatTurnWorker::with_runner(Arc::clone(&db), Arc::new(AuthorityOnlyRunner));
