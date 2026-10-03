@@ -10823,11 +10823,11 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
         vec![
             (
                 "forge.main.project-discovery/v2".to_owned(),
-                "forge.main.project-discovery/v2@6".to_owned(),
+                "forge.main.project-discovery/v2@7".to_owned(),
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@19".to_owned(),
+                "forge.project.orchestration/v1@20".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -10835,7 +10835,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@19'",
+         WHERE id = 'forge.project.orchestration/v1@20'",
     )
     .fetch_one(db.pool())
     .await
@@ -10856,8 +10856,8 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     assert!(
         body.contains("Dependency edges only gate execution, never hierarchy or Workspace sharing")
     );
-    assert!(body.contains("Name owned repository-relative paths in every Task description"));
-    assert!(body.contains("shared-file edits with dependencies"));
+    assert!(body.contains("name owned modules/files in each Task"));
+    assert!(body.contains("give one Task ownership of shared edits and make others depend on it"));
     assert!(!body.contains("Evidence is mandatory proof, not optional decoration"));
     assert!(!body.contains("MILESTONES AND EVIDENCE"));
     assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);

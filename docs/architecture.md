@@ -451,7 +451,7 @@ Charter amendment rotates current binding/approval pointers while retaining the
 same receipt. Already admitted retrying turns continue to use their frozen
 binding/Profile/skill provenance.
 
-The Project operating skill (`forge.project.orchestration/v1@18`) is a
+The Project operating skill (`forge.project.orchestration/v1@20`) is a
 doctrine index, not a doctrine dump: the resident prompt carries the mission,
 authority boundaries, standing invariants, and autonomous-drive rules, plus an
 index of server-owned doctrine sections (`research`, `documents`,
@@ -463,23 +463,41 @@ identity and digests, and the Agent reads the full rendered text with the
 Project Chat turn's fixed prompt cost small enough that LCM compaction has a
 real conversation budget to work with on small provider profiles.
 
-Merge-friendly doctrine is delivered where layout and scope are decided: Main
-Genesis (`forge.main.project-discovery/v2@6`) calls for small modules with clear
-ownership, per-feature files, and thin mechanical composition instead of shared
-hub files. The account baseline (`forge.main.baseline/v1@4`) carries that advice
-into discovery. Project standing invariants require owned repository-relative
-paths in Task descriptions, disjoint files for parallel Tasks, and dependency
-ordering for shared-file edits. On-demand document and Task sections apply this
-to architecture and splitting; planning prompts carry the same constraints in
-both native and outbox delivery. Scaffolded `AGENTS.md` tells Task Workers to
-stay in owned paths, add feature files, and report scope discoveries.
+Merge-friendly doctrine is delivered where layout and scope are decided. The
+shared compile-time rule recommends small modules with clear ownership and
+disjoint files for parallel Tasks; avoids central registries, route tables,
+export/barrel lists and large shared libraries; and favors per-feature files
+that are discovered or registered without editing a shared list. If a shared
+edit is unavoidable, one Task owns it and other Tasks depend on that Task.
+Work splits follow module boundaries, with owned modules/files named in each
+Task. Main applies this to Charter architecture constraints during Genesis
+(`forge.main.project-discovery/v2@7`). Its account baseline remains at @4,
+with no additional resident layout rule. Project
+standing invariants apply it to `task.propose`
+(`forge.project.orchestration/v1@20`); the on-demand document and Task sections
+apply it to architecture/execution plans and adaptive splitting. Planner runs
+receive it once in their system prompt for both native and outbox delivery;
+plan-artifact delivery instructions still require owned repository-relative
+paths and scope reporting. Scaffolded `AGENTS.md` carries it for implementation
+and follow-up proposals, retaining the worker's existing scope discipline.
+Native Task proposal/adaptive payload guidance carries one short reminder when
+either operation is admitted. MCP Task creation and sub-task descriptors share
+that same reminder: split along module boundaries, name each Task's owned files,
+and avoid Tasks that all edit one shared file. The full doctrine stays at the
+layout/planning surfaces above. Transport-only plan
+artifact instructions and argument field help retain their existing ownership
+requirements without another copy of the rule.
 
-Migration `V202610010500__merge_friendly_doctrine.sql` inserts new digest-pinned
-Main/Project revisions and advances current skill pointers and Project bindings.
-It retains previous revision rows, session prompts, and frozen turn admissions.
-The compiled baseline retains exact bodies for revisions @1–@3; unknown
-revisions still fail closed. These instructions guide agents; they do not
-change merge, rebase, review, or enforce file ownership as a capability grant.
+Migration `V202610031431__merge_friendly_layout_guidance.sql` inserts new
+digest-pinned Main/Project revisions, advances current skill pointers, and
+moves Project bindings from @19 to @20. Previous revision rows, Genesis session
+prompts, and frozen turn admissions stay unchanged. The compiled baseline
+stays at @4 and retains exact bodies/digests for @1–@3; unknown revisions fail
+closed. On-demand
+doctrine, planner constants and scaffold exports have no persisted body
+revision mechanism; their text follows the server build. These instructions
+guide agents; they do not change merge/rebase/review behavior or enforce file
+ownership as a capability grant.
 
 Migration `V202610010550__chat_session_denied_operations.sql` derives Project
 revision @18 by replacing the attention-wake rule in the immutable @17 body.
@@ -1031,7 +1049,7 @@ Attention or wake an Agent.
 
 Every Main Agent Chat turn carries a server-owned operating instruction.
 Outside an active Product Genesis session, the account baseline skill
-`forge.main.baseline/v1` Revision `@2` is in force: it tells the model it is
+`forge.main.baseline/v1` Revision `@4` is in force: it tells the model it is
 Forge's Main Agent, hands it the bounded portfolio projection, and restates the
 no-Task/no-repository/no-credential boundary. It also routes clear
 natural-language new-Project intent through the Main-only typed
@@ -1040,8 +1058,8 @@ new-versus-existing Project intent, and keeps non-Project or existing-Project
 requests in baseline scope. The browser does not own semantic classification.
 The baseline is compiled into the server (each revision's content digest is
 pinned by a test, not a seeded row) and the exact revision/digest is frozen in
-the turn's context manifest. Historical `@1` turns remain reproducible from
-their frozen body and digest.
+the turn's context manifest. Historical `@1`–`@3` turns remain reproducible from
+their frozen bodies and digests.
 
 `genesis.start` is implemented by one receipt-backed command shared with the
 REST start route. Account, Main Chat, and native source-turn authority are
