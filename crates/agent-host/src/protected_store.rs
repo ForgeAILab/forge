@@ -217,12 +217,13 @@ impl SqliteProtectedRuntimeStore {
 
     fn snapshot_digest(&self, snapshot: &SessionSnapshot) -> Result<String, RuntimeError> {
         // Runtime snapshots stamp the clock on every call, even without a state change.
+        // Diagnostic manifests are a bounded recent window and are omitted from
+        // new protected checkpoints; neither belongs to canonical state identity.
         let bytes = serde_json::to_vec(&(
             &snapshot.id,
             &snapshot.history,
             &snapshot.usage,
             &snapshot.identity,
-            &snapshot.manifests,
             &snapshot.extension_state,
         ))?;
         let mut mac = self.snapshot_mac.clone();
@@ -2066,7 +2067,6 @@ mod tests {
             &snapshot.history,
             &snapshot.usage,
             &snapshot.identity,
-            &snapshot.manifests,
             &snapshot.extension_state,
         ))
         .unwrap();
@@ -2099,6 +2099,94 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, store.snapshot_digest(&checkpoint.snapshot).unwrap());
+    }
+
+    #[tokio::test]
+    async fn session_state_manifest_window_does_not_change_checkpoint_digest() {
+        use agent_runtime::{
+            core::{
+                ids::TurnId,
+                manifest::{CapabilityResolution, ModelResolution, RunManifest},
+                provider::ModelId,
+                store::{TurnManifest, VersionedSessionState},
+            },
+            registry::{Fingerprint, RegistryRevision},
+            runtime::MANIFEST_BOUNDARY_NAMESPACE,
+        };
+        let (store, db, mut snapshot) = session_store().await;
+        let fingerprint = Fingerprint::of(b"manifest-fixture");
+        let manifest = RunManifest::new(
+            fingerprint.clone(),
+            fingerprint.clone(),
+            ModelResolution::new(
+                "fixture",
+                ModelId::new("fixture-model"),
+                fingerprint.clone(),
+                Default::default(),
+            ),
+            CapabilityResolution::new(RegistryRevision::new("fixture-resolver")),
+            fingerprint.clone(),
+            fingerprint,
+        );
+        snapshot.manifests.push(TurnManifest::new(
+            TurnId::new("earlier-turn"),
+            manifest.clone(),
+        ));
+        snapshot.extension_state.insert(
+            MANIFEST_BOUNDARY_NAMESPACE.to_owned(),
+            VersionedSessionState::new(
+                RegistryRevision::new("manifest-boundary-1"),
+                serde_json::json!({"schema_version": 1, "planned_steps": 1}),
+            ),
+        );
+        // The ordinary snapshot retains diagnostics and the protected boundary.
+        SessionStore::save(&store, &snapshot).await.unwrap();
+        assert_eq!(
+            SessionStore::load(&store, &snapshot.id).await.unwrap(),
+            Some(snapshot.clone())
+        );
+        let mut checkpoint = session_checkpoint(snapshot);
+        let live = checkpoint.snapshot.clone();
+        assert!(!live.manifests.is_empty());
+        // Model Runtime's checkpoint capture, which preserves execution state
+        // and its boundary extension but leaves diagnostics in the live window.
+        checkpoint.snapshot.manifests.clear();
+        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        let loaded = SessionStore::load(&store, &live.id).await.unwrap().unwrap();
+        // SessionStore references the checkpoint's execution state, whose
+        // serialized snapshot omits the live diagnostic window.
+        assert!(loaded.manifests.is_empty());
+        assert_eq!(loaded.extension_state, live.extension_state);
+        assert_eq!(
+            store.snapshot_digest(&live).unwrap(),
+            store.snapshot_digest(&loaded).unwrap()
+        );
+        let mut retained = live.clone();
+        retained
+            .manifests
+            .push(TurnManifest::new(TurnId::new("latest-turn"), manifest));
+        retained.manifests.remove(0);
+        assert_eq!(
+            store.snapshot_digest(&live).unwrap(),
+            store.snapshot_digest(&retained).unwrap()
+        );
+        // Neither the restored state nor the live diagnostic window requires
+        // a conflicting independent save over the checkpoint-backed row.
+        sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
+            .execute(db.pool()).await.unwrap();
+        SessionStore::save(&store, &loaded).await.unwrap();
+        SessionStore::save(&store, &retained).await.unwrap();
+        // The runtime-owned boundary remains protected even though manifests
+        // are diagnostic: changing its frontier must change the digest.
+        retained
+            .extension_state
+            .get_mut(MANIFEST_BOUNDARY_NAMESPACE)
+            .unwrap()
+            .value = serde_json::json!({"schema_version": 1, "planned_steps": 2});
+        assert_ne!(
+            store.snapshot_digest(&live).unwrap(),
+            store.snapshot_digest(&retained).unwrap()
+        );
     }
 
     #[tokio::test]
