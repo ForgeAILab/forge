@@ -318,7 +318,7 @@ export function ProjectSettingsPage({
           version: project.version,
           settings: {
             ...(isRecord(project.settings) ? project.settings : {}),
-            placement: { provision },
+            placement: { ...(isRecord(project.settings?.placement) ? project.settings.placement : {}), provision },
             environment: {
               ...(environment.value ?? { env: {}, assets: [], checks: [] }),
               recheck_interval_seconds: Math.round(recheckMinutes * 60),

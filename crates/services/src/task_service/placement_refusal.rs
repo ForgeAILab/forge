@@ -2,7 +2,10 @@ use super::*;
 use sha2::{Digest, Sha256};
 
 impl TaskService {
-    async fn placement_eligibility_key(&self, project_id: &str) -> Result<String> {
+    async fn placement_eligibility_key(&self, task: &Task) -> Result<String> {
+        let project_id = &task.project_id;
+        let assignments:Vec<(String,Option<String>,Option<String>,String)>=sqlx::query_as("SELECT role_name,assignee_type,assignee_id,updated_at FROM task_role_assignment WHERE task_id=? OR task_id=? ORDER BY task_id,role_name")
+            .bind(&task.id).bind(task.parent_task_id.as_deref().unwrap_or(&task.id)).fetch_all(self.db.pool()).await?;
         // Heartbeat timestamps are intentionally excluded: only eligibility
         // facts can wake a deterministic refusal.
         let locations: Vec<(String, i64, String, String)> = sqlx::query_as("SELECT l.id,l.version,l.status,COALESCE(r.status,'') FROM repo_location l JOIN repo ON repo.id=l.repo_id LEFT JOIN runtime r ON r.id=l.runtime_id WHERE repo.project_id=? ORDER BY l.id")
@@ -45,6 +48,13 @@ impl TaskService {
         Ok(hex::encode(Sha256::digest(
             serde_json::to_vec(&(
                 locations,
+                assignments,
+                (
+                    &task.task_type,
+                    &task.task_state_config,
+                    &task.assignee_type,
+                    &task.assignee_id,
+                ),
                 machines,
                 profiles,
                 profile_versions,
@@ -105,7 +115,14 @@ impl TaskService {
             .filter_map(|machine| machine["machine"].as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let message = if capabilities.is_empty() {
+        let unverified = refusal.rejected_candidates.iter().any(|candidate| {
+            candidate
+                .filter_codes
+                .contains(&crate::placement::PlacementFilterCode::EnvironmentUnverified)
+        });
+        let message = if unverified {
+            format!("Environment unverified on {names}: mark a Project check machine, or add the repository on that machine")
+        } else if capabilities.is_empty() {
             format!("No eligible workspace owner for this role on {names}: {error}")
         } else {
             format!(
@@ -113,13 +130,27 @@ impl TaskService {
                 capabilities.join(", ")
             )
         };
-        let key = self.placement_eligibility_key(&task.project_id).await?;
+        let key = self.placement_eligibility_key(task).await?;
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        let metadata: Value = current
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        if metadata["placement_refusal"]["state"] == current.status
+            && metadata["placement_refusal"]["eligibility_key"] == key
+        {
+            return Ok(true);
+        }
         let annotation = serde_json::json!({"type":"dispatch_failed","code":"placement_unavailable","state":task.status,"message":message,"machines":machines,"missing_capabilities":capabilities,"rejected_candidates":refusal.rejected_candidates});
-        let marker =
-            serde_json::json!({"state":task.status,"eligibility_key":key,"annotation":annotation});
+        let marker = serde_json::json!({"state":task.status,"repo_id":refusal.repo_id,"eligibility_key":key,"annotation":annotation});
+        let wait=refusal.rejected_candidates.iter().find(|candidate|candidate.filter_codes.contains(&crate::placement::PlacementFilterCode::EnvironmentUnverified))
+            .map(|candidate|serde_json::json!({"kind":"environment_unverified","machine":{"owner_kind":"daemon","daemon_id":candidate.daemon_id,"runtime_id":candidate.runtime_id},"checks":[]}));
         let result=sqlx::query("UPDATE task SET error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation,'$.type')='dispatch_failed' THEN ? ELSE error_annotation END,
-            metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?)),version=version+1,updated_at=? WHERE id=? AND version=?")
-            .bind(annotation.to_string()).bind(marker.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version).execute(self.db.pool()).await?;
+            metadata_json=CASE WHEN ? THEN json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?),'$.environment_wait',json(?)) ELSE json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?)) END,version=version+1,updated_at=? WHERE id=? AND version=?")
+            .bind(annotation.to_string()).bind(unverified).bind(marker.to_string()).bind(serde_json::to_string(&wait).expect("wait")).bind(marker.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version).execute(self.db.pool()).await?;
         if result.rows_affected() != 1 {
             return Err(DbError::VersionConflict.into());
         }
@@ -133,7 +164,71 @@ impl TaskService {
             &message,
         )
         .await?;
+        if unverified {
+            let now = now_rfc3339();
+            let mut tx = db::begin_immediate(self.db.pool()).await?;
+            let event = db::DomainEventRepo::append_event_in_tx(
+                &*self.db,
+                &mut tx,
+                &db::CreateDomainEvent {
+                    id: new_uuid_v4(),
+                    event_type: "task.environment_unverified".into(),
+                    entity_type: "task".into(),
+                    entity_id: task.id.clone(),
+                    actor_type: "system".into(),
+                    actor_id: None,
+                    scope_type: "project".into(),
+                    scope_id: task.project_id.clone(),
+                    correlation_id: task.id.clone(),
+                    causation_id: None,
+                    causation_depth: 0,
+                    dedupe_key: None,
+                    payload_json: annotation.to_string(),
+                    created_at: now.clone(),
+                },
+            )
+            .await?;
+            sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'human_input_required', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'configure_environment') ON CONFLICT(dedupe_key) DO UPDATE SET status='open', summary=excluded.summary, details_json=excluded.details_json, updated_at=excluded.updated_at, resolved_at=NULL, version=attention_projection.version+1")
+                .bind(new_uuid_v4()).bind(&task.project_id).bind(event.id).bind(&message).bind(serde_json::json!({"task":{"id":task.id,"title":task.title},"machines":machines,"cause":"environment_unverified"}).to_string()).bind(format!("task-environment-unverified:{}",task.id)).bind(&now).bind(&now).execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
         Ok(true)
+    }
+
+    /// A failed state-entry hook can record admission before the workflow rolls
+    /// back. Finish that same refusal against the restored initial Task once.
+    pub(crate) async fn finish_initial_unverified_refusal(&self, original: &Task) -> Result<bool> {
+        let current = TaskRepo::get_by_id(&*self.db, &original.id, false)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        let metadata: Value = current
+            .metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        let marker = &metadata["placement_refusal"];
+        if current.status != original.status
+            || metadata["environment_wait"]["kind"] != "environment_unverified"
+            || marker["eligibility_key"] != self.placement_eligibility_key(&current).await?
+        {
+            return Ok(false);
+        }
+        let repo_id = marker["repo_id"]
+            .as_str()
+            .ok_or_else(|| ServiceError::invalid_operation("placement refusal has no repository"))?
+            .to_owned();
+        let candidates =
+            serde_json::from_value(marker["annotation"]["rejected_candidates"].clone())
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        self.record_placement_dispatch_refusal(
+            &current,
+            &ServiceError::PlacementUnavailable(crate::placement::PlacementUnavailable {
+                task_id: current.id.clone(),
+                repo_id,
+                rejected_candidates: candidates,
+            }),
+        )
+        .await
     }
 
     pub(crate) async fn refresh_placement_dispatch_refusal(&self, task: Task) -> Result<Task> {
@@ -147,12 +242,13 @@ impl TaskService {
             return Ok(task);
         }
         if marker["state"] == task.status
-            && marker["eligibility_key"] == self.placement_eligibility_key(&task.project_id).await?
+            && marker["eligibility_key"] == self.placement_eligibility_key(&task).await?
         {
             return Ok(task);
         }
+        sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1 WHERE dedupe_key=? AND status<>'resolved'").bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-environment-unverified:{}",task.id)).execute(self.db.pool()).await?;
         sqlx::query("UPDATE task SET error_annotation=CASE WHEN error_annotation=? THEN NULL ELSE error_annotation END,
-            metadata_json=json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition'),version=version+1,updated_at=? WHERE id=? AND version=? AND metadata_json IS ?")
+            metadata_json=CASE WHEN json_extract(metadata_json,'$.environment_wait.kind')='environment_unverified' THEN json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition','$.environment_wait') ELSE json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition') END,version=version+1,updated_at=? WHERE id=? AND version=? AND metadata_json IS ?")
             .bind(marker["annotation"].to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version).bind(&task.metadata_json).execute(self.db.pool()).await?;
         TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?

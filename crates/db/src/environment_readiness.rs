@@ -304,6 +304,16 @@ mod tests {
             .unwrap();
         assert_eq!(unknown.status, EnvironmentReadinessStatus::Unknown);
         assert!(unknown.version > saved.version);
+        assert!(!db
+            .reschedule_readiness(&saved, &crate::now_rfc3339())
+            .await
+            .unwrap());
+        let mut wrong_digest = unknown.clone();
+        wrong_digest.checks_digest = saved.checks_digest.clone();
+        assert!(!db
+            .reschedule_readiness(&wrong_digest, &crate::now_rfc3339())
+            .await
+            .unwrap());
         assert!(matches!(
             db.put_readiness(saved.clone(), Some(saved.version)).await,
             Err(DbError::VersionConflict)

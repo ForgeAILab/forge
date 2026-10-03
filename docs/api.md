@@ -2265,16 +2265,25 @@ ten-minute review at a time:
   `workspace` without rewriting saved settings. Unknown values are rejected by
   Project create/PATCH validation. Machine checks must work without a checkout
   or assets; checks must be read-only. Timeouts remain 1–300 seconds.
-- `settings.placement` accepts `{ "provision": "when_verified" | "never" }`.
-  Omission defaults to `when_verified`. Unknown values are rejected. Provisioning
+- `settings.placement` accepts `{ "provision": "when_verified" | "never", "provision_timeout_seconds": 1800 }`.
+  Omission defaults to `when_verified` and a 30-minute clone/fetch timeout.
+  `provision_timeout_seconds` must be 1–86400. Unknown provision values are rejected. Provisioning
   needs a remote, both daemon capabilities and local policy permissions, and at
   least one applicable passing machine check. No eligible ready location is
   displaced by provisioning; capacity-only waits do not trigger it.
 - `placement_unavailable` candidate filter codes now include
   `environment_unverified`, with instructions to declare a machine check or
-  register a location. Like `environment_probe_pending`, it is retryable and
-  parks the Task with its machine in `environment_wait`. Clone errors retain
-  `location_not_ready` and the unavailable location's bounded `last_error`.
+  add the repository on that machine. This is a deterministic refusal recorded
+  once with Task `human_input_required` Attention (details `cause: environment_unverified`,
+  `task: { id, title }`, and `machines: [{ daemon_id, machine, filter_codes }]`,
+  recommended action `configure_environment`); checks/provision settings changes, machine connections,
+  and new locations wake it. `environment_probe_pending` remains retryable and
+  parks the Task in `environment_wait`. Failed provisioning-only machine checks
+  create Task environment Attention and never pause the Project. Clone and verify
+  errors retain the location's bounded `last_error` and appear in the wait reason
+  with elapsed seconds; credentials are redacted. Five failed attempts for the
+  same settings and connection show an unreachable machine until reconnection
+  or settings changes.
 
 - `env` is set on every executor process (all CLI harnesses and the shell
   executor), on review `setup_steps`/`ci_steps`/required checks, and on
@@ -3920,7 +3929,9 @@ Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protoco
 `location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
 `agent_capacity`, `machine_capacity`, `native_backend_unsupported`,
 `run_purpose_denied`, `not_visible`, `environment_not_ready`, and
-`environment_probe_pending`. Environment rejections carry applicable check names
+`environment_probe_pending`, and `environment_unverified`. Unverified is a
+deterministic, action-required refusal with machine-named Task Attention; it
+also stays deterministic when transport facts are absent. Environment rejections carry applicable check names
 in `failing_checks`. Probe-pending defers dispatcher admission; direct/manual
 claims run the checks at launch. An environment Project pause defers dispatch
 without a `dispatch_failed` annotation.
@@ -4055,7 +4066,9 @@ the daemon's effective `workspace.run` policy; absent facts are unsupported.
 | `workspace.cleanup` | Remove the workspace and acknowledge cleanup |
 
 `machine_probe.v1` and `repo_provision.v1` are independent optional handshake
-capabilities; protocol revision remains 3. Daemons missing them stay connected
+capabilities; protocol revision remains 3. Upgrade the server before enabling
+these new purposes on daemons: older servers reject their handshake enum values.
+Daemons missing the capabilities stay connected
 and unverified and existing locations use launch preflight. Their run-policy
 allow list gains `environment_probe` and `repo_provision`; defaults stay
 `[ci_step]`. Neither purpose can be sent through `workspace.run`.
@@ -4068,9 +4081,14 @@ Tails are bounded to 4096 bytes while collected and redacted using Project env.
 A null location uses a new empty directory per command, removed afterwards.
 It uses no workspace lock, handle, mutation fence, journal or run slot.
 
-`repo_location.provision` request: `{ daemon_id, runtime_id, repo_id, remote_url }`;
-response: `{ path, default_branch }`. No credentials are sent. It clones under
-`workspace_root/repos/<repo_id>`, using daemon-local Git credentials. Retries
+`repo_location.provision` request: `{ daemon_id, runtime_id, repo_id, remote_url,
+default_branch, timeout_seconds }`; response: `{ workspace_root, path,
+default_branch }`. The branch and timeout are required; timeout is 1–86400 seconds.
+The server passes the owner-configured URL and uses daemon-local Git credentials;
+URL userinfo and token-like parameters are redacted from diagnostics. It clones
+under the returned canonical `workspace_root/repos/<repo_id>`. The returned path
+is authoritative even for a symlinked advertised root. The requested branch is
+selected for a new clone; a missing local branch is fetched on reuse. Retries
 reuse a matching normalized remote. Other content returns `path_conflict`
 without changes. `clone_failed` returns bounded output and removes partial
 staging; lost replies or restart are safe to retry. The server records a

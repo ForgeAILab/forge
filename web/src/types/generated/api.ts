@@ -307,6 +307,7 @@ export interface EnvironmentAsset {
 export type EnvironmentCheckScope = 'workspace' | 'machine'
 export type PlacementProvision = 'when_verified' | 'never'
 export interface ProjectPlacementSettings {
+  provision_timeout_seconds?: number
   provision: PlacementProvision
 }
 

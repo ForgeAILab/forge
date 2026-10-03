@@ -78,9 +78,26 @@ impl ProjectMachineReadinessRepo for SqliteDb {
         row: &ProjectMachineReadiness,
         next_check_at: &str,
     ) -> Result<bool> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let settings: Option<String> =
+            sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
+                .bind(&row.project_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(settings) = settings else {
+            return Ok(false);
+        };
+        if crate::environment_checks_digest(&crate::environment_readiness::settings_environment(
+            &settings,
+        )?) != row.checks_digest
+        {
+            return Ok(false);
+        }
         let (kind, daemon, runtime) = row.machine.columns();
-        Ok(sqlx::query("UPDATE project_machine_readiness SET next_check_at = ?, version = version + 1 WHERE project_id = ? AND owner_kind = ? AND daemon_id = ? AND runtime_id = ? AND version = ?")
-            .bind(next_check_at).bind(&row.project_id).bind(kind).bind(daemon).bind(runtime).bind(row.version).execute(self.pool()).await?.rows_affected() == 1)
+        let changed = sqlx::query("UPDATE project_machine_readiness SET next_check_at = ?, version = version + 1 WHERE project_id = ? AND owner_kind = ? AND daemon_id = ? AND runtime_id = ? AND version = ? AND checks_digest = ?")
+            .bind(next_check_at).bind(&row.project_id).bind(kind).bind(daemon).bind(runtime).bind(row.version).bind(&row.checks_digest).execute(&mut *tx).await?.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     async fn list_readiness_in_tx(

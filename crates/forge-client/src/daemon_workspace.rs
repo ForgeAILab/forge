@@ -95,6 +95,22 @@ impl DaemonWorkspaceBackend {
         journal: Arc<DaemonJournal>,
     ) -> anyhow::Result<Self> {
         let workspace_root = workspace_root.canonicalize()?;
+        let probes = workspace_root.join(".forge/probes");
+        if probes.exists() {
+            if probes.canonicalize()? != probes {
+                anyhow::bail!("probe directory contains a symlink");
+            }
+            for entry in std::fs::read_dir(&probes)? {
+                let entry = entry?;
+                if uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_ok() {
+                    if entry.file_type()?.is_dir() {
+                        std::fs::remove_dir_all(entry.path())?;
+                    } else {
+                        std::fs::remove_file(entry.path())?;
+                    }
+                }
+            }
+        }
         let state = journal.load_workspace_state()?;
         Ok(Self {
             manager: WorkspaceManager::new(workspace_root.join(WORKTREE_DIRECTORY)),
@@ -150,7 +166,18 @@ impl DaemonWorkspaceBackend {
                 .or_default()
                 .clone();
             let _guard = lock.lock().await;
-            return encode(self.provision_location(params).await?);
+            let remote = params.remote_url.clone();
+            return encode(self.provision_location(params).await.map_err(|mut error| {
+                error.message = git::redact_remote_credentials(&error.message, &remote);
+                if let Some(details) = error.details {
+                    error.details = serde_json::from_str(&git::redact_remote_credentials(
+                        &details.to_string(),
+                        &remote,
+                    ))
+                    .ok();
+                }
+                error
+            })?);
         }
         let _guard = self.operation_lock.lock().await;
         // Capture activity after acquiring the mutation lock. An execution
@@ -160,7 +187,21 @@ impl DaemonWorkspaceBackend {
             return Err(error(UNSUPPORTED_METHOD, "unsupported workspace method"));
         }
         match method {
-            METHOD_REPO_LOCATION_VERIFY => return encode(self.verify(decode(params)?).await?),
+            METHOD_REPO_LOCATION_VERIFY => {
+                let request: RepoLocationVerifyParams = decode(params)?;
+                let remote = request.remote_url.clone().unwrap_or_default();
+                return encode(self.verify(request).await.map_err(|mut error| {
+                    error.message = git::redact_remote_credentials(&error.message, &remote);
+                    error.details = error.details.and_then(|details| {
+                        serde_json::from_str(&git::redact_remote_credentials(
+                            &details.to_string(),
+                            &remote,
+                        ))
+                        .ok()
+                    });
+                    error
+                })?);
+            }
             METHOD_WORKSPACE_DESCRIBE => {
                 if params.get("operation").is_some() {
                     return encode(self.reconcile(decode(params)?).await?);
@@ -611,7 +652,9 @@ impl DaemonWorkspaceBackend {
             repo_location_id: params.repo_location_id,
             path: path.to_string_lossy().into_owned(),
             default_branch_sha,
-            origin_url: branches.origin_url,
+            origin_url: branches
+                .origin_url
+                .map(|origin| git::redact_remote_credentials(&origin, &origin)),
             probe_content,
         })
     }
@@ -671,7 +714,8 @@ impl DaemonWorkspaceBackend {
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE");
-            let output = bounded_command(command, check.timeout_seconds, 4096, true).await?;
+            let output =
+                bounded_command_inner(command, check.timeout_seconds, 4096, true, true).await?;
             let raw = [output.stdout, output.stderr].concat();
             let (output_tail, _) = redacted_tail(&raw, &params.env, 4096);
             results.push(MachineProbeCommandResult {
@@ -700,6 +744,27 @@ impl DaemonWorkspaceBackend {
                 "repo_provision is denied by local daemon configuration",
             ));
         }
+        if !(1..=86400).contains(&params.timeout_seconds) {
+            return Err(error(
+                INVALID_INPUT,
+                "provision timeout must be between 1 and 86400 seconds",
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_secs(params.timeout_seconds);
+        if params.default_branch.is_empty()
+            || params.default_branch.starts_with('-')
+            || local_git(
+                &self.workspace_root,
+                &[
+                    "check-ref-format",
+                    &format!("refs/heads/{}", params.default_branch),
+                ],
+            )
+            .await
+            .is_err()
+        {
+            return Err(error(INVALID_INPUT, "invalid repository branch"));
+        }
         if params.remote_url.trim().is_empty() || params.remote_url.starts_with('-') {
             return Err(error(INVALID_INPUT, "repository remote is required"));
         }
@@ -725,6 +790,9 @@ impl DaemonWorkspaceBackend {
                     "managed clone path holds another repository or non-repository content",
                 ));
             }
+            // The identity is unchanged, but owner-configured credentials may
+            // have rotated. Fetch uses this request's URL, never a stale origin.
+            local_git(&path, &["remote", "set-url", "origin", &params.remote_url]).await?;
         } else {
             let requested_staging = self
                 .workspace_root
@@ -747,6 +815,8 @@ impl DaemonWorkspaceBackend {
             let mut command = Command::new("git");
             command
                 .arg("clone")
+                .arg("--branch")
+                .arg(&params.default_branch)
                 .arg("--")
                 .arg(&params.remote_url)
                 .arg(&staging)
@@ -755,7 +825,7 @@ impl DaemonWorkspaceBackend {
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE");
-            let output = bounded_command(command, 300, 4096, true).await?;
+            let output = bounded_command(command, params.timeout_seconds, 4096, true).await?;
             if output.timed_out || output.exit_code != Some(0) {
                 let (message, _) = redacted_tail(&output.stderr, &BTreeMap::new(), 4096);
                 return Err(error(
@@ -774,8 +844,51 @@ impl DaemonWorkspaceBackend {
             drop(cleanup);
         }
         verify_git_dir(&path, &self.workspace_root).await?;
-        let default_branch = local_git(&path, &["symbolic-ref", "--short", "HEAD"]).await?;
+        if resolve_commit(&path, &format!("refs/heads/{}", params.default_branch))
+            .await
+            .is_err()
+        {
+            let mut fetch = Command::new("git");
+            fetch
+                .args([
+                    "fetch",
+                    "--",
+                    "origin",
+                    &format!(
+                        "refs/heads/{0}:refs/remotes/origin/{0}",
+                        params.default_branch
+                    ),
+                ])
+                .current_dir(&path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE");
+            let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
+            if remaining == 0 {
+                return Err(error("clone_failed", "repository fetch timed out"));
+            }
+            let fetched = bounded_command(fetch, remaining, 4096, true).await?;
+            if fetched.timed_out || fetched.exit_code != Some(0) {
+                return Err(error(
+                    "clone_failed",
+                    String::from_utf8_lossy(&fetched.stderr),
+                ));
+            }
+            local_git(
+                &path,
+                &[
+                    "branch",
+                    "--no-track",
+                    &params.default_branch,
+                    &format!("refs/remotes/origin/{}", params.default_branch),
+                ],
+            )
+            .await?;
+        }
+        let default_branch = params.default_branch;
         Ok(RepoLocationProvisionResult {
+            workspace_root: self.workspace_root.to_string_lossy().into_owned(),
             path: path.to_string_lossy().into_owned(),
             default_branch,
         })
@@ -1673,11 +1786,50 @@ struct BoundedOutput {
     stderr_drain_incomplete: bool,
 }
 
+struct ProcessGroupGuard(Option<u32>);
+impl ProcessGroupGuard {
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(id) = self.0.take() {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{id}")])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(windows)]
+        if let Some(id) = self.0.take() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &id.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 async fn bounded_command(
+    command: Command,
+    seconds: u64,
+    cap: usize,
+    keep_tail: bool,
+) -> CommandResult<BoundedOutput> {
+    bounded_command_inner(command, seconds, cap, keep_tail, false).await
+}
+
+async fn bounded_command_inner(
     mut command: Command,
     seconds: u64,
     cap: usize,
     keep_tail: bool,
+    kill_on_success: bool,
 ) -> CommandResult<BoundedOutput> {
     command
         .stdin(Stdio::null())
@@ -1687,6 +1839,7 @@ async fn bounded_command(
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(io_error)?;
+    let mut group = ProcessGroupGuard(child.id());
     let stdout = child
         .stdout
         .take()
@@ -1717,19 +1870,17 @@ async fn bounded_command(
     let (exit_code, timed_out) = match wait {
         Ok(status) => (status.map_err(io_error)?.code(), false),
         Err(_) => {
-            #[cfg(unix)]
-            if let Some(id) = child.id() {
-                // The shell's descendants share its process group.
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{id}")])
-                    .status()
-                    .await;
-            }
+            group.kill();
             let _ = child.kill().await;
             let _ = child.wait().await;
             (None, true)
         }
     };
+    if kill_on_success {
+        group.kill();
+    } else {
+        group.0 = None;
+    }
     let collect = async {
         (&mut stdout_task)
             .await

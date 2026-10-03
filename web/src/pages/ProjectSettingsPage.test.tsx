@@ -21,9 +21,12 @@ const project: Project = {
     environment: {
       env: { TOOL_PATH: '/opt/tool' },
       assets: [],
-      checks: [{ name: 'disk', command: 'df -h /', roles: [], timeout_seconds: 120 }],
+      checks: [
+        { name: 'disk', command: 'df -h /', scope: 'workspace', roles: [], timeout_seconds: 120 },
+      ],
       recheck_interval_seconds: 600,
     },
+    placement: { provision: 'when_verified' },
     command_allowlist: { allow: ['cargo'] },
   },
   default_review_config: { ci_steps: ['cargo test -p db one_case'] },
@@ -75,6 +78,34 @@ beforeEach(() => {
 })
 
 describe('Project flow control settings', () => {
+  it('preserves the provision timeout when saving environment controls', async () => {
+    query.data = {
+      ...project,
+      settings: {
+        ...project.settings,
+        placement: { provision: 'when_verified', provision_timeout_seconds: 3600 },
+      },
+    }
+    renderSettings('environment')
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText('Environment re-check interval (minutes)') as HTMLInputElement)
+          .value,
+      ).toBe('10'),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Save environment' }))
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          settings: expect.objectContaining({
+            placement: { provision: 'when_verified', provision_timeout_seconds: 3600 },
+          }),
+        }),
+      }),
+      expect.any(Object),
+    )
+  })
+
   it('preserves the active-limit draft when only slot counts refresh', async () => {
     const { rerender } = renderSettings('general')
     await waitFor(() =>
@@ -128,9 +159,9 @@ describe('Project flow control settings', () => {
       fireEvent.change(screen.getByLabelText('Active task limit'), { target: { value } })
       expect(screen.getByRole('alert').textContent).toContain('integer from 0 to 1000')
       expect(screen.getByLabelText('Active task limit').getAttribute('aria-invalid')).toBe('true')
-      expect(
-        (screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled,
-      ).toBe(true)
+      expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(
+        true,
+      )
       expect(mutate).not.toHaveBeenCalled()
     },
   )

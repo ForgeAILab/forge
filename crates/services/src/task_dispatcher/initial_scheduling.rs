@@ -159,6 +159,9 @@ impl TaskDispatcher {
             let task_id = task.id.clone();
             let result: Result<()> = async {
                 task = self.task_service.refresh_placement_dispatch_refusal(task.clone()).await?;
+                if task.metadata().map_err(|error|ServiceError::invalid_operation(error.to_string()))?.extra.get("environment_wait").is_some_and(|wait|wait["kind"]=="environment_unverified") {
+                    return Ok(());
+                }
                 if deferred_dispatch::queued_recovery(&task).is_some() {
                     return Ok(());
                 }
@@ -281,7 +284,8 @@ impl TaskDispatcher {
                         );
                     }
                     Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
-                        if self.task_service.record_placement_dispatch_refusal(&task, &error).await? { return Ok(()); }
+                        let current = db::TaskRepo::get_by_id(&*self.db,&task.id,false).await?.ok_or(db::DbError::NotFound)?;
+                        if current.status==task.status && self.task_service.record_placement_dispatch_refusal(&current, &error).await? { return Ok(()); }
                         deferred_dispatch::record_dispatch_disposition(
                             &self.db,
                             &task,
@@ -395,7 +399,8 @@ impl TaskDispatcher {
             return Ok(false);
         }
 
-        self.task_service
+        let transition = self
+            .task_service
             .transition(
                 task.id.clone(),
                 target.transition_to.clone(),
@@ -407,7 +412,29 @@ impl TaskDispatcher {
                     defer_dispatch_seconds: None,
                 },
             )
-            .await?;
+            .await;
+        // Log-policy entry failures can return Ok with the restored Task.
+        // Rebase only that handled refusal; ordinary dispatch adds no read.
+        if transition
+            .as_ref()
+            .is_ok_and(|result| result.task.status == task.status)
+            && self
+                .task_service
+                .finish_initial_unverified_refusal(task)
+                .await?
+        {
+            return Ok(false);
+        }
+        if let Err(error) = transition {
+            if self
+                .task_service
+                .finish_initial_unverified_refusal(task)
+                .await?
+            {
+                return Ok(false);
+            }
+            return Err(error);
+        }
         Ok(true)
     }
 

@@ -238,6 +238,8 @@ async fn project_patch_validates_environment_scope_and_provision_policy() {
     for settings in [
         json!({"environment":{"checks":[{"name":"cargo","command":"true","scope":"host"}]}}),
         json!({"placement":{"provision":"always"}}),
+        json!({"placement":{"provision_timeout_seconds":0}}),
+        json!({"placement":{"provision_timeout_seconds":86401}}),
     ] {
         let _: ErrorResponse = common::json_request(
             &harness.app,
@@ -248,10 +250,14 @@ async fn project_patch_validates_environment_scope_and_provision_policy() {
         )
         .await;
     }
-    let saved: api_types::ProjectResponse = common::json_request(&harness.app, Method::PATCH, &format!("/api/v1/projects/{}", project.id), json!({"version":project.version,"settings":{"environment":{"checks":[{"name":"cargo","command":"true","scope":"machine"}]},"placement":{"provision":"never"}}}), StatusCode::OK).await;
+    let saved: api_types::ProjectResponse = common::json_request(&harness.app, Method::PATCH, &format!("/api/v1/projects/{}", project.id), json!({"version":project.version,"settings":{"environment":{"checks":[{"name":"cargo","command":"true","scope":"machine"}]},"placement":{"provision":"never","provision_timeout_seconds":3600}}}), StatusCode::OK).await;
     assert_eq!(
         saved.settings["environment"]["checks"][0]["scope"],
         "machine"
     );
     assert_eq!(saved.settings["placement"]["provision"], "never");
+    assert_eq!(
+        saved.settings["placement"]["provision_timeout_seconds"],
+        3600
+    );
 }

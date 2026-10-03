@@ -16,7 +16,10 @@ without overwriting a user or repository pause. This SHALL happen before any
 initial Task transition or `dispatch_failed` annotation, including a first
 failing probe. The detail SHALL name the machine, checks, role, bounded output
 and pause/check times; the existing public response shape stays unchanged in
-build step A. Step 3 later adds provisioning candidates to eligibility.
+build step A. Provisioning candidates SHALL never contribute to the last-resort
+Project pause. Their failed machine checks SHALL instead leave the Task waiting
+with Task-linked environment Attention naming the machine and applicable checks,
+and a placement_unavailable refusal with those check names.
 
 Other eligible owners SHALL allow new Tasks to run there. A Task pinned by an
 Agent or existing/inherited placement to the failed machine SHALL wait there

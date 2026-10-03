@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-02T05:22:12Z
-updated_at: 2026-10-02T19:34:57Z
+updated_at: 2026-10-03T00:32:38Z
 completed_at:
 ---
 
@@ -57,6 +57,5 @@ completed_at:
 - Protocol stays at revision 3; machine probe/provision are optional capability facts. Legacy ready-location owners retain launch preflight.
 - V202610021500 adds restartable retry deadlines and refreshes scope-default digests while retaining verdicts and due times.
 - Whole touched modules/targets passed: 443 test executions across 16 commands, plus 603 binding-export tests and 7 web tests. Clippy, Rust formatting, web typecheck, daemon build check and strict spec validation passed.
-- [environment-placement-build-c-verification.md](../../../environment-placement-build-c-verification.md) records implementation locations, protocol facts, wait endings, parity, exact commands/results, frozen-line diffs and proposed changelog text.
 - Browser QA could not start: installed Chrome exited with SIGABRT. No screenshots or Lighthouse result are claimed.
 - Step B surfaces and CHANGELOG.md remain under their respective owners; those task boxes are unchanged.

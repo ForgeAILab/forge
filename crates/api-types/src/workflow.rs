@@ -119,12 +119,28 @@ pub enum PlacementProvision {
     Never,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct ProjectPlacementSettings {
     #[serde(default)]
     pub provision: PlacementProvision,
+    #[serde(default = "default_provision_timeout_seconds")]
+    #[ts(type = "number")]
+    pub provision_timeout_seconds: u64,
+}
+
+/// Total clone/fetch budget; 1–86400 seconds, default 30 minutes.
+pub fn default_provision_timeout_seconds() -> u64 {
+    1800
+}
+impl Default for ProjectPlacementSettings {
+    fn default() -> Self {
+        Self {
+            provision: PlacementProvision::default(),
+            provision_timeout_seconds: default_provision_timeout_seconds(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -774,6 +790,8 @@ mod tests {
     #[test]
     fn environment_scope_and_provision_defaults_and_validation() {
         let settings: super::ProjectSettings = serde_json::from_value(serde_json::json!({"environment":{"checks":[{"name":"cargo","command":"cargo --version"}]}})).unwrap();
+        assert!(<super::ProjectPlacementSettings as ts_rs::TS>::decl()
+            .contains("provision_timeout_seconds: number"));
         assert_eq!(
             settings.environment.checks[0].scope,
             super::EnvironmentCheckScope::Workspace

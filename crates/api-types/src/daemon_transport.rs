@@ -286,6 +286,8 @@ pub struct MachineProbeResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct RepoLocationProvisionParams {
+    pub default_branch: String,
+    pub timeout_seconds: u64,
     pub daemon_id: String,
     pub runtime_id: String,
     pub repo_id: String,
@@ -294,6 +296,7 @@ pub struct RepoLocationProvisionParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 pub struct RepoLocationProvisionResult {
+    pub workspace_root: String,
     pub path: String,
     pub default_branch: String,
 }
@@ -1047,7 +1050,7 @@ mod tests {
         assert_eq!(super::DAEMON_PROTOCOL_REVISION, 3);
         let probe: super::MachineProbeParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_location_id":null,"commands":[{"name":"cargo","command":"cargo --version","timeout_seconds":10}],"env":{}})).unwrap();
         assert_eq!(probe.commands[0].name, "cargo");
-        let provision: super::RepoLocationProvisionParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_id":"repo","remote_url":"file:///repository"})).unwrap();
+        let provision: super::RepoLocationProvisionParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_id":"repo","remote_url":"file:///repository","default_branch":"main","timeout_seconds":1800})).unwrap();
         assert!(serde_json::to_value(provision)
             .unwrap()
             .get("credentials")

@@ -918,7 +918,12 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert!(attention.contains(daemon_id));
+        let hostname: String = sqlx::query_scalar("SELECT hostname FROM daemon WHERE id=?")
+            .bind(daemon_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(attention.contains(&hostname));
         assert!(attention.contains("owner-probe"));
 
         let (kind, action): (String, String) = sqlx::query_as(

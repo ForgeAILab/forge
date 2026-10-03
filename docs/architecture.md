@@ -2684,8 +2684,17 @@ both `machine_probe.v1` and `repo_provision.v1`. Its local policy must allow
 Project `settings.placement.provision` must be `when_verified` (default).
 `never` disables provisioning. A ready location blocked only by capacity or a
 pending probe prevents provisioning elsewhere. Probe and clone jobs take no run
-slots. A daemon with no applicable machine check is `environment_unverified`:
-declare a machine check or manually register a location.
+slots. A daemon with no applicable machine check is `environment_unverified`.
+This deterministic refusal is recorded once on the Task with Attention naming
+the machine and the action: mark a Project check `machine`, or add the repository
+on that machine. Repeated scans do not rewrite the Task. Changes to checks or
+`placement.provision`, machine connections, and location changes wake it.
+Role/assignee changes also invalidate the refusal. State-entry bookkeeping does
+not: its key tracks placement facts and role assignments, rather than Task
+version changes from internal hooks. A rolled-back entry refusal is recorded
+against the restored Task before the scan finishes.
+A provisioning candidate with an incompatible executor or capability does not
+turn another candidate's deterministic refusal into a pending environment wait.
 
 A background job, single-flight per repository/runtime, runs machine checks
 before `repo_location.provision`. Only passing applicable checks permit cloning
@@ -2697,10 +2706,36 @@ error. Durable exponential retry deadlines (`repo_provision_retry`) survive
 server restarts without a persistent running flag; daemon retries reuse an
 existing matching clone and remove interrupted private staging. Transport and
 version errors retain check facts, reschedule and do not fail another Task.
-Pending, provisioning and unverified Tasks reuse `environment_wait`, remain
-queued, and are parked for Project slots. Settings edits or manual location
-registration release unverified waits; job completion or retry releases pending
-waits. No execution, lease or worktree exists during these jobs.
+Pending, provisioning and unverified Tasks reuse `environment_wait`, remain queued, and
+are parked for Project slots. An unfinished daemon location with provisioning
+disabled waits for location verification with `location_not_ready`, rather than
+for a full probe without a checkout. A failed machine check on a provisioning candidate
+creates Task-scoped environment Attention naming the machine and checks; it
+never pauses the Project. The last-resort Project pause considers ready-location
+candidates only. Scheduled rechecks recover the failing machine.
+All job writes fence the check digest and observed readiness version; stale
+results are discarded and the current digest is probed. Clone and verification
+failures appear in the Task's wait reason, with elapsed time and the bounded
+`repo_location.last_error`. Provisioning stops after five attempts for unchanged
+inputs and connection, shows the machine as unreachable, and resumes after
+reconnection or a relevant settings edit. Backoff is 60–600 seconds. No execution,
+lease or worktree exists during these jobs.
+
+Provisioning sends the repository's default branch, creates or fetches its local
+ref before verification, and uses `settings.placement.provision_timeout_seconds`
+(default 1800; allowed 1–86400). The daemon's returned canonical root and clone
+path are authoritative; the server checks `<returned root>/repos/<repo id>` and
+records that path, including when the advertised root uses a symlink. Daemon
+locations do not suppress creation of the server's own lazy location.
+Credentials in URL userinfo and token-like query parameters are redacted from
+errors, receipts, logs, and wait reasons on both sides; the clone URL itself is
+sent to the daemon, which also uses its local Git credentials.
+
+Deleting a Project removes its readiness and provisioning retry rows through
+foreign keys. Task workspace cleanup uses the existing owner-routed cleanup
+path. The repository's managed daemon clone is retained as an owner-local cache:
+there is currently no repository-clone cleanup operation. The owner may remove
+`<workspace_root>/repos/<repo id>` after its Task workspaces are cleaned.
 
 The embedded provider supplies the server host's adapter facts, including session
 resume for its session-capable executors. Recovery uses those facts for embedded
@@ -2828,14 +2863,23 @@ Protocol revision 3 independently negotiates `machine_probe.v1` for
 A probe accepts named commands, 1–300 second timeouts, Project env, and an
 optional verified location ID. It returns exit status, timeout and a redacted
 4096-byte output tail per command. Without a location, each command gets a fresh
-empty directory removed on completion or cancellation. Probes take no workspace
+empty directory removed on completion or cancellation, with abandoned probe
+directories swept at daemon startup. Checks must be read-only: scratch directories
+are a working-directory choice, not a filesystem sandbox. Checks inherit the
+daemon's environment with Project env overrides, as `workspace.run` does.
+Timeout and cancellation kill the entire probe process group; a completed probe
+also stops background descendants. Probes take no workspace
 lock and write no journal. Provisioning is idempotent by repository identity and
 normalized remote: a matching clone is reused; conflicting content returns
 `path_conflict` unchanged. Failed clones publish no partial final directory. Provisioning serializes only
 requests for the same repository, leaving workspace operations and other
-repositories' jobs independent. The server sends no Git credentials. These operations require their separate
+repositories' jobs independent. Clone URLs may carry owner-configured credentials;
+these are never included in diagnostics. These operations require their separate
 local policy purposes, `environment_probe` and `repo_provision`, and refusal is
 `run_purpose_denied`. Missing capabilities do not change connection health.
+Upgrade the server first: a daemon that opts into these new purposes needs a
+server from this release; an older server rejects the handshake because its
+run-purpose enum does not recognize them. Protocol revision remains 3.
 
 Protocol revision 3 negotiates `workspace.v1` for `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
