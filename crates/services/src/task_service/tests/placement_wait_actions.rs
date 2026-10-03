@@ -314,3 +314,65 @@ async fn expired_environment_probe_deferral_is_claimed_without_losing_its_extra_
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn running_task_with_paused_agent_offers_the_execution_hold() {
+    let fixture = fixture().await;
+    let agent = sqlx::query_scalar::<_, String>(
+        "SELECT assignee_id FROM task_role_assignment WHERE task_id = ? AND role_name = 'coder'",
+    )
+    .bind(&fixture.task.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    seed_execution(
+        &fixture.db,
+        &fixture.task.id,
+        Some(&agent),
+        "coder",
+        ExecutionStatus::Running,
+        Some("session"),
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
+        .bind(&agent)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
+    let owner = Actor::user(UserActionSource::Test);
+    let offers = fixture
+        .service
+        .task_action_offers(&fixture.task.id, &owner)
+        .await
+        .unwrap();
+    let holds = offers
+        .available_actions
+        .iter()
+        .filter(|offer| offer.action.verb() == "hold")
+        .map(|offer| offer.reason.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(holds, ["execution_running"]);
+
+    let current = reload(&fixture).await;
+    fixture
+        .service
+        .perform_task_action_as(
+            &fixture.task.id,
+            TaskAction::Hold { reason: None },
+            current.version,
+            owner.clone(),
+        )
+        .await
+        .expect("the offered Hold applies to a running Task");
+    let held = fixture
+        .service
+        .task_action_offers(&fixture.task.id, &owner)
+        .await
+        .unwrap();
+    assert!(!held
+        .available_actions
+        .iter()
+        .any(|offer| offer.action.verb() == "hold"));
+}

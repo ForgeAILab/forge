@@ -435,8 +435,13 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             "Cancel Task",
         );
     }
-    if queued
-        || (snapshot.wait_cause.is_some() && !dependency_cancelled && task.failed_json.is_none())
+    // A running Task is held through its execution (below); a dispatch-wait
+    // Hold only applies to work that is waiting to be dispatched.
+    let running_live = running && !snapshot.owner_disconnected;
+    if !held
+        && !running_live
+        && (queued
+            || (snapshot.wait_cause.is_some() && condition.is_none() && task.failed_json.is_none()))
     {
         offer(
             TaskAction::Hold { reason: None },
@@ -465,8 +470,8 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         }
         return offers;
     }
-    if running && !snapshot.owner_disconnected {
-        if !queued && snapshot.wait_cause.is_none() {
+    if running_live {
+        if !held {
             offer(
                 TaskAction::Hold { reason: None },
                 &[],
@@ -1928,16 +1933,16 @@ mod tests {
     }
 
     #[test]
-    fn paused_review_keeps_budget_reset_and_hold_but_withholds_one_shot_retry() {
+    fn paused_review_keeps_budget_reset_but_withholds_hold_and_one_shot_retry() {
         let mut snapshot = snapshot("review", Some(FailureKind::ReviewBudgetExhausted));
         snapshot.project_paused = true;
         snapshot.wait_cause = Some(api_types::DeniedBy::ProjectPaused(
             "environment_not_ready".to_owned(),
         ));
         let offers = available_actions(&snapshot);
-        assert!(offers
-            .iter()
-            .any(|offer| offer.reason == "dispatch_wait" && offer.action.verb() == "hold"));
+        // A Hold would overwrite the exhausted-budget condition; nothing is
+        // waiting to be dispatched.
+        assert!(!offers.iter().any(|offer| offer.action.verb() == "hold"));
         let reset = offers
             .iter()
             .find(|offer| offer.reason == "retry_budget_exhausted")

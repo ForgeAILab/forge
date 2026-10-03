@@ -913,7 +913,7 @@ async fn action_requests_require_an_explicit_version() {
 }
 
 #[tokio::test]
-async fn paused_task_action_refusals_keep_wait_cause_and_hold_offer() {
+async fn paused_task_action_refusals_keep_wait_cause_without_erasing_the_condition() {
     let workspace = common::TestDir::new("action-pause-causes");
     let repo = common::TestDir::new("action-pause-repo");
     let path = common::setup_git_repo(repo.path());
@@ -971,10 +971,15 @@ async fn paused_task_action_refusals_keep_wait_cause_and_hold_offer() {
         let details = error.details.unwrap();
         assert_eq!(details["denied_by"], cause);
         assert_eq!(details["retry"]["scope"], "turn");
-        assert!(details["available_actions"]
+        // Nothing is waiting to be dispatched and a Hold would overwrite the
+        // live condition, so the refusal offers cancel but no Hold.
+        let verbs = details["available_actions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|offer| offer["action"]["verb"] == "hold"));
+            .map(|offer| offer["action"]["verb"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(verbs.iter().any(|verb| verb == "cancel"), "{verbs:?}");
+        assert!(!verbs.iter().any(|verb| verb == "hold"), "{verbs:?}");
     }
 }
