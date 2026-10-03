@@ -2340,6 +2340,7 @@ rows are recreated. The consumer placements are:
 | `agent-wake-turns` | Literal prefix `agent.wake.` | Plan admission/disposition / persist disposition and optional message/turn admission | Reconsider due deferred or changed setup dispositions, isolating and bounding failures per row | None; decision resolution shares admission/cursor commit |
 | `project-hooks` | Exact `task.transitioned`, `task.status_changed`, `project_hook.task_created`, `project_hook.task_archived` | Evaluate existing completion/epoch rules and prepare action content / claim run and write notification, comment or Task (including dispatch automation Task) with cursor | Settle stale started runs from execution evidence | Publish live hints and comment-memory indexing; launch external Agent execution only for the admitted started run |
 | `notifications` | Exact `task.transitioned`, `task.status_changed`, `review.status_changed`, `notification.requested` | Prepare the existing human notification / insert notification row with cursor | None | Publish `notification.created` live hint |
+| `conflict-hotspots` | Exact `task.transitioned` | Validate workflow handoff and read its full transition reason / seek Project Tasks then merge-failed log rows, count every path once, and commit episode/detection/cursor atomically | None | None |
 
 
 #### Periodic and event-triggered process workers
@@ -3604,17 +3605,21 @@ on the manual path. There, the recovery action creates a
 marked review-refresh transition, clears the old approval, and runs the
 repaired result through fresh checks and review before merge.
 
-The durable `conflict-hotspots` consumer observes these workflow-authored
-`merging → merge_failed` handoffs after its installation cutover. The existing
-type/sequence index bounds the event-ledger query, which filters the Project and
-seven-day window and counts distinct Tasks per path, excluding unsplittable
-dependency lockfiles. Three Tasks produce a
-`project.conflict_hotspot.detected` event atomically with the consumer cursor;
-Attention projects a Project/path incident and the existing wake pipeline asks
-the Project Agent to propose one module-splitting Task. Further handoffs refresh
-the same incident. A durable boundary preserves the latest resolution timestamp across reopening, so only
-newer handoffs count. Worker retries, dead letters, and replay use
-the shared runtime; neither conflict handling nor wake budgets change.
+The durable `conflict-hotspots` consumer observes workflow-authored
+`merging → merge_failed` handoffs after its installation timestamp. One query
+seeks Project Tasks through the existing Project index, then merge-failed logs
+through `idx_transition_log_merge_failed` with UTC RFC3339 time bounds computed
+in Rust. The seven-day window ends at the source handoff's timestamp; full
+transition reasons supply every path, excluding dependency lockfiles. Three
+distinct Tasks emit one `project.conflict_hotspot.detected` event and open a
+Project/path episode atomically with the cursor. An open episode skips counting
+and emission even while Attention is unprojected, acknowledged, or snoozed.
+Only a user resolution at or after `open_since` closes it and advances its
+boundary; three qualifying handoffs newer than that boundary can open the next
+episode. The summary remains at its first crossing. Episode rows cascade on
+Project deletion; shared retries/dead letters and existing wake budgets apply.
+The Project Agent proposes one splitting Task; the user resolves the incident
+in Mission Control.
 
 ### Task condition actions
 

@@ -1,8 +1,12 @@
 //! Project layout feedback from durable conflict handoffs; never creates Tasks.
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use api_types::{Actor, SystemComponent, TaskTransitionEventPayload};
 use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
 use db::{new_uuid_v4, now_rfc3339, CreateDomainEvent, DomainEvent, DomainEventRepo, SqliteDb};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -32,28 +36,37 @@ const UNSPLITTABLE_LOCKFILES: &[&str] = &[
     "composer.lock",
 ];
 
-// The existing type/sequence index seeks only transitions after installation
-// through this delivery, avoiding a full-table scan. Project/time and path
-// filtering retain the workflow's JSON semantics, including RFC3339 offsets.
-const HANDOFF_QUERY: &str = "SELECT entity_id, actor_type, actor_id, payload_json
-    FROM domain_event INDEXED BY idx_domain_event_type_sequence
-    WHERE event_type = 'task.transitioned' AND json_valid(payload_json)
-      AND json_extract(payload_json, '$.project_id') = ?
-      AND julianday(created_at) >= julianday(?) - ?
-      AND julianday(created_at) <= julianday(?)
-      AND julianday(created_at) > julianday(COALESCE(?, '0001-01-01T00:00:00Z'))
-      AND sequence > (SELECT cutover_sequence FROM event_consumer_cutover
-                      WHERE consumer_name = 'conflict-hotspots')
-      AND sequence <= ? AND entity_type = 'task'
-    ORDER BY julianday(created_at) DESC, sequence DESC";
+// Existing Project and Task/state/time indexes bound the seek before parsing.
+// One query supplies every eligible path; UTC RFC3339 bounds match DB writers.
+const HANDOFF_QUERY: &str = "SELECT tl.task_id, tl.trigger_reason, tl.created_at
+    FROM task t JOIN transition_log tl ON tl.task_id = t.id
+    WHERE t.project_id = ? AND tl.from_state = 'merging' AND tl.to_state = 'merge_failed'
+      AND tl.triggered_by = ? AND tl.created_at > ? AND tl.created_at <= ?
+    ORDER BY tl.created_at DESC, tl.rowid DESC";
+const EPISODE_QUERY: &str = "SELECT resolved_after, open_since
+    FROM conflict_hotspot_boundary WHERE project_id = ? AND path = ?";
+const CLOSE_EPISODE: &str = "UPDATE conflict_hotspot_boundary
+    SET resolved_after = ?, open_since = NULL WHERE project_id = ? AND path = ?";
+const OPEN_EPISODE: &str = "INSERT INTO conflict_hotspot_boundary
+    (project_id, path, resolved_after, open_since) VALUES (?, ?, ?, ?)
+    ON CONFLICT(project_id, path) DO UPDATE SET open_since = excluded.open_since";
 
-pub(crate) struct ConflictHotspotConsumer {
+/// Durable conflict observation shared by the server and Solo worker runtime.
+pub struct ConflictHotspotConsumer {
     db: Arc<SqliteDb>,
 }
 
-pub(crate) struct Handoff {
+/// Immutable source data prepared before the writer transaction.
+pub struct Handoff {
     project_id: String,
     paths: Vec<String>,
+    created_at: String,
+}
+
+struct PathCount {
+    boundary: Option<DateTime<Utc>>,
+    seen: HashSet<String>,
+    task_ids: Vec<String>,
 }
 
 /// Shared with Attention so punctuation and long paths have one stable incident key.
@@ -64,34 +77,74 @@ pub(crate) fn incident_key(project_id: &str, path: &str) -> String {
     )
 }
 
-fn parse_handoff(actor_type: &str, actor_id: Option<&str>, payload_json: &str) -> Option<Handoff> {
-    let actor = actor_id.map_or_else(|| actor_type.to_owned(), |id| format!("{actor_type}:{id}"));
-    if actor != Actor::system(SystemComponent::Workflow).display() {
+fn handoff_paths(reason: &str) -> Option<Vec<String>> {
+    if !reason.contains(CONFLICT_HANDOFF_MARKER) {
         return None;
     }
-    let payload: TaskTransitionEventPayload = serde_json::from_str(payload_json).ok()?;
-    if payload.from_state != "merging"
-        || payload.to_state != "merge_failed"
-        || !payload.trigger_reason.contains(CONFLICT_HANDOFF_MARKER)
-    {
-        return None;
-    }
-    let (_, encoded) = payload
-        .trigger_reason
-        .rsplit_once(CONFLICT_HANDOFF_PATHS_PREFIX)?;
+    let (_, encoded) = reason.rsplit_once(CONFLICT_HANDOFF_PATHS_PREFIX)?;
     let mut paths: Vec<String> = serde_json::from_str(encoded).ok()?;
     paths.retain(|path| !UNSPLITTABLE_LOCKFILES.contains(&path.rsplit('/').next().unwrap_or(path)));
     paths.sort();
     paths.dedup();
-    Some(Handoff {
-        project_id: payload.project_id,
-        paths,
-    })
+    Some(paths)
+}
+
+fn timestamp(value: &str) -> crate::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|at| at.with_timezone(&Utc))
+        .map_err(|_| crate::ServiceError::invalid_operation("invalid conflict handoff timestamp"))
 }
 
 impl ConflictHotspotConsumer {
-    pub(crate) fn new(db: Arc<SqliteDb>) -> Self {
+    pub fn new(db: Arc<SqliteDb>) -> Self {
         Self { db }
+    }
+
+    async fn prepare(&self, event: &DomainEvent) -> crate::Result<Option<Handoff>> {
+        if event.event_type != "task.transitioned"
+            || event.entity_type != "task"
+            || event.actor_type != "system"
+            || event.actor_id.as_deref() != Some("workflow")
+        {
+            return Ok(None);
+        }
+        let Ok(payload) = serde_json::from_str::<TaskTransitionEventPayload>(&event.payload_json)
+        else {
+            return Ok(None);
+        };
+        if payload.from_state != "merging" || payload.to_state != "merge_failed" {
+            return Ok(None);
+        }
+        // The ledger reason is bounded. Read the authoritative full reason and
+        // timestamp, and refuse a removed or mismatched source Task/log.
+        let source = sqlx::query(
+            "SELECT tl.from_state, tl.to_state, tl.triggered_by, tl.trigger_reason, tl.created_at
+            FROM transition_log tl JOIN task t ON t.id = tl.task_id
+            WHERE tl.id = ? AND t.id = ? AND t.project_id = ?",
+        )
+        .bind(&payload.transition_log_id)
+        .bind(&event.entity_id)
+        .bind(&payload.project_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        if source.try_get::<String, _>("from_state")? != "merging"
+            || source.try_get::<String, _>("to_state")? != "merge_failed"
+            || source.try_get::<String, _>("triggered_by")?
+                != Actor::system(SystemComponent::Workflow).display()
+        {
+            return Ok(None);
+        }
+        let Some(paths) = handoff_paths(&source.try_get::<String, _>("trigger_reason")?) else {
+            return Ok(None);
+        };
+        Ok((!paths.is_empty()).then(|| Handoff {
+            project_id: payload.project_id,
+            paths,
+            created_at: source.get("created_at"),
+        }))
     }
 
     async fn detect_in_tx(
@@ -101,27 +154,105 @@ impl ConflictHotspotConsumer {
         handoff: &Handoff,
     ) -> crate::Result<()> {
         let now = now_rfc3339();
+        let mut counts = BTreeMap::new();
         for path in &handoff.paths {
-            let key = incident_key(&handoff.project_id, path);
-            let attention: Option<(String, Option<String>)> = sqlx::query_as(
-                "SELECT status, resolved_at FROM attention_projection WHERE dedupe_key = ?",
-            )
-            .bind(&key)
-            .fetch_optional(&mut **tx)
-            .await?;
-            if let Some((_, Some(resolved_at))) = attention {
-                sqlx::query("INSERT INTO conflict_hotspot_boundary (project_id, path, resolved_after)
-                    VALUES (?, ?, ?) ON CONFLICT(project_id, path) DO UPDATE SET
-                    resolved_after = excluded.resolved_after
-                    WHERE julianday(excluded.resolved_after) > julianday(conflict_hotspot_boundary.resolved_after)")
-                    .bind(&handoff.project_id).bind(path).bind(resolved_at)
-                    .execute(&mut **tx).await?;
+            let state: Option<(Option<String>, Option<String>)> = sqlx::query_as(EPISODE_QUERY)
+                .bind(&handoff.project_id)
+                .bind(path)
+                .fetch_optional(&mut **tx)
+                .await?;
+            let (mut boundary, open_since) = state.unwrap_or_default();
+            if let Some(open_since) = open_since {
+                let attention: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT status, resolved_at FROM attention_projection WHERE dedupe_key = ?",
+                )
+                .bind(incident_key(&handoff.project_id, path))
+                .fetch_optional(&mut **tx)
+                .await?;
+                let resolved = match attention {
+                    Some((status, Some(at)))
+                        if status == "resolved" && timestamp(&at)? >= timestamp(&open_since)? =>
+                    {
+                        Some(at)
+                    }
+                    _ => None,
+                };
+                let Some(resolved) = resolved else {
+                    continue;
+                };
+                boundary = Some(timestamp(&resolved)?.to_rfc3339());
+                sqlx::query(CLOSE_EPISODE)
+                    .bind(&boundary)
+                    .bind(&handoff.project_id)
+                    .bind(path)
+                    .execute(&mut **tx)
+                    .await?;
             }
-            let resolved_at: Option<String> = sqlx::query_scalar(
-                "SELECT resolved_after FROM conflict_hotspot_boundary WHERE project_id = ? AND path = ?",
-            ).bind(&handoff.project_id).bind(path).fetch_optional(&mut **tx).await?;
+            counts.insert(
+                path.clone(),
+                PathCount {
+                    boundary: boundary.as_deref().map(timestamp).transpose()?,
+                    seen: HashSet::new(),
+                    task_ids: Vec::new(),
+                },
+            );
+        }
+        // Projection lag, acknowledgement and snoozing keep the episode open:
+        // no history query, upsert or new wake for any of those states.
+        if counts.is_empty() {
+            return Ok(());
+        }
+        let cutover: String = sqlx::query_scalar(
+            "SELECT created_at FROM event_consumer_cutover WHERE consumer_name = ?",
+        )
+        .bind(CONSUMER_NAME)
+        .fetch_one(&mut **tx)
+        .await?;
+        let cutover = timestamp(&cutover)?;
+        let end = timestamp(&handoff.created_at)?;
+        let start = end - Duration::days(WINDOW_DAYS);
+        // A strict lower bound includes the exact window start while excluding
+        // the installation/resolution instants. More recent path boundaries
+        // are applied per path below, after this single indexed query.
+        let lower = counts
+            .values()
+            .map(|count| count.boundary.unwrap_or(cutover))
+            .min()
+            .unwrap_or(cutover);
+        let lower = lower.max(cutover).max(start - Duration::nanoseconds(1));
+        let rows = sqlx::query(HANDOFF_QUERY)
+            .bind(&handoff.project_id)
+            .bind(Actor::system(SystemComponent::Workflow).display())
+            .bind(lower.to_rfc3339())
+            .bind(end.to_rfc3339())
+            .fetch_all(&mut **tx)
+            .await?;
+        for row in rows {
+            let at = timestamp(&row.try_get::<String, _>("created_at")?)?;
+            let Some(paths) = handoff_paths(&row.try_get::<String, _>("trigger_reason")?) else {
+                continue;
+            };
+            let task_id: String = row.try_get("task_id")?;
+            for path in paths {
+                if let Some(count) = counts.get_mut(&path) {
+                    if at >= start
+                        && count.boundary.is_none_or(|boundary| at > boundary)
+                        && count.seen.insert(task_id.clone())
+                    {
+                        count.task_ids.push(task_id.clone());
+                    }
+                }
+            }
+        }
+        for (path, mut count) in counts {
+            let handoff_count = count.task_ids.len();
+            if handoff_count < MIN_TASKS {
+                continue;
+            }
+            count.task_ids.truncate(MAX_TASK_IDS);
+            let key = incident_key(&handoff.project_id, &path);
             let detection_key = format!("{key}:detected:{}", event.id);
-            // Source/path identity also makes an explicit dead-letter replay idempotent.
+            // Explicit dead-letter replay also retains source/path identity.
             let detected: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = ?)",
             )
@@ -131,46 +262,37 @@ impl ConflictHotspotConsumer {
             if detected {
                 continue;
             }
-            let rows = sqlx::query(HANDOFF_QUERY)
-                .bind(&handoff.project_id)
-                .bind(&now)
-                .bind(WINDOW_DAYS)
-                .bind(&now)
-                .bind(&resolved_at)
-                .bind(event.sequence)
-                .fetch_all(&mut **tx)
-                .await?;
-            let mut seen = HashSet::new();
-            let mut task_ids = Vec::new();
-            for row in rows {
-                let candidate = parse_handoff(
-                    &row.try_get::<String, _>("actor_type")?,
-                    row.try_get::<Option<String>, _>("actor_id")?.as_deref(),
-                    &row.try_get::<String, _>("payload_json")?,
-                );
-                if candidate.is_some_and(|handoff| handoff.paths.contains(path)) {
-                    let task_id: String = row.try_get("entity_id")?;
-                    if seen.insert(task_id.clone()) {
-                        task_ids.push(task_id);
-                    }
-                }
-            }
-            let handoff_count = task_ids.len();
-            if handoff_count < MIN_TASKS {
-                continue;
-            }
-            task_ids.truncate(MAX_TASK_IDS);
-            self.db.append_event_in_tx(tx, &CreateDomainEvent {
-                id: new_uuid_v4(), event_type: DETECTED_EVENT.into(),
-                entity_type: "project".into(), entity_id: handoff.project_id.clone(),
-                actor_type: "system".into(), actor_id: Some(CONSUMER_NAME.into()),
-                scope_type: "project".into(), scope_id: handoff.project_id.clone(),
-                correlation_id: event.correlation_id.clone(), causation_id: Some(event.id.clone()),
-                causation_depth: event.causation_depth.saturating_add(1), dedupe_key: Some(detection_key),
-                payload_json: json!({"project_id": handoff.project_id, "path": path,
-                    "task_ids": task_ids, "handoff_count": handoff_count, "window_days": WINDOW_DAYS}).to_string(),
+            let payload = json!({
+                "project_id": handoff.project_id,
+                "path": path,
+                "task_ids": count.task_ids,
+                "handoff_count": handoff_count,
+                "window_days": WINDOW_DAYS,
+            });
+            let detection = CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: DETECTED_EVENT.into(),
+                entity_type: "project".into(),
+                entity_id: handoff.project_id.clone(),
+                actor_type: "system".into(),
+                actor_id: Some(CONSUMER_NAME.into()),
+                scope_type: "project".into(),
+                scope_id: handoff.project_id.clone(),
+                correlation_id: event.correlation_id.clone(),
+                causation_id: Some(event.id.clone()),
+                causation_depth: event.causation_depth.saturating_add(1),
+                dedupe_key: Some(detection_key),
+                payload_json: payload.to_string(),
                 created_at: now.clone(),
-            }).await?;
+            };
+            self.db.append_event_in_tx(tx, &detection).await?;
+            sqlx::query(OPEN_EPISODE)
+                .bind(&handoff.project_id)
+                .bind(&path)
+                .bind(count.boundary.map(|at| at.to_rfc3339()))
+                .bind(&now)
+                .execute(&mut **tx)
+                .await?;
         }
         Ok(())
     }
@@ -189,19 +311,10 @@ impl Worker for ConflictHotspotConsumer {
         &self,
         event: &DomainEvent,
     ) -> std::result::Result<Outcome<Handoff>, WorkerError> {
-        if event.event_type != "task.transitioned" || event.entity_type != "task" {
-            return Ok(Outcome::Skip);
-        }
-        Ok(
-            match parse_handoff(
-                &event.actor_type,
-                event.actor_id.as_deref(),
-                &event.payload_json,
-            ) {
-                Some(handoff) if !handoff.paths.is_empty() => Outcome::Done(handoff),
-                _ => Outcome::Skip,
-            },
-        )
+        self.prepare(event)
+            .await
+            .map(|handoff| handoff.map_or(Outcome::Skip, Outcome::Done))
+            .map_err(consumer_error)
     }
     async fn commit(
         &self,

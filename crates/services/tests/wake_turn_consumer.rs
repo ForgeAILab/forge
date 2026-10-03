@@ -3417,12 +3417,172 @@ async fn conflict_hotspot_wake_routes_to_project_agent_with_bounded_directive() 
     assert_eq!(chat_id, fixture.chat_id);
     assert_eq!(responder, fixture.identity_id);
     let directive = content.lines().last().unwrap();
-    assert!(directive.contains("src/共有.rs"));
+    assert!(content.contains("src/共有.rs"));
     for task in ["task-1", "task-2", "task-3"] {
-        assert!(directive.contains(task));
+        assert_eq!(content.matches(task).count(), 1);
     }
+    assert!(directive.contains("path and Tasks in Details"));
     assert!(directive.contains("Propose one Task via `task.propose`"));
-    assert!(directive.contains("unless an open Task already covers it"));
-    assert!(directive.contains("Resolve this incident afterwards."));
-    assert!(directive.split_whitespace().count() <= 60);
+    assert!(directive.contains("unless an open Task already does"));
+    assert!(!directive.contains("Resolve"));
+    assert!(directive.split_whitespace().count() <= 40);
+}
+
+// Regression scenarios copied from the independent 3.9(b) audit.
+
+async fn audit39b_detection(fixture: &ChatTurnFixture, path: &str, count: i64) {
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task WHERE project_id = ? AND title LIKE 'audit39b:%'",
+    )
+    .bind(&fixture.project_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    for number in existing..count {
+        let task_id = new_uuid_v4();
+        let id = new_uuid_v4();
+        let now = now_rfc3339();
+        let reason = format!(
+            "[conflict-handoff]; paths_json={}",
+            serde_json::json!([path])
+        );
+        sqlx::query("INSERT INTO task (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, ?, 'merge_failed', ?, ?)")
+            .bind(&task_id).bind(&fixture.project_id).bind(format!("audit39b:{number}"))
+            .bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+        let mut tx = db::begin_immediate(fixture.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO transition_log (id, task_id, from_state, to_state, triggered_by, trigger_reason, created_at) VALUES (?, ?, 'merging', 'merge_failed', 'system:workflow', ?, ?)")
+            .bind(&id).bind(&task_id).bind(&reason).bind(&now).execute(&mut *tx).await.unwrap();
+        fixture
+            .db
+            .append_event_in_tx(
+                &mut tx,
+                &CreateDomainEvent::task_transition(
+                    id,
+                    task_id,
+                    &fixture.project_id,
+                    "merging",
+                    "merge_failed",
+                    None,
+                    "system:workflow",
+                    reason,
+                    false,
+                    now,
+                    serde_json::Value::Null,
+                ),
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    services::worker_runtime::WorkerRuntime::new(
+        Arc::clone(&fixture.db),
+        Arc::new(
+            services::worker_runtime::conflict_hotspot::ConflictHotspotConsumer::new(Arc::clone(
+                &fixture.db,
+            )),
+        ),
+    )
+    .run_once(100)
+    .await
+    .unwrap();
+}
+
+async fn audit39b_hotspot_turns(fixture: &ChatTurnFixture) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_chat_turn_job j
+         JOIN agent_chat_message m ON m.id = j.triggering_message_id
+         WHERE j.chat_id = ? AND m.content LIKE '%Category: conflict_hotspot%'",
+    )
+    .bind(&fixture.chat_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap()
+}
+
+/// Two adjacent handoffs at/above threshold must produce one stable detection
+/// before Attention or wake delivery has polled the burst.
+#[tokio::test]
+async fn audit39b_refresh_before_delivery_loses_the_only_wake() {
+    let fixture = chat_turn_fixture().await;
+    audit39b_detection(&fixture, "src/shared.rs", 3).await;
+    audit39b_detection(&fixture, "src/shared.rs", 4).await;
+    AttentionService::new(Arc::clone(&fixture.db))
+        .project_once(100)
+        .await
+        .unwrap();
+    WakeTurnConsumer::new(Arc::clone(&fixture.db))
+        .run_once(100)
+        .await
+        .unwrap();
+    let detections: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'project.conflict_hotspot.detected'",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(detections, 1);
+    let decisions: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT event_type, json_extract(payload_json, '$.reason') FROM domain_event
+         WHERE event_type LIKE 'agent.wake.%' ORDER BY sequence",
+    )
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    let dispositions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT disposition, reason FROM agent_wake_disposition ORDER BY created_at",
+    )
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM attention_projection WHERE attention_type = 'conflict_hotspot'",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    eprintln!("wake decisions = {decisions:?}");
+    eprintln!("wake dispositions = {dispositions:?}");
+    eprintln!("attention status = {status}");
+    assert_eq!(
+        audit39b_hotspot_turns(&fixture).await,
+        1,
+        "open conflict_hotspot incident produced no Project Agent turn"
+    );
+}
+
+#[tokio::test]
+async fn audit39b_each_refresh_after_cooldown_rewakes_project_agent() {
+    let fixture = chat_turn_fixture().await;
+    let attention = AttentionService::new(Arc::clone(&fixture.db));
+    let wake = WakeTurnConsumer::new(Arc::clone(&fixture.db));
+    audit39b_detection(&fixture, "src/shared.rs", 3).await;
+    attention.project_once(100).await.unwrap();
+    wake.run_once(100).await.unwrap();
+    for count in 4..=20 {
+        // Simulate the 300 s cooldown elapsing between two later handoffs.
+        sqlx::query("UPDATE agent_wake_lease SET leased_until = '2000-01-01T00:00:00Z', cooldown_until = '2000-01-01T00:00:00Z'")
+            .execute(fixture.db.pool()).await.unwrap();
+        audit39b_detection(&fixture, "src/shared.rs", count).await;
+        attention.project_once(100).await.unwrap();
+        wake.run_once(100).await.unwrap();
+    }
+    let admitted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.admitted'",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    let budget: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(admitted_count) FROM agent_wake_budget_window")
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    let turns = audit39b_hotspot_turns(&fixture).await;
+    assert_eq!(turns, 1);
+    assert_eq!(budget, Some(1));
+    eprintln!("admitted = {admitted}, budget admitted_count = {budget:?}, hotspot turns = {turns}");
+    assert_eq!(
+        admitted, 1,
+        "every refresh after cooldown re-woke the Project Agent for the same open incident"
+    );
 }

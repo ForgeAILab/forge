@@ -388,6 +388,16 @@ export function getMissionControl(): Promise<MissionControlResponse> {
   return apiFetch<MissionControlResponse>(federationApiPaths.missionControl)
 }
 
+export function resolveAttentionItem(id: string, expectedVersion: number): Promise<AttentionItem> {
+  return apiFetch<AttentionItem>(
+    `${federationApiPaths.missionControl}/attention/${encodeURIComponent(id)}/resolve`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ expected_version: expectedVersion }),
+    },
+  )
+}
+
 export function getContextManifest(
   manifestId: string,
   query: ContextManifestLookup,

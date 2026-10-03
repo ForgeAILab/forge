@@ -1663,28 +1663,20 @@ fn execution_failed_directive(attention: &db::AttentionProjection) -> String {
     }
 }
 
-fn conflict_hotspot_directive(attention: &db::AttentionProjection) -> String {
-    let details = serde_json::from_str::<Value>(&attention.details_json).unwrap_or(Value::Null);
-    let hotspot = &details["conflict_hotspot"];
-    let path = hotspot["path"].as_str().unwrap_or("unknown path");
-    let tasks = hotspot["task_ids"]
-        .as_array()
-        .map(|ids| {
-            ids.iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(",")
-        })
-        .unwrap_or_default();
-    let layout = forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE;
-    format!("Path: {path}; Tasks: {tasks}. Propose one Task via `task.propose` to split this file into smaller modules, unless an open Task already covers it. {layout} Use clear owners so parallel Tasks edit disjoint files. Resolve this incident afterwards.")
+fn conflict_hotspot_directive() -> &'static str {
+    "Conflict hot spot (path and Tasks in Details). Propose one Task via `task.propose` that splits this file into modules with clear owners so parallel Tasks edit disjoint files, unless an open Task already does."
 }
 
 fn wake_content(
     attention: &db::AttentionProjection,
     delivery: Option<&DeliveryFollowupState>,
 ) -> String {
-    let details = if attention.details_json.trim().is_empty()
+    let details = if attention.attention_type == "conflict_hotspot" {
+        // Keep the bounded event payload's path/Tasks once, including long paths,
+        // without spending tokens on unrelated projection/recovery metadata.
+        let details = serde_json::from_str::<Value>(&attention.details_json).unwrap_or(Value::Null);
+        format!("\nDetails: {}\n", details["conflict_hotspot"])
+    } else if attention.details_json.trim().is_empty()
         || attention.details_json.trim() == "{}"
         || attention.details_json.chars().count() > MAX_DETAIL_CHARS
     {
@@ -1701,7 +1693,7 @@ fn wake_content(
     let final_instruction = if attention.attention_type == "execution_failed" {
         execution_failed_directive(attention)
     } else if attention.attention_type == "conflict_hotspot" {
-        conflict_hotspot_directive(attention)
+        conflict_hotspot_directive().to_owned()
     } else {
         "Assess the current state with your tools and take the action this incident requires. If a decision genuinely belongs to the user, ask for it; otherwise proceed.".to_owned()
     };
@@ -1918,15 +1910,28 @@ mod tests {
     }
 
     #[test]
-    fn conflict_hotspot_directive_names_path_tasks_and_stays_category_local() {
-        let details = json!({"conflict_hotspot": {"path": "src/shared.rs",
-            "task_ids": (1..=10).map(|id| format!("task-{id}")).collect::<Vec<_>>()}})
-        .to_string();
+    fn conflict_hotspot_directive_is_short_and_references_details_once() {
+        let tasks: Vec<_> = (0..10).map(|_| db::new_uuid_v4()).collect();
+        // A path larger than the generic Details cutoff still reaches this
+        // wake, and cannot increase the directive's length or duplicate UUIDs.
+        let path = format!("src/{}.rs", "長い名前".repeat(1000));
+        let details = json!({"conflict_hotspot": {"path": path, "task_ids": tasks}}).to_string();
         let item = attention("conflict_hotspot", &details);
-        let directive = conflict_hotspot_directive(&item);
-        assert_eq!(directive, format!("Path: src/shared.rs; Tasks: task-1,task-2,task-3,task-4,task-5,task-6,task-7,task-8,task-9,task-10. Propose one Task via `task.propose` to split this file into smaller modules, unless an open Task already covers it. {} Use clear owners so parallel Tasks edit disjoint files. Resolve this incident afterwards.", forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE));
-        assert!(directive.split_whitespace().count() <= 60);
-        assert!(wake_content(&item, None).ends_with(&directive));
+        let directive = conflict_hotspot_directive();
+        assert_eq!(directive, "Conflict hot spot (path and Tasks in Details). Propose one Task via `task.propose` that splits this file into modules with clear owners so parallel Tasks edit disjoint files, unless an open Task already does.");
+        assert!(directive.split_whitespace().count() <= 40);
+        let content = wake_content(&item, None);
+        assert!(content.ends_with(directive));
+        assert_eq!(
+            content.lines().last().unwrap().split_whitespace().count(),
+            34
+        );
+        assert_eq!(content.matches(&path).count(), 1);
+        for id in &tasks {
+            assert_eq!(content.matches(id).count(), 1);
+        }
+        assert!(!directive.contains(&path));
+        assert!(!directive.contains("Resolve"));
         for category in [
             "execution_failed",
             "delivery_followup",
@@ -1937,13 +1942,9 @@ mod tests {
             "budget_threshold",
             "commitment_overdue",
         ] {
-            let content = wake_content(&attention(category, &details), None);
             assert!(
-                !content.contains("Propose one Task via `task.propose`"),
-                "{category}"
-            );
-            assert!(
-                !content.contains(forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE),
+                !wake_content(&attention(category, &details), None)
+                    .contains("Conflict hot spot (path and Tasks in Details)"),
                 "{category}"
             );
         }

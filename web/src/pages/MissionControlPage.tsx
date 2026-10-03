@@ -22,7 +22,7 @@ import {
 } from '@/features/agent-chat/hooks'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { RetryTurnAction } from '@/types/generated/bindings/RetryTurnAction'
-import { useMissionControlQuery } from '@/features/federation/hooks'
+import { useMissionControlQuery, useResolveAttentionMutation } from '@/features/federation/hooks'
 import type {
   AgentHealthItem,
   AttentionConsumerHealth,
@@ -137,6 +137,7 @@ function AttentionCard({ item }: { item: AttentionItem }) {
   const taskId = isProgressWarning ? attentionTaskId(item) : null
   const retryAction = attentionRetryAction(item)
   const retryTurn = useRetryAgentChatTurnMutation(retryAction?.chat_id)
+  const resolve = useResolveAttentionMutation()
   const turns = useAgentChatTurnsQuery(retryAction?.chat_id)
   const anotherTurnLive =
     turns.data?.some((turn) =>
@@ -160,6 +161,17 @@ function AttentionCard({ item }: { item: AttentionItem }) {
               {isProgressWarning ? 'Waiting for semantic progress' : item.summary}
             </h3>
             <StateBadge status={item.lifecycle} />
+            {item.lifecycle !== 'resolved' ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="ml-auto"
+                disabled={resolve.isPending || resolve.isSuccess}
+                onClick={() => resolve.mutate({ id: item.id, expectedVersion: item.version })}
+              >
+                {resolve.isPending ? 'Resolving…' : 'Resolve'}
+              </Button>
+            ) : null}
           </div>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
             {isProgressWarning ? (
@@ -218,6 +230,11 @@ function AttentionCard({ item }: { item: AttentionItem }) {
           {retryTurn.error ? (
             <p className="mt-2 text-xs text-destructive" role="alert">
               {retryTurn.error.message}
+            </p>
+          ) : null}
+          {resolve.error ? (
+            <p className="mt-2 text-xs text-destructive" role="alert">
+              {resolve.error.message}
             </p>
           ) : null}
         </div>
@@ -625,7 +642,9 @@ function ConsumerHealth({ health }: { health: AttentionConsumerHealth | null }) 
         Last success {formatDate(health.last_success_at)}
         {health.last_error_code ? ` · ${health.last_error_code}` : ''}
       </p>
-      {health.last_error_message ? <p className="mt-2 text-xs text-muted-foreground">{health.last_error_message}</p> : null}
+      {health.last_error_message ? (
+        <p className="mt-2 text-xs text-muted-foreground">{health.last_error_message}</p>
+      ) : null}
     </Card>
   )
 }

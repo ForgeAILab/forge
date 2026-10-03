@@ -825,13 +825,20 @@ direct stream so one approved execution cannot appear twice.
 `handoff_count` (the full distinct-Task count), and `window_days` (7).
 Three distinct Tasks handing off conflicts on one non-lockfile path within seven
 days raise one `conflict_hotspot` Attention incident per Project/path (priority 60,
-recommended action `split_hotspot`). Repeated detections refresh that incident.
-The detector starts at the installation event head and excludes earlier handoffs.
-After resolution, three distinct Tasks must hand off that path again using only
-handoffs newer than resolution. Its Project Agent wake asks for one file-splitting
-Task proposal through the existing approval flow, skips an already-open equivalent
-Task, and asks the Agent to resolve the incident; Forge does not create the Task.
-Existing wake duplicate, cooldown, and budget rules apply.
+recommended action `split_hotspot`). The window ends at the handoff's timestamp,
+and counting reads the full transition log after the installation timestamp.
+The consumer starts at the installation event head, without historical backfill.
+Each episode emits one detection, causing one Attention upsert and at most one
+Project Agent wake. Later handoffs leave the first-crossing summary and wake
+unchanged while the item is unprojected, open, acknowledged, or snoozed. The user
+resolves the item in Mission Control; a resolution at or after the episode's
+emission advances its boundary. Three distinct Tasks with newer qualifying
+handoffs can then open another episode, reopening the same resolved item through
+the normal upsert. Its wake points to the path and Task IDs in Details and asks
+for one module-splitting Task proposal, unless an open Task already covers it.
+Forge does not create the Task or auto-resolve the incident, and the Agent has
+no incident-resolution operation. Existing wake duplicate, cooldown, and budget
+rules apply.
 
 `AttentionCategory` includes `delivery_followup`. Forge projects it when a
 Task reaches a successful terminal state (`done` in the default workflow) so

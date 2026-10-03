@@ -2656,14 +2656,33 @@ async fn audit_lost_wake_lease_cas_suppresses_without_charging_budget() {
 }
 
 #[tokio::test]
-async fn conflict_hotspots_project_per_path_refresh_and_keep_wake_rules() {
+async fn conflict_hotspots_project_per_path_reopen_and_keep_wake_rules() {
     let db = database().await;
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
     let project_id = configured_project(&db, &identity_id, "conflict-hotspots").await;
     let service = AttentionService::new(Arc::clone(&db));
-    let mut first_id = None;
+    let mut first_id: Option<String> = None;
     for (path, count) in [("src/共有.rs", 3), ("src/共有.rs", 4), ("src/other.rs", 3)] {
+        if count == 4 {
+            let current = db
+                .get_attention(first_id.as_ref().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            db.update_attention_lifecycle(UpdateAttentionLifecycle {
+                id: current.id,
+                expected_version: current.version,
+                status: "resolved".into(),
+                acknowledged_at: None,
+                snoozed_until: Some(None),
+                resolved_at: Some(Some(now_rfc3339())),
+                updated_by_user_id: None,
+                updated_at: now_rfc3339(),
+            })
+            .await
+            .unwrap();
+        }
         db.append_event(CreateDomainEvent {
             id: new_uuid_v4(), event_type: "project.conflict_hotspot.detected".into(),
             entity_type: "project".into(), entity_id: project_id.clone(),
@@ -2705,6 +2724,8 @@ async fn conflict_hotspots_project_per_path_refresh_and_keep_wake_rules() {
             assert_ne!(Some(&item.0), first_id.as_ref());
         }
         let projection = db.get_attention(&item.0).await.unwrap().unwrap();
+        assert_eq!(projection.status, "open");
+        assert!(projection.resolved_at.is_none());
         assert_eq!(
             services::attention_service::attention_item(projection)
                 .unwrap()
@@ -2718,7 +2739,7 @@ async fn conflict_hotspots_project_per_path_refresh_and_keep_wake_rules() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(admitted, 2); // Same path's refresh remains a duplicate incident.
+    assert_eq!(admitted, 2); // A later episode still obeys the same path's live lease/cooldown.
     let ineligible: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.suppressed' AND json_extract(payload_json, '$.reason') = 'ineligible_scope'")
         .fetch_one(db.pool()).await.unwrap();
     assert_eq!(ineligible, 0);
