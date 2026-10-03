@@ -1582,10 +1582,20 @@ export interface UsageIndexStatus {
   fallback: boolean
 }
 
+export interface PeriodicWorkerStatus {
+  worker_name: string
+  running: boolean
+  last_tick_at: string | null
+  last_error: string | null
+  last_error_at: string | null
+  restart_count: number
+}
+
 export interface OperatorStatusResponse {
   usage_index: UsageIndexStatus
   event_relay: EventRelayStatus
   event_consumers: EventConsumerStatus[]
+  periodic_workers: PeriodicWorkerStatus[]
   database: DatabaseStorageStatus
   overall_severity: OperatorSeverity
   active_executions: ActiveExecutionSummary[]

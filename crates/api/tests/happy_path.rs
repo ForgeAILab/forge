@@ -169,8 +169,22 @@ PY"# }
     assert!(workspace.cleanup_after.is_some(), "cleanup is scheduled");
     assert!(worktree_path.exists(), "transition does not delete inline");
 
-    let (cleanup_shutdown, cleanup_shutdown_rx) = tokio::sync::watch::channel(false);
-    let cleanup_worker = Arc::clone(&harness.state.cleanup_scheduler).spawn(cleanup_shutdown_rx);
+    let registry = harness.state.operator_status_service.periodic_workers();
+    let cleanup_worker = if registry
+        .status()
+        .await
+        .unwrap()
+        .iter()
+        .any(|row| row.worker_name == "workspace-cleanup")
+    {
+        None
+    } else {
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        Some((
+            shutdown,
+            Arc::clone(&harness.state.cleanup_scheduler).spawn(&registry, receiver),
+        ))
+    };
     tokio::time::timeout(Duration::from_secs(5), async {
         while workspaces_root.path().join(&task_id).exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -178,8 +192,10 @@ PY"# }
     })
     .await
     .expect("cleanup worker removes the workspace");
-    cleanup_shutdown.send(true).expect("cleanup worker stops");
-    cleanup_worker.await.expect("cleanup worker joins");
+    if let Some((shutdown, handle)) = cleanup_worker {
+        shutdown.send(true).expect("cleanup worker stops");
+        handle.await.expect("cleanup worker joins");
+    }
     assert!(
         !workspaces_root.path().join(&task_id).exists(),
         "workspace task directory is cleaned"

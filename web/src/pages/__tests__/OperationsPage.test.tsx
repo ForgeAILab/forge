@@ -70,6 +70,7 @@ const usageSummary: UsageAggregate = {
 }
 
 const degradedStatus: OperatorStatusResponse = {
+  periodic_workers: [],
   usage_index: {
     current_size_bytes: 10 * 1024 * 1024,
     budget_bytes: 128 * 1024 * 1024,

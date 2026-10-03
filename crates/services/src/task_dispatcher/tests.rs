@@ -8949,3 +8949,103 @@ mod environment_placement;
 
 #[path = "tests/environment_parity.rs"]
 mod environment_parity;
+
+#[tokio::test]
+async fn supervised_dispatcher_recovers_panic_reports_budget_keeps_wakes_and_stops() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct InFlight(Arc<AtomicBool>);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let db = Arc::new(sqlite_db().await);
+    let status_service = crate::OperatorStatusService::new_for_test(Arc::clone(&db));
+    let root = TempDir::new().unwrap();
+    let (mut built, _launches) = build_dispatcher(db, root.path()).await;
+    built.check_interval = Duration::from_secs(300);
+    let dispatcher = Arc::new(built.with_periodic_workers(status_service.periodic_workers()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let in_flight = Arc::new(AtomicBool::new(false));
+    let resume = Arc::new(Notify::new());
+    let success = Arc::new(Notify::new());
+    let handle = Arc::clone(&dispatcher).start_with_check(Duration::from_millis(100), {
+        let calls = Arc::clone(&calls);
+        let in_flight = Arc::clone(&in_flight);
+        let resume = Arc::clone(&resume);
+        let success = Arc::clone(&success);
+        move |_| {
+            let calls = Arc::clone(&calls);
+            let in_flight = Arc::clone(&in_flight);
+            let resume = Arc::clone(&resume);
+            let success = Arc::clone(&success);
+            async move {
+                match calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => panic!("dispatcher tick panic"),
+                    1 => {
+                        in_flight.store(true, Ordering::SeqCst);
+                        let _in_flight = InFlight(in_flight);
+                        resume.notified().await;
+                    }
+                    _ => {}
+                }
+                success.notify_one();
+                // This test exercises the driver's wakes, independently of
+                // any notifications check_once itself may emit in the future.
+                Ok(0)
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = status_service.compute_status().await.unwrap();
+            if status.recent_errors.iter().any(|row| {
+                row.entity_type == "periodic_worker"
+                    && row.entity_id == "task-dispatcher"
+                    && row.error.contains("tick running longer than 100ms")
+            }) {
+                assert_eq!(
+                    status.overall_severity,
+                    api_types::OperatorSeverity::Attention
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        in_flight.load(Ordering::SeqCst),
+        "over-budget work was not dropped"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), success.notified())
+        .await
+        .unwrap();
+    dispatcher.task_service.dispatch_wake.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), success.notified())
+        .await
+        .unwrap();
+    dispatcher.stop_notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), success.notified())
+        .await
+        .unwrap();
+    dispatcher.stop();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap();
+    let status = dispatcher.periodic_workers.status().await.unwrap();
+    let row = status
+        .iter()
+        .find(|row| row.worker_name == "task-dispatcher")
+        .unwrap();
+    assert!(!row.running);
+    assert!(row.last_tick_at.is_some());
+    assert_eq!(row.restart_count, 1);
+    assert!(row.last_error.is_none());
+    assert!(!in_flight.load(Ordering::SeqCst));
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+}

@@ -2278,6 +2278,78 @@ rows are recreated. The consumer placements are:
 | `notifications` | Exact `task.transitioned`, `task.status_changed`, `review.status_changed`, `notification.requested` | Prepare the existing human notification / insert notification row with cursor | None | Publish `notification.created` live hint |
 
 
+#### Periodic and event-triggered process workers
+
+`worker_runtime::PeriodicWorkers` supplies source-free `PeriodicWorker` tick
+contexts backed by the same `WorkerSupervisor` and `db::WorkerHealth` as the
+durable workers. The runtime and server-only startup share one registry exposed
+by `OperatorStatusService`; no event subscription, cursor, poison strike or
+quarantine is created. Operator status adds `periodic_workers` with the worker
+identity, live `running`, process-local `last_tick_at` (tick start, sampled at
+most once per 30 seconds and never written to SQLite), independently
+retained error/time and persisted restart count. Stopped workers remain visible;
+persisted health from an unstarted worker never implies a live process. Periodic
+faults also enter `recent_errors` and raise Operations severity to `attention`.
+
+| Worker | Original schedule and wake signals | Tick budget / policy |
+| --- | --- | --- |
+| `task-dispatcher` | Immediate scan, then 10 seconds after each pass; existing dispatch completion/probe Notify and dispatch_wake; atomic stop | 1 hour / warn, continue awaiting |
+| `agent-chat-turns` | Existing immediate 250 ms Skip poll, gated by active-turn capacity; active JoinSet completion and shutdown watch | 5 minutes / warn, continue admission |
+| `heartbeat-monitor` | Immediate check, then 10 seconds after each pass; existing stop and daemon reconciliation Notify | 5 minutes / warn, continue awaiting |
+| `operator-status-emitter` | EventBus hints, existing 500 ms Skip coalescer (initial tick consumed); activity refresh after 5 seconds | 5 minutes / cancel |
+| `lifecycle-projection` | Existing EventBus receiver; only events the handler acts on count as ticks; other hints bypass health, lag warned | 1 hour / cancel |
+| `workspace-cleanup` | Independent immediate 60-second cleanup and 10-minute terminal sweep Skip intervals | 1 hour / cancel |
+| `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum | 5 minutes / cancel |
+| `daemon-monitor` | Immediate check, then 30 seconds after each pass; stop Notify | 5 minutes / cancel |
+| `embedded-daemon` | Immediate CLI scan/report, then 60 seconds after each pass; stop Notify; server and Solo | 5 minutes / cancel |
+| `shared-media-cleanup` | One startup pass, then create 60-second Burst interval and consume initial tick | 5 minutes / cancel |
+| `external-sync` | Immediate due-integration pass, then 60 seconds after each pass; stop Notify | 1 hour / warn, cancel safety unverified |
+| `environment-settings-observer` | Existing Project update/resume EventBus hints, lag ignored; weak service ownership; stops with dispatcher | 5 minutes / cancel |
+
+Simple immediate-pass/wait-after-pass workers use the shared tick driver.
+Specialized interval/select state stays with the domain worker to preserve
+missed-tick policy, startup timing and in-process wake behavior. Wait/receive
+futures are outside the tick budget. Cancel-safe workers cancel an over-budget
+future and record `periodic worker tick timed out after {budget}`. Dispatcher,
+heartbeat, Agent Chat admission and external sync use a non-cancelling watchdog:
+after the
+budget they report `tick running longer than {budget}` once and continue polling
+the same future, including while the health write waits for a database lock.
+This preserves inline workflow barriers, unbounded CI and committed claim
+batches. External sync also warns because import cancellation safety is unverified.
+Completion clears the warning; an actual failure replaces it with the
+failure cause. Recoverable failures retain the original cadence.
+
+Successful ticks check SQLite health only once after child startup (to clear
+stale persisted causes) and on a reported error-to-success transition. Repeated
+identical tick faults are deduplicated in memory; steady successful ticks perform
+no health reads or writes. `last_tick_at` is sampled in memory at most once per
+30 seconds, with no SQLite heartbeat flush. Loop-specific warning messages are
+retained with the `worker` field; Agent Chat logs an admission failure once.
+
+A panic escapes the tick to the supervisor; unexpected return,
+error or cancellation also restarts after 250 ms, doubling to a 5-second cap,
+reset after 60 healthy seconds. Atomic stop is an intentional exit, not a restart.
+Workers with a shutdown watch let the in-flight pass finish under the existing
+runtime's 10-second shutdown deadline, then abort and join if needed. Workers
+with atomic stop/Notify keep those stop APIs and their wait-after-pass behavior.
+Aborting an owning supervisor also aborts its child, preventing detached loops.
+
+Agent Chat keeps its existing 250 ms capacity-gated poller and active-turn
+JoinSet. Only admission polling has a warning budget; individual turn execution
+is outside it. The set is outside the poller's unwind boundary: a panic cancels
+and drains the old turns before it is rethrown to the supervisor for restart.
+Panic cleanup waits 15 seconds (the CLI executor's 10-second SIGTERM grace
+before SIGKILL, plus 5), so a CLI turn's process group is killed before any
+abort, then aborts and joins non-cooperative turns before restarting. Cooperative shutdown uses the same
+cancel-and-drain path under the existing runtime shutdown deadline. Turn-lifetime drop guards cancel both the provider
+signal and lease-renewal token on every exit, including panic and hard abort,
+so an unfinished lease can expire rather than being renewed indefinitely.
+Per-execution/per-probe/per-terminal tasks, request-bound provider-health CAS retries and usage/log scans, daemon WebSocket transport and
+the Axum listener retain their current owners. The read-only domain-event relay
+already uses `WorkerSupervisor` and retains its separate `event_relay` status.
+
+
 Project hooks and notifications cut over in migration `V202610030200`.
 Each new cursor is seeded at `MAX(domain_event.sequence)` in the migration
 transaction; existing cursors and all user history survive. Only events committed

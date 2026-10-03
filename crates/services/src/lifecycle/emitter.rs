@@ -60,13 +60,43 @@ impl LifecycleEventEmitter {
         self
     }
 
+    pub fn start(
+        self: Arc<Self>,
+        bus: Arc<events::EventBus>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let initial = std::sync::Mutex::new(Some(bus.subscribe()));
+        workers
+            .worker("lifecycle-projection")
+            .with_tick_timeout(std::time::Duration::from_secs(3600))
+            .start(
+                shutdown,
+                || false,
+                move |worker, shutdown| {
+                    let emitter = Arc::clone(&self);
+                    let rx = initial
+                        .lock()
+                        .expect("lifecycle receiver")
+                        .take()
+                        .unwrap_or_else(|| bus.subscribe());
+                    async move {
+                        emitter
+                            .run_until_shutdown(rx, Some(shutdown), Some(worker))
+                            .await;
+                        Ok(())
+                    }
+                },
+            )
+    }
+
     /// Run the emitter until the event bus closes.
     ///
     /// This is retained for callers that own the receiver directly. Runtime
     /// assembly should prefer [`Self::run_with_shutdown`] so the receiver
     /// loop has an explicit lifecycle boundary.
     pub async fn run(&self, rx: broadcast::Receiver<ForgeEvent>) {
-        self.run_until_shutdown(rx, None).await;
+        self.run_until_shutdown(rx, None, None).await;
     }
 
     /// Run the emitter until the event bus closes or shutdown is requested.
@@ -78,13 +108,14 @@ impl LifecycleEventEmitter {
         rx: broadcast::Receiver<ForgeEvent>,
         shutdown: watch::Receiver<bool>,
     ) {
-        self.run_until_shutdown(rx, Some(shutdown)).await;
+        self.run_until_shutdown(rx, Some(shutdown), None).await;
     }
 
     async fn run_until_shutdown(
         &self,
         mut rx: broadcast::Receiver<ForgeEvent>,
         shutdown: Option<watch::Receiver<bool>>,
+        worker: Option<crate::worker_runtime::PeriodicWorker>,
     ) {
         if shutdown.as_ref().is_some_and(|receiver| *receiver.borrow()) {
             return;
@@ -103,8 +134,15 @@ impl LifecycleEventEmitter {
                 result = rx.recv() => {
                     match result {
                         Ok(event) => {
-                            if let Err(error) = self.handle_event(event).await {
-                                warn!(%error, "lifecycle event emitter failed");
+                            if !handles_event(&event) { continue; }
+                            if let Some(worker) = &worker {
+                                if let Err(error) = worker.tick(async {
+                                    self.handle_event(event).await.map_err(crate::ServiceError::invalid_operation)
+                                }).await {
+                                    warn!(worker = worker.name(), %error, "lifecycle event emitter failed");
+                                }
+                            } else if let Err(error) = self.handle_event(event).await {
+                                warn!(worker = "lifecycle-projection", %error, "lifecycle event emitter failed");
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -502,6 +540,19 @@ async fn wait_for_shutdown(mut shutdown: Option<watch::Receiver<bool>>) {
     }
 }
 
+// Match the handler's existing context/type gates before allocating tick health.
+fn handles_event(event: &ForgeEvent) -> bool {
+    match &event.context {
+        EventContext::TaskStatusChanged { .. } => event.event_type == "task.status_changed",
+        EventContext::TaskMoved(payload) => {
+            event.event_type == events::TASK_MOVED_EVENT && payload.old_status != payload.new_status
+        }
+        EventContext::TaskAssigned { .. } => event.event_type == "task.execution_launched",
+        EventContext::ExecutionStarted { .. } => true,
+        _ => false,
+    }
+}
+
 fn lifecycle_hooks_for(
     hooks: &LifecycleHooks,
     event: api_types::LifecycleEvent,
@@ -548,6 +599,39 @@ mod tests {
     use db::{create_sqlite_pool, SqliteDb};
     use events::EventBus;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn ignored_streaming_events_do_not_tick_or_touch_health() {
+        let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let workers = crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db));
+        let emitter = LifecycleEventEmitter::new_for_test(db, Arc::new(PluginRegistry::default()));
+        let bus = EventBus::new(1024);
+        let rx = bus.subscribe();
+        for _ in 0..512 {
+            bus.publish(ForgeEvent {
+                event_type: "execution.log".to_owned(),
+                entity_id: "execution".to_owned(),
+                timestamp: events::event_timestamp(),
+                context: EventContext::ReconciliationEvent {
+                    task_id: None,
+                    execution_id: None,
+                    reason: "stream".to_owned(),
+                },
+            });
+        }
+        // A closed bus drains its queued events before Closed: the loop must
+        // process all 512 hints without creating even its first health tick.
+        drop(bus);
+        timeout(
+            Duration::from_secs(5),
+            emitter.run_until_shutdown(rx, None, Some(workers.worker("lifecycle-projection"))),
+        )
+        .await
+        .unwrap();
+        assert!(workers.status().await.unwrap()[0].last_tick_at.is_none());
+    }
 
     #[tokio::test]
     async fn run_with_shutdown_stops_the_receiver_loop() {

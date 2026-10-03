@@ -419,32 +419,53 @@ impl HeartbeatMonitor {
         self
     }
 
-    pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(
+    pub fn start(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+    ) -> tokio::task::JoinHandle<()> {
+        self.start_with_check(workers, Duration::from_secs(300), |monitor| async move {
+            monitor.check_timeouts().await
+        })
+    }
+
+    fn start_with_check<F, Fut>(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        budget: Duration,
+        check: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: Fn(Arc<Self>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let check = Arc::new(check);
+        let stop = Arc::clone(&self);
+        workers.worker("heartbeat-monitor").with_stall_budget(budget).start_stoppable(move || stop.is_stopped(), move |worker| {
+            let monitor = Arc::clone(&self);
+            let check = Arc::clone(&check);
             async move {
-                tracing::info!(
-                    check_interval_seconds = self.check_interval.as_secs(),
-                    "heartbeat monitor started"
-                );
-                while !self.is_stopped() {
-                    if let Err(error) = self.check_timeouts().await {
-                        tracing::warn!(%error, "heartbeat monitor check failed");
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(self.check_interval) => {}
-                        _ = self.stop_notify.notified() => {}
-                        _ = async {
-                            match self.daemon_connections.as_ref() {
-                                Some(registry) => registry.reconciliation_notify().notified().await,
-                                None => std::future::pending::<()>().await,
-                            }
-                        } => {}
-                    }
-                }
+                tracing::info!(check_interval_seconds = monitor.check_interval.as_secs(), "heartbeat monitor started");
+                let result = worker.run(
+                    || monitor.is_stopped(),
+                    "heartbeat monitor check failed",
+                    || check(Arc::clone(&monitor)),
+                    || async {
+                        tokio::select! {
+                            _ = tokio::time::sleep(monitor.check_interval) => {}
+                            _ = monitor.stop_notify.notified() => {}
+                            _ = async {
+                                match monitor.daemon_connections.as_ref() {
+                                    Some(registry) => registry.reconciliation_notify().notified().await,
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {}
+                        }
+                    },
+                ).await;
                 tracing::info!("heartbeat monitor stopped");
-            }
-            .instrument(tracing::info_span!("heartbeat.monitor")),
-        )
+                result
+            }.instrument(tracing::info_span!("heartbeat.monitor"))
+        })
     }
 
     #[tracing::instrument(skip(self))]
@@ -4432,16 +4453,91 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn supervised_heartbeat_recovers_panic_reports_budget_without_cancelling_and_stops() {
+        use std::sync::atomic::AtomicUsize;
+        struct InFlight(Arc<AtomicBool>);
+        impl Drop for InFlight {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let db = Arc::new(sqlite_db().await);
+        let workers = crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db));
+        let monitor = Arc::new(HeartbeatMonitor::with_check_interval(
+            db,
+            Arc::new(EventBus::new(16)),
+            Duration::from_secs(300),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let complete = Arc::new(tokio::sync::Notify::new());
+        let handle = Arc::clone(&monitor).start_with_check(&workers, Duration::from_millis(100), {
+            let calls = Arc::clone(&calls);
+            let in_flight = Arc::clone(&in_flight);
+            let resume = Arc::clone(&resume);
+            let complete = Arc::clone(&complete);
+            move |_| {
+                let calls = Arc::clone(&calls);
+                let in_flight = Arc::clone(&in_flight);
+                let resume = Arc::clone(&resume);
+                let complete = Arc::clone(&complete);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("heartbeat tick panic");
+                    }
+                    in_flight.store(true, Ordering::SeqCst);
+                    let _in_flight = InFlight(in_flight);
+                    resume.notified().await;
+                    complete.notify_one();
+                    Ok(())
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !workers.status().await.unwrap().iter().any(|row| {
+                row.worker_name == "heartbeat-monitor"
+                    && row
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("tick running longer than 100ms"))
+            }) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(in_flight.load(Ordering::SeqCst));
+        resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), complete.notified())
+            .await
+            .unwrap();
+        monitor.stop();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let row = workers.status().await.unwrap().remove(0);
+        assert!(!row.running);
+        assert_eq!(row.restart_count, 1);
+        assert!(row.last_error.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(!in_flight.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn heartbeat_monitor_start_stops() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let monitor = Arc::new(HeartbeatMonitor::with_check_interval(
-            db,
+            Arc::clone(&db),
             event_bus,
             Duration::from_millis(1),
         ));
 
-        let handle = Arc::clone(&monitor).start();
+        let handle = Arc::clone(&monitor).start(&crate::worker_runtime::PeriodicWorkers::new(
+            Arc::clone(&db),
+        ));
         monitor.stop();
         handle.await.expect("monitor task joins");
         assert!(monitor.is_stopped());

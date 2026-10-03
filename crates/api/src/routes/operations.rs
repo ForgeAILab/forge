@@ -5,7 +5,7 @@ use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{errors::ApiResult, routes::auth::RequireAdmin, state::AppState};
 
-/// Admin snapshot including live worker backlog, supervised relay status,
+/// Admin snapshot including live worker backlog, periodic tick/restart health, supervised relay status,
 /// lasting dead-letter history, SQLite storage diagnostics and usage index charge.
 pub async fn get_operations_status(
     _admin: RequireAdmin,

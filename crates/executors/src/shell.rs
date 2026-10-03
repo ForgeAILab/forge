@@ -21,7 +21,8 @@ use tokio::{
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const DEFAULT_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(10);
+/// How long `cancel` waits after SIGTERM before it SIGKILLs the process group.
+pub const DEFAULT_CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct ShellExecutor {

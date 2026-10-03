@@ -48,18 +48,32 @@ impl DaemonMonitor {
         }
     }
 
-    pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            while !self.is_stopped() {
-                if let Err(error) = self.check_once().await {
-                    tracing::warn!(%error, "daemon monitor check failed");
+    pub fn start(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+    ) -> tokio::task::JoinHandle<()> {
+        let stop = Arc::clone(&self);
+        workers.worker("daemon-monitor").start_stoppable(
+            move || stop.is_stopped(),
+            move |worker| {
+                let monitor = Arc::clone(&self);
+                async move {
+                    worker
+                        .run(
+                            || monitor.is_stopped(),
+                            "daemon monitor check failed",
+                            || monitor.check_once(),
+                            || async {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(monitor.check_interval) => {}
+                                    _ = monitor.stop_notify.notified() => {}
+                                }
+                            },
+                        )
+                        .await
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(self.check_interval) => {}
-                    _ = self.stop_notify.notified() => {}
-                }
-            }
-        })
+            },
+        )
     }
 
     pub fn stop(&self) {
