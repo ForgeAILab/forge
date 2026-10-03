@@ -410,9 +410,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   rows added or changed since the previous read, so warm reads no longer grow
   with the size of the ledger. A page of Agents loads usage, execution
   statistics, assignments and effective status in a few batched queries
-  instead of several per Agent. The index keeps up to about 41,000 usage
-  events (128 MiB) per server process; a larger ledger falls back to a
-  memoized full read. A new migration adds change markers for the index
+  instead of several per Agent. By default the index keeps up to about
+  41,000 usage events (128 MiB) per server process; a larger ledger falls
+  back to a memoized full read. The budget is `server.usage_index_budget_mb`
+  (config file, `FORGE_SERVER_USAGE_INDEX_BUDGET_MB`,
+  `forge --usage-index-budget-mb N`, the Settings API and the Forge Settings
+  page; `0` turns the index off). A change applies on the next usage read,
+  and the Operations page shows the index size, the budget and whether reads
+  use the fallback. A new migration adds change markers for the index
   (`usage_ledger_revision` and changed-row tables); ledger rows are unchanged.
 - A paused Agent reports no runnable machines (`runnable_on.count` 0) and no
   longer runs a CLI availability probe when an Agent list is loaded.
