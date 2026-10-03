@@ -1631,3 +1631,41 @@ async fn verification_receipt_redacts_origin_credentials() {
         assert!(!encoded.contains(secret), "{encoded}");
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_run_applies_machine_build_environment_and_niceness() {
+    let fixture = Fixture::new().await;
+    let executable = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\'', "'\\''");
+    let command = format!("test \"$CARGO_BUILD_JOBS\" = project || exit 91; printf '%s\\n' \"$MAKEFLAGS\"; '{executable}' --exact daemon_config::budget_tests::daemon_priority_probe --nocapture");
+    let mut params = fixture.run("budget-run", WorkspaceRunPurpose::CiStep, &command);
+    params.env = vec![("CARGO_BUILD_JOBS".into(), "project".into())];
+    let result = fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_RUN,
+            serde_json::to_value(params).unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+    let result: WorkspaceRunResult = serde_json::from_value(result).unwrap();
+    assert_eq!(result.exit_code, Some(0));
+    let budget = executors::run_process::machine_policy().get();
+    assert_eq!(
+        result.stdout.lines().next().unwrap(),
+        std::env::var("MAKEFLAGS").unwrap_or_else(|_| format!("-j{}", budget.build_jobs()))
+    );
+    let nice: i32 = result
+        .stdout
+        .lines()
+        .find_map(|line| line.split_once("FORGE_NICE=").map(|(_, value)| value))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let baseline = executors::run_process::current_niceness();
+    assert_eq!(nice, (baseline + budget.run_nice as i32).min(19));
+}

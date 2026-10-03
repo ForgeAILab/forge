@@ -667,6 +667,8 @@ fn clear_forge_env() {
     for key in [
         "FORGE_EVENT_CONSUMER_STALL_SECONDS",
         "FORGE_SERVER_BIND",
+        "FORGE_SERVER_BUILD_JOBS_PER_RUN",
+        "FORGE_SERVER_RUN_NICE",
         "FORGE_PUBLIC_BASE_URL",
         "FORGE_PUBLIC_SEARCH_ENDPOINT",
         "FORGE_PUBLIC_SEARCH_TIMEOUT_MS",
@@ -810,4 +812,48 @@ fn default_data_dir_tripwire_panics_in_test_binary() {
         Ok("1")
     );
     let _ = default_data_dir();
+}
+
+#[test]
+fn run_budget_file_env_flag_precedence_and_validation() {
+    let _guard = env_lock().lock().unwrap();
+    clear_forge_env();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("forge.yaml");
+    fs::write(&path, "server:\n  build_jobs_per_run: 3\n  run_nice: 7\n").unwrap();
+    let load = |jobs, nice| {
+        ForgeConfig::load(
+            Some(&path),
+            ConfigOverrides {
+                server_build_jobs_per_run: jobs,
+                server_run_nice: nice,
+                ..test_overrides(dir.path())
+            },
+        )
+    };
+    let cfg = load(None, None).unwrap();
+    assert_eq!(cfg.server.build_jobs_per_run, Some(3));
+    assert_eq!(cfg.server.run_nice, 7);
+    env::set_var("FORGE_SERVER_BUILD_JOBS_PER_RUN", "0");
+    env::set_var("FORGE_SERVER_RUN_NICE", "0");
+    let cfg = load(None, None).unwrap();
+    assert_eq!(cfg.server.build_jobs_per_run, Some(0));
+    assert_eq!(cfg.server.run_nice, 0);
+    let cfg = load(Some(5), Some(19)).unwrap();
+    assert_eq!(cfg.server.build_jobs_per_run, Some(5));
+    assert_eq!(cfg.server.run_nice, 19);
+    assert!(load(None, Some(20)).is_err());
+    env::set_var("FORGE_SERVER_RUN_NICE", "20");
+    assert!(load(None, None).is_err());
+    env::set_var("FORGE_SERVER_BUILD_JOBS_PER_RUN", "-1");
+    assert!(load(None, None).is_err());
+    clear_forge_env();
+    fs::write(&path, "{}").unwrap();
+    let cfg = load(None, None).unwrap();
+    assert_eq!(cfg.server.build_jobs_per_run, None);
+    assert_eq!(cfg.server.run_nice, 10);
+    fs::write(&path, "server:\n  build_jobs_per_run: 0\n  run_nice: 0\n").unwrap();
+    let cfg = load(None, None).unwrap();
+    assert_eq!(cfg.server.build_jobs_per_run, Some(0));
+    assert_eq!(cfg.server.run_nice, 0);
 }

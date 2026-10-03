@@ -514,6 +514,7 @@ impl EmbeddedTaskExecutor {
             input,
             server_state_card: None,
             command_allowlist: Some(command_allowlist.clone()),
+            environment: executors::environment::task_environment(&ctx.agent_config),
             cancellation: cancellation.clone(),
         };
         let output = self

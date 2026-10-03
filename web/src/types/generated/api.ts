@@ -1675,6 +1675,9 @@ export interface ActiveExecutionSummary {
 }
 
 export interface DaemonPressureSummary {
+  logical_cores: number | null
+  build_jobs_per_run: number | null
+  run_nice: number | null
   daemon_id: string
   hostname: string | null
   active_runs: number
@@ -1809,6 +1812,8 @@ export interface UpdateForgePathsRequest {
 }
 
 export interface UpdateServerSettingsRequest {
+  build_jobs_per_run?: number | null
+  run_nice?: number | null
   max_concurrent_runs?: number | null
   bind?: string | null
   mcp_enabled?: boolean | null

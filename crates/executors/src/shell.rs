@@ -118,6 +118,10 @@ impl TaskExecutor for ShellExecutor {
         for (key, value) in &plan.env_set {
             command.env(key, value);
         }
+        crate::run_process::apply(
+            &mut command,
+            &crate::environment::task_environment(&ctx.agent_config),
+        );
         configure_process_group(&mut command);
 
         let mut child = match command.spawn() {

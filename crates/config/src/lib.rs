@@ -6,7 +6,9 @@ mod file;
 mod jwt_secret;
 mod loader;
 mod machine_capacity;
+mod run_budget;
 pub use machine_capacity::{automatic_run_cap_for_cores, embedded_machine_id, resolved_run_cap};
+pub use run_budget::{default_run_nice, logical_cores, resolved_build_jobs_for_cores, RunBudget};
 mod path;
 mod runtime;
 #[cfg(test)]

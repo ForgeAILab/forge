@@ -1935,6 +1935,7 @@ async fn fetch_needs_both_a_host_transport_and_the_scopes_web_permission() {
             ProjectChatToolContext::default(),
             Some(Arc::new(fixture.provider.clone())),
             ScopeToolRuntime {
+                environment: Default::default(),
                 command_allowlist: None,
                 fetch_transport: transport
                     .then(|| Arc::new(ForgeFetchTransport::new()) as Arc<dyn FetchTransport>),
@@ -1983,6 +1984,7 @@ async fn a_task_worker_reaches_documentation_only_with_its_read_permission() {
             ProjectChatToolContext::default(),
             Some(Arc::new(fixture.provider.clone())),
             ScopeToolRuntime {
+                environment: Default::default(),
                 command_allowlist: None,
                 fetch_transport: Some(Arc::new(ForgeFetchTransport::new())),
             },

@@ -163,12 +163,24 @@ const degradedStatus: OperatorStatusResponse = {
     },
   ],
   daemon_pressure: [
-    { daemon_id: 'server_host', hostname: 'Server host', active_runs: 2, max_concurrent_runs: 4, at_capacity: false },
+    {
+      daemon_id: 'server_host',
+      hostname: 'Server host',
+      active_runs: 2,
+      max_concurrent_runs: 4,
+      logical_cores: 8,
+      build_jobs_per_run: 2,
+      run_nice: 10,
+      at_capacity: false,
+    },
     {
       daemon_id: 'daemon-1',
       hostname: 'worker-01',
       active_runs: 2,
       max_concurrent_runs: 4,
+      logical_cores: null,
+      build_jobs_per_run: null,
+      run_nice: null,
       at_capacity: false,
     },
   ],
@@ -221,12 +233,13 @@ describe('OperationsPage', () => {
     } as unknown as ReturnType<typeof useRefreshOperationsMutation>)
   })
 
-
-it('lists server-host occupancy and links it to live settings', () => {
-  render(<OperationsPage />)
-  expect(screen.getByRole('link', { name: 'Server host' }).getAttribute('href')).toBe('/settings')
-  expect(screen.getByRole('link', { name: 'Server host' }).parentElement?.textContent).toContain('2/4 active runs')
-})
+  it('lists server-host occupancy and links it to live settings', () => {
+    render(<OperationsPage />)
+    expect(screen.getByRole('link', { name: 'Server host' }).getAttribute('href')).toBe('/settings')
+    expect(screen.getByRole('link', { name: 'Server host' }).parentElement?.textContent).toContain(
+      '2/4 active runs',
+    )
+  })
   it('renders summary counters with correct counts', () => {
     render(<OperationsPage />)
 
@@ -304,6 +317,11 @@ it('lists server-host occupancy and links it to live settings', () => {
     expect(screen.getByText('Conversion required')).toBeTruthy()
     expect(screen.getByText('42')).toBeTruthy()
     expect(screen.queryByText('All systems healthy')).toBeNull()
+  })
+
+  it('shows effective server build and priority facts with the run cap', () => {
+    render(<OperationsPage />)
+    expect(screen.getByText(/8 cores · 2 jobs\/run · nice \+10/)).toBeTruthy()
   })
 
   it('renders recent error rows as task drill-down links', () => {

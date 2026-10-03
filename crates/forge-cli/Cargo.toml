@@ -9,6 +9,7 @@ name = "forge"
 path = "src/main.rs"
 
 [dependencies]
+executors = { path = "../executors" }
 api = { path = "../api" }
 cli-adapters = { path = "../cli-adapters" }
 clap = { version = "4", features = ["derive"] }

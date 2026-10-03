@@ -111,6 +111,10 @@ pub struct ForgePaths {
 pub struct ServerConfig {
     #[serde(default)]
     pub max_concurrent_runs: Option<u32>,
+    #[serde(default)]
+    pub build_jobs_per_run: Option<u32>,
+    #[serde(default = "crate::default_run_nice")]
+    pub run_nice: u32,
     pub bind: String,
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -242,6 +246,8 @@ pub struct ProjectSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigOverrides {
     pub server_max_concurrent_runs: Option<u32>,
+    pub server_build_jobs_per_run: Option<u32>,
+    pub server_run_nice: Option<u32>,
     pub server_bind: Option<String>,
     pub server_public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,
@@ -346,6 +352,11 @@ impl ForgeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.server.run_nice > 19 {
+            return Err(ConfigError::InvalidConfig {
+                message: "server.run_nice must be between 0 and 19".to_owned(),
+            });
+        }
         if self.server.event_consumer_stall_seconds == 0 {
             return Err(ConfigError::InvalidConfig {
                 message: "server.event_consumer_stall_seconds must be positive".to_owned(),
@@ -381,6 +392,8 @@ impl ForgeConfig {
             forge: ForgePaths { data_dir },
             server: ServerConfig {
                 max_concurrent_runs: None,
+                build_jobs_per_run: None,
+                run_nice: crate::default_run_nice(),
                 bind: DEFAULT_SERVER_BIND.to_owned(),
                 public_base_url: None,
                 mcp_enabled: true,

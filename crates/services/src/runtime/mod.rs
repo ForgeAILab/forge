@@ -260,6 +260,7 @@ pub struct ForgeRuntime {
     pub provider_authorization_service: Arc<ProviderAuthorizationService>,
     pub config_path: Arc<PathBuf>,
     pub effective_config: Arc<ForgeConfig>,
+    pub run_process_policy: Arc<executors::run_process::MachineRunPolicy>,
 }
 
 impl ForgeRuntime {
@@ -267,6 +268,11 @@ impl ForgeRuntime {
     /// after constructing a compatibility AppState.  New callers should pass
     /// the final config to the builder up front.
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
+        self.run_process_policy.update(
+            Some(config.server.max_concurrent_runs),
+            Some(config.server.build_jobs_per_run),
+            Some(config.server.run_nice),
+        );
         self.db.server_run_cap.set(
             config.server.max_concurrent_runs,
             config::resolved_run_cap(config.server.max_concurrent_runs),
@@ -561,6 +567,9 @@ impl ForgeRuntimeBuilder {
             ))
         });
         let effective_config = self.config;
+        let run_process_policy = Arc::new(executors::run_process::MachineRunPolicy::new(
+            (&effective_config.server).into(),
+        ));
         self.db.server_run_cap.set(
             effective_config.server.max_concurrent_runs,
             config::resolved_run_cap(effective_config.server.max_concurrent_runs),
@@ -695,6 +704,7 @@ impl ForgeRuntimeBuilder {
                 Arc::clone(&self.db),
                 Arc::clone(&workspace_backend_router),
             )
+            .with_run_process_policy(Arc::clone(&run_process_policy))
             .with_consumer_stall_seconds(effective_config.server.event_consumer_stall_seconds)
             .with_daemon_connections(Arc::clone(&daemon_connections)),
         );
@@ -811,6 +821,7 @@ impl ForgeRuntimeBuilder {
             provider_authorization_service,
             config_path: Arc::new(self.config_path),
             effective_config: Arc::new(effective_config),
+            run_process_policy,
         };
         if start_notification_service {
             // Compatibility AppState constructors still start notifications

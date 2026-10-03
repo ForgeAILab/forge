@@ -309,6 +309,7 @@ impl ChatFixture {
             input: input.to_owned(),
             server_state_card: None,
             command_allowlist: None,
+            environment: Default::default(),
             cancellation: CancellationToken::new(),
         }
     }

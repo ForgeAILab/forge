@@ -26,6 +26,12 @@ struct Cli {
     /// Maximum concurrent runs on the server host (default: automatic; 0: unlimited).
     #[arg(long)]
     max_concurrent_runs: Option<u32>,
+    /// Build jobs per run (unset: automatic; 0: disabled).
+    #[arg(long)]
+    build_jobs_per_run: Option<u32>,
+    /// Unix niceness increment for run children (0: off).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
+    run_nice: Option<u32>,
     #[arg(long)]
     demo: bool,
     #[arg(long = "no-mcp")]
@@ -60,6 +66,8 @@ async fn run() {
         None,
         ConfigOverrides {
             server_max_concurrent_runs: cli.max_concurrent_runs,
+            server_build_jobs_per_run: cli.build_jobs_per_run,
+            server_run_nice: cli.run_nice,
             mcp_enabled: if cli.no_mcp { Some(false) } else { None },
             data_dir: cli.data_dir,
             event_consumer_stall_seconds: cli.event_consumer_stall_seconds,
@@ -90,6 +98,9 @@ async fn run() {
     }
 
     init_tracing(&config.forge.data_dir.join("logs"));
+    executors::run_process::install_machine_policy(Arc::new(
+        executors::run_process::MachineRunPolicy::new((&config.server).into()),
+    ));
 
     let configured_addr: SocketAddr = config
         .server
@@ -267,6 +278,7 @@ async fn run() {
     let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start();
     let state =
         api::AppState::from_runtime_arc(Arc::clone(&runtime), effective_config.server.mcp_enabled);
+    executors::run_process::install_machine_policy(Arc::clone(&state.run_process_policy));
     let shared_media_cleanup_handle =
         Arc::clone(&shared_media_cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
     let external_sync = Arc::new(services::ExternalSyncService::new(

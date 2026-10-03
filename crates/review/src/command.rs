@@ -6,6 +6,7 @@ use tokio::process::Command;
 pub fn workspace_command(path: &Path, step: &str, env: &BTreeMap<String, String>) -> Command {
     let mut command = Command::new("bash");
     command.arg("-lc").arg(step).envs(env).current_dir(path);
+    executors::run_process::apply(&mut command, env);
     command
 }
 
@@ -62,4 +63,37 @@ pub(crate) async fn bounded_output(
     })
     .await
     .map_err(|_| "review command timed out".to_owned())?
+}
+
+#[cfg(test)]
+mod run_budget_tests {
+    use super::*;
+    #[test]
+    fn launch_environment_preserves_project_and_fills_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let env =
+            std::collections::BTreeMap::from([("CARGO_BUILD_JOBS".into(), "project-value".into())]);
+        let command = workspace_command(temp.path(), "cargo test", &env);
+        let envs: std::collections::BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+            .collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CARGO_BUILD_JOBS")).unwrap(),
+            "project-value"
+        );
+        let jobs = executors::run_process::machine_policy().get().build_jobs();
+        for (key, default) in [
+            ("RUST_TEST_THREADS", jobs.to_string()),
+            ("MAKEFLAGS", format!("-j{jobs}")),
+            ("CMAKE_BUILD_PARALLEL_LEVEL", jobs.to_string()),
+            ("GOFLAGS", format!("-p={jobs}")),
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&std::env::var_os(key).unwrap_or(default.into()))
+            );
+        }
+    }
 }

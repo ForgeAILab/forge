@@ -339,6 +339,7 @@ Your inquiry id is {inquiry_id}."
             // to layer over it.
             server_state_card: None,
             command_allowlist: Some(embedded_agents.effective_command_allowlist(None).await),
+            environment: Default::default(),
             cancellation: turn_cancellation.clone(),
         };
 

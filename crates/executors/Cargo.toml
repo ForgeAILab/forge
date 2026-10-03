@@ -8,6 +8,8 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+config = { path = "../config" }
+tracing.workspace = true
 api-types = { path = "../api-types" }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -21,5 +23,9 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt",
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
-[lints]
-workspace = true
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Only run_process's audited pre_exec callback permits unsafe OS syscalls.
+[lints.rust]
+unsafe_code = "deny"

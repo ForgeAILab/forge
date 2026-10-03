@@ -76,6 +76,7 @@ pub struct AppState {
     pub mcp_enabled: bool,
     pub config_path: Arc<PathBuf>,
     pub effective_config: Arc<ForgeConfig>,
+    pub run_process_policy: Arc<executors::run_process::MachineRunPolicy>,
     /// Keeps compatibility notification startup abortable when no runtime
     /// supervisor is present (for example in API-only test harnesses).
     _notification_worker: Arc<services::RuntimeTaskHandle>,
@@ -235,6 +236,7 @@ impl AppState {
             mcp_enabled,
             config_path: Arc::clone(&runtime.config_path),
             effective_config: Arc::clone(&runtime.effective_config),
+            run_process_policy: Arc::clone(&runtime.run_process_policy),
             _notification_worker: runtime.notification_worker_handle(),
             _test_data_dir: None,
         }
@@ -246,6 +248,11 @@ impl AppState {
     }
 
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
+        self.run_process_policy.update(
+            Some(config.server.max_concurrent_runs),
+            Some(config.server.build_jobs_per_run),
+            Some(config.server.run_nice),
+        );
         self.db.server_run_cap.set(
             config.server.max_concurrent_runs,
             config::resolved_run_cap(config.server.max_concurrent_runs),

@@ -386,6 +386,7 @@ impl EmbeddedAgentService {
             // so it carries the same transport the backend composes with.
             forge_agent_host::ScopeToolRuntime {
                 command_allowlist: None,
+                environment: Default::default(),
                 fetch_transport: Some(Arc::new(forge_agent_host::ForgeFetchTransport::new())),
             },
         )

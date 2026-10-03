@@ -258,11 +258,15 @@ function DaemonPressureSection({ items }: { items: DaemonPressureSummary[] }) {
             className="flex min-w-0 items-center justify-between gap-4 px-4 py-3 transition-colors hover:bg-muted/20"
           >
             <div className="min-w-0">
-              <EntityLink href={item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`}>
+              <EntityLink
+                href={item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`}
+              >
                 {item.hostname ?? item.daemon_id}
               </EntityLink>
               <p className="mt-1 text-xs text-muted-foreground">
                 {item.active_runs}/{item.max_concurrent_runs ?? 'Unlimited'} active runs
+                {item.logical_cores != null &&
+                  ` · ${item.logical_cores} cores · ${item.build_jobs_per_run === 0 ? 'budget off' : `${item.build_jobs_per_run} jobs/run`} · nice +${item.run_nice}`}
               </p>
             </div>
             <CapacityBadge atCapacity={item.at_capacity} />
@@ -289,7 +293,11 @@ function AgentPressureSection({ items }: { items: AgentPressureSummary[] }) {
                   {item.active_tasks}/{item.max_concurrent_tasks} active tasks
                 </span>
                 {item.daemon_id ? (
-                  <EntityLink href={item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`}>
+                  <EntityLink
+                    href={
+                      item.daemon_id === 'server_host' ? '/settings' : `/daemons/${item.daemon_id}`
+                    }
+                  >
                     Daemon {item.daemon_id}
                   </EntityLink>
                 ) : null}

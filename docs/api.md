@@ -2064,6 +2064,9 @@ Other keys retain their startup value until restart.
 | `server.bind` | HTTP bind address | Restart |
 | `server.mcp_enabled` | Boolean | Restart |
 | `server.max_concurrent_runs` | `null`: automatic; `0`: unlimited; positive integer: ceiling | Live |
+| `server.logical_cores` | Discovered logical cores | Read-only |
+| `server.build_jobs_per_run` | `null`: automatic; `0`: disabled; positive integer: exact budget | Live |
+| `server.run_nice` | Integer 0–19; default 10; 0 disables priority changes | Live |
 | `workspace.root` | Workspace-directory path | Restart |
 | `workspace.cleanup_delay_seconds` | Positive seconds | Restart |
 | `agent.max_concurrent_tasks` | Positive task quota | Restart |
@@ -2079,6 +2082,31 @@ Updates apply to the next placement admission after the YAML write succeeds.
 
 A live update supersedes a CLI or environment override for the running process;
 that override takes effect again at the next restart under the usual precedence.
+
+### Run build budget and priority settings
+
+`GET /api/v1/settings` includes `server.logical_cores` (read-only),
+`server.build_jobs_per_run` (configured null/0/positive value; effective numeric
+budget), and `server.run_nice` (configured increment 0–19, default 10). Zero
+build jobs disables budget variables. Null restores automatic jobs:
+`max(1, cores / positive_configured_run_cap)`, using the automatic run cap when
+the configured cap is null or zero. These settings never require restart.
+
+`PUT /api/v1/settings` accepts `server.build_jobs_per_run` as an unsigned
+integer or null, and `server.run_nice` as an integer 0–19; omitted fields keep
+their live values. Like the run cap, updates persist to YAML and apply to new
+processes immediately; file/environment/flag launch overrides apply after a
+restart. Only administrators may read or update Settings. The Project's
+`environment.env` wins over the operator environment, which wins over Forge's
+five build budget variables. Unix priority changes apply only to children;
+Windows ignores run_nice. Already running processes keep their launch policy.
+
+Operations `daemon_pressure` machine entries add nullable `logical_cores`,
+`build_jobs_per_run` and `run_nice`. The server host supplies these values;
+external daemons leave them null because build/priority policy stays local and
+is not sent over the protocol. `build_jobs_per_run: 0` denotes a disabled budget,
+while `run_nice` reports the configured increment, including on Windows.
+
 
 ### Daemon run limits
 

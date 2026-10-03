@@ -3046,6 +3046,24 @@ impl FederatedAgentChatTurnRunner {
             .embedded_agents
             .effective_command_allowlist(chat.as_ref().and_then(|chat| chat.project_id.as_deref()))
             .await;
+        let environment =
+            if let Some(project_id) = chat.as_ref().and_then(|chat| chat.project_id.as_deref()) {
+                match db::ProjectRepo::get_by_id(&*self.db, project_id).await? {
+                    Some(project) => {
+                        serde_json::from_str::<api_types::ProjectSettings>(&project.settings)
+                            .map_err(|error| {
+                                ServiceError::invalid_operation(format!(
+                                    "invalid project settings: {error}"
+                                ))
+                            })?
+                            .environment
+                            .env
+                    }
+                    None => Default::default(),
+                }
+            } else {
+                Default::default()
+            };
         let turn_log = self.turn_log_sink(job).await;
         let started = std::time::Instant::now();
         let output = match self
@@ -3094,6 +3112,7 @@ impl FederatedAgentChatTurnRunner {
                     input: input.content,
                     server_state_card: Some(state_card),
                     command_allowlist: Some(command_allowlist),
+                    environment,
                     cancellation,
                 },
                 turn_log,

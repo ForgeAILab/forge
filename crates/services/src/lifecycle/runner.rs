@@ -344,7 +344,9 @@ impl LifecycleHookRunner {
         };
         let environment_preview = environment_preview(ctx);
 
-        let child = match Command::new("bash")
+        let mut child_command = Command::new("bash");
+        executors::run_process::apply(&mut child_command, &ctx.env);
+        let child = match child_command
             .arg("-lc")
             .arg(command)
             .current_dir(&working_dir)
