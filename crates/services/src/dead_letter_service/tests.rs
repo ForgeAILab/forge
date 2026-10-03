@@ -1,5 +1,6 @@
 use super::*;
 use crate::worker_runtime::{Outcome, RetryPolicy, Subscription, WorkerError};
+use api_types::DeadLetterOutcome;
 use async_trait::async_trait;
 use db::{create_sqlite_pool, run_migrations, CreateDomainEvent, DomainEvent, DomainEventRepo};
 use sqlx::{Sqlite, Transaction};
@@ -13,6 +14,9 @@ struct Consumer {
     entered: Notify,
     release: Notify,
     seen: AtomicUsize,
+    commits: AtomicUsize,
+    requarantine: AtomicBool,
+    db: Option<Arc<SqliteDb>>,
     published: AtomicUsize,
 }
 impl Consumer {
@@ -24,6 +28,9 @@ impl Consumer {
             entered: Notify::new(),
             release: Notify::new(),
             seen: AtomicUsize::new(0),
+            commits: AtomicUsize::new(0),
+            requarantine: AtomicBool::new(false),
+            db: None,
             published: AtomicUsize::new(0),
         }
     }
@@ -57,6 +64,7 @@ impl Worker for Consumer {
         event: &DomainEvent,
         _: &(),
     ) -> std::result::Result<(), WorkerError> {
+        self.commits.fetch_add(1, Ordering::SeqCst);
         sqlx::query(
             "INSERT INTO replay_effect (consumer, sequence) VALUES (?, ?) ON CONFLICT DO NOTHING",
         )
@@ -65,6 +73,23 @@ impl Worker for Consumer {
         .execute(&mut **tx)
         .await
         .map_err(|e| WorkerError::new(e.to_string()))?;
+        if self.requarantine.load(Ordering::SeqCst) {
+            db::WorkerHealth::new(self.db.as_ref().unwrap().clone(), self.name)
+                .dead_letter_in_tx(
+                    tx,
+                    db::WorkItem {
+                        source_key: &event.sequence.to_string(),
+                        item_type: &event.event_type,
+                    },
+                    db::FailureState {
+                        attempts: 8,
+                        first_failed_at: &db::now_rfc3339(),
+                    },
+                    "commit re-quarantined the event",
+                )
+                .await
+                .map_err(|error| WorkerError::database("test quarantine", error))?;
+        }
         if self.fail.load(Ordering::SeqCst) {
             return Err(WorkerError::new("new commit error"));
         }
@@ -91,7 +116,10 @@ async fn fixture() -> (Arc<SqliteDb>, Arc<Consumer>, DeadLetterService, String) 
     run_migrations(&pool).await.unwrap();
     sqlx::query("CREATE TABLE replay_effect (consumer TEXT, sequence INTEGER, PRIMARY KEY (consumer, sequence))").execute(&pool).await.unwrap();
     let db = Arc::new(SqliteDb::new(pool));
-    let worker = Arc::new(Consumer::new("original"));
+    let worker = Arc::new(Consumer {
+        db: Some(db.clone()),
+        ..Consumer::new("original")
+    });
     db.append_event(CreateDomainEvent {
         id: db::new_uuid_v4(),
         event_type: "test.event".into(),
@@ -146,13 +174,15 @@ async fn replay_commits_effect_and_resolution_once_without_touching_cursors_or_o
     .await
     .unwrap();
     let result = service.replay(admin(), &id).await.unwrap();
-    assert_eq!(result.outcome, "replayed");
+    assert_eq!(result.outcome, DeadLetterOutcome::Replayed);
     assert_eq!(result.dead_letter.summary.attempts, 2);
     assert_eq!(result.dead_letter.resolved_by.as_deref(), Some("admin-1"));
     assert!(result.dead_letter.resolved_at.is_some());
     assert_eq!(effect_count(&db).await, 1);
     assert_eq!(worker.published.load(Ordering::SeqCst), 1);
     assert_eq!(other.seen.load(Ordering::SeqCst), 0);
+    assert_eq!(other.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(worker.commits.load(Ordering::SeqCst), 2);
     let cursor = db.get_consumer_cursor("original").await.unwrap().unwrap();
     assert_eq!(cursor.last_sequence, 100);
     assert_eq!(cursor.updated_at, "2000-01-01T00:00:00Z");
@@ -161,6 +191,7 @@ async fn replay_commits_effect_and_resolution_once_without_touching_cursors_or_o
         Err(ServiceError::Db(db::DbError::VersionConflict))
     ));
     assert_eq!(effect_count(&db).await, 1);
+    assert_eq!(worker.commits.load(Ordering::SeqCst), 2);
     assert_eq!(
         db.worker_dead_letter_history("original").await.unwrap().0,
         0
@@ -182,7 +213,7 @@ async fn replay_failure_rolls_back_effect_and_audits_new_attempt_without_automat
     let (db, worker, service, id) = fixture().await;
     worker.fail.store(true, Ordering::SeqCst);
     let result = service.replay(admin(), &id).await.unwrap();
-    assert_eq!(result.outcome, "replay_failed");
+    assert_eq!(result.outcome, DeadLetterOutcome::ReplayFailed);
     assert!(result.dead_letter.resolved_at.is_none());
     assert_eq!(result.dead_letter.summary.attempts, 2);
     assert_eq!(result.dead_letter.summary.reason, "new commit error");
@@ -225,7 +256,7 @@ async fn dismiss_audits_reason_and_excludes_resolved_from_status() {
         .dismiss(admin(), &id, Some("obsolete event"))
         .await
         .unwrap();
-    assert_eq!(result.outcome, "dismissed");
+    assert_eq!(result.outcome, DeadLetterOutcome::Dismissed);
     assert_eq!(
         result.dead_letter.resolution_reason.as_deref(),
         Some("obsolete event")
@@ -264,6 +295,7 @@ async fn dismiss_wins_race_during_replay_preparation_and_replay_has_no_effect() 
         Err(ServiceError::Db(db::DbError::VersionConflict))
     ));
     assert_eq!(effect_count(&db).await, 0);
+    assert_eq!(worker.commits.load(Ordering::SeqCst), 1);
     let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter_action")
         .fetch_one(db.pool())
         .await
@@ -298,6 +330,7 @@ async fn concurrent_replays_have_one_winner_and_one_effect() {
         Err(ServiceError::Db(db::DbError::VersionConflict))
     ));
     assert_eq!(effect_count(&db).await, 1);
+    assert_eq!(worker.commits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -328,7 +361,7 @@ async fn unregistered_consumer_replay_is_an_audited_failure() {
     let (db, _, _, id) = fixture().await;
     let service = DeadLetterService::new(db.clone());
     let result = service.replay(admin(), &id).await.unwrap();
-    assert_eq!(result.outcome, "replay_failed");
+    assert_eq!(result.outcome, DeadLetterOutcome::ReplayFailed);
     assert_eq!(result.dead_letter.summary.attempts, 2);
     assert_eq!(
         result.dead_letter.summary.reason,
@@ -336,4 +369,162 @@ async fn unregistered_consumer_replay_is_an_audited_failure() {
     );
     assert!(result.dead_letter.resolved_at.is_none());
     assert_eq!(effect_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn item_keys_are_refused_without_writes_and_can_be_dismissed() {
+    let (db, worker, service, id) = fixture().await;
+    for key in [
+        "event:1:commitment:a",
+        "event:1:inbox:recipient",
+        "wake-retry:disposition",
+        "01",
+        "+1",
+        "0",
+        "-1",
+    ] {
+        sqlx::query("UPDATE worker_dead_letter SET source_key = ? WHERE id = ?")
+            .bind(key)
+            .bind(&id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            service.replay(admin(), &id).await,
+            Err(ServiceError::Db(db::DbError::DeadLetterNotReplayable))
+        ));
+        let row = db.get_dead_letter(&id).await.unwrap();
+        assert_eq!(row.version, 0);
+        assert_eq!(row.attempts, 1);
+        assert!(row.resolved_at.is_none());
+        assert!(!row.replayable());
+    }
+    assert_eq!(worker.seen.load(Ordering::SeqCst), 1);
+    assert_eq!(worker.commits.load(Ordering::SeqCst), 1);
+    let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter_action")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(audit, 0);
+    assert_eq!(
+        service.dismiss(admin(), &id, None).await.unwrap().outcome,
+        DeadLetterOutcome::Dismissed
+    );
+}
+
+#[tokio::test]
+async fn consumer_requarantine_inside_commit_is_a_failed_replay_with_rolled_back_effects() {
+    let (db, worker, service, id) = fixture().await;
+    worker.requarantine.store(true, Ordering::SeqCst);
+    let result = service.replay(admin(), &id).await.unwrap();
+    assert_eq!(result.outcome, DeadLetterOutcome::ReplayFailed);
+    assert_eq!(
+        result.dead_letter.summary.reason,
+        "commit re-quarantined the event"
+    );
+    assert_eq!(result.dead_letter.summary.attempts, 2);
+    assert!(result.dead_letter.resolved_at.is_none());
+    assert_eq!(effect_count(&db).await, 0);
+    assert_eq!(worker.commits.load(Ordering::SeqCst), 2);
+    assert_eq!(worker.published.load(Ordering::SeqCst), 0);
+    let audit: (String, i64) =
+        sqlx::query_as("SELECT outcome, version FROM worker_dead_letter_action")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(audit, ("replay_failed".into(), 1));
+}
+
+#[tokio::test]
+async fn new_quarantine_reopens_resolved_identity_and_moves_its_version() {
+    let (db, _, service, id) = fixture().await;
+    service
+        .dismiss(admin(), &id, Some("old reason"))
+        .await
+        .unwrap();
+    let before = db.get_dead_letter(&id).await.unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    db::WorkerHealth::new(db.clone(), "original")
+        .dead_letter_in_tx(
+            &mut tx,
+            db::WorkItem {
+                source_key: &before.source_key,
+                item_type: "test.event",
+            },
+            db::FailureState {
+                attempts: 8,
+                first_failed_at: &db::now_rfc3339(),
+            },
+            "new rejection",
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let after = db.get_dead_letter(&id).await.unwrap();
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.version, before.version + 1);
+    assert_eq!(after.attempts, 8);
+    assert_eq!(after.last_error, "new rejection");
+    assert!(after.resolved_at.is_none());
+    assert!(after.resolved_by.is_none());
+    assert!(after.resolution.is_none());
+    assert!(after.resolution_reason.is_none());
+    assert_eq!(after.first_failed_at, before.first_failed_at);
+    assert_eq!(
+        db.worker_dead_letter_history("original").await.unwrap().0,
+        1
+    );
+}
+
+#[tokio::test]
+async fn replay_and_live_poll_commit_their_own_events_once() {
+    let (db, worker, service, id) = fixture().await;
+    worker.entered.notified().await;
+    worker.hold.store(true, Ordering::SeqCst);
+    let later = db
+        .append_event(CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: "test.event".into(),
+            entity_type: "test".into(),
+            entity_id: "later".into(),
+            actor_type: "system".into(),
+            actor_id: None,
+            scope_type: "system".into(),
+            scope_id: "test".into(),
+            correlation_id: "test".into(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".into(),
+            created_at: db::now_rfc3339(),
+        })
+        .await
+        .unwrap();
+    let runtime = WorkerRuntime::new(db.clone(), worker.clone());
+    let polling = tokio::spawn(async move { runtime.run_once(1).await });
+    worker.entered.notified().await;
+    let replay = tokio::spawn(async move { service.replay(admin(), &id).await });
+    worker.entered.notified().await;
+    worker.release.notify_waiters();
+    let (polled, replayed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        (
+            polling.await.unwrap().unwrap(),
+            replay.await.unwrap().unwrap(),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(polled, 1);
+    assert_eq!(replayed.outcome, DeadLetterOutcome::Replayed);
+    assert_eq!(effect_count(&db).await, 2);
+    assert_eq!(worker.commits.load(Ordering::SeqCst), 3); // original failure, live delivery, replay
+    assert_eq!(worker.published.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        db.get_consumer_cursor("original")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_sequence,
+        later.sequence
+    );
 }

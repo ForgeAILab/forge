@@ -294,6 +294,12 @@ pub struct WorkerDeadLetterSummary {
     pub attempts: i64,
     #[ts(type = "number | null")]
     pub event_sequence: Option<i64>,
+    // Only canonical bare event sequence keys may be replayed.
+    pub replayable: bool,
+    pub event_created_at: Option<String>,
+    // Later subscribed ledger events acknowledged by the current checkpoint.
+    #[ts(type = "number")]
+    pub events_since: i64,
     pub reason: String,
     pub occurred_at: String,
 }
@@ -354,11 +360,44 @@ pub struct DeadLetterActionResponse {
     pub dead_letter: DeadLetterResponse,
     /// replayed, skipped, replay_failed, or dismissed. Failure is an audited
     /// action result, with the dead letter still open; it is never auto-retried.
-    pub outcome: String,
+    pub outcome: DeadLetterOutcome,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct DismissDeadLetterRequest {
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DeadLetterOutcome {
+    Replayed,
+    Skipped,
+    ReplayFailed,
+    Dismissed,
+}
+impl DeadLetterOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replayed => "replayed",
+            Self::Skipped => "skipped",
+            Self::ReplayFailed => "replay_failed",
+            Self::Dismissed => "dismissed",
+        }
+    }
+}
+impl std::fmt::Display for DeadLetterOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl std::fmt::Display for DeadLetterState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        })
+    }
 }

@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202610030300 (dead-letter resolution and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
+// Embedded migration bundle revision: V202610030300 (dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later

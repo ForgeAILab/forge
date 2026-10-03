@@ -270,7 +270,7 @@ async fn dead_letter_replay_reports_failure_then_success_and_keeps_cursor() {
     let replayed: DeadLetterActionResponse =
         serde_json::from_value(action(&harness, &id, "replay", json!({}), StatusCode::OK).await)
             .unwrap();
-    assert_eq!(replayed.outcome, "replayed");
+    assert_eq!(replayed.outcome, api_types::DeadLetterOutcome::Replayed);
     assert!(replayed.dead_letter.resolved_by.is_some());
     let notifications: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM notification WHERE title = 'Recovered'")
@@ -287,4 +287,333 @@ async fn dead_letter_replay_reports_failure_then_success_and_keeps_cursor() {
         .unwrap();
     assert_eq!(cursor.last_sequence, 100);
     action(&harness, &id, "replay", json!({}), StatusCode::CONFLICT).await;
+}
+
+#[tokio::test]
+async fn unauthenticated_dead_letter_routes_return_401() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let root = common::TestDir::new("dead-letter-no-auth");
+    let harness = test_app(root.path()).await;
+    for (method, path) in [
+        (Method::GET, "/api/v1/operations/dead-letters"),
+        (
+            Method::POST,
+            "/api/v1/operations/dead-letters/unknown/replay",
+        ),
+        (
+            Method::POST,
+            "/api/v1/operations/dead-letters/unknown/dismiss",
+        ),
+    ] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn item_replay_returns_specific_conflict_without_counting_an_attempt_and_bodyless_dismiss_works(
+) {
+    let root = common::TestDir::new("dead-letter-item");
+    let harness = test_app(root.path()).await;
+    let id = seed(&harness, "notifications", json!({})).await;
+    for key in [
+        "event:1:commitment:a",
+        "event:1:inbox:user",
+        "wake-retry:disposition",
+    ] {
+        sqlx::query("UPDATE worker_dead_letter SET source_key = ? WHERE id = ?")
+            .bind(key)
+            .bind(&id)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+        let refused = action(&harness, &id, "replay", json!({}), StatusCode::CONFLICT).await;
+        assert_eq!(refused["code"], "dead_letter_not_replayable");
+        let row = harness.state.db.get_dead_letter(&id).await.unwrap();
+        assert_eq!(row.attempts, 8);
+        assert_eq!(row.version, 0);
+        let listed: DeadLetterListResponse = common::empty_request_with_bearer(
+            &harness.app,
+            Method::GET,
+            "/api/v1/operations/dead-letters",
+            &common::admin_jwt(),
+            StatusCode::OK,
+        )
+        .await;
+        assert!(!listed.items[0].summary.replayable);
+    }
+    let actions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter_action")
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(actions, 0);
+    let dismissed: DeadLetterActionResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/operations/dead-letters/{id}/dismiss"),
+        &common::admin_jwt(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(dismissed.outcome, api_types::DeadLetterOutcome::Dismissed);
+}
+
+#[tokio::test]
+async fn resolved_keyset_uses_resolution_time_and_event_context_counts_only_acknowledged_subscribed_rows(
+) {
+    let root = common::TestDir::new("dead-letter-resolved-order");
+    let harness = test_app(root.path()).await;
+    let first = seed(&harness, "notifications", json!({})).await;
+    let second = seed(&harness, "notifications", json!({})).await;
+    let third = seed(&harness, "notifications", json!({})).await;
+    let sequence = harness
+        .state
+        .db
+        .get_dead_letter(&third)
+        .await
+        .unwrap()
+        .event_sequence()
+        .unwrap();
+    sqlx::query(
+        "UPDATE event_consumer_cursor SET last_sequence = ? WHERE consumer_name = 'notifications'",
+    )
+    .bind(sequence)
+    .execute(harness.state.db.pool())
+    .await
+    .unwrap();
+    let mut tx = db::begin_immediate(harness.state.db.pool()).await.unwrap();
+    harness
+        .state
+        .db
+        .initialize_event_worker_in_tx(
+            &mut tx,
+            &db::WorkerHealth::new(harness.state.db.clone(), "notifications"),
+            &db::EventSubscription::Exact(vec!["notification.requested".into()]),
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let first_row = harness.state.db.get_dead_letter(&first).await.unwrap();
+    assert!(first_row.event_created_at.is_some());
+    assert_eq!(first_row.events_since, 2);
+    // A later ignored event can be scanned/acknowledged, but is not a delivery.
+    let ignored = harness
+        .state
+        .db
+        .append_event(CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: "ignored".into(),
+            entity_type: "test".into(),
+            entity_id: "test".into(),
+            actor_type: "system".into(),
+            actor_id: None,
+            scope_type: "system".into(),
+            scope_id: "system".into(),
+            correlation_id: "test".into(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".into(),
+            created_at: db::now_rfc3339(),
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE event_consumer_cursor SET last_sequence = ? WHERE consumer_name = 'notifications'",
+    )
+    .bind(ignored.sequence)
+    .execute(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        harness
+            .state
+            .db
+            .get_dead_letter(&first)
+            .await
+            .unwrap()
+            .events_since,
+        2
+    );
+    let pending = seed(&harness, "notifications", json!({})).await;
+    assert_eq!(
+        harness
+            .state
+            .db
+            .get_dead_letter(&first)
+            .await
+            .unwrap()
+            .events_since,
+        2
+    );
+    for id in [&first, &second, &third] {
+        action(&harness, id, "dismiss", json!({}), StatusCode::OK).await;
+    }
+    sqlx::query("UPDATE worker_dead_letter SET dead_lettered_at = '2099-01-01T00:00:00Z', resolved_at = '2026-01-01T00:00:00Z' WHERE id = ?").bind(&first).execute(harness.state.db.pool()).await.unwrap();
+    for id in [&second, &third] {
+        sqlx::query(
+            "UPDATE worker_dead_letter SET resolved_at = '2026-10-03T00:00:00Z' WHERE id = ?",
+        )
+        .bind(id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    }
+    let page: DeadLetterListResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/operations/dead-letters?state=resolved&limit=2",
+        &common::admin_jwt(),
+        StatusCode::OK,
+    )
+    .await;
+    let mut expected = vec![second, third];
+    expected.sort_by(|a, b| b.cmp(a));
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|row| row.summary.id.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        page.items[0].summary.events_since,
+        if page.items[0].summary.id == expected[0]
+            && page.items[0].summary.event_sequence == Some(sequence)
+        {
+            0
+        } else {
+            1
+        }
+    );
+    let cursor = page.next_cursor.unwrap();
+    let last: DeadLetterListResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/operations/dead-letters?state=resolved&limit=2&cursor={cursor}"),
+        &common::admin_jwt(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(last.items.len(), 1);
+    assert_eq!(last.items[0].summary.id, first);
+    assert!(last.next_cursor.is_none());
+    assert!(harness
+        .state
+        .db
+        .get_dead_letter(&pending)
+        .await
+        .unwrap()
+        .resolved_at
+        .is_none());
+}
+
+#[tokio::test]
+async fn dropping_request_future_after_commit_does_not_cancel_after_commit() {
+    use async_trait::async_trait;
+    use services::worker_runtime::{Outcome, Subscription, Worker, WorkerError};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::sync::Notify;
+    struct Consumer {
+        entered: Notify,
+        release: Notify,
+        published: Notify,
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Worker for Consumer {
+        type Prepared = ();
+        fn name(&self) -> &str {
+            "cancellation-probe"
+        }
+        fn subscription(&self) -> Subscription {
+            Subscription::All
+        }
+        async fn handle(&self, _: &db::DomainEvent) -> Result<Outcome<()>, WorkerError> {
+            Ok(Outcome::Done(()))
+        }
+        async fn commit(
+            &self,
+            _: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+            _: &db::DomainEvent,
+            _: &(),
+        ) -> Result<(), WorkerError> {
+            Ok(())
+        }
+        async fn after_commit(
+            &self,
+            _: &db::DomainEvent,
+            _: &(),
+            _: &(),
+        ) -> Result<(), WorkerError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.published.notify_one();
+            Ok(())
+        }
+    }
+    let root = common::TestDir::new("dead-letter-cancel");
+    let mut harness = test_app(root.path()).await;
+    let id = seed(&harness, "cancellation-probe", json!({})).await;
+    let worker = Arc::new(Consumer {
+        entered: Notify::new(),
+        release: Notify::new(),
+        published: Notify::new(),
+        calls: AtomicUsize::new(0),
+    });
+    let mut service =
+        services::dead_letter_service::DeadLetterService::new(harness.state.db.clone());
+    service.register(worker.clone());
+    harness.state.dead_letter_service = Arc::new(service);
+    let state = harness.state.clone();
+    let request_id = id.clone();
+    let request = tokio::spawn(async move {
+        api::routes::operations::replay_dead_letter(
+            api::routes::auth::RequireAdmin(api::routes::auth::AuthenticatedUser {
+                user_id: "admin".into(),
+                email: "admin@example.test".into(),
+                is_admin: true,
+            }),
+            axum::extract::State(state),
+            axum::extract::Path(request_id),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), worker.entered.notified())
+        .await
+        .unwrap();
+    assert!(harness
+        .state
+        .db
+        .get_dead_letter(&id)
+        .await
+        .unwrap()
+        .resolved_at
+        .is_some());
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    worker.release.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        worker.published.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(worker.calls.load(Ordering::SeqCst), 1);
 }

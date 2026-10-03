@@ -477,28 +477,37 @@ function RetryPressureSection({ items }: { items: RetryPressureSummary[] }) {
   )
 }
 
-function DeadLetterRow({ dead }: { dead: WorkerDeadLetterSummary }) {
+function DeadLetterRow({
+  dead,
+  receipt,
+  onResolved,
+}: {
+  dead: WorkerDeadLetterSummary
+  receipt?: DeadLetterActionResponse
+  onResolved: (result: DeadLetterActionResponse) => void
+}) {
   const action = useDeadLetterActionMutation()
   const [reason, setReason] = useState('')
   const [result, setResult] = useState<DeadLetterActionResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState<'replay' | 'dismiss' | null>(null)
+  const actionResult = result ?? receipt
   const summary =
-    result && result.dead_letter.summary.attempts > dead.attempts
-      ? result.dead_letter.summary
+    actionResult && actionResult.dead_letter.summary.attempts > dead.attempts
+      ? actionResult.dead_letter.summary
       : dead
-  const resolved = result?.dead_letter.state === 'resolved'
+  const resolved = actionResult?.dead_letter.state === 'resolved'
   async function apply(kind: 'replay' | 'dismiss') {
     setPending(kind)
     setError(null)
     try {
-      setResult(
-        await action.mutateAsync({
-          id: dead.id,
-          action: kind,
-          reason: kind === 'dismiss' && reason.trim() ? reason.trim() : undefined,
-        }),
-      )
+      const response = await action.mutateAsync({
+        id: dead.id,
+        action: kind,
+        reason: kind === 'dismiss' && reason.trim() ? reason.trim() : undefined,
+      })
+      setResult(response)
+      if (response.dead_letter.state === 'resolved') onResolved(response)
     } catch (error) {
       setError(
         getApiErrorCode(error) === 'version_conflict'
@@ -524,14 +533,27 @@ function DeadLetterRow({ dead }: { dead: WorkerDeadLetterSummary }) {
       <p className="mt-1 break-words text-xs text-destructive">{summary.reason}</p>
       {!resolved && (
         <div className="mt-2 flex flex-wrap items-end gap-2">
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={pending !== null}
-            onClick={() => void apply('replay')}
-          >
-            {pending === 'replay' ? 'Replaying…' : 'Replay'}
-          </Button>
+          {summary.replayable && (
+            <div className="flex max-w-full flex-wrap items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={pending !== null}
+                onClick={() => void apply('replay')}
+              >
+                {pending === 'replay' ? 'Replaying…' : 'Replay'}
+              </Button>
+              <span
+                className="text-xs text-muted-foreground"
+                title={summary.event_created_at ?? undefined}
+              >
+                {summary.event_created_at
+                  ? `Event ${formatRuntimeSeconds(Math.max(0, (Date.now() - Date.parse(summary.event_created_at)) / 1000))} old`
+                  : 'Event age unavailable'}{' '}
+                · {summary.events_since} later events processed
+              </span>
+            </div>
+          )}
           <div className="min-w-0 flex-1">
             <label className="text-xs text-muted-foreground" htmlFor={`dismiss-reason-${dead.id}`}>
               Dismiss reason (optional)
@@ -554,13 +576,13 @@ function DeadLetterRow({ dead }: { dead: WorkerDeadLetterSummary }) {
           </Button>
         </div>
       )}
-      {result && (
+      {actionResult && (
         <p role="status" className="mt-2 text-xs text-muted-foreground">
-          {result.outcome === 'replay_failed'
+          {actionResult.outcome === 'replay_failed'
             ? 'Replay failed; remains open. Retry after fixing the cause.'
-            : result.outcome === 'skipped'
+            : actionResult.outcome === 'skipped'
               ? 'Replay completed; consumer skipped this event.'
-              : result.outcome === 'dismissed'
+              : actionResult.outcome === 'dismissed'
                 ? 'Dismissed without delivery.'
                 : 'Replayed successfully.'}
         </p>
@@ -575,6 +597,15 @@ function DeadLetterRow({ dead }: { dead: WorkerDeadLetterSummary }) {
 }
 
 function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
+  const [receipts, setReceipts] = useState<DeadLetterActionResponse[]>([])
+  function resolved(receipt: DeadLetterActionResponse) {
+    setReceipts((current) =>
+      [
+        receipt,
+        ...current.filter((row) => row.dead_letter.summary.id !== receipt.dead_letter.summary.id),
+      ].slice(0, 5),
+    )
+  }
   return (
     <Section title="Event Consumers" count={items.length}>
       <div className="divide-y">
@@ -596,8 +627,22 @@ function EventConsumersSection({ items }: { items: EventConsumerStatus[] }) {
                   </span>
                 ) : null}
               </div>
-              {item.recent_dead_letters.map((dead) => (
-                <DeadLetterRow key={dead.id} dead={dead} />
+              {[
+                ...item.recent_dead_letters,
+                ...receipts
+                  .map((row) => row.dead_letter.summary)
+                  .filter(
+                    (row) =>
+                      row.consumer_name === item.consumer_name &&
+                      !item.recent_dead_letters.some((dead) => dead.id === row.id),
+                  ),
+              ].map((dead) => (
+                <DeadLetterRow
+                  key={dead.id}
+                  dead={dead}
+                  receipt={receipts.find((row) => row.dead_letter.summary.id === dead.id)}
+                  onResolved={resolved}
+                />
               ))}
             </div>
             <div className="flex items-center gap-2 text-xs">

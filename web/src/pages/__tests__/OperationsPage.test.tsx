@@ -9,7 +9,12 @@ import {
 import { ApiError } from '@/api/client'
 import { OperationsPage } from '@/pages/OperationsPage'
 import { emptyUsage } from '@/test-utils/usage'
-import type { CostSummary, OperatorStatusResponse, UsageAggregate } from '@/types/generated'
+import type {
+  CostSummary,
+  DeadLetterActionResponse,
+  OperatorStatusResponse,
+  UsageAggregate,
+} from '@/types/generated'
 
 type LinkProps = {
   to: string
@@ -106,7 +111,10 @@ const degradedStatus: OperatorStatusResponse = {
           consumer_name: 'attention_projection',
           event_type: 'task.done',
           attempts: 8,
-          item_key: 'event:9:commitment:c-1',
+          item_key: '9',
+          replayable: true,
+          event_created_at: '2025-04-29T12:00:00Z',
+          events_since: 4,
           event_sequence: 9,
           reason: 'blocked commitment',
           occurred_at: '2025-04-29T12:00:00Z',
@@ -250,7 +258,7 @@ describe('OperationsPage', () => {
     } as unknown as ReturnType<typeof useRefreshOperationsMutation>)
   })
 
-  function actionResult(outcome: string) {
+  function actionResult(outcome: DeadLetterActionResponse['outcome']) {
     return {
       outcome,
       dead_letter: {
@@ -335,6 +343,79 @@ describe('OperationsPage', () => {
     expect(screen.getByText(/10 attempts/)).toBeTruthy()
     expect(screen.getByText('latest polled error')).toBeTruthy()
     expect(screen.queryByText('new error')).toBeNull()
+  })
+  it('hides Replay on item quarantines while keeping Dismiss', () => {
+    vi.mocked(useOperationsStatusQuery).mockReturnValue({
+      data: {
+        ...degradedStatus,
+        event_consumers: [
+          {
+            ...degradedStatus.event_consumers[0],
+            recent_dead_letters: [
+              {
+                ...degradedStatus.event_consumers[0].recent_dead_letters[0],
+                item_key: 'event:9:commitment:c-1',
+                replayable: false,
+              },
+            ],
+          },
+        ],
+      },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useOperationsStatusQuery>)
+    render(<OperationsPage />)
+    expect(screen.queryByRole('button', { name: 'Replay' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeTruthy()
+  })
+  it('shows event age and later-event context next to Replay', () => {
+    render(<OperationsPage />)
+    expect(screen.getByText(/Event .* old · 4 later events processed/)).toBeTruthy()
+  })
+  it('retains the action result when status refresh removes the resolved row', async () => {
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: vi.fn().mockResolvedValue(actionResult('replayed')),
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    const view = render(<OperationsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Replay' }))
+    await screen.findByText('Replayed successfully.')
+    vi.mocked(useOperationsStatusQuery).mockReturnValue({
+      data: {
+        ...degradedStatus,
+        event_consumers: [
+          { ...degradedStatus.event_consumers[0], dead_letter_count: 0, recent_dead_letters: [] },
+        ],
+      },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useOperationsStatusQuery>)
+    view.rerender(<OperationsPage />)
+    expect(screen.getByText('Dead letters 0')).toBeTruthy()
+    expect(screen.getByText('Replayed successfully.')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Replay' })).toBeNull()
+  })
+  it('shows the resolved receipt when a poll removed the row during after-commit work', async () => {
+    let complete: (value: ReturnType<typeof actionResult>) => void = () => {}
+    const promise = new Promise<ReturnType<typeof actionResult>>((resolve) => {
+      complete = resolve
+    })
+    vi.mocked(useDeadLetterActionMutation).mockReturnValue({
+      mutateAsync: vi.fn().mockReturnValue(promise),
+    } as unknown as ReturnType<typeof useDeadLetterActionMutation>)
+    const view = render(<OperationsPage />)
+    fireEvent.click(screen.getByRole('button', { name: 'Replay' }))
+    vi.mocked(useOperationsStatusQuery).mockReturnValue({
+      data: {
+        ...degradedStatus,
+        event_consumers: [
+          { ...degradedStatus.event_consumers[0], dead_letter_count: 0, recent_dead_letters: [] },
+        ],
+      },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useOperationsStatusQuery>)
+    view.rerender(<OperationsPage />)
+    complete(actionResult('replayed'))
+    await screen.findByText('Replayed successfully.')
+    expect(screen.queryByRole('button', { name: 'Replay' })).toBeNull()
+    expect(screen.getByText('Dead letters 0')).toBeTruthy()
   })
   it('disables both actions during replay and handles conflict inline', async () => {
     let reject: (reason: unknown) => void = () => {}
@@ -467,7 +548,7 @@ describe('OperationsPage', () => {
       'Position 12 · Head 15 · tail retry',
     )
     expect(screen.getByText('Dead letters 7')).toBeTruthy()
-    expect(screen.getByText(/event:9:commitment:c-1 · 8 attempts/)).toBeTruthy()
+    expect(screen.getByText(/9 · 8 attempts/)).toBeTruthy()
     expect(screen.getByText('blocked commitment')).toBeTruthy()
   })
 })

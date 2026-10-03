@@ -9,7 +9,11 @@ use axum::{
 use db::now_rfc3339;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
-use crate::{errors::ApiResult, routes::auth::RequireAdmin, state::AppState};
+use crate::{
+    errors::{ApiError, ApiResult},
+    routes::auth::RequireAdmin,
+    state::AppState,
+};
 use services::dead_letter_service::DeadLetterActor;
 
 #[derive(serde::Deserialize)]
@@ -48,9 +52,11 @@ pub async fn replay_dead_letter(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<DeadLetterActionResponse>> {
-    Ok(Json(
-        state
-            .dead_letter_service
+    let service = state.dead_letter_service.clone();
+    // Dropping the request's JoinHandle detaches the owned replay task, so a
+    // disconnect after COMMIT cannot cancel the consumer's after_commit hook.
+    let replay = tokio::spawn(async move {
+        service
             .replay(
                 DeadLetterActor {
                     user_id: &admin.user_id,
@@ -58,16 +64,20 @@ pub async fn replay_dead_letter(
                 },
                 &id,
             )
-            .await?,
-    ))
+            .await
+    });
+    Ok(Json(replay.await.map_err(|_| {
+        ApiError::internal("dead-letter replay task failed")
+    })??))
 }
 
 pub async fn dismiss_dead_letter(
     RequireAdmin(admin): RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(body): Json<DismissDeadLetterRequest>,
+    body: Option<Json<DismissDeadLetterRequest>>,
 ) -> ApiResult<Json<DeadLetterActionResponse>> {
+    let body = body.map(|Json(body)| body).unwrap_or_default();
     Ok(Json(
         state
             .dead_letter_service

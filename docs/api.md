@@ -3200,7 +3200,7 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `event_consumers[].last_advanced_at` | Cursor's last advancement timestamp, or `null` if no cursor exists. |
 | `event_consumers[].stalled` | Pending subscribed events and checkpoint/initialization progress are older than `server.event_consumer_stall_seconds` (default 300). Idle, caught-up and newly initialized consumers are never stalled. |
 | `event_consumers[].dead_letter_count` | Open quarantines for that worker, without an age cutoff; resolved audit rows are excluded. |
-| `event_consumers[].recent_dead_letters` | Most recent five open quarantines, without an age cutoff: opaque `id`, `item_key`, optional `event_sequence`, `consumer_name`, `event_type`, `attempts`, bounded `reason`, and `occurred_at`. Includes per-commitment/inbox failures as well as event quarantines. |
+| `event_consumers[].recent_dead_letters` | Most recent five open quarantines, without an age cutoff: opaque `id`, `item_key`, optional `event_sequence`, `consumer_name`, `event_type`, `attempts`, `replayable`, nullable `event_created_at`, `events_since`, bounded `reason`, and `occurred_at`. Includes per-commitment/inbox failures as well as event quarantines. |
 | `event_relay` | Separate supervised SSE tail status: `running`, nullable in-memory `position` and live `head`, bounded `last_error` and `last_error_at`. No durable consumer cursor. |
 
 Dead-letter history remains visible after the one-hour degraded-health window.
@@ -3228,9 +3228,10 @@ Admin dead-letter actions use these routes:
 | --- | --- | --- |
 | GET | `/api/v1/operations/dead-letters` | List `items` and nullable `next_cursor`. Filter by exact `consumer` and `state=open\|resolved` (default `open`); `limit` defaults to 50, clamped to 1–100. |
 | POST | `/api/v1/operations/dead-letters/{id}/replay` | Replay the source event only to its original registered durable consumer. No body is required. |
-| POST | `/api/v1/operations/dead-letters/{id}/dismiss` | Resolve without delivery. JSON body `{ "reason"?: string }`; optional reason is bounded to 1024 characters. |
+| POST | `/api/v1/operations/dead-letters/{id}/dismiss` | Resolve without delivery. Optional JSON body `{ "reason"?: string }`; reason is bounded to 1024 characters. |
 
-List ordering is `(dead_lettered_at DESC, id DESC)` with a keyset cursor and
+Open lists order by `(dead_lettered_at DESC, id DESC)`; resolved lists order by
+`(resolved_at DESC, id DESC)`. Both use a keyset cursor and
 `limit + 1` fetch. Cursors are opaque and bound to the consumer/state filters;
 invalid cursors or changed filters return 400. Each item has `summary` (the same
 bounded metadata as status), `state`, `error_kind`, `first_failed_at`,
@@ -3249,10 +3250,41 @@ already resolved rows and losing concurrent actions return 409 `version_conflict
 All three routes require admin access (non-admin 403). Replay of a quarantine
 with no registered event consumer records `replay_failed`; dismissal remains available.
 
+`summary.replayable` is true only for the canonical positive bare sequence keys
+that the runtime writes for whole events. Item keys such as
+`event:N:commitment:C`, `event:N:inbox:…` and `wake-retry:…` are dismiss-only.
+Replay refuses them before any mutation with 409 `dead_letter_not_replayable`,
+without counting an attempt or writing an action audit. A resolved whole-event
+row still has `replayable: true` as a description of its key; its resolved state
+prevents another replay. `outcome` is the closed enum `replayed | skipped |
+replay_failed | dismissed`.
+
+`summary.event_created_at` is the source event's creation timestamp, or null when
+no source event exists. `summary.events_since` counts later retained events
+matching the consumer's current stored subscription through its checkpoint,
+including handler skips; ignored types and pending events are excluded. It is a
+context count, not a count of effects or a historical subscription receipt.
+The Operations page shows event age and this count beside Replay.
+
+Replay applies an old event after any newer events, using the consumer's current
+state. Existing idempotency does not make this equivalent to historical ordered
+delivery. For example, replaying an old `task.blocked` coordination event after a
+commitment returned to `in_progress` can block it again and send an old “Task
+delivery blocked” inbox item. Review the event age and later-event count before
+replaying; item-level failures need a future per-consumer item replay contract.
+
+The route owns replay in a spawned task and awaits its result. Client disconnects
+cannot cancel committed delivery's `after_commit` work. The request may still wait
+for bounded preparation and after-commit hooks; process crashes retain normal
+worker recovery semantics.
+
 Replay uses the normal preparation, transactional commit and after-commit hooks,
 with existing consumer idempotency. Effects, health bookkeeping and successful
 resolution commit in one transaction. Failed effects roll back before recording
-the failed attempt. Replay neither moves the original cursor nor fans out the
+the failed attempt. If commit re-quarantines that same row, replay detects its
+version change, rolls back effects and records `replay_failed` with the new error.
+A repeat quarantine reopens its stable identity, clears resolution and increments
+its version, so later failures cannot stay hidden behind an earlier dismissal. Replay neither moves the original cursor nor fans out the
 source event to other consumers. Normal events emitted by a consumer's commit
 remain subject to their usual downstream delivery. After-commit faults remain
 worker health faults and do not undo the successful replay. Resolved audit rows

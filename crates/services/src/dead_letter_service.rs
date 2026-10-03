@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use api_types::{
-    DeadLetterActionResponse, DeadLetterListResponse, DeadLetterResponse, DeadLetterState,
-    WorkerDeadLetterSummary,
+    DeadLetterActionResponse, DeadLetterListResponse, DeadLetterOutcome, DeadLetterResponse,
+    DeadLetterState, WorkerDeadLetterSummary,
 };
 use db::{DeadLetter, DeadLetterAction, SqliteDb};
 
@@ -89,7 +89,13 @@ impl DeadLetterService {
         id: &str,
     ) -> Result<DeadLetterActionResponse> {
         actor.authorize()?;
-        let row = self.open(id).await?;
+        let row = self.db.get_dead_letter(id).await?;
+        if !row.replayable() {
+            return Err(db::DbError::DeadLetterNotReplayable.into());
+        }
+        if row.resolved_at.is_some() {
+            return Err(db::DbError::VersionConflict.into());
+        }
         let (updated, outcome) = if let Some(consumer) = self.consumers.get(&row.worker_name) {
             consumer.replay(&row, actor.user_id).await?
         } else {
@@ -105,7 +111,7 @@ impl DeadLetterService {
         };
         Ok(DeadLetterActionResponse {
             dead_letter: response(updated),
-            outcome: outcome.into(),
+            outcome,
         })
     }
     pub async fn dismiss(
@@ -145,7 +151,7 @@ impl DeadLetterService {
         tx.commit().await?;
         Ok(DeadLetterActionResponse {
             dead_letter: response(updated),
-            outcome: "dismissed".into(),
+            outcome: DeadLetterOutcome::Dismissed,
         })
     }
 }
@@ -155,6 +161,9 @@ pub(crate) fn summary(row: &DeadLetter) -> WorkerDeadLetterSummary {
         id: row.id.clone(),
         item_key: row.source_key.clone(),
         event_sequence: row.event_sequence(),
+        replayable: row.replayable(),
+        event_created_at: row.event_created_at.clone(),
+        events_since: row.events_since,
         consumer_name: row.worker_name.clone(),
         event_type: row.item_type.clone(),
         attempts: row.attempts,

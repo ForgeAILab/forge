@@ -459,6 +459,7 @@ impl From<DbError> for ApiError {
             },
             DbError::TurnNotRetryable => Self::conflict_with_code("turn_not_retryable", "Agent Chat turn is not retryable"),
             DbError::ChatTurnLive => Self::conflict_with_code("another_turn_live", "another Agent Chat turn is live"),
+            DbError::DeadLetterNotReplayable => Self::conflict_with_code("dead_letter_not_replayable", "Only whole-event dead letters can be replayed; dismiss this item instead"),
             DbError::VersionConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "version_conflict",

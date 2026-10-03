@@ -58,8 +58,10 @@ async fn audit2_metadata_upgrade_preserves_dead_letters_and_resets_transient_str
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert_eq!(
-        row, again,
-        "identity and original diagnostic survive upgrade/repeated quarantine"
-    );
+    assert_eq!(row.0, again.0, "identity survives repeated quarantine");
+    assert_eq!(row.1, again.1);
+    assert_eq!(again.2, "replayed failure");
+    let updated = db.get_dead_letter(&row.0).await.unwrap();
+    assert_eq!(updated.version, 1);
+    assert_eq!(updated.attempts, 9);
 }

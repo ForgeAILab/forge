@@ -1552,6 +1552,9 @@ export interface EventRelayStatus {
 }
 
 export interface WorkerDeadLetterSummary {
+  replayable: boolean
+  event_created_at: string | null
+  events_since: number
   consumer_name: string
   event_type: string
   attempts: number

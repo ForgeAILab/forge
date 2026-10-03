@@ -7,7 +7,7 @@ ALTER TABLE worker_dead_letter ADD COLUMN resolution_reason TEXT;
 CREATE INDEX idx_worker_dead_letter_open_time
     ON worker_dead_letter(dead_lettered_at DESC, id DESC) WHERE resolved_at IS NULL;
 CREATE INDEX idx_worker_dead_letter_resolved_time
-    ON worker_dead_letter(dead_lettered_at DESC, id DESC) WHERE resolved_at IS NOT NULL;
+    ON worker_dead_letter(resolved_at DESC, id DESC) WHERE resolved_at IS NOT NULL;
 CREATE TABLE worker_dead_letter_action (
     id TEXT PRIMARY KEY,
     dead_letter_id TEXT NOT NULL REFERENCES worker_dead_letter(id),

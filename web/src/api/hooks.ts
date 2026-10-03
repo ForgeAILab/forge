@@ -1190,6 +1190,7 @@ export function useRefreshOperationsMutation() {
 }
 
 export function useDeadLetterActionMutation() {
+  const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({
       id,
@@ -1200,6 +1201,9 @@ export function useDeadLetterActionMutation() {
       action: 'replay' | 'dismiss'
       reason?: string
     }) => (action === 'replay' ? replayDeadLetter(id) : dismissDeadLetter(id, reason)),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
+    },
   })
 }
 

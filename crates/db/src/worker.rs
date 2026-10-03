@@ -112,7 +112,12 @@ impl WorkerHealth {
         sqlx::query(
             "INSERT INTO worker_dead_letter (id, worker_name, source_key, item_type, attempts,
             last_error, first_failed_at, last_failed_at, dead_lettered_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(worker_name, source_key) DO NOTHING",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(worker_name, source_key) DO UPDATE SET
+            item_type = excluded.item_type, attempts = MAX(worker_dead_letter.attempts + 1, excluded.attempts),
+            last_error = excluded.last_error, last_failed_at = excluded.last_failed_at,
+            dead_lettered_at = excluded.dead_lettered_at, error_kind = excluded.error_kind,
+            version = worker_dead_letter.version + 1, resolved_at = NULL, resolved_by = NULL,
+            resolution = NULL, resolution_reason = NULL",
         )
         .bind(crate::new_uuid_v4())
         .bind(&self.name)

@@ -1,5 +1,7 @@
 use anyhow::Result;
-use api_types::{DeadLetterActionResponse, DeadLetterListResponse, DismissDeadLetterRequest};
+use api_types::{
+    DeadLetterActionResponse, DeadLetterListResponse, DeadLetterOutcome, DismissDeadLetterRequest,
+};
 use clap::Subcommand;
 
 use crate::{client::ForgeClient, output::print_json, OutputFormat};
@@ -19,6 +21,7 @@ enum OperationsCmd {
 }
 #[derive(Subcommand)]
 enum DeadLettersCmd {
+    /// List open or resolved quarantines with their replay eligibility.
     List {
         #[arg(long)]
         consumer: Option<String>,
@@ -69,13 +72,19 @@ impl OperationsArgs {
                     OutputFormat::Table => {
                         for row in response.items {
                             println!(
-                                "{}  {}  {}  {} attempts  {:?}\n  {}",
+                                "{}  {}  {}  {} attempts  {}\n  {}",
                                 row.summary.id,
                                 row.summary.consumer_name,
                                 row.summary.event_type,
                                 row.summary.attempts,
                                 row.state,
                                 row.summary.reason
+                            );
+                            println!(
+                                "  replayable={} event_created_at={} events_since={}",
+                                row.summary.replayable,
+                                row.summary.event_created_at.as_deref().unwrap_or("-"),
+                                row.summary.events_since
                             );
                             if let Some(resolution) = row.resolution {
                                 println!(
@@ -133,12 +142,12 @@ fn print_action(response: DeadLetterActionResponse, output: &OutputFormat) -> Re
                 response.outcome,
                 response.dead_letter.summary.attempts
             );
-            if response.outcome == "replay_failed" {
+            if response.outcome == DeadLetterOutcome::ReplayFailed {
                 println!("  {}", response.dead_letter.summary.reason);
             }
         }
     }
-    if response.outcome == "replay_failed" {
+    if response.outcome == DeadLetterOutcome::ReplayFailed {
         anyhow::bail!("replay failed; dead letter remains open")
     }
     Ok(())
@@ -147,7 +156,7 @@ fn print_action(response: DeadLetterActionResponse, output: &OutputFormat) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[derive(Parser)]
     struct Cli {
@@ -157,6 +166,18 @@ mod tests {
 
     #[test]
     fn parses_dead_letter_commands_and_filters() {
+        assert_eq!(api_types::DeadLetterState::Open.to_string(), "open");
+        assert_eq!(api_types::DeadLetterState::Resolved.to_string(), "resolved");
+        assert_eq!(DeadLetterOutcome::ReplayFailed.to_string(), "replay_failed");
+        assert!(Cli::command()
+            .find_subcommand("dead-letters")
+            .unwrap()
+            .find_subcommand("list")
+            .unwrap()
+            .get_about()
+            .unwrap()
+            .to_string()
+            .contains("replay eligibility"));
         let cli = Cli::try_parse_from([
             "ctl",
             "dead-letters",
@@ -221,7 +242,7 @@ mod tests {
         let app = Router::new().route("/api/v1/operations/dead-letters/dead-1/dismiss", post(|Json(body): Json<serde_json::Value>| async move {
             assert_eq!(body["reason"], "obsolete");
             Json(serde_json::json!({ "outcome": "dismissed", "dead_letter": {
-                "summary": { "id": "dead-1", "item_key": "1", "consumer_name": "consumer", "event_type": "test", "attempts": 8, "event_sequence": 1, "reason": "bad event", "occurred_at": "2026-10-03T00:00:00Z" },
+                "summary": { "id": "dead-1", "item_key": "1", "consumer_name": "consumer", "event_type": "test", "attempts": 8, "event_sequence": 1, "replayable": true, "event_created_at": "2026-10-03T00:00:00Z", "events_since": 0, "reason": "bad event", "occurred_at": "2026-10-03T00:00:00Z" },
                 "state": "resolved", "error_kind": "failure", "first_failed_at": "2026-10-03T00:00:00Z", "last_failed_at": "2026-10-03T00:00:00Z", "resolved_at": "2026-10-03T01:00:00Z", "resolved_by": "admin", "resolution": "dismissed", "resolution_reason": "obsolete"
             }}))
         })).route("/api/v1/operations/dead-letters/dead-1/replay", post(|| async { (axum::http::StatusCode::CONFLICT, Json(serde_json::json!({"code": "version_conflict", "message": "already resolved"}))) }));

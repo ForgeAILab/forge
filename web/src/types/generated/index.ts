@@ -382,3 +382,5 @@ export type { DeadLetterResponse } from './bindings/DeadLetterResponse'
 export type { DeadLetterListResponse } from './bindings/DeadLetterListResponse'
 export type { DeadLetterActionResponse } from './bindings/DeadLetterActionResponse'
 export type { DismissDeadLetterRequest } from './bindings/DismissDeadLetterRequest'
+
+export type { DeadLetterOutcome } from './bindings/DeadLetterOutcome'

@@ -716,9 +716,12 @@ forge-ctl operations dead-letters dismiss <id> [--reason <text>]
 ```
 
 List defaults to open rows, 50 at a time. JSON returns `items` and `next_cursor`;
-table output prints the next cursor when another page exists. Pass the cursor
-unchanged with the same filters. IDs come from this list or Operations status.
-Replay delivers one event to its original consumer through the usual transaction
+table output prints the next cursor when another page exists. It uses lowercase
+states and shows `replayable`, `event_created_at`, and `events_since`. Pass the cursor
+unchanged with the same filters. Resolved lists order by resolution time. IDs come from this list or Operations status.
+Replay accepts only whole-event bare sequence keys; item-level and wake-retry
+quarantines return 409 `dead_letter_not_replayable` without counting an attempt.
+They remain dismissible. Replay delivers one event to its original consumer through the usual transaction
 and idempotency rules, without moving the cursor. Its outcome is `replayed`,
 `skipped` or `replay_failed`. Failed replay prints its updated row and exits
 nonzero; it remains open for another manual action. Dismiss returns `dismissed`

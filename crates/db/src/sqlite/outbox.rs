@@ -106,12 +106,10 @@ impl SqliteDb {
         .bind(name)
         .fetch_one(&self.pool)
         .await?;
-        let rows = sqlx::query("SELECT * FROM worker_dead_letter WHERE worker_name = ? AND resolved_at IS NULL ORDER BY dead_lettered_at DESC, id DESC LIMIT 5")
-            .bind(name).fetch_all(&self.pool).await?;
-        let records = rows
-            .into_iter()
-            .map(super::dead_letter::map_dead_letter)
-            .collect::<Result<Vec<_>>>()?;
+        let records = self
+            .list_dead_letters(Some(name), false, None, 5)
+            .await?
+            .items;
         Ok((count, records))
     }
     pub async fn domain_event_consumer_lag(

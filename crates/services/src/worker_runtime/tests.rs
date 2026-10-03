@@ -1,4 +1,5 @@
 use super::*;
+use api_types::DeadLetterOutcome;
 use db::{create_sqlite_pool, new_uuid_v4, run_migrations, CreateDomainEvent, DomainEventRepo};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -254,7 +255,7 @@ async fn manual_replay_uses_terminal_refresh_and_keeps_after_commit_errors_resol
     let runtime = WorkerRuntime::new(db.clone(), worker.clone());
     let row = replay_row(&db, "manual", &event).await;
     let (updated, outcome) = runtime.replay(&row, "admin").await.unwrap();
-    assert_eq!(outcome, "replayed");
+    assert_eq!(outcome, DeadLetterOutcome::Replayed);
     assert!(updated.resolved_at.is_some());
     assert_eq!(updated.attempts, 9);
     assert_eq!(effects(&db).await, vec![event.sequence]);
@@ -298,9 +299,9 @@ async fn manual_replay_skip_resolves_and_deferral_panic_missing_source_stay_open
         assert_eq!(
             outcome,
             if name == "skip" {
-                "skipped"
+                DeadLetterOutcome::Skipped
             } else {
-                "replay_failed"
+                DeadLetterOutcome::ReplayFailed
             }
         );
         assert_eq!(updated.resolved_at.is_some(), name == "skip");
