@@ -476,10 +476,14 @@ pub struct AutoCascadeOnCompletion;
 
 #[async_trait]
 impl HookAction for AutoCascadeOnCompletion {
-    async fn execute(&self, _ctx: &HookContext) -> HookResult {
-        HookResult::Cascade {
+    fn declared_cascade(&self) -> Option<HookResult> {
+        Some(HookResult::Cascade {
             to: "done".to_string(),
             reason: "completed".to_string(),
-        }
+        })
+    }
+    async fn execute(&self, _ctx: &HookContext) -> HookResult {
+        self.declared_cascade()
+            .expect("completion declares its cascade")
     }
 }

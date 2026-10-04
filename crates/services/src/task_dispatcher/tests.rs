@@ -19,6 +19,49 @@ use crate::{deferred_dispatch, ServiceError};
 
 use super::*;
 
+#[async_trait]
+trait DispatcherDrain {
+    async fn drain_steps(&self) -> crate::Result<()>;
+    async fn check_once_and_drain(&self) -> crate::Result<u64>;
+    async fn dispatch_initial_tasks_and_drain(
+        &self,
+        project: &db::Project,
+        workflow: &api_types::WorkflowDefinition,
+    ) -> crate::Result<u64>;
+}
+#[async_trait]
+impl DispatcherDrain for TaskDispatcher {
+    async fn drain_steps(&self) -> crate::Result<()> {
+        for _ in 0..100 {
+            let ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed') ORDER BY task_id")
+                .fetch_all(self.db.pool()).await?;
+            if ids.is_empty() {
+                return Ok(());
+            }
+            for id in ids {
+                self.task_service.drain(&id).await?;
+            }
+        }
+        Err(crate::ServiceError::invalid_operation(
+            "dispatcher test steps did not settle",
+        ))
+    }
+    async fn check_once_and_drain(&self) -> crate::Result<u64> {
+        let count = self.check_once().await?;
+        self.drain_steps().await?;
+        Ok(count)
+    }
+    async fn dispatch_initial_tasks_and_drain(
+        &self,
+        p: &db::Project,
+        w: &api_types::WorkflowDefinition,
+    ) -> crate::Result<u64> {
+        let count = self.dispatch_initial_tasks(p, w).await?;
+        self.drain_steps().await?;
+        Ok(count)
+    }
+}
+
 struct RecordingExecutor {
     sender: mpsc::UnboundedSender<ExecutionContext>,
 }
@@ -748,7 +791,13 @@ async fn dispatcher_dispatches_pre_repository_task_after_primary_repo_is_attache
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        0
+    );
     let paused = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .expect("project loads")
@@ -796,7 +845,13 @@ async fn dispatcher_dispatches_pre_repository_task_after_primary_repo_is_attache
 
     // The first scan after attachment only clears the system-owned pause so
     // this check never dispatches from the stale in-memory Project snapshot.
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        0
+    );
 
     let resumed = ProjectRepo::get_by_id(&*db, &project_id)
         .await
@@ -805,7 +860,10 @@ async fn dispatcher_dispatches_pre_repository_task_after_primary_repo_is_attache
     assert!(resumed.paused_at.is_none());
     assert!(resumed.system_pause_reason.is_none());
 
-    let (first_scan, second_scan) = tokio::join!(dispatcher.check_once(), dispatcher.check_once());
+    let (first_scan, second_scan) = tokio::join!(
+        dispatcher.check_once_and_drain(),
+        dispatcher.check_once_and_drain()
+    );
     assert_eq!(
         first_scan.expect("first concurrent dispatcher scan runs")
             + second_scan.expect("second concurrent dispatcher scan runs"),
@@ -848,7 +906,10 @@ async fn dispatcher_dispatches_pre_repository_task_after_primary_repo_is_attache
     assert_eq!(lease.repository_binding_id, workspace.repo_id);
 
     assert_eq!(
-        dispatcher.check_once().await.expect("dispatcher runs"),
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
         0,
         "an already-running Task must not be dispatched twice"
     );
@@ -1092,7 +1153,13 @@ async fn dispatcher_holds_a_project_with_an_unborn_repository_until_its_first_co
     .expect("repository attaches");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        0
+    );
     let paused = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .expect("project loads")
@@ -1103,7 +1170,13 @@ async fn dispatcher_holds_a_project_with_an_unborn_repository_until_its_first_co
         Some(super::repo_pause_sync::REPOSITORY_NOT_READY)
     );
     // Held at the Project, not parked on a setup refusal nothing would wake.
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        0
+    );
     let held = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("Task reloads")
@@ -1115,7 +1188,13 @@ async fn dispatcher_holds_a_project_with_an_unborn_repository_until_its_first_co
     run_git(repo_dir.path(), &["add", "-A"]);
     run_git(repo_dir.path(), &["commit", "-m", "initial commit"]);
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        0
+    );
     let resumed = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .expect("project loads")
@@ -1123,7 +1202,13 @@ async fn dispatcher_holds_a_project_with_an_unborn_repository_until_its_first_co
     assert!(resumed.paused_at.is_none());
     assert!(resumed.system_pause_reason.is_none());
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        1
+    );
     let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("execution spawned in time")
@@ -1488,7 +1573,10 @@ async fn dispatcher_skips_unassigned_planning_gate_before_coder_dispatch() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let updated = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -1607,7 +1695,10 @@ async fn dispatcher_enters_unassigned_auto_planning_gate_before_coder_dispatch()
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let updated = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -2276,7 +2367,7 @@ async fn assert_merge_gate_untouched(fixture: &MergeGateFixture) {
 #[tokio::test]
 async fn dispatcher_merge_gate_completes_already_merged_branch() {
     let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(fixture.dispatcher.check_once_and_drain().await.unwrap(), 1);
     let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
         .unwrap()
@@ -2290,7 +2381,7 @@ async fn dispatcher_merge_gate_completes_already_merged_branch() {
     assert_eq!(logs[1].to_state, "merging");
     assert_eq!(logs[2].to_state, "done");
     assert_eq!(logs[2].trigger_reason, "merge succeeded");
-    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(fixture.dispatcher.check_once_and_drain().await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -2319,7 +2410,7 @@ async fn pull_request_merge_wait_requires_human_retry_before_direct_merge() {
         .await
         .unwrap();
 
-    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(fixture.dispatcher.check_once_and_drain().await.unwrap(), 0);
     let parked = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
         .unwrap()
@@ -2353,6 +2444,13 @@ async fn pull_request_merge_wait_requires_human_retry_before_direct_merge() {
         )
         .await
         .expect("human merge retry integrates the reviewed candidate");
+    assert_eq!(merged.status, "merging");
+    let merged = fixture
+        .dispatcher
+        .task_service
+        .drain(&parked.id)
+        .await
+        .unwrap();
     assert_eq!(merged.status, "done");
     assert_eq!(
         run_git(fixture._repo_dir.path(), &["rev-parse", "HEAD"]),
@@ -4902,13 +5000,16 @@ async fn dispatcher_respects_priority_ordering() {
     crate::test_support::force_task_version_conflict_after_transition(
         &db,
         &high.id,
-        crate::workflow::default_states::IN_PROGRESS,
+        crate::workflow::default_states::PLANNING,
         &low.id,
     )
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -6201,9 +6302,9 @@ async fn environment_probe_three_admissions_defer_once_then_launch() {
     .await
     .unwrap();
     let initial_versions = task_versions(&db, &tasks).await;
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     let before: Vec<_> = task_versions(&db, &tasks).await;
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     assert_eq!(
         task_versions(&db, &tasks).await,
         before,
@@ -6259,7 +6360,7 @@ async fn environment_probe_three_admissions_defer_once_then_launch() {
         before,
         "probe completion wakes without another version change"
     );
-    assert_eq!(dispatcher.check_once().await.unwrap(), 3);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 3);
     for _ in 0..3 {
         tokio::time::timeout(Duration::from_secs(5), launches.recv())
             .await
@@ -6471,7 +6572,7 @@ async fn environment_recheck_is_single_flight_off_tick_and_stale_result_preserve
     assign_role(&db, &task.id, "coder", &agent).await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), dispatcher.check_once())
+        tokio::time::timeout(Duration::from_secs(2), dispatcher.check_once_and_drain())
             .await
             .unwrap()
             .unwrap(),
@@ -6489,7 +6590,7 @@ async fn environment_recheck_is_single_flight_off_tick_and_stale_result_preserve
     .await
     .unwrap();
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), dispatcher.check_once())
+        tokio::time::timeout(Duration::from_secs(2), dispatcher.check_once_and_drain())
             .await
             .unwrap()
             .unwrap(),
@@ -6670,7 +6771,7 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
     let repo = TempDir::new().unwrap();
     let (healthy, _) = seed_project_repo(&db, repo.path()).await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if dispatcher
@@ -6696,7 +6797,7 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
     )
     .await;
     assign_role(&db, &task.id, "coder", &agent).await;
-    assert_eq!(dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 1);
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -6706,7 +6807,7 @@ async fn environment_and_project_limit_errors_do_not_abort_later_projects() {
         task.id
     );
     assert_eq!(
-        dispatcher.check_once().await.unwrap(),
+        dispatcher.check_once_and_drain().await.unwrap(),
         0,
         "subsequent ticks also isolate bad rows"
     );
@@ -6774,7 +6875,7 @@ async fn environment_recheck_resumes_and_redispatches_current_task_states() {
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
     let mut events = dispatcher.event_bus.subscribe();
     assert_eq!(
-        dispatcher.check_once().await.unwrap(),
+        dispatcher.check_once_and_drain().await.unwrap(),
         0,
         "resume skips the stale snapshot"
     );
@@ -6817,7 +6918,7 @@ async fn environment_recheck_resumes_and_redispatches_current_task_states() {
         .execute(db.pool())
         .await
         .unwrap();
-    assert_eq!(dispatcher.check_once().await.unwrap(), 2);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 2);
     let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .unwrap()
@@ -7161,7 +7262,7 @@ async fn dispatcher_full_project_rechecks_capacity_without_task_version_change()
 
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         0
@@ -7192,7 +7293,7 @@ async fn dispatcher_full_project_rechecks_capacity_without_task_version_change()
         .unwrap();
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         0
@@ -7221,7 +7322,7 @@ async fn dispatcher_full_project_rechecks_capacity_without_task_version_change()
     .unwrap();
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         1
@@ -7263,7 +7364,7 @@ async fn dispatcher_project_limit_preserves_ready_queue_order_and_counts_each_ad
 
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         1
@@ -7313,7 +7414,7 @@ async fn dispatcher_parked_review_frees_a_project_slot() {
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         1
@@ -7355,7 +7456,7 @@ async fn dispatcher_parked_guard_rechecks_when_owner_clears_a_park() {
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         0
@@ -7378,7 +7479,7 @@ async fn dispatcher_parked_guard_rechecks_when_owner_clears_a_park() {
         .unwrap();
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         1
@@ -7526,7 +7627,7 @@ async fn dispatcher_zero_project_limit_disables_capacity_and_parked_guard() {
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         1
@@ -7781,7 +7882,7 @@ async fn revision_two_refused_task_dispatches_after_upgrade_without_manual_actio
             .with_daemon_connections(registry.clone()),
     );
     let dispatcher = TaskDispatcher::new(db.clone(), dispatcher.event_bus.clone(), service);
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let refused = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .unwrap()
@@ -7806,7 +7907,7 @@ async fn revision_two_refused_task_dispatches_after_upgrade_without_manual_actio
         .is_none());
     assert!(rx.try_recv().is_err());
     // The refusal is parked; the accepted handshake wakes it through the monitor.
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let (connection, mut upgraded_outbound) =
         crate::daemon_transport::DaemonConnection::new(daemon_id.into());
     let id = connection.id();
@@ -7860,7 +7961,7 @@ async fn revision_two_refused_task_dispatches_after_upgrade_without_manual_actio
         .unwrap()
         .unwrap();
     assert!(woken.error_annotation.is_none());
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let executions = ExecutionRepo::list_running_by_task(&*db, &task.id)
         .await
         .unwrap();
@@ -7906,12 +8007,12 @@ async fn worker_robustness_dispatcher_isolates_projects_and_tasks() {
     let healthy = seed_task(&db, &project_id, "healthy", "todo", 0).await;
     assign_role(&db, &healthy.id, "coder", &agent).await;
     let (dispatcher, mut rx) = build_dispatcher(db, workspace.path()).await;
-    assert_eq!(dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 1);
     assert_eq!(rx.recv().await.unwrap().task_id, healthy.id);
 
     let healthy_again = seed_task(&dispatcher.db, &project_id, "healthy again", "todo", 0).await;
     assign_role(&dispatcher.db, &healthy_again.id, "coder", &agent).await;
-    assert_eq!(dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 1);
     assert_eq!(rx.recv().await.unwrap().task_id, healthy_again.id);
 }
 
@@ -7939,7 +8040,7 @@ async fn machine_capacity_waits_in_initial_state_then_starts_after_run_ends() {
     let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         0
@@ -7985,7 +8086,7 @@ async fn machine_capacity_waits_in_initial_state_then_starts_after_run_ends() {
         .unwrap();
     assert_eq!(
         dispatcher
-            .dispatch_initial_tasks(&project, &workflow)
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
             .await
             .unwrap(),
         1
@@ -8577,7 +8678,7 @@ async fn machine_capacity_six_todo_waiters_take_one_freed_slot_per_tick() {
     }
     let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
     for _ in 0..3 {
-        assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+        assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     }
     for task in &waiting {
         let current = machine_capacity_task(&db, &task.id).await;
@@ -8596,7 +8697,7 @@ async fn machine_capacity_six_todo_waiters_take_one_freed_slot_per_tick() {
             .execute(db.pool())
             .await
             .unwrap();
-        assert_eq!(dispatcher.check_once().await.unwrap(), 1);
+        assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 1);
         active = tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
             .unwrap()
@@ -8611,7 +8712,7 @@ async fn machine_capacity_six_todo_waiters_take_one_freed_slot_per_tick() {
             }
         }
         assert_eq!(still_todo, 6 - admitted_count);
-        assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+        assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     }
 }
 
@@ -8635,7 +8736,7 @@ async fn machine_capacity_start_refusal_parks_ready_workspace_then_retries() {
         .set(Some(1), 1, &config::embedded_machine_id());
     sqlx::query(&format!("CREATE TRIGGER fill_at_ready AFTER UPDATE OF state ON workspace_placement WHEN NEW.task_id = '{}' AND NEW.state = 'ready' BEGIN UPDATE execution SET status = 'running' WHERE task_id = '{}'; END", task.id, busy.id)).execute(db.pool()).await.unwrap();
     let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let waiting = machine_capacity_task(&db, &task.id).await;
     assert_eq!(waiting.status, "in_progress");
     assert_eq!(
@@ -8677,7 +8778,7 @@ async fn machine_capacity_start_refusal_parks_ready_workspace_then_retries() {
         1
     );
     for _ in 0..3 {
-        dispatcher.check_once().await.unwrap();
+        dispatcher.check_once_and_drain().await.unwrap();
         assert_eq!(
             machine_capacity_task(&db, &task.id).await.version,
             waiting.version
@@ -8692,7 +8793,7 @@ async fn machine_capacity_start_refusal_parks_ready_workspace_then_retries() {
         .execute(db.pool())
         .await
         .unwrap();
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
@@ -9049,3 +9150,9 @@ async fn supervised_dispatcher_recovers_panic_reports_budget_keeps_wakes_and_sto
     assert!(!in_flight.load(Ordering::SeqCst));
     assert_eq!(calls.load(Ordering::SeqCst), 4);
 }
+
+#[path = "tests/audit_23a.rs"]
+mod audit_23a;
+
+#[path = "tests/reaudit_23a.rs"]
+mod reaudit_23a;

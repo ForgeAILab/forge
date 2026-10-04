@@ -278,9 +278,40 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   it) or commits `docs/knowledge` into the workspace after each Task. The
   upgrade removes those two hook entries from Project settings and keeps
   every other hook.
+- **Task transitions return before their follow-up cascades run.** A REST or
+  MCP transition returns the Task as committed by that transition plus
+  `pending_steps`, the number of queued follow-up steps; later states arrive
+  through SSE or a fresh GET. `pending_steps: 0` does not mean the Task has
+  settled.
+  - `transition.cascade_depth_exceeded` (`{task_id, state, depth}`) is
+    replaced by `transition.loop_detected`
+    (`{task_id, state, chain_id, chain_position, reason}`).
+  - New durable event `transition.step_superseded`
+    (`{task_id, step_id, expected_status, expected_epoch, observed_status,
+    observed_epoch, reason}`) when a queued step no longer applies because
+    the Task left that status.
+  - Queue failures annotate the Task with the new failure kinds
+    `workflow_loop` and `cascade_failed` instead of `dispatch_failed`; the
+    same recovery offers apply.
 
 ### Changed
 
+- Workflow cascades are durable `task_step` rows run by a leased per-Task
+  worker instead of recursive calls inside the request (refactor 2.3a).
+  - A step fences on the Task's status and a status epoch that every status
+    change bumps, so edits, annotation clears, same-column reorders and
+    recovery markers no longer drop a queued cascade.
+  - A repeated transition without new evidence (a new candidate, target or
+    rebase) parks as a loop; the old fixed depth limit of 3 is gone.
+  - Steps that run a merge or CI review checks use a separate lane of 4 so
+    other cascades (lane of 8) never wait behind them.
+  - A started step is never cancelled by a claim error, a failed lease
+    renewal or a laptop sleep; shutdown drains in-flight steps.
+  - Operator status gains `task_steps` (pending, claimed, failed and parked
+    counts and the oldest pending age). Settled steps are pruned after 7
+    days, failed and parked ones after 30.
+  - Dispatcher admission counts only role entries that are about to take a
+    slot.
 - Agents that shape a managed project or split its work get one
   merge-friendly layout rule: small modules with clear ownership so parallel
   Tasks edit disjoint files, no hub files every feature must edit (central

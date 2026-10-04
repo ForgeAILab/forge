@@ -81,9 +81,35 @@ pub struct OperatorStatusResponse {
     pub recent_errors: Vec<RecentErrorSummary>,
     pub event_consumers: Vec<EventConsumerStatus>,
     pub periodic_workers: Vec<PeriodicWorkerStatus>,
+    pub task_steps: TaskStepQueueStatus,
     pub event_relay: EventRelayStatus,
     pub database: DatabaseStorageStatus,
     pub computed_at: String,
+}
+
+/// Cascade queue health, separate from durable consumer dead letters.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskStepQueueStatus {
+    pub worker_name: String,
+    #[ts(type = "number")]
+    pub pending: i64,
+    #[ts(type = "number")]
+    pub claimed: i64,
+    /// Failed steps whose Task annotation still references them.
+    #[ts(type = "number")]
+    pub failed: i64,
+    /// Parked (loop-detected) steps whose Task annotation still references them.
+    #[ts(type = "number")]
+    pub parked: i64,
+    #[ts(type = "number")]
+    pub in_flight: usize,
+    #[ts(type = "number | null")]
+    pub oldest_pending_age_seconds: Option<f64>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+    #[ts(type = "number")]
+    pub restart_count: i64,
 }
 
 /// Source-free workers use the same health identity, bounded errors and

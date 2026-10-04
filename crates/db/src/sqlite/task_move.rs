@@ -272,6 +272,9 @@ impl TaskBoardRepo for SqliteDb {
         .bind(&input.operation_id)
         .execute(&mut *tx)
         .await?;
+        if let Some(step) = &input.cascade_step {
+            crate::TaskStepRepo::enqueue_step_in_tx(self, &mut tx, step).await?;
+        }
         tx.commit().await?;
 
         Ok(MoveTaskPersistence::Committed {
@@ -505,8 +508,9 @@ async fn insert_transition_log(
     tx: &mut Transaction<'_, Sqlite>,
     input: &CreateTransitionLog,
 ) -> Result<()> {
+    // Runs after the move's status update: record the epoch it entered.
     sqlx::query(
-        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, status_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))",
     )
     .bind(&input.id)
     .bind(&input.task_id)
@@ -518,6 +522,7 @@ async fn insert_transition_log(
     .bind(input.hook_results_json.as_deref())
     .bind(if input.rejection { 1_i64 } else { 0_i64 })
     .bind(&input.created_at)
+    .bind(&input.task_id)
     .execute(&mut **tx)
     .await?;
     Ok(())

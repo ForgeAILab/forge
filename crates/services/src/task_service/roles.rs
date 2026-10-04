@@ -1080,7 +1080,7 @@ impl TaskService {
         Ok((false, false))
     }
 
-    fn workflow_engine(&self) -> WorkflowEngine {
+    pub(crate) fn workflow_engine(&self) -> WorkflowEngine {
         WorkflowEngine {
             db: Arc::clone(&self.db),
             event_bus: Arc::clone(&self.event_bus),

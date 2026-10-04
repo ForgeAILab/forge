@@ -37,7 +37,10 @@ async fn todo_skips_unassigned_planning_without_planner_dispatch() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(moved.task.status, "in_progress");
+    assert_eq!(moved.task.status, "planning");
+    assert_eq!(moved.pending_steps, 1);
+    let settled = common::drain(&harness._state, &harness.app, &task.id).await;
+    assert_eq!(settled.status, "in_progress");
 
     let log: Value = empty_request(
         &harness.app,

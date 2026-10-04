@@ -149,7 +149,7 @@ PY"# }
     poll_until_workspace_written(&harness.app, &task_id, &greeting_path).await;
     poll_until_execution_completed(&harness.state.db, &execution_id).await;
 
-    let completed = poll_until_task_status(&harness.app, &task_id, "done".to_owned()).await;
+    let completed = drain_until_task_status(&harness, &task_id, "done".to_owned()).await;
     assert_eq!(
         completed.status,
         "done".to_owned(),
@@ -369,7 +369,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     )
     .await;
     assert!(matches!(approved.status.as_str(), "merging" | "done"));
-    let completed = poll_until_task_status(&harness.app, &task.id, "done".to_owned()).await;
+    let completed = drain_until_task_status(&harness, &task.id, "done".to_owned()).await;
     assert_eq!(completed.status, "done".to_owned());
 
     let ci_failure_task: TaskResponse = json_request(
@@ -396,7 +396,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     let first_ci_execution = single_execution_for_task(&harness.app, &ci_failure_task.id).await;
 
     let failed_follow_up =
-        poll_until_follow_up_execution(&harness.app, &ci_failure_task.id, &first_ci_execution.id)
+        drain_until_follow_up_execution(&harness, &ci_failure_task.id, &first_ci_execution.id)
             .await;
     assert_eq!(
         failed_follow_up.parent_execution_id.as_deref(),
@@ -449,7 +449,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     .await;
     assert!(matches!(ci_approved.status.as_str(), "merging" | "done"));
     let ci_completed =
-        poll_until_task_status(&harness.app, &ci_failure_task.id, "done".to_owned()).await;
+        drain_until_task_status(&harness, &ci_failure_task.id, "done".to_owned()).await;
     assert_eq!(ci_completed.status, "done".to_owned());
     let ci_reviews = ReviewRepo::list_by_task(&*harness.state.db, &ci_failure_task.id)
         .await
@@ -507,7 +507,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     assert_eq!(rejected.status, "working".to_owned());
 
     let resumed =
-        poll_until_follow_up_execution(&harness.app, &second_task.id, &second_execution.id).await;
+        drain_until_follow_up_execution(&harness, &second_task.id, &second_execution.id).await;
     assert_eq!(resumed.role.to_string(), "worker");
     assert_eq!(
         resumed.parent_execution_id.as_deref(),
@@ -841,39 +841,22 @@ async fn poll_until_workspace_written(app: &Router, task_id: &str, greeting_path
     );
 }
 
-async fn poll_until_task_status(
-    app: &Router,
+async fn drain_until_task_status(
+    harness: &TestHarness,
     task_id: &str,
     expected_status: TaskStatus,
 ) -> TaskResponse {
+    // Executions finish independently; every observation settles the durable
+    // cascade queue instead of polling for inline cascade side effects.
     for _ in 0..100 {
-        let task: TaskResponse = empty_request(
-            app,
-            Method::GET,
-            &format!("/api/v1/tasks/{task_id}"),
-            StatusCode::OK,
-        )
-        .await;
+        let task = common::drain(&harness.state, &harness.app, task_id).await;
         if task.status == expected_status {
             return task;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let last: TaskResponse = empty_request(
-        app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}"),
-        StatusCode::OK,
-    )
-    .await;
-    let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
-        app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}/executions"),
-        StatusCode::OK,
-    )
-    .await;
-    panic!("task did not reach {expected_status:?} within timeout; last Task: {last:?}; executions: {executions:?}");
+    let last = common::drain(&harness.state, &harness.app, task_id).await;
+    panic!("task did not reach {expected_status:?}; last Task: {last:?}");
 }
 
 async fn poll_until_task_awaiting_human(app: &Router, task_id: &str) -> TaskResponse {
@@ -905,14 +888,15 @@ async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionSumm
     executions.items.into_iter().next().unwrap()
 }
 
-async fn poll_until_follow_up_execution(
-    app: &Router,
+async fn drain_until_follow_up_execution(
+    harness: &TestHarness,
     task_id: &str,
     parent_execution_id: &str,
 ) -> ExecutionSummaryResponse {
     for _ in 0..100 {
+        common::drain(&harness.state, &harness.app, task_id).await;
         let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
-            app,
+            &harness.app,
             Method::GET,
             &format!("/api/v1/tasks/{task_id}/executions"),
             StatusCode::OK,

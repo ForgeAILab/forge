@@ -10,7 +10,12 @@ impl TaskService {
         new_status: TaskStatus,
         options: impl Into<TransitionOptions>,
     ) -> Result<TransitionResult> {
-        self.transition_inner(task_id.into(), new_status, options.into(), None)
+        let task_id = task_id.into();
+        crate::worker_runtime::queue::PRODUCER_TASK
+            .scope(
+                task_id.clone(),
+                self.transition_inner(task_id, new_status, options.into(), None),
+            )
             .await
     }
 
@@ -21,13 +26,13 @@ impl TaskService {
         options: impl Into<TransitionOptions>,
         execution_id: &str,
     ) -> Result<TransitionResult> {
-        self.transition_inner(
-            task_id.into(),
-            new_status,
-            options.into(),
-            Some(execution_id),
-        )
-        .await
+        let task_id = task_id.into();
+        crate::worker_runtime::queue::PRODUCER_TASK
+            .scope(
+                task_id.clone(),
+                self.transition_inner(task_id, new_status, options.into(), Some(execution_id)),
+            )
+            .await
     }
 
     async fn transition_inner(
@@ -159,13 +164,13 @@ impl TaskService {
                 }),
             )
             .await?;
-        // Entry/after-enter hooks can update metadata without changing the
-        // Task version (for example, a manual review marker). Reload the
-        // committed row so the returned Task snapshot and its version carry
-        // the same state used by API readiness calculations.
-        let mut task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        let _step_reservation = crate::worker_runtime::queue::ProducerReservation::hold(
+            Arc::clone(&self.db),
+            result.queued_step_id.as_deref(),
+        );
+        // The engine returns the requested transition's settled inline
+        // snapshot. A concurrent writer cannot replace it in this response.
+        let mut task = result.task;
         if was_blocked {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
@@ -271,8 +276,18 @@ impl TaskService {
         }
         self.reconcile_terminal_subtask(&task).await;
 
+        if let Some(persisted) = TaskRepo::get_by_id(&*self.db, &task_id, false).await? {
+            if persisted.status == task.status && persisted.version == task.version {
+                task = persisted;
+            }
+        }
+        let pending_steps = db::TaskStepRepo::pending_steps(&*self.db, &task_id).await?;
+        if let Some(id) = &result.queued_step_id {
+            db::TaskStepRepo::ready_step(&*self.db, id).await?;
+        }
         Ok(TransitionResult {
             task,
+            pending_steps,
             review: result.review,
         })
     }
@@ -1176,26 +1191,23 @@ async fn clear_manual_advance_error_annotation(
         return Ok(advanced_task);
     }
 
-    TaskRepo::update(
-        db,
-        UpdateTask {
-            id: advanced_task.id.clone(),
-            expected_version: advanced_task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(None),
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .map_err(Into::into)
+    // Compare the annotation, not the version: the Advance's own queued step
+    // may already have moved the Task. A replaced annotation is a no-op,
+    // never a post-commit 409. The event shares the clear's transaction.
+    let mut tx = db::begin_immediate(db.pool()).await?;
+    let cleared = sqlx::query("UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL")
+        .bind(now_rfc3339()).bind(&advanced_task.id).bind(&source_task.error_annotation)
+        .execute(&mut *tx).await?.rows_affected();
+    let current = db
+        .get_task_in_tx(&mut tx, &advanced_task.id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", advanced_task.id.clone()))?;
+    if cleared == 1 {
+        let event = db::CreateDomainEvent::task_interruption_changed(&current);
+        db::DomainEventRepo::append_event_in_tx(db, &mut tx, &event).await?;
+    }
+    tx.commit().await?;
+    Ok(current)
 }
 
 pub(super) async fn clear_manual_review_awaiting_metadata(
@@ -1477,6 +1489,51 @@ mod tests {
             version: 1,
             created_at: now.clone(),
             updated_at: now,
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn advance_annotation_clear_accepts_both_step_orderings() {
+        for step_wins in [false, true] {
+            let db = SqliteDb::new(db::create_sqlite_pool("sqlite::memory:").await.unwrap());
+            db::run_migrations(db.pool()).await.unwrap();
+            let now = now_rfc3339();
+            sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p',?,?)")
+                .bind(&now)
+                .bind(&now)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO task(id,project_id,title,status,error_annotation,created_at,updated_at) VALUES('t','p','t','todo','old annotation',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+            let source = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            sqlx::query("UPDATE task SET status='planning',version=version+1 WHERE id='t'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let advanced = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            if step_wins {
+                sqlx::query("UPDATE task SET status='in_progress',version=version+1 WHERE id='t'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let result = clear_manual_advance_error_annotation(&db, &source, advanced)
+                .await
+                .unwrap();
+            assert!(result.error_annotation.is_none());
+            if !step_wins {
+                sqlx::query("UPDATE task SET status='in_progress',version=version+1 WHERE id='t'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let final_task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            assert_eq!(final_task.status, "in_progress");
+            assert!(final_task.error_annotation.is_none());
         }
     }
 }

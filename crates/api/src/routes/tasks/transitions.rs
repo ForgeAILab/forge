@@ -28,6 +28,7 @@ pub async fn transition_task(
     )
     .await?;
     Ok(Json(TransitionTaskResponse {
+        pending_steps: result.pending_steps,
         task: response,
         review: result
             .review

@@ -99,6 +99,7 @@ pub async fn get_operations_status(
     _admin: RequireAdmin,
     State(state): State<AppState>,
 ) -> ApiResult<Json<OperatorStatusResponse>> {
+    // Includes leased task_steps queue pressure alongside worker/consumer health.
     Ok(Json(state.operator_status_service.compute_status().await?))
 }
 

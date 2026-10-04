@@ -131,6 +131,7 @@ pub enum RuntimeWorker {
     WorkspaceCleanup,
     DomainEventBroadcast,
     StorageMaintenance,
+    TaskSteps,
 }
 
 impl RuntimeWorker {
@@ -149,7 +150,7 @@ impl RuntimeWorker {
     }
 }
 
-pub(crate) const COMMON_WORKERS: [RuntimeWorker; 16] = [
+pub(crate) const COMMON_WORKERS: [RuntimeWorker; 17] = [
     RuntimeWorker::CrashRecovery,
     RuntimeWorker::NotificationProjection,
     RuntimeWorker::OperatorStatusProjection,
@@ -165,6 +166,7 @@ pub(crate) const COMMON_WORKERS: [RuntimeWorker; 16] = [
     RuntimeWorker::WorkspaceCleanup,
     RuntimeWorker::DomainEventBroadcast,
     RuntimeWorker::StorageMaintenance,
+    RuntimeWorker::TaskSteps,
     RuntimeWorker::ConflictHotspots,
 ];
 
@@ -978,6 +980,13 @@ impl RuntimeSupervisor {
             ),
         ));
         self.handles.push((
+            RuntimeWorker::TaskSteps,
+            self.runtime
+                .task_service
+                .task_step_worker()
+                .start(shutdown.clone()),
+        ));
+        self.handles.push((
             RuntimeWorker::TaskDispatcher,
             Arc::clone(&self.runtime.task_dispatcher).start(),
         ));
@@ -1168,14 +1177,15 @@ mod tests {
 
     #[test]
     fn worker_set_is_explicit_and_stable() {
-        assert_eq!(COMMON_WORKERS.len(), 16);
+        assert_eq!(COMMON_WORKERS.len(), 17);
         assert_eq!(COMMON_WORKERS[0], RuntimeWorker::CrashRecovery);
         assert_eq!(COMMON_WORKERS[1], RuntimeWorker::NotificationProjection);
         assert_eq!(COMMON_WORKERS[2], RuntimeWorker::OperatorStatusProjection);
         assert_eq!(COMMON_WORKERS[4], RuntimeWorker::TaskDispatcher);
         assert_eq!(COMMON_WORKERS[13], RuntimeWorker::DomainEventBroadcast);
         assert_eq!(COMMON_WORKERS[14], RuntimeWorker::StorageMaintenance);
-        assert_eq!(COMMON_WORKERS[15], RuntimeWorker::ConflictHotspots);
+        assert_eq!(COMMON_WORKERS[15], RuntimeWorker::TaskSteps);
+        assert_eq!(COMMON_WORKERS[16], RuntimeWorker::ConflictHotspots);
     }
 
     #[tokio::test]
@@ -1224,14 +1234,15 @@ mod tests {
         assert!(!supervisor.started());
         supervisor.start().await.expect("runtime starts");
         assert!(supervisor.started());
-        assert_eq!(supervisor.workers().len(), 16);
-        assert_eq!(supervisor.worker_handle_count(), 15);
+        assert_eq!(supervisor.workers().len(), 17);
+        assert_eq!(supervisor.worker_handle_count(), 16);
         assert!(supervisor
             .workers()
             .contains(&RuntimeWorker::HeartbeatMonitor));
         assert!(supervisor
             .workers()
             .contains(&RuntimeWorker::StorageMaintenance));
+        assert!(supervisor.workers().contains(&RuntimeWorker::TaskSteps));
         let monitored = runtime_graph
             .operator_status_service
             .compute_status()
@@ -1325,7 +1336,7 @@ mod tests {
         let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
 
         supervisor.start().await.expect("runtime starts");
-        assert_eq!(supervisor.worker_handle_count(), 15);
+        assert_eq!(supervisor.worker_handle_count(), 16);
         supervisor.shutdown().await.expect("runtime shuts down");
     }
 }

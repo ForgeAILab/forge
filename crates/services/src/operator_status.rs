@@ -188,6 +188,7 @@ impl OperatorStatusService {
         let usage_summary = Some(self.usage_summary(active_execution_count).await?);
         let event_consumers = self.event_consumers(now).await?;
         let periodic_workers = self.periodic_workers.status().await?;
+        let task_steps = self.task_step_status(now).await?;
         let storage = db::sqlite_storage_status(self.db.pool()).await?;
         let database = DatabaseStorageStatus {
             incremental_vacuum: storage.incremental_vacuum,
@@ -333,9 +334,36 @@ impl OperatorStatusService {
             recent_errors,
             event_consumers,
             periodic_workers,
+            task_steps,
             event_relay,
             database,
             computed_at,
+        })
+    }
+
+    async fn task_step_status(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<api_types::TaskStepQueueStatus, ServiceError> {
+        // Failed and parked count only while the Task's annotation still
+        // points at that step: resolved rows are history, not queue health.
+        let (pending,claimed,oldest): (i64,i64,Option<String>) = sqlx::query_as("SELECT COALESCE(SUM(status='pending'),0),COALESCE(SUM(status='claimed'),0),MIN(CASE WHEN status='pending' THEN created_at END) FROM task_step WHERE status IN ('pending','claimed')")
+            .fetch_one(self.db.pool()).await?;
+        let (failed,parked): (i64,i64) = sqlx::query_as("SELECT COALESCE(SUM(s.status='failed'),0),COALESCE(SUM(s.status='parked'),0) FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.status IN ('failed','parked') AND t.deleted_at IS NULL AND CASE WHEN json_valid(t.error_annotation) THEN json_extract(t.error_annotation,'$.task_step_id') END=s.id")
+            .fetch_one(self.db.pool()).await?;
+        let (last_error,last_error_at,restart_count): (Option<String>,Option<String>,i64) = sqlx::query_as("SELECT last_error,last_error_at,restart_count FROM worker_health WHERE worker_name='task_steps'")
+            .fetch_optional(self.db.pool()).await?.unwrap_or_default();
+        Ok(api_types::TaskStepQueueStatus {
+            worker_name: "task_steps".into(),
+            pending,
+            claimed,
+            failed,
+            parked,
+            in_flight: self.db.active_step_count(),
+            oldest_pending_age_seconds: oldest.as_deref().map(|at| seconds_since(at, now)),
+            last_error,
+            last_error_at,
+            restart_count,
         })
     }
 
@@ -2044,5 +2072,46 @@ mod tests {
             .recent_errors
             .iter()
             .any(|error| error.entity_type == "worker_dead_letter"));
+    }
+    #[tokio::test]
+    async fn task_step_queue_is_visible_with_counts_and_age() {
+        use db::TaskStepRepo;
+        let (db, service) = test_service().await;
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('queue-project','queue',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES ('queue-task','queue-project','queue','todo',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        db.enqueue_step(&db::EnqueueTaskStep {
+            id: "queue-step".into(),
+            task_id: "queue-task".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: "queue".into(),
+            chain_id: "queue".into(),
+            chain_position: 1,
+            expected_status: "todo".into(),
+            expected_version: 1,
+            expected_epoch: None,
+            lane: "fast".into(),
+            available_at: now.clone(),
+        })
+        .await
+        .unwrap();
+        // Resolved history does not count; a step the Task still points at does.
+        for (id, status) in [("old-failure", "failed"), ("live-park", "parked")] {
+            sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at,completed_at) VALUES (?,'queue-task',(SELECT MAX(seq)+1 FROM task_step),'cascade','{}',?,?,1,'todo',1,?,?,?,?,?)")
+                .bind(id).bind(id).bind(id).bind(status).bind(&now).bind(&now).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        }
+        sqlx::query("UPDATE task SET error_annotation=? WHERE id='queue-task'")
+            .bind(r#"{"type":"workflow_loop","task_step_id":"live-park"}"#)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.task_steps.worker_name, "task_steps");
+        assert_eq!(status.task_steps.pending, 1);
+        assert_eq!(status.task_steps.claimed, 0);
+        assert_eq!(status.task_steps.failed, 0);
+        assert_eq!(status.task_steps.parked, 1);
+        assert!(status.task_steps.oldest_pending_age_seconds.is_some());
     }
 }
