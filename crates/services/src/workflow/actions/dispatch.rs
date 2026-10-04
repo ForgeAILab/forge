@@ -29,6 +29,31 @@ pub struct DispatchRoleAgent;
 #[async_trait]
 impl HookAction for DispatchRoleAgent {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        if let Some(attempt) = crate::workflow::engine::durable::current_hook(&ctx.task_id) {
+            match sqlx::query_scalar::<_, Option<String>>(
+                "SELECT execution_id FROM task_hook_checkpoint WHERE step_id=? AND hook_index=?",
+            )
+            .bind(&attempt.step.id)
+            .bind(attempt.index)
+            .fetch_one(ctx.db.pool())
+            .await
+            {
+                Ok(Some(execution_id)) => {
+                    // The admission transaction already durably launched this
+                    // transition's execution, even if it has since terminalised.
+                    return match ensure_review_record_for_dispatch(ctx, &execution_id).await {
+                        Ok(()) => HookResult::Ok,
+                        Err(reason) => HookResult::Failed { reason },
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    }
+                }
+            }
+        }
         let Some(state) = ctx
             .workflow
             .states

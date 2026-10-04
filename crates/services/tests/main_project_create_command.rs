@@ -6,11 +6,7 @@
 //! Project/Chat/binding/handoff/event/receipt/action execution are one durable
 //! outcome.
 
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::PathBuf, sync::Arc};
 
 use api_types::ProductMaturity;
 use db::{
@@ -473,14 +469,11 @@ async fn fixture_with_project_backend(db: Arc<SqliteDb>, project_backend_kind: &
 }
 
 async fn file_fixture() -> (Fixture, PathBuf) {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time is after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "forge-main-project-service-race-{}-{nanos}.db",
-        std::process::id()
-    ));
+    let file = tempfile::NamedTempFile::new().expect("isolated SQLite fixture file");
+    let (handle, path) = file
+        .keep()
+        .expect("fixture file persists until test cleanup");
+    drop(handle);
     (
         fixture_with_url(&format!("sqlite://{}", path.display())).await,
         path,

@@ -40,6 +40,7 @@ pub struct BranchList {
 
 async fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
+        .kill_on_drop(true)
         .args(args)
         .current_dir(cwd)
         .env_remove("GIT_DIR")
@@ -250,6 +251,7 @@ pub async fn detect_interrupted_merge(worktree_path: &Path) -> Result<bool> {
     // For worktrees, .git is a file pointing to the actual git dir.
     // Check via git rev-parse instead.
     let result = Command::new("git")
+        .kill_on_drop(true)
         .args(["rev-parse", "--verify", "MERGE_HEAD"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
@@ -412,6 +414,7 @@ pub async fn continue_rebase_keeping_conflicts(worktree_path: &Path) -> Result<V
             }
             run_git(worktree_path, &["add", "-A"]).await?;
             let output = Command::new("git")
+                .kill_on_drop(true)
                 .args(["-c", "core.editor=true", "rebase", "--continue"])
                 .current_dir(worktree_path)
                 .env_remove("GIT_DIR")
@@ -569,6 +572,7 @@ fn diff_destination_path(header: &str) -> Option<String> {
 /// Detect if a rebase is in progress via `git rev-parse`.
 pub async fn detect_rebase_in_progress(worktree_path: &Path) -> Result<bool> {
     let result = Command::new("git")
+        .kill_on_drop(true)
         .args(["rev-parse", "--git-path", "rebase-merge"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
@@ -589,6 +593,7 @@ pub async fn detect_rebase_in_progress(worktree_path: &Path) -> Result<bool> {
     }
 
     let result = Command::new("git")
+        .kill_on_drop(true)
         .args(["rev-parse", "--git-path", "rebase-apply"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
@@ -638,6 +643,7 @@ pub async fn detect_conflict_state(worktree_path: &Path) -> Result<ConflictOpera
 /// List paths with unresolved conflicts.
 pub async fn conflict_paths(worktree_path: &Path) -> Result<Vec<String>> {
     let output = Command::new("git")
+        .kill_on_drop(true)
         .args(["diff", "--name-only", "--diff-filter=U"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")

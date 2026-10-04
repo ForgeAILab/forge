@@ -785,6 +785,60 @@ async fn owner_rebase_preserves_clean_dirty_and_conflict_outcomes() {
         .unwrap());
 }
 
+/// An owner restarted inside `git rebase` resumes it as a fresh rebase would
+/// end: abort without handoff, continue and hand off with it.
+#[tokio::test]
+async fn owner_rebase_resumes_an_interrupted_rebase_as_the_fresh_path_ends() {
+    for handoff_conflicts in [false, true] {
+        let fixture = Fixture::new().await;
+        let handle = &fixture.prepared.workspace.workspace_handle;
+        std::fs::write(fixture.path().join("feature.txt"), "candidate\n").unwrap();
+        let candidate = git::commit_all(fixture.path(), "candidate").await.unwrap();
+        std::fs::write(fixture.repo.join("feature.txt"), "target\n").unwrap();
+        let target = git::commit_all(&fixture.repo, "target").await.unwrap();
+        assert!(git::rebase(fixture.path(), "main").await.is_err());
+        assert!(git::detect_rebase_in_progress(fixture.path())
+            .await
+            .unwrap());
+        let result = owner(
+            &fixture,
+            "resumed-owner-rebase",
+            handle,
+            WorkspaceOwnerOperation::RebaseTarget {
+                target_branch: "main".into(),
+                handoff_conflicts,
+            },
+        )
+        .await;
+        assert!(!git::detect_rebase_in_progress(fixture.path())
+            .await
+            .unwrap());
+        if handoff_conflicts {
+            assert!(
+                matches!(&result.outcome, WorkspaceOwnerOperationOutcome::Conflict { conflict_paths, .. } if conflict_paths == &["feature.txt"]),
+                "{:?}",
+                result.outcome
+            );
+            assert_eq!(
+                local_git(fixture.path(), &["merge-base", &target, "HEAD"])
+                    .await
+                    .unwrap(),
+                target
+            );
+        } else {
+            assert!(
+                matches!(&result.outcome, WorkspaceOwnerOperationOutcome::Conflict { conflict_paths, .. } if conflict_paths.is_empty()),
+                "{:?}",
+                result.outcome
+            );
+            assert_eq!(
+                git::get_current_sha(fixture.path()).await.unwrap(),
+                candidate
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn ci_unbounded_sentinels_do_not_remove_other_purpose_budgets() {
     let fixture = Fixture::new().await;

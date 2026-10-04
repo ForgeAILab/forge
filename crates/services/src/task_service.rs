@@ -427,17 +427,9 @@ pub struct TaskService {
     workspace_max_disconnect: Duration,
     memory_service: Arc<MemoryService>,
     move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// Task IDs whose completion cascade is running right now. Shared by
-    /// every clone, so competing terminal completions cannot apply effects
-    /// to the same Task at once.
-    completion_cascades: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Shared with manual checks: a Project has at most one host re-check.
     environment_rechecks: Arc<std::sync::Mutex<HashSet<String>>>,
     dispatch_notify: Arc<tokio::sync::Notify>,
-    /// Wakes completion cascades that arrived while another execution for
-    /// the same Task was settling. Waiters retry the Task slot after every
-    /// release, so a successor completion is never silently dropped.
-    completion_cascade_released: Arc<tokio::sync::Notify>,
     credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
     pub(crate) dispatch_wake: Arc<tokio::sync::Notify>,
 }
@@ -528,10 +520,8 @@ impl TaskService {
             workspace_max_disconnect: Duration::from_secs(::config::DEFAULT_MAX_DISCONNECT_SECONDS),
             memory_service,
             move_operation_locks: Arc::new(Mutex::new(HashMap::new())),
-            completion_cascades: Arc::default(),
             environment_rechecks: Arc::default(),
             dispatch_notify: Arc::default(),
-            completion_cascade_released: Arc::default(),
             credential_env: None,
             dispatch_wake: Arc::default(),
         }
@@ -1108,6 +1098,12 @@ impl TaskService {
                     &input.id,
                 )
                 .await?;
+                if let Some(attempt) = crate::workflow::engine::durable::current_hook(&input.task_id) {
+                    self.db.fence_hook_in_tx(&mut transaction, &attempt.step).await?;
+                    let linked = sqlx::query("UPDATE task_hook_checkpoint SET execution_id=? WHERE step_id=? AND hook_index=? AND execution_id IS NULL")
+                        .bind(&execution.id).bind(&attempt.step.id).bind(attempt.index).execute(&mut *transaction).await?.rows_affected();
+                    if linked != 1 { return Err(DbError::VersionConflict.into()); }
+                }
                 transaction.commit().await?;
                 Ok(execution)
             } else {

@@ -24,6 +24,7 @@ pub(crate) use helpers::is_blocking_annotation_type;
 mod initial_scheduling;
 mod repo_pause_sync;
 pub mod slots;
+mod stranded_hooks;
 mod workspace_blocking;
 
 pub struct TaskDispatcher {

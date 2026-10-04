@@ -57,6 +57,7 @@ pub(crate) struct PausedIntegration {
     pub deferred_at: String,
 }
 
+#[cfg(test)]
 pub(crate) async fn set(
     db: &db::SqliteDb,
     task: &Task,
@@ -67,6 +68,7 @@ pub(crate) async fn set(
     set_with_mutations(db, task, target_state, not_before, reason, Vec::new()).await
 }
 
+#[cfg(test)]
 pub(crate) async fn set_with_mutations(
     db: &db::SqliteDb,
     task: &Task,

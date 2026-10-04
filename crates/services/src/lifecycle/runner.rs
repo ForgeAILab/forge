@@ -19,7 +19,7 @@ use crate::workspace_backend::{
 
 pub struct LifecycleHookRunner;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LifecycleHookRun {
     pub index: usize,
     pub entry: Value,
@@ -166,9 +166,47 @@ impl LifecycleHookRunner {
             if !blocking {
                 continue;
             }
-            let mut run =
-                Self::run_workspace_script_hook(&ctx, index, command, *timeout_seconds, workspace)
-                    .await?;
+            let attempt = crate::workflow::engine::durable::current_hook(&ctx.task_id);
+            let (recorded, interrupted) = match &attempt {
+                Some(attempt) => {
+                    attempt
+                        .db
+                        .start_hook_script(&attempt.step, attempt.index, index as i64)
+                        .await?
+                }
+                None => (None, false),
+            };
+            let mut run = if let Some(recorded) = recorded {
+                serde_json::from_str::<LifecycleHookRun>(&recorded)
+                    .map_err(|e| crate::ServiceError::invalid_operation(e.to_string()))?
+            } else {
+                let mut run = Self::run_workspace_script_hook(
+                    &ctx,
+                    index,
+                    command,
+                    *timeout_seconds,
+                    workspace,
+                )
+                .await?;
+                if let Some(attempt) = &attempt {
+                    run.entry["step_id"] = json!(attempt.step.id);
+                    if interrupted {
+                        run.entry["rerun_after_interruption"] = json!(true);
+                    }
+                    attempt
+                        .db
+                        .finish_hook_script(
+                            &attempt.step,
+                            attempt.index,
+                            index as i64,
+                            &serde_json::to_string(&run).map_err(|e| {
+                                crate::ServiceError::invalid_operation(e.to_string())
+                            })?,
+                        )
+                        .await?;
+                }
+                run
+            };
             run.log_path = Self::write_log_entry(&ctx, index, &run.entry);
             if run.status != "success" {
                 return Ok(Some(run));
@@ -709,7 +747,11 @@ impl LifecycleHookRunner {
         }
     }
 
-    fn write_log_entry(ctx: &LifecycleHookContext, index: usize, entry: &Value) -> Option<String> {
+    pub(crate) fn write_log_entry(
+        ctx: &LifecycleHookContext,
+        index: usize,
+        entry: &Value,
+    ) -> Option<String> {
         let log_dir = ctx.log_dir.as_ref()?;
 
         if let Err(err) = std::fs::create_dir_all(log_dir) {

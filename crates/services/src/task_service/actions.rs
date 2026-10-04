@@ -444,6 +444,9 @@ impl TaskService {
                                 }
                                 let mut selection = snapshot.clone();
                                 selection.caller = crate::ActionCaller::owner();
+                                // This action's own entry hooks are queued;
+                                // they fence readiness, not the continuation.
+                                selection.entry_hooks_running = false;
                                 let mut work = offer;
                                 work.reason = "role_retry".to_owned();
                                 work.target_execution_id = crate::available_actions(&selection)
@@ -745,8 +748,10 @@ impl TaskService {
         }
         let mut selection = snapshot.clone();
         selection.caller = crate::ActionCaller::owner();
-        // The accepted intent is a scheduling fence, not a condition on the
-        // next role. Derive its continuation target from the same pure resolver.
+        // The accepted intent and this action's own queued entry hooks are
+        // scheduling fences, not conditions on the next role. Derive its
+        // continuation target from the same pure resolver.
+        selection.entry_hooks_running = false;
         if let Some(raw) = selection.task.metadata_json.as_deref() {
             if let Ok(mut metadata) = serde_json::from_str::<Value>(raw) {
                 if let Some(object) = metadata.as_object_mut() {

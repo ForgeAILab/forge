@@ -283,6 +283,13 @@ pub async fn next_daemon_request(
                             .expect("verification response sends");
                         continue;
                     }
+                    if method == api_types::METHOD_JOURNAL_ACK
+                        && expected_method != api_types::METHOD_JOURNAL_ACK
+                    {
+                        send_daemon_response(socket, id, serde_json::json!({"acknowledged":true}))
+                            .await;
+                        continue;
+                    }
                     assert_eq!(method, expected_method);
                     return (id, params);
                 }

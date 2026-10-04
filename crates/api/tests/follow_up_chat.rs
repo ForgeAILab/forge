@@ -356,6 +356,7 @@ impl CodingExecutorAdapter for CompletingShellAdapter {
 }
 
 struct TestHarness {
+    _step_worker: common::StepWorkerGuard,
     app: Router,
     state: Arc<AppState>,
     _web_dist_dir: common::TestDir,
@@ -412,6 +413,7 @@ async fn test_app(
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
     TestHarness {
+        _step_worker: common::StepWorkerGuard::start(&state),
         app,
         state,
         _web_dist_dir: web_dist_dir,

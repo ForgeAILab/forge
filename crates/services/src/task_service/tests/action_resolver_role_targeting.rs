@@ -64,6 +64,7 @@ async fn test_resolve_execution_actions_targets_current_role() {
         action_agent_id: None,
         planning_approval_ready: true,
         advance_target: None,
+        entry_hooks_running: false,
     };
     let offers = crate::available_actions(&snapshot);
     assert!(offers.iter().any(|offer| offer.action.verb() == "retry"));
@@ -275,6 +276,7 @@ async fn test_resolve_execution_actions_disables_resume_for_terminal_bound_revie
         action_agent_id: None,
         planning_approval_ready: true,
         advance_target: None,
+        entry_hooks_running: false,
     };
     let offers = crate::available_actions(&snapshot);
     assert!(!offers.iter().any(|offer| matches!(

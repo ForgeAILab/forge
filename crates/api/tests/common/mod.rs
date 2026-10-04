@@ -23,10 +23,43 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+/// Real asynchronous workflow execution for socket/provider integration tests.
+pub struct StepWorkerGuard {
+    stop: tokio::sync::watch::Sender<bool>,
+    job: tokio::task::JoinHandle<()>,
+}
+impl StepWorkerGuard {
+    pub fn start(state: &AppState) -> Self {
+        let (stop, signal) = tokio::sync::watch::channel(false);
+        Self {
+            stop,
+            job: state.task_service.task_step_worker().start(signal),
+        }
+    }
+}
+impl StepWorkerGuard {
+    pub fn stop(&self) {
+        let _ = self.stop.send(true);
+        self.job.abort();
+    }
+}
+impl Drop for StepWorkerGuard {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub struct Harness {
+    _step_worker: StepWorkerGuard,
     pub app: Router,
     pub state: Arc<AppState>,
     _web_dist_dir: TestDir,
+}
+
+impl Harness {
+    pub fn stop_step_worker(&self) {
+        self._step_worker.stop();
+    }
 }
 
 /// Settle queued workflow cascades deterministically before final-state assertions.
@@ -109,6 +142,7 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
     Harness {
+        _step_worker: StepWorkerGuard::start(&state),
         app,
         state,
         _web_dist_dir: web_dist_dir,

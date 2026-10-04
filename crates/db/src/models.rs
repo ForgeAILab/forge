@@ -1285,7 +1285,7 @@ pub struct MoveTaskIdentity {
 
 #[derive(Debug, Clone)]
 pub struct CompareAndMoveTask {
-    pub cascade_step: Option<crate::EnqueueTaskStep>,
+    pub post_commit_step: Option<crate::EnqueueTaskStep>,
     pub operation_id: String,
     pub project_id: String,
     pub task_id: String,

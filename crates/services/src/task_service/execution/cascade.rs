@@ -23,26 +23,6 @@ impl ExecutionRetryDisposition {
     }
 }
 
-/// Holds one Task's slot in `TaskService::completion_cascades` and frees it on
-/// drop, including when the cascade returns early or errors. Serializing by
-/// Task prevents two completed same-role executions from publishing different
-/// plan snapshots before only one workflow transition wins its CAS.
-pub(crate) struct CompletionCascadeSlot {
-    in_flight: Arc<std::sync::Mutex<HashSet<String>>>,
-    released: Arc<tokio::sync::Notify>,
-    task_id: String,
-}
-
-impl Drop for CompletionCascadeSlot {
-    fn drop(&mut self) {
-        self.in_flight
-            .lock()
-            .expect("completion cascade set lock")
-            .remove(&self.task_id);
-        self.released.notify_waiters();
-    }
-}
-
 impl TaskService {
     /// Settle one terminal execution. The inline completion path and the
     /// dispatcher's reconciliation of terminal executions both call this, and
@@ -51,29 +31,7 @@ impl TaskService {
     /// retries against current authority. This keeps duplicate delivery
     /// idempotent without dropping a successor role's terminal completion.
     pub async fn maybe_cascade_executor_completion(&self, execution_id: &str) -> Result<()> {
-        let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
-            return Ok(());
-        };
-
-        loop {
-            // Register before checking the slot. Otherwise its owner could
-            // release and notify between a failed claim and `notified()`,
-            // leaving this terminal completion asleep forever.
-            let released = self.completion_cascade_released.notified();
-            tokio::pin!(released);
-            released.as_mut().enable();
-
-            if let Some(_slot) = self.claim_completion_cascade(&execution.task_id) {
-                return self.cascade_executor_completion(execution_id).await;
-            }
-
-            tracing::debug!(
-                execution_id,
-                task_id = %execution.task_id,
-                "Task completion cascade already in flight; waiting to retry"
-            );
-            released.await;
-        }
+        self.cascade_executor_completion(execution_id).await
     }
 
     /// A sweep must never wait behind another Task cascade while holding an owner permit.
@@ -81,14 +39,10 @@ impl TaskService {
         let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
             return Ok(true);
         };
-        let Some(slot) = self.claim_completion_cascade(&execution.task_id) else {
-            return Ok(false);
-        };
         let service = self.clone();
         let execution_id = execution_id.to_owned();
         tokio::spawn(async move {
             let result = service.cascade_executor_completion(&execution_id).await;
-            drop(slot);
             if let Err(error) = result {
                 tracing::warn!(%execution_id, %error, "detached completion cascade remains pending");
                 return;
@@ -108,18 +62,6 @@ impl TaskService {
             }
         });
         Ok(true)
-    }
-
-    pub(crate) fn claim_completion_cascade(&self, task_id: &str) -> Option<CompletionCascadeSlot> {
-        self.completion_cascades
-            .lock()
-            .expect("completion cascade set lock")
-            .insert(task_id.to_owned())
-            .then(|| CompletionCascadeSlot {
-                in_flight: Arc::clone(&self.completion_cascades),
-                released: Arc::clone(&self.completion_cascade_released),
-                task_id: task_id.to_owned(),
-            })
     }
 
     async fn cascade_executor_completion(&self, execution_id: &str) -> Result<()> {

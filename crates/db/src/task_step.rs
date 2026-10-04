@@ -44,6 +44,7 @@ pub struct TaskStep {
 
 #[derive(Debug, Clone)]
 pub struct EnqueueTaskStep {
+    pub kind: String,
     pub id: String,
     pub task_id: String,
     pub payload_json: String,
@@ -73,6 +74,10 @@ pub trait TaskStepRepo: Send + Sync {
     async fn enqueue_step(&self, input: &EnqueueTaskStep) -> Result<String>;
     async fn task_steps(&self, task_id: &str) -> Result<Vec<TaskStep>>;
     async fn pending_steps(&self, task_id: &str) -> Result<i64>;
+    /// The current entry's post-commit hooks row is still pending or
+    /// claimed: its entry checks (CI, before-work scripts, dispatch) have not
+    /// settled. Matched on status and epoch, as the step fence is.
+    async fn entry_hooks_pending(&self, task_id: &str) -> Result<bool>;
     async fn chain_steps(&self, chain_id: &str) -> Result<Vec<TaskStep>>;
     async fn step_workflow(&self, id: &str) -> Result<String>;
     async fn store_step_workflow(&self, definition: &str) -> Result<String>;
@@ -142,8 +147,8 @@ impl TaskStepRepo for SqliteDb {
         i: &EnqueueTaskStep,
     ) -> Result<String> {
         let now = now_rfc3339();
-        sqlx::query("INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,expected_epoch,lane,status,available_at,created_at,updated_at) SELECT ?,?,COALESCE(MAX(seq),0)+1,'cascade',?,?,?,?,?,?,?,COALESCE(?,(SELECT status_epoch FROM task WHERE id=?),0),?,'pending',?,?,? FROM task_step WHERE task_id = ? ON CONFLICT(task_id,causation_key) DO NOTHING")
-            .bind(&i.id).bind(&i.task_id).bind(&i.payload_json).bind(&i.causation_step_id).bind(&i.causation_key)
+        sqlx::query("INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,expected_epoch,lane,status,available_at,created_at,updated_at) SELECT ?,?,COALESCE(MAX(seq),0)+1,?,?,?,?,?,?,?,?,COALESCE(?,(SELECT status_epoch FROM task WHERE id=?),0),?,'pending',?,?,? FROM task_step WHERE task_id = ? ON CONFLICT(task_id,causation_key) DO NOTHING")
+            .bind(&i.id).bind(&i.task_id).bind(&i.kind).bind(&i.payload_json).bind(&i.causation_step_id).bind(&i.causation_key)
             .bind(&i.chain_id).bind(i.chain_position).bind(&i.expected_status).bind(i.expected_version)
             .bind(i.expected_epoch).bind(&i.task_id).bind(&i.lane).bind(&i.available_at).bind(&now).bind(&now).bind(&i.task_id).execute(&mut **tx).await?;
         Ok(
@@ -263,6 +268,14 @@ impl TaskStepRepo for SqliteDb {
         .fetch_one(self.pool())
         .await?)
     }
+    async fn entry_hooks_pending(&self, task_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id = s.task_id WHERE s.task_id = ? AND s.kind = 'hooks' AND s.status IN ('pending','claimed') AND s.expected_status = t.status AND s.expected_epoch = t.status_epoch)",
+        )
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
     async fn claim_step(
         &self,
         owner: &str,
@@ -353,6 +366,116 @@ impl Drop for TaskStepActivity {
     }
 }
 impl SqliteDb {
+    /// Check lease ownership and the producing status entry in the writer
+    /// transaction that records a hook effect or checkpoint.
+    pub async fn fence_hook_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        step: &TaskStep,
+    ) -> Result<()> {
+        let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE id=? AND status='claimed' AND claimed_by=? AND (lease_until>? OR ?))")
+            .bind(&step.id).bind(&step.claimed_by).bind(now_rfc3339()).bind(self.step_is_active(step)).fetch_one(&mut **tx).await?;
+        let entry: bool = sqlx::query_scalar(STEP_FENCE)
+            .bind(&step.task_id)
+            .bind(&step.expected_status)
+            .bind(step.expected_epoch)
+            .fetch_one(&mut **tx)
+            .await?;
+        if !owned || !entry {
+            return Err(DbError::VersionConflict);
+        }
+        Ok(())
+    }
+
+    /// Returns a recorded outcome and whether an unrecorded attempt was
+    /// interrupted. Starting is durable before invoking the action.
+    pub async fn start_hook(&self, step: &TaskStep, index: i64) -> Result<(Option<String>, bool)> {
+        let mut tx = begin_immediate(self.pool()).await?;
+        self.fence_hook_in_tx(&mut tx, step).await?;
+        let previous: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT result_json FROM task_hook_checkpoint WHERE step_id=? AND hook_index=?",
+        )
+        .bind(&step.id)
+        .bind(index)
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at) VALUES(?,?,?) ON CONFLICT DO NOTHING")
+            .bind(&step.id).bind(index).bind(now_rfc3339()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        let interrupted = previous.as_ref().is_some_and(Option::is_none);
+        Ok((previous.flatten(), interrupted))
+    }
+
+    pub async fn finish_hook(&self, step: &TaskStep, index: i64, outcome: &str) -> Result<()> {
+        let mut tx = begin_immediate(self.pool()).await?;
+        self.fence_hook_in_tx(&mut tx, step).await?;
+        sqlx::query(
+            "UPDATE task_hook_checkpoint SET result_json=? WHERE step_id=? AND hook_index=?",
+        )
+        .bind(outcome)
+        .bind(&step.id)
+        .bind(index)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn hook_effect(
+        &self,
+        step: &TaskStep,
+        index: i64,
+        key: &str,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT json_extract(effects_json,?) FROM task_hook_checkpoint WHERE step_id=? AND hook_index=?")
+            .bind(format!("$.{key}")).bind(&step.id).bind(index).fetch_one(self.pool()).await?)
+    }
+    pub async fn record_hook_effect(
+        &self,
+        step: &TaskStep,
+        index: i64,
+        key: &str,
+        value: &str,
+    ) -> Result<()> {
+        let mut tx = begin_immediate(self.pool()).await?;
+        self.fence_hook_in_tx(&mut tx, step).await?;
+        sqlx::query("UPDATE task_hook_checkpoint SET effects_json=json_set(effects_json,?,?) WHERE step_id=? AND hook_index=?")
+            .bind(format!("$.{key}")).bind(value).bind(&step.id).bind(index).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn start_hook_script(
+        &self,
+        step: &TaskStep,
+        hook: i64,
+        script: i64,
+    ) -> Result<(Option<String>, bool)> {
+        let mut tx = begin_immediate(self.pool()).await?;
+        self.fence_hook_in_tx(&mut tx, step).await?;
+        let previous: Option<Option<String>> = sqlx::query_scalar("SELECT result_json FROM task_hook_script WHERE step_id=? AND hook_index=? AND script_index=?")
+            .bind(&step.id).bind(hook).bind(script).fetch_optional(&mut *tx).await?;
+        sqlx::query("INSERT INTO task_hook_script(step_id,hook_index,script_index,started_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING")
+            .bind(&step.id).bind(hook).bind(script).bind(now_rfc3339()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        let interrupted = previous.as_ref().is_some_and(Option::is_none);
+        Ok((previous.flatten(), interrupted))
+    }
+
+    pub async fn finish_hook_script(
+        &self,
+        step: &TaskStep,
+        hook: i64,
+        script: i64,
+        outcome: &str,
+    ) -> Result<()> {
+        let mut tx = begin_immediate(self.pool()).await?;
+        self.fence_hook_in_tx(&mut tx, step).await?;
+        sqlx::query("UPDATE task_hook_script SET result_json=? WHERE step_id=? AND hook_index=? AND script_index=?")
+            .bind(outcome).bind(&step.id).bind(hook).bind(script).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
     pub fn hold_task_step(&self, step: &TaskStep) -> TaskStepActivity {
         self.task_step_activity
             .lock()
@@ -407,8 +530,8 @@ impl SqliteDb {
     }
     /// Role entries about to take an agent slot: `(for agent_id, all)`,
     /// excluding `excluding_task`. Counts a Task's available fast-lane head
-    /// step, a claimed fast-lane step, and a done step still holding its lease
-    /// for the inline dispatch that follows its CAS. Steps behind another
+    /// step or a claimed fast-lane hook while dispatch is imminent. Completed
+    /// status steps and recorded dispatch outcomes reserve nothing. Rows behind another
     /// step, in back-off, under a producer reservation, or waiting for or
     /// inside a long-lane merge/CI hook hold no capacity; the dispatcher
     /// re-drives a refused entry.
@@ -424,13 +547,13 @@ impl SqliteDb {
              AND ((s.status='pending' AND s.lane='fast' AND s.available_at<=? \
                    AND NOT EXISTS(SELECT 1 FROM task_step p WHERE p.task_id=s.task_id AND p.seq<s.seq AND p.status IN ('pending','claimed')) \
                    AND NOT EXISTS(SELECT 1 FROM task_step p WHERE p.task_id=s.task_id AND p.id!=s.id AND p.lease_until>?)) \
-               OR (s.status='claimed' AND s.lane='fast' AND s.lease_until>?) \
-               OR (s.status='done' AND s.lease_until>?)) \
+               OR (s.status='claimed' AND s.lane='fast' AND s.lease_until>?)) \
+             AND EXISTS(SELECT 1 FROM task t WHERE t.id=s.task_id AND t.status=s.expected_status AND t.status_epoch=s.expected_epoch AND t.deleted_at IS NULL) \
+             AND NOT EXISTS(SELECT 1 FROM task_hook_checkpoint h WHERE h.step_id=s.id AND (h.hook_index=json_extract(s.payload_json,'$.dispatch_index') AND h.result_json IS NOT NULL OR (json_extract(s.payload_json,'$.dispatch_index') IS NOT NULL AND json_type(h.result_json,'$.Cascade') IS NOT NULL) OR json_type(h.result_json,'$.Failed') IS NOT NULL)) \
              AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.task_id=s.task_id AND e.status='running')",
         )
         .bind(agent_id)
         .bind(excluding_task)
-        .bind(&now)
         .bind(&now)
         .bind(&now)
         .bind(&now)
@@ -523,6 +646,7 @@ mod tests {
     }
     fn input(task: &str, key: &str) -> EnqueueTaskStep {
         EnqueueTaskStep {
+            kind: "cascade".into(),
             id: crate::new_uuid_v4(),
             task_id: task.into(),
             payload_json: "{}".into(),
@@ -983,7 +1107,172 @@ mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
+        assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (2, 2));
+        db.release_step(&committed.id, "f-owner").await.unwrap();
+        let mut hooks = role_entry("f", "hook-dispatch", "fast");
+        hooks.kind = "hooks".into();
+        hooks.payload_json =
+            serde_json::json!({"admission_agent_id":"agent", "dispatch_index":0}).to_string();
+        db.enqueue_step(&hooks).await.unwrap();
+        let hook_step = db
+            .claim_step("hook-owner", Some("f"), &later())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (3, 3));
         assert_eq!(db.queued_admissions("other", "a").await.unwrap(), (0, 2));
+        db.start_hook(&hook_step, 0).await.unwrap();
+        db.finish_hook(&hook_step, 0, "\"Ok\"").await.unwrap();
+        assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (2, 2));
+    }
+    #[tokio::test]
+    async fn hook_and_script_checkpoints_reject_stale_owners_and_entries() {
+        let db = fixture().await;
+        let mut input = input("a", "hook");
+        input.kind = "hooks".into();
+        db.enqueue_step(&input).await.unwrap();
+        let step = db
+            .claim_step("owner", Some("a"), &later())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.start_hook(&step, 0).await.unwrap(), (None, false));
+        assert_eq!(db.start_hook(&step, 0).await.unwrap(), (None, true));
+        assert_eq!(
+            db.start_hook_script(&step, 0, 0).await.unwrap(),
+            (None, false)
+        );
+        assert_eq!(
+            db.start_hook_script(&step, 0, 0).await.unwrap(),
+            (None, true)
+        );
+        db.finish_hook_script(&step, 0, 0, "script-result")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.start_hook_script(&step, 0, 0).await.unwrap(),
+            (Some("script-result".into()), false)
+        );
+        db.record_hook_effect(&step, 0, "merge", "{\"Done\":true}")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.hook_effect(&step, 0, "merge").await.unwrap().as_deref(),
+            Some("{\"Done\":true}")
+        );
+        sqlx::query("UPDATE task_step SET lease_until='2000-01-01T00:00:00Z' WHERE id=?")
+            .bind(&step.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let replacement = db
+            .claim_step("replacement", Some("a"), &later())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            db.finish_hook(&step, 0, "old").await,
+            Err(DbError::VersionConflict)
+        ));
+        sqlx::query("UPDATE task SET status='other' WHERE id='a'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.finish_hook_script(&replacement, 0, 0, "late").await,
+            Err(DbError::VersionConflict)
+        ));
+    }
+    #[tokio::test]
+    async fn durable_hook_upgrade_unblocks_legacy_running_barrier_without_moving_epoch() {
+        let db = fixture().await;
+        sqlx::query("UPDATE task SET entry_barrier_json=?,title='preserved',version=7 WHERE id='a'")
+            .bind(serde_json::json!({"status":"running","state":"todo","started_at":"2026-10-01T00:00:00Z","infrastructure_attempts":2}).to_string()).execute(db.pool()).await.unwrap();
+        let sql = include_str!("../migrations/V202610040225__durable_hook_steps.sql")
+            .split("-- Legacy running barriers")
+            .nth(1)
+            .unwrap();
+        let sql = &sql[sql.find("UPDATE task SET").unwrap()..];
+        sqlx::raw_sql(sql).execute(db.pool()).await.unwrap();
+        let (title, version, epoch, raw): (String, i64, i64, String) = sqlx::query_as(
+            "SELECT title,version,status_epoch,entry_barrier_json FROM task WHERE id='a'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(title, "preserved");
+        assert_eq!(version, 8);
+        assert_eq!(epoch, 0);
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["status"], "blocked");
+        assert_eq!(value["infrastructure_attempts"], 2);
+    }
+
+    // A real upgrade from the pre-durable-hooks schema with in-flight step rows.
+    #[tokio::test]
+    async fn upgrade_preserves_in_flight_steps_and_converts_running_barrier() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let old = tempfile::TempDir::new().unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("V202610040225") {
+                std::fs::copy(entry.path(), old.path().join(&name)).unwrap();
+            }
+        }
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        crate::run_migrations_from(&pool, old.path()).await.unwrap();
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('p','p',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at,entry_barrier_json) VALUES ('a','p','a','review',?,?,?)")
+            .bind(&now).bind(&now).bind(serde_json::json!({"status":"running","state":"review"}).to_string()).execute(&pool).await.unwrap();
+        for (id, seq, status, cause, lease) in [
+            ("s1", 1, "done", None, Some("2099-01-01T00:00:00Z")),
+            ("s2", 2, "claimed", Some("s1"), Some("2099-01-01T00:00:00Z")),
+            ("s3", 3, "pending", Some("s2"), None),
+        ] {
+            sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,status,claimed_by,lease_until,available_at,created_at,updated_at,expected_epoch,lane) VALUES (?,'a',?,'cascade',?,?,?,'c',?,'review',1,?,?,?,?,?,?,4,'long')")
+                .bind(id).bind(seq).bind(r#"{"workflow_ref":{"id":"wf"}}"#).bind(cause).bind(format!("k{seq}")).bind(seq).bind(status)
+                .bind(lease.map(|_| "owner")).bind(lease).bind(&now).bind(&now).bind(&now).execute(&pool).await.unwrap();
+        }
+        crate::run_migrations_from(&pool, &src).await.unwrap();
+        type UpgradedStep = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            String,
+            Option<String>,
+        );
+        let rows: Vec<UpgradedStep> = sqlx::query_as(
+            "SELECT id,status,causation_step_id,lease_until,expected_epoch,lane,workflow_ref_id FROM task_step ORDER BY seq").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].2.as_deref(), Some("s1"));
+        assert_eq!(rows[1].3.as_deref(), Some("2099-01-01T00:00:00Z"));
+        assert_eq!(rows[2].4, 4);
+        assert_eq!(rows[2].6.as_deref(), Some("wf"));
+        let (barrier, ann): (String, Option<String>) =
+            sqlx::query_as("SELECT entry_barrier_json,error_annotation FROM task WHERE id='a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(barrier.contains("blocked"));
+        assert!(ann.is_some_and(|a| a.contains("before_work_hook_failed")));
+        let fk: Vec<(String,)> =
+            sqlx::query_as("SELECT sql FROM sqlite_master WHERE name='task_step'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !fk[0].0.contains("task_step_new"),
+            "self-reference not renamed: {}",
+            fk[0].0
+        );
     }
 }

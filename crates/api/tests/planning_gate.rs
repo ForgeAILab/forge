@@ -78,6 +78,7 @@ async fn entering_planning_dispatches_assigned_planner_role() {
     .await;
     assert_eq!(moved.task.status, "planning");
 
+    harness._state.task_service.drain(&task.id).await.unwrap();
     let events = drain_events(&mut rx).await;
     assert!(
         events.iter().any(|event| matches!(

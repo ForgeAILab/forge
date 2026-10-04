@@ -114,6 +114,18 @@ async fn carry(ctx: &HookContext) -> Result<HookResult, CarryError> {
         return Err(ineligible("not a mechanical merge-contention entry"));
     };
 
+    if let Some(attempt) = crate::workflow::engine::durable::current_hook(&ctx.task_id) {
+        if let Some(review) = latest_review(ctx).await.map_err(failed)? {
+            let details: Value = serde_json::from_str(&review.step_results_json).map_err(failed)?;
+            if review.status == ReviewStatus::Passed
+                && details["carry_hook_step_id"] == attempt.step.id
+                && details["carry_hook_index"] == attempt.index
+            {
+                return Ok(HookResult::Cascade { to: default_states::MERGING.into(), reason: "[review-carry] resumed carried review authority; CI passed; re-review skipped".into() });
+            }
+        }
+    }
+
     // `run_ci_steps` (a blocking before_enter hook) opened this Review row and
     // recorded the checks it ran. Insist that every configured step ran and
     // exited zero for this entry.
@@ -174,6 +186,10 @@ async fn carry(ctx: &HookContext) -> Result<HookResult, CarryError> {
     // Keep the previous verdict exactly as recorded; only this entry's checks
     // are new.
     let mut details = json!({ "ci_steps": ci_results });
+    if let Some(attempt) = crate::workflow::engine::durable::current_hook(&ctx.task_id) {
+        details["carry_hook_step_id"] = json!(attempt.step.id);
+        details["carry_hook_index"] = json!(attempt.index);
+    }
     for key in ["conformance", "auditor"] {
         if let Some(value) = base.prior_details.get(key).filter(|value| !value.is_null()) {
             details[key] = value.clone();

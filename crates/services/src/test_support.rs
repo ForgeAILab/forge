@@ -183,10 +183,10 @@ pub(crate) async fn force_task_version_conflict_after_transition(
     let now = now_rfc3339().replace('\'', "''");
     let sql = format!(
         "CREATE TRIGGER \"{trigger_name}\"
-         AFTER UPDATE OF hook_results_json ON transition_log
+         AFTER INSERT ON task_step
          WHEN NEW.task_id = '{first_task_id}'
-          AND NEW.to_state = '{to_state}'
-          AND NEW.hook_results_json IS NOT NULL
+          AND NEW.expected_status = '{to_state}'
+          AND NEW.kind = 'hooks'
          BEGIN
              UPDATE task
              SET version = version + 1, updated_at = '{now}'

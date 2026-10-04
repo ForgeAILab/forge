@@ -53,6 +53,8 @@ pub struct TaskSnapshot {
     pub action_agent_id: Option<String>,
     pub planning_approval_ready: bool,
     pub advance_target: Option<String>,
+    /// The current entry's post-commit hook step is pending or claimed.
+    pub entry_hooks_running: bool,
 }
 
 impl TaskSnapshot {
@@ -176,9 +178,6 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         .entry_barrier_json
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-    let barrier_running = barrier
-        .as_ref()
-        .is_some_and(|barrier| barrier["status"] == "running");
     let barrier_blocked = barrier
         .as_ref()
         .is_some_and(|barrier| barrier["status"] == "blocked");
@@ -217,7 +216,10 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         .latest_review
         .as_ref()
         .is_some_and(|review| review.status == ReviewStatus::Failed);
-    let awaiting_human = !barrier_running
+    // While the entry's hook step runs, the latest Review may belong to an
+    // earlier entry; nothing waits for a human until its checks settle.
+    let entry_hooks_running = snapshot.entry_hooks_running;
+    let awaiting_human = !entry_hooks_running
         && (snapshot
             .latest_review
             .as_ref()
@@ -537,7 +539,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             return offers;
         }
     }
-    if barrier_running || queued {
+    if entry_hooks_running || queued {
         return offers;
     }
     if matches!(
@@ -1517,6 +1519,7 @@ pub async fn load_snapshot(
                 })
         }
     };
+    let entry_hooks_running = db::TaskStepRepo::entry_hooks_pending(db, &task.id).await?;
     let advance_target =
         if crate::task_service::execution::ensure_plan_publication_transition_authority(&task, None)
             .is_ok()
@@ -1558,6 +1561,7 @@ pub async fn load_snapshot(
         action_agent_id,
         planning_approval_ready,
         advance_target,
+        entry_hooks_running,
     })
 }
 async fn select_action_agent(
@@ -1805,6 +1809,7 @@ mod tests {
             action_agent_id: None,
             planning_approval_ready: true,
             advance_target: None,
+            entry_hooks_running: false,
         }
     }
 
@@ -2148,14 +2153,14 @@ mod tests {
         assert!(offers
             .iter()
             .any(|offer| offer.reason == "entry_barrier_override"));
-        snapshot.task.entry_barrier_json =
-            Some(json!({"status":"running","state":"review"}).to_string());
+        snapshot.task.entry_barrier_json = None;
+        snapshot.entry_hooks_running = true;
         assert_eq!(
             available_actions(&snapshot).len(),
             1,
             "only cancellation while entry checks run"
         );
-        snapshot.task.entry_barrier_json = None;
+        snapshot.entry_hooks_running = false;
         snapshot.task.error_annotation =
             Some(json!({"type":"review_needs_owner","blocking_reason":"finding"}).to_string());
         snapshot.executions.push(super::condition_matrix::exec(
@@ -2292,7 +2297,6 @@ mod condition_matrix {
             "failed_json",
             "legacy_annotation",
             "barrier_blocked",
-            "barrier_running",
             "queued",
             "awaiting_human_meta",
             "pr_merge_wait",
@@ -2367,7 +2371,6 @@ mod condition_matrix {
                                             "failed_json" => task.failed_json = Some(json!({"kind":"executor_failed","reason":"fixture"}).to_string()),
                                             "legacy_annotation" => task.error_annotation = Some(json!({"message":"old free-form annotation"}).to_string()),
                                             "barrier_blocked" => task.entry_barrier_json = Some(json!({"status":"blocked","state":state.name}).to_string()),
-                                            "barrier_running" => task.entry_barrier_json = Some(json!({"status":"running","state":state.name}).to_string()),
                                             "queued" => metadata["queued_recovery"] = json!({"id":"q"}),
                                             "awaiting_human_meta" => metadata["awaiting_human"] = json!(true),
                                             "pr_merge_wait" => { metadata["awaiting_human"] = json!(true); metadata["awaiting_human_reason"] = json!("pull_request_merge"); }
@@ -2449,6 +2452,7 @@ mod condition_matrix {
                                         action_agent_id: None,
                                         planning_approval_ready: true,
                                         advance_target: None,
+                                        entry_hooks_running: false,
                                     };
                                     let offers = available_actions(&snapshot);
                                     let verbs: Vec<String> = offers
@@ -2459,8 +2463,7 @@ mod condition_matrix {
                                         .collect();
                                     let _ = writeln!(full, "{wf_name}\t{}\t{:?}\t{condition}\t{flag}\trev={review_name}\texec={exec_name}\trej_max={exhausted}\t{}", state.name, state.kind, verbs.join(","));
                                     let terminal = state.kind == StateKind::Terminal;
-                                    let in_flight =
-                                        exec_name == "running" || condition == "barrier_running";
+                                    let in_flight = exec_name == "running";
                                     let only_cancel =
                                         offers.iter().all(|offer| offer.action.verb() == "cancel");
                                     let key = format!(

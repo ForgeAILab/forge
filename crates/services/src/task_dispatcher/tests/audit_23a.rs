@@ -55,7 +55,7 @@ async fn audit_23a_control_unconfigured_review_cascades_to_merging() {
     let settled = dispatcher.task_service.drain(&task.id).await.unwrap();
     assert_eq!(settled.status, "merging");
     let steps = db.task_steps(&task.id).await.unwrap();
-    assert_eq!(steps[0].status, "done");
+    assert!(steps.iter().all(|s| s.status == "done"));
 }
 
 /// A title edit (any version-bumping write) that lands before the worker
@@ -92,7 +92,7 @@ async fn audit_23a_unrelated_title_edit_preserves_review_cascade() {
 
     let settled = dispatcher.task_service.drain(&task.id).await.unwrap();
     let steps = db.task_steps(&task.id).await.unwrap();
-    assert_eq!(steps.len(), 1);
+    assert_eq!(steps.iter().filter(|s| s.kind == "cascade").count(), 1);
     assert_eq!(
         steps[0].status, "done",
         "title edits preserve the producing entry"
@@ -177,8 +177,8 @@ async fn audit_23a_manual_advance_preserves_its_own_cascade() {
             .map(|s| (&s.status, s.expected_version, &s.last_error))
             .collect::<Vec<_>>()
     );
-    assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].status, "done");
+    assert_eq!(steps.iter().filter(|s| s.kind == "cascade").count(), 1);
+    assert!(steps.iter().all(|s| s.status == "done"));
     assert_eq!(settled.status, "in_progress");
 }
 

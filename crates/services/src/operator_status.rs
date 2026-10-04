@@ -2081,6 +2081,7 @@ mod tests {
         sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('queue-project','queue',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES ('queue-task','queue-project','queue','todo',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
         db.enqueue_step(&db::EnqueueTaskStep {
+            kind: "cascade".into(),
             id: "queue-step".into(),
             task_id: "queue-task".into(),
             payload_json: "{}".into(),

@@ -1,6 +1,6 @@
 # Workflow Hook Actions
 
-This directory contains the flexible workflow engine and the curated library of Rust hook actions that workflow definitions reference by name. Workflow JSON never executes user code; `registry.rs::resolve_action` maps a string such as `"run_review"` to a compiled Rust type implementing `HookAction`.
+This directory contains the flexible workflow engine and the curated library of Rust hook actions that workflow definitions reference by name. Workflow JSON selects compiled actions; script-running actions execute configured commands through the workspace backend; `registry.rs::resolve_action` maps a string such as `"run_review"` to a compiled Rust type implementing `HookAction`.
 
 ## Action Contract
 
@@ -52,7 +52,7 @@ Workflow definitions attach actions through `HookSpec`:
 - `FailurePolicy::Log`: for effects. Failures are logged/emitted and the transition remains committed.
 - `FailurePolicy::Cascade(target)`: declared in the API type for auto-advance policy. In the current engine, auto-advance is implemented by an action returning `HookResult::Cascade` from `after_enter`; verify engine support before relying on policy-driven cascade from `on_exit` or `on_enter`.
 
-The engine writes a `transition_log` row after the status update, then backfills hook results after hooks complete.
+The status CAS writes the transition log and a durable `hooks` step. The leased step checkpoints each action, backfills hook results, and atomically settles with any cascade enqueue. Resumed CI and user before-work scripts may re-run; other effects use durable completion facts.
 
 ## Audience
 

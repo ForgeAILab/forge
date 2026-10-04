@@ -518,6 +518,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
 }
 
 struct TestHarness {
+    _step_worker: common::StepWorkerGuard,
     app: Router,
     state: Arc<AppState>,
     event_bus: Arc<EventBus>,
@@ -589,6 +590,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
     TestHarness {
+        _step_worker: common::StepWorkerGuard::start(&state),
         app,
         state,
         event_bus,

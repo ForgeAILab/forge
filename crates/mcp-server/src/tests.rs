@@ -2065,7 +2065,10 @@ fn forge_transition_task_changes_status() {
         .await;
 
         assert_eq!(result["status"], "in_progress");
-        assert_eq!(result["pending_steps"], 0);
+        assert_eq!(
+            result["pending_steps"], 1,
+            "the committed entry has a durable hook phase"
+        );
         assert!(
             result["version"].as_i64().expect("version is an integer") > task.version,
             "transition should advance task version"

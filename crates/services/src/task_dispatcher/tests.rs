@@ -1345,7 +1345,13 @@ async fn dispatcher_inherits_root_default_coder_without_copying_it_to_subtask() 
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        1
+    );
     let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("execution spawned in time")
@@ -1442,7 +1448,13 @@ async fn dispatcher_prefers_subtask_coder_over_root_default() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        1
+    );
     let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("execution spawned in time")
@@ -1512,7 +1524,13 @@ async fn changing_root_default_wakes_and_dispatches_unstarted_subtask() {
         .expect("child reloads")
         .expect("child exists");
     assert!(deferred_dispatch::dispatch_disposition_for_test(&woken_child).is_none());
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        1
+    );
     let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("execution spawned in time")
@@ -1765,7 +1783,10 @@ async fn dispatcher_recovers_task_stuck_in_unassigned_optional_planning_gate() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let updated = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -2096,150 +2117,6 @@ async fn dispatcher_failed_review_records_exhausted_budget_once() {
 }
 
 #[tokio::test]
-async fn dispatcher_failed_review_respects_grace_and_recovery_fences() {
-    for fence in [
-        "grace",
-        "annotation",
-        "blocked",
-        "running",
-        "awaiting_human",
-        "user",
-        "barrier",
-        "cascade",
-        "old_review",
-        "new_review",
-    ] {
-        let age = if fence == "grace" {
-            chrono::Duration::seconds(30)
-        } else {
-            chrono::Duration::minutes(3)
-        };
-        let fixture = failed_review_fixture(age, 3).await;
-        let cascade_slot = if fence == "cascade" {
-            fixture
-                .dispatcher
-                .task_service
-                .claim_completion_cascade(&fixture.task.id)
-        } else {
-            None
-        };
-        match fence {
-            "annotation" => {
-                sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
-                    .bind(r#"{"type":"review_blocked","message":"owner action required"}"#)
-                    .bind(&fixture.task.id)
-                    .execute(fixture.db.pool())
-                    .await
-                    .unwrap();
-            }
-            "blocked" => {
-                sqlx::query("UPDATE task SET blocked_json = '{}' WHERE id = ?")
-                    .bind(&fixture.task.id)
-                    .execute(fixture.db.pool())
-                    .await
-                    .unwrap();
-            }
-            "running" => {
-                let agent =
-                    seed_agent(&fixture.db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-                seed_running_execution(&fixture.db, &fixture.task.id, &agent, "coder").await;
-            }
-            "awaiting_human" => {
-                sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
-                    .bind(r#"{"awaiting_human":true}"#)
-                    .bind(&fixture.task.id)
-                    .execute(fixture.db.pool())
-                    .await
-                    .unwrap();
-            }
-            "user" => {
-                sqlx::query("UPDATE transition_log SET triggered_by = 'user:override:api' WHERE task_id = ?")
-                .bind(&fixture.task.id).execute(fixture.db.pool()).await.unwrap();
-            }
-            "barrier" => {
-                sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
-                    .bind(serde_json::json!({"state":"review","status":"running","retry_started_at":now_rfc3339()}).to_string())
-                    .bind(&fixture.task.id)
-                    .execute(fixture.db.pool())
-                    .await
-                    .unwrap();
-            }
-            "old_review" => {
-                sqlx::query("UPDATE transition_log SET created_at = ? WHERE task_id = ?")
-                    .bind(now_rfc3339())
-                    .bind(&fixture.task.id)
-                    .execute(fixture.db.pool())
-                    .await
-                    .unwrap();
-            }
-            "new_review" => {
-                let candidate = seed_completed_coder_execution(&fixture.db, &fixture.task.id).await;
-                let now = now_rfc3339();
-                ReviewRepo::create(
-                    &*fixture.db,
-                    db::CreateReview {
-                        id: new_uuid_v4(),
-                        task_id: fixture.task.id.clone(),
-                        execution_id: candidate,
-                        attempt_number: 2,
-                        status: ReviewStatus::Running,
-                        step_results_json: r#"{"ci_steps":[]}"#.to_owned(),
-                        started_at: now.clone(),
-                        created_at: now.clone(),
-                        updated_at: now,
-                    },
-                )
-                .await
-                .unwrap();
-            }
-            _ => {}
-        }
-        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            !fixture
-                .dispatcher
-                .recover_failed_review(&task)
-                .await
-                .unwrap()
-                .unwrap_or(false),
-            "{fence}"
-        );
-        let current = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(current.version, task.version, "{fence}");
-        assert_eq!(current.status, "review", "{fence}");
-        drop(cascade_slot);
-    }
-}
-
-#[tokio::test]
-async fn dispatcher_failed_review_clears_abandoned_running_entry_barrier() {
-    let fixture = failed_review_fixture(chrono::Duration::minutes(3), 3).await;
-    sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
-        .bind(
-            serde_json::json!({"state":"review", "status":"running",
-            "started_at":(chrono::Utc::now() - chrono::Duration::minutes(4)).to_rfc3339()})
-            .to_string(),
-        )
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
-    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.status, "in_progress");
-    assert!(current.entry_barrier_json.is_none());
-}
-
-#[tokio::test]
 async fn dispatcher_failed_review_rejects_stale_task_version() {
     for budget in [1, 3] {
         let fixture = failed_review_fixture(chrono::Duration::minutes(3), budget).await;
@@ -2347,43 +2224,6 @@ async fn merge_gate_fixture(entered_ago: chrono::Duration) -> MergeGateFixture {
     }
 }
 
-async fn assert_merge_gate_untouched(fixture: &MergeGateFixture) {
-    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 0);
-    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.status, "merging");
-    assert_eq!(current.version, fixture.task.version);
-    assert_eq!(
-        TransitionLogRepo::list_by_task(&*fixture.db, &current.id)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn dispatcher_merge_gate_completes_already_merged_branch() {
-    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    assert_eq!(fixture.dispatcher.check_once_and_drain().await.unwrap(), 1);
-    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.status, "done");
-    let logs = TransitionLogRepo::list_by_task(&*fixture.db, &current.id)
-        .await
-        .unwrap();
-    assert_eq!(logs.len(), 3);
-    assert_eq!(logs[1].from_state, "merging");
-    assert_eq!(logs[1].to_state, "merging");
-    assert_eq!(logs[2].to_state, "done");
-    assert_eq!(logs[2].trigger_reason, "merge succeeded");
-    assert_eq!(fixture.dispatcher.check_once_and_drain().await.unwrap(), 0);
-}
-
 #[tokio::test]
 async fn pull_request_merge_wait_requires_human_retry_before_direct_merge() {
     let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
@@ -2460,116 +2300,6 @@ async fn pull_request_merge_wait_requires_human_retry_before_direct_merge() {
     assert!(metadata.extra.get("awaiting_human").is_none());
     assert!(metadata.extra.get("awaiting_human_reason").is_none());
     assert!(metadata.extra.get("awaiting_human_marker_id").is_none());
-}
-
-#[tokio::test]
-async fn dispatcher_merge_gate_respects_entry_grace() {
-    let fixture = merge_gate_fixture(chrono::Duration::seconds(30)).await;
-    assert_merge_gate_untouched(&fixture).await;
-}
-
-#[tokio::test]
-async fn dispatcher_merge_gate_skips_blocked_task() {
-    let mut fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    sqlx::query("UPDATE task SET error_annotation = ?, version = version + 1 WHERE id = ?")
-        .bind(r#"{"type":"manual_stop","message":"integration paused by user"}"#)
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    fixture.task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_merge_gate_untouched(&fixture).await;
-}
-
-#[tokio::test]
-async fn dispatcher_merge_gate_skips_blocking_record() {
-    let mut fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    sqlx::query("UPDATE task SET blocked_json = ?, version = version + 1 WHERE id = ?")
-        .bind(r#"{"kind":"merge_conflict","reason":"manual repair required"}"#)
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    fixture.task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_merge_gate_untouched(&fixture).await;
-}
-
-#[tokio::test]
-async fn dispatcher_merge_gate_skips_running_execution() {
-    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    let agent_id = seed_agent(&fixture.db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    seed_running_execution(&fixture.db, &fixture.task.id, &agent_id, "coder").await;
-    assert_merge_gate_untouched(&fixture).await;
-}
-
-#[tokio::test]
-async fn dispatcher_merge_gate_skips_running_merge_hook() {
-    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    let _slot = fixture
-        .merge_service
-        .claim_merge_hook(&fixture.task.id)
-        .unwrap();
-    assert_merge_gate_untouched(&fixture).await;
-}
-
-#[tokio::test]
-async fn dispatcher_merge_gate_skips_running_completion_cascade() {
-    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    let _slot = fixture
-        .dispatcher
-        .task_service
-        .claim_completion_cascade(&fixture.task.id)
-        .unwrap();
-    assert_merge_gate_untouched(&fixture).await;
-}
-
-#[tokio::test]
-async fn dispatcher_merge_gate_reentry_rejects_stale_task_version() {
-    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    let project = ProjectRepo::get_by_id(&*fixture.db, &fixture.task.project_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-    let error = fixture
-        .dispatcher
-        .task_service
-        .retry_merge_state_entry(
-            &fixture.task,
-            &project,
-            &workflow,
-            "recover interrupted merge gate",
-        )
-        .await
-        .expect_err("stale recovery cannot run entry hooks");
-    assert!(matches!(
-        error,
-        crate::ServiceError::Db(db::DbError::VersionConflict)
-    ));
-    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(current.status, "merging");
-    assert_eq!(current.version, fixture.task.version + 1);
-    assert_eq!(
-        TransitionLogRepo::list_by_task(&*fixture.db, &current.id)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
 }
 
 #[tokio::test]
@@ -4609,12 +4339,18 @@ async fn dispatcher_resumes_integration_deferred_by_project_pause() {
         .expect("paused integration marker records");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     // This fixture has no workspace, so the resumed merge hook is skipped.
     // Success-atomic recovery must keep the marker for a later retry instead
     // of reporting a dispatched integration that never ran.
-    assert_eq!(dispatched, 0);
+    assert_eq!(
+        dispatched, 1,
+        "resumed hook intent is queued before it runs"
+    );
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -5010,7 +4746,6 @@ async fn dispatcher_respects_priority_ordering() {
         .check_once_and_drain()
         .await
         .expect("dispatcher runs");
-
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
@@ -8142,6 +7877,7 @@ async fn machine_capacity_active_waiter_is_parked_at_final_version() {
         )
         .await
         .unwrap();
+    dispatcher.drain_steps().await.unwrap();
     let waiting = TaskRepo::get_by_id(&*db, &queued.id, false)
         .await
         .unwrap()
@@ -8842,6 +8578,7 @@ async fn machine_capacity_title_edit_keeps_waiter_parked_until_recheck() {
         )
         .await
         .unwrap();
+    dispatcher.drain_steps().await.unwrap();
     let before = machine_capacity_task(&db, &task.id).await;
     let edited = TaskRepo::update(
         &*db,
@@ -9156,3 +8893,795 @@ mod audit_23a;
 
 #[path = "tests/reaudit_23a.rs"]
 mod reaudit_23a;
+
+#[tokio::test]
+async fn dispatcher_failed_review_respects_grace_and_recovery_fences() {
+    for fence in [
+        "grace",
+        "annotation",
+        "blocked",
+        "running",
+        "awaiting_human",
+        "user",
+        "barrier",
+        "old_review",
+        "new_review",
+    ] {
+        let age = if fence == "grace" {
+            chrono::Duration::seconds(30)
+        } else {
+            chrono::Duration::minutes(3)
+        };
+        let fixture = failed_review_fixture(age, 3).await;
+        match fence {
+            "annotation" => {
+                sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+                    .bind(r#"{"type":"review_blocked","message":"owner action required"}"#)
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "blocked" => {
+                sqlx::query("UPDATE task SET blocked_json = '{}' WHERE id = ?")
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "running" => {
+                let agent =
+                    seed_agent(&fixture.db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+                seed_running_execution(&fixture.db, &fixture.task.id, &agent, "coder").await;
+            }
+            "awaiting_human" => {
+                sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+                    .bind(r#"{"awaiting_human":true}"#)
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "user" => {
+                sqlx::query("UPDATE transition_log SET triggered_by = 'user:override:api' WHERE task_id = ?")
+                .bind(&fixture.task.id).execute(fixture.db.pool()).await.unwrap();
+            }
+            "barrier" => {
+                sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
+                    .bind(serde_json::json!({"state":"review","status":"blocked","retry_started_at":now_rfc3339()}).to_string())
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "old_review" => {
+                sqlx::query("UPDATE transition_log SET created_at = ? WHERE task_id = ?")
+                    .bind(now_rfc3339())
+                    .bind(&fixture.task.id)
+                    .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+            }
+            "new_review" => {
+                let candidate = seed_completed_coder_execution(&fixture.db, &fixture.task.id).await;
+                let now = now_rfc3339();
+                ReviewRepo::create(
+                    &*fixture.db,
+                    db::CreateReview {
+                        id: new_uuid_v4(),
+                        task_id: fixture.task.id.clone(),
+                        execution_id: candidate,
+                        attempt_number: 2,
+                        status: ReviewStatus::Running,
+                        step_results_json: r#"{"ci_steps":[]}"#.to_owned(),
+                        started_at: now.clone(),
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            _ => {}
+        }
+        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !fixture
+                .dispatcher
+                .recover_failed_review(&task)
+                .await
+                .unwrap()
+                .unwrap_or(false),
+            "{fence}"
+        );
+        let current = TaskRepo::get_by_id(&*fixture.db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.version, task.version, "{fence}");
+        assert_eq!(current.status, "review", "{fence}");
+    }
+}
+
+#[tokio::test]
+async fn hook_restart_recognizes_merge_landed_before_checkpoint_even_after_sibling_merge() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    let project = ProjectRepo::get_by_id(&*fixture.db, &fixture.task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let engine = fixture.dispatcher.task_service.workflow_engine();
+    engine
+        .manual_override_transition_with_authority(
+            &fixture.task.id,
+            "merging",
+            fixture.task.version,
+            &workflow,
+            api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+            "resume integration",
+            false,
+            Some(crate::workflow::engine::WorkflowAuthority {
+                project_version: project.version,
+                workflow_definition: project.workflow_definition,
+                clear_review_passed_at_on_commit: false,
+            }),
+        )
+        .await
+        .unwrap();
+    let step = fixture
+        .db
+        .claim_step(
+            "crashed-merge",
+            Some(&fixture.task.id),
+            &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.db.start_hook(&step, 0).await.unwrap();
+    let intent = fixture
+        .merge_service
+        .hook_merge_intent(&fixture.task.id)
+        .await
+        .unwrap();
+    fixture
+        .db
+        .record_hook_effect(
+            &step,
+            0,
+            "merge_intent",
+            &serde_json::to_string(&intent).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .merge_service
+            .merge(fixture.task.id.clone())
+            .await
+            .unwrap(),
+        crate::merge_service::MergeOutcome::Done { .. }
+    ));
+    std::fs::write(
+        fixture._repo_dir.path().join("later-user-edit.txt"),
+        "preserved after landed merge",
+    )
+    .unwrap();
+    // Crash after Git integration, before recording the hook's outcome.
+    sqlx::query("UPDATE task_step SET lease_until='2000-01-01T00:00:00Z' WHERE id=?")
+        .bind(&step.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    // A sibling lands on the target after the crash, before the resume.
+    std::fs::write(
+        fixture._repo_dir.path().join("sibling-after-crash.txt"),
+        "sibling merged after the crash\n",
+    )
+    .unwrap();
+    run_git(
+        fixture._repo_dir.path(),
+        &["add", "sibling-after-crash.txt"],
+    );
+    run_git(
+        fixture._repo_dir.path(),
+        &["commit", "-m", "sibling merged after crash"],
+    );
+    let target_tip = run_git(fixture._repo_dir.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(target_tip, intent.candidate_sha);
+    let settled = crate::worker_runtime::queue::TaskStepWorker::new(engine)
+        .drain(&fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(settled.status, "done");
+    assert!(settled.error_annotation.is_none());
+    assert_eq!(
+        fixture.db.task_steps(&fixture.task.id).await.unwrap()[0].attempts,
+        2
+    );
+    // The recorded merge result is the candidate, never the target's tip.
+    let after_sha: Option<String> =
+        sqlx::query_scalar("SELECT after_sha FROM execution WHERE id = ?")
+            .bind(&intent.execution_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(after_sha.as_deref(), Some(intent.candidate_sha.as_str()));
+    let merged_comments: Vec<String> = sqlx::query_scalar(
+        "SELECT content FROM task_comment WHERE task_id = ? AND content LIKE 'Changes merged%'",
+    )
+    .bind(&fixture.task.id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        merged_comments,
+        vec![format!(
+            "Changes merged to main (SHA: {})",
+            intent.candidate_sha
+        )]
+    );
+}
+
+// A Task left in `merging` by a pre-upgrade binary (merge interrupted, no
+// task_step row) is re-driven by the startup sweep, once.
+#[tokio::test]
+async fn legacy_merging_task_without_hook_step_is_merged_after_one_startup() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(30)).await;
+    assert!(fixture
+        .db
+        .task_steps(&fixture.task.id)
+        .await
+        .unwrap()
+        .is_empty());
+    // The dispatcher loop alone does not re-drive it.
+    fixture.dispatcher.check_once_and_drain().await.unwrap();
+    assert!(fixture
+        .db
+        .task_steps(&fixture.task.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert_eq!(
+        fixture
+            .dispatcher
+            .recover_stranded_hook_entries()
+            .await
+            .unwrap(),
+        1
+    );
+    // Repeated starts never duplicate the recovered row.
+    assert_eq!(
+        fixture
+            .dispatcher
+            .recover_stranded_hook_entries()
+            .await
+            .unwrap(),
+        0
+    );
+    let steps = fixture.db.task_steps(&fixture.task.id).await.unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].kind, "hooks");
+    assert!(steps[0].causation_key.ends_with(":recovered"));
+    fixture.dispatcher.drain_steps().await.unwrap();
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "done", "legacy merging Task is stranded");
+    assert!(current.error_annotation.is_none());
+    assert_eq!(
+        fixture
+            .dispatcher
+            .recover_stranded_hook_entries()
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn startup_sweep_skips_held_blocked_and_non_merge_entries() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(30)).await;
+    // Held for a human: the owner's action owns it.
+    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+        .bind(serde_json::json!({"awaiting_human": true, "awaiting_human_reason": "pull_request_merge"}).to_string())
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .dispatcher
+            .recover_stranded_hook_entries()
+            .await
+            .unwrap(),
+        0
+    );
+    // Blocked with an annotation that waits for a human.
+    sqlx::query("UPDATE task SET metadata_json = NULL, error_annotation = ? WHERE id = ?")
+        .bind(serde_json::json!({"type": "manual_stop", "message": "paused"}).to_string())
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .dispatcher
+            .recover_stranded_hook_entries()
+            .await
+            .unwrap(),
+        0
+    );
+    // A state without run_merge has no completion witness: never re-run.
+    sqlx::query("UPDATE task SET error_annotation = NULL, status = 'in_progress' WHERE id = ?")
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .dispatcher
+            .recover_stranded_hook_entries()
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(fixture
+        .db
+        .task_steps(&fixture.task.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+// Paused-integration resume must not re-enter `merging` on every scan while
+// the previous resume's hook step is still pending or running.
+#[tokio::test]
+async fn paused_integration_resume_does_not_supersede_its_own_pending_merge() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    crate::deferred_dispatch::defer_integration_for_pause(&fixture.db, &fixture.task)
+        .await
+        .unwrap();
+    // Two dispatcher scans before the step worker gets to the merge (lane busy,
+    // or the merge/CI simply takes longer than one scan interval).
+    fixture.dispatcher.check_once().await.unwrap();
+    fixture.dispatcher.check_once().await.unwrap();
+    let logs = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    let resumes = logs
+        .iter()
+        .filter(|l| l.trigger_reason == "resuming integration after project pause")
+        .count();
+    fixture.dispatcher.drain_steps().await.unwrap();
+    let steps = fixture.db.task_steps(&fixture.task.id).await.unwrap();
+    assert_eq!(
+        resumes, 1,
+        "second scan re-entered merging and superseded the first merge hook"
+    );
+    assert!(
+        steps.iter().all(|s| s.status != "superseded"),
+        "{:?}",
+        steps
+            .iter()
+            .map(|s| (&s.kind, &s.status))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|s| s.kind == "hooks" && s.expected_status == "merging")
+            .count(),
+        1,
+        "one merge step"
+    );
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "done");
+    assert!(crate::deferred_dispatch::paused_integration(&current).is_none());
+}
+
+// A crash inside `rebase_target` leaves the rebase stopped on its conflict.
+// HEAD already descends from the target, so the resume must not read it as a
+// landed rebase: it finishes the conflict handoff with its paths and leaves
+// no rebase in progress for the coder.
+#[tokio::test]
+async fn hook_restart_resumes_rebase_interrupted_mid_conflict_as_handoff() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    let repo = fixture._repo_dir.path();
+    let worktree = fixture._workspace_dir.path().join("worktree");
+    // Target never received the candidate; a sibling changed the same file.
+    run_git(repo, &["reset", "--hard", "HEAD~2"]);
+    std::fs::write(repo.join("feature.txt"), "sibling version\n").unwrap();
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "sibling adds feature"]);
+    let target = run_git(repo, &["rev-parse", "main"]);
+    let branch = workspace::task_branch_name(&fixture.task.id);
+    let candidate = run_git(&worktree, &["rev-parse", "HEAD"]);
+
+    let project = ProjectRepo::get_by_id(&*fixture.db, &fixture.task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let engine = fixture.dispatcher.task_service.workflow_engine();
+    engine
+        .manual_override_transition_with_authority(
+            &fixture.task.id,
+            "merging",
+            fixture.task.version,
+            &workflow,
+            api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+            "resume integration",
+            false,
+            Some(crate::workflow::engine::WorkflowAuthority {
+                project_version: project.version,
+                workflow_definition: project.workflow_definition,
+                clear_review_passed_at_on_commit: false,
+            }),
+        )
+        .await
+        .unwrap();
+    let step = fixture
+        .db
+        .claim_step(
+            "crashed-rebase",
+            Some(&fixture.task.id),
+            &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.db.start_hook(&step, 0).await.unwrap();
+    let moved = crate::merge_service::MergeOutcome::TargetMoved {
+        reason: "main advanced since review".into(),
+        target_branch: "main".into(),
+    };
+    fixture
+        .db
+        .record_hook_effect(
+            &step,
+            0,
+            "merge_outcome",
+            &serde_json::to_string(&moved).unwrap(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .db
+        .record_hook_effect(
+            &step,
+            0,
+            "rebase_target",
+            &serde_json::json!(target).to_string(),
+        )
+        .await
+        .unwrap();
+    // The process died inside `git rebase`, which stopped on the conflict.
+    let rebase = std::process::Command::new("git")
+        .args(["rebase", "main"])
+        .current_dir(&worktree)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .unwrap();
+    assert!(!rebase.status.success());
+    assert!(git::detect_rebase_in_progress(&worktree).await.unwrap());
+    sqlx::query("UPDATE task_step SET lease_until='2000-01-01T00:00:00Z' WHERE id=?")
+        .bind(&step.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
+    crate::worker_runtime::queue::TaskStepWorker::new(engine)
+        .drain(&fixture.task.id)
+        .await
+        .unwrap();
+
+    let handoff = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            entry.from_state == "merging"
+                && entry.to_state == "merge_failed"
+                && entry
+                    .trigger_reason
+                    .contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
+        })
+        .expect("the resumed rebase hands its conflict to the coder");
+    assert_eq!(
+        handoff.triggered_by,
+        api_types::Actor::system(api_types::SystemComponent::Workflow).display()
+    );
+    assert!(
+        handoff.trigger_reason.contains(&format!(
+            "{}[\"feature.txt\"]",
+            crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX
+        )),
+        "{}",
+        handoff.trigger_reason
+    );
+    assert!(
+        !handoff
+            .trigger_reason
+            .contains(crate::workflow::REVIEW_REFRESH_MARKER),
+        "{}",
+        handoff.trigger_reason
+    );
+    // The coder gets the branch on the new target, not a stopped rebase.
+    assert!(!git::detect_rebase_in_progress(&worktree).await.unwrap());
+    assert!(run_git(&worktree, &["status", "--porcelain"]).is_empty());
+    let head = run_git(&worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(run_git(&worktree, &["rev-parse", &branch]), head);
+    assert_ne!(head, candidate);
+    assert_eq!(run_git(&worktree, &["merge-base", "HEAD", "main"]), target);
+    let feature = std::fs::read_to_string(worktree.join("feature.txt")).unwrap();
+    assert!(feature.contains("<<<<<<< ") && feature.contains(">>>>>>> "));
+    assert!(fixture
+        .db
+        .task_steps(&fixture.task.id)
+        .await
+        .unwrap()
+        .iter()
+        .all(|s| s.status != "failed"));
+}
+
+// Resetting the workspace while the Task's hook step is queued or running
+// would delete the worktree (and Workspace row) that its CI, merge or
+// dispatch captured. The step table is the witness the in-memory completion
+// slot used to be.
+#[tokio::test]
+async fn workspace_reset_waits_for_in_flight_hook_steps() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    let project = ProjectRepo::get_by_id(&*fixture.db, &fixture.task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    fixture
+        .dispatcher
+        .task_service
+        .workflow_engine()
+        .manual_override_transition_with_authority(
+            &fixture.task.id,
+            "merging",
+            fixture.task.version,
+            &workflow,
+            api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+            "resume integration",
+            false,
+            Some(crate::workflow::engine::WorkflowAuthority {
+                project_version: project.version,
+                workflow_definition: project.workflow_definition,
+                clear_review_passed_at_on_commit: false,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.db.pending_steps(&fixture.task.id).await.unwrap(), 1);
+    let error = fixture
+        .dispatcher
+        .task_service
+        .reset_task_workspace(&fixture.task.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ServiceError::Conflict(_)), "{error:?}");
+    assert!(
+        WorkspaceRepo::get_by_task_id(&*fixture.db, &fixture.task.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(fixture._workspace_dir.path().join("worktree").exists());
+}
+
+// Without conflict handoff (a coordination root), an interrupted rebase is
+// aborted as a fresh conflicting rebase is, restoring the candidate branch.
+#[tokio::test]
+async fn embedded_rebase_target_aborts_an_interrupted_rebase_without_handoff() {
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    let repo = fixture._repo_dir.path();
+    let worktree = fixture._workspace_dir.path().join("worktree");
+    run_git(repo, &["reset", "--hard", "HEAD~2"]);
+    std::fs::write(repo.join("feature.txt"), "sibling version\n").unwrap();
+    run_git(repo, &["add", "-A"]);
+    run_git(repo, &["commit", "-m", "sibling adds feature"]);
+    let candidate = run_git(&worktree, &["rev-parse", "HEAD"]);
+    assert!(git::rebase(&worktree, "main").await.is_err());
+    assert!(git::detect_rebase_in_progress(&worktree).await.unwrap());
+    let workspace = WorkspaceRepo::get_by_task_id(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+        fixture
+            .dispatcher
+            .task_service
+            .workspace_backend_router()
+            .as_ref(),
+        &fixture.db,
+        &workspace,
+        fixture._workspace_dir.path(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        resolved.rebase_target("main", false).await.unwrap(),
+        api_types::WorkspaceOwnerOperationOutcome::Conflict { conflict_paths, .. }
+            if conflict_paths.is_empty()
+    ));
+    assert!(!git::detect_rebase_in_progress(&worktree).await.unwrap());
+    assert_eq!(run_git(&worktree, &["rev-parse", "HEAD"]), candidate);
+}
+
+// A transient `run_merge` failure (here a disconnected daemon) does not
+// settle the hook step: it retries on the step queue's back-off and merges.
+#[tokio::test]
+async fn transient_merge_failure_retries_the_hook_step_then_merges() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    crate::workflow::actions::merge_test_faults::inject(
+        &fixture.task.id,
+        ServiceError::DaemonUnavailable {
+            daemon_id: "daemon-offline".into(),
+        },
+    );
+    assert_eq!(
+        fixture
+            .dispatcher
+            .recover_stranded_hook_entries()
+            .await
+            .unwrap(),
+        1
+    );
+    fixture.dispatcher.drain_steps().await.unwrap();
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "done");
+    assert!(current.error_annotation.is_none());
+    let steps = fixture.db.task_steps(&fixture.task.id).await.unwrap();
+    let merge = steps
+        .iter()
+        .find(|s| s.kind == "hooks" && s.expected_status == "merging")
+        .unwrap();
+    assert_eq!(merge.status, "done");
+    assert_eq!(merge.attempts, 2, "one retry after the transient failure");
+}
+
+// A permanent `run_merge` failure under the default (Log) policy still
+// annotates the Task as a failed merge: Attention shows it and the owner's
+// Retry re-runs the merge.
+#[tokio::test]
+async fn permanent_merge_failure_annotates_and_owner_retry_recovers() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    crate::workflow::actions::merge_test_faults::inject(
+        &fixture.task.id,
+        ServiceError::invalid_operation("merge target is unreadable"),
+    );
+    fixture
+        .dispatcher
+        .recover_stranded_hook_entries()
+        .await
+        .unwrap();
+    fixture.dispatcher.drain_steps().await.unwrap();
+    let failed = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, "merging");
+    let annotation: serde_json::Value =
+        serde_json::from_str(failed.error_annotation.as_deref().expect("merge failure")).unwrap();
+    assert_eq!(annotation["type"], "workspace_error");
+    assert!(annotation["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("merge target is unreadable")));
+    let steps = fixture.db.task_steps(&fixture.task.id).await.unwrap();
+    assert!(steps
+        .iter()
+        .any(|s| s.kind == "hooks" && s.expected_status == "merging" && s.status == "failed"));
+    assert!(super::helpers::has_blocking_annotation(&failed));
+
+    let attention_service = crate::AttentionService::new(Arc::clone(&fixture.db));
+    while attention_service
+        .project_once(100)
+        .await
+        .unwrap()
+        .processed_events
+        > 0
+    {}
+    let attention: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attention_projection WHERE status = 'open' AND json_extract(details_json, '$.entity_id') = ?",
+    )
+    .bind(&fixture.task.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert!(attention >= 1, "the failed merge needs the owner");
+
+    let offers = fixture
+        .dispatcher
+        .task_service
+        .task_action_offers(
+            &fixture.task.id,
+            &Actor::user(api_types::UserActionSource::Test),
+        )
+        .await
+        .unwrap();
+    let retry = offers
+        .available_actions
+        .iter()
+        .find(|offer| offer.reason == "merge_gate_retry")
+        .expect("owner Retry re-runs the merge");
+    fixture
+        .dispatcher
+        .task_service
+        .perform_task_action(&fixture.task.id, retry.action.clone(), offers.version)
+        .await
+        .unwrap();
+    // An accepted action is a queued recovery the dispatcher applies.
+    fixture.dispatcher.check_once_and_drain().await.unwrap();
+    let recovered = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.status, "done");
+    assert!(recovered.error_annotation.is_none());
+}
+
+// Transient failures are bounded by the step retry budget; once it is spent
+// the merge settles as a failed merge the owner can retry.
+#[tokio::test]
+async fn transient_merge_failures_settle_as_merge_failure_once_retries_are_spent() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    crate::workflow::actions::merge_test_faults::inject(
+        &fixture.task.id,
+        ServiceError::DaemonTimeout {
+            daemon_id: "daemon-slow".into(),
+            method: "workspace.merge".into(),
+        },
+    );
+    fixture
+        .dispatcher
+        .recover_stranded_hook_entries()
+        .await
+        .unwrap();
+    // Seven earlier attempts already spent their back-off.
+    sqlx::query("UPDATE task_step SET attempts = 7 WHERE task_id = ?")
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    fixture.dispatcher.drain_steps().await.unwrap();
+    let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "merging");
+    let annotation: serde_json::Value =
+        serde_json::from_str(current.error_annotation.as_deref().expect("merge failure")).unwrap();
+    assert_eq!(annotation["type"], "workspace_error");
+    let steps = fixture.db.task_steps(&fixture.task.id).await.unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].status, "failed");
+    assert_eq!(steps[0].attempts, 8);
+}

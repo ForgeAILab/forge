@@ -8,6 +8,7 @@ use serde_json::json;
 async fn transition_returns_requested_commit_and_pending_count_before_final_sse_state() {
     let dir = tempfile::tempdir().unwrap();
     let harness = common::test_app(dir.path(), "task-step").await;
+    harness.stop_step_worker(); // Explicit drain below owns this test's interleaving.
     let state = |name: &str, kind: &str, target: Option<&str>, cascade: bool| {
         json!({
             "name":name,"kind":kind,"column":name,"display_name":name,"role":null,

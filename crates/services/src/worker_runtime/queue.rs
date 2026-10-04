@@ -31,8 +31,8 @@ pub(crate) fn producer_deferred(task_id: &str) -> bool {
     PRODUCER_TASK.try_with(|id| id == task_id).unwrap_or(false)
 }
 
-/// Holds a pre-CAS enqueue through long inline producer hooks. Dropping a
-/// cancelled producer stops renewal; its reservation expires crash-safely.
+/// Holds a CAS enqueue through the service wrapper's short bookkeeping
+/// window. Cancellation stops renewal; its reservation expires after a crash.
 pub(crate) struct ProducerReservation(JoinHandle<()>);
 impl ProducerReservation {
     pub(crate) fn hold(db: Arc<db::SqliteDb>, id: Option<&str>) -> Option<Self> {
@@ -223,9 +223,9 @@ impl TaskStepWorker {
     }
     async fn execute(&self, step: TaskStep) -> Result<()> {
         let owner = step.claimed_by.as_deref().expect("claimed step owner");
-        // The status CAS marks done before inline hooks settle. Keep the lease
-        // through that phase so another process cannot start this Task's next
-        // step during its predecessor's hooks. All commits fence this token.
+        // Keep ownership until this row settles. A cascade's CAS inserts a
+        // separate hooks row; that row owns and checkpoints its effects.
+        // All commits fence this token.
         // Renewal runs independently: awaiting the pool from a select branch
         // must not stop polling a transition that currently owns a transaction.
         let (stop, mut stopped) = watch::channel(false);
@@ -266,20 +266,17 @@ impl TaskStepWorker {
                 if !self.db.step_entry_matches(&step).await? {
                     self.settle(&step, "superseded", Some(&error.to_string()), false)
                         .await?;
-                } else if retryable(&error) && step.attempts < 8 {
-                    let delay = 1_i64 << (step.attempts - 1).clamp(0, 6);
-                    let due = (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339();
-                    self.db.retry_step(&step, &error.to_string(), &due).await?;
+                } else if step.kind == "hooks" {
+                    self.fail_committed_hook_phase(&step, &error.to_string())
+                        .await?;
+                } else if retryable(&error) && step.attempts < MAX_STEP_ATTEMPTS {
+                    self.db
+                        .retry_step(&step, &error.to_string(), &retry_due(step.attempts))
+                        .await?;
                 } else {
                     self.settle(&step, "failed", Some(&error.to_string()), true)
                         .await?;
                 }
-            } else if current
-                .as_ref()
-                .is_some_and(|s| s.status == "done" && s.claimed_by == step.claimed_by)
-            {
-                self.fail_committed_hook_phase(&step, &error.to_string())
-                    .await?;
             } else {
                 tracing::warn!(step_id = %step.id, %error, "task step attempt lost ownership or was already settled");
             }
@@ -298,6 +295,87 @@ impl TaskStepWorker {
                     false,
                 )
                 .await;
+        }
+        if step.kind == "hooks" {
+            let payload: crate::workflow::engine::durable::HookPayload =
+                serde_json::from_str(&step.payload_json)
+                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+            let result = self.engine.execute_hook_step(step, &payload).await?;
+            if let Some(reason) = result.retry.as_deref() {
+                // A transient `run_merge` failure takes the cascade retry
+                // budget and back-off; once spent it settles as a merge failure.
+                if step.attempts < MAX_STEP_ATTEMPTS {
+                    tracing::info!(step_id = %step.id, task_id = %step.task_id, attempts = step.attempts, error = %reason, "transient merge failure; retrying hook step");
+                    self.db
+                        .retry_step(step, reason, &retry_due(step.attempts))
+                        .await?;
+                    return Ok(());
+                }
+            }
+            let mut tx = db::begin_immediate(self.db.pool()).await?;
+            self.db.fence_hook_in_tx(&mut tx, step).await?;
+            let merged:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_hook_checkpoint WHERE step_id=? AND json_type(json_extract(effects_json,'$.merge_outcome'),'$.Done') IS NOT NULL)").bind(&step.id).fetch_one(&mut *tx).await?;
+            if result.failure.is_none() && merged {
+                let task = self
+                    .db
+                    .get_task_in_tx(&mut tx, &step.task_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                if crate::deferred_dispatch::paused_integration(&task)
+                    .is_some_and(|m| m.state == step.expected_status)
+                {
+                    sqlx::query("UPDATE task SET metadata_json=json_set(json_remove(COALESCE(metadata_json,'{}'),'$.paused_integration'),'$.paused_integration_generation',COALESCE(json_extract(metadata_json,'$.paused_integration_generation'),0)+1),updated_at=? WHERE id=? AND version=?")
+                        .bind(db::now_rfc3339()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
+                }
+            }
+            let status = if result.failure.is_some() {
+                "failed"
+            } else {
+                "done"
+            };
+            self.db
+                .finish_step_in_tx(&mut tx, step, status, result.failure.as_deref())
+                .await?;
+            if let Some(mut follow_up) = result.follow_up {
+                follow_up.available_at = db::now_rfc3339();
+                self.db.enqueue_step_in_tx(&mut tx, &follow_up).await?;
+            } else if let Some(error) = result.merge_failure {
+                // Whatever its policy, a merge that cannot complete must not
+                // sit silently in its merge state: annotate it as a failed
+                // merge, which the owner's Retry re-runs.
+                let mut task = self
+                    .db
+                    .get_task_in_tx(&mut tx, &step.task_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                self.annotate_failure_in_tx(
+                    &mut tx,
+                    step,
+                    &mut task,
+                    api_types::FailureKind::WorkspaceError,
+                    &format!("Merge failed: {error}"),
+                )
+                .await?;
+            } else if let Some(error) = result.blocking_failure {
+                // Any other `Log`-policy failure only settles the step
+                // `failed` and is logged; it never blocks the Task.
+                let mut task = self
+                    .db
+                    .get_task_in_tx(&mut tx, &step.task_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                self.annotate_in_tx(
+                    &mut tx,
+                    step,
+                    &mut task,
+                    "failed",
+                    Some(&format!("Transition committed; hook failed: {error}")),
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            self.db.domain_event_notify().notify_waiters();
+            return Ok(());
         }
         let payload: CascadePayload =
             serde_json::from_str(&step.payload_json).map_err(|error| {
@@ -387,7 +465,8 @@ impl TaskStepWorker {
             .await?
             .iter()
             .any(|prior| {
-                prior.chain_id == step.chain_id
+                prior.kind == "cascade"
+                    && prior.chain_id == step.chain_id
                     && prior.chain_position < step.chain_position
                     && prior.status == "done"
                     && prior.expected_status == step.expected_status
@@ -506,17 +585,53 @@ impl TaskStepWorker {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
+        let kind = if status == "parked" {
+            api_types::FailureKind::WorkflowLoop
+        } else {
+            api_types::FailureKind::CascadeFailed
+        };
+        self.write_annotation_in_tx(tx, step, task, status, kind, error)
+            .await
+    }
+
+    /// A failed hook phase's own failure kind (a merge failure).
+    async fn annotate_failure_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        step: &TaskStep,
+        task: &mut db::Task,
+        kind: api_types::FailureKind,
+        message: &str,
+    ) -> Result<()> {
+        self.write_annotation_in_tx(tx, step, task, "failed", kind, Some(message))
+            .await
+    }
+
+    async fn write_annotation_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        step: &TaskStep,
+        task: &mut db::Task,
+        status: &str,
+        kind: api_types::FailureKind,
+        error: Option<&str>,
+    ) -> Result<()> {
         let now = db::now_rfc3339();
-        let mut annotation = serde_json::json!({"type":if status=="parked" {"workflow_loop"} else {"cascade_failed"}, "state":step.expected_status, "message":error, "detected_at":now, "task_step_id":step.id});
+        let mut annotation = serde_json::json!({"type":kind, "state":step.expected_status, "message":error, "detected_at":now, "task_step_id":step.id});
+        if kind == api_types::FailureKind::WorkspaceError {
+            annotation["blocking_reason"] = serde_json::json!(error);
+        }
         if status != "parked" {
             if let Some(mut existing) = task
                 .error_annotation
                 .as_deref()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
             {
-                if existing["type"]
-                    .as_str()
-                    .is_some_and(crate::task_dispatcher::is_blocking_annotation_type)
+                if task.blocked_json.is_some()
+                    || task.failed_json.is_some()
+                    || existing["type"]
+                        .as_str()
+                        .is_some_and(crate::task_dispatcher::is_blocking_annotation_type)
                 {
                     existing["task_step_id"] = serde_json::json!(step.id);
                     existing["task_step_error"] = serde_json::json!(error);
@@ -554,54 +669,8 @@ impl TaskStepWorker {
     }
 
     async fn fail_committed_hook_phase(&self, step: &TaskStep, error: &str) -> Result<()> {
-        let message = format!("Transition committed; inline hook failed: {error}");
-        let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let mut task = self.db.get_task_in_tx(&mut tx, &step.task_id).await?;
-        // The step's own CAS wrote the log row with the step's id.
-        let own_epoch: Option<i64> =
-            sqlx::query_scalar("SELECT status_epoch FROM transition_log WHERE id=? AND task_id=?")
-                .bind(&step.id)
-                .bind(&step.task_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
-        let current_epoch: Option<i64> =
-            sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
-                .bind(&step.task_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let target = serde_json::from_str::<CascadePayload>(&step.payload_json)
-            .ok()
-            .map(|p| p.to);
-        let own_entry = own_epoch.is_some()
-            && own_epoch == current_epoch
-            && task
-                .as_ref()
-                .is_some_and(|t| t.deleted_at.is_none() && Some(&t.status) == target.as_ref());
-        // A later action can legitimately interrupt inline hooks. Keep its
-        // successful predecessor done and retain the diagnostic, without
-        // annotating the later Task entry. Never replay an applied CAS.
-        let status = if own_entry { "failed" } else { "done" };
-        // Same ownership rule as finish_step_in_tx: a live local hook owns
-        // its step after a sleep expired the wall-clock lease.
-        let now = db::now_rfc3339();
-        let changed = sqlx::query("UPDATE task_step SET status=?,last_error=?,updated_at=? WHERE id=? AND status='done' AND claimed_by=? AND (lease_until > ? OR ?)")
-            .bind(status).bind(&message).bind(&now).bind(&step.id).bind(&step.claimed_by).bind(&now).bind(self.db.step_is_active(step))
-            .execute(&mut *tx).await?.rows_affected();
-        if changed != 1 {
-            tracing::warn!(step_id=%step.id, %error, "task step lost ownership before its hook failure was recorded");
-        }
-        if own_entry && changed == 1 {
-            if let Some(task) = task.as_mut() {
-                let mut context = step.clone();
-                context.expected_status = task.status.clone();
-                context.expected_version = task.version;
-                self.annotate_in_tx(&mut tx, &context, task, "failed", Some(&message))
-                    .await?;
-            }
-        }
-        tx.commit().await?;
-        Ok(())
+        let message = format!("Transition committed; hook failed: {error}");
+        self.settle(step, "failed", Some(&message), true).await
     }
 }
 fn log_job(result: Option<std::result::Result<Result<()>, tokio::task::JoinError>>) {
@@ -616,7 +685,16 @@ fn log_job(result: Option<std::result::Result<Result<()>, tokio::task::JoinError
 fn lease_deadline() -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(LEASE_SECONDS)).to_rfc3339()
 }
-fn retryable(error: &ServiceError) -> bool {
+/// Attempts (including the first) a step gets for retryable failures.
+const MAX_STEP_ATTEMPTS: i64 = 8;
+
+/// Exponential back-off for the next attempt: 1 s doubling to 64 s.
+fn retry_due(attempts: i64) -> String {
+    let delay = 1_i64 << (attempts - 1).clamp(0, 6);
+    (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339()
+}
+
+pub(crate) fn retryable(error: &ServiceError) -> bool {
     matches!(error, ServiceError::Db(db::DbError::VersionConflict))
         || consumer_error_kind(error) == WorkerErrorKind::Transient
 }

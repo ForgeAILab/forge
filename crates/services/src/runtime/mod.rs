@@ -952,6 +952,18 @@ impl RuntimeSupervisor {
             // API routes from starting, matching the legacy entry point.
             tracing::warn!(%error, "workflow template initialization failed");
         }
+        // Integration entries whose hooks were lost (before the durable-hooks
+        // upgrade) get their hooks row before the step worker starts.
+        match self
+            .runtime
+            .task_dispatcher
+            .recover_stranded_hook_entries()
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "re-enqueued stranded integration hooks"),
+            Err(error) => tracing::warn!(%error, "stranded hook recovery failed during startup"),
+        }
 
         // Projection startup intentionally follows recovery so all common
         // workers have one well-defined owner after the durable startup pass.

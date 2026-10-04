@@ -1473,6 +1473,16 @@ impl DaemonWorkspaceBackend {
         }
         let target_sha =
             resolve_commit(target, &format!("refs/heads/{}", params.target_branch)).await?;
+        if local_git(target, &["merge-base", "--is-ancestor", &head, &target_sha])
+            .await
+            .is_ok()
+        {
+            return Ok(WorkspaceMergeOutcome::Done {
+                before_sha: params.expected_target_sha.clone(),
+                after_sha: head,
+                branch: params.target_branch.clone(),
+            });
+        }
         if target_sha != params.expected_target_sha {
             return Ok(WorkspaceMergeOutcome::TargetMoved {
                 reason: "integration target changed since review".into(),

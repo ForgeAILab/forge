@@ -713,6 +713,7 @@ async fn owner_advance_override_stops_the_role_and_dispatches_the_next_without_a
         "the command cannot launch the next role"
     );
     service.test_dispatch_task_action(&task.id).await.unwrap();
+    service.drain(&task.id).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
         .unwrap()

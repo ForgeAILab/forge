@@ -598,6 +598,12 @@ async fn condition_offer_apply_dispatch_matrix() {
                             .await
                             .unwrap();
                         let marker = condition_marker_present(&current);
+                        // The applied action's entry hook step is queued work
+                        // in flight, like a running execution; offers wait
+                        // (Cancel only) until it settles.
+                        let hooks_pending = db::TaskStepRepo::entry_hooks_pending(&*db, &copy.id)
+                            .await
+                            .unwrap();
                         let after = service
                             .task_action_offers(&copy.id, &Actor::user(UserActionSource::Test))
                             .await
@@ -643,7 +649,7 @@ async fn condition_offer_apply_dispatch_matrix() {
                         if marker && running.is_empty() {
                             flags.push("MARKER_STUCK");
                         }
-                        if !terminal && running.is_empty() && only_cancel {
+                        if !terminal && running.is_empty() && !hooks_pending && only_cancel {
                             flags.push("DEAD_END");
                             if command_result == "ok" {
                                 dead_ends += 1;

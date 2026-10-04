@@ -168,6 +168,7 @@ async fn test_done_transition_emits_dependency_satisfied_event() {
         .await
         .expect("prerequisite completes");
     assert_eq!(done.task.status, "done".to_owned());
+    service.drain(&prerequisite.id).await.unwrap();
     relay.broadcast_once(100).await.unwrap();
 
     let mut status_event_seen = false;

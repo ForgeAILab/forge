@@ -9,9 +9,8 @@ use db::{
 use events::EventBus;
 use serde_json::Value;
 use std::{
-    collections::HashSet,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock, Weak},
+    sync::{Arc, RwLock, Weak},
 };
 use tokio::process::Command;
 
@@ -23,23 +22,6 @@ pub struct MergeService {
     integration_locks: Arc<workspace::RepoCacheLockManager>,
     workspace_backend_router: Arc<RwLock<Option<Weak<WorkspaceBackendRouter>>>>,
     test_workspace_backend: bool,
-    merge_hooks: Arc<Mutex<HashSet<String>>>,
-}
-
-/// Tracks the entire merge hook, including target-moved rebase handling, so
-/// dispatcher recovery never races a hook that outlives its entry grace.
-pub(crate) struct MergeHookSlot {
-    in_flight: Arc<Mutex<HashSet<String>>>,
-    task_id: String,
-}
-
-impl Drop for MergeHookSlot {
-    fn drop(&mut self) {
-        self.in_flight
-            .lock()
-            .expect("merge hook set lock")
-            .remove(&self.task_id);
-    }
 }
 
 pub(crate) struct WorkspaceMergeInput<'a> {
@@ -49,7 +31,7 @@ pub(crate) struct WorkspaceMergeInput<'a> {
     pub spec: &'a crate::workspace_backend::MergeSpec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MergeOutcome {
     ReviewRequired {
         reason: String,
@@ -91,6 +73,17 @@ pub enum MergeOutcome {
     },
 }
 
+/// The immutable object and delivery identity selected before a hook attempts
+/// integration. On restart, target ancestry can prove completion independently
+/// of later policy edits or sibling commits.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct MergeIntent {
+    pub execution_id: String,
+    pub workspace_id: String,
+    pub candidate_sha: String,
+    pub target_branch: String,
+}
+
 /// Git facts a review-authority carry needs about the Task's current HEAD.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewCarryFacts {
@@ -115,26 +108,7 @@ impl MergeService {
             integration_locks: Arc::new(workspace::RepoCacheLockManager::new()),
             workspace_backend_router: Arc::new(RwLock::new(None)),
             test_workspace_backend: false,
-            merge_hooks: Arc::new(Mutex::new(HashSet::new())),
         }
-    }
-
-    pub(crate) fn merge_hook_running(&self, task_id: &str) -> bool {
-        self.merge_hooks
-            .lock()
-            .expect("merge hook set lock")
-            .contains(task_id)
-    }
-
-    pub(crate) fn claim_merge_hook(&self, task_id: &str) -> Option<MergeHookSlot> {
-        self.merge_hooks
-            .lock()
-            .expect("merge hook set lock")
-            .insert(task_id.to_owned())
-            .then(|| MergeHookSlot {
-                in_flight: Arc::clone(&self.merge_hooks),
-                task_id: task_id.to_owned(),
-            })
     }
 
     /// Handed-off conflict files whose current `HEAD` still adds Git conflict
@@ -428,6 +402,107 @@ impl MergeService {
             .map_err(Into::into)
     }
 
+    pub(crate) async fn hook_merge_intent(&self, task_id: &str) -> Result<MergeIntent> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, &task)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("merge has no implementation execution")
+            })?;
+        let (workspace, resolved) = self.ensure_delivery_workspace(&task, &execution).await?;
+        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
+        let candidate_sha = resolved
+            .git_query(api_types::WorkspaceGitQuery::Head, false)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("merge candidate has no HEAD"))?
+            .trim()
+            .to_owned();
+        Ok(MergeIntent {
+            execution_id: execution.id,
+            workspace_id: workspace.id,
+            candidate_sha,
+            target_branch: target_branch(&task.merge_config, &repo.default_branch)?,
+        })
+    }
+
+    pub(crate) async fn completed_hook_merge(
+        &self,
+        intent: &MergeIntent,
+    ) -> Result<Option<MergeOutcome>> {
+        let execution = ExecutionRepo::get_by_id(&*self.db, &intent.execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", intent.execution_id.clone()))?;
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, &intent.workspace_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace", intent.workspace_id.clone()))?;
+        let resolved = EmbeddedWorkspaceBackend::resolve_workspace(
+            self.workspace_backend_router()?.as_ref(),
+            &self.db,
+            &workspace,
+            &self.workspace_root,
+        )
+        .await?;
+        let target = resolved
+            .git_query(
+                api_types::WorkspaceGitQuery::ResolveRef {
+                    reference: intent.target_branch.clone(),
+                },
+                false,
+            )
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("merge target has no HEAD"))?
+            .trim()
+            .to_owned();
+        if resolved
+            .git_query(
+                api_types::WorkspaceGitQuery::IsAncestor {
+                    base: intent.candidate_sha.clone(),
+                    head: target.clone(),
+                },
+                true,
+            )
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        // Reviewed integration fast-forwards the target to this exact
+        // object, so the candidate is the merge result. The target's tip may
+        // since be a sibling's commit and is never recorded here.
+        let merged_sha = intent.candidate_sha.clone();
+        ExecutionRepo::update(
+            &*self.db,
+            db::UpdateExecution {
+                id: execution.id,
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: Some(Some(merged_sha.clone())),
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        Ok(Some(MergeOutcome::Done {
+            before_sha: intent.candidate_sha.clone(),
+            after_sha: merged_sha,
+            branch: intent.target_branch.clone(),
+        }))
+    }
+
     pub(crate) async fn merge_workspace(
         &self,
         task_id: &str,
@@ -628,8 +703,10 @@ impl MergeService {
         };
         match merged {
             Ok(()) => {
+                // An already-landed candidate is the merge result; the
+                // target's tip may be a sibling merged after it.
                 let after_sha = if already_merged {
-                    target_sha
+                    worktree_sha
                 } else {
                     git::get_current_sha(repo_path).await?
                 };
