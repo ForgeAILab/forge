@@ -68,6 +68,8 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
 
 pub(super) const BLOCKING_ANNOTATION_KINDS: &[&str] = &[
     "manual_stop",
+    "workflow_loop",
+    "cascade_failed",
     "workspace_error",
     "agent_timeout",
     "recovery_required",

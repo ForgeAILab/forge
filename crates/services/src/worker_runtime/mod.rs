@@ -3,6 +3,7 @@
 mod event_source;
 mod periodic;
 mod policy;
+pub mod queue;
 mod replay;
 pub(crate) use replay::record_failed;
 pub use replay::EventReplay;

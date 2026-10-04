@@ -13,6 +13,12 @@ use workspace::RepoCacheLockManager;
 
 #[async_trait]
 pub trait HookAction: Send + Sync {
+    /// A context-independent, effect-free cascade. The engine may persist this
+    /// intent with the status CAS only when no earlier hook can intercept it.
+    /// The hook still executes in its original post-commit phase.
+    fn declared_cascade(&self) -> Option<HookResult> {
+        None
+    }
     async fn execute(&self, ctx: &HookContext) -> HookResult;
 }
 

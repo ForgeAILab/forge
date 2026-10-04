@@ -321,6 +321,7 @@ async fn create_claim_and_transition_task() {
         )
         .await
         .expect("task enters review");
+    let review = crate::test_support::drain_transition(&service, review).await;
     assert!(review.review.is_none());
     assert_eq!(review.task.status, "merging".to_owned());
     let event = rx.recv().await.unwrap();

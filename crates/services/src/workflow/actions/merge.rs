@@ -393,7 +393,7 @@ fn target_moved_rebases_since_boundary(entries: &[db::TransitionLog]) -> i64 {
 /// merge. A rebase conflict is a genuine failure and falls through to the
 /// manual-repair path. Managed Task agents cannot rebase or write the linked
 /// Git metadata, so Forge must not dispatch a follow-up they cannot complete.
-pub(super) async fn target_moved_result(
+pub(crate) async fn target_moved_result(
     ctx: &HookContext,
     task: &db::Task,
     reason: &str,

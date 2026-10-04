@@ -11,7 +11,10 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot, Notify},
+    task::JoinHandle,
+};
 use tokio_tungstenite::tungstenite::Message;
 
 struct Owner {
@@ -19,6 +22,8 @@ struct Owner {
     jobs: Vec<JoinHandle<()>>,
     drop_provision_reply: Arc<std::sync::atomic::AtomicBool>,
     reject_verify: Arc<std::sync::atomic::AtomicBool>,
+    full_probe_release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    full_probe_started: Arc<Notify>,
 }
 impl Drop for Owner {
     fn drop(&mut self) {
@@ -49,6 +54,11 @@ impl Owner {
         let dropped = drop_provision_reply.clone();
         let reject_verify = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rejected = reject_verify.clone();
+        let full_probe_release: Arc<Mutex<Option<oneshot::Receiver<()>>>> =
+            Arc::new(Mutex::new(None));
+        let probe_release = full_probe_release.clone();
+        let full_probe_started = Arc::new(Notify::new());
+        let probe_started = full_probe_started.clone();
         let write = tokio::spawn(async move {
             while let Some(frame) = receive.recv().await {
                 if writer
@@ -74,6 +84,23 @@ impl Owner {
                     } else {
                         unreachable!()
                     };
+                    let full_probe = method == METHOD_MACHINE_PROBE
+                        && seen
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|method| method.as_str() == METHOD_MACHINE_PROBE)
+                            .count()
+                            == 2;
+                    let release = if full_probe {
+                        probe_release.lock().unwrap().take()
+                    } else {
+                        None
+                    };
+                    if let Some(release) = release {
+                        probe_started.notify_one();
+                        release.await.expect("test releases full checks");
+                    }
                     let mut reply = match common::fake_daemon::handle_environment_request(
                         &runtime,
                         frame.clone(),
@@ -130,6 +157,8 @@ impl Owner {
             jobs: vec![write, read],
             drop_provision_reply,
             reject_verify,
+            full_probe_release,
+            full_probe_started,
         }
     }
 }
@@ -1376,6 +1405,7 @@ async fn initial_unverified_dispatch_is_stable_until_eligibility_changes() {
     let mut first = None;
     for _ in 0..3 {
         dispatcher.check_once().await.unwrap();
+        fixture.service.drain(&fixture.task).await.unwrap();
         let snapshot:(i64,i64,Option<String>,Option<String>)=sqlx::query_as("SELECT t.version,p.list_revision,t.error_annotation,t.metadata_json FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=?").bind(&fixture.task).fetch_one(fixture.harness.state.db.pool()).await.unwrap();
         assert!(
             snapshot
@@ -1553,6 +1583,7 @@ async fn verification_failure_is_visible_and_exhausted_retry_waits_for_reconnect
     let mut active = None;
     for _ in 0..3 {
         dispatcher.check_once().await.unwrap();
+        fixture.service.drain(&fixture.task).await.unwrap();
         let snapshot:(i64,i64,Option<String>,Option<String>)=sqlx::query_as("SELECT t.version,p.list_revision,t.error_annotation,t.metadata_json FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=?").bind(&fixture.task).fetch_one(fixture.harness.state.db.pool()).await.unwrap();
         assert!(
             snapshot
@@ -1585,6 +1616,7 @@ async fn verification_failure_is_visible_and_exhausted_retry_waits_for_reconnect
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             dispatcher.check_once().await.unwrap();
+            fixture.service.drain(&fixture.task).await.unwrap();
             if WorkspacePlacementRepo::get_for_task(&*fixture.harness.state.db, &fixture.task)
                 .await
                 .unwrap()
@@ -1604,33 +1636,18 @@ async fn unrelated_project_edit_during_full_checks_keeps_the_same_provision_atte
     let fixture = Fixture::new(
         json!([
             {"name":"toolchain","command":"true","scope":"machine"},
-            {"name":"slow","command":"sleep 2; true","timeout_seconds":10}
+            {"name":"full","command":"true","timeout_seconds":10}
         ]),
         "coder",
     )
     .await;
+    let owner = fixture.owner.as_ref().unwrap();
+    let (release, wait) = oneshot::channel();
+    *owner.full_probe_release.lock().unwrap() = Some(wait);
     fixture.claim().await.unwrap_err();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if fixture
-                .owner
-                .as_ref()
-                .unwrap()
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|method| method.as_str() == METHOD_MACHINE_PROBE)
-                .count()
-                >= 2
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), owner.full_probe_started.notified())
+        .await
+        .unwrap();
     let project = ProjectRepo::get_by_id(&*fixture.harness.state.db, &fixture.project)
         .await
         .unwrap()
@@ -1652,6 +1669,18 @@ async fn unrelated_project_edit_during_full_checks_keeps_the_same_provision_atte
     )
     .await
     .unwrap();
+    release.send(()).unwrap();
+    // Observe this provisioning job's settlement before asking admission to
+    // verify the same still-unverified location concurrently. The barrier
+    // above proves the unrelated edit happened during its full checks.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let ready: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repo_location WHERE repo_id=? AND owner_kind='daemon' AND status='ready')")
+                .bind(&fixture.repo).fetch_one(fixture.harness.state.db.pool()).await.unwrap();
+            if ready { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
     fixture.claim_until_ready().await;
     assert_eq!(
         fixture

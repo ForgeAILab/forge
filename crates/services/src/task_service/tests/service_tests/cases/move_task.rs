@@ -92,7 +92,12 @@ async fn cross_column_move_preserves_workflow_cascade_and_event_contract() {
         .await
         .expect("cross-column move commits and cascades");
     assert_eq!(result.old_status, default_states::TODO);
-    assert_eq!(result.task.status, default_states::IN_PROGRESS);
+    assert_eq!(result.task.status, default_states::PLANNING);
+    let settled = service
+        .drain(&result.task.id)
+        .await
+        .expect("board cascade drains");
+    assert_eq!(settled.status, default_states::IN_PROGRESS);
     assert!(result.board_revision > revision);
 
     let logs = TransitionLogRepo::list_by_task(&*db, &task.id)

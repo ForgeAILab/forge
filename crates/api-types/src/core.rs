@@ -102,6 +102,8 @@ pub struct BlockingArtifact {
 #[ts(export)]
 pub enum FailureKind {
     DispatchFailed,
+    WorkflowLoop,
+    CascadeFailed,
     DependencyCancelled,
     MergeConflict,
     TargetRepoDirty,

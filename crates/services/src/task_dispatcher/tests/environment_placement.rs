@@ -29,7 +29,7 @@ where
 {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            dispatcher.check_once().await.unwrap();
+            dispatcher.check_once_and_drain().await.unwrap();
             if done().await {
                 break;
             }
@@ -123,7 +123,7 @@ async fn launch_failure_resume(fix: bool) {
     std::fs::write(&flag, "yes").unwrap();
     configure(&db,&project,serde_json::json!({"env":{"FIXED":flag},"recheck_interval_seconds":86400,"checks":[{"name":"disk","command":"test -f \"$FIXED\" || { echo broken; exit 1; }"}]})).await;
     let (dispatcher, mut launches) = build_dispatcher(db.clone(), root.path()).await;
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if db
@@ -313,6 +313,11 @@ async fn probe_completion_kicks_dispatch_before_long_interval() {
         built.task_service.clone(),
         Duration::from_secs(300),
     ));
+    let (step_shutdown, step_receiver) = tokio::sync::watch::channel(false);
+    let steps = dispatcher
+        .task_service
+        .task_step_worker()
+        .start(step_receiver);
     let job = dispatcher.clone().start();
     tokio::time::timeout(Duration::from_secs(5), launches.recv())
         .await
@@ -320,6 +325,8 @@ async fn probe_completion_kicks_dispatch_before_long_interval() {
         .unwrap();
     dispatcher.stop();
     job.await.unwrap();
+    step_shutdown.send(true).unwrap();
+    steps.await.unwrap();
 }
 
 #[tokio::test]
@@ -388,7 +395,7 @@ async fn environment_recheck_name_edit_cas_loss_retries_the_same_pause() {
     let (project, _) = seed_project_repo(&db, repo.path()).await;
     seed_environment_pause(&db,&project,serde_json::json!({"env":{"START":signals.path().join("start"),"RELEASE":signals.path().join("release")},"checks":[{"name":"disk","command":"echo started > \"$START\"; while ! test -f \"$RELEASE\"; do sleep 0.05; done","timeout_seconds":10}]}),&["disk"],"2000-01-01T00:00:00Z").await;
     let (dispatcher, _) = build_dispatcher(db.clone(), root.path()).await;
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !signals.path().join("start").exists() {
             tokio::task::yield_now().await;
@@ -470,7 +477,7 @@ async fn machine_capacity_wait_with_ready_environment_keeps_todo_and_no_environm
     db.server_run_cap
         .set(Some(1), 1, &config::embedded_machine_id());
     let (dispatcher, mut launches) = build_dispatcher(db.clone(), root.path()).await;
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let current = machine_capacity_task(&db, &task.id).await;
     assert_eq!(current.status, "todo");
     assert_eq!(current.version, task.version);
@@ -512,7 +519,7 @@ async fn environment_probe_pending_on_full_machine_does_not_leave_todo() {
     db.server_run_cap
         .set(Some(1), 1, &config::embedded_machine_id());
     let (dispatcher, mut launches) = build_dispatcher(db.clone(), root.path()).await;
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let current = machine_capacity_task(&db, &task.id).await;
     assert_eq!(current.status, "todo");
     assert_eq!(current.version, task.version);

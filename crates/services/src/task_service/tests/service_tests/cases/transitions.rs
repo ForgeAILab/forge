@@ -258,6 +258,7 @@ async fn transition_from_active_work_requires_complete_plan_checklist() {
         )
         .await
         .expect("complete plan allows work stop");
+    let result = crate::test_support::drain_transition(&service, result).await;
 
     assert_eq!(result.task.status, crate::workflow::default_states::MERGING);
 }
@@ -328,6 +329,7 @@ async fn transition_to_review_runs_configured_review_runner() {
         )
         .await
         .expect("task enters review and review runs");
+    let result = crate::test_support::drain_transition(&service, result).await;
 
     assert_eq!(
         result.task.status,

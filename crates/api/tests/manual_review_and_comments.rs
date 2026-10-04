@@ -497,7 +497,8 @@ async fn approve_review_cascades_via_merge() {
         .max_by_key(|review| review.attempt_number)
         .expect("decision Review persists");
     assert_eq!(decision_review.status, db::ReviewStatus::Passed);
-    assert_eq!(result.status, "done".to_owned());
+    let settled = common::drain(&harness.state, &harness.app, &result.id).await;
+    assert_eq!(settled.status, "done".to_owned());
 
     // Verify system comment was created
     let comments: PaginatedResponse<CommentResponse> = empty_request(
@@ -605,7 +606,8 @@ async fn rerun_review_pass_cascades_through_merge_instead_of_parking() {
         .unwrap();
 
     assert_eq!(result_review.status, db::ReviewStatus::Passed);
-    assert_eq!(result.status, "done");
+    let settled = common::drain(&harness.state, &harness.app, &result.id).await;
+    assert_eq!(settled.status, "done");
 }
 
 #[tokio::test]

@@ -304,10 +304,12 @@ pub enum EventContext {
         guard_name: String,
         reason: String,
     },
-    TransitionCascadeDepthExceeded {
+    TransitionLoopDetected {
         task_id: String,
         state: String,
-        depth: u8,
+        chain_id: String,
+        chain_position: i64,
+        reason: String,
     },
     TaskRoleNotified {
         task_id: String,

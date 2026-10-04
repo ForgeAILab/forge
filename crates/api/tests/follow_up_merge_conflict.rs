@@ -104,7 +104,9 @@ async fn merge_conflict_is_handed_back_to_the_coder() {
     // onto the target itself (a managed agent cannot write linked git
     // metadata), commits the conflict with its markers, and hands the Task
     // back through `merge_failed` so the coder only has to edit files.
-    assert_eq!(transition.task.status, "merge_failed".to_owned());
+    assert_eq!(transition.task.status, "merging");
+    let settled = common::drain(&harness.state, &harness.app, &task_id).await;
+    assert_eq!(settled.status, "merge_failed".to_owned());
 
     let task: api_types::TaskResponse = empty_request(
         &harness.app,

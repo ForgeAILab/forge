@@ -125,7 +125,7 @@ database for historical provenance.
 | GET    | `/api/v1/tasks/{id}/actions` | Read caller-filtered offers and the Task version |
 | POST   | `/api/v1/tasks/{id}/actions` | Apply one offered closed verb and parameters at an exact Task version |
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
-| POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
+| POST   | `/api/v1/tasks/{id}/transition` | Commit the requested transition; return `{task, review, pending_steps}` before queued cascades |
 | POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
 | POST   | `/api/v1/tasks/{id}/subtasks/reorder` | Reorder a root's direct children; the terminal/current-child prefix stays fixed and only the untouched `todo` suffix may move |
 | GET    | `/api/v1/tasks/{id}/dependencies` | List prerequisite dependency edges |
@@ -2627,6 +2627,26 @@ selection is newer than the latest stopped attempt for the role, the dispatcher
 treats it as the explicit retry signal and starts one fresh attempt without a
 separate `release` command.
 
+### Transition responses and queued cascades
+
+`POST /api/v1/tasks/{id}/transition` returns the Task snapshot produced by the
+requested transition, its inline Review (or `null`), and `pending_steps` (the
+number of pending or claimed cascade rows for that Task at response preparation).
+It does not wait for those follow-up transitions. For example, entering
+`planning` without a planner returns `task.status = "planning"` and
+`pending_steps = 1`; the queued hop later enters `in_progress`. Observe subsequent
+`task.status_changed` SSE events or issue a later `GET /api/v1/tasks/{id}` for the
+settled state. `pending_steps = 0` does not mean settled: a done step can still
+be running inline hooks and enqueue more steps. It is a snapshot, not a promise
+that future agent or execution actions will never enqueue more work. Failed,
+parked, superseded and done rows do not count as pending.
+
+`forge_transition_task` retains its Task-with-offers result and adds the same
+`pending_steps` integer. The returned Task belongs to the requested transition;
+follow-up cascades are asynchronous on both REST and MCP. In this first outbox
+slice, the requested transition still runs its existing inline post-commit
+hooks (including CI and merge); moving that phase off requests is slice B.
+
 ## Task hierarchy, workspaces, and prerequisite dependencies
 
 `parent_task_id` is the hierarchy pointer. A Task that names a parent is a
@@ -2815,7 +2835,7 @@ agent default.
 `reason`, and optional `source`. When a user move would fail strict routing
 (missing edge or system-only trigger) but the target is a defined workflow
 state, the server auto-escalates to the user-routing-override path. MCP
-`forge_transition_task` is unchanged — it still emits `triggered_by="system"`
+`forge_transition_task` retains its MCP system attribution (`triggered_by="system"`)
 and does not support user override (REST-only for now).
 
 `approve` and `send_back` at `POST /api/v1/tasks/{id}/actions` accept the
@@ -2994,8 +3014,9 @@ project/column membership and adjacency, then writes status and position in one
 transaction. Same-column moves skip status hooks; cross-column moves retain
 workflow guards, cancellation, audit, hooks, dispatch, and cascades.
 
-The response contains the final task after synchronous cascades, the final
-board revision, and the submitted operation ID:
+The response contains the Task committed by the move, its board revision, and
+the submitted operation ID. Automatic cascade steps run asynchronously; their
+final state arrives through SSE or a later GET:
 
 ```json
 {
@@ -3208,6 +3229,12 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `periodic_workers[].last_error`, `.last_error_at` | Nullable bounded error and RFC3339 time from existing worker health. Successful ticks clear tick/runtime causes. Faults also enter `recent_errors` as `periodic_worker` and raise severity to attention. |
 | `periodic_workers[].restart_count` | Persisted total unexpected loop exits/panics/cancellations; normal shutdown does not increment it. |
 | `event_relay` | Separate supervised SSE tail status: `running`, nullable in-memory `position` and live `head`, bounded `last_error` and `last_error_at`. No durable consumer cursor. |
+| `task_steps` | Cascade step queue health. No consumer cursor or dead-letter actions. |
+| `task_steps.pending`, `.claimed` | Current pending and claimed step rows. |
+| `task_steps.failed`, `.parked` | Unresolved failed and parked (loop-detected) steps: rows the Task's error annotation still references. Resolved history does not count. |
+| `task_steps.in_flight` | Steps this process is executing now. |
+| `task_steps.oldest_pending_age_seconds` | Age of the oldest pending step, or `null` for an empty queue. |
+| `task_steps.last_error`, `.last_error_at`, `.restart_count` | Worker health for `worker_name = "task_steps"`, as for periodic workers. |
 
 Dead-letter history remains visible after the one-hour degraded-health window.
 IDs are stable and opaque; the stored worker/item key identifies the source for
@@ -4457,8 +4484,19 @@ context contains `project_id`, `operation_id`, `old_status`, `new_status`,
 `old_board_position`, `new_board_position`, `task_version`, `board_revision`,
 `before_id`, and `after_id`. Status-changing moves drive the same internal
 lifecycle consumers as normal transitions but do not also publish a direct
-`task.status_changed` event. Synchronous cascades remain separate transitions
+`task.status_changed` event. Queued cascades remain separate transitions
 and can publish their own status events.
+
+Queued cascade steps publish two transition events. `transition.loop_detected`
+(`{task_id, state, chain_id, chain_position, reason}`) is broadcast once when a
+repeated automatic edge parks a chain; its durable copy reaches SSE only inside
+`domain_event.committed`. `transition.step_superseded` is durable and records
+`{task_id, step_id, expected_status, expected_epoch, observed_status,
+observed_epoch, reason}` when the Task has left the status entry that produced
+the step, or a current-workflow approval rule invalidates it. A status entry is
+identified by the Task's status epoch: every status change starts a new one, as
+does a workflow self-transition (planning to planning on a gate reject). Edits,
+annotation changes, same-column reorders and same-state recovery markers do not.
 
 Agent Chat events already committed to the durable outbox (message admission,
 response completion, awaiting-input, failure, cancellation, retry, and control
