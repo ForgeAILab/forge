@@ -5,6 +5,7 @@ import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { MissionControlResponse } from '@/features/federation/types'
 
 const retryTurn = vi.hoisted(() => vi.fn())
+const resolveAttention = vi.hoisted(() => vi.fn())
 const turnState = vi.hoisted(() => ({ live: false }))
 
 vi.mock('@tanstack/react-router', () => ({
@@ -20,6 +21,12 @@ vi.mock('@/features/federation/hooks', () => ({
     isFetching: false,
     dataUpdatedAt: Date.now(),
     refetch: vi.fn(),
+  }),
+  useResolveAttentionMutation: () => ({
+    mutate: resolveAttention,
+    isPending: false,
+    isSuccess: false,
+    error: null,
   }),
 }))
 vi.mock('@/features/agent-chat/hooks', () => ({
@@ -173,6 +180,34 @@ const data: MissionControlResponse = {
 }
 
 describe('MissionControlPage', () => {
+  it('renders conflict hot spots with the existing attention warning treatment', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        category: 'conflict_hotspot',
+        scope_type: 'project',
+        scope_id: 'project-1',
+        summary: 'src/shared.rs conflicted in 3 Tasks this week',
+        recommended_action: 'split_hotspot',
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      expect(screen.getByText('Conflict Hotspot')).toBeTruthy()
+      expect(screen.getByText('src/shared.rs conflicted in 3 Tasks this week')).toBeTruthy()
+      expect(screen.getByText('Split Hotspot')).toBeTruthy()
+      expect(
+        screen
+          .getByText('Conflict Hotspot')
+          .closest('article')
+          ?.classList.contains('border-warning/30'),
+      ).toBe(true)
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+
   it('prioritizes attention and review-ready work', () => {
     render(<MissionControlPage />)
     expect(screen.getByText('What needs your attention?')).toBeTruthy()
@@ -272,6 +307,19 @@ describe('MissionControlPage', () => {
     }
   })
 
+  it('resolves an attention item with its version', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [{ ...previous[0], id: 'attention-hotspot', version: 7 }]
+    try {
+      render(<MissionControlPage />)
+      fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
+      expect(resolveAttention).toHaveBeenCalledWith({ id: 'attention-hotspot', expectedVersion: 7 })
+    } finally {
+      data.needs_attention = previous
+      resolveAttention.mockClear()
+    }
+  })
+
   it('re-drives the typed turn action from Attention with its version', () => {
     const previous = data.needs_attention
     data.needs_attention = [
@@ -346,13 +394,19 @@ describe('MissionControlPage', () => {
     }
   })
   it('renders worker error kind and message without a processed-event counter', () => {
-    data.consumer_health = { consumer_name: 'attention_projection', last_sequence: 12, last_success_at: null,
-      last_error_code: 'terminal', last_error_message: 'Commitment transition rejected', stale: false, updated_at: '2026-10-02T00:00:00Z' }
+    data.consumer_health = {
+      consumer_name: 'attention_projection',
+      last_sequence: 12,
+      last_success_at: null,
+      last_error_code: 'terminal',
+      last_error_message: 'Commitment transition rejected',
+      stale: false,
+      updated_at: '2026-10-02T00:00:00Z',
+    }
     render(<MissionControlPage />)
     expect(screen.getByText('Commitment transition rejected')).toBeTruthy()
     expect(screen.queryByText('Processed events')).toBeNull()
     expect(screen.queryByText('Stale')).toBeNull()
     data.consumer_health = null
   })
-
 })

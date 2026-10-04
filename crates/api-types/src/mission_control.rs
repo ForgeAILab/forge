@@ -41,6 +41,8 @@ pub enum AttentionCategory {
     RuntimeOffline,
     BudgetThreshold,
     CommitmentOverdue,
+    /// Repeated conflict handoffs indicate a shared file needs clearer module ownership.
+    ConflictHotspot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]

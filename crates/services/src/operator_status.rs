@@ -1731,7 +1731,7 @@ mod tests {
             OperatorSeverity::Attention
         );
         assert!(status.database.incremental_vacuum);
-        assert_eq!(status.event_consumers.len(), 6);
+        assert_eq!(status.event_consumers.len(), 7);
         assert!(status
             .event_consumers
             .iter()
@@ -1889,7 +1889,7 @@ mod tests {
         let (db, service) = test_service().await;
         let now = Utc::now();
         let empty = service.event_consumers(now).await.unwrap();
-        assert_eq!(empty.len(), 6);
+        assert_eq!(empty.len(), 7);
         assert!(empty.iter().all(|c| c.lag == 0 && !c.stalled));
         let old = (now - Duration::seconds(301)).to_rfc3339();
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('old', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)").bind(&old).execute(db.pool()).await.unwrap();

@@ -1765,7 +1765,21 @@ impl AttentionService {
             let cause = failed_turn
                 .as_ref()
                 .and_then(|turn| turn.failure_class.as_ref());
-            let summary = if retry_action.is_some() {
+            let summary = if category == "conflict_hotspot" {
+                let payload =
+                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+                format!(
+                    "{} conflicted in {} Tasks this week",
+                    payload
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Shared file"),
+                    payload
+                        .get("handoff_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                )
+            } else if retry_action.is_some() {
                 format!(
                     "Agent Chat turn failed: {}",
                     cause
@@ -1866,7 +1880,7 @@ impl AttentionService {
                 .get("requires_intervention")
                 .and_then(Value::as_bool)
                 .unwrap_or(category == "execution_failed");
-            let details_json = serde_json::to_string(&json!({
+            let mut details = json!({
                 "source_event_id": event.id,
                 "source_event_type": event.event_type,
                 "source_sequence": event.sequence,
@@ -1888,8 +1902,12 @@ impl AttentionService {
                     "actions": available_actions,
                     "automatic_retry": false,
                 },
-            }))
-            .map_err(|error| ServiceError::Domain(error.to_string()))?;
+            });
+            if category == "conflict_hotspot" {
+                details["conflict_hotspot"] = event_payload.clone();
+            }
+            let details_json = serde_json::to_string(&details)
+                .map_err(|error| ServiceError::Domain(error.to_string()))?;
             let projection = CreateAttentionProjection {
                 id: new_uuid_v4(),
                 attention_type: category.to_owned(),
@@ -3163,6 +3181,14 @@ fn attention_incident_key(
     scope_type: &str,
     scope_id: &str,
 ) -> String {
+    if category == "conflict_hotspot" {
+        let payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+        let path = payload
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return crate::worker_runtime::conflict_hotspot::incident_key(scope_id, path);
+    }
     if category == "progress_warning" {
         let execution_id = serde_json::from_str::<Value>(&event.payload_json)
             .ok()
@@ -3329,6 +3355,9 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
     let event_type = event.event_type.to_ascii_lowercase();
     if user_decision_outcome(event).is_some() {
         return Some(DECISION_RECORDED_CATEGORY);
+    }
+    if event_type == crate::worker_runtime::conflict_hotspot::DETECTED_EVENT {
+        return Some("conflict_hotspot");
     }
     if event_type == "project_release.candidate_requested" {
         return Some("human_input_required");
@@ -3514,6 +3543,7 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
         "runtime_offline" => (95, "Agent runtime is unavailable", "restore_runtime"),
         "budget_threshold" => (60, "Agent budget threshold reached", "review_budget"),
         "commitment_overdue" => (75, "Commitment is overdue", "review_commitment"),
+        "conflict_hotspot" => (60, "Shared file repeatedly conflicted", "split_hotspot"),
         _ => (50, "Attention required", "inspect"),
     }
 }
@@ -3533,6 +3563,7 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         "runtime_offline" | "environment_not_ready" => AttentionCategory::RuntimeOffline,
         "budget_threshold" => AttentionCategory::BudgetThreshold,
         "commitment_overdue" => AttentionCategory::CommitmentOverdue,
+        "conflict_hotspot" => AttentionCategory::ConflictHotspot,
         other => {
             return Err(ServiceError::Domain(format!(
                 "unknown attention category: {other}"
