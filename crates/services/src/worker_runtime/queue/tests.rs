@@ -83,7 +83,7 @@ fn step(to: &str) -> EnqueueTaskStep {
         chain_position: 1,
         expected_status: "todo".into(),
         expected_version: 1,
-        producing_transition_id: None,
+        expected_epoch: None,
         lane: "fast".into(),
         available_at: db::now_rfc3339(),
     }
@@ -322,6 +322,40 @@ async fn interrupted_committed_hook_does_not_annotate_later_task_entry() {
         .as_deref()
         .unwrap()
         .contains("predecessor was interrupted"));
+}
+
+/// R5: a hook error after a sleep that expired the wall-clock lease is still
+/// recorded while the local owner is alive.
+#[tokio::test]
+async fn committed_hook_failure_after_sleep_is_recorded_for_live_owner() {
+    let (db, worker) = fixture().await;
+    db.enqueue_step(&step("done")).await.unwrap();
+    let claimed = db
+        .claim_step("owner", Some("t"), &lease_deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    let _activity = db.hold_task_step(&claimed);
+    worker.execute_inner(&claimed).await.unwrap();
+    sqlx::query("UPDATE task_step SET lease_until='2000-01-01T00:00:00+00:00' WHERE id=?")
+        .bind(&claimed.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    worker
+        .fail_committed_hook_phase(&claimed, "hook failed after wake")
+        .await
+        .unwrap();
+    let row = &db.task_steps("t").await.unwrap()[0];
+    assert_eq!(row.status, "failed");
+    let task = TaskRepo::get_by_id(&*db, "t", false)
+        .await
+        .unwrap()
+        .unwrap();
+    let annotation: serde_json::Value =
+        serde_json::from_str(task.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["type"], "cascade_failed");
+    assert_eq!(annotation["task_step_id"], claimed.id.as_str());
 }
 
 #[tokio::test]

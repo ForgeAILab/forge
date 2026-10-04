@@ -3,4 +3,12 @@
 /**
  * Cascade queue health, separate from durable consumer dead letters.
  */
-export type TaskStepQueueStatus = { worker_name: string, pending: number, claimed: number, failed: number, parked: number, in_flight: number, oldest_pending_age_seconds: number | null, last_error: string | null, last_error_at: string | null, restart_count: number, };
+export type TaskStepQueueStatus = { worker_name: string, pending: number, claimed: number, 
+/**
+ * Failed steps whose Task annotation still references them.
+ */
+failed: number, 
+/**
+ * Parked (loop-detected) steps whose Task annotation still references them.
+ */
+parked: number, in_flight: number, oldest_pending_age_seconds: number | null, last_error: string | null, last_error_at: string | null, restart_count: number, };

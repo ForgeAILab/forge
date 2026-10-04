@@ -8,14 +8,24 @@ use crate::Result;
 // 100 pages every five seconds drains about 580 MB in two hours at 4 KiB/page.
 // Each statement holds the writer lock for at most 100 page reclamations.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+// Task step retention runs hourly inside the same worker, in bounded batches.
+const STEP_PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+const STEP_PRUNE_BATCH: i64 = 100;
+const STEP_PRUNE_MAX_BATCHES: usize = 20;
+const SETTLED_STEP_RETENTION_DAYS: i64 = 7;
+const UNRESOLVED_STEP_RETENTION_DAYS: i64 = 30;
 
 pub struct StorageMaintenanceWorker {
     db: Arc<SqliteDb>,
+    last_step_prune: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl StorageMaintenanceWorker {
     pub fn new(db: Arc<SqliteDb>) -> Self {
-        Self { db }
+        Self {
+            db,
+            last_step_prune: std::sync::Mutex::new(None),
+        }
     }
 
     pub fn start(
@@ -45,11 +55,46 @@ impl StorageMaintenanceWorker {
 
     async fn maintain_once(&self, shutdown: &watch::Receiver<bool>) -> Result<()> {
         if !*shutdown.borrow() {
-            let before = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
-            self.db.prune_steps(&before, 100).await?;
+            if self.step_prune_due() {
+                self.prune_steps(shutdown).await?;
+            }
             db::incremental_vacuum(self.db.pool()).await?;
         }
         Ok(())
+    }
+
+    fn step_prune_due(&self) -> bool {
+        let mut last = self.last_step_prune.lock().expect("step prune clock");
+        let now = tokio::time::Instant::now();
+        if last.is_some_and(|at| now.duration_since(at) < STEP_PRUNE_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
+    /// Each batch is its own statement, so the writer lock is held for at
+    /// most one 100-row delete per retention class.
+    async fn prune_steps(&self, shutdown: &watch::Receiver<bool>) -> Result<u64> {
+        let now = chrono::Utc::now();
+        let settled = (now - chrono::Duration::days(SETTLED_STEP_RETENTION_DAYS)).to_rfc3339();
+        let unresolved =
+            (now - chrono::Duration::days(UNRESOLVED_STEP_RETENTION_DAYS)).to_rfc3339();
+        let mut total = 0;
+        for _ in 0..STEP_PRUNE_MAX_BATCHES {
+            if *shutdown.borrow() {
+                break;
+            }
+            let deleted = self
+                .db
+                .prune_steps(&settled, &unresolved, STEP_PRUNE_BATCH)
+                .await?;
+            total += deleted;
+            if deleted < STEP_PRUNE_BATCH as u64 {
+                break;
+            }
+        }
+        Ok(total)
     }
 }
 
@@ -95,6 +140,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn step_retention_runs_hourly_not_every_vacuum_tick() {
+        let db = database().await;
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('p','p',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES ('t','p','t','todo',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let old_step = |key: &str| {
+            let key = key.to_owned();
+            let db = Arc::clone(&db);
+            async move {
+                sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at,completed_at) VALUES (?,'t',(SELECT COALESCE(MAX(seq),0)+1 FROM task_step),'cascade','{}',?,?,1,'todo',1,'done','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z','2000-01-01T00:00:00Z')")
+                    .bind(&key).bind(&key).bind(&key).execute(db.pool()).await.unwrap();
+            }
+        };
+        let worker = StorageMaintenanceWorker::new(Arc::clone(&db));
+        let (_tx, rx) = watch::channel(false);
+        old_step("first").await;
+        worker.maintain_once(&rx).await.unwrap();
+        old_step("second").await;
+        worker.maintain_once(&rx).await.unwrap();
+        let left: Vec<String> = sqlx::query_scalar("SELECT id FROM task_step")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(left, vec!["second".to_owned()]);
     }
 
     #[tokio::test]

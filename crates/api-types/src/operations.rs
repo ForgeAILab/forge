@@ -96,8 +96,10 @@ pub struct TaskStepQueueStatus {
     pub pending: i64,
     #[ts(type = "number")]
     pub claimed: i64,
+    /// Failed steps whose Task annotation still references them.
     #[ts(type = "number")]
     pub failed: i64,
+    /// Parked (loop-detected) steps whose Task annotation still references them.
     #[ts(type = "number")]
     pub parked: i64,
     #[ts(type = "number")]

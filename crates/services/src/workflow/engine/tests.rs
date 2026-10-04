@@ -643,6 +643,7 @@ async fn review_carry_two_refresh_rounds_complete_without_parking() {
                 None,
                 parent.as_ref(),
                 format!("carry:{index}"),
+                None,
             )
             .await
             .unwrap();
@@ -4791,6 +4792,7 @@ async fn audit_23a_unconfigured_review_target_moved_round_keeps_running() {
             None,
             Some(&step1),
             "audit:target-moved".into(),
+            None,
         )
         .await
         .unwrap();

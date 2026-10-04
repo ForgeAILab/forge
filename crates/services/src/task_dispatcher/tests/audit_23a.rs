@@ -201,9 +201,7 @@ async fn audit_23a_annotation_clear_and_board_reorder_preserve_review_entry() {
             )
             .await
             .unwrap();
-        let before = db.task_steps(&task.id).await.unwrap()[0]
-            .producing_transition_id
-            .clone();
+        let before = db.task_steps(&task.id).await.unwrap()[0].expected_epoch;
         if reorder {
             let neighbor = seed_task(&db, &project, "neighbor", "review", 1).await;
             let revision = TaskBoardRepo::board_revision(&*db, &project).await.unwrap();
@@ -255,7 +253,7 @@ async fn audit_23a_annotation_clear_and_board_reorder_preserve_review_entry() {
         );
         let rows = db.task_steps(&task.id).await.unwrap();
         assert_eq!(rows[0].status, "done");
-        assert_eq!(rows[0].producing_transition_id, before);
+        assert_eq!(rows[0].expected_epoch, before);
     }
 }
 

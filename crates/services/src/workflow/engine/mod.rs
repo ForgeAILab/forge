@@ -842,6 +842,15 @@ impl WorkflowEngine {
             "infrastructure_attempts": barrier.get("infrastructure_attempts").cloned().unwrap_or(serde_json::json!(0)),
         })
         .to_string();
+        // The retried entry is the current one; the barrier CAS below fences
+        // this same version, so a later move invalidates the cascade.
+        let entry_epoch: i64 =
+            sqlx::query_scalar("SELECT status_epoch FROM task WHERE id = ? AND version = ?")
+                .bind(task_id)
+                .bind(task.version)
+                .fetch_optional(self.db.pool())
+                .await?
+                .ok_or(db::DbError::VersionConflict)?;
         let mut task = TaskRepo::set_entry_barrier_with_workflow_authority(
             &*self.db,
             task_id,
@@ -1097,6 +1106,7 @@ impl WorkflowEngine {
                     Some(authority.clone()),
                     None,
                     format!("entry-retry:{task_id}:{version}"),
+                    Some(entry_epoch),
                 )
                 .await?;
             Some(self.db.enqueue_step(&input).await?)
@@ -1793,8 +1803,10 @@ impl WorkflowEngine {
                 let mut producing = task.clone();
                 producing.status = target_state.clone();
                 producing.version = version + 1;
+                // Enqueued inside the CAS transaction: None reads the
+                // epoch after the status update there.
                 Some(self.cascade_step_input(&producing, workflow, to.clone(), why.clone(),
-                    false, false, authority.clone(), step.as_ref(), transition_log_id.clone()).await?)
+                    false, false, authority.clone(), step.as_ref(), transition_log_id.clone(), None).await?)
             } else { None };
             let (mut task, transition_log, board_move_outcome) =
                 if let Some(move_request) = board_move {
@@ -1872,19 +1884,24 @@ impl WorkflowEngine {
                     let clear_review_passed_at = authority
                         .as_ref()
                         .is_some_and(|authority| authority.clear_review_passed_at_on_commit);
+                    // A status change bumps status_epoch through its trigger.
+                    // A workflow self-transition (planning -> planning on a
+                    // gate reject) is also a new entry: bump it here. A step
+                    // fences on status plus epoch, never on the version.
                     let update = query(
-                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END\n                 WHERE id = ? AND deleted_at IS NULL AND ((? = 0 AND version = ?) OR (? = 1 AND status = ? AND (SELECT id FROM transition_log WHERE task_id=task.id AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1) IS ?))",
+                        "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?,\n                     review_passed_at = CASE WHEN ? THEN NULL ELSE review_passed_at END,\n                     status_epoch = status_epoch + (status = ?)\n                 WHERE id = ? AND deleted_at IS NULL AND ((? = 0 AND version = ?) OR (? = 1 AND status = ? AND status_epoch = ?))",
                     )
                     .bind(&target_state)
                     .bind(&updated_at)
                     .bind(entry_barrier_json.as_deref())
                     .bind(clear_review_passed_at)
+                    .bind(&target_state)
                     .bind(&task_id)
                     .bind(step.is_some())
                     .bind(version)
                     .bind(step.is_some())
                     .bind(step.as_ref().map(|s| s.expected_status.as_str()))
-                    .bind(step.as_ref().and_then(|s|s.producing_transition_id.as_deref()))
+                    .bind(step.as_ref().map(|s| s.expected_epoch))
                     .execute(&mut *transaction)
                     .await?;
 
@@ -1933,8 +1950,8 @@ impl WorkflowEngine {
                     sqlx::query(
                         "INSERT INTO transition_log (
                             id, task_id, from_state, to_state, trigger_name, triggered_by,
-                            trigger_reason, hook_results_json, rejection, created_at
-                         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                            trigger_reason, hook_results_json, rejection, created_at, status_epoch
+                         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))",
                     )
                     .bind(&transition_log_id)
                     .bind(&task.id)
@@ -1945,6 +1962,7 @@ impl WorkflowEngine {
                     .bind(&reason)
                     .bind(if rejection { 1_i64 } else { 0_i64 })
                     .bind(&updated_at)
+                    .bind(&task.id)
                     .execute(&mut *transaction)
                     .await?;
                     if let Some(step) = &step {
@@ -2687,10 +2705,21 @@ impl WorkflowEngine {
                         && !cascade_reason.contains(crate::workflow::REVIEW_REFRESH_MARKER)
                         && !cascade_reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
                         && !Self::is_terminal(workflow, &cascade_to));
-                // Fence the producing snapshot, not a later writer's row.
+                // Fence the entry this transition committed, not a later
+                // writer's: its epoch was recorded on its log row.
+                let entry_epoch: Option<i64> = sqlx::query_scalar(
+                    "SELECT status_epoch FROM transition_log WHERE id = ?",
+                )
+                .bind(&transition_log_id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .flatten();
+                let entry_epoch = entry_epoch.ok_or_else(|| {
+                    ServiceError::invalid_operation("committed transition has no status epoch")
+                })?;
                 let input = self.cascade_step_input(&task, workflow, cascade_to, cascade_reason,
                     cascade_rejection, cascade_skip_before_exit, authority.clone(), step.as_ref(),
-                    transition_log_id.clone()).await?;
+                    transition_log_id.clone(), Some(entry_epoch)).await?;
                 queued_step_id = Some(self.db.enqueue_step(&input).await?);
             }
 
@@ -2766,6 +2795,7 @@ impl WorkflowEngine {
         authority: Option<WorkflowAuthority>,
         parent: Option<&db::TaskStep>,
         causation_key: String,
+        expected_epoch: Option<i64>,
     ) -> crate::Result<db::EnqueueTaskStep> {
         let review_evidence = latest_review(&self.db, &task.id)
             .await?
@@ -2789,11 +2819,6 @@ impl WorkflowEngine {
         let head: Option<String> = sqlx::query_scalar("SELECT h.head_sha FROM workspace_expected_head h JOIN workspace_placement p ON p.id=h.placement_id AND p.generation=h.generation WHERE p.task_id=? ORDER BY h.recorded_at DESC LIMIT 1")
             .bind(&task.id).fetch_optional(self.db.pool()).await?;
         let evidence = Some(format!("{review_evidence:?}|{rebases}|{head:?}"));
-        let producing_transition_id = if uuid::Uuid::parse_str(&causation_key).is_ok() {
-            Some(causation_key.clone())
-        } else {
-            sqlx::query_scalar("SELECT id FROM transition_log WHERE task_id=? AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1").bind(&task.id).fetch_optional(self.db.pool()).await?
-        };
         let workflow_ref = if authority.is_some() {
             crate::worker_runtime::queue::WorkflowReference::Project
         } else {
@@ -2853,7 +2878,7 @@ impl WorkflowEngine {
             chain_position: continuing.map(|p| p.chain_position + 1).unwrap_or(1),
             expected_status: task.status.clone(),
             expected_version: task.version,
-            producing_transition_id,
+            expected_epoch,
             lane: crate::worker_runtime::queue::cascade_lane(workflow, &payload.to).into(),
             available_at: (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
         })

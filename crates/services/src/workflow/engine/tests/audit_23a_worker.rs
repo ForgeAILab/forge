@@ -39,6 +39,7 @@ async fn queued_ci_for_task(
             Some(fixture.workflow_authority().await),
             None,
             format!("audit:ci:{}", selected.id),
+            None,
         )
         .await
         .unwrap();
@@ -220,6 +221,7 @@ async fn audit_23a_real_target_moved_rebases_twice_without_ci_do_not_park() {
                 None,
                 Some(&parent),
                 format!("audit:real:{round}"),
+                None,
             )
             .await
             .unwrap();
@@ -294,9 +296,16 @@ async fn audit_23a_before_exit_cascade_does_not_suppress_target_hooks() {
     assert!(db.task_steps(id).await.unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn audit_23a_fast_lane_progresses_while_four_real_ci_hooks_hold_long_lane() {
-    let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+/// Four CI steps on one repository fill the long lane: the first holds the
+/// checkout lock inside its blocked command, the rest wait on that lock.
+async fn hold_long_lane(
+    fixture: &FailedCiFixture,
+) -> (
+    Vec<TempDir>,
+    Vec<db::Task>,
+    tokio::sync::watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
     let gates: Vec<_> = (0..4).map(|_| TempDir::new().unwrap()).collect();
     let mut tasks = vec![fixture.task.clone()];
     for n in 1..4 {
@@ -331,12 +340,16 @@ async fn audit_23a_fast_lane_progresses_while_four_real_ci_hooks_hold_long_lane(
         tasks.push(task);
     }
     for (task, gate) in tasks.iter().zip(&gates) {
-        queued_ci_for_task(&fixture, task, gate.path()).await;
+        queued_ci_for_task(fixture, task, gate.path()).await;
+    }
+    for task in &tasks {
+        assert_eq!(
+            fixture.db.task_steps(&task.id).await.unwrap()[0].lane,
+            "long"
+        );
     }
     let (stop, rx) = tokio::sync::watch::channel(false);
     let handle = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(rx);
-    // Jobs waiting on the same repository's checkout lock also occupy the
-    // long lane; only the first CI needs to have entered its blocked command.
     tokio::time::timeout(Duration::from_secs(5), async {
         while fixture.db.active_step_count() < 4 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -354,6 +367,56 @@ async fn audit_23a_fast_lane_progresses_while_four_real_ci_hooks_hold_long_lane(
     })
     .await
     .unwrap();
+    (gates, tasks, stop, handle)
+}
+
+async fn release_long_lane(
+    fixture: &FailedCiFixture,
+    gates: Vec<TempDir>,
+    tasks: Vec<db::Task>,
+    stop: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    for task in &tasks {
+        assert!(fixture.db.task_step_is_running(&task.id));
+    }
+    stop.send(true).unwrap();
+    for gate in &gates {
+        std::fs::write(gate.path().join("release"), "release").unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(7), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn wait_for_status(db: &SqliteDb, id: &str, status: &str) {
+    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if TaskRepo::get_by_id(db, id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                == status
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        reached.is_ok(),
+        "never reached {status}: {:?}",
+        db.task_steps(id).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn audit_23a_fast_lane_progresses_while_four_real_ci_hooks_hold_long_lane() {
+    let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    let (gates, tasks, stop, handle) = hold_long_lane(&fixture).await;
     let id = new_uuid_v4();
     let now = now_rfc3339();
     sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES (?,?,'fast','start',?,?)").bind(&id).bind(&fixture.task.project_id).bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
@@ -387,37 +450,58 @@ async fn audit_23a_fast_lane_progresses_while_four_real_ci_hooks_hold_long_lane(
             None,
             None,
             "audit:fast".into(),
+            None,
         )
         .await
         .unwrap();
     assert_eq!(input.lane, "fast");
     fixture.db.enqueue_step(&input).await.unwrap();
     fixture.db.ready_step(&input.id).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if TaskRepo::get_by_id(&*fixture.db, &id, false)
-                .await
-                .unwrap()
-                .unwrap()
-                .status
-                == "finished"
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    for task in &tasks {
-        assert!(fixture.db.task_step_is_running(&task.id));
+    wait_for_status(&fixture.db, &id, "finished").await;
+    release_long_lane(&fixture, gates, tasks, stop, handle).await;
+}
+
+/// R4: with the long lane full on one repository's lock, default-workflow
+/// cascades in another Project still run. planning -> in_progress (provision,
+/// dispatch) and review -> in_progress (reject) were long before; only merge
+/// and CI review checks are long now.
+#[tokio::test]
+async fn reaudit_23a_default_cascades_in_other_projects_run_while_long_lane_is_full() {
+    let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    let (gates, tasks, stop, handle) = hold_long_lane(&fixture).await;
+    let workflow = crate::workflow::default_workflow::default_workflow();
+    assert_eq!(
+        crate::worker_runtime::queue::cascade_lane(&workflow, "merging"),
+        "long"
+    );
+    for (from, to) in [("planning", "in_progress"), ("review", "in_progress")] {
+        let id = new_uuid_v4();
+        seed_project_repo_and_task(&fixture.db, &id, from).await;
+        let other = TaskRepo::get_by_id(&*fixture.db, &id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(other.project_id, fixture.task.project_id);
+        let input = fixture
+            .engine
+            .cascade_step_input(
+                &other,
+                &workflow,
+                to.into(),
+                "gate skipped: other Project".into(),
+                from == "review",
+                false,
+                None,
+                None,
+                format!("reaudit:other:{from}"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(input.lane, "fast", "{from} -> {to}");
+        fixture.db.enqueue_step(&input).await.unwrap();
+        fixture.db.ready_step(&input.id).await.unwrap();
+        wait_for_status(&fixture.db, &id, to).await;
     }
-    stop.send(true).unwrap();
-    for gate in &gates {
-        std::fs::write(gate.path().join("release"), "release").unwrap();
-    }
-    tokio::time::timeout(Duration::from_secs(7), handle)
-        .await
-        .unwrap()
-        .unwrap();
+    release_long_lane(&fixture, gates, tasks, stop, handle).await;
 }

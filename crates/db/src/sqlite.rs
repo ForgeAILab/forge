@@ -476,6 +476,23 @@ fn map_skill(row: SqliteRow) -> Result<Skill> {
     })
 }
 
+impl SqliteDb {
+    /// Reads a Task, including a soft-deleted one, inside the caller's
+    /// transaction.
+    pub async fn get_task_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &str,
+    ) -> Result<Option<Task>> {
+        sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(map_task)
+            .transpose()
+    }
+}
+
 fn map_task(row: SqliteRow) -> Result<Task> {
     Ok(Task {
         id: row.try_get("id")?,

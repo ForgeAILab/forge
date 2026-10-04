@@ -4,6 +4,16 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, Sqlite, Transaction};
 
+/// A step is valid while its Task is still in the status entry that produced
+/// it. Binds: task id, expected status, expected epoch.
+pub const STEP_FENCE: &str = "SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND status=? AND status_epoch=? AND deleted_at IS NULL)";
+// Both use task_step_settled(status, completed_at); binds: cutoff, now,
+// active Task ids (JSON), batch limit.
+const PRUNE_SETTLED: &str = "DELETE FROM task_step WHERE id IN (SELECT id FROM task_step WHERE status IN ('done','superseded') AND completed_at<? AND (lease_until IS NULL OR lease_until<?) AND task_id NOT IN (SELECT value FROM json_each(?)) AND NOT EXISTS(SELECT 1 FROM task_step live WHERE live.chain_id=task_step.chain_id AND live.status IN ('pending','claimed')) ORDER BY completed_at LIMIT ?)";
+const PRUNE_UNRESOLVED: &str = "DELETE FROM task_step WHERE id IN (SELECT id FROM task_step WHERE status IN ('failed','parked') AND completed_at<? AND (lease_until IS NULL OR lease_until<?) AND task_id NOT IN (SELECT value FROM json_each(?)) AND NOT EXISTS(SELECT 1 FROM task_step live WHERE live.chain_id=task_step.chain_id AND live.status IN ('pending','claimed')) ORDER BY completed_at LIMIT ?)";
+// task_step_workflow_ref(workflow_ref_id) answers the reference probe.
+const PRUNE_WORKFLOWS: &str = "DELETE FROM task_step_workflow WHERE id IN (SELECT w.id FROM task_step_workflow w WHERE w.last_used_at<? AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.workflow_ref_id=w.id) LIMIT ?)";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskStep {
     pub id: String,
@@ -17,7 +27,9 @@ pub struct TaskStep {
     pub chain_position: i64,
     pub expected_status: String,
     pub expected_version: i64,
-    pub producing_transition_id: Option<String>,
+    /// Status epoch of the entry that produced this step; with
+    /// `expected_status` it is the step's fence.
+    pub expected_epoch: i64,
     pub lane: String,
     pub status: String,
     pub claimed_by: Option<String>,
@@ -41,7 +53,10 @@ pub struct EnqueueTaskStep {
     pub chain_position: i64,
     pub expected_status: String,
     pub expected_version: i64,
-    pub producing_transition_id: Option<String>,
+    /// `None` only when this enqueue shares the producing status CAS's
+    /// transaction: the epoch is then read after that update, in that
+    /// transaction. Post-commit producers pass their entry's epoch.
+    pub expected_epoch: Option<i64>,
     pub lane: String,
     /// Producer reservation. Release after inline hooks and wrapper writes;
     /// a lost producer becomes eligible after this deadline on restart.
@@ -62,7 +77,15 @@ pub trait TaskStepRepo: Send + Sync {
     async fn step_workflow(&self, id: &str) -> Result<String>;
     async fn store_step_workflow(&self, definition: &str) -> Result<String>;
     async fn reroute_step(&self, step: &TaskStep, lane: &str) -> Result<()>;
-    async fn prune_steps(&self, before: &str, limit: i64) -> Result<u64>;
+    /// Deletes one bounded batch per retention class: done/superseded rows
+    /// completed before `settled_before`, failed/parked rows completed before
+    /// `unresolved_before`. Live chains, leases and running Tasks are kept.
+    async fn prune_steps(
+        &self,
+        settled_before: &str,
+        unresolved_before: &str,
+        limit: i64,
+    ) -> Result<u64>;
     async fn step_entry_matches(&self, step: &TaskStep) -> Result<bool>;
     async fn claim_step(
         &self,
@@ -97,7 +120,7 @@ fn row_step(row: sqlx::sqlite::SqliteRow) -> TaskStep {
         chain_position: row.get("chain_position"),
         expected_status: row.get("expected_status"),
         expected_version: row.get("expected_version"),
-        producing_transition_id: row.get("producing_transition_id"),
+        expected_epoch: row.get("expected_epoch"),
         lane: row.get("lane"),
         status: row.get("status"),
         claimed_by: row.get("claimed_by"),
@@ -119,10 +142,10 @@ impl TaskStepRepo for SqliteDb {
         i: &EnqueueTaskStep,
     ) -> Result<String> {
         let now = now_rfc3339();
-        sqlx::query("INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,producing_transition_id,lane,status,available_at,created_at,updated_at) SELECT ?,?,COALESCE(MAX(seq),0)+1,'cascade',?,?,?,?,?,?,?,?,?,'pending',?,?,? FROM task_step WHERE task_id = ? ON CONFLICT(task_id,causation_key) DO NOTHING")
+        sqlx::query("INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,expected_epoch,lane,status,available_at,created_at,updated_at) SELECT ?,?,COALESCE(MAX(seq),0)+1,'cascade',?,?,?,?,?,?,?,COALESCE(?,(SELECT status_epoch FROM task WHERE id=?),0),?,'pending',?,?,? FROM task_step WHERE task_id = ? ON CONFLICT(task_id,causation_key) DO NOTHING")
             .bind(&i.id).bind(&i.task_id).bind(&i.payload_json).bind(&i.causation_step_id).bind(&i.causation_key)
             .bind(&i.chain_id).bind(i.chain_position).bind(&i.expected_status).bind(i.expected_version)
-            .bind(&i.producing_transition_id).bind(&i.lane).bind(&i.available_at).bind(&now).bind(&now).bind(&i.task_id).execute(&mut **tx).await?;
+            .bind(i.expected_epoch).bind(&i.task_id).bind(&i.lane).bind(&i.available_at).bind(&now).bind(&now).bind(&i.task_id).execute(&mut **tx).await?;
         Ok(
             sqlx::query_scalar("SELECT id FROM task_step WHERE task_id = ? AND causation_key = ?")
                 .bind(&i.task_id)
@@ -186,7 +209,12 @@ impl TaskStepRepo for SqliteDb {
         self.domain_event_notify().notify_waiters();
         Ok(())
     }
-    async fn prune_steps(&self, before: &str, limit: i64) -> Result<u64> {
+    async fn prune_steps(
+        &self,
+        settled_before: &str,
+        unresolved_before: &str,
+        limit: i64,
+    ) -> Result<u64> {
         let active: Vec<String> = self
             .task_step_activity
             .lock()
@@ -196,15 +224,36 @@ impl TaskStepRepo for SqliteDb {
             .collect();
         let active = serde_json::to_string(&active)
             .map_err(|e| DbError::from(sqlx::Error::Decode(Box::new(e))))?;
-        let deleted=sqlx::query("DELETE FROM task_step WHERE id IN (SELECT id FROM task_step WHERE status IN ('done','superseded') AND completed_at<? AND (lease_until IS NULL OR lease_until<?) AND task_id NOT IN (SELECT value FROM json_each(?)) AND NOT EXISTS(SELECT 1 FROM task_step live WHERE live.chain_id=task_step.chain_id AND live.status IN ('pending','claimed')) ORDER BY completed_at LIMIT ?)")
-            .bind(before).bind(now_rfc3339()).bind(active).bind(limit.clamp(1,100)).execute(self.pool()).await?.rows_affected();
-        sqlx::query("DELETE FROM task_step_workflow WHERE id IN (SELECT id FROM task_step_workflow WHERE last_used_at<? AND NOT EXISTS(SELECT 1 FROM task_step s WHERE json_extract(s.payload_json,'$.workflow_ref.id')=task_step_workflow.id) LIMIT ?)")
-            .bind(before).bind(limit.clamp(1,100)).execute(self.pool()).await?;
+        let limit = limit.clamp(1, 100);
+        let now = now_rfc3339();
+        let mut deleted = 0;
+        for (statuses, before) in [
+            (PRUNE_SETTLED, settled_before),
+            (PRUNE_UNRESOLVED, unresolved_before),
+        ] {
+            deleted += sqlx::query(statuses)
+                .bind(before)
+                .bind(&now)
+                .bind(&active)
+                .bind(limit)
+                .execute(self.pool())
+                .await?
+                .rows_affected();
+        }
+        sqlx::query(PRUNE_WORKFLOWS)
+            .bind(settled_before)
+            .bind(limit)
+            .execute(self.pool())
+            .await?;
         Ok(deleted)
     }
     async fn step_entry_matches(&self, step: &TaskStep) -> Result<bool> {
-        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND status=? AND deleted_at IS NULL AND (SELECT id FROM transition_log WHERE task_id=task.id AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1) IS ?)")
-            .bind(&step.task_id).bind(&step.expected_status).bind(&step.producing_transition_id).fetch_one(self.pool()).await?)
+        Ok(sqlx::query_scalar(STEP_FENCE)
+            .bind(&step.task_id)
+            .bind(&step.expected_status)
+            .bind(step.expected_epoch)
+            .fetch_one(self.pool())
+            .await?)
     }
     async fn pending_steps(&self, task_id: &str) -> Result<i64> {
         Ok(sqlx::query_scalar(
@@ -258,9 +307,13 @@ impl TaskStepRepo for SqliteDb {
         Ok(())
     }
     async fn retry_step(&self, s: &TaskStep, error: &str, available_at: &str) -> Result<()> {
-        sqlx::query("UPDATE task_step SET status='pending',claimed_by=NULL,lease_until=NULL,last_error=?,available_at=?,updated_at=? WHERE id=? AND status='claimed' AND claimed_by=? AND lease_until > ?")
-            .bind(error).bind(available_at).bind(now_rfc3339()).bind(&s.id).bind(&s.claimed_by).bind(now_rfc3339())
-            .execute(self.pool()).await?;
+        let now = now_rfc3339();
+        let n = sqlx::query("UPDATE task_step SET status='pending',claimed_by=NULL,lease_until=NULL,last_error=?,available_at=?,updated_at=? WHERE id=? AND status='claimed' AND claimed_by=? AND (lease_until > ? OR ?)")
+            .bind(error).bind(available_at).bind(&now).bind(&s.id).bind(&s.claimed_by).bind(&now).bind(self.step_is_active(s))
+            .execute(self.pool()).await?.rows_affected();
+        if n != 1 {
+            return Err(DbError::VersionConflict);
+        }
         Ok(())
     }
     async fn renew_step_reservation(&self, id: &str, until: &str) -> Result<bool> {
@@ -351,6 +404,38 @@ impl SqliteDb {
             .await?;
         }
         Ok(())
+    }
+    /// Role entries about to take an agent slot: `(for agent_id, all)`,
+    /// excluding `excluding_task`. Counts a Task's available fast-lane head
+    /// step, a claimed fast-lane step, and a done step still holding its lease
+    /// for the inline dispatch that follows its CAS. Steps behind another
+    /// step, in back-off, under a producer reservation, or waiting for or
+    /// inside a long-lane merge/CI hook hold no capacity; the dispatcher
+    /// re-drives a refused entry.
+    pub async fn queued_admissions(
+        &self,
+        agent_id: &str,
+        excluding_task: &str,
+    ) -> Result<(i64, i64)> {
+        let now = now_rfc3339();
+        Ok(sqlx::query_as(
+            "SELECT COALESCE(SUM(json_extract(s.payload_json,'$.admission_agent_id')=?),0),COUNT(*) FROM task_step s \
+             WHERE s.task_id<>? AND json_extract(s.payload_json,'$.admission_agent_id') IS NOT NULL \
+             AND ((s.status='pending' AND s.lane='fast' AND s.available_at<=? \
+                   AND NOT EXISTS(SELECT 1 FROM task_step p WHERE p.task_id=s.task_id AND p.seq<s.seq AND p.status IN ('pending','claimed')) \
+                   AND NOT EXISTS(SELECT 1 FROM task_step p WHERE p.task_id=s.task_id AND p.id!=s.id AND p.lease_until>?)) \
+               OR (s.status='claimed' AND s.lane='fast' AND s.lease_until>?) \
+               OR (s.status='done' AND s.lease_until>?)) \
+             AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.task_id=s.task_id AND e.status='running')",
+        )
+        .bind(agent_id)
+        .bind(excluding_task)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .fetch_one(self.pool())
+        .await?)
     }
     pub fn active_step_count(&self) -> usize {
         self.task_step_activity.lock().expect("step activity").len()
@@ -447,7 +532,7 @@ mod tests {
             chain_position: 1,
             expected_status: "todo".into(),
             expected_version: 1,
-            producing_transition_id: None,
+            expected_epoch: None,
             lane: "fast".into(),
             available_at: now_rfc3339(),
         }
@@ -617,7 +702,7 @@ mod tests {
         assert_eq!(retried.last_error.as_deref(), Some("temporary refusal"));
     }
     #[tokio::test]
-    async fn entry_identity_tolerates_versions_but_not_a_return_to_same_status() {
+    async fn epoch_fence_tolerates_edits_and_markers_but_not_a_return_to_same_status() {
         let db = fixture().await;
         let id = db.enqueue_step(&input("a", "edit")).await.unwrap();
         let step = db
@@ -627,13 +712,51 @@ mod tests {
             .into_iter()
             .find(|s| s.id == id)
             .unwrap();
+        assert_eq!(step.expected_epoch, 0);
         sqlx::query("UPDATE task SET title='edited',version=version+1 WHERE id='a'")
             .execute(db.pool())
             .await
             .unwrap();
+        // A same-state recovery marker or reorder audit row is not an entry.
+        sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at) VALUES('marker','a','todo','todo','user','retry window reset',?)").bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE task SET status='todo',version=version+1 WHERE id='a'")
+            .execute(db.pool())
+            .await
+            .unwrap();
         assert!(db.step_entry_matches(&step).await.unwrap());
-        sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at) VALUES('new-entry','a','planning','todo','user','returned',?)").bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+        // Leaving and returning, by any writer, is a new entry.
+        for status in ["planning", "todo"] {
+            sqlx::query("UPDATE task SET status=? WHERE id='a'")
+                .bind(status)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let epoch: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id='a'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(epoch, 2);
         assert!(!db.step_entry_matches(&step).await.unwrap());
+        // An in-transaction enqueue reads the epoch after the producing CAS.
+        let mut tx = begin_immediate(db.pool()).await.unwrap();
+        sqlx::query("UPDATE task SET status='planning' WHERE id='a'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let mut produced = input("a", "produced");
+        produced.expected_status = "planning".into();
+        db.enqueue_step_in_tx(&mut tx, &produced).await.unwrap();
+        tx.commit().await.unwrap();
+        let produced = db
+            .task_steps("a")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.causation_key == "produced")
+            .unwrap();
+        assert_eq!(produced.expected_epoch, 3);
+        assert!(db.step_entry_matches(&produced).await.unwrap());
     }
     #[tokio::test]
     async fn live_hook_witness_prevents_wall_expired_reclaim_and_fences_owner() {
@@ -674,10 +797,193 @@ mod tests {
             .unwrap();
         db.enqueue_step(&input("b", "pending")).await.unwrap();
         assert_eq!(
-            db.prune_steps("2020-01-01T00:00:00Z", 1000).await.unwrap(),
+            db.prune_steps("2020-01-01T00:00:00Z", "2020-01-01T00:00:00Z", 1000)
+                .await
+                .unwrap(),
             100
         );
         assert_eq!(db.task_steps("a").await.unwrap().len(), 5);
         assert_eq!(db.pending_steps("b").await.unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn retention_keeps_unresolved_rows_longer_and_uses_indexes() {
+        let db = fixture().await;
+        let workflow = db.store_step_workflow("{\"states\":[]}").await.unwrap();
+        for (key, status, completed) in [
+            ("done-old", "done", "2000-01-01T00:00:00Z"),
+            ("failed-recent", "failed", "2020-01-20T00:00:00Z"),
+            ("parked-old", "parked", "2000-01-01T00:00:00Z"),
+        ] {
+            let mut value = input("a", key);
+            value.chain_id = key.into();
+            if status == "failed" {
+                value.payload_json =
+                    serde_json::json!({"workflow_ref":{"kind":"snapshot","id":workflow}})
+                        .to_string();
+            }
+            db.enqueue_step(&value).await.unwrap();
+            sqlx::query("UPDATE task_step SET status=?,completed_at=? WHERE causation_key=?")
+                .bind(status)
+                .bind(completed)
+                .bind(key)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE task_step_workflow SET last_used_at='2000-01-01T00:00:00Z'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // Seven-day cutoff for settled rows, thirty-day cutoff for unresolved.
+        assert_eq!(
+            db.prune_steps("2020-01-25T00:00:00Z", "2020-01-01T00:00:00Z", 100)
+                .await
+                .unwrap(),
+            2
+        );
+        let left: Vec<String> = db
+            .task_steps("a")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.causation_key)
+            .collect();
+        assert_eq!(left, vec!["failed-recent".to_owned()]);
+        // The failed row still references its definition.
+        assert!(db.step_workflow(&workflow).await.is_ok());
+        db.prune_steps("2020-01-25T00:00:00Z", "2020-02-01T00:00:00Z", 100)
+            .await
+            .unwrap();
+        assert!(db.task_steps("a").await.unwrap().is_empty());
+        assert!(db.step_workflow(&workflow).await.is_err());
+        for (sql, index) in [
+            (PRUNE_SETTLED, "task_step_settled"),
+            (PRUNE_UNRESOLVED, "task_step_settled"),
+            (PRUNE_WORKFLOWS, "task_step_workflow_ref"),
+        ] {
+            let explain = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut query = sqlx::query(&explain).bind("2020-01-01T00:00:00Z");
+            if sql == PRUNE_WORKFLOWS {
+                query = query.bind(100);
+            } else {
+                query = query.bind(now_rfc3339()).bind("[]").bind(100);
+            }
+            let plan: Vec<String> = query
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            assert!(
+                plan.iter().any(|detail| detail.contains(index)),
+                "{index} not used: {plan:?}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn hook_retry_after_sleep_lands_for_a_live_local_owner() {
+        let db = fixture().await;
+        db.enqueue_step(&input("a", "sleep")).await.unwrap();
+        let step = db
+            .claim_step("owner", Some("a"), "2000-01-01T00:00:00+00:00")
+            .await
+            .unwrap()
+            .unwrap();
+        let activity = db.hold_task_step(&step);
+        db.retry_step(&step, "transient after wake", &later())
+            .await
+            .unwrap();
+        let row = &db.task_steps("a").await.unwrap()[0];
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.last_error.as_deref(), Some("transient after wake"));
+        drop(activity);
+        // Without the local witness an expired owner is fenced out.
+        let stale = db
+            .claim_step("stale", Some("a"), "2000-01-01T00:00:00+00:00")
+            .await
+            .unwrap();
+        assert!(stale.is_none(), "back-off keeps the step pending");
+        sqlx::query("UPDATE task_step SET available_at='2000-01-01T00:00:00Z'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let stale = db
+            .claim_step("stale", Some("a"), "2000-01-01T00:00:00+00:00")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            db.retry_step(&stale, "lost", &later()).await,
+            Err(DbError::VersionConflict)
+        ));
+    }
+    #[tokio::test]
+    async fn queued_admissions_count_only_imminent_role_entries() {
+        let db = fixture().await;
+        let now = now_rfc3339();
+        for id in ["c", "d", "e", "f"] {
+            sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES (?,'p',?,'todo',?,?)")
+                .bind(id).bind(id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        }
+        let role_entry = |task: &str, key: &str, lane: &str| {
+            let mut value = input(task, key);
+            value.payload_json = serde_json::json!({"admission_agent_id":"agent"}).to_string();
+            value.lane = lane.into();
+            value
+        };
+        // a: available head entry -> counts.
+        db.enqueue_step(&role_entry("a", "head", "fast"))
+            .await
+            .unwrap();
+        assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (1, 1));
+        // b: a long-lane step inside its CI hook, with an entry queued behind it.
+        db.enqueue_step(&role_entry("b", "ci", "long"))
+            .await
+            .unwrap();
+        db.enqueue_step(&role_entry("b", "behind", "fast"))
+            .await
+            .unwrap();
+        db.claim_step("ci-owner", Some("b"), &later())
+            .await
+            .unwrap()
+            .unwrap();
+        // g: an available long-lane head waiting for a long slot (CI first).
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES ('g','p','g','todo',?,?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        db.enqueue_step(&role_entry("g", "long-head", "long"))
+            .await
+            .unwrap();
+        // c: in retry back-off; d: under its producer's reservation.
+        let mut backoff = role_entry("c", "backoff", "fast");
+        backoff.available_at = later();
+        db.enqueue_step(&backoff).await.unwrap();
+        let mut reserved = role_entry("d", "reserved", "fast");
+        reserved.available_at = later();
+        db.enqueue_step(&reserved).await.unwrap();
+        assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (1, 1));
+        // e: claimed fast entry; f: done, still leased for its inline dispatch.
+        db.enqueue_step(&role_entry("e", "dispatching", "fast"))
+            .await
+            .unwrap();
+        db.claim_step("e-owner", Some("e"), &later())
+            .await
+            .unwrap()
+            .unwrap();
+        db.enqueue_step(&role_entry("f", "committed", "fast"))
+            .await
+            .unwrap();
+        let committed = db
+            .claim_step("f-owner", Some("f"), &later())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut tx = begin_immediate(db.pool()).await.unwrap();
+        db.finish_step_in_tx(&mut tx, &committed, "done", None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (3, 3));
+        assert_eq!(db.queued_admissions("other", "a").await.unwrap(), (0, 2));
     }
 }

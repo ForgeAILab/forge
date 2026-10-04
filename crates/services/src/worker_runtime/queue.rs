@@ -17,7 +17,11 @@ use tokio::{
 };
 
 pub const CHAIN_LIMIT: i64 = 64;
-const FAST_CONCURRENCY: usize = 4;
+// Long steps (merge, CI review checks) can wait on one repository's lock for
+// the whole hook. They get their own four slots so the eight fast slots keep
+// every other Project's cascades moving. Per-repository head-of-line inside
+// the long lane is a 3.2 follow-up.
+const FAST_CONCURRENCY: usize = 8;
 const LONG_CONCURRENCY: usize = 4;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 const LEASE_SECONDS: i64 = 60;
@@ -74,6 +78,8 @@ pub(crate) enum WorkflowReference {
     Snapshot(String),
 }
 
+/// A step is long only when its target state runs a merge or CI review
+/// checks. Dispatch hooks only launch an execution and stay fast.
 pub(crate) fn cascade_lane(workflow: &api_types::WorkflowDefinition, to: &str) -> &'static str {
     let long = workflow
         .states
@@ -86,17 +92,7 @@ pub(crate) fn cascade_lane(workflow: &api_types::WorkflowDefinition, to: &str) -
                 .iter()
                 .chain(&state.hooks.on_enter)
                 .chain(&state.hooks.after_enter)
-                .any(|hook| {
-                    matches!(
-                        hook.action.as_str(),
-                        "run_merge"
-                            | "run_ci_steps"
-                            | "run_before_work_hooks"
-                            | "dispatch_role_agent"
-                            | "dispatch_fix_agent"
-                            | "dispatch_executor"
-                    )
-                })
+                .any(|hook| matches!(hook.action.as_str(), "run_merge" | "run_ci_steps"))
         });
     if long {
         "long"
@@ -444,10 +440,19 @@ impl TaskStepWorker {
         error: Option<&str>,
         annotate: bool,
     ) -> Result<()> {
-        let mut snapshot = TaskRepo::get_by_id(&*self.db, &step.task_id, true).await?;
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND status=? AND deleted_at IS NULL AND (SELECT id FROM transition_log WHERE task_id=task.id AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1) IS ?)")
-            .bind(&step.task_id).bind(&step.expected_status).bind(&step.producing_transition_id).fetch_one(&mut *tx).await?;
+        let mut task = self
+            .db
+            .get_task_in_tx(&mut tx, &step.task_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", step.task_id.clone()))?;
+        let observed_epoch: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+            .bind(&step.task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let matches = task.deleted_at.is_none()
+            && task.status == step.expected_status
+            && observed_epoch == step.expected_epoch;
         let status = if annotate && !matches {
             "superseded"
         } else {
@@ -457,31 +462,19 @@ impl TaskStepWorker {
             .finish_step_in_tx(&mut tx, step, status, error)
             .await?;
         if status == "superseded" {
-            let observed: Option<(String, Option<String>)> = sqlx::query_as("SELECT status,(SELECT id FROM transition_log WHERE task_id=task.id AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1) FROM task WHERE id=?")
-                .bind(&step.task_id).fetch_optional(&mut *tx).await?;
-            let mut event = db::CreateDomainEvent::task_interruption_changed(
-                snapshot
-                    .as_ref()
-                    .ok_or_else(|| ServiceError::not_found("task", step.task_id.clone()))?,
-            );
+            let mut event = db::CreateDomainEvent::task_interruption_changed(&task);
             event.id = db::new_uuid_v4();
             event.event_type = "transition.step_superseded".into();
             event.entity_id = step.task_id.clone();
             event.scope_id = step.task_id.clone();
             event.dedupe_key = Some(format!("task-step-superseded:{}", step.id));
-            event.payload_json = serde_json::json!({"task_id":step.task_id,"step_id":step.id,"expected_status":step.expected_status,"expected_entry":step.producing_transition_id,"observed_status":observed.as_ref().map(|o|&o.0),"observed_entry":observed.as_ref().and_then(|o|o.1.as_ref()),"reason":error}).to_string();
-            tracing::debug!(step_id=%step.id, expected_status=%step.expected_status, expected_entry=?step.producing_transition_id, observed=?observed, "cascade superseded");
+            event.payload_json = serde_json::json!({"task_id":step.task_id,"step_id":step.id,"expected_status":step.expected_status,"expected_epoch":step.expected_epoch,"observed_status":task.status,"observed_epoch":observed_epoch,"reason":error}).to_string();
+            tracing::debug!(step_id=%step.id, expected_status=%step.expected_status, expected_epoch=step.expected_epoch, observed_status=%task.status, observed_epoch, "cascade superseded");
             db::DomainEventRepo::append_event_in_tx(&*self.db, &mut tx, &event).await?;
         }
         if annotate && matches {
-            self.annotate_in_tx(
-                &mut tx,
-                step,
-                snapshot.as_mut().expect("matching Task"),
-                status,
-                error,
-            )
-            .await?;
+            self.annotate_in_tx(&mut tx, step, &mut task, status, error)
+                .await?;
         }
         tx.commit().await?;
         // A concurrent direct writer may supersede the step while parking
@@ -502,18 +495,21 @@ impl TaskStepWorker {
         }
         Ok(())
     }
+    /// `task` must have been read inside `tx`; the write lock then guarantees
+    /// its version is current. The row count is still checked so an event
+    /// never claims an annotation that was not written.
     async fn annotate_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         step: &TaskStep,
-        snapshot: &mut db::Task,
+        task: &mut db::Task,
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
         let now = db::now_rfc3339();
         let mut annotation = serde_json::json!({"type":if status=="parked" {"workflow_loop"} else {"cascade_failed"}, "state":step.expected_status, "message":error, "detected_at":now, "task_step_id":step.id});
         if status != "parked" {
-            if let Some(mut existing) = snapshot
+            if let Some(mut existing) = task
                 .error_annotation
                 .as_deref()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
@@ -532,18 +528,19 @@ impl TaskStepWorker {
             serde_json::json!({"reason":error, "blocked_at":now, "source":"workflow_loop"})
                 .to_string()
         });
-        sqlx::query("UPDATE task SET error_annotation=?,blocked_json=COALESCE(?,blocked_json),version=version+1,updated_at=? WHERE id=? AND version=?")
-                .bind(annotation.to_string()).bind(blocked).bind(&now).bind(&step.task_id).bind(snapshot.version).execute(&mut **tx).await?;
-        snapshot.error_annotation = Some(annotation.to_string());
-        if status == "parked" {
-            snapshot.blocked_json = Some(
-                serde_json::json!({"reason":error,"blocked_at":now,"source":"workflow_loop"})
-                    .to_string(),
-            );
+        let written = sqlx::query("UPDATE task SET error_annotation=?,blocked_json=COALESCE(?,blocked_json),version=version+1,updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL")
+            .bind(annotation.to_string()).bind(&blocked).bind(&now).bind(&step.task_id).bind(task.version)
+            .execute(&mut **tx).await?.rows_affected();
+        if written != 1 {
+            return Err(db::DbError::VersionConflict.into());
         }
-        snapshot.version += 1;
-        snapshot.updated_at = now;
-        let event = db::CreateDomainEvent::task_interruption_changed(snapshot);
+        task.error_annotation = Some(annotation.to_string());
+        if blocked.is_some() {
+            task.blocked_json = blocked;
+        }
+        task.version += 1;
+        task.updated_at = now;
+        let event = db::CreateDomainEvent::task_interruption_changed(task);
         db::DomainEventRepo::append_event_in_tx(&*self.db, tx, &event).await?;
         if status == "parked" {
             let mut loop_event = event;
@@ -558,35 +555,49 @@ impl TaskStepWorker {
 
     async fn fail_committed_hook_phase(&self, step: &TaskStep, error: &str) -> Result<()> {
         let message = format!("Transition committed; inline hook failed: {error}");
-        let mut snapshot = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await?;
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let latest: Option<String> = sqlx::query_scalar("SELECT id FROM transition_log WHERE task_id=? AND is_status_entry=1 ORDER BY created_at DESC,id DESC LIMIT 1")
-            .bind(&step.task_id).fetch_optional(&mut *tx).await?;
+        let mut task = self.db.get_task_in_tx(&mut tx, &step.task_id).await?;
+        // The step's own CAS wrote the log row with the step's id.
+        let own_epoch: Option<i64> =
+            sqlx::query_scalar("SELECT status_epoch FROM transition_log WHERE id=? AND task_id=?")
+                .bind(&step.id)
+                .bind(&step.task_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+        let current_epoch: Option<i64> =
+            sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+                .bind(&step.task_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let target = serde_json::from_str::<CascadePayload>(&step.payload_json)
             .ok()
             .map(|p| p.to);
-        let own_entry = latest.as_deref() == Some(step.id.as_str())
-            && snapshot
+        let own_entry = own_epoch.is_some()
+            && own_epoch == current_epoch
+            && task
                 .as_ref()
-                .is_some_and(|t| Some(&t.status) == target.as_ref());
+                .is_some_and(|t| t.deleted_at.is_none() && Some(&t.status) == target.as_ref());
         // A later action can legitimately interrupt inline hooks. Keep its
         // successful predecessor done and retain the diagnostic, without
         // annotating the later Task entry. Never replay an applied CAS.
         let status = if own_entry { "failed" } else { "done" };
-        let changed = sqlx::query("UPDATE task_step SET status=?,last_error=?,updated_at=? WHERE id=? AND status='done' AND claimed_by=? AND lease_until > ?")
-            .bind(status).bind(&message).bind(db::now_rfc3339()).bind(&step.id).bind(&step.claimed_by).bind(db::now_rfc3339())
+        // Same ownership rule as finish_step_in_tx: a live local hook owns
+        // its step after a sleep expired the wall-clock lease.
+        let now = db::now_rfc3339();
+        let changed = sqlx::query("UPDATE task_step SET status=?,last_error=?,updated_at=? WHERE id=? AND status='done' AND claimed_by=? AND (lease_until > ? OR ?)")
+            .bind(status).bind(&message).bind(&now).bind(&step.id).bind(&step.claimed_by).bind(&now).bind(self.db.step_is_active(step))
             .execute(&mut *tx).await?.rows_affected();
+        if changed != 1 {
+            tracing::warn!(step_id=%step.id, %error, "task step lost ownership before its hook failure was recorded");
+        }
         if own_entry && changed == 1 {
-            if let Some(task) = snapshot.as_mut() {
-                let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND status=? AND version=? AND deleted_at IS NULL)")
-                    .bind(&task.id).bind(&task.status).bind(task.version).fetch_one(&mut *tx).await?;
-                if current {
-                    let mut context = step.clone();
-                    context.expected_status = task.status.clone();
-                    context.expected_version = task.version;
-                    self.annotate_in_tx(&mut tx, &context, task, "failed", Some(&message))
-                        .await?;
-                }
+            if let Some(task) = task.as_mut() {
+                let mut context = step.clone();
+                context.expected_status = task.status.clone();
+                context.expected_version = task.version;
+                self.annotate_in_tx(&mut tx, &context, task, "failed", Some(&message))
+                    .await?;
             }
         }
         tx.commit().await?;

@@ -133,7 +133,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_transition_task",
-            "Return the Task after this transition; pending_steps counts queued asynchronous follow-ups.",
+            "Transition a task to another status. Returns the committed Task; pending_steps counts follow-ups that run asynchronously.",
             json!({
                 "task_id": { "type": "string" },
                 "status": { "type": "string", "enum": ["todo", "in_progress", "review", "merging", "merge_failed", "done", "cancelled", "blocked"] },

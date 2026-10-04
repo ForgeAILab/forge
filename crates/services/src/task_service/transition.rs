@@ -1191,19 +1191,23 @@ async fn clear_manual_advance_error_annotation(
         return Ok(advanced_task);
     }
 
-    let cleared: Option<(String,i64)> = sqlx::query_as("UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL RETURNING status,version")
-        .bind(now_rfc3339()).bind(&advanced_task.id).bind(&source_task.error_annotation).fetch_optional(db.pool()).await?;
-    // Preserve the initiating transition's response snapshot even if its step
-    // has already advanced the persisted Task. Clearing a replaced annotation
-    // is a no-op, never a post-commit 409.
-    let mut snapshot = advanced_task;
-    if let Some((status, version)) = cleared {
-        if status == snapshot.status {
-            snapshot.version = version;
-        }
+    // Compare the annotation, not the version: the Advance's own queued step
+    // may already have moved the Task. A replaced annotation is a no-op,
+    // never a post-commit 409. The event shares the clear's transaction.
+    let mut tx = db::begin_immediate(db.pool()).await?;
+    let cleared = sqlx::query("UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL")
+        .bind(now_rfc3339()).bind(&advanced_task.id).bind(&source_task.error_annotation)
+        .execute(&mut *tx).await?.rows_affected();
+    let current = db
+        .get_task_in_tx(&mut tx, &advanced_task.id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", advanced_task.id.clone()))?;
+    if cleared == 1 {
+        let event = db::CreateDomainEvent::task_interruption_changed(&current);
+        db::DomainEventRepo::append_event_in_tx(db, &mut tx, &event).await?;
     }
-    snapshot.error_annotation = None;
-    Ok(snapshot)
+    tx.commit().await?;
+    Ok(current)
 }
 
 pub(super) async fn clear_manual_review_awaiting_metadata(

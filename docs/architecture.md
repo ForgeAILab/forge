@@ -2363,7 +2363,7 @@ faults also enter `recent_errors` and raise Operations severity to `attention`.
 | `operator-status-emitter` | EventBus hints, existing 500 ms Skip coalescer (initial tick consumed); activity refresh after 5 seconds | 5 minutes / cancel |
 | `lifecycle-projection` | Existing EventBus receiver; only events the handler acts on count as ticks; other hints bypass health, lag warned | 1 hour / cancel |
 | `workspace-cleanup` | Independent immediate 60-second cleanup and 10-minute terminal sweep Skip intervals | 1 hour / cancel |
-| `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum | 5 minutes / cancel |
+| `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum; Task step retention on the first tick and hourly after | 5 minutes / cancel |
 | `daemon-monitor` | Immediate check, then 30 seconds after each pass; stop Notify | 5 minutes / cancel |
 | `embedded-daemon` | Immediate CLI scan/report, then 60 seconds after each pass; stop Notify; server and Solo | 5 minutes / cancel |
 | `shared-media-cleanup` | One startup pass, then create 60-second Burst interval and consume initial tick | 5 minutes / cancel |
@@ -3903,8 +3903,18 @@ in the compact Task list's existing `workflow_health` projection.
 
 The `task_step` cascade outbox orders rows by a monotonically increasing `seq`
 per Task. Its leased worker lives in `worker_runtime/queue.rs` and is registered
-with the common runtime supervisor. Four fast jobs and four long-hook jobs run in separate lanes, so merges, CI and dispatch/provisioning cannot consume fast-lane capacity;
-only the earliest unfinished row of each Task is eligible. Claims carry a unique
+with the common runtime supervisor. Jobs run in two lanes: eight fast slots and
+four long slots. A step is long only when its target state's hooks include
+`run_merge` or `run_ci_steps`; those can wait on one repository's integration or
+checkout lock for the whole hook. Everything else is fast, including
+`run_before_work_hooks` and the dispatch hooks, which only launch an execution
+(`provider.start` returns once the run is launched). A full long lane therefore
+stalls only merges and CI review checks; other Projects' planning, dispatch,
+reject and terminal cascades keep running. Per-repository head-of-line limits
+inside the long lane are a follow-up (refactor item 3.2): today four steps
+waiting on one repository's lock can still delay another repository's merge.
+Project before-work hooks are user commands that run in a fast slot.
+Only the earliest unfinished row of each Task is eligible, whatever its lane. Claims carry a unique
 owner token and a renewable 60-second lease. A missed in-process commit kick
 falls back to a 250 ms poll; expired claims are reclaimed after a restart. The
 step's `done` write shares the transition's status/version CAS transaction.
@@ -3913,10 +3923,26 @@ fences that observed Project authority in the CAS. A removed cascade target or n
 lease remains held through the existing inline hook phase, so the next queued
 hop cannot overlap those hooks even in another process.
 
-Each step fences the producing status and latest status-entry transition-log identity inside the immediate status-CAS transaction. Title edits, annotation clears, reorders and version-only metadata writes are tolerated. A real entry change becomes `superseded` with a durable `transition.step_superseded` event and no transition or retry. Producers reserve eligibility until their
+Each step fences on a **status epoch**. `task.status_epoch` starts at 0 and an
+`AFTER UPDATE OF status ON task` trigger increments it whenever the status value
+changes, so every writer is covered, direct ones included. The workflow engine's
+status CAS also bumps it for a real self-transition (the default workflow's
+`planning` gate reject re-enters `planning`); board same-column reorders do not.
+A step records `expected_status` and `expected_epoch`, and its CAS requires
+`status = expected_status AND status_epoch = expected_epoch` inside the immediate
+transaction. Steps enqueued in the producing CAS transaction read the epoch after
+that status update. Post-commit producers read the epoch recorded on their own
+`transition_log` row (`transition_log.status_epoch`, written by the engine CAS
+and board moves); a blocked-barrier retry reads it with its version check. Title
+edits, annotation clears, reorders, version-only writes and same-state recovery
+markers never move the epoch, so they never drop a queued cascade. Leaving and
+returning to a status does. A step whose entry has changed becomes `superseded`
+with a durable `transition.step_superseded` event and no transition or retry.
+Rebuilding the `task` table in a future migration must recreate the
+`task_status_epoch` trigger. Producers reserve eligibility until their
 inline hook and service-wrapper writes finish; readiness releases that reserved row without rebinding a version. A lost reservation
 becomes eligible after 60 seconds and is still checked against its recorded
-status/entry identity. Transient availability/database failures retry with exponential
+status and epoch. Transient availability/database failures retry with exponential
 backoff (1–64 seconds, at most eight attempts). Deterministic failures become
 `failed` and persist a `cascade_failed` Task annotation consumed by existing recovery views; loops use `workflow_loop`. An exception from the retained inline hook phase after the CAS
 records `failed` with an explicit "transition committed" annotation; it never
@@ -3948,9 +3974,9 @@ serialization, merge-hook single-flight tracking, running entry barriers and
 the stale-merging re-drive remain in place. Direct non-cascade writers remain
 until slice C; queued-step leases alone are not yet a universal Task writer.
 
-Initial admission on the background dispatcher enqueues and kicks the leased worker; queued execution entries reserve admission capacity while waiting for their real run slot. This preserves admission ordering
+Initial admission on the background dispatcher enqueues and kicks the leased worker; queued execution entries reserve admission capacity only in the short window before they take their real run slot (see the task-step reservation rules above). This preserves admission ordering
 and stable refusal annotations without delaying REST/MCP cascade responses.
-Recovery replay retains its original command-marker cleanup; version-only cleanup does not invalidate the entry identity.
+Recovery replay retains its original command-marker cleanup; version-only cleanup does not change the status epoch.
 
 A state with blocking `before_enter` hooks is persisted with a running entry
 barrier until those hooks and the target state's inline `on_enter` dispatch
@@ -4829,8 +4855,18 @@ unchanged.
 
 Task-step execution is not cancelled by claim/renewal failures. Claim errors back off while retaining in-flight jobs; shutdown drains for eight seconds within the supervisor's ten-second grace. Process-local active execution witnesses exclude their Tasks from claims even when wall time advances during laptop sleep; renewal can restore an expired lease only while its owner token still matches. The status-CAS completion accepts that live server witness, but always fences the SQLite owner token.
 
-Step payloads reference the current Project workflow or a deduplicated immutable definition for explicit engine workflows; they never repeat full definitions. Queue execution resolves and validates the current gate approval policy and propagates the producer's clear_review_passed_at_on_commit flag, matching base behavior. Rebase head evidence and rebase counts end a chain segment even without CI/review. Loop lookup reads only the current chain. Storage maintenance deletes done/superseded rows older than seven days in batches of at most 100, retaining active chains and leases.
+Step payloads reference the current Project workflow or a deduplicated immutable definition for explicit engine workflows; they never repeat full definitions. Queue execution resolves and validates the current gate approval policy and propagates the producer's clear_review_passed_at_on_commit flag, matching base behavior. Rebase head evidence and rebase counts end a chain segment even without CI/review. Loop lookup reads only the current chain.
+
+Step retention runs hourly inside the `storage-maintenance` worker (its vacuum
+tick stays at five seconds). Each prune deletes `done`/`superseded` rows
+completed more than seven days ago and `failed`/`parked` rows completed more than
+thirty days ago, in statements of at most 100 rows per class and at most 20
+rounds per run, using the `task_step_settled(status, completed_at)` index. It
+keeps rows of chains that still have pending or claimed steps, rows holding a
+lease, and Tasks running a step. Unreferenced workflow definitions older than
+seven days are then removed; the reference probe uses the indexed generated
+column `task_step.workflow_ref_id`, not a JSON scan.
 
 Initial dispatcher admission only commits/enqueues and kicks the worker. A queued rollback to the initial state finalizes the existing placement-refusal bookkeeping; the dispatcher does not drain chains inline.
 
-Board reorders remain audit records but carry is_status_entry=false; only true entries participate in the latest-entry fence, with created_at/id descending order. expected_version remains a diagnostic stamp and is never rebound. Replay-marker cleanup stays with its original recovery writer. Queued role-entry agent references reserve admission capacity until an execution acquires its real slot; the dispatcher kicks and continues rather than running the queue. Lane classification is checked again against the resolved workflow at execution and requeues a changed lane before any transition starts.
+Board reorders and recovery markers remain audit rows only; neither changes the status epoch. expected_version remains a diagnostic stamp and is never rebound. Replay-marker cleanup stays with its original recovery writer. Queued role-entry agent references reserve admission capacity only for the short window before the entry takes its slot: a Task's available fast-lane head step, a claimed fast-lane step, and a done step still leased for the inline dispatch after its CAS. Steps behind another step, in retry back-off, under a producer reservation, or waiting for or inside a long-lane merge/CI hook hold no agent or server capacity; if their later dispatch finds the agent full it is skipped and the dispatcher's active-task recovery re-drives it. The dispatcher kicks and continues rather than running the queue. Lane classification is checked again against the resolved workflow at execution and requeues a changed lane before any transition starts.

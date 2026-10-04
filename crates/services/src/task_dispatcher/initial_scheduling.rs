@@ -357,9 +357,9 @@ impl TaskDispatcher {
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", target.agent_id.clone()))?;
         // A queued role entry has not acquired its execution slot yet. Count
-        // that short admission window without executing the cascade inline.
-        let (queued_agent,queued_all):(i64,i64)=sqlx::query_as("SELECT COALESCE(SUM(json_extract(payload_json,'$.admission_agent_id')=?),0),COUNT(*) FROM task_step WHERE task_id<>? AND json_extract(payload_json,'$.admission_agent_id') IS NOT NULL AND (status IN ('pending','claimed') OR lease_until>?) AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.task_id=task_step.task_id AND e.status='running')")
-            .bind(&agent.id).bind(&task.id).bind(db::now_rfc3339()).fetch_one(self.db.pool()).await?;
+        // only that short admission window, without executing the cascade
+        // inline; steps queued behind long hooks hold no capacity.
+        let (queued_agent, queued_all) = self.db.queued_admissions(&agent.id, &task.id).await?;
         let running_agent: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM execution WHERE agent_id=? AND status='running'",
         )

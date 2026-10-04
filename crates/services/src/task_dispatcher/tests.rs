@@ -9153,3 +9153,6 @@ async fn supervised_dispatcher_recovers_panic_reports_budget_keeps_wakes_and_sto
 
 #[path = "tests/audit_23a.rs"]
 mod audit_23a;
+
+#[path = "tests/reaudit_23a.rs"]
+mod reaudit_23a;
