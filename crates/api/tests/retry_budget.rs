@@ -39,10 +39,15 @@ async fn review_retry_budget_reports_exhaustion_without_blocking_gate_entry() {
 
     task = transition(&harness.app, &task, "in_progress").await;
     task = transition(&harness.app, &task, "review").await;
+    // No step worker runs here: settle review's entry hooks (the attached
+    // check_retry_budget) before acting on the gate, as production would.
+    task = common::drain(&harness._state, &harness.app, &task.id).await;
+    assert_eq!(task.status, "review");
     task = gate_reject(&harness.app, &task).await;
     assert_eq!(task.status, "in_progress");
 
     task = transition(&harness.app, &task, "review").await;
+    task = common::drain(&harness._state, &harness.app, &task.id).await;
     assert_eq!(
         task.status, "review",
         "the second review cycle should stay in review; review execution failure enforces the exhausted budget"

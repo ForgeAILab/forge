@@ -125,6 +125,11 @@ async fn planning_gate_approval_conflicts_while_planner_execution_is_running() {
         StatusCode::OK,
     )
     .await;
+    assert_eq!(moved.task.status, "planning");
+    // Settle planning's entry hooks first: while they are queued the gate
+    // offers nothing, which would make the conflict below vacuous.
+    let settled = harness._state.task_service.drain(&task.id).await.unwrap();
+    assert_eq!(settled.status, "planning");
     let now = now_rfc3339();
     ExecutionRepo::create(
         &*harness._state.db,
@@ -156,15 +161,16 @@ async fn planning_gate_approval_conflicts_while_planner_execution_is_running() {
     .await
     .expect("running planner execution creates");
 
-    let _: Value = json_request_with_bearer(
+    let refused: Value = json_request_with_bearer(
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{}/actions", task.id),
         &admin_jwt(),
-        json!({ "action": {"verb":"approve","override":false},  "version": moved.task.version}),
+        json!({ "action": {"verb":"approve","override":false},  "version": settled.version}),
         StatusCode::CONFLICT,
     )
     .await;
+    assert_eq!(refused["code"], "action_unavailable", "{refused}");
 }
 
 fn planning_workflow() -> Value {

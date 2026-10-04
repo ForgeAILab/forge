@@ -1001,11 +1001,15 @@ async fn provisioning_wait_detail(
     else {
         return Ok(String::new());
     };
-    let detail: Option<(Option<String>, Option<String>)> = sqlx::query_as("SELECT started_at, COALESCE(l.last_error, j.last_error) FROM repo_provision_retry j LEFT JOIN repo_location l ON l.id = j.location_id WHERE j.repo_id = ? AND j.runtime_id = ?").bind(repo).bind(runtime_id).fetch_optional(db.pool()).await?;
-    let Some((started, error)) = detail else {
+    // One read: a provisioning job that verifies the location deletes this
+    // retry row concurrently, so a second lookup could find it gone.
+    type RetryDetail = (Option<String>, Option<String>, i64, String, i64);
+    let detail: Option<RetryDetail> = sqlx::query_as("SELECT j.started_at, COALESCE(l.last_error, j.last_error), j.attempts, j.checks_digest, j.connection_id FROM repo_provision_retry j LEFT JOIN repo_location l ON l.id = j.location_id WHERE j.repo_id = ? AND j.runtime_id = ?").bind(repo).bind(runtime_id).fetch_optional(db.pool()).await?;
+    let Some((started, error, attempts, inputs_digest, connection_id)) = detail else {
         return Ok(String::new());
     };
-    let retry:super::provisioning::ProvisionRetryState=sqlx::query_as::<_,(i64,String,i64)>("SELECT attempts,checks_digest AS inputs_digest,connection_id FROM repo_provision_retry WHERE repo_id=? AND runtime_id=?").bind(repo).bind(runtime_id).fetch_one(db.pool()).await?.into();
+    let retry =
+        super::provisioning::ProvisionRetryState::from((attempts, inputs_digest, connection_id));
     let raw: String = sqlx::query_scalar(
         "SELECT p.settings FROM project p JOIN repo r ON r.project_id=p.id WHERE r.id=?",
     )
@@ -1499,5 +1503,58 @@ mod tests {
         );
         tokio::task::yield_now().await;
         assert!(db.list_readiness(&project).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provisioning_wait_detail_tolerates_the_retry_row_settling_concurrently() {
+        let (db, project) = fixture(&ProjectEnvironment::default()).await;
+        let now = db::now_rfc3339();
+        db::RepoRepo::create(
+            &db,
+            db::CreateRepo {
+                id: "wait-repo".into(),
+                project_id: project,
+                name: "repo".into(),
+                local_path: None,
+                remote_url: Some("https://example.com/repo.git".into()),
+                default_branch: "main".into(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES ('wait-daemon','wait-machine','owner','linux','aarch64','online',?,?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO runtime (id,daemon_id,kind,workspace_root,status,created_at,updated_at) VALUES ('wait-runtime','wait-daemon','native','/owner','ready',?,?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let machine = EnvironmentMachine::Daemon {
+            runtime_id: "wait-runtime".into(),
+            daemon_id: "wait-daemon".into(),
+        };
+        // A provisioning job that verifies the location deletes the retry
+        // row while a claim's refusal is describing the wait.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = tokio::spawn({
+            let (db, stop) = (db.clone(), stop.clone());
+            async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    sqlx::query("INSERT INTO repo_provision_retry (repo_id,runtime_id,attempts,next_attempt_at,checks_digest,connection_id,started_at) VALUES ('wait-repo','wait-runtime',1,?,'',0,?)")
+                        .bind(db::now_rfc3339()).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
+                    sqlx::query("DELETE FROM repo_provision_retry WHERE repo_id='wait-repo' AND runtime_id='wait-runtime'")
+                        .execute(db.pool()).await.unwrap();
+                }
+            }
+        });
+        let mut described = 0;
+        for _ in 0..2_000 {
+            let detail = provisioning_wait_detail(&db, "wait-repo", &machine, None)
+                .await
+                .expect("a settled retry row is not an error");
+            described += usize::from(!detail.is_empty());
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.await.unwrap();
+        assert!(described > 0, "the wait detail was never read mid-retry");
     }
 }

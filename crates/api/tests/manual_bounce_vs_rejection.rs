@@ -202,8 +202,15 @@ async fn drive_to_review(service: &TaskService, task_id: &str) -> db::Task {
             (1_i64, Some("ready for review".to_owned())),
         )
         .await
-        .expect("in_progress -> review succeeds")
-        .task
+        .expect("in_progress -> review succeeds");
+    // No step worker runs here: settle review's entry hooks the way
+    // production's worker would before the gate offers its decisions.
+    let task = service
+        .drain(task_id)
+        .await
+        .expect("review entry hooks settle");
+    assert_eq!(task.status, default_states::REVIEW);
+    task
 }
 
 async fn remaining_review_retries(db: &SqliteDb, task_id: &str) -> i64 {
