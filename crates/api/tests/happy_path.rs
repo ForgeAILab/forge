@@ -149,7 +149,7 @@ PY"# }
     poll_until_workspace_written(&harness.app, &task_id, &greeting_path).await;
     poll_until_execution_completed(&harness.state.db, &execution_id).await;
 
-    let completed = poll_until_task_status(&harness.app, &task_id, "done".to_owned()).await;
+    let completed = drain_until_task_status(&harness, &task_id, "done".to_owned()).await;
     assert_eq!(
         completed.status,
         "done".to_owned(),
@@ -169,8 +169,22 @@ PY"# }
     assert!(workspace.cleanup_after.is_some(), "cleanup is scheduled");
     assert!(worktree_path.exists(), "transition does not delete inline");
 
-    let (cleanup_shutdown, cleanup_shutdown_rx) = tokio::sync::watch::channel(false);
-    let cleanup_worker = Arc::clone(&harness.state.cleanup_scheduler).spawn(cleanup_shutdown_rx);
+    let registry = harness.state.operator_status_service.periodic_workers();
+    let cleanup_worker = if registry
+        .status()
+        .await
+        .unwrap()
+        .iter()
+        .any(|row| row.worker_name == "workspace-cleanup")
+    {
+        None
+    } else {
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        Some((
+            shutdown,
+            Arc::clone(&harness.state.cleanup_scheduler).spawn(&registry, receiver),
+        ))
+    };
     tokio::time::timeout(Duration::from_secs(5), async {
         while workspaces_root.path().join(&task_id).exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -178,8 +192,10 @@ PY"# }
     })
     .await
     .expect("cleanup worker removes the workspace");
-    cleanup_shutdown.send(true).expect("cleanup worker stops");
-    cleanup_worker.await.expect("cleanup worker joins");
+    if let Some((shutdown, handle)) = cleanup_worker {
+        shutdown.send(true).expect("cleanup worker stops");
+        handle.await.expect("cleanup worker joins");
+    }
     assert!(
         !workspaces_root.path().join(&task_id).exists(),
         "workspace task directory is cleaned"
@@ -347,13 +363,13 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
 
     let approved: TaskResponse = versioned_task_request(
         &harness.app,
-        &format!("/api/v1/tasks/{}/gates/review/approve", task.id),
+        &format!("/api/v1/tasks/{}/actions", task.id),
         &task.id,
-        json!({ "version": review_task.version, "reason": "human approval" }),
+        json!({ "version": review_task.version, "action": { "verb":"approve", "override":false } }),
     )
     .await;
     assert!(matches!(approved.status.as_str(), "merging" | "done"));
-    let completed = poll_until_task_status(&harness.app, &task.id, "done".to_owned()).await;
+    let completed = drain_until_task_status(&harness, &task.id, "done".to_owned()).await;
     assert_eq!(completed.status, "done".to_owned());
 
     let ci_failure_task: TaskResponse = json_request(
@@ -362,7 +378,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
         &format!("/api/v1/projects/{project_id}/tasks"),
         json!({
             "title": "Autonomous validation retry",
-            "description": "printf 'validation retry\\n' > autonomous-ci-retry.txt && git add autonomous-ci-retry.txt && git commit --allow-empty -m autonomous-ci-retry",
+            "description": "printf 'validation retry\\n' > autonomous-ci-retry.txt && git add autonomous-ci-retry.txt && git commit -m autonomous-ci-retry",
             "review_config": { "ci_steps": ["false"] }
         }),
         StatusCode::OK,
@@ -380,7 +396,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     let first_ci_execution = single_execution_for_task(&harness.app, &ci_failure_task.id).await;
 
     let failed_follow_up =
-        poll_until_follow_up_execution(&harness.app, &ci_failure_task.id, &first_ci_execution.id)
+        drain_until_follow_up_execution(&harness, &ci_failure_task.id, &first_ci_execution.id)
             .await;
     assert_eq!(
         failed_follow_up.parent_execution_id.as_deref(),
@@ -394,7 +410,11 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
         StatusCode::OK,
     )
     .await;
-    assert_eq!(after_ci_failure.status, "working".to_owned());
+    assert_eq!(
+        after_ci_failure.status,
+        "working".to_owned(),
+        "Task after CI failure: {after_ci_failure:?}"
+    );
     assert!(!after_ci_failure.awaiting_human);
 
     let passing_review_config = serde_json::to_string(&json!({
@@ -422,14 +442,14 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     let ci_review = poll_until_task_awaiting_human(&harness.app, &ci_failure_task.id).await;
     let ci_approved: TaskResponse = versioned_task_request(
         &harness.app,
-        &format!("/api/v1/tasks/{}/gates/review/approve", ci_failure_task.id),
+        &format!("/api/v1/tasks/{}/actions", ci_failure_task.id),
         &ci_failure_task.id,
-        json!({ "version": ci_review.version, "reason": "human approval" }),
+        json!({ "version": ci_review.version, "action": { "verb": "approve", "override": false } }),
     )
     .await;
     assert!(matches!(ci_approved.status.as_str(), "merging" | "done"));
     let ci_completed =
-        poll_until_task_status(&harness.app, &ci_failure_task.id, "done".to_owned()).await;
+        drain_until_task_status(&harness, &ci_failure_task.id, "done".to_owned()).await;
     assert_eq!(ci_completed.status, "done".to_owned());
     let ci_reviews = ReviewRepo::list_by_task(&*harness.state.db, &ci_failure_task.id)
         .await
@@ -465,25 +485,36 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     let second_execution = single_execution_for_task(&harness.app, &second_task.id).await;
     let second_review = poll_until_task_awaiting_human(&harness.app, &second_task.id).await;
 
+    // Production consumes condition commands through this dispatcher. A long
+    // interval makes this also prove that the post-commit wake starts the worker.
+    let dispatcher = Arc::new(services::TaskDispatcher::with_check_interval(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.event_bus),
+        Arc::clone(&harness.state.task_service),
+        std::time::Duration::from_secs(3600),
+    ));
+    let dispatch_loop = Arc::clone(&dispatcher).start();
     let rejected: TaskResponse = versioned_task_request(
         &harness.app,
-        &format!("/api/v1/tasks/{}/gates/review/reject", second_task.id),
+        &format!("/api/v1/tasks/{}/actions", second_task.id),
         &second_task.id,
         json!({
             "version": second_review.version,
-            "reason": "Please add evidence for the requested behavior"
+            "action": { "verb": "send_back", "guidance": "Please add evidence for the requested behavior" }
         }),
     )
     .await;
     assert_eq!(rejected.status, "working".to_owned());
 
     let resumed =
-        poll_until_follow_up_execution(&harness.app, &second_task.id, &second_execution.id).await;
+        drain_until_follow_up_execution(&harness, &second_task.id, &second_execution.id).await;
     assert_eq!(resumed.role.to_string(), "worker");
     assert_eq!(
         resumed.parent_execution_id.as_deref(),
         Some(second_execution.id.as_str())
     );
+    dispatcher.stop();
+    dispatch_loop.await.expect("dispatcher exits");
 }
 
 struct TestHarness {
@@ -515,12 +546,12 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     )
     .await
     .expect("seed test user");
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -810,25 +841,22 @@ async fn poll_until_workspace_written(app: &Router, task_id: &str, greeting_path
     );
 }
 
-async fn poll_until_task_status(
-    app: &Router,
+async fn drain_until_task_status(
+    harness: &TestHarness,
     task_id: &str,
     expected_status: TaskStatus,
 ) -> TaskResponse {
+    // Executions finish independently; every observation settles the durable
+    // cascade queue instead of polling for inline cascade side effects.
     for _ in 0..100 {
-        let task: TaskResponse = empty_request(
-            app,
-            Method::GET,
-            &format!("/api/v1/tasks/{task_id}"),
-            StatusCode::OK,
-        )
-        .await;
+        let task = common::drain(&harness.state, &harness.app, task_id).await;
         if task.status == expected_status {
             return task;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("task did not reach {expected_status:?} within timeout");
+    let last = common::drain(&harness.state, &harness.app, task_id).await;
+    panic!("task did not reach {expected_status:?}; last Task: {last:?}");
 }
 
 async fn poll_until_task_awaiting_human(app: &Router, task_id: &str) -> TaskResponse {
@@ -860,14 +888,15 @@ async fn single_execution_for_task(app: &Router, task_id: &str) -> ExecutionSumm
     executions.items.into_iter().next().unwrap()
 }
 
-async fn poll_until_follow_up_execution(
-    app: &Router,
+async fn drain_until_follow_up_execution(
+    harness: &TestHarness,
     task_id: &str,
     parent_execution_id: &str,
 ) -> ExecutionSummaryResponse {
     for _ in 0..100 {
+        common::drain(&harness.state, &harness.app, task_id).await;
         let executions: PaginatedResponse<ExecutionSummaryResponse> = empty_request(
-            app,
+            &harness.app,
             Method::GET,
             &format!("/api/v1/tasks/{task_id}/executions"),
             StatusCode::OK,
@@ -972,6 +1001,7 @@ async fn versioned_task_request<T>(app: &Router, uri: &str, task_id: &str, mut b
 where
     T: DeserializeOwned,
 {
+    let mut last_snapshot = None;
     for _ in 0..40 {
         let response = raw_json_request(app, Method::POST, uri, body.clone()).await;
         if response.status() != StatusCode::CONFLICT {
@@ -985,9 +1015,12 @@ where
         )
         .await;
         body["version"] = json!(current.version);
+        last_snapshot = Some(current);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("versioned request to {uri} never won the version race");
+    panic!(
+        "versioned request to {uri} never won the version race; last snapshot: {last_snapshot:?}"
+    );
 }
 
 async fn empty_request<T>(app: &Router, method: Method, uri: &str, expected_status: StatusCode) -> T
@@ -1087,4 +1120,147 @@ fn run_git(path: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+#[tokio::test]
+async fn single_machine_environment_recheck_resumes_task_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = common::setup_git_repo(root.path());
+    let harness = test_app(root.path()).await;
+    let (project_id, repo_id) =
+        common::create_project_and_repo(&harness.app, "Environment smoke", &repo).await;
+    let (agent_id, _) =
+        common::create_shell_agents(&harness.app, root.path(), "environment-smoke").await;
+    let agent: AgentResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agents/{agent_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &repo_id,
+        &agent.id,
+        &agent.id,
+    )
+    .await;
+    let project = db::ProjectRepo::get_by_id(&*harness.state.db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings: Value = serde_json::from_str(&project.settings).unwrap();
+    settings["environment"] = json!({"checks":[{"name":"disk","command":"test -f recovered"}]});
+    db::ProjectRepo::update_at_version(
+        &*harness.state.db,
+        db::UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: Some(settings.to_string()),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: db::now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .unwrap();
+    let task: TaskResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{project_id}/tasks"), json!({"title":"Environment smoke","description":"sleep 3","role_assignments":[{"role_name":"coder","assignee_type":"agent","assignee_id":agent.id}]}), StatusCode::OK).await;
+    // Direct claim reaches preflight on an unknown host, as in the single-machine base.
+    let _: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", task.id),
+        json!({"agent_id":agent.id}),
+        StatusCode::OK,
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let paused = db::ProjectRepo::get_by_id(&*harness.state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if paused.system_pause_reason.as_deref() == Some("environment_not_ready") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "environment did not pause"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let before = db::ExecutionRepo::list_by_task(
+        &*harness.state.db,
+        &task.id,
+        db::PageRequest {
+            cursor: None,
+            limit: 20,
+            include_total: false,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Desc,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(before.items.len(), 1);
+    assert_eq!(before.items[0].status, db::ExecutionStatus::Failed);
+    // Restore the same host's primary checkout and existing Task workspace.
+    std::fs::write(repo.join("recovered"), "ready").unwrap();
+    let workspace = db::WorkspaceRepo::get_by_task_id(&*harness.state.db, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let placement =
+        db::WorkspacePlacementRepo::get_by_workspace_id(&*harness.state.db, &workspace.id)
+            .await
+            .unwrap()
+            .unwrap();
+    std::fs::write(
+        std::path::Path::new(placement.workspace_handle.as_deref().unwrap()).join("recovered"),
+        "ready",
+    )
+    .unwrap();
+    let checked: api_types::ProjectEnvironmentRecheckResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/environment/recheck"),
+        json!({"machine":"server"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(!checked.project.paused);
+    assert!(checked.machines[0].checks[0].passed);
+    let dispatcher = services::TaskDispatcher::new(
+        harness.state.db.clone(),
+        harness.event_bus.clone(),
+        harness.state.task_service.clone(),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        dispatcher.check_once().await.unwrap();
+        let executions = db::ExecutionRepo::list_by_task(
+            &*harness.state.db,
+            &task.id,
+            db::PageRequest {
+                cursor: None,
+                limit: 20,
+                include_total: false,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Desc,
+            },
+        )
+        .await
+        .unwrap();
+        if executions.items.len() > 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Task did not re-dispatch"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

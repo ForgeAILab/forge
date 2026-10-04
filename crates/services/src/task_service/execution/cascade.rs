@@ -3,6 +3,10 @@ use super::*;
 const AUTOMATIC_REVIEW_RECOVERY_TRIGGER: &str = "automatic_review_recovery";
 const AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX: &str = "[Forge automatic review recovery]";
 
+tokio::task_local! {
+    static AUTOMATIC_REVIEW_RECOVERY_TASK: String;
+}
+
 struct CapacityRetry<'a> {
     retry_at: Option<&'a str>,
     reason: &'static str,
@@ -70,6 +74,40 @@ impl TaskService {
             );
             released.await;
         }
+    }
+
+    /// A sweep must never wait behind another Task cascade while holding an owner permit.
+    pub(crate) async fn try_cascade_executor_completion(&self, execution_id: &str) -> Result<bool> {
+        let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
+            return Ok(true);
+        };
+        let Some(slot) = self.claim_completion_cascade(&execution.task_id) else {
+            return Ok(false);
+        };
+        let service = self.clone();
+        let execution_id = execution_id.to_owned();
+        tokio::spawn(async move {
+            let result = service.cascade_executor_completion(&execution_id).await;
+            drop(slot);
+            if let Err(error) = result {
+                tracing::warn!(%execution_id, %error, "detached completion cascade remains pending");
+                return;
+            }
+            if let Some(registry) = &service.daemon_connections {
+                if let Ok(Some(placement)) =
+                    db::WorkspacePlacementRepo::get_for_task(&*service.db, &execution.task_id).await
+                {
+                    if let Some(daemon_id) =
+                        crate::recovery::placement_execution_daemon_id(&placement)
+                    {
+                        if let Err(error) = registry.retry_retained_terminals(daemon_id).await {
+                            tracing::warn!(%daemon_id, %error, "cascade acknowledgement remains pending");
+                        }
+                    }
+                }
+            }
+        });
+        Ok(true)
     }
 
     pub(crate) fn claim_completion_cascade(&self, task_id: &str) -> Option<CompletionCascadeSlot> {
@@ -186,7 +224,13 @@ impl TaskService {
             if super::pending_plan_publication_cleanup_owner(&task)?.as_deref()
                 == Some(execution.id.as_str())
             {
-                super::cleanup_execution_plan_private_files(&self.db, &task, &execution.id).await?;
+                super::cleanup_execution_plan_private_files(
+                    &self.db,
+                    &self.workspace_backend_router,
+                    &task,
+                    &execution.id,
+                )
+                .await?;
                 super::clear_plan_publication_cleanup(&self.db, &task, &execution.id).await?;
             }
             return Ok(());
@@ -358,18 +402,34 @@ impl TaskService {
             let workspace = brokered_workspace
                 .as_ref()
                 .expect("brokered workspace checked before plan publication");
-            let worktree = std::path::Path::new(&workspace.worktree_path);
-            match crate::plan_artifact::publish_staged_execution_plan(worktree, &execution.id) {
-                Ok(true) => {}
+            let resolved = self
+                .workspace_backend_router
+                .resolve(&self.db, workspace)
+                .await?;
+            let plan = crate::plan_artifact::ExecutionPlan::new(&self.db, &resolved);
+            match plan.publish(&execution).await {
+                Ok(true) => {
+                    task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                }
                 Ok(false) => {
-                    let candidate_required = execution.role
-                        == crate::workflow::default_roles::PLANNER
-                        || task.plan.as_deref().is_some_and(|plan| {
-                            !crate::plan_artifact::parse_plan_markdown(plan)
-                                .items
-                                .is_empty()
-                        })
-                        || crate::plan_artifact::read_canonical_plan_text(worktree)
+                    let candidate_required =
+                        plan.rejected_candidate(&execution.id)
+                            .await
+                            .map_err(|error| {
+                                error.into_service_error("execution plan candidate is unreadable")
+                            })?
+                            || execution.role == crate::workflow::default_roles::PLANNER
+                            || task.plan.as_deref().is_some_and(|plan| {
+                                !crate::plan_artifact::parse_plan_markdown(plan)
+                                    .items
+                                    .is_empty()
+                            })
+                            || crate::plan_artifact::read_plan_text_for_resolved_workspace(
+                                &resolved,
+                            )
+                            .await
                             .map_err(|error| {
                                 ServiceError::invalid_operation(format!(
                                     "canonical plan artifact is unreadable: {error}"
@@ -649,8 +709,13 @@ impl TaskService {
             return Ok(());
         }
         if let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, true).await? {
-            return super::cleanup_execution_plan_private_files(&self.db, &task, &execution.id)
-                .await;
+            return super::cleanup_execution_plan_private_files(
+                &self.db,
+                &self.workspace_backend_router,
+                &task,
+                &execution.id,
+            )
+            .await;
         }
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
             return Ok(());
@@ -658,29 +723,18 @@ impl TaskService {
         let Some(workspace) = WorkspaceRepo::get_by_id(&*self.db, workspace_id).await? else {
             return Ok(());
         };
-        crate::plan_artifact::discard_staged_execution_plan(
-            std::path::Path::new(&workspace.worktree_path),
-            &execution.id,
-        )
-        .map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "failed to remove settled execution plan stage: {error}"
-            ))
-        })?;
-        if let Some(outbox) = executors::execution_outbox_path(
-            std::path::Path::new(&workspace.worktree_path),
-            &execution.id,
-        ) {
-            match std::fs::remove_dir_all(&outbox) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(ServiceError::invalid_operation(format!(
-                        "failed to remove settled execution plan outbox: {error}"
-                    )));
-                }
-            }
-        }
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        crate::plan_artifact::ExecutionPlan::new(&self.db, &resolved)
+            .discard(&execution.id)
+            .await
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "failed to remove settled execution plan stage: {error}"
+                ))
+            })?;
         Ok(())
     }
 
@@ -730,17 +784,24 @@ impl TaskService {
             }
         };
         if let Some(workspace) = workspace.as_ref() {
-            crate::plan_artifact::restore_plan_before_abandon(
-                std::path::Path::new(&workspace.worktree_path),
-                execution_id,
-            )
+            let resolved = self
+                .workspace_backend_router
+                .resolve(&self.db, workspace)
+                .await?;
+            crate::plan_artifact::ExecutionPlan::new(&self.db, &resolved).restore(execution_id).await
             .map_err(|_| {
                 ServiceError::invalid_operation(
                     "failed to restore the prior plan while abandoning an invalid publication claim",
                 )
             })?;
         }
-        super::cleanup_execution_plan_private_files(&self.db, task, execution_id).await?;
+        super::cleanup_execution_plan_private_files(
+            &self.db,
+            &self.workspace_backend_router,
+            task,
+            execution_id,
+        )
+        .await?;
         super::release_plan_publication_for_execution_id(&self.db, task, execution_id).await?;
         Ok(())
     }
@@ -788,15 +849,18 @@ impl TaskService {
             }
         };
         if let Some(workspace) = workspace {
-            crate::plan_artifact::restore_plan_before_abandon(
-                std::path::Path::new(&workspace.worktree_path),
-                &execution.id,
-            )
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!(
+            let resolved = self
+                .workspace_backend_router
+                .resolve(&self.db, &workspace)
+                .await?;
+            crate::plan_artifact::ExecutionPlan::new(&self.db, &resolved)
+                .restore(&execution.id)
+                .await
+                .map_err(|error| {
+                    ServiceError::invalid_operation(format!(
                     "failed to restore the prior plan after losing publication authority: {error}"
                 ))
-            })?;
+                })?;
         }
         Ok(())
     }
@@ -1025,16 +1089,6 @@ impl TaskService {
         if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
             return Ok(());
         }
-        let mut recovery_actions = vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::CancelTask,
-        ];
-        if self
-            .resume_session_recovery_available(task, execution)
-            .await?
-        {
-            recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
-        }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::WorkflowGuardRejected,
             blocking_reason: guard.to_owned(),
@@ -1050,7 +1104,6 @@ impl TaskService {
             }),
             message: Some(reason.to_owned()),
             hook: None,
-            recovery_actions,
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -1082,12 +1135,6 @@ impl TaskService {
         else {
             return Ok(());
         };
-
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
 
         self.publish(ForgeEvent {
             event_type: "task.blocked".to_owned(),
@@ -1313,11 +1360,6 @@ impl TaskService {
                 },
             ),
             hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::Reexecute,
-                api_types::RecoveryAction::ResetToInitial,
-                api_types::RecoveryAction::CancelTask,
-            ],
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -1358,12 +1400,6 @@ impl TaskService {
         else {
             return Ok(());
         };
-
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
 
         tracing::info!(
             task_id = %task.id,
@@ -1458,17 +1494,6 @@ impl TaskService {
         if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
             return Ok(());
         }
-        let mut recovery_actions = vec![
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::ResetToInitial,
-            api_types::RecoveryAction::CancelTask,
-        ];
-        if self
-            .resume_session_recovery_available(task, execution)
-            .await?
-        {
-            recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
-        }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ExecutorFailed,
             blocking_reason: "executor_failed".to_owned(),
@@ -1489,7 +1514,6 @@ impl TaskService {
                     .unwrap_or_else(|| "Execution failed".to_owned()),
             ),
             hook: None,
-            recovery_actions,
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -1527,12 +1551,6 @@ impl TaskService {
             return Ok(());
         };
 
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
-
         tracing::info!(
             task_id = %task.id,
             execution_id = %execution.id,
@@ -1559,42 +1577,6 @@ impl TaskService {
     /// same identity/role checks as the WorkspaceLease it will request.  Keep
     /// impossible actions out of the durable annotation instead of inviting a
     /// coordinator to call a recovery route that is guaranteed to fail.
-    pub(super) async fn resume_session_recovery_available(
-        &self,
-        task: &Task,
-        execution: &Execution,
-    ) -> Result<bool> {
-        // A reviewer/auditor execution is part of a durable Review attempt.
-        // Once that exact attempt is terminal, its session cannot be resumed:
-        // admission only accepts a Running Review and a fresh attempt must be
-        // created instead.  Keep the impossible recovery action out of new
-        // annotations (and manual-stop annotations) at the source.
-        if terminal_review_is_bound_to_execution(&self.db, execution).await? {
-            return Ok(false);
-        }
-
-        let (Some(agent_id), Some(_session_id), Some(_snapshot)) = (
-            execution.agent_id.as_deref(),
-            execution.agent_session_id.as_deref(),
-            execution.executor_config_snapshot_json.as_deref(),
-        ) else {
-            return Ok(false);
-        };
-
-        if let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, &execution.role)
-                .await?
-        {
-            return Ok(assignment.assignee_type == Some(AssigneeKind::Agent)
-                && assignment.assignee_id.as_deref() == Some(agent_id));
-        }
-
-        // Legacy Tasks may predate role-assignment rows.  Their task-level
-        // assignee remains the scheduler's authority fallback.
-        Ok(task.assignee_type.as_deref() == Some("agent")
-            && task.assignee_id.as_deref() == Some(agent_id))
-    }
-
     async fn maybe_schedule_execution_retry(
         &self,
         execution: &Execution,
@@ -1866,7 +1848,7 @@ impl TaskService {
                     "review outcome was committed without its task cascade; reconciling"
                 );
                 return self
-                    .reconcile_settled_reviewer_completion(&task, execution, &review)
+                    .reconcile_settled_reviewer_completion(&task, execution, &review, true)
                     .await;
             }
             tracing::debug!(
@@ -1890,28 +1872,29 @@ impl TaskService {
             return Ok(());
         }
         let final_message = reviewer_final_message(execution).await?;
-        let workspace_path = match execution.workspace_id.as_deref() {
-            Some(_) => Some(
-                prepare_workspace(
+        let workspace_io = match execution.workspace_id.as_deref() {
+            Some(_) => {
+                let workspace = prepare_workspace(
                     &self.db,
                     &self.workspace_root,
                     &task,
                     &task.id,
                     self.repo_cache_locks.clone(),
+                    &self.workspace_backend_router,
                 )
-                .await?
-                .worktree_path,
-            ),
+                .await?;
+                Some(self.review_workspace_io(&workspace).await?)
+            }
             None => None,
         };
         let mut check_attempt = 1;
         let conformance = loop {
-            let conformance = match workspace_path.as_deref() {
+            let conformance = match workspace_io.as_ref() {
                 Some(path) => {
                     ::review::contract::evaluate(
                         &self.db,
                         &execution.id,
-                        std::path::Path::new(path),
+                        path.as_ref(),
                         &final_message,
                     )
                     .await
@@ -1977,6 +1960,7 @@ impl TaskService {
         };
         let passed = conformance.status == api_types::ConformanceStatus::Passed;
         let blocked = conformance.status == api_types::ConformanceStatus::Blocked;
+        let owner_finding = owner_review_failure_message(&conformance, &review, &reviews);
         let status = if passed && user_approval_required {
             ReviewStatus::AwaitingHuman
         } else if passed {
@@ -2020,6 +2004,7 @@ impl TaskService {
                 &finished_at,
                 task.version,
                 review_passed_at,
+                db::ReviewEventOrigin::Runner,
             )
             .await?;
             (updated_review, task)
@@ -2035,11 +2020,7 @@ impl TaskService {
             .await?;
             (updated_review, task)
         };
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            updated_review.id, updated_review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &updated_review)
@@ -2111,6 +2092,16 @@ impl TaskService {
                         .block_task_for_review_environment(&task, execution, reason)
                         .await;
                 }
+                if let Some(message) = owner_finding {
+                    return self
+                        .block_task_for_review_finding(
+                            &task,
+                            execution,
+                            api_types::FailureKind::ReviewNeedsOwner,
+                            message,
+                        )
+                        .await;
+                }
                 let (task, target, reason) = self
                     .review_failure_target(&task, Some(&execution.id))
                     .await?;
@@ -2136,9 +2127,26 @@ impl TaskService {
         reason: String,
     ) -> Result<()> {
         let message = format!("review blocked by its environment: {reason}");
+        self.block_task_for_review_finding(
+            task,
+            execution,
+            api_types::FailureKind::ReviewBlocked,
+            message,
+        )
+        .await
+    }
+
+    /// Park a failed review without spending the remediation retry budget.
+    async fn block_task_for_review_finding(
+        &self,
+        task: &Task,
+        execution: &Execution,
+        kind: api_types::FailureKind,
+        message: String,
+    ) -> Result<()> {
         let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::ReviewBlocked,
-            blocking_reason: "review_blocked".to_owned(),
+            annotation_type: kind,
+            blocking_reason: kind.to_string(),
             blocked_by: Some(
                 api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
             ),
@@ -2151,22 +2159,16 @@ impl TaskService {
             }),
             message: Some(message.clone()),
             hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::Reexecute,
-                api_types::RecoveryAction::MarkReviewed,
-                api_types::RecoveryAction::OpenInteractive,
-                api_types::RecoveryAction::CancelTask,
-            ],
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
-                "failed to serialize review-blocked annotation: {error}"
+                "failed to serialize review blocking annotation: {error}"
             ))
         })?;
         let blocked_meta = json!({
             "reason": message,
             "created_at": now_rfc3339(),
-            "kind": api_types::FailureKind::ReviewBlocked,
+            "kind": kind,
             "execution_id": execution.id,
         });
         let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
@@ -2186,11 +2188,7 @@ impl TaskService {
             },
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
+
         self.publish(ForgeEvent {
             event_type: "task.blocked".to_owned(),
             entity_id: updated.id.clone(),
@@ -2198,7 +2196,7 @@ impl TaskService {
             context: EventContext::TaskBlocked {
                 project_id: updated.project_id,
                 reason: message,
-                kind: Some(api_types::FailureKind::ReviewBlocked),
+                kind: Some(kind),
                 source: None,
                 execution_id: Some(execution.id.clone()),
             },
@@ -2206,11 +2204,12 @@ impl TaskService {
         Ok(())
     }
 
-    async fn reconcile_settled_reviewer_completion(
+    pub(crate) async fn reconcile_settled_reviewer_completion(
         &self,
         task: &Task,
         execution: &Execution,
         review: &Review,
+        strict_details: bool,
     ) -> Result<()> {
         let now = now_rfc3339();
         match review.status {
@@ -2249,6 +2248,51 @@ impl TaskService {
                     )
                     .await?
                 };
+                let conformance = strict_review_details(review).and_then(|details| {
+                    details
+                        .get("conformance")
+                        .filter(|value| !value.is_null())
+                        .map(|value| {
+                            serde_json::from_value::<api_types::ReviewConformance>(value.clone())
+                                .map_err(|error| ServiceError::invalid_operation(error.to_string()))
+                        })
+                        .transpose()
+                });
+                let conformance = match conformance {
+                    Ok(conformance) => conformance,
+                    Err(error) if !strict_details => {
+                        tracing::warn!(task_id = %task.id, review_id = %review.id, %error,
+                            "invalid failed review details; recovering with plain remediation routing");
+                        None
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(conformance) = conformance {
+                    if conformance.status == api_types::ConformanceStatus::Blocked {
+                        return self
+                            .block_task_for_review_environment(
+                                &task,
+                                execution,
+                                conformance.reason.unwrap_or_else(|| {
+                                    "reviewer reported a blocked environment".to_owned()
+                                }),
+                            )
+                            .await;
+                    }
+                    let reviews = ReviewRepo::list_by_task(&*self.db, &task.id).await?;
+                    if let Some(message) =
+                        owner_review_failure_message(&conformance, review, &reviews)
+                    {
+                        return self
+                            .block_task_for_review_finding(
+                                &task,
+                                execution,
+                                api_types::FailureKind::ReviewNeedsOwner,
+                                message,
+                            )
+                            .await;
+                    }
+                }
                 let (task, target, reason) = self
                     .review_failure_target(&task, Some(&execution.id))
                     .await?;
@@ -2329,7 +2373,7 @@ impl TaskService {
                 "status": "scheduled",
                 "scheduled_at": finished_at.clone(),
             });
-            let updated_review = ReviewRepo::update_status(
+            ReviewRepo::update_status(
                 &*self.db,
                 &review.id,
                 ReviewStatus::Running,
@@ -2338,11 +2382,7 @@ impl TaskService {
                 &finished_at,
             )
             .await?;
-            self.publish_domain_event_by_dedupe(&format!(
-                "review-status:{}:{}:{}",
-                updated_review.id, updated_review.status, finished_at
-            ))
-            .await;
+
             self.publish_reviewer_comment(
                 execution,
                 &task.id,
@@ -2364,13 +2404,10 @@ impl TaskService {
             &finished_at,
             task.version,
             None,
+            db::ReviewEventOrigin::Runner,
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            updated_review.id, updated_review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &updated_review)
@@ -2475,11 +2512,6 @@ impl TaskService {
                 "blocking_reason": reason,
                 "message": reason,
                 "detected_at": now_rfc3339(),
-                "recovery_actions": [
-                    api_types::RecoveryAction::ResetRetryWindow,
-                    api_types::RecoveryAction::ProceedOnce,
-                    api_types::RecoveryAction::OpenInteractive,
-                ],
             });
             // A stale recovery snapshot must not annotate a successor state
             // or execution. Let the caller retry from current authority.
@@ -2531,7 +2563,15 @@ impl TaskService {
         }
     }
 
-    async fn try_dispatch_automatic_review_recovery(
+    /// The explicit recovery owns its state-entry dispatch. Its scoped future
+    /// supplies the configured Agent and recovery prompt after that transition.
+    pub(crate) fn automatic_review_recovery_owns_dispatch(task_id: &str) -> bool {
+        AUTOMATIC_REVIEW_RECOVERY_TASK
+            .try_with(|id| id == task_id)
+            .unwrap_or(false)
+    }
+
+    pub(in crate::task_service) async fn try_dispatch_automatic_review_recovery(
         &self,
         project: &db::Project,
         task: &Task,
@@ -2597,6 +2637,23 @@ impl TaskService {
             )));
         }
 
+        if let Some(agent) = AgentRepo::get_by_id(&*self.db, &agent_id).await? {
+            if self
+                .machine_capacity_blocked(task, &agent, Some("coder"))
+                .await?
+            {
+                self.defer_placement_refusal(task, &ServiceError::Db(DbError::MachineAtCapacity))
+                    .await?;
+                let waiting = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                return Ok(Some((
+                    waiting,
+                    "automatic review recovery waiting for machine capacity".to_owned(),
+                )));
+            }
+        }
+
         let prompt = render_automatic_review_recovery_prompt(
             task,
             failure_reason,
@@ -2606,18 +2663,35 @@ impl TaskService {
             recovery_attempts + 1,
             max_attempts,
         );
-        let execution = match self
-            .dispatch_role_follow_up_with_agent(
-                &task.id,
-                crate::workflow::default_roles::CODER,
-                parent_execution_id.to_owned(),
-                agent_id.clone(),
-                prompt,
-                AUTOMATIC_REVIEW_RECOVERY_TRIGGER,
+        let execution = match AUTOMATIC_REVIEW_RECOVERY_TASK
+            .scope(
+                task.id.clone(),
+                self.dispatch_role_follow_up_with_agent(
+                    &task.id,
+                    crate::workflow::default_roles::CODER,
+                    parent_execution_id.to_owned(),
+                    agent_id.clone(),
+                    prompt,
+                    AUTOMATIC_REVIEW_RECOVERY_TRIGGER,
+                ),
             )
             .await
         {
             Ok(execution) => execution,
+            Err(error) if crate::placement::is_machine_capacity_refusal(&error) => {
+                let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                self.defer_placement_refusal(&current, &error).await?;
+                let mut waiting = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+                crate::deferred_dispatch::refresh_machine_wait(&self.db, &mut waiting).await?;
+                return Ok(Some((
+                    waiting,
+                    "automatic review recovery waiting for machine capacity".to_owned(),
+                )));
+            }
             Err(error) => {
                 tracing::warn!(
                     task_id = %task.id,
@@ -2732,6 +2806,56 @@ impl TaskService {
 /// timeout parks the Task instead of retrying.
 const REVIEW_CHECK_ATTEMPTS: u32 = 3;
 
+/// Honor routing only when the reviewer verdict caused the failure. Forge
+/// replaces the assessment reason when setup, checks, or reproduction fail.
+fn owner_review_failure_message(
+    conformance: &api_types::ReviewConformance,
+    review: &Review,
+    reviews: &[Review],
+) -> Option<String> {
+    let assessment = conformance.assessment.as_ref()?;
+    if conformance.status != api_types::ConformanceStatus::Failed
+        || assessment.result != api_types::ReviewResult::Fail
+        || conformance.checks.iter().any(|check| check.exit_code != 0)
+        || conformance.reason.as_deref().unwrap_or_default() != assessment.reason
+    {
+        return None;
+    }
+    let reason = if assessment.reason.is_empty() {
+        "reviewer reported a blocking finding"
+    } else {
+        &assessment.reason
+    };
+    if assessment.fixable_by == api_types::FixableBy::Owner {
+        return Some(format!("fixable by owner: {reason}"));
+    }
+    let previous_failed = reviews
+        .iter()
+        .filter(|previous| previous.attempt_number < review.attempt_number)
+        .max_by_key(|previous| (previous.attempt_number, previous.id.as_str()))
+        .is_some_and(|previous| {
+            previous.status == ReviewStatus::Failed
+                && strict_review_details(previous)
+                    .ok()
+                    .and_then(|details| {
+                        serde_json::from_value::<api_types::ReviewConformance>(
+                            details["conformance"].clone(),
+                        )
+                        .ok()
+                    })
+                    .is_some_and(|conformance| {
+                        conformance.status == api_types::ConformanceStatus::Failed
+                            && conformance.checks.iter().all(|check| check.exit_code == 0)
+                            && conformance.assessment.as_ref().is_some_and(|assessment| {
+                                assessment.result == api_types::ReviewResult::Fail
+                                    && conformance.reason.as_deref()
+                                        == Some(assessment.reason.as_str())
+                            })
+                    })
+        });
+    (assessment.repeat && previous_failed).then(|| format!("repeated finding: {reason}"))
+}
+
 /// Whether `task` is already parked by a review-environment block that this
 /// reviewer execution raised.
 fn review_blocked_by_execution(task: &Task, execution_id: &str) -> bool {
@@ -2770,27 +2894,6 @@ pub(crate) fn exact_review_for_execution<'a>(
 /// multiple reviewer attempts may inspect the same candidate, while only the
 /// durable reviewer/auditor execution binding identifies the attempt whose
 /// session a recovery request would resume.
-pub(crate) async fn terminal_review_is_bound_to_execution(
-    db: &SqliteDb,
-    execution: &Execution,
-) -> Result<bool> {
-    if !matches!(
-        execution.role.as_str(),
-        crate::workflow::default_roles::REVIEWER | crate::workflow::default_roles::AUDITOR
-    ) {
-        return Ok(false);
-    }
-    let reviews = ReviewRepo::list_by_task(db, &execution.task_id).await?;
-    Ok(
-        exact_review_for_execution(execution, &reviews).is_some_and(|review| {
-            matches!(
-                review.status,
-                ReviewStatus::Passed | ReviewStatus::Failed | ReviewStatus::Cancelled
-            )
-        }),
-    )
-}
-
 fn exact_review_binding_matches(execution: &Execution, review: &Review) -> bool {
     if review.reviewer_execution_id.is_some() || review.auditor_execution_id.is_some() {
         review.reviewer_execution_id.as_deref() == Some(execution.id.as_str())
@@ -3144,6 +3247,8 @@ mod reviewer_message_tests {
         let assessment = api_types::ReviewAssessment {
             result: api_types::ReviewResult::Fail,
             reason: "api not exported".to_owned(),
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
             report: "## R1\n\nExpected the api exported; `src/lib.rs:3` does not.".to_owned(),
         };
         let mut failed = conformance(Some(assessment.clone()));
@@ -3158,6 +3263,8 @@ mod reviewer_message_tests {
         let mut blocked = conformance(Some(api_types::ReviewAssessment {
             result: api_types::ReviewResult::Blocked,
             reason: "tsc not found".to_owned(),
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
             report: String::new(),
         }));
         blocked.status = api_types::ConformanceStatus::Blocked;

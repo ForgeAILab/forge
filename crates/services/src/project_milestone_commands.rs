@@ -1922,6 +1922,7 @@ fn frozen_project_value(
         "workflow_template_name": project.workflow_template_name,
         "primary_repo_id": project.primary_repo_id,
         "paused_at": project.paused_at,
+        "environment_pause_json": project.environment_pause_json,
         "owner_id": project.owner_id,
         "project_hooks_json": project.project_hooks_json,
         "project_work_epoch": project.project_work_epoch,
@@ -1947,6 +1948,7 @@ fn project_from_value(value: &Value) -> Result<Project> {
         primary_repo_id: optional_value_string(value, "primary_repo_id")?,
         paused_at: optional_value_string(value, "paused_at")?,
         system_pause_reason: optional_value_string(value, "system_pause_reason")?,
+        environment_pause_json: optional_value_string(value, "environment_pause_json")?,
         owner_id: optional_value_string(value, "owner_id")?,
         project_hooks_json: required_value(value, "project_hooks_json")?,
         project_work_epoch: required_value_i64(value, "project_work_epoch")?,
@@ -2032,21 +2034,6 @@ fn native_authorization(
             "occurred_at": action.created_at,
         })
         .to_string(),
-    }
-}
-
-fn build_revision_provenance() -> RevisionProvenance {
-    RevisionProvenance {
-        author: api_types::PrincipalRef {
-            kind: api_types::PrincipalKind::Agent,
-            id: String::new(),
-            display_name: None,
-        },
-        source_refs: Vec::new(),
-        change_summary: "Project Agent authored a typed milestone definition".to_owned(),
-        profile_revision: None,
-        operating_skill_revision: None,
-        material_diff: None,
     }
 }
 
@@ -2170,11 +2157,4 @@ fn map_readiness(row: sqlx::sqlite::SqliteRow) -> Result<ProjectReadinessSnapsho
         idempotency_key: row.try_get("idempotency_key")?,
         created_at: row.try_get("created_at")?,
     })
-}
-
-impl ProjectMilestoneDefinitionCommand {
-    #[must_use]
-    pub fn native_provenance() -> RevisionProvenance {
-        build_revision_provenance()
-    }
 }

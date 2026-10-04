@@ -32,6 +32,7 @@ async fn user_subtask_into_review_review_pass_cascade_and_hooks_succeed() {
         )
         .await
         .expect("user subtask into review with review-pass cascade completes");
+    let result = crate::test_support::drain_transition(&service, result).await;
 
     assert!(
         result.task.status == crate::workflow::default_states::MERGING

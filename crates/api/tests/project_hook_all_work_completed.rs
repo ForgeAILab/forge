@@ -175,7 +175,7 @@ async fn test_app() -> Harness {
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(db::SqliteDb::new(pool));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
@@ -186,7 +186,8 @@ async fn test_app() -> Harness {
         true,
         adapter_registry,
     ));
-    let hook_service_handle = Arc::clone(&state.project_hook_service).start();
+    let hook_service_handle = Arc::clone(&state.project_hook_service)
+        .start_with_shutdown(state.shutdown_signal.subscribe());
     tokio::task::yield_now().await;
 
     let web_dist_dir = common::TestDir::new("forge-project-hooks-web");

@@ -314,7 +314,7 @@ Note `System` matches **only** `All`. Regenerate the TS bindings (`web/src/types
 Replace `triggered_by: &str` with `&Actor` in:
 
 - `TransitionOptions` (`task_service.rs`) — replace the three `From` impls (`:127`, `:139`, `:151`) with explicit `Actor` fields. The `From<i64>` default-that-means-"system" is a footgun and should be removed.
-- `WorkflowEngine::transition`, `transition_with_deferred_dispatch`, `manual_override_transition`, `reset_to_initial`, `transition_inner` (`workflow/engine/mod.rs`).
+- `WorkflowEngine::transition`, `transition_with_deferred_dispatch`, `reset_to_initial`, `transition_inner` (`workflow/engine/mod.rs`).
 - `HookContext.triggered_by` (`engine/mod.rs` and `engine/context.rs`).
 
 Keep the `transition_log.triggered_by` **column** as TEXT; convert via `Actor::to_trigger_string()` at the write boundary only. Read-side code that parses the string (e.g. `is_awaiting_human`'s `starts_with("gate approved")`) is addressed in Phase 6.

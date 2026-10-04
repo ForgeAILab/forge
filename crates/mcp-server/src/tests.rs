@@ -421,7 +421,6 @@ async fn seed_project_repo(state: &AppState) -> (String, String) {
             name: "forge".to_owned(),
             local_path: None,
             remote_url: Some("https://example.com/forge.git".to_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now,
@@ -515,6 +514,7 @@ async fn seed_agent_registration_deps(state: &AppState) -> (String, String) {
     let host = DaemonRepo::upsert_by_machine_id(
         &*state.db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -543,6 +543,7 @@ async fn seed_agent(state: &AppState, name: &str) -> Agent {
     let daemon = DaemonRepo::upsert_by_machine_id(
         &*state.db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -564,6 +565,7 @@ async fn seed_agent(state: &AppState, name: &str) -> Agent {
     DaemonRepo::update_report(
         &*state.db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon.id.clone(),
             last_report_at: now.clone(),
             status: DaemonStatus::Online,
@@ -729,11 +731,7 @@ fn known_tool_version_conflict_is_an_in_band_structured_outcome() {
         scope: "repository".to_owned(),
         execution_id: "execution-2".to_owned(),
     })
-    .with_call_context(
-        "forge_reexecute_execution",
-        Some("project-1"),
-        Some("user-1"),
-    )
+    .with_call_context("forge_task_action", Some("project-1"), Some("user-1"))
     .into_tool_response(json!(2));
     let db_result = db_response
         .result
@@ -969,7 +967,7 @@ fn tools_list_returns_descriptors() {
         let expected = [
             "forge_add_task_dependency",
             "forge_assign_agent",
-            "forge_cancel_task",
+            "forge_task_action",
             "forge_create_agent_handoff",
             "forge_create_project",
             "forge_create_sub_tasks",
@@ -1030,6 +1028,31 @@ fn tools_list_returns_descriptors() {
             .expect("create task description")
             .contains("shared-workspace subtask relationship"));
 
+        for phrase in [
+            "owned repository-relative paths",
+            "parallel Task files disjoint",
+            "depends_on_ids to order shared-file edits",
+        ] {
+            assert!(create_task["description"]
+                .as_str()
+                .unwrap()
+                .contains(phrase));
+        }
+
+        assert_eq!(
+            create_task["description"]
+                .as_str()
+                .unwrap()
+                .matches(forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE)
+                .count(),
+            1
+        );
+
+        assert!(!create_task["description"]
+            .as_str()
+            .unwrap()
+            .contains(forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
+
         let create_subtasks = tools
             .iter()
             .find(|tool| tool["name"] == "forge_create_sub_tasks")
@@ -1038,6 +1061,18 @@ fn tools_list_returns_descriptors() {
             .as_str()
             .expect("create subtasks description")
             .contains("non-executing coordination container"));
+        assert_eq!(
+            create_subtasks["description"]
+                .as_str()
+                .unwrap()
+                .matches(forge_agent_host::MERGE_FRIENDLY_TASK_GUIDANCE)
+                .count(),
+            1
+        );
+        assert!(!create_subtasks["description"]
+            .as_str()
+            .unwrap()
+            .contains(forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
     });
 }
 
@@ -2030,6 +2065,7 @@ fn forge_transition_task_changes_status() {
         .await;
 
         assert_eq!(result["status"], "in_progress");
+        assert_eq!(result["pending_steps"], 0);
         assert!(
             result["version"].as_i64().expect("version is an integer") > task.version,
             "transition should advance task version"
@@ -2627,4 +2663,142 @@ fn forge_create_sub_tasks_nested_rejected() {
             Some("NESTED_SUBTASK_UNSUPPORTED")
         );
     });
+}
+
+#[test]
+fn task_actions_mcp_reads_share_offers_and_ignore_stored_lists() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let _agent = seed_agent(&state, "action-agent").await;
+        for condition in ["failed_review", "stored_annotation", "blocked_budget"] {
+            let task = seed_task(&state).await;
+            let execution_id = seed_execution(&state, task.id.clone()).await;
+            sqlx::query("UPDATE execution SET status = 'completed' WHERE id = ?")
+                .bind(&execution_id)
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            let status = if condition == "failed_review" {
+                "review"
+            } else {
+                "in_progress"
+            };
+            sqlx::query("UPDATE task SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(&task.id)
+                .execute(state.db.pool())
+                .await
+                .unwrap();
+            if condition == "failed_review" {
+                let now = now_rfc3339();
+                db::ReviewRepo::create(
+                    &*state.db,
+                    db::CreateReview {
+                        id: new_uuid_v4(),
+                        task_id: task.id.clone(),
+                        execution_id,
+                        attempt_number: 1,
+                        status: db::ReviewStatus::Failed,
+                        step_results_json: json!({"ci_steps":[{"command":"check","exit_code":1}]})
+                            .to_string(),
+                        started_at: now.clone(),
+                        created_at: now.clone(),
+                        updated_at: now,
+                    },
+                )
+                .await
+                .unwrap();
+            } else if condition == "stored_annotation" {
+                sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+                    .bind(json!({"type":"executor_failed","blocking_reason":"fixture","recovery_actions":["return_to_implementation","retry_pr_publication"]}).to_string())
+                    .bind(&task.id).execute(state.db.pool()).await.unwrap();
+            } else {
+                sqlx::query("UPDATE task SET blocked_json = ? WHERE id = ?")
+                    .bind(json!({"kind":"retry_exhausted","reason":"spent","recovery_actions":["return_to_implementation"]}).to_string())
+                    .bind(&task.id).execute(state.db.pool()).await.unwrap();
+            }
+            let offers = state
+                .task_service
+                .task_action_offers(
+                    &task.id,
+                    &api_types::Actor::user(api_types::UserActionSource::Api),
+                )
+                .await
+                .unwrap();
+            let result = call_tool(&state, "forge_get_task", json!({"task_id":task.id})).await;
+            assert_eq!(result["available_actions"], json!(offers.available_actions));
+            assert!(result.get("execution_actions").is_none());
+            assert_eq!(
+                result["workflow_exception"]["actions"],
+                result["available_actions"]
+            );
+            assert!(result["error_annotation"].get("recovery_actions").is_none());
+            assert_eq!(result["version"], offers.version);
+        }
+    });
+}
+
+#[test]
+fn task_lists_omit_offers_but_single_task_reads_keep_them() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let root = seed_task_in_project(&state, project_id.clone()).await;
+        let listed = call_tool(&state, "forge_list_tasks", json!({"project_id":project_id})).await;
+        for task in listed["items"].as_array().unwrap() {
+            assert!(task.get("available_actions").is_none());
+        }
+        let created = call_tool(
+            &state,
+            "forge_create_sub_tasks",
+            json!({"parent_task_id":root.id, "subtasks":[{"title":"Child"}]}),
+        )
+        .await;
+        for task in created["subtasks"].as_array().unwrap() {
+            assert!(task.get("available_actions").is_none());
+        }
+        let children = call_tool(
+            &state,
+            "forge_list_sub_tasks",
+            json!({"parent_task_id":root.id}),
+        )
+        .await;
+        for task in children["subtasks"].as_array().unwrap() {
+            assert!(task.get("available_actions").is_none());
+        }
+        let single = call_tool(&state, "forge_get_task", json!({"task_id":root.id})).await;
+        assert!(single["available_actions"].is_array());
+    });
+}
+
+#[test]
+fn paused_task_action_error_preserves_wait_cause_and_turn_scope() {
+    for cause in [
+        api_types::DeniedBy::TargetAgentPaused,
+        api_types::DeniedBy::ProjectPaused("environment_not_ready".to_owned()),
+    ] {
+        let error: crate::error::McpToolError = services::ServiceError::TaskActionUnavailable {
+            available_actions: vec![],
+            reason: "retry unavailable".to_owned(),
+            wait_cause: Some(cause.clone()),
+        }
+        .into();
+        assert_eq!(error.code, -32010);
+        let response = error.into_response(json!(1));
+        let data = response.error.unwrap().data.unwrap();
+        assert_eq!(data["code"], "action_unavailable");
+        assert_eq!(data["denied_by"], cause.to_string());
+        assert_eq!(data["retry"]["scope"], "turn");
+        let response = McpToolError::from(services::ServiceError::TaskActionUnavailable {
+            available_actions: vec![],
+            reason: "retry unavailable".to_owned(),
+            wait_cause: Some(cause.clone()),
+        })
+        .into_tool_response(json!(2));
+        let outcome = &response.result.unwrap()["structuredContent"];
+        assert_eq!(outcome["code"], "action_unavailable");
+        assert_eq!(outcome["denied_by"], cause.to_string());
+        assert_eq!(outcome["retry"]["scope"], "turn");
+        assert_eq!(outcome["retry"]["action"], "none");
+    }
 }

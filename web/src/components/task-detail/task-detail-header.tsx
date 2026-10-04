@@ -2,6 +2,7 @@ import { ArrowSquareOut, X } from '@phosphor-icons/react'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { TaskCapacityNotice } from '@/components/task-capacity-notice'
 import { taskStatusColors } from '@/components/task-controls'
 import { cn } from '@/lib/cn'
 import type { KeyboardEvent } from 'react'
@@ -107,6 +108,7 @@ export function TaskDetailHeader({
             </button>
           )
         ) : null}
+        {task ? <TaskCapacityNotice task={task} /> : null}
       </div>
 
       <div className="flex items-center gap-1">

@@ -3,9 +3,10 @@
 mod common;
 
 use api_types::{
-    AgentChatMessageListResponse, AgentChatSwitcherResponse, AgentChatTurnJobResponse,
-    AgentChatTurnStatus, ConnectedEmbeddedAgentResponse, ErrorResponse, MainAgentBindingResponse,
-    ProjectAgentBindingResponse, ProjectResponse, SendAgentChatMessageResponse,
+    AgentChatDetailResponse, AgentChatMessageListResponse, AgentChatSwitcherResponse,
+    AgentChatTurnJobResponse, AgentChatTurnStatus, ConnectedEmbeddedAgentResponse, ErrorResponse,
+    MainAgentBindingResponse, ProjectAgentBindingResponse, ProjectResponse,
+    SendAgentChatMessageResponse,
 };
 use axum::{
     body::Body,
@@ -209,6 +210,32 @@ async fn project_creation_records_chat_binding_events_and_stale_binding_replacem
         .any(|value| value == "agent_chat.created"));
 }
 
+/// `pending_turn_count` as the switcher item and the chat detail report it.
+async fn pending_turn_counts(app: &axum::Router, token: &str, chat_id: &str) -> (i64, i64) {
+    let switcher: AgentChatSwitcherResponse = common::empty_request_with_bearer(
+        app,
+        Method::GET,
+        "/api/v1/agent-chats",
+        token,
+        StatusCode::OK,
+    )
+    .await;
+    let detail: AgentChatDetailResponse = common::empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{chat_id}"),
+        token,
+        StatusCode::OK,
+    )
+    .await;
+    let item = switcher
+        .items
+        .iter()
+        .find(|item| item.chat_id == chat_id)
+        .expect("chat is in the switcher");
+    (item.pending_turn_count, detail.chat.pending_turn_count)
+}
+
 #[tokio::test]
 async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     let workspace = common::TestDir::new("agent-chat-turn-cancel");
@@ -283,6 +310,12 @@ async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     .await;
     assert_eq!(before.items.len(), 1);
     assert_eq!(before.items[0].id, first.message.id);
+    // Both admitted turns are still queued: the switcher and the chat detail
+    // count them without loading the turn history.
+    assert_eq!(
+        pending_turn_counts(&harness.app, &token, &binding.chat_id).await,
+        (2, 2)
+    );
 
     let cancelled: AgentChatTurnJobResponse = common::json_request_with_bearer(
         &harness.app,
@@ -301,6 +334,18 @@ async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     .await;
     assert_eq!(cancelled.status, AgentChatTurnStatus::Cancelled);
     assert_eq!(cancelled.version, first_turn.version + 1);
+    assert_eq!(
+        pending_turn_counts(&harness.app, &token, &binding.chat_id).await,
+        (1, 1)
+    );
+    let events: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM domain_event WHERE entity_id = ? ORDER BY sequence",
+    )
+    .bind(&first_turn.id)
+    .fetch_all(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(events, ["agent_chat.turn.cancelled"]);
 
     let replay: AgentChatTurnJobResponse = common::json_request_with_bearer(
         &harness.app,
@@ -470,6 +515,32 @@ async fn agent_chat_turn_parks_awaiting_input_and_can_be_cancelled() {
         Some("test-interaction-1")
     );
 
+    // Preserve the baseline's best-effort supersede: a failed parked-turn
+    // statement must not reject the newer user message's admission.
+    sqlx::raw_sql("CREATE TRIGGER reject_supersede BEFORE UPDATE ON agent_chat_turn_job WHEN NEW.error_code = 'superseded_by_user_message' BEGIN SELECT RAISE(ABORT, 'supersede unavailable'); END;")
+        .execute(harness.state.db.pool()).await.unwrap();
+    let newer: SendAgentChatMessageResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        json!({"content":"Newer user message"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert!(newer.turn_job.is_some());
+    let unchanged =
+        db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &parked.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(unchanged.status, db::AgentChatTurnState::AwaitingInput);
+    assert_eq!(unchanged.version, parked.version);
+    sqlx::query("DROP TRIGGER reject_supersede")
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+
     // Cancel while parked in awaiting_input
     let cancelled: AgentChatTurnJobResponse = common::json_request_with_bearer(
         &harness.app,
@@ -493,12 +564,6 @@ async fn agent_chat_turn_parks_awaiting_input_and_can_be_cancelled() {
 async fn agent_chat_turn_logs_serve_the_turns_durable_activity() {
     let workspace = common::TestDir::new("agent-chat-turn-logs");
     let harness = common::test_app(workspace.path(), "agent-chat-turn-logs").await;
-    // The harness has no `--data-dir`; keep this test's logs inside its own
-    // workspace instead of the default `~/.forge`.
-    harness
-        .state
-        .agent_chat_turn_logs
-        .set_root(workspace.path().join("agent-chat-logs"));
     let token = common::test_jwt();
 
     let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
@@ -649,4 +714,573 @@ async fn agent_chat_turn_logs_serve_the_turns_durable_activity() {
         .await
         .expect("router response");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn typed_turn_failure_response_and_redrive_require_version_and_replay_one_enqueue() {
+    let workspace = common::TestDir::new("typed-turn-redrive");
+    let harness = common::test_app(workspace.path(), "typed-turn-redrive").await;
+    let token = common::test_jwt();
+    let connected = common::connect_embedded_agent(
+        &harness.app,
+        &token,
+        "typed-turn-agent",
+        "typed-turn",
+        "typed-turn-secret",
+        json!({"permissions": ["read_agent_chat", "propose_message"]}),
+        json!({"allowed": ["read_agent_chat", "propose_message"]}),
+    )
+    .await;
+    let binding: MainAgentBindingResponse = common::json_request_with_bearer(&harness.app, Method::PUT, "/api/v1/account/main-agent", &token,
+        json!({"identity_id": connected.agent.id, "profile_id": connected.profile.id, "expected_version": 0, "autonomy_policy": {}}), StatusCode::OK).await;
+    let admitted: SendAgentChatMessageResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        json!({"content": "original request", "dedupe_key": "typed-redrive"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let turn = admitted.turn_job.unwrap();
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'failed', attempt_count = 1, invocation_count = 1, failure_class_json = ?, retry_decision = 'fail', error_code = 'configuration_invalid', error_message = 'provider configuration is invalid', version = version + 1 WHERE id = ?")
+        .bind(serde_json::to_string(&api_types::TurnFailure::Configuration).unwrap()).bind(&turn.id).execute(harness.state.db.pool()).await.unwrap();
+    let listed: Vec<AgentChatTurnJobResponse> = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{}/turns", binding.chat_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    let failed = &listed[0];
+    assert_eq!(
+        failed.failure_class,
+        Some(api_types::TurnFailure::Configuration)
+    );
+    assert_eq!(
+        failed.retry_decision,
+        Some(api_types::TurnRetryDecision::Fail)
+    );
+    assert_eq!(
+        failed.retry_action.as_ref().unwrap().expected_version,
+        failed.version
+    );
+    let path = format!(
+        "/api/v1/agent-chats/{}/turns/{}/retry",
+        binding.chat_id, turn.id
+    );
+    let stale: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        json!({"expected_version": turn.version, "idempotency_key": "stale"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(stale.code, "version_conflict");
+    let body = json!({"expected_version": failed.version, "idempotency_key": "manual-fix"});
+    let queued: AgentChatTurnJobResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        body.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    let replay: AgentChatTurnJobResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        body,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(queued, replay);
+    assert_ne!(queued.id, turn.id);
+    assert_eq!(queued.status, AgentChatTurnStatus::Queued);
+    assert_eq!(queued.attempt_count, 0);
+    assert!(queued.retry_action.is_none());
+    let source = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(source.retry_action().is_none());
+    let live_refusal: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        json!({"expected_version": source.version, "idempotency_key": "while-live"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(live_refusal.code, "turn_not_retryable");
+    let child_path = format!(
+        "/api/v1/agent-chats/{}/turns/{}/retry",
+        binding.chat_id, queued.id
+    );
+    let not_retryable: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &child_path,
+        &token,
+        json!({"expected_version": queued.version, "idempotency_key": "nonterminal"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(not_retryable.code, "turn_not_retryable");
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'succeeded' WHERE id = ?")
+        .bind(&queued.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let after_success: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &path,
+        &token,
+        json!({"expected_version": source.version, "idempotency_key": "after-success"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(after_success.code, "turn_not_retryable");
+
+    // A failed retry child is the sole eligible turn for this message.
+    sqlx::query(
+        "UPDATE agent_chat_turn_job SET status = 'failed', version = version + 1 WHERE id = ?",
+    )
+    .bind(&queued.id)
+    .execute(harness.state.db.pool())
+    .await
+    .unwrap();
+    let listed: Vec<AgentChatTurnJobResponse> = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{}/turns", binding.chat_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|turn| turn.retry_action.is_some())
+            .count(),
+        1
+    );
+    assert!(listed
+        .iter()
+        .find(|turn| turn.id == queued.id)
+        .unwrap()
+        .retry_action
+        .is_some());
+    assert!(listed
+        .iter()
+        .find(|turn| turn.id == source.id)
+        .unwrap()
+        .retry_action
+        .is_none());
+    let child = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &queued.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // An older parked turn still holds the chat's single live slot.
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'awaiting_input' WHERE id = ?")
+        .bind(&source.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let parked_refusal: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &child_path,
+        &token,
+        json!({"expected_version": child.version, "idempotency_key": "while-parked"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(parked_refusal.code, "another_turn_live");
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'failed' WHERE id = ?")
+        .bind(&source.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+
+    // Cancellation of the newest turn also permits fresh admission.
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'cancelled', failure_class_json = NULL, retry_decision = NULL, version = version + 1 WHERE id = ?")
+        .bind(&child.id).execute(harness.state.db.pool()).await.unwrap();
+    let cancelled =
+        db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &child.id)
+            .await
+            .unwrap()
+            .unwrap();
+    let cancelled_retry: AgentChatTurnJobResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &child_path,
+        &token,
+        json!({"expected_version": cancelled.version, "idempotency_key": "cancelled-retry"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_ne!(cancelled_retry.id, cancelled.id);
+    assert_eq!(
+        cancelled_retry.input_message_id,
+        cancelled.triggering_message_id
+    );
+    assert_eq!(cancelled_retry.status, AgentChatTurnStatus::Queued);
+    // Historical codes remain visible and the newest historical failure is eligible.
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'failed', failure_class_json = NULL, retry_decision = NULL, error_code = 'credential_unavailable', error_message = 'old failure', version = version + 1 WHERE id = ?")
+        .bind(&cancelled_retry.id).execute(harness.state.db.pool()).await.unwrap();
+    let listed: Vec<AgentChatTurnJobResponse> = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{}/turns", binding.chat_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    let historical = listed
+        .iter()
+        .find(|turn| turn.id == cancelled_retry.id)
+        .unwrap();
+    assert_eq!(
+        historical.error_code.as_deref(),
+        Some("credential_unavailable")
+    );
+    assert_eq!(historical.error_message.as_deref(), Some("old failure"));
+    assert!(historical.failure_class.is_none());
+    assert!(historical.retry_action.is_some());
+    let messages: AgentChatMessageListResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(messages.items.len(), 1);
+    assert_eq!(messages.items[0].id, admitted.message.id);
+
+    // A topic divider has no turn, but still closes retries into the old topic.
+    let _: api_types::StartAgentChatTopicResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/topics", binding.chat_id),
+        &token,
+        json!({"label": "new topic"}),
+        StatusCode::OK,
+    )
+    .await;
+    let source =
+        db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &cancelled_retry.id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(source.retry_action().is_none());
+    let superseded: ErrorResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!(
+            "/api/v1/agent-chats/{}/turns/{}/retry",
+            binding.chat_id, source.id
+        ),
+        &token,
+        json!({"expected_version": source.version, "idempotency_key": "too-late"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(superseded.code, "turn_not_retryable");
+}
+
+#[tokio::test]
+async fn agent_chat_read_notifications_relay_ids_without_message_bodies() {
+    let dir = common::TestDir::new("chat-read-events");
+    let h = common::test_app(dir.path(), "chat-read-events").await;
+    let token = common::test_jwt();
+    let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
+        &h.app,
+        &token,
+        "read-events-agent",
+        "read-events",
+        "read-events-secret",
+        json!({"permissions": ["read_agent_chat", "propose_message"]}),
+        json!({"allowed": ["read_agent_chat", "propose_message"]}),
+    )
+    .await;
+    let binding: MainAgentBindingResponse = common::json_request_with_bearer(
+        &h.app, Method::PUT, "/api/v1/account/main-agent", &token,
+        json!({"identity_id": connected.agent.id, "profile_id": connected.profile.id, "expected_version": 0, "autonomy_policy": {}}),
+        StatusCode::OK,
+    ).await;
+    let sent: SendAgentChatMessageResponse = common::json_request_with_bearer(
+        &h.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        json!({"content":"private message body", "dedupe_key":"read-event-message"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let turn = sent.turn_job.unwrap();
+    let admission_events: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM domain_event WHERE entity_id = ? ORDER BY sequence",
+    )
+    .bind(&sent.message.id)
+    .fetch_all(h.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(admission_events, ["agent_chat.message.admitted"]);
+    // Exercise the worker's transactional status-notification seam without running a turn.
+    let mut tx = db::begin_immediate(h.state.db.pool()).await.unwrap();
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'leased', lease_owner = 'reader', leased_until = '2099-01-01T00:00:00Z', version = version + 1, updated_at = ? WHERE id = ?")
+        .bind("2000-01-01T00:00:00Z").bind(&turn.id).execute(&mut *tx).await.unwrap();
+    h.state
+        .db
+        .append_agent_chat_turn_status_in_tx(&mut tx, &turn.id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = h.state.db.pool().begin().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_chat_turn_job SET status = 'retry_wait', version = version + 1 WHERE id = ?",
+    )
+    .bind(&turn.id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    h.state
+        .db
+        .append_agent_chat_turn_status_in_tx(&mut tx, &turn.id)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent_chat.turn.status_changed' AND entity_id = ?")
+        .bind(&turn.id).fetch_one(h.state.db.pool()).await.unwrap();
+    assert_eq!(count, 1, "rolled-back status has no durable notification");
+    let inquiry = db::AgentInquiryRepo::create_agent_inquiry(
+        &*h.state.db,
+        db::CreateAgentInquiry {
+            id: db::new_uuid_v4(),
+            chat_id: binding.chat_id.clone(),
+            turn_job_id: Some(turn.id.clone()),
+            identity_id: connected.agent.id,
+            owner_user_id: "test-user-id".to_owned(),
+            title: "Read event".to_owned(),
+            question: "private inquiry body".to_owned(),
+            workspace_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    db::AgentInquiryRepo::cancel_agent_inquiry(&*h.state.db, &inquiry.id, inquiry.version)
+        .await
+        .unwrap();
+    // Status writes need neither a version bump nor an updated_at write to notify.
+    for status in ["retry_wait", "leased", "cancelled"] {
+        let mut tx = db::begin_immediate(h.state.db.pool()).await.unwrap();
+        sqlx::query("UPDATE agent_chat_turn_job SET status = ?, lease_owner = NULL, leased_until = NULL WHERE id = ?")
+            .bind(status).bind(&turn.id).execute(&mut *tx).await.unwrap();
+        h.state
+            .db
+            .append_agent_chat_turn_status_in_tx(&mut tx, &turn.id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let status_events: Vec<(String, String)> = sqlx::query_as("SELECT payload_json, created_at FROM domain_event WHERE event_type = 'agent_chat.turn.status_changed' AND entity_id = ? ORDER BY sequence")
+        .bind(&turn.id).fetch_all(h.state.db.pool()).await.unwrap();
+    assert_eq!(
+        status_events.len(),
+        4,
+        "each status write gets its own event"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&status_events[3].0).unwrap()["status"],
+        "cancelled"
+    );
+    let stored_updated_at: String =
+        sqlx::query_scalar("SELECT updated_at FROM agent_chat_turn_job WHERE id = ?")
+            .bind(&turn.id)
+            .fetch_one(h.state.db.pool())
+            .await
+            .unwrap();
+    assert_ne!(status_events[3].1, stored_updated_at);
+    assert!(status_events[3].1 >= stored_updated_at);
+    let _: api_types::StartAgentChatTopicResponse = common::json_request_with_bearer(
+        &h.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/topics", binding.chat_id),
+        &token,
+        json!({"label":"Next", "summary":null}),
+        StatusCode::OK,
+    )
+    .await;
+    let appended_system: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event e JOIN agent_chat_message m ON m.id = e.entity_id WHERE e.event_type = 'agent_chat.message.appended' AND m.chat_id = ? AND m.author_type = 'system'")
+        .bind(&binding.chat_id).fetch_one(h.state.db.pool()).await.unwrap();
+    assert!(
+        appended_system > 0,
+        "system appends also reach the durable relay"
+    );
+    let payloads: Vec<String> = sqlx::query_scalar("SELECT payload_json FROM domain_event WHERE scope_id = ? AND event_type IN ('agent_chat.message.appended', 'agent_chat.turn.status_changed', 'agent_chat.inquiry.updated', 'agent_chat.topic.started')")
+        .bind(&binding.chat_id).fetch_all(h.state.db.pool()).await.unwrap();
+    for payload in payloads {
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(payload.as_object().unwrap().keys().all(|key| [
+            "chat_id",
+            "id",
+            "message_id",
+            "turn_id",
+            "status"
+        ]
+        .contains(&key.as_str())));
+    }
+    let mut receiver = h.state.event_bus.subscribe();
+    let relay = services::DomainEventBroadcastConsumer::new(
+        h.state.db.clone(),
+        h.state.event_bus.clone(),
+        Some(0),
+    );
+    let emitted = relay.broadcast_once(100).await.unwrap();
+    let mut kinds = std::collections::HashSet::new();
+    for _ in 0..emitted {
+        let event = receiver.try_recv().unwrap();
+        let value = serde_json::to_value(event).unwrap();
+        assert!(!value.to_string().contains("private message body"));
+        assert!(!value.to_string().contains("private inquiry body"));
+        if value["scope_type"] == "agent_chat" {
+            kinds.insert(value["domain_event_type"].as_str().unwrap().to_owned());
+        }
+    }
+    for kind in [
+        "agent_chat.message.admitted",
+        "agent_chat.message.appended",
+        "agent_chat.turn.status_changed",
+        "agent_chat.inquiry.updated",
+        "agent_chat.topic.started",
+    ] {
+        assert!(kinds.contains(kind), "missing {kind}");
+    }
+    let service = services::agent_chat_service::AgentChatService::new(h.state.db.clone());
+    for ledger in [false, true] {
+        for terminal in ["completed", "failed", "cancelled"] {
+            let admitted: SendAgentChatMessageResponse = common::json_request_with_bearer(
+                &h.app,
+                Method::POST,
+                &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+                &token,
+                json!({"content":"Lifecycle event coverage"}),
+                StatusCode::CREATED,
+            )
+            .await;
+            let turn = admitted.turn_job.unwrap();
+            let admitted_events: Vec<String> = sqlx::query_scalar(
+                "SELECT event_type FROM domain_event WHERE entity_id = ? ORDER BY sequence",
+            )
+            .bind(&admitted.message.id)
+            .fetch_all(h.state.db.pool())
+            .await
+            .unwrap();
+            assert_eq!(admitted_events, ["agent_chat.message.admitted"]);
+            let job = db::AgentChatTurnJobRepo::update_agent_chat_turn_job(
+                &*h.state.db,
+                db::UpdateAgentChatTurnJob {
+                    id: turn.id.clone(),
+                    expected_version: turn.version,
+                    status: db::AgentChatTurnState::Leased,
+                    lease_owner: Some(Some("reader".to_owned())),
+                    leased_until: Some(Some("2099-01-01T00:00:00Z".to_owned())),
+                    attempt_count: Some(1),
+                    pending_interaction_id: None,
+                    next_attempt_at: None,
+                    response_message_id: None,
+                    error_code: None,
+                    error_message: None,
+                    updated_at: db::now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+            let before: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM domain_event")
+                .fetch_one(h.state.db.pool())
+                .await
+                .unwrap();
+            let expected = match terminal {
+                "completed" => {
+                    let response = services::agent_chat_service::AppendAgentChatSuccessInput {
+                        content: "Completed response".to_owned(),
+                        model: None,
+                        session_id: None,
+                        context_manifest_id: None,
+                        token_usage_json: None,
+                        duration_ms: None,
+                    };
+                    // Success has one service path; it settles usage even
+                    // when there is none to settle.
+                    service
+                        .append_success_with_usage(&job, "reader", response, vec![])
+                        .await
+                        .unwrap();
+                    "agent_chat.response.completed"
+                }
+                "failed" => {
+                    if ledger {
+                        service
+                            .append_failure_with_usage(
+                                &job,
+                                "reader",
+                                &api_types::TurnFailure::Configuration,
+                                "Configuration failed",
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        service
+                            .append_failure(
+                                &job,
+                                "reader",
+                                &api_types::TurnFailure::Configuration,
+                                "Configuration failed",
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    "agent_chat.turn.failed"
+                }
+                _ => {
+                    let input = db::CancelAgentChatTurn {
+                        turn_job_id: job.id.clone(),
+                        expected_version: job.version,
+                        actor_user_id: "test-user-id".to_owned(),
+                        idempotency_key: db::new_uuid_v4(),
+                        updated_at: db::now_rfc3339(),
+                    };
+                    if ledger {
+                        db::AgentChatTransactionRepo::cancel_agent_chat_turn_with_usage(
+                            &*h.state.db,
+                            db::CancelAgentChatTurnWithUsage {
+                                terminal: input,
+                                settlements: vec![],
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        db::AgentChatTransactionRepo::cancel_agent_chat_turn(&*h.state.db, input)
+                            .await
+                            .unwrap();
+                    }
+                    "agent_chat.turn.cancelled"
+                }
+            };
+            let events: Vec<String> = sqlx::query_scalar("SELECT event_type FROM domain_event WHERE scope_type = 'agent_chat' AND scope_id = ? AND sequence > ? ORDER BY sequence")
+                .bind(&binding.chat_id).bind(before).fetch_all(h.state.db.pool()).await.unwrap();
+            assert_eq!(events, [expected], "{terminal}, ledger={ledger}");
+        }
+    }
 }

@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    workflow::engine::{BoardMoveOutcome, BoardMoveRequest},
-    DomainEventService,
-};
+use crate::workflow::engine::{BoardMoveOutcome, BoardMoveRequest};
 use api_types::{Actor, MoveTaskRequest, TaskMovedEventPayload, UserActionSource};
 use db::{
     CompareAndMoveTask, MoveTaskIdentity, MoveTaskPersistence, MoveTaskResult, TaskBoardRepo,
@@ -37,7 +34,9 @@ impl TaskService {
             )
         };
         let guard = operation_lock.lock().await;
-        let result = self.move_task_locked(task_id, request).await;
+        let result = crate::worker_runtime::queue::PRODUCER_TASK
+            .scope(task_id.clone(), self.move_task_locked(task_id, request))
+            .await;
         drop(guard);
         let mut locks = self.move_operation_locks.lock().await;
         if Arc::strong_count(&operation_lock) == 2 {
@@ -179,6 +178,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         };
         let engine_result = engine
             .move_task_with_authority(
@@ -203,6 +203,10 @@ impl TaskService {
                 }),
             )
             .await?;
+        let _step_reservation = crate::worker_runtime::queue::ProducerReservation::hold(
+            Arc::clone(&self.db),
+            engine_result.queued_step_id.as_deref(),
+        );
         let direct_result = match engine_result.board_move {
             Some(BoardMoveOutcome::Replayed(result)) => return Ok(result),
             Some(BoardMoveOutcome::Committed(result)) => result,
@@ -293,6 +297,9 @@ impl TaskService {
         )
         .await?;
         self.reconcile_terminal_subtask(&result.task).await;
+        if let Some(id) = &engine_result.queued_step_id {
+            db::TaskStepRepo::ready_step(&*self.db, id).await?;
+        }
         Ok(result)
     }
 
@@ -314,6 +321,7 @@ impl TaskService {
         let persistence = TaskBoardRepo::compare_and_move_task(
             &*self.db,
             CompareAndMoveTask {
+                cascade_step: None,
                 operation_id: request.operation_id.clone(),
                 project_id: task.project_id.clone(),
                 task_id: task.id.clone(),
@@ -340,14 +348,8 @@ impl TaskService {
             MoveTaskPersistence::Replayed(result) => Ok(*result),
             MoveTaskPersistence::Committed {
                 result,
-                transition_log,
+                transition_log: _,
             } => {
-                if let Some(event) =
-                    db::DomainEventRepo::get_event(&*self.db, &transition_log.id).await?
-                {
-                    DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
-                        .publish_committed(&event);
-                }
                 self.publish_move_event(&result);
                 TaskBoardRepo::complete_move_operation(
                     &*self.db,

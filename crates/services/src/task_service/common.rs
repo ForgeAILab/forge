@@ -37,6 +37,21 @@ pub(crate) async fn latest_executor_execution_for_task(
 }
 
 impl TaskService {
+    pub(crate) async fn resolve_task_workspace(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<crate::workspace_backend::ResolvedWorkspace> {
+        Ok(
+            crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+                &self.workspace_backend_router,
+                &self.db,
+                workspace,
+                &self.workspace_root,
+            )
+            .await?,
+        )
+    }
+
     pub(super) async fn latest_executor_execution(&self, task_id: &str) -> Result<Execution> {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
@@ -120,7 +135,13 @@ impl TaskService {
             },
         )
         .await?;
-        if let Err(error) = self.index_task_comment_memory(task_id, &comment).await {
+        self.after_project_hook_comment(&comment).await;
+        Ok(())
+    }
+
+    pub(crate) async fn after_project_hook_comment(&self, comment: &TaskComment) {
+        let task_id = &comment.task_id;
+        if let Err(error) = self.index_task_comment_memory(task_id, comment).await {
             tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
         }
         self.publish(ForgeEvent {
@@ -129,12 +150,11 @@ impl TaskService {
             timestamp: event_timestamp(),
             context: EventContext::CommentCreated {
                 task_id: task_id.to_owned(),
-                comment_id: comment.id,
+                comment_id: comment.id.clone(),
                 author_type: "system".to_owned(),
                 author_name: "Forge".to_owned(),
             },
         });
-        Ok(())
     }
 
     pub(super) async fn create_agent_comment(
@@ -208,6 +228,7 @@ impl TaskService {
             &self.workspace_root,
             &task,
             self.repo_cache_locks.clone(),
+            &self.workspace_backend_router,
         )
         .await
     }
@@ -238,33 +259,11 @@ impl TaskService {
             .filter(|repo| repo.project_id == task.project_id)
             .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
 
-        let branch_ref = format!("{}...HEAD", repo.default_branch);
-        let output = Command::new("git")
-            .arg("diff")
-            .arg(branch_ref)
-            .current_dir(&workspace.worktree_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .await;
-        let stdout = match output {
-            Ok(output) if output.status.success() => output.stdout,
-            _ => {
-                Command::new("git")
-                    .arg("diff")
-                    .current_dir(&workspace.worktree_path)
-                    .env_remove("GIT_DIR")
-                    .env_remove("GIT_WORK_TREE")
-                    .env_remove("GIT_INDEX_FILE")
-                    .output()
-                    .await
-                    .map_err(|error| {
-                        ServiceError::invalid_operation(format!("failed to run git diff: {error}"))
-                    })?
-                    .stdout
-            }
-        };
-        Ok(truncate_utf8_bytes(&stdout, MAX_FOLLOW_UP_DIFF_BYTES))
+        let resolved = self.resolve_task_workspace(&workspace).await?;
+        let diff = ::review::ReviewWorkspace::diff(&resolved, &repo.default_branch).await?;
+        Ok(truncate_utf8_bytes(
+            diff.as_bytes(),
+            MAX_FOLLOW_UP_DIFF_BYTES,
+        ))
     }
 }

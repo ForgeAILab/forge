@@ -103,7 +103,6 @@ test.describe('task dependency chain (integration)', () => {
           name: `dep-chain-repo-${runId}`,
           remote_url: repoPath,
           local_path: repoPath,
-          work_mode: 'direct_merge',
           default_branch: 'main',
         })
 

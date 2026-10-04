@@ -7,6 +7,9 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+test-support = ["cli-adapters/test-support"]
+
 [dependencies]
 api-types = { path = "../api-types" }
 cli-adapters = { path = "../cli-adapters" }
@@ -42,6 +45,9 @@ uuid = { version = "1", features = ["v4", "v5"] }
 which = "*"
 
 [dev-dependencies]
+cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
+services = { path = ".", features = ["test-support"] }
+db = { path = "../db", features = ["test-template"] }
 agent-runtime.workspace = true
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

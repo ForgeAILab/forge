@@ -123,7 +123,10 @@ describe('task interruption annotations', () => {
       priority: 0,
       board_position: 0,
       role_assignments: [],
+      effective_coder: null,
+      effective_coder_source: null,
       remaining_retries: {},
+      placement: null,
       blocked: null,
       failed: null,
       error_annotation: {
@@ -134,7 +137,6 @@ describe('task interruption annotations', () => {
         blocked_execution_id: blockedExecutionId,
         artifact: null,
         message: 'Previous execution failed',
-        recovery_actions: ['reexecute'],
       },
       execution_observability: {
         counts: {

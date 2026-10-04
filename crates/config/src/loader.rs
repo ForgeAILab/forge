@@ -9,19 +9,38 @@ impl ForgeConfig {
         config_path: Option<&Path>,
         overrides: ConfigOverrides,
     ) -> Result<Self, ConfigError> {
-        let mut config = Self::default();
         let path = config_path.map_or_else(default_config_path, Path::to_path_buf);
 
-        if path.exists() {
+        let file_config = if path.exists() {
             let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
                 path: path.clone(),
                 source,
             })?;
-            let file_config =
-                serde_yaml::from_str::<FileConfig>(&text).map_err(|source| ConfigError::Parse {
+            Some(serde_yaml::from_str::<FileConfig>(&text).map_err(|source| {
+                ConfigError::Parse {
                     path: path.clone(),
                     source,
-                })?;
+                }
+            })?)
+        } else {
+            None
+        };
+        let data_dir = overrides
+            .data_dir
+            .clone()
+            .or_else(|| env_value("FORGE_DATA_DIR").map(|value| expand_path(&value)))
+            .or_else(|| {
+                file_config
+                    .as_ref()?
+                    .forge
+                    .as_ref()?
+                    .data_dir
+                    .as_deref()
+                    .map(expand_path)
+            })
+            .unwrap_or_else(crate::default_data_dir);
+        let mut config = Self::with_data_dir(data_dir);
+        if let Some(file_config) = file_config {
             config.apply_file(file_config);
         }
 
@@ -39,6 +58,12 @@ impl ForgeConfig {
         }
 
         if let Some(server) = file.server {
+            self.server.max_concurrent_runs = server.max_concurrent_runs;
+            self.server.build_jobs_per_run = server.build_jobs_per_run;
+            if let Some(nice) = server.run_nice {
+                self.server.run_nice = nice;
+            }
+            self.server.usage_index_budget_mb = server.usage_index_budget_mb;
             if let Some(bind) = server.bind {
                 self.server.bind = bind;
             }
@@ -60,6 +85,9 @@ impl ForgeConfig {
             if let Some(media_upload_limit_bytes) = server.media_upload_limit_bytes {
                 self.server.media_upload_limit_bytes = media_upload_limit_bytes;
             }
+            if let Some(seconds) = server.event_consumer_stall_seconds {
+                self.server.event_consumer_stall_seconds = seconds;
+            }
         }
 
         if let Some(workspace) = file.workspace {
@@ -68,6 +96,9 @@ impl ForgeConfig {
             }
             if let Some(cleanup_delay_seconds) = workspace.cleanup_delay_seconds {
                 self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;
+            }
+            if let Some(max_disconnect_seconds) = workspace.max_disconnect_seconds {
+                self.workspace.max_disconnect_seconds = max_disconnect_seconds;
             }
         }
 
@@ -176,6 +207,25 @@ impl ForgeConfig {
     }
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(value) = env_value("FORGE_SERVER_BUILD_JOBS_PER_RUN") {
+            self.server.build_jobs_per_run =
+                Some(parse_env_u32("FORGE_SERVER_BUILD_JOBS_PER_RUN", &value)?);
+        }
+        if let Some(value) = env_value("FORGE_SERVER_RUN_NICE") {
+            self.server.run_nice = parse_env_u32("FORGE_SERVER_RUN_NICE", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_USAGE_INDEX_BUDGET_MB") {
+            self.server.usage_index_budget_mb =
+                Some(parse_env_u32("FORGE_SERVER_USAGE_INDEX_BUDGET_MB", &value)?);
+        }
+        if let Some(value) = env_value("FORGE_SERVER_MAX_CONCURRENT_RUNS") {
+            self.server.max_concurrent_runs =
+                Some(parse_env_u32("FORGE_SERVER_MAX_CONCURRENT_RUNS", &value)?);
+        }
+        if let Some(value) = env_value("FORGE_EVENT_CONSUMER_STALL_SECONDS") {
+            self.server.event_consumer_stall_seconds =
+                parse_env_u32("FORGE_EVENT_CONSUMER_STALL_SECONDS", &value)?;
+        }
         if let Some(value) = env_value("FORGE_SERVER_BIND") {
             self.server.bind = value;
         }
@@ -202,6 +252,10 @@ impl ForgeConfig {
         if let Some(value) = env_value("FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS") {
             self.workspace.cleanup_delay_seconds =
                 parse_env_u64("FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_MAX_DISCONNECT_SECONDS") {
+            self.workspace.max_disconnect_seconds =
+                parse_env_u64("FORGE_MAX_DISCONNECT_SECONDS", &value)?;
         }
         if let Some(value) = env_value("FORGE_AGENT_MAX_CONCURRENT_TASKS") {
             self.agent.max_concurrent_tasks =
@@ -239,6 +293,21 @@ impl ForgeConfig {
     }
 
     fn apply_overrides(&mut self, overrides: ConfigOverrides) {
+        if let Some(jobs) = overrides.server_build_jobs_per_run {
+            self.server.build_jobs_per_run = Some(jobs);
+        }
+        if let Some(nice) = overrides.server_run_nice {
+            self.server.run_nice = nice;
+        }
+        if let Some(budget) = overrides.server_usage_index_budget_mb {
+            self.server.usage_index_budget_mb = Some(budget);
+        }
+        if let Some(cap) = overrides.server_max_concurrent_runs {
+            self.server.max_concurrent_runs = Some(cap);
+        }
+        if let Some(seconds) = overrides.event_consumer_stall_seconds {
+            self.server.event_consumer_stall_seconds = seconds;
+        }
         if let Some(server_bind) = overrides.server_bind {
             self.server.bind = server_bind;
         }
@@ -256,6 +325,9 @@ impl ForgeConfig {
         }
         if let Some(cleanup_delay_seconds) = overrides.workspace_cleanup_delay_seconds {
             self.workspace.cleanup_delay_seconds = cleanup_delay_seconds;
+        }
+        if let Some(max_disconnect_seconds) = overrides.workspace_max_disconnect_seconds {
+            self.workspace.max_disconnect_seconds = max_disconnect_seconds;
         }
         if let Some(max_concurrent_tasks) = overrides.agent_max_concurrent_tasks {
             self.agent.max_concurrent_tasks = max_concurrent_tasks;

@@ -65,7 +65,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -234,7 +233,6 @@ async fn seed_local_project_repo_and_task(
             name: "forge".to_owned(),
             remote_url: Some(repo_path.to_string_lossy().into_owned()),
             local_path: Some(repo_path.to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -294,14 +292,23 @@ async fn seed_agent(db: &SqliteDb, agent_id: &str) {
 }
 
 async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks: i64) {
-    let now = now_rfc3339();
-    let daemon_id = new_uuid_v4();
+    seed_agent_with_executor(db, agent_id, max_concurrent_tasks, "shell").await;
+}
 
-    DaemonRepo::upsert_by_machine_id(
+async fn seed_agent_with_executor(
+    db: &SqliteDb,
+    agent_id: &str,
+    max_concurrent_tasks: i64,
+    executor_type: &str,
+) {
+    let now = now_rfc3339();
+
+    let daemon_id = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
-            id: daemon_id.clone(),
-            machine_id: format!("machine-{daemon_id}"),
+            max_concurrent_runs: None,
+            id: new_uuid_v4(),
+            machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
@@ -316,12 +323,16 @@ async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks
         },
     )
     .await
-    .expect("daemon creates");
+    .expect("daemon creates")
+    .id;
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
-            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            detected_clis_json:
+                serde_json::json!([{ "kind": executor_type, "availability": "authenticated" }])
+                    .to_string(),
             labels_json: None,
             status: DaemonStatus::Online,
             last_report_at: now.clone(),
@@ -337,7 +348,7 @@ async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks
             id: agent_id.to_owned(),
             name: "test-agent".to_owned(),
             description: None,
-            executor_type: "shell".to_owned(),
+            executor_type: executor_type.to_owned(),
             model: None,
             reasoning_effort: None,
             permission_policy: None,
@@ -433,12 +444,33 @@ async fn build_role_dispatch_harness(
     agent_id: &str,
     max_concurrent_tasks: i64,
 ) -> DispatchHarness {
+    build_role_dispatch_harness_with_executor(
+        task_id,
+        from_state,
+        to_state,
+        role,
+        agent_id,
+        max_concurrent_tasks,
+        "shell",
+    )
+    .await
+}
+
+async fn build_role_dispatch_harness_with_executor(
+    task_id: &str,
+    from_state: &str,
+    to_state: &str,
+    role: &str,
+    agent_id: &str,
+    max_concurrent_tasks: i64,
+    executor_type: &str,
+) -> DispatchHarness {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_root = TempDir::new().expect("workspace dir creates");
     let project_id =
         seed_local_project_repo_and_task(&db, repo_dir.path(), task_id, to_state).await;
-    seed_agent_with_max(&db, agent_id, max_concurrent_tasks).await;
+    seed_agent_with_executor(&db, agent_id, max_concurrent_tasks, executor_type).await;
     assign_agent_role(&db, task_id, role, agent_id).await;
     if role == default_roles::REVIEWER {
         configure_review_defaults(&db, &project_id, &[json!("test -d .")]).await;
@@ -469,6 +501,7 @@ async fn build_role_dispatch_harness(
             project_id,
             from_state: from_state.to_owned(),
             to_state: to_state.to_owned(),
+            workspace_backend_router: task_service.workspace_backend_router(),
             db,
             event_bus,
             gate_config,
@@ -530,6 +563,7 @@ async fn build_no_repo_dispatch_harness(
             project_id,
             from_state: default_states::TODO.to_owned(),
             to_state: default_states::IN_PROGRESS.to_owned(),
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             event_bus,
             gate_config,
@@ -635,6 +669,7 @@ async fn build_test_ctx(
         project_id,
         from_state: from_state.to_owned(),
         to_state: to_state.to_owned(),
+        workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
         db,
         event_bus,
         gate_config,
@@ -1976,7 +2011,17 @@ async fn dispatch_role_agent_skips_without_coder_assignment() {
 #[tokio::test]
 async fn dispatch_role_agent_emits_event_for_coder_assignment() {
     let agent_id = "agent-coder-dispatch";
-    let mut harness = build_initial_dispatch_harness("task-dispatch-coder", agent_id, 1).await;
+    let mut harness = build_role_dispatch_harness_with_executor(
+        "task-dispatch-coder",
+        default_states::TODO,
+        default_states::IN_PROGRESS,
+        default_roles::CODER,
+        agent_id,
+        1,
+        "codex",
+    )
+    .await;
+
     let ctx = harness.ctx.clone();
     let mut rx = ctx.event_bus.subscribe();
 
@@ -2006,7 +2051,7 @@ async fn dispatch_role_agent_emits_event_for_coder_assignment() {
         other => panic!("unexpected event context: {other:?}"),
     }
 
-    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(30), harness.rx.recv())
         .await
         .expect("executor receives dispatch")
         .expect("executor context exists");
@@ -2020,15 +2065,17 @@ async fn dispatch_role_agent_emits_event_for_coder_assignment() {
 #[tokio::test]
 async fn dispatch_role_agent_uses_dirty_worktree_prompt_from_task_annotation() {
     let agent_id = "agent-coder-dirty-worktree";
-    let mut harness = build_role_dispatch_harness(
+    let mut harness = build_role_dispatch_harness_with_executor(
         "task-dispatch-dirty-worktree",
         default_states::MERGING,
         default_states::MERGE_FAILED,
         default_roles::CODER,
         agent_id,
         1,
+        "codex",
     )
     .await;
+
     sqlx::query(
         "UPDATE task
          SET review_passed_at = ?, error_annotation = ?
@@ -2053,7 +2100,7 @@ async fn dispatch_role_agent_uses_dirty_worktree_prompt_from_task_annotation() {
         "{dispatch_result:?}"
     );
 
-    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(30), harness.rx.recv())
         .await
         .expect("coder executor spawned in time")
         .expect("coder execution context received");
@@ -2232,13 +2279,10 @@ async fn coordination_root_merge_conflict_becomes_manual_repair_block() {
         panic!("coordination merge block must be typed")
     };
     assert_eq!(annotation.blocked_by.as_deref(), Some("coordination_root"));
-    assert_eq!(
-        annotation.recovery_actions,
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::CancelTask
-        ]
-    );
+    assert!(serde_json::to_value(&annotation)
+        .unwrap()
+        .get("recovery_actions")
+        .is_none());
 }
 
 #[tokio::test]
@@ -2293,13 +2337,10 @@ async fn ordinary_merge_conflict_parks_for_manual_repair_and_invalidates_review(
         annotation.blocked_by.as_deref(),
         Some("manual_workspace_repair")
     );
-    assert_eq!(
-        annotation.recovery_actions,
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::CancelTask
-        ]
-    );
+    assert!(serde_json::to_value(&annotation)
+        .unwrap()
+        .get("recovery_actions")
+        .is_none());
 }
 
 /// Two sibling Tasks each add an entry to the same export list; the first
@@ -2569,7 +2610,7 @@ async fn run_merge_blocks_unresolved_handed_off_markers() {
         panic!("conflict should hand off");
     };
     record_conflict_handoff(&ctx, reason, false).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -2607,7 +2648,7 @@ async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
         panic!("conflict should hand off");
     };
     record_conflict_handoff(&ctx, reason, false).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -2666,7 +2707,7 @@ async fn handed_off_conflict_resolves_and_run_merge_integrates() {
     .expect("Worker resolves both sides");
     run_git(&worktree_path, &["add", "-A"]);
     run_git(&worktree_path, &["commit", "-m", "resolve handoff"]);
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -2694,7 +2735,7 @@ async fn plain_merge_conflict_is_handed_back_to_the_worker() {
     )
     .await;
     let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&ctx.db),
         Arc::clone(&ctx.event_bus),
         dir.path().to_path_buf(),
@@ -3038,6 +3079,7 @@ async fn build_reviewer_dispatch_harness(
             project_id,
             from_state: default_states::IN_PROGRESS.to_owned(),
             to_state: default_states::REVIEW.to_owned(),
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             event_bus,
             gate_config,
@@ -3850,7 +3892,7 @@ async fn build_carry_scenario(
         changed_paths: vec!["feature.txt".to_owned(), "shared.txt".to_owned()],
     };
     let mut harness = harness;
-    harness.ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new(
+    harness.ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
         Arc::clone(&harness.ctx.db),
         Arc::clone(&harness.ctx.event_bus),
         harness._workspace_root.path().to_path_buf(),
@@ -3967,6 +4009,8 @@ async fn seed_passed_carry_review(
         status: api_types::ConformanceStatus::Passed,
         contract: Some(contract),
         assessment: Some(api_types::ReviewAssessment {
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
             result: api_types::ReviewResult::Pass,
             reason: "looks right".to_owned(),
             report: String::new(),

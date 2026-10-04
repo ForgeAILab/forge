@@ -381,6 +381,7 @@ fn dispatch_role_follow_up_impl(
                 },
                 false,
                 Some(admission),
+                None,
             )
             .await?;
 
@@ -420,8 +421,12 @@ pub(super) async fn assigned_agent_for_role(
     task_id: &str,
     role: &str,
 ) -> Result<Option<String>> {
-    let assignment =
-        TaskRoleAssignmentRepo::get_by_task_and_role(&*service.db, task_id, role).await?;
+    let task = TaskRepo::get_by_id(&*service.db, task_id, false)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+    let assignment = crate::task_hierarchy::effective_role_assignment(&service.db, &task, role)
+        .await?
+        .map(|resolved| resolved.assignment);
     Ok(assignment.and_then(|assignment| {
         (assignment.assignee_type == Some(AssigneeKind::Agent))
             .then_some(assignment.assignee_id)

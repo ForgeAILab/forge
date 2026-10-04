@@ -3,9 +3,9 @@ use std::{collections::HashMap, str::FromStr};
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse,
     ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewDetails,
-    ReviewResponse, StateKind, StepResultEntry, StepResultResponse, Task as ApiTask,
-    TaskAnnotation, TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse, TaskType,
-    UsageAggregate, WorkspaceResponse,
+    ReviewResponse, StateKind, StepResultEntry, StepResultResponse, TaskAnnotation,
+    TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse, TaskType, UsageAggregate,
+    WorkspacePlacementResponse, WorkspaceResponse,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -17,16 +17,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use services::workflow::engine::WorkflowEngine;
 use services::{
-    plan_artifact::{read_plan_for_workspace, PlanArtifactError},
+    plan_artifact::{read_plan_with_router, PlanArtifactError},
     task_diagnostics::{
         compare_running_execution_authority, count_gate_rejections_since_boundary,
-        derive_workflow_exception_with_running_interactive, derive_workflow_health,
-        disable_recovery_while_running,
+        derive_workflow_health,
     },
-    task_service::action_resolver::{
-        has_open_interactive_launch_authority, list_execution_action_authority,
-        resolve_execution_actions, select_open_interactive_target,
-    },
+    task_service::action_resolver::list_execution_action_authority,
 };
 use sqlx::Row;
 
@@ -69,6 +65,7 @@ pub mod projects;
 pub mod provider_authorizations;
 pub mod providers;
 pub mod reconciliations;
+pub mod repo_locations;
 pub mod repos;
 pub mod reviews;
 pub mod scoped_memory;
@@ -110,7 +107,7 @@ pub(crate) fn client_idempotency_key(stored_key: &str) -> String {
     stored_key.to_owned()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListParams {
     pub cursor: Option<String>,
     pub limit: Option<i64>,
@@ -173,7 +170,28 @@ pub fn paginated<T, U>(page: Page<T>, map: impl Fn(T) -> U) -> PaginatedResponse
     }
 }
 
-pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
+pub async fn project_response(db: &db::SqliteDb, project: Project) -> ApiResult<ProjectResponse> {
+    let slots = services::task_dispatcher::slots::load_project_slots(db, &project).await?;
+    project_response_with_slots(db, project, slots).await
+}
+
+async fn project_response_with_slots(
+    db: &db::SqliteDb,
+    project: Project,
+    slots: api_types::ProjectSlots,
+) -> ApiResult<ProjectResponse> {
+    let mut environment =
+        services::environment_surfaces::project_environments(db, std::slice::from_ref(&project))
+            .await?;
+    let environment = environment.remove(&project.id).expect("requested Project");
+    project_response_from_environment(project, slots, environment)
+}
+
+fn project_response_from_environment(
+    project: Project,
+    slots: api_types::ProjectSlots,
+    environment: services::environment_surfaces::ProjectEnvironmentRead,
+) -> ApiResult<ProjectResponse> {
     let settings = parse_json_value(project.settings);
     let default_review_config = settings
         .get("default_review_config")
@@ -185,6 +203,26 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
             project.id
         ))
     })?;
+    let environment_readiness = environment.readiness;
+    let environment_pause = if let Some(raw) = project.environment_pause_json.as_deref() {
+        let detail =
+            serde_json::from_str::<api_types::ProjectEnvironmentPause>(raw).map_err(|error| {
+                ApiError::internal(format!("invalid persisted environment pause: {error}"))
+            })?;
+        let value: Value =
+            serde_json::from_str(raw).map_err(|error| ApiError::internal(error.to_string()))?;
+        if value.get("machine").is_some() {
+            serde_json::from_value::<db::EnvironmentMachine>(value["machine"].clone()).map_err(
+                |error| ApiError::internal(format!("invalid environment pause machine: {error}")),
+            )?;
+        }
+        Some(api_types::EnvironmentPauseResponse {
+            detail,
+            machine: environment.pause_machine.expect("loaded pause owner"),
+        })
+    } else {
+        None
+    };
     Ok(ProjectResponse {
         id: project.id,
         name: project.name,
@@ -198,6 +236,9 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
         workflow_template_name: project.workflow_template_name,
         paused_at: project.paused_at.clone(),
         system_pause_reason: project.system_pause_reason,
+        environment_pause,
+        environment_readiness,
+        slots,
         paused: project.paused_at.is_some(),
         charter_status: project.charter_status,
         charter_setup_required: project.charter_setup_required,
@@ -218,34 +259,30 @@ pub fn repo_response(repo: Repo) -> RepoResponse {
         local_path: repo.local_path,
         remote_url: repo.remote_url,
         default_branch: repo.default_branch,
-        work_mode: repo_work_mode_response(repo.work_mode),
-        pr_provider: None,
-        pr_provider_status: None,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
     }
 }
 
-fn repo_work_mode_response(work_mode: db::WorkMode) -> api_types::WorkMode {
-    match work_mode {
-        db::WorkMode::DirectMerge => api_types::WorkMode::DirectMerge,
-        db::WorkMode::PullRequest => api_types::WorkMode::PullRequest,
-    }
-}
-
-pub async fn task_response(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
-    Ok(task_response_and_workflow(db, task).await?.0)
+pub async fn task_response(
+    db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
+    task: Task,
+) -> ApiResult<TaskResponse> {
+    Ok(task_response_and_workflow(db, router, task).await?.0)
 }
 
 pub async fn task_response_and_workflow(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     task: Task,
 ) -> ApiResult<(TaskResponse, api_types::WorkflowDefinition)> {
-    task_response_and_workflow_with_awaiting_human(db, task, false).await
+    task_response_and_workflow_with_awaiting_human(db, router, task, false).await
 }
 
 pub async fn task_response_and_workflow_with_awaiting_human(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     task: Task,
     awaiting_human: bool,
 ) -> ApiResult<(TaskResponse, api_types::WorkflowDefinition)> {
@@ -253,6 +290,7 @@ pub async fn task_response_and_workflow_with_awaiting_human(
     let workflow = task_workflow_for_response(db, &task).await?;
     let response = task_response_inner(
         db,
+        router,
         task,
         true,
         awaiting_human,
@@ -264,11 +302,16 @@ pub async fn task_response_and_workflow_with_awaiting_human(
     Ok((response, workflow))
 }
 
-pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<TaskResponse> {
+pub async fn task_response_light(
+    db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
+    task: Task,
+) -> ApiResult<TaskResponse> {
     let (latest_review, latest_execution) = latest_diagnostic_rows(db, &task.id).await?;
     let workflow = task_workflow_for_response(db, &task).await?;
     task_response_inner(
         db,
+        router,
         task,
         false,
         false,
@@ -281,11 +324,12 @@ pub async fn task_response_light(db: &db::SqliteDb, task: Task) -> ApiResult<Tas
 
 pub async fn task_response_with_awaiting_human(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     task: Task,
     awaiting_human: bool,
 ) -> ApiResult<TaskResponse> {
     Ok(
-        task_response_and_workflow_with_awaiting_human(db, task, awaiting_human)
+        task_response_and_workflow_with_awaiting_human(db, router, task, awaiting_human)
             .await?
             .0,
     )
@@ -315,8 +359,10 @@ async fn latest_diagnostic_rows(
     Ok((reviews.pop(), executions.pop()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn task_response_inner(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     task: Task,
     include_actions: bool,
     awaiting_human: bool,
@@ -330,6 +376,10 @@ async fn task_response_inner(
         .cloned()
         .map(task_role_assignment_response)
         .collect();
+    let effective_coder = services::task_hierarchy::effective_coder_assignment(db, &task).await?;
+    let effective_coder_source = effective_coder.as_ref().map(|resolved| resolved.source);
+    let effective_coder =
+        effective_coder.map(|resolved| task_role_assignment_response(resolved.assignment));
 
     let has_retry_budget = workflow.states.iter().any(|state| {
         state.kind == StateKind::Gate
@@ -344,16 +394,21 @@ async fn task_response_inner(
     } else {
         Vec::new()
     };
-    let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
+    let workspace_model =
+        WorkspaceRepo::get_by_task_id(db, task.parent_task_id.as_deref().unwrap_or(&task.id))
+            .await?;
     let (plan_progress, plan_artifact) = if include_actions {
         match workspace_model.as_ref() {
-            Some(workspace) => plan_artifact_response(db, &workspace.id).await?,
+            Some(workspace) => plan_artifact_response(db, router, &workspace.id).await?,
             None => (None, None),
         }
     } else {
         (None, None)
     };
-    let workspace = workspace_model.map(workspace_response);
+    let workspace = match workspace_model {
+        Some(workspace) => Some(workspace_response(db, router, workspace).await?),
+        None => None,
+    };
     let current_role = workflow
         .states
         .iter()
@@ -368,7 +423,6 @@ async fn task_response_inner(
     let task_projection::TaskDiagnosticProjection {
         canonical_phase,
         remaining_retries,
-        execution_actions,
         error_annotation,
         workflow_health,
         workflow_exception,
@@ -383,7 +437,6 @@ async fn task_response_inner(
             execution_authority: &execution_authority,
             running_executions: &running_executions,
         },
-        include_actions,
         awaiting_human,
     );
     let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
@@ -394,7 +447,29 @@ async fn task_response_inner(
     let (execution_evidence, execution_blocker) =
         services::load_task_execution_blocker(db, &task).await?;
 
+    let (offers, workflow_exception) = if include_actions {
+        let snapshot = services::task_actions::load_snapshot(
+            db,
+            task.clone(),
+            workflow.clone(),
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+            router.daemon_connections(),
+        )
+        .await?;
+        let offers = services::available_actions(&snapshot);
+        let exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
+        (offers, exception)
+    } else {
+        (Vec::new(), workflow_exception)
+    };
+    let placement_diagnostics = services::environment_surfaces::task_placement_diagnostics(
+        db,
+        &task,
+        workspace.as_ref().map(|workspace| &workspace.placement),
+    )
+    .await?;
     Ok(TaskResponse {
+        placement_diagnostics,
         id: task.id,
         project_id: task.project_id,
         parent_task_id: task.parent_task_id.clone(),
@@ -410,8 +485,10 @@ async fn task_response_inner(
         board_position: task.board_position,
         subtask_order: task.subtask_order,
         role_assignments,
+        effective_coder,
+        effective_coder_source,
         remaining_retries,
-        execution_actions,
+        available_actions: offers,
         error_annotation,
         blocked: task
             .blocked_json
@@ -427,6 +504,9 @@ async fn task_response_inner(
         task_state_config: task.task_state_config.map(parse_json_value),
         review_passed_at: task.review_passed_at,
         archived_at: task.archived_at,
+        placement: workspace
+            .as_ref()
+            .map(|workspace| workspace.placement.clone()),
         workspace,
         plan_progress,
         plan_artifact,
@@ -470,26 +550,10 @@ fn blocking_annotation_for_projection<'a>(
     if task.failed_json.is_some() {
         return None;
     }
-    if error_annotation.is_some_and(|annotation| !annotation.recovery_actions.is_empty()) {
-        return error_annotation;
-    }
-
-    // Keep the legacy fallback in lockstep with TaskService::recovery_annotation:
-    // only the known retry/merge blocker shapes override an empty typed
-    // annotation. A generic blocked row must not widen an explicit empty
-    // annotation into actions that recovery will reject.
-    let blocked_is_recoverable_legacy = blocked_metadata.is_some_and(|annotation| {
-        annotation.annotation_type.is_retry_exhausted_metadata()
-            || (task.status == services::workflow::default_states::MERGING
-                && annotation.annotation_type == api_types::FailureKind::TargetRepoDirty)
-            || (task.status == services::workflow::default_states::MERGE_FAILED
-                && annotation.annotation_type.is_merge_recoverable())
-    });
-    if blocked_is_recoverable_legacy {
-        return blocked_metadata;
-    }
-
-    error_annotation.or(blocked_metadata)
+    error_annotation
+        .filter(|annotation| annotation.annotation_type != api_types::FailureKind::Unknown)
+        .or(blocked_metadata)
+        .or(error_annotation)
 }
 
 fn retry_budget_exhausted_for_state(
@@ -523,7 +587,46 @@ mod retry_projection_tests {
         retry_budget_exhausted_for_state,
     };
 
-    fn annotation(actions: Vec<api_types::RecoveryAction>) -> api_types::TaskBlockingAnnotation {
+    #[tokio::test]
+    async fn owner_wait_and_review_ci_blockers_project_in_task_response() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = std::sync::Arc::new(db::SqliteDb::new(pool));
+        sqlx::query("INSERT INTO project (id, name, created_at, updated_at) VALUES ('project', 'projection', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')")
+            .execute(db.pool()).await.unwrap();
+        let service = services::TaskService::new_for_test(
+            db.clone(),
+            std::sync::Arc::new(events::EventBus::default()),
+        );
+        let workflow = services::workflow::default_workflow::default_workflow();
+        for kind in [
+            api_types::FailureKind::RecoveryRequired,
+            api_types::FailureKind::BeforeWorkHookFailed,
+        ] {
+            let mut task = test_task();
+            task.blocked_json = Some(serde_json::json!({"reason":"owner unavailable", "created_at":"2026-10-01T00:00:00Z", "kind":kind, "execution_id":null}).to_string());
+            let response = super::task_response_inner(
+                &db,
+                &service.workspace_backend_router(),
+                task,
+                false,
+                false,
+                None,
+                None,
+                &workflow,
+            )
+            .await
+            .unwrap();
+            let blocked = response
+                .blocked
+                .expect("public blocked field must survive projection");
+            assert_eq!(blocked.kind, Some(kind));
+            assert_eq!(blocked.reason, "owner unavailable");
+            assert_eq!(blocked.created_at, "2026-10-01T00:00:00Z");
+        }
+    }
+
+    fn annotation(_actions: Vec<api_types::TaskAction>) -> api_types::TaskBlockingAnnotation {
         api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::RecoveryRequired,
             blocking_reason: "test blocker".to_owned(),
@@ -533,7 +636,6 @@ mod retry_projection_tests {
             artifact: None,
             message: None,
             hook: None,
-            recovery_actions: actions,
         }
     }
 
@@ -543,14 +645,14 @@ mod retry_projection_tests {
             status: services::workflow::default_states::IN_PROGRESS.to_owned(),
             ..test_task()
         };
-        let mut legacy = annotation(vec![api_types::RecoveryAction::CancelTask]);
+        let mut legacy = annotation(vec![api_types::TaskAction::Cancel { reason: None }]);
         legacy.annotation_type = api_types::FailureKind::TargetRepoDirty;
-        let typed = annotation(vec![api_types::RecoveryAction::ResetToInitial]);
+        let typed = annotation(vec![api_types::TaskAction::Restart { reason: None }]);
 
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&typed))
             .expect("one blocker selected");
 
-        assert_eq!(selected.recovery_actions, typed.recovery_actions);
+        assert_eq!(selected.annotation_type, typed.annotation_type);
     }
 
     #[test]
@@ -559,26 +661,33 @@ mod retry_projection_tests {
             status: services::workflow::default_states::MERGING.to_owned(),
             ..test_task()
         };
-        let mut legacy = annotation(vec![api_types::RecoveryAction::CancelTask]);
+        let mut legacy = annotation(vec![api_types::TaskAction::Cancel { reason: None }]);
         legacy.annotation_type = api_types::FailureKind::TargetRepoDirty;
-        let empty_typed = annotation(Vec::new());
+        let mut empty_typed = annotation(Vec::new());
+        empty_typed.annotation_type = api_types::FailureKind::Unknown;
 
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&empty_typed))
             .expect("one blocker selected");
 
-        assert_eq!(selected.recovery_actions, legacy.recovery_actions);
+        assert_eq!(
+            selected.annotation_type,
+            api_types::FailureKind::TargetRepoDirty
+        );
     }
 
     #[test]
     fn generic_legacy_blocker_does_not_override_empty_typed_annotation() {
         let task = test_task();
-        let legacy = annotation(vec![api_types::RecoveryAction::CancelTask]);
+        let legacy = annotation(vec![api_types::TaskAction::Cancel { reason: None }]);
         let empty_typed = annotation(Vec::new());
 
         let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&empty_typed))
             .expect("typed annotation remains authoritative");
 
-        assert!(selected.recovery_actions.is_empty());
+        assert_eq!(
+            selected.annotation_type,
+            api_types::FailureKind::RecoveryRequired
+        );
     }
 
     #[test]
@@ -596,7 +705,10 @@ mod retry_projection_tests {
 
         let parsed = blocked_metadata_annotation(&task).expect("legacy blocker parses");
         assert_eq!(parsed.annotation_type, api_types::FailureKind::Unknown);
-        assert!(parsed.recovery_actions.is_empty());
+        assert!(serde_json::to_value(&parsed)
+            .unwrap()
+            .get("recovery_actions")
+            .is_none());
     }
 
     #[test]
@@ -614,15 +726,13 @@ mod retry_projection_tests {
 
         let parsed = blocked_metadata_annotation(&task).expect("legacy blocker parses");
         assert_eq!(
-            parsed.recovery_actions,
-            vec![
-                api_types::RecoveryAction::RetryHook,
-                api_types::RecoveryAction::ResumeProcess,
-                api_types::RecoveryAction::ResetRetryWindow,
-                api_types::RecoveryAction::OpenInteractive,
-                api_types::RecoveryAction::CancelTask,
-            ]
+            parsed.annotation_type,
+            api_types::FailureKind::RetryExhausted
         );
+        assert!(serde_json::to_value(parsed)
+            .unwrap()
+            .get("recovery_actions")
+            .is_none());
     }
 
     fn test_task() -> db::Task {
@@ -674,7 +784,6 @@ mod retry_projection_tests {
             artifact: None,
             message: None,
             hook: None,
-            recovery_actions: vec![],
         };
 
         assert!(retry_budget_exhausted_for_state(
@@ -701,46 +810,6 @@ fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
         .get("execution_id")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    // Match TaskService::recovery_annotation's fixed legacy allowlists. The
-    // persisted list is historical data, not an authority source: trusting it
-    // here can advertise ResumeSession or retry actions that recovery will
-    // reject for the same metadata row.
-    let recovery_actions = if kind == api_types::FailureKind::Unknown {
-        Vec::new()
-    } else if kind.is_retry_exhausted_metadata() {
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::ResumeProcess,
-            api_types::RecoveryAction::ResetRetryWindow,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ]
-    } else if task.status == services::workflow::default_states::MERGING
-        && kind == api_types::FailureKind::TargetRepoDirty
-    {
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ]
-    } else if task.status == services::workflow::default_states::MERGE_FAILED
-        && kind.is_merge_recoverable()
-    {
-        vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ]
-    } else {
-        vec![
-            api_types::RecoveryAction::ResumeSession,
-            api_types::RecoveryAction::Reexecute,
-            api_types::RecoveryAction::ResetToInitial,
-            api_types::RecoveryAction::CancelTask,
-        ]
-    };
-
     Some(TaskBlockingAnnotation {
         annotation_type: kind,
         blocking_reason: reason.clone(),
@@ -763,7 +832,6 @@ fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
         }),
         message: Some(reason),
         hook: metadata.get("hook").cloned(),
-        recovery_actions,
     })
 }
 
@@ -845,45 +913,6 @@ fn parse_task_type(task_type: &str) -> TaskType {
     }
 }
 
-pub fn task_wire(task: Task, agent_name: Option<String>) -> ApiTask {
-    let task_type = parse_task_type(&task.task_type);
-    let agent_id = if task.assignee_type.as_deref() == Some("agent") {
-        task.assignee_id
-    } else {
-        None
-    };
-    ApiTask {
-        id: task.id,
-        project_id: task.project_id,
-        title: task.title,
-        description: task.description,
-        status: task.status,
-        task_type,
-        priority: task.priority.try_into().unwrap_or_else(|_| {
-            if task.priority.is_negative() {
-                i32::MIN
-            } else {
-                i32::MAX
-            }
-        }),
-        board_position: task.board_position,
-        blocked: task
-            .blocked_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        failed: task
-            .failed_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        agent_id,
-        agent_name,
-        external_issue_number: None,
-        external_issue_url: None,
-        version: task.version,
-        updated_at: task.updated_at,
-    }
-}
-
 pub fn task_role_assignment_response(assignment: TaskRoleAssignment) -> TaskRoleAssignmentResponse {
     TaskRoleAssignmentResponse {
         id: assignment.id,
@@ -921,6 +950,7 @@ pub fn agent_response(
         config_json: redact_sensitive_config(parse_json_value_or_empty_object(agent.config_json)),
         credential_handle_id: agent.credential_ref,
         daemon_id: agent.daemon_id,
+        runnable_on: Default::default(),
         max_concurrent_tasks: agent.max_concurrent_tasks,
         status,
         active_assigned_task_count,
@@ -950,8 +980,17 @@ fn projected_agent_status(
     }
 }
 
-pub fn daemon_response(daemon: Daemon) -> DaemonResponse {
+pub fn daemon_response(db: &db::SqliteDb, mut daemon: Daemon) -> DaemonResponse {
+    if services::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id) {
+        daemon.max_concurrent_runs = Some(db.server_run_cap.effective().unwrap_or(0));
+    }
     DaemonResponse {
+        max_concurrent_runs: daemon.max_concurrent_runs,
+        run_limit: daemon.run_limit,
+        effective_max_concurrent_runs: services::placement::capacity::effective_machine_cap(
+            daemon.max_concurrent_runs,
+            daemon.run_limit,
+        ),
         id: daemon.id,
         machine_id: daemon.machine_id,
         hostname: daemon.hostname,
@@ -970,19 +1009,69 @@ pub fn daemon_response(daemon: Daemon) -> DaemonResponse {
     }
 }
 
-pub fn workspace_response(workspace: Workspace) -> WorkspaceResponse {
-    WorkspaceResponse {
+pub async fn workspace_response(
+    db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
+    workspace: Workspace,
+) -> ApiResult<WorkspaceResponse> {
+    let placement = match db::WorkspacePlacementRepo::get_by_workspace_id(db, &workspace.id).await?
+    {
+        Some(placement) => placement,
+        None => {
+            router
+                .resolve(db, &workspace)
+                .await
+                .map_err(services::ServiceError::from)?
+                .placement
+        }
+    };
+    let worktree_path = if placement.owner_kind == db::PlacementOwnerKind::Server {
+        placement.workspace_handle.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let placement = workspace_placement_response(placement)?;
+    Ok(WorkspaceResponse {
         id: workspace.id,
         task_id: workspace.task_id,
         repo_id: workspace.repo_id,
-        worktree_path: workspace.worktree_path,
+        worktree_path,
+        placement,
         branch: workspace.branch,
         status: workspace.status.to_string(),
         before_sha: workspace.before_sha,
         error: workspace.error,
         created_at: workspace.created_at,
         updated_at: workspace.updated_at,
-    }
+    })
+}
+
+pub fn workspace_placement_response(
+    placement: db::WorkspacePlacement,
+) -> ApiResult<WorkspacePlacementResponse> {
+    Ok(WorkspacePlacementResponse {
+        id: placement.id,
+        workspace_id: placement.workspace_id,
+        task_id: placement.task_id,
+        agent_id: placement.agent_id,
+        owner_kind: placement.owner_kind.to_string(),
+        daemon_id: placement.daemon_id,
+        runtime_id: placement.runtime_id,
+        repo_location_id: placement.repo_location_id,
+        execution_daemon_id: placement.execution_daemon_id,
+        workspace_handle: placement.workspace_handle,
+        generation: placement.generation,
+        state: placement.state.to_string(),
+        selected_by: placement.selected_by.to_string(),
+        selection_reason: serde_json::from_str(&placement.selection_reason)
+            .map_err(|_| ApiError::internal("invalid workspace placement selection reason"))?,
+        reserved_until: placement.reserved_until,
+        disconnected_at: placement.disconnected_at,
+        failure_cause: placement.failure_cause.map(|cause| cause.to_string()),
+        version: placement.version,
+        created_at: placement.created_at,
+        updated_at: placement.updated_at,
+    })
 }
 
 pub fn execution_response(execution: Execution) -> ExecutionResponse {
@@ -1200,12 +1289,14 @@ fn execution_status_code(value: &db::ExecutionStatus) -> &'static str {
 
 pub async fn execution_response_with_plan(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     execution: Execution,
 ) -> ApiResult<ExecutionResponse> {
     let workspace_id = execution.workspace_id.clone();
     let mut response = execution_response_with_usage(db, execution).await?;
     if let Some(workspace_id) = workspace_id {
-        let (plan_progress, plan_artifact) = plan_artifact_response(db, &workspace_id).await?;
+        let (plan_progress, plan_artifact) =
+            plan_artifact_response(db, router, &workspace_id).await?;
         response.plan_progress = plan_progress;
         response.plan_artifact = plan_artifact;
     }
@@ -1229,12 +1320,13 @@ pub async fn execution_response_with_usage(
 
 async fn plan_artifact_response(
     db: &db::SqliteDb,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     workspace_id: &str,
 ) -> ApiResult<(
     Option<api_types::PlanProgressSummary>,
     Option<api_types::PlanArtifactDetail>,
 )> {
-    match read_plan_for_workspace(db, workspace_id).await {
+    match read_plan_with_router(db, router, workspace_id).await {
         Ok(Some((progress, artifact))) => Ok((Some(progress), Some(artifact))),
         Ok(None) | Err(PlanArtifactError::WorkspaceNotFound { .. }) => Ok((None, None)),
         Err(PlanArtifactError::DbError(error)) => Err(ApiError::from(error)),
@@ -1361,20 +1453,6 @@ where
                 .map_err(|_| ApiError::bad_request(format!("invalid {field}: {item}")))
         })
         .collect()
-}
-
-pub fn parse_optional<T>(value: Option<&String>, field: &str) -> ApiResult<Option<T>>
-where
-    T: FromStr,
-    <T as FromStr>::Err: std::fmt::Display,
-{
-    value
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| ApiError::bad_request(format!("invalid {field}: {value}")))
-        })
-        .transpose()
 }
 
 fn parse_json_value(value: impl Into<String>) -> Value {

@@ -55,7 +55,7 @@ pub async fn create_embedded_agent(
             max_output_tokens: request.max_output_tokens,
         })
         .await?;
-    let agent = response_for_agent(&state, connected.agent).await?;
+    let agent = response_for_agent(&state, connected.agent, user.is_admin).await?;
     Ok(Json(ConnectedEmbeddedAgentResponse {
         agent,
         credential_handle: credential_response(connected.credential_handle),
@@ -91,7 +91,7 @@ pub async fn connect_embedded_profile(
         })
         .await?;
     Ok(Json(ConnectedEmbeddedProfileResponse {
-        agent: response_for_agent(&state, agent).await?,
+        agent: response_for_agent(&state, agent, user.is_admin).await?,
         profile: profile_response(profile),
         credential_handle: credential_response(credential),
         health: health_response(health),
@@ -125,7 +125,9 @@ pub async fn select_profile(
         },
     )
     .await?;
-    Ok(Json(response_for_agent(&state, agent).await?))
+    Ok(Json(
+        response_for_agent(&state, agent, user.is_admin).await?,
+    ))
 }
 
 pub async fn create_session(
@@ -311,25 +313,43 @@ async fn set_session_status(
     Ok(Json(session_response(session)))
 }
 
-async fn response_for_agent(state: &AppState, agent: Agent) -> ApiResult<api_types::AgentResponse> {
+async fn response_for_agent(
+    state: &AppState,
+    agent: Agent,
+    admin: bool,
+) -> ApiResult<api_types::AgentResponse> {
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
-    let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
+    let usage = state.usage_ledger_index.agent(&agent.id).await?;
     let active_assigned_task_count =
         AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     let running_execution_count =
         AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
-    let effective_status = compute_effective_status(&state.db, &agent)
-        .await?
-        .as_str()
-        .to_owned();
-    Ok(agent_response(
+    let effective_status =
+        compute_effective_status(&state.db, &agent, Some(&state.daemon_connections))
+            .await?
+            .as_str()
+            .to_owned();
+    let runnable_on = services::environment_surfaces::runnable_on(
+        &state.db,
+        &agent,
+        &state.adapter_registry,
+        &state.daemon_connections,
+        admin,
+    )
+    .await?;
+    let mut response = agent_response(
         agent,
         Some(active_assigned_task_count),
         Some(running_execution_count),
         Some(effective_status),
         stats,
         usage,
-    ))
+    );
+    response.runnable_on = runnable_on;
+    if !admin {
+        response.daemon_id = None;
+    }
+    Ok(response)
 }
 
 async fn require_owned_identity(
@@ -433,6 +453,8 @@ fn protected_interaction_error(error: AgentHostError) -> ApiError {
             )
         }
         AgentHostError::CredentialNotFound
+        | AgentHostError::AgentPaused { .. }
+        | AgentHostError::ProjectPaused { .. }
         | AgentHostError::Runtime(_)
         | AgentHostError::RuntimeWithUsage { .. }
         | AgentHostError::TurnLimitReached { .. }

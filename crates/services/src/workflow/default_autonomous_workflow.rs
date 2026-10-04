@@ -8,8 +8,6 @@ use serde_json::json;
 
 use crate::workflow::{default_roles, dispatch};
 
-pub const PRESET_NAME: &str = "autonomous_v1";
-
 pub const BACKLOG: &str = "backlog";
 pub const READY: &str = "ready";
 pub const WORKING: &str = "working";

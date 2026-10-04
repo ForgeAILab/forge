@@ -114,7 +114,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: Some("https://example.com/repo.git".to_owned()),
             default_branch: "main".to_owned(),
             created_at: now.clone(),
@@ -188,8 +187,13 @@ async fn assign_role(db: &SqliteDb, task_id: &str, role_name: &str) {
 }
 
 fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
-    let task_service = services::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let task_service = services::TaskService::new_for_test(Arc::clone(&db), Arc::clone(&event_bus));
     WorkflowEngine {
+        workspace_backend_router: services::TaskService::new_for_test(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+        )
+        .workspace_backend_router(),
         db,
         event_bus,
         review_runner: None,

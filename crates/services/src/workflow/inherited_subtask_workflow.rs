@@ -191,7 +191,6 @@ mod tests {
                 name: "forge".to_owned(),
                 remote_url: Some("https://example.com/forge.git".to_owned()),
                 local_path: None,
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -278,6 +277,7 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(16));
         let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
         let engine = WorkflowEngine {
+            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
             db,
             event_bus,
             review_runner: None,

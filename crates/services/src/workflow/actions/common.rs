@@ -3,11 +3,10 @@ use std::sync::Arc;
 use db::{
     new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, DbError, Execution,
     ExecutionRepo, ProjectRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo,
-    TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    TaskRoleAssignment, TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
-use tokio::process::Command;
 
 use crate::workflow::{
     default_states,
@@ -15,22 +14,15 @@ use crate::workflow::{
     inherited_subtask_workflow, HookContext, HookResult,
 };
 
-pub(super) async fn publish_domain_event(ctx: &HookContext, dedupe_key: &str) {
-    let service = crate::DomainEventService::new(Arc::clone(&ctx.db), Arc::clone(&ctx.event_bus));
-    if let Err(error) = service.publish_by_dedupe(dedupe_key).await {
-        tracing::warn!(dedupe_key, %error, "failed to mirror committed domain event");
-    }
-}
-
 pub(super) async fn get_role_assignment(
     ctx: &HookContext,
     role: &str,
 ) -> Result<Option<TaskRoleAssignment>, String> {
-    match TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role).await {
-        Ok(assignment) => Ok(assignment),
-        Err(DbError::NotFound) => Ok(None),
-        Err(error) => Err(error.to_string()),
-    }
+    let task = task(ctx).await?;
+    crate::task_hierarchy::effective_role_assignment(&ctx.db, &task, role)
+        .await
+        .map(|resolved| resolved.map(|resolved| resolved.assignment))
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn execution_guard_roles(role: &str) -> Vec<&str> {
@@ -103,6 +95,27 @@ pub(super) async fn workspace_id(ctx: &HookContext) -> Option<String> {
         .map(|workspace| workspace.id)
 }
 
+pub(super) fn workspace_backend_router(
+    ctx: &HookContext,
+) -> Arc<crate::workspace_backend::WorkspaceBackendRouter> {
+    Arc::clone(&ctx.workspace_backend_router)
+}
+
+pub(super) async fn resolve_workspace_backend(
+    ctx: &HookContext,
+    workspace: &db::Workspace,
+) -> crate::Result<crate::workspace_backend::ResolvedWorkspace> {
+    Ok(
+        crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &workspace_backend_router(ctx),
+            &ctx.db,
+            workspace,
+            &ctx.workspace_root,
+        )
+        .await?,
+    )
+}
+
 pub(super) async fn cancel_subtask_with_effective_workflow(
     ctx: &HookContext,
     subtask: db::Task,
@@ -168,6 +181,7 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
         terminal_activity: ctx.terminal_activity.clone(),
         workspace_root: ctx.workspace_root.clone(),
         repo_cache_locks: ctx.repo_cache_locks.clone(),
+        workspace_backend_router: Arc::clone(&ctx.workspace_backend_router),
     };
     engine
         .transition_with_authority(
@@ -617,17 +631,7 @@ pub(super) async fn cancel_review_after_authority_loss(
     )
     .await
     {
-        Ok(Some(cancelled)) => {
-            publish_domain_event(
-                ctx,
-                &format!(
-                    "review-status:{}:{}:{}",
-                    cancelled.id, cancelled.status, now
-                ),
-            )
-            .await;
-        }
-        Ok(None) => {}
+        Ok(Some(_)) | Ok(None) => {}
         Err(error) => {
             tracing::warn!(
                 review_id = %review.id,
@@ -808,11 +812,7 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
         candidate_execution_id,
     )
     .await?;
-    publish_domain_event(
-        ctx,
-        &format!("review-status:{}:{}:{}", review.id, review.status, now),
-    )
-    .await;
+
     let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
     if let Err(error) = memory_service
         .record_review_result_if_final(&ctx.project_id, &review)
@@ -850,11 +850,16 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
     Ok(())
 }
 
+pub(super) struct CiStepFailure {
+    pub error: crate::workspace_backend::WorkspaceBackendError,
+    pub completed_steps: usize,
+}
+
 pub(super) async fn run_ci_steps_in_worktree(
-    worktree_path: &str,
+    workspace: &crate::workspace_backend::ResolvedWorkspace,
     ci_steps: &[String],
     env: &std::collections::BTreeMap<String, String>,
-) -> Result<(Vec<Value>, Option<usize>), String> {
+) -> Result<(Vec<Value>, Option<usize>), CiStepFailure> {
     let mut results = Vec::with_capacity(ci_steps.len());
 
     for (index, step) in ci_steps.iter().enumerate() {
@@ -862,23 +867,26 @@ pub(super) async fn run_ci_steps_in_worktree(
         // API publishes them, so stamp each step here — this is the only place
         // that knows when a step actually ran.
         let started_at = now_rfc3339();
-        let output = Command::new("bash")
-            .arg("-lc")
-            .arg(step)
-            .envs(env)
-            .current_dir(worktree_path)
-            .output()
+        let output = workspace
+            .backend
+            .run(
+                &workspace.placement,
+                &crate::workspace_backend::RunSpec {
+                    purpose: api_types::WorkspaceRunPurpose::CiStep,
+                    command: step.clone(),
+                    env: env.clone(),
+                    timeout_secs: 0,
+                    max_output_bytes: usize::MAX,
+                },
+            )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CiStepFailure {
+                error,
+                completed_steps: index,
+            })?;
         let finished_at = now_rfc3339();
-        let stderr = executors::environment::redact_environment_values(
-            &String::from_utf8_lossy(&output.stderr),
-            env,
-        );
-        let stdout = executors::environment::redact_environment_values(
-            &String::from_utf8_lossy(&output.stdout),
-            env,
-        );
+        let stderr = executors::environment::redact_environment_values(&output.stderr_tail, env);
+        let stdout = executors::environment::redact_environment_values(&output.stdout_tail, env);
         let output_tail = if stdout.is_empty() {
             stderr.clone()
         } else if stderr.is_empty() {
@@ -886,7 +894,11 @@ pub(super) async fn run_ci_steps_in_worktree(
         } else {
             format!("{stdout}\n{stderr}")
         };
-        let exit_code = output.status.code().unwrap_or(1);
+        let exit_code = if output.exit_code < 0 {
+            1
+        } else {
+            output.exit_code
+        };
         results.push(json!({
             "index": index,
             "command": step,

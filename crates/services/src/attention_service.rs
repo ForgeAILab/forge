@@ -8,31 +8,35 @@ use api_types::{
     MissionControlCoordinationActivity, MissionControlHomeResponse, MissionControlRecentOutcome,
     MissionControlWorkItem, UsageAggregate,
 };
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use db::{
     new_uuid_v4, now_rfc3339,
     task_interruption_requires_intervention as interruption_fields_require_intervention,
     AgentContextScopeRepo, AgentRepo, AttentionListQuery, AttentionProjection, AttentionRepo,
-    ClaimDomainEvents, CompleteDomainEvent, CreateAttentionProjection, CreateDomainEvent,
-    DomainEvent, DomainEventRepo, EventConsumerCursor, Page, PageRequest, ProjectMemberRepo,
-    ProjectRepo, SqliteDb, UpdateAttentionLifecycle, UpsertAttentionConsumerHealth,
+    CreateAttentionProjection, CreateDomainEvent, DomainEvent, DomainEventRepo,
+    EventConsumerCursor, Page, PageRequest, ProjectMemberRepo, ProjectRepo, SqliteDb,
+    UpdateAttentionLifecycle,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, Transaction};
-use tokio::sync::{watch, Mutex};
+use sqlx::{Acquire, Row, Sqlite, Transaction};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
-use crate::{Result, ServiceError};
+use crate::{
+    worker_runtime::{Outcome, Subscription, Worker, WorkerError, WorkerRuntime},
+    Result, ServiceError,
+};
 
 const CONSUMER_NAME: &str = "attention_projection";
-const CONSUMER_LEASE_SECONDS: i64 = 30;
+
+pub(crate) fn attention_consumer_name() -> &'static str {
+    CONSUMER_NAME
+}
+
 const CONSUMER_STALE_SECONDS: i64 = 90;
 const MAX_ATTENTION_SUMMARY_LEN: usize = 160;
-const PROJECTION_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
-const HEALTH_WRITE_INTERVAL: StdDuration = StdDuration::from_secs(5);
-const HEALTH_WRITE_EVENTS: i64 = 100;
 /// Terminal execution truth is committed before Task recovery disposition.
 /// Give that short saga time to settle before treating a still-manual,
 /// undisposed terminal attempt as an actionable orphan.
@@ -49,12 +53,6 @@ pub struct AttentionProjectionRun {
     pub claimed_events: usize,
     pub processed_events: usize,
     pub last_sequence: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectionOutcome {
-    Completed,
-    Deferred,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,16 +161,8 @@ enum WakeDecisionEvent {
 #[derive(Clone)]
 pub struct AttentionService {
     db: Arc<SqliteDb>,
+    action_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     event_bus: Option<Arc<events::EventBus>>,
-    health_writes: Arc<Mutex<ConsumerHealthWrites>>,
-}
-
-#[derive(Default)]
-struct ConsumerHealthWrites {
-    pending: Option<UpsertAttentionConsumerHealth>,
-    last_written: Option<Instant>,
-    lease_owner: Option<String>,
-    lease_until: Option<String>,
 }
 
 impl AttentionService {
@@ -180,8 +170,18 @@ impl AttentionService {
         Self {
             db,
             event_bus: None,
-            health_writes: Arc::new(Mutex::new(ConsumerHealthWrites::default())),
+            action_connections: None,
         }
+    }
+
+    /// Offer construction uses the same live owner resume facts as Task reads.
+    #[must_use]
+    pub fn with_action_connections(
+        mut self,
+        connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+    ) -> Self {
+        self.action_connections = Some(connections);
+        self
     }
 
     /// Attach the event bus so an autonomy stall reaches the user. Without it
@@ -225,197 +225,16 @@ impl AttentionService {
         });
     }
 
-    /// Start the durable Attention projection consumer.  The worker owns no
-    /// mutable in-memory cursor: each tick claims from the database ledger,
-    /// records bounded health, and exits promptly when the server requests
-    /// shutdown.
-    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut poll = tokio::time::interval(PROJECTION_POLL_INTERVAL);
-            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow_and_update() {
-                            break;
-                        }
-                    }
-                    _ = poll.tick() => {
-                        if let Err(error) = self.project_once(100).await {
-                            tracing::warn!(error = %error, "Attention projection poll failed");
-                        }
-                    }
-                }
-            }
-        })
+    pub fn start(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        Arc::new(WorkerRuntime::new(Arc::clone(&self.db), self)).start(shutdown)
     }
-
-    /// Claim and project a bounded batch from the authoritative event ledger.
-    /// Every event is checkpointed only after its projection has committed, so
-    /// a crash leaves the event eligible for an idempotent replay.
     pub async fn project_once(&self, limit: i64) -> Result<AttentionProjectionRun> {
-        let result = self.project_batch(limit).await;
-        if let Err(error) = &result {
-            let writes = self.health_writes.lock().await;
-            let input = UpsertAttentionConsumerHealth {
-                consumer_name: CONSUMER_NAME.to_owned(),
-                last_sequence: 0,
-                last_started_at: None,
-                last_success_at: None,
-                last_error_at: Some(now_rfc3339()),
-                last_error_code: Some(error_code(error).to_owned()),
-                last_error_message: Some(bounded_error_message(error)),
-                lease_owner: writes.pending.as_ref().map_or_else(
-                    || writes.lease_owner.clone(),
-                    |pending| pending.lease_owner.clone(),
-                ),
-                lease_until: writes.pending.as_ref().map_or_else(
-                    || writes.lease_until.clone(),
-                    |pending| pending.lease_until.clone(),
-                ),
-                processed_events_delta: 0,
-                updated_at: now_rfc3339(),
-            };
-            drop(writes);
-            // Preserve the projection error if the database also rejects its health write.
-            let _ = self.record_health(input).await;
-        }
-        result
-    }
-
-    async fn project_batch(&self, limit: i64) -> Result<AttentionProjectionRun> {
-        let owner = new_uuid_v4();
-        let started_at = now_rfc3339();
-        let leased_until = (Utc::now() + Duration::seconds(CONSUMER_LEASE_SECONDS)).to_rfc3339();
-        let events = DomainEventRepo::claim_event_batch(
-            &*self.db,
-            ClaimDomainEvents {
-                consumer_name: CONSUMER_NAME.to_owned(),
-                lease_owner: owner.clone(),
-                now: started_at.clone(),
-                leased_until: leased_until.clone(),
-                limit: limit.clamp(1, 100),
-            },
-        )
-        .await?;
-        let claimed_events = events.len();
-        // Empty polls have no reportable processing lease. Their final health
-        // update is just an interval-limited heartbeat.
-        if claimed_events > 0 {
-            self.record_health(UpsertAttentionConsumerHealth {
-                consumer_name: CONSUMER_NAME.to_owned(),
-                last_sequence: 0,
-                last_started_at: Some(started_at.clone()),
-                last_success_at: None,
-                last_error_at: None,
-                last_error_code: None,
-                last_error_message: None,
-                lease_owner: Some(owner.clone()),
-                lease_until: Some(leased_until.clone()),
-                processed_events_delta: 0,
-                updated_at: started_at.clone(),
-            })
+        let processed_events = WorkerRuntime::new(Arc::clone(&self.db), Arc::new(self.clone()))
+            .run_once(limit.clamp(1, 100) as usize)
             .await?;
-        }
-        let mut processed_events = 0;
-        let mut last_sequence = self
-            .consumer_cursor()
-            .await?
-            .map(|cursor| cursor.last_sequence)
-            .unwrap_or(0);
-
-        for event in events {
-            let projection = self.project_event(&event).await;
-            if matches!(projection, Ok(ProjectionOutcome::Deferred)) {
-                // The execution terminal CAS is deliberately earlier than
-                // retry/block disposition. Release this batch immediately so
-                // the next poll can observe the settled Task instead of
-                // waiting for the ordinary 30-second crash lease.
-                let released_at = now_rfc3339();
-                sqlx::query(
-                    "UPDATE event_processing_lease
-                     SET leased_until = ?, updated_at = ?
-                     WHERE consumer_name = ? AND lease_owner = ?",
-                )
-                .bind(&released_at)
-                .bind(&released_at)
-                .bind(CONSUMER_NAME)
-                .bind(&owner)
-                .execute(self.db.pool())
-                .await?;
-                break;
-            }
-            if let Err(error) = projection {
-                // A semantic dedupe/check conflict can never succeed on
-                // retry: retrying the same event forever wedges the cursor
-                // and silences the entire wake pipeline. Quarantine the
-                // event (complete it without projection) and keep going;
-                // transient errors still abort the poll and retry.
-                if !matches!(&error, ServiceError::Db(db::DbError::Check(_))) {
-                    return Err(error);
-                }
-                tracing::error!(
-                    event_sequence = event.sequence,
-                    event_id = %event.id,
-                    event_type = %event.event_type,
-                    %error,
-                    "attention projection quarantined a poison event"
-                );
-            }
-
-            let completed_at = now_rfc3339();
-            let dedupe_key = crate::domain_event_service::event_completion_dedupe_key(&event);
-            DomainEventRepo::complete_claimed_event(
-                &*self.db,
-                CompleteDomainEvent {
-                    consumer_name: CONSUMER_NAME.to_owned(),
-                    lease_owner: owner.clone(),
-                    event_sequence: event.sequence,
-                    event_id: event.id.clone(),
-                    dedupe_key,
-                    completed_at: completed_at.clone(),
-                },
-            )
-            .await?;
-            processed_events += 1;
-            last_sequence = event.sequence;
-            self.record_health(UpsertAttentionConsumerHealth {
-                consumer_name: CONSUMER_NAME.to_owned(),
-                last_sequence,
-                last_started_at: None,
-                last_success_at: Some(completed_at.clone()),
-                last_error_at: None,
-                last_error_code: None,
-                last_error_message: None,
-                lease_owner: Some(owner.clone()),
-                lease_until: Some(leased_until.clone()),
-                processed_events_delta: 1,
-                updated_at: completed_at,
-            })
-            .await?;
-        }
-
-        self.record_health(UpsertAttentionConsumerHealth {
-            consumer_name: CONSUMER_NAME.to_owned(),
-            last_sequence,
-            last_started_at: None,
-            last_success_at: if processed_events == 0 {
-                None
-            } else {
-                Some(now_rfc3339())
-            },
-            last_error_at: None,
-            last_error_code: None,
-            last_error_message: None,
-            lease_owner: None,
-            lease_until: None,
-            processed_events_delta: 0,
-            updated_at: now_rfc3339(),
-        })
-        .await?;
-
+        let last_sequence = self.consumer_cursor().await?.map_or(0, |c| c.last_sequence);
         Ok(AttentionProjectionRun {
-            claimed_events,
+            claimed_events: processed_events,
             processed_events,
             last_sequence,
         })
@@ -597,13 +416,50 @@ impl AttentionService {
                 .await;
         }
 
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        let committed = self
+            .admit_wake_in_tx(&mut transaction, &request, &context)
+            .await?;
+        transaction.commit().await?;
+        if let Some((scope_type, scope_id)) = committed.stall_scope {
+            self.publish_autonomy_stall(
+                &scope_type,
+                &scope_id,
+                "the Project Agent's hourly wake budget is exhausted",
+            )
+            .await;
+        }
+        Ok(committed.result)
+    }
+
+    async fn admit_wake_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        request: &WakeAdmissionRequest,
+        context: &WakeDecisionContext,
+    ) -> Result<CommittedWakeAdmission> {
+        let mut stall_scope = None;
+        let result = self
+            .admit_wake_result_in_tx(transaction, request, context, &mut stall_scope)
+            .await?;
+        Ok(CommittedWakeAdmission {
+            result,
+            stall_scope,
+        })
+    }
+    async fn admit_wake_result_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        request: &WakeAdmissionRequest,
+        context: &WakeDecisionContext,
+        stall_scope: &mut Option<(String, String)>,
+    ) -> Result<WakeAdmissionResult> {
         let now = parse_rfc3339(&request.now).unwrap_or_else(Utc::now);
         let lease_seconds = request.lease_seconds.clamp(1, 300);
         let cooldown_seconds = request.cooldown_seconds.clamp(1, 86_400);
         let leased_until = (now + Duration::seconds(lease_seconds)).to_rfc3339();
         let cooldown_until = (now + Duration::seconds(cooldown_seconds)).to_rfc3339();
         let now = now.to_rfc3339();
-        let mut transaction = db::begin_immediate(self.db.pool()).await?;
 
         // Attention is authoritative at the admission boundary.  A source
         // event can be delivered after an operator resolves its incident;
@@ -612,28 +468,27 @@ impl AttentionService {
         let attention_status = if let Some(attention_id) = context.attention_id.as_deref() {
             sqlx::query_scalar::<_, String>("SELECT status FROM attention_projection WHERE id = ?")
                 .bind(attention_id)
-                .fetch_optional(&mut *transaction)
+                .fetch_optional(&mut **transaction)
                 .await?
         } else {
             sqlx::query_scalar::<_, String>(
                 "SELECT status FROM attention_projection WHERE dedupe_key = ?",
             )
             .bind(&request.incident_key)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
         };
         if attention_status.as_deref() == Some("resolved") {
             self.append_wake_decision_in_tx(
-                &mut transaction,
-                &request,
-                &context,
+                transaction,
+                request,
+                context,
                 WakeDecisionEvent::Suppressed(WakeSuppressionReason::ResolvedIncident),
                 None,
                 None,
                 &now,
             )
             .await?;
-            transaction.commit().await?;
             return Ok(WakeAdmissionResult::Suppressed {
                 reason: WakeSuppressionReason::ResolvedIncident,
             });
@@ -646,14 +501,14 @@ impl AttentionService {
             let active = if let Some(execution_id) = context.orphan_execution_id.as_deref() {
                 // A successor can commit between projection and admission.
                 // Check again under the same writer lock as wake budgeting.
-                orphan_attempt_is_current(&self.db, &mut transaction, execution_id).await?
+                orphan_attempt_is_current(&self.db, transaction, execution_id).await?
             } else if let Some(task_id) = context.task_id.as_deref() {
                 let row = sqlx::query(
                     "SELECT error_annotation, blocked_json, failed_json
                      FROM task WHERE id = ? AND deleted_at IS NULL",
                 )
                 .bind(task_id)
-                .fetch_optional(&mut *transaction)
+                .fetch_optional(&mut **transaction)
                 .await?;
                 row.is_some_and(|row| {
                     let error_annotation = row
@@ -689,20 +544,19 @@ impl AttentionService {
                     .bind(&now)
                     .bind(attention_id)
                     .bind(context.attention_version)
-                    .execute(&mut *transaction)
+                    .execute(&mut **transaction)
                     .await?;
                 }
                 self.append_wake_decision_in_tx(
-                    &mut transaction,
-                    &request,
-                    &context,
+                    transaction,
+                    request,
+                    context,
                     WakeDecisionEvent::Suppressed(WakeSuppressionReason::ResolvedIncident),
                     None,
                     None,
                     &now,
                 )
                 .await?;
-                transaction.commit().await?;
                 return Ok(WakeAdmissionResult::Suppressed {
                     reason: WakeSuppressionReason::ResolvedIncident,
                 });
@@ -711,7 +565,7 @@ impl AttentionService {
 
         let (budget, budget_scope_type, budget_scope_id) = self
             .wake_budget_in_tx(
-                &mut transaction,
+                transaction,
                 &request.identity_id,
                 &request.scope_type,
                 &request.scope_id,
@@ -737,7 +591,7 @@ impl AttentionService {
         .bind(&request.incident_key)
         .bind(&now)
         .bind(&now)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
         if let Some(row) = existing_lease {
             let leased_until_existing: String = row.try_get("leased_until")?;
@@ -753,16 +607,15 @@ impl AttentionService {
                 WakeSuppressionReason::DuplicateIncident
             };
             self.append_wake_decision_in_tx(
-                &mut transaction,
-                &request,
-                &context,
+                transaction,
+                request,
+                context,
                 WakeDecisionEvent::Suppressed(reason.clone()),
                 budget,
                 Some((&budget_scope_type, &budget_scope_id)),
                 &now,
             )
             .await?;
-            transaction.commit().await?;
             return Ok(WakeAdmissionResult::Suppressed { reason });
         }
 
@@ -772,12 +625,12 @@ impl AttentionService {
         // source was already pre-admitted; return its metadata rather than
         // incrementing the budget a second time before the domain-event
         // dedupe turns the append into a no-op.
-        let dedupe_key = wake_admitted_dedupe_key(&request, &context);
+        let dedupe_key = wake_admitted_dedupe_key(request, context);
         let admitted_payload = sqlx::query_scalar::<_, String>(
             "SELECT payload_json FROM domain_event WHERE dedupe_key = ?",
         )
         .bind(&dedupe_key)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
         if let Some(payload_json) = admitted_payload {
             let payload = serde_json::from_str::<Value>(&payload_json).unwrap_or(Value::Null);
@@ -792,7 +645,6 @@ impl AttentionService {
                 .unwrap_or_default()
                 .to_owned();
             let budget_remaining = payload.get("budget_remaining").and_then(Value::as_i64);
-            transaction.rollback().await?;
             return Ok(WakeAdmissionResult::Admitted {
                 leased_until,
                 cooldown_until,
@@ -801,28 +653,45 @@ impl AttentionService {
         }
 
         if budget == Some(0) {
+            *stall_scope = Some((budget_scope_type.clone(), budget_scope_id.clone()));
+            if budget_scope_type == "project" {
+                let open_incidents: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM attention_projection WHERE scope_type = 'project' AND scope_id = ? AND status = 'open'"
+                ).bind(&budget_scope_id).fetch_one(&mut **transaction).await?;
+                if open_incidents > 0 {
+                    DomainEventRepo::append_event_in_tx(&*self.db, transaction, &CreateDomainEvent {
+                        id: new_uuid_v4(), event_type: "notification.requested".to_owned(),
+                        entity_type: "project".to_owned(), entity_id: budget_scope_id.clone(),
+                        actor_type: "system".to_owned(), actor_id: None,
+                        scope_type: "project".to_owned(), scope_id: budget_scope_id.clone(),
+                        correlation_id: request.correlation_id.clone(), causation_id: request.causation_id.clone(),
+                        causation_depth: request.reaction_depth,
+                        dedupe_key: None,
+                        payload_json: json!({
+                            "project_id": budget_scope_id, "task_id": null,
+                            "event_type": "project.autonomy_stalled",
+                            "title": format!("Project Agent stopped: {open_incidents} open incident(s) unanswered"),
+                            "body": "the Project Agent's hourly wake budget is exhausted"
+                        }).to_string(), created_at: now.clone(),
+                    }).await?;
+                }
+            }
             self.append_wake_decision_in_tx(
-                &mut transaction,
-                &request,
-                &context,
+                transaction,
+                request,
+                context,
                 WakeDecisionEvent::Suppressed(WakeSuppressionReason::BudgetExhausted),
                 budget,
                 Some((&budget_scope_type, &budget_scope_id)),
                 &now,
             )
             .await?;
-            transaction.commit().await?;
-            self.publish_autonomy_stall(
-                &budget_scope_type,
-                &budget_scope_id,
-                "the Project Agent's hourly wake budget is exhausted",
-            )
-            .await;
             return Ok(WakeAdmissionResult::Suppressed {
                 reason: WakeSuppressionReason::BudgetExhausted,
             });
         }
 
+        let mut budget_attempt = transaction.begin().await?;
         let window_started =
             (parse_rfc3339(&now).unwrap_or_else(Utc::now) - Duration::hours(1)).to_rfc3339();
         let budget_remaining = if let Some(budget) = budget {
@@ -834,7 +703,7 @@ impl AttentionService {
             .bind(&request.identity_id)
             .bind(&budget_scope_type)
             .bind(&budget_scope_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut *budget_attempt)
             .await?;
             let (admitted_count, in_window) = current
                 .map(|row| {
@@ -846,16 +715,16 @@ impl AttentionService {
                 .unwrap_or((0, false));
             if in_window && admitted_count >= budget {
                 self.append_wake_decision_in_tx(
-                    &mut transaction,
-                    &request,
-                    &context,
+                    &mut budget_attempt,
+                    request,
+                    context,
                     WakeDecisionEvent::Suppressed(WakeSuppressionReason::BudgetExhausted),
                     Some(0),
                     Some((&budget_scope_type, &budget_scope_id)),
                     &now,
                 )
                 .await?;
-                transaction.commit().await?;
+                budget_attempt.commit().await?;
                 return Ok(WakeAdmissionResult::Suppressed {
                     reason: WakeSuppressionReason::BudgetExhausted,
                 });
@@ -871,7 +740,7 @@ impl AttentionService {
                 .bind(&request.identity_id)
                 .bind(&budget_scope_type)
                 .bind(&budget_scope_id)
-                .execute(&mut *transaction)
+                .execute(&mut *budget_attempt)
                 .await?;
             } else {
                 sqlx::query(
@@ -890,7 +759,7 @@ impl AttentionService {
                 .bind(&budget_scope_id)
                 .bind(&now)
                 .bind(&now)
-                .execute(&mut *transaction)
+                .execute(&mut *budget_attempt)
                 .await?;
             }
             Some((budget - admitted_count - 1).max(0))
@@ -930,29 +799,36 @@ impl AttentionService {
         .bind(&now)
         .bind(&request.correlation_id)
         .bind(request.causation_id.as_deref())
-        .execute(&mut *transaction)
+        .execute(&mut *budget_attempt)
         .await?;
         if lease_result.rows_affected() == 0 {
             // This is normally covered by the global pre-check.  Keep the
             // compare-and-swap result authoritative for same-transaction
             // replays and classify an expired lease/cooldown conservatively.
-            transaction.rollback().await?;
-            return self
-                .persist_suppressed_wake(
-                    &request,
-                    &context,
-                    WakeSuppressionReason::DuplicateIncident,
-                )
-                .await;
+            budget_attempt.rollback().await?;
+            self.append_wake_decision_in_tx(
+                transaction,
+                request,
+                context,
+                WakeDecisionEvent::Suppressed(WakeSuppressionReason::DuplicateIncident),
+                None,
+                None,
+                &now,
+            )
+            .await?;
+            return Ok(WakeAdmissionResult::Suppressed {
+                reason: WakeSuppressionReason::DuplicateIncident,
+            });
         }
 
+        budget_attempt.commit().await?;
         // The lease, budget increment, and pre-admitted wake event share one
         // transaction.  No budget is consumed for suppressed/setup-required
         // decision events.
         self.append_wake_decision_in_tx(
-            &mut transaction,
-            &request,
-            &context,
+            transaction,
+            request,
+            context,
             WakeDecisionEvent::Admitted {
                 leased_until: leased_until.clone(),
                 cooldown_until: cooldown_until.clone(),
@@ -962,7 +838,6 @@ impl AttentionService {
             &now,
         )
         .await?;
-        transaction.commit().await?;
         Ok(WakeAdmissionResult::Admitted {
             leased_until,
             cooldown_until,
@@ -1400,7 +1275,15 @@ impl AttentionService {
             .await?;
         let agent_health = self.agent_health(user_id, project_id, limit).await?;
         let recent_outcomes = self.recent_outcomes(user_id, project_id, limit).await?;
-        let capacity = self.capacity(user_id, project_id).await?;
+        let capacity = self
+            .capacity(
+                user_id,
+                project_id,
+                !health
+                    .as_ref()
+                    .is_some_and(|health| health.stale || health.last_error_code.is_some()),
+            )
+            .await?;
         Ok(MissionControlHomeResponse {
             needs_attention: attention
                 .items
@@ -1740,31 +1623,40 @@ impl AttentionService {
     }
 
     pub async fn consumer_health(&self) -> Result<Option<AttentionConsumerHealthResponse>> {
-        let Some(health) =
-            AttentionRepo::get_attention_consumer_health(&*self.db, CONSUMER_NAME).await?
-        else {
+        let row = sqlx::query("SELECT h.*, COALESCE(c.last_sequence, 0) AS last_sequence
+            FROM worker_health h LEFT JOIN event_consumer_cursor c ON c.consumer_name = h.worker_name WHERE h.worker_name = ?")
+            .bind(CONSUMER_NAME).fetch_optional(self.db.pool()).await?;
+        let Some(row) = row else {
             return Ok(None);
         };
-        let stale = health
-            .last_success_at
-            .as_deref()
-            .and_then(parse_rfc3339)
-            .map(|timestamp| Utc::now() - timestamp > Duration::seconds(CONSUMER_STALE_SECONDS))
-            .unwrap_or(true);
+        let lag = self.db.domain_event_consumer_lag(&[CONSUMER_NAME]).await?;
+        let stale = lag
+            .first()
+            .is_some_and(|lag| lag.stalled(Utc::now(), CONSUMER_STALE_SECONDS));
+        let mut last_error_code: Option<String> = row.try_get("last_error_kind")?;
+        let mut last_error_message: Option<String> = row.try_get("last_error")?;
+        if last_error_message.is_none() {
+            let recent: Option<(String, String)> = sqlx::query_as("SELECT error_kind, last_error FROM worker_dead_letter WHERE worker_name = ? AND resolved_at IS NULL AND dead_lettered_at >= ? ORDER BY dead_lettered_at DESC LIMIT 1")
+                .bind(CONSUMER_NAME).bind((Utc::now() - Duration::hours(1)).to_rfc3339()).fetch_optional(self.db.pool()).await?;
+            if let Some((kind, message)) = recent {
+                last_error_code = Some(kind);
+                last_error_message = Some(message);
+            }
+        }
         Ok(Some(AttentionConsumerHealthResponse {
-            consumer_name: health.consumer_name,
-            last_sequence: health.last_sequence,
-            last_success_at: health.last_success_at,
-            last_error_code: health.last_error_code,
+            consumer_name: CONSUMER_NAME.to_owned(),
+            last_sequence: row.try_get("last_sequence")?,
+            last_success_at: row.try_get("last_success_at")?,
+            last_error_code,
+            last_error_message,
             stale,
-            processed_events: health.processed_events,
-            updated_at: health.updated_at,
+            updated_at: row.try_get("updated_at")?,
         }))
     }
 
     /// A Task entering `review` is only attention when a person must decide
     /// the gate. A review run by the workflow's reviewer Agent settles itself;
-    /// waking the Project Agent for it sends the Agent to a `task.review`
+    /// waking the Project Agent for it sends the Agent to a `task.action`
     /// action the gate rejects, which wastes the turn and reports a blocker
     /// that does not exist. A Task that no longer exists is nobody's review.
     async fn review_needs_a_person(&self, event: &DomainEvent) -> Result<bool> {
@@ -1787,7 +1679,36 @@ impl AttentionService {
         ))
     }
 
-    async fn project_event(&self, event: &DomainEvent) -> Result<ProjectionOutcome> {
+    async fn resolve_superseded_turn_incidents(&self) -> Result<()> {
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT a.dedupe_key, e.entity_id, e.id, e.payload_json FROM attention_projection a
+             JOIN domain_event e ON e.id = a.source_event_id
+             WHERE a.status <> 'resolved' AND e.event_type = 'agent_chat.turn.failed'",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+        for (key, turn_id, event_id, payload) in rows {
+            if let Some(turn) =
+                db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &turn_id).await?
+            {
+                let version = serde_json::from_str::<Value>(&payload)
+                    .ok()
+                    .and_then(|value| value.get("version").and_then(Value::as_i64));
+                if turn.retry_action().is_none() || version.is_some_and(|v| v != turn.version) {
+                    AttentionRepo::resolve_attention_by_dedupe(
+                        &*self.db,
+                        &key,
+                        &event_id,
+                        &now_rfc3339(),
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn prepare_projection(&self, event: &DomainEvent) -> Result<Outcome<PreparedAttention>> {
         let transition_attention = if event.event_type.eq_ignore_ascii_case("task.transitioned") {
             Some(task_transition_attention(event))
         } else {
@@ -1797,9 +1718,15 @@ impl AttentionService {
             Some(transition) => transition.category,
             None => match self.event_category(event).await? {
                 EventCategoryDecision::Ready(category) => category,
-                EventCategoryDecision::Deferred => return Ok(ProjectionOutcome::Deferred),
+                EventCategoryDecision::Deferred => {
+                    return Ok(Outcome::Defer {
+                        after: StdDuration::from_secs(1),
+                        reason: "terminal Task disposition has not settled".to_owned(),
+                    })
+                }
             },
         };
+        let mut incident = None;
         if let Some(category) = category {
             let review_is_current =
                 category != "review_ready" || self.review_needs_a_person(event).await?;
@@ -1816,6 +1743,57 @@ impl AttentionService {
             let identity_id = self.wake_identity_for_event(event).await?;
             let incident_key = attention_incident_key(category, event, &scope_type, &scope_id);
             let (priority, summary, recommended_action) = category_metadata(category);
+            let failed_turn = if event.event_type == "agent_chat.turn.failed" {
+                db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &event.entity_id)
+                    .await?
+            } else {
+                None
+            };
+            // Re-drive or completion may precede this consumer's projection.
+            if failed_turn.as_ref().is_some_and(|turn| {
+                turn.retry_action().is_none()
+                    || serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|value| value.get("version").and_then(Value::as_i64))
+                        .is_some_and(|v| v != turn.version)
+            }) {
+                return Ok(Outcome::Skip);
+            }
+            let retry_action = failed_turn
+                .as_ref()
+                .and_then(db::AgentChatTurnJob::retry_action);
+            let cause = failed_turn
+                .as_ref()
+                .and_then(|turn| turn.failure_class.as_ref());
+            let summary = if category == "conflict_hotspot" {
+                let payload =
+                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+                format!(
+                    "{} conflicted in {} Tasks this week",
+                    payload
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Shared file"),
+                    payload
+                        .get("handoff_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default()
+                )
+            } else if retry_action.is_some() {
+                format!(
+                    "Agent Chat turn failed: {}",
+                    cause
+                        .map(api_types::TurnFailure::code)
+                        .unwrap_or("backend_failed")
+                )
+            } else {
+                summary.to_owned()
+            };
+            let recommended_action = if retry_action.is_some() {
+                "retry_turn"
+            } else {
+                recommended_action
+            };
             let task_context = if event.entity_type == "task" {
                 sqlx::query("SELECT title, status, version FROM task WHERE id = ?")
                     .bind(&event.entity_id)
@@ -1856,16 +1834,53 @@ impl AttentionService {
                 .get("interruption")
                 .cloned()
                 .unwrap_or(Value::Null);
-            let recovery_actions = interruption
-                .get("recovery_actions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            let available_actions = if event.entity_type == "task" {
+                if let Some(task) =
+                    db::TaskRepo::get_by_id(&*self.db, &event.entity_id, false).await?
+                {
+                    if let Some(project) =
+                        db::ProjectRepo::get_by_id(&*self.db, &task.project_id).await?
+                    {
+                        let actor = match db::ProjectAgentBindingRepo::get_active_project_binding(
+                            &*self.db,
+                            &task.project_id,
+                        )
+                        .await?
+                        .filter(|binding| binding.state == "active")
+                        .and_then(|binding| binding.identity_id)
+                        {
+                            Some(agent_id) => api_types::Actor::agent(agent_id),
+                            None => api_types::Actor::system(api_types::SystemComponent::Workflow),
+                        };
+                        let workflow =
+                            crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+                                &task,
+                                &project.workflow_definition,
+                                &actor,
+                            );
+                        let snapshot = crate::task_actions::load_snapshot(
+                            &self.db,
+                            task,
+                            workflow,
+                            &actor,
+                            self.action_connections.as_deref(),
+                        )
+                        .await?;
+                        crate::available_actions(&snapshot)
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
             let requires_intervention = event_payload
                 .get("requires_intervention")
                 .and_then(Value::as_bool)
                 .unwrap_or(category == "execution_failed");
-            let details_json = serde_json::to_string(&json!({
+            let mut details = json!({
                 "source_event_id": event.id,
                 "source_event_type": event.event_type,
                 "source_sequence": event.sequence,
@@ -1874,6 +1889,9 @@ impl AttentionService {
                 "scope_type": scope_type,
                 "scope_id": scope_id,
                 "task": task_context,
+                "failure_class": cause,
+                "retry_decision": failed_turn.as_ref().and_then(|turn| turn.retry_decision.as_ref()),
+                "retry_action": retry_action,
                 "decision": decision_context,
                 "role": event_payload.get("role").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
                 "stop_reason": event_payload.get("stop_reason").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
@@ -1881,76 +1899,36 @@ impl AttentionService {
                 "interruption": interruption,
                 "recovery": {
                     "requires_intervention": requires_intervention,
-                    "actions": recovery_actions,
+                    "actions": available_actions,
                     "automatic_retry": false,
                 },
-            }))
-            .map_err(|error| ServiceError::Domain(error.to_string()))?;
-            let attention = AttentionRepo::insert_attention(
-                &*self.db,
-                CreateAttentionProjection {
-                    id: new_uuid_v4(),
-                    attention_type: category.to_owned(),
-                    scope_type: attention_scope_type,
-                    scope_id: attention_scope_id,
-                    identity_id: identity_id.clone(),
-                    source_event_id: event.id.clone(),
-                    priority,
-                    status: "open".to_owned(),
-                    summary: bounded_summary(summary),
-                    details_json,
-                    dedupe_key: incident_key.clone(),
-                    occurred_at: event.created_at.clone(),
-                    updated_at: now_rfc3339(),
-                    acknowledged_at: None,
-                    snoozed_until: None,
-                    resolved_at: None,
-                    updated_by_user_id: None,
-                    recommended_action: recommended_action.to_owned(),
-                    source_sequence: Some(event.sequence),
-                },
-            )
-            .await?;
-
-            if !review_is_current {
-                AttentionRepo::resolve_attention_by_dedupe(
-                    &*self.db,
-                    &incident_key,
-                    &event.id,
-                    &now_rfc3339(),
-                )
-                .await?;
-                return Ok(ProjectionOutcome::Completed);
+            });
+            if category == "conflict_hotspot" {
+                details["conflict_hotspot"] = event_payload.clone();
             }
-
-            let decision_context = WakeDecisionContext {
-                attention_id: Some(attention.id.clone()),
-                source_event_id: Some(event.id.clone()),
-                incident_digest: Some(wake_attention_incident_digest(&attention)),
-                attention_status: Some(attention.status.clone()),
-                attention_version: Some(attention.version),
-                task_id: (event.event_type == "task.interruption_changed")
-                    .then(|| event.entity_id.clone()),
-                requires_current_task_intervention: event.event_type == "task.interruption_changed"
-                    && requires_intervention,
-                orphan_execution_id: (category == "execution_failed"
-                    && matches!(
-                        event.event_type.as_str(),
-                        "execution.failed" | "execution.cancelled"
-                    ))
-                .then(|| {
-                    event_payload
-                        .get("execution_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .flatten(),
+            let details_json = serde_json::to_string(&details)
+                .map_err(|error| ServiceError::Domain(error.to_string()))?;
+            let projection = CreateAttentionProjection {
+                id: new_uuid_v4(),
+                attention_type: category.to_owned(),
+                scope_type: attention_scope_type,
+                scope_id: attention_scope_id,
+                identity_id: identity_id.clone(),
+                source_event_id: event.id.clone(),
+                priority,
+                status: "open".to_owned(),
+                summary: bounded_summary(&summary),
+                details_json,
+                dedupe_key: incident_key.clone(),
+                occurred_at: event.created_at.clone(),
+                updated_at: now_rfc3339(),
+                acknowledged_at: None,
+                snoozed_until: None,
+                resolved_at: None,
+                updated_by_user_id: None,
+                recommended_action: recommended_action.to_owned(),
+                source_sequence: Some(event.sequence),
             };
-
-            // Wake admission happens only after the rebuildable Attention row
-            // is durable.  Eligibility is checked independently of the
-            // projection so a visible incident cannot grant an identity a
-            // Project/Agent Chat/Task wake authority it does not already possess.
             let request = WakeAdmissionRequest {
                 identity_id: identity_id.clone().unwrap_or_default(),
                 scope_type: scope_type.clone(),
@@ -1972,46 +1950,50 @@ impl AttentionService {
             // as recursive suppression even when its binding has already
             // disappeared; setup-required would otherwise hide a recursion
             // decision behind a missing responder.
-            if let Some(reason) = wake_pre_admission_suppression_reason(&request) {
-                let _ = self
-                    .persist_suppressed_wake(&request, &decision_context, reason)
-                    .await?;
+            let decision = if let Some(reason) = wake_pre_admission_suppression_reason(&request) {
+                PreparedWakeDecision::Suppressed(reason)
             } else {
-                let responder_configured = self
+                let configured = self
                     .wake_responder_is_configured(&scope_type, &scope_id, None)
                     .await?;
-                let identity_eligible = match identity_id.as_deref() {
-                    Some(identity_id) => {
-                        self.wake_responder_is_configured(&scope_type, &scope_id, Some(identity_id))
+                let eligible = match identity_id.as_deref() {
+                    Some(id) => {
+                        self.wake_responder_is_configured(&scope_type, &scope_id, Some(id))
                             .await?
                             && self
-                                .wake_identity_is_eligible(identity_id, &scope_type, &scope_id)
+                                .wake_identity_is_eligible(id, &scope_type, &scope_id)
                                 .await?
                     }
                     None => false,
                 };
                 match identity_id {
-                    Some(_) if responder_configured && identity_eligible => {
-                        let _ = self
-                            .admit_wake_with_context(request, decision_context)
-                            .await?;
+                    Some(_) if configured && eligible => PreparedWakeDecision::Admit,
+                    Some(_) if configured => {
+                        PreparedWakeDecision::Suppressed(WakeSuppressionReason::IneligibleScope)
                     }
-                    Some(_) if responder_configured => {
-                        let _ = self
-                            .persist_suppressed_wake(
-                                &request,
-                                &decision_context,
-                                WakeSuppressionReason::IneligibleScope,
-                            )
-                            .await?;
-                    }
-                    _ => {
-                        let _ = self
-                            .persist_setup_required_wake(&request, &decision_context)
-                            .await?;
-                    }
+                    _ => PreparedWakeDecision::SetupRequired,
                 }
-            }
+            };
+            incident = Some(PreparedAttentionIncident {
+                projection,
+                request,
+                decision,
+                failed_turn,
+                review_is_current,
+                requires_intervention,
+                orphan_execution_id: (category == "execution_failed"
+                    && matches!(
+                        event.event_type.as_str(),
+                        "execution.failed" | "execution.cancelled"
+                    ))
+                .then(|| {
+                    event_payload
+                        .get("execution_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten(),
+            });
         }
 
         let mut resolved_categories = resolution_categories(event);
@@ -2026,39 +2008,129 @@ impl AttentionService {
                 "execution_failed",
             ]);
         }
+        let mut resolutions = Vec::new();
         for category in resolved_categories {
             let (scope_type, scope_id) = self.event_scope(event).await?;
-            let incident_key = attention_incident_key(category, event, &scope_type, &scope_id);
-            AttentionRepo::resolve_attention_by_dedupe(
-                &*self.db,
-                &incident_key,
-                &event.id,
-                &now_rfc3339(),
-            )
-            .await?;
+            resolutions.push(attention_incident_key(
+                category,
+                event,
+                &scope_type,
+                &scope_id,
+            ));
         }
-        if event.event_type == "milestone.readiness.evaluated" {
+        let followup_scope = if event.event_type == "milestone.readiness.evaluated" {
             let (scope_type, scope_id) = self.event_scope(event).await?;
-            let (scope_type, scope_id) = self
-                .attention_projection_scope(&scope_type, &scope_id)
-                .await?;
-            let resolved_at = now_rfc3339();
-            sqlx::query(
-                "UPDATE attention_projection
-                 SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
-                     source_event_id = ?, updated_at = ?, version = version + 1
-                 WHERE attention_type = 'delivery_followup'
-                   AND scope_type = ? AND scope_id = ? AND status <> 'resolved'",
+            Some(
+                self.attention_projection_scope(&scope_type, &scope_id)
+                    .await?,
             )
-            .bind(&resolved_at)
-            .bind(&event.id)
-            .bind(&resolved_at)
-            .bind(scope_type)
-            .bind(scope_id)
-            .execute(self.db.pool())
-            .await?;
+        } else {
+            None
+        };
+        if incident.is_none() && resolutions.is_empty() && followup_scope.is_none() {
+            return Ok(Outcome::Skip);
         }
-        Ok(ProjectionOutcome::Completed)
+        Ok(Outcome::Done(PreparedAttention {
+            incident,
+            resolutions,
+            followup_scope,
+        }))
+    }
+
+    async fn commit_projection(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        event: &DomainEvent,
+        prepared: &PreparedAttention,
+    ) -> Result<Option<(String, String)>> {
+        let mut stall = None;
+        if let Some(p) = &prepared.incident {
+            let admitted: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM domain_event WHERE causation_id = ? AND event_type = 'agent.wake.admitted')")
+                .bind(&event.id).fetch_one(&mut **tx).await?;
+            if admitted != 0 {
+                return Ok(None);
+            }
+            let attention = self
+                .db
+                .insert_attention_in_tx(tx, p.projection.clone())
+                .await?;
+            let stale = if let Some(turn) = &p.failed_turn {
+                self.db
+                    .get_agent_chat_turn_job_in_tx(tx, &turn.id)
+                    .await?
+                    .is_some_and(|current| {
+                        current.retry_action().is_none() || current.version != turn.version
+                    })
+            } else {
+                false
+            };
+            if stale || !p.review_is_current {
+                self.db
+                    .resolve_attention_by_dedupe_in_tx(
+                        tx,
+                        &p.projection.dedupe_key,
+                        &event.id,
+                        &now_rfc3339(),
+                    )
+                    .await?;
+                return Ok(None);
+            }
+            let context = WakeDecisionContext {
+                attention_id: Some(attention.id.clone()),
+                source_event_id: Some(event.id.clone()),
+                incident_digest: Some(wake_attention_incident_digest(&attention)),
+                attention_status: Some(attention.status.clone()),
+                attention_version: Some(attention.version),
+                task_id: (event.event_type == "task.interruption_changed")
+                    .then(|| event.entity_id.clone()),
+                requires_current_task_intervention: event.event_type == "task.interruption_changed"
+                    && p.requires_intervention,
+                orphan_execution_id: p.orphan_execution_id.clone(),
+            };
+            match &p.decision {
+                PreparedWakeDecision::Admit => {
+                    let committed = self.admit_wake_in_tx(tx, &p.request, &context).await?;
+                    stall = committed.stall_scope;
+                }
+                PreparedWakeDecision::Suppressed(reason) => {
+                    self.append_wake_decision_in_tx(
+                        tx,
+                        &p.request,
+                        &context,
+                        WakeDecisionEvent::Suppressed(reason.clone()),
+                        None,
+                        None,
+                        &p.request.now,
+                    )
+                    .await?;
+                }
+                PreparedWakeDecision::SetupRequired => {
+                    self.append_wake_decision_in_tx(
+                        tx,
+                        &p.request,
+                        &context,
+                        WakeDecisionEvent::SetupRequired(WakeSetupReason::ResponderBindingMissing),
+                        None,
+                        None,
+                        &p.request.now,
+                    )
+                    .await?;
+                }
+            }
+        }
+        for key in &prepared.resolutions {
+            self.db
+                .resolve_attention_by_dedupe_in_tx(tx, key, &event.id, &now_rfc3339())
+                .await?;
+        }
+        if let Some((scope_type, scope_id)) = &prepared.followup_scope {
+            let at = now_rfc3339();
+            sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                source_event_id = ?, updated_at = ?, version = version + 1
+                WHERE attention_type = 'delivery_followup' AND scope_type = ? AND scope_id = ? AND status <> 'resolved'")
+                .bind(&at).bind(&event.id).bind(&at).bind(scope_type).bind(scope_id).execute(&mut **tx).await?;
+        }
+        Ok(stall)
     }
 
     /// Decide whether a durable event represents an actionable incident.
@@ -2512,44 +2584,6 @@ impl AttentionService {
         Ok(eligible)
     }
 
-    async fn record_health(&self, mut input: UpsertAttentionConsumerHealth) -> Result<()> {
-        let mut writes = self.health_writes.lock().await;
-        if let Some(pending) = &writes.pending {
-            input.processed_events_delta += pending.processed_events_delta;
-            input.last_sequence = input.last_sequence.max(pending.last_sequence);
-            input.last_started_at = input
-                .last_started_at
-                .or_else(|| pending.last_started_at.clone());
-            input.last_success_at = input
-                .last_success_at
-                .or_else(|| pending.last_success_at.clone());
-        }
-        let due = writes
-            .last_written
-            .is_none_or(|last| last.elapsed() >= HEALTH_WRITE_INTERVAL)
-            || input.processed_events_delta >= HEALTH_WRITE_EVENTS
-            || input.last_error_at.is_some()
-            // A batch's new owner/expiry is diagnostic, not a health change
-            // that merits another write. Release does flush real progress or
-            // clear a lease that was published by an interval/count flush.
-            || (input.lease_owner.is_none()
-                && (input.processed_events_delta > 0 || writes.lease_owner.is_some()));
-        writes.pending = Some(input);
-        if due {
-            let input = writes
-                .pending
-                .as_ref()
-                .expect("health update is pending")
-                .clone();
-            AttentionRepo::upsert_attention_consumer_health(&*self.db, input.clone()).await?;
-            writes.pending = None;
-            writes.last_written = Some(Instant::now());
-            writes.lease_owner = input.lease_owner;
-            writes.lease_until = input.lease_until;
-        }
-        Ok(())
-    }
-
     async fn consumer_cursor(&self) -> Result<Option<EventConsumerCursor>> {
         Ok(DomainEventRepo::get_consumer_cursor(&*self.db, CONSUMER_NAME).await?)
     }
@@ -2811,6 +2845,7 @@ impl AttentionService {
         &self,
         user_id: &str,
         project_id: Option<&str>,
+        healthy: bool,
     ) -> Result<MissionControlCapacity> {
         let (predicate, values) = self.project_visibility_predicate(user_id, project_id);
         // Keep the query construction below explicit; it avoids interpolating
@@ -2858,11 +2893,7 @@ impl AttentionService {
             active_executions: active,
             queued_tasks: queued,
             active_sessions,
-            healthy: self
-                .consumer_health()
-                .await?
-                .map(|health| !health.stale && health.last_error_code.is_none())
-                .unwrap_or(false),
+            healthy,
         })
     }
 
@@ -3150,6 +3181,14 @@ fn attention_incident_key(
     scope_type: &str,
     scope_id: &str,
 ) -> String {
+    if category == "conflict_hotspot" {
+        let payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+        let path = payload
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return crate::worker_runtime::conflict_hotspot::incident_key(scope_id, path);
+    }
     if category == "progress_warning" {
         let execution_id = serde_json::from_str::<Value>(&event.payload_json)
             .ok()
@@ -3317,6 +3356,9 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
     if user_decision_outcome(event).is_some() {
         return Some(DECISION_RECORDED_CATEGORY);
     }
+    if event_type == crate::worker_runtime::conflict_hotspot::DETECTED_EVENT {
+        return Some("conflict_hotspot");
+    }
     if event_type == "project_release.candidate_requested" {
         return Some("human_input_required");
     }
@@ -3324,15 +3366,12 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
         return Some("human_input_required");
     }
     if event_type == "agent_chat.turn.failed" {
-        let status = serde_json::from_str::<Value>(&event.payload_json)
-            .ok()
-            .and_then(|payload| {
-                payload
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-        return (status.as_deref() == Some("failed")).then_some("retry_exhausted");
+        let payload = serde_json::from_str::<Value>(&event.payload_json).ok()?;
+        let failure: api_types::TurnFailure =
+            serde_json::from_value(payload.get("failure_class")?.clone()).ok()?;
+        return (payload.get("status").and_then(Value::as_str) == Some("failed")
+            && failure.requires_attention())
+        .then_some("retry_exhausted");
     }
     if event_type.contains("validation")
         && (event_type.contains("fail") || event_type.contains("error"))
@@ -3504,6 +3543,7 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
         "runtime_offline" => (95, "Agent runtime is unavailable", "restore_runtime"),
         "budget_threshold" => (60, "Agent budget threshold reached", "review_budget"),
         "commitment_overdue" => (75, "Commitment is overdue", "review_commitment"),
+        "conflict_hotspot" => (60, "Shared file repeatedly conflicted", "split_hotspot"),
         _ => (50, "Attention required", "inspect"),
     }
 }
@@ -3520,9 +3560,10 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         "execution_failed" => AttentionCategory::ExecutionFailed,
         "delivery_followup" => AttentionCategory::DeliveryFollowup,
         "decision_recorded" => AttentionCategory::DecisionRecorded,
-        "runtime_offline" => AttentionCategory::RuntimeOffline,
+        "runtime_offline" | "environment_not_ready" => AttentionCategory::RuntimeOffline,
         "budget_threshold" => AttentionCategory::BudgetThreshold,
         "commitment_overdue" => AttentionCategory::CommitmentOverdue,
+        "conflict_hotspot" => AttentionCategory::ConflictHotspot,
         other => {
             return Err(ServiceError::Domain(format!(
                 "unknown attention category: {other}"
@@ -3619,6 +3660,90 @@ const MAX_WAKE_REF_CHARS: usize = 256;
 
 fn bounded_wake_ref(value: &str) -> String {
     value.chars().take(MAX_WAKE_REF_CHARS).collect()
+}
+
+struct CommittedWakeAdmission {
+    result: WakeAdmissionResult,
+    stall_scope: Option<(String, String)>,
+}
+pub struct PreparedAttention {
+    incident: Option<PreparedAttentionIncident>,
+    resolutions: Vec<String>,
+    followup_scope: Option<(String, String)>,
+}
+struct PreparedAttentionIncident {
+    projection: CreateAttentionProjection,
+    request: WakeAdmissionRequest,
+    decision: PreparedWakeDecision,
+    failed_turn: Option<db::AgentChatTurnJob>,
+    review_is_current: bool,
+    requires_intervention: bool,
+    orphan_execution_id: Option<String>,
+}
+enum PreparedWakeDecision {
+    Admit,
+    Suppressed(WakeSuppressionReason),
+    SetupRequired,
+}
+fn projection_worker_error(error: ServiceError) -> WorkerError {
+    let message = bounded_error_message(&error);
+    let kind = crate::worker_runtime::consumer_error(error).kind;
+    match kind {
+        crate::worker_runtime::WorkerErrorKind::Failure => WorkerError::new(message),
+        crate::worker_runtime::WorkerErrorKind::Transient => WorkerError::transient(message),
+        crate::worker_runtime::WorkerErrorKind::Terminal => WorkerError::terminal(message),
+    }
+}
+#[async_trait]
+impl Worker<Option<(String, String)>> for AttentionService {
+    type Prepared = PreparedAttention;
+    fn name(&self) -> &str {
+        CONSUMER_NAME
+    }
+    fn subscription(&self) -> Subscription {
+        Subscription::All
+    }
+    async fn tick(&self) -> std::result::Result<(), WorkerError> {
+        self.resolve_superseded_turn_incidents()
+            .await
+            .map_err(projection_worker_error)
+    }
+    async fn handle(
+        &self,
+        event: &DomainEvent,
+    ) -> std::result::Result<Outcome<Self::Prepared>, WorkerError> {
+        match self.prepare_projection(event).await {
+            Err(ServiceError::Db(db::DbError::Check(reason))) => Ok(Outcome::DeadLetter { reason }),
+            other => other.map_err(projection_worker_error),
+        }
+    }
+    async fn commit(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        event: &DomainEvent,
+        prepared: &Self::Prepared,
+    ) -> std::result::Result<Option<(String, String)>, WorkerError> {
+        match self.commit_projection(tx, event, prepared).await {
+            Err(ServiceError::Db(db::DbError::Check(reason))) => Err(WorkerError::terminal(reason)),
+            other => other.map_err(projection_worker_error),
+        }
+    }
+    async fn after_commit(
+        &self,
+        _: &DomainEvent,
+        _: &Self::Prepared,
+        stall: &Option<(String, String)>,
+    ) -> std::result::Result<(), WorkerError> {
+        if let Some((scope_type, scope_id)) = stall {
+            self.publish_autonomy_stall(
+                scope_type,
+                scope_id,
+                "the Project Agent's hourly wake budget is exhausted",
+            )
+            .await;
+        }
+        Ok(())
+    }
 }
 
 /// Return terminal policy reasons that must be decided before responder
@@ -3746,16 +3871,6 @@ fn is_visibility_miss(error: &ServiceError) -> bool {
     )
 }
 
-fn error_code(error: &ServiceError) -> &'static str {
-    match error {
-        ServiceError::Db(db::DbError::VersionConflict) => "version_conflict",
-        ServiceError::Db(db::DbError::NotFound) => "not_found",
-        ServiceError::Db(_) => "database_error",
-        ServiceError::Domain(_) => "projection_error",
-        _ => "projection_error",
-    }
-}
-
 fn bounded_error_message(error: &ServiceError) -> String {
     // Errors are operational diagnostics, not event payloads.  Keep them
     // bounded and strip likely credential-bearing query fragments.
@@ -3769,6 +3884,23 @@ fn bounded_error_message(error: &ServiceError) -> String {
     bounded_text(message)
 }
 
+/// Close a Chat turn incident through Attention's resolver so snoozes are cleared.
+pub(crate) async fn resolve_turn_incident<D: db::AttentionRepo>(
+    db: &D,
+    chat_id: &str,
+    turn_id: &str,
+    event_id: &str,
+) -> Result<()> {
+    db::AttentionRepo::resolve_attention_by_dedupe(
+        db,
+        &format!("attention:retry_exhausted:agent_chat:{chat_id}:agent_chat_turn_job:{turn_id}"),
+        event_id,
+        &now_rfc3339(),
+    )
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3779,146 +3911,201 @@ mod tests {
         AttentionService::new(Arc::new(SqliteDb::new(pool)))
     }
 
-    fn health_update(sequence: i64, delta: i64) -> UpsertAttentionConsumerHealth {
-        UpsertAttentionConsumerHealth {
-            consumer_name: CONSUMER_NAME.to_owned(),
-            last_sequence: sequence,
-            last_started_at: None,
-            last_success_at: (delta > 0).then(now_rfc3339),
-            last_error_at: None,
-            last_error_code: None,
-            last_error_message: None,
-            lease_owner: Some("health-owner".to_owned()),
-            lease_until: Some("2026-09-30T12:00:30Z".to_owned()),
-            processed_events_delta: delta,
-            updated_at: now_rfc3339(),
-        }
+    async fn append_projection_event(
+        service: &AttentionService,
+        id: &str,
+        kind: &str,
+    ) -> DomainEvent {
+        service
+            .db
+            .append_event(CreateDomainEvent {
+                id: id.into(),
+                event_type: kind.into(),
+                entity_type: "task".into(),
+                entity_id: id.into(),
+                actor_type: "system".into(),
+                actor_id: None,
+                scope_type: "project".into(),
+                scope_id: "projection-test".into(),
+                correlation_id: id.into(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(id.into()),
+                payload_json: "{}".into(),
+                created_at: now_rfc3339(),
+            })
+            .await
+            .unwrap()
     }
-
     #[tokio::test]
-    async fn consumer_health_throttles_progress_and_flushes_after_100_events() {
+    async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_projects_once() {
         let service = health_service().await;
-        service.record_health(health_update(0, 0)).await.unwrap();
-        for sequence in 1..100 {
+        let old = append_projection_event(&service, "old-incident", "validation.failed").await;
+        let next = append_projection_event(&service, "new-incident", "validation.failed").await;
+        sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, ?, ?)")
+            .bind(CONSUMER_NAME).bind(old.sequence).bind(now_rfc3339()).execute(service.db.pool()).await.unwrap();
+        sqlx::raw_sql(include_str!("../../db/tests/fixtures/event_delivery.sql"))
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO event_processing_lease (consumer_name, event_sequence, lease_owner, leased_until, attempts, updated_at) VALUES (?, ?, 'legacy', '2999-01-01T00:00:00Z', 1, ?)")
+            .bind(CONSUMER_NAME).bind(next.sequence).bind(now_rfc3339()).execute(service.db.pool()).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../db/migrations/V202610020700__retire_event_delivery_leases.sql"
+        ))
+        .execute(service.db.pool())
+        .await
+        .unwrap();
+        sqlx::raw_sql("CREATE TRIGGER fail_after_projection BEFORE INSERT ON domain_event WHEN NEW.event_type LIKE 'agent.wake.%' BEGIN SELECT RAISE(ABORT, 'test failure after projection write'); END;")
+            .execute(service.db.pool()).await.unwrap();
+        assert_eq!(service.project_once(100).await.unwrap().processed_events, 0);
+        assert_eq!(
             service
-                .record_health(health_update(sequence, 1))
+                .consumer_cursor()
+                .await
+                .unwrap()
+                .unwrap()
+                .last_sequence,
+            old.sequence
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attention_projection")
+            .fetch_one(service.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("DROP TRIGGER fail_after_projection")
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE worker_health SET retry_not_before = '2000-01-01T00:00:00Z'")
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(service.project_once(100).await.unwrap().processed_events, 1);
+        assert_eq!(service.project_once(100).await.unwrap().processed_events, 0);
+        let keys: Vec<String> =
+            sqlx::query_scalar("SELECT source_event_id FROM attention_projection")
+                .fetch_all(service.db.pool())
                 .await
                 .unwrap();
-        }
-        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(health.version, 1);
-        assert_eq!(health.processed_events, 0);
-        service.record_health(health_update(100, 1)).await.unwrap();
-        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(health.version, 2);
-        assert_eq!(health.processed_events, 100);
-        assert_eq!(health.last_sequence, 100);
+        assert_eq!(keys, vec![next.id]);
+        assert_eq!(
+            service
+                .consumer_cursor()
+                .await
+                .unwrap()
+                .unwrap()
+                .last_sequence,
+            next.sequence
+        );
+        let health = service.consumer_health().await.unwrap().unwrap();
         assert!(health.last_success_at.is_some());
-        assert_eq!(health.lease_until.as_deref(), Some("2026-09-30T12:00:30Z"));
-    }
-
-    #[tokio::test]
-    async fn consumer_health_flushes_after_five_seconds() {
-        let service = health_service().await;
-        service.record_health(health_update(0, 0)).await.unwrap();
-        service.record_health(health_update(1, 1)).await.unwrap();
-        service.health_writes.lock().await.last_written =
-            Some(Instant::now() - HEALTH_WRITE_INTERVAL);
-        service.record_health(health_update(2, 1)).await.unwrap();
-        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(health.version, 2);
-        assert_eq!(health.processed_events, 2);
-        assert_eq!(health.last_sequence, 2);
-    }
-
-    #[tokio::test]
-    async fn consumer_health_flushes_errors_and_release_without_losing_progress() {
-        let service = health_service().await;
-        service.record_health(health_update(0, 0)).await.unwrap();
-        service.record_health(health_update(1, 1)).await.unwrap();
-        let mut error = health_update(1, 0);
-        error.last_error_at = Some(now_rfc3339());
-        error.last_error_code = Some("database".to_owned());
-        error.last_error_message = Some("projection failed".to_owned());
-        service.record_health(error).await.unwrap();
-        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(health.version, 2);
-        assert_eq!(health.processed_events, 1);
-        assert_eq!(health.last_error_code.as_deref(), Some("database"));
-        assert!(health.last_success_at.is_some());
-        service.record_health(health_update(2, 1)).await.unwrap();
-        let mut renew = health_update(2, 0);
-        renew.lease_until = Some("2026-09-30T12:01:00Z".to_owned());
-        service.record_health(renew.clone()).await.unwrap();
-        let mut release = renew;
-        release.lease_owner = None;
-        release.lease_until = None;
-        service.record_health(release).await.unwrap();
-        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(health.version, 3);
-        assert_eq!(health.processed_events, 2);
-        assert_eq!(health.last_sequence, 2);
         assert!(health.last_error_code.is_none());
-        assert!(health.lease_owner.is_none());
-        assert!(health.lease_until.is_none());
+    }
+    #[tokio::test]
+    async fn runtime_unprojected_event_and_idle_cycle_write_nothing() {
+        let service = health_service().await;
+        service.project_once(1).await.unwrap(); // one-time worker initialization
+        sqlx::raw_sql("CREATE TABLE writes (name TEXT); CREATE TRIGGER observed_health AFTER UPDATE ON worker_health BEGIN INSERT INTO writes VALUES ('health'); END;
+            CREATE TRIGGER observed_cursor AFTER UPDATE ON event_consumer_cursor BEGIN INSERT INTO writes VALUES ('cursor'); END;")
+            .execute(service.db.pool()).await.unwrap();
+        append_projection_event(&service, "irrelevant", "ignored").await;
+        for _ in 0..4 {
+            assert_eq!(service.project_once(100).await.unwrap().processed_events, 0);
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM writes")
+            .fetch_one(service.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    #[tokio::test]
+    async fn runtime_commit_check_quarantines_once_and_next_incident_proceeds() {
+        let service = health_service().await;
+        let poison = append_projection_event(&service, "poison", "validation.failed").await;
+        let good = append_projection_event(&service, "good", "validation.failed").await;
+        let Outcome::Done(prepared) = service.prepare_projection(&poison).await.unwrap() else {
+            panic!("projected");
+        };
+        let mut tx = db::begin_immediate(service.db.pool()).await.unwrap();
+        service
+            .commit_projection(&mut tx, &poison, &prepared)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        // Force exact semantic dedupe conflict at commit, after the first write.
+        sqlx::query(
+            "UPDATE domain_event SET payload_json = '{}' WHERE event_type LIKE 'agent.wake.%'",
+        )
+        .execute(service.db.pool())
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM attention_projection")
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+        let run = service.project_once(100).await.unwrap();
+        assert_eq!(run.processed_events, 2); // terminal acknowledgement and good projection
+        assert_eq!(service.project_once(100).await.unwrap().processed_events, 0);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter WHERE worker_name = ?")
+                .bind(CONSUMER_NAME)
+                .fetch_one(service.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        let sources: Vec<String> =
+            sqlx::query_scalar("SELECT source_event_id FROM attention_projection")
+                .fetch_all(service.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(sources, vec![good.id]);
     }
 
     #[tokio::test]
-    async fn consumer_health_throttles_batch_lease_churn_and_idle_polls() {
+    async fn consumer_health_ignores_resolved_quarantines() {
         let service = health_service().await;
-        service.project_once(100).await.unwrap();
-        for _ in 0..10 {
-            service.project_once(100).await.unwrap();
-        }
-        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+        service.project_once(1).await.unwrap();
+        let mut tx = db::begin_immediate(service.db.pool()).await.unwrap();
+        db::WorkerHealth::new(service.db.clone(), CONSUMER_NAME)
+            .dead_letter_in_tx(
+                &mut tx,
+                db::WorkItem {
+                    source_key: "12",
+                    item_type: "validation.failed",
+                },
+                db::FailureState {
+                    attempts: 8,
+                    first_failed_at: &now_rfc3339(),
+                },
+                "projection rejection",
+            )
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(health.version, 1);
-        assert!(health.lease_owner.is_none());
-        assert!(health.last_started_at.is_none());
-        assert!(health.last_success_at.is_none());
-
-        for sequence in 1..10 {
-            let mut acquisition = health_update(sequence, 0);
-            acquisition.lease_owner = Some(format!("batch-{sequence}"));
-            acquisition.lease_until = Some(format!("2026-09-30T12:00:{sequence:02}Z"));
-            service.record_health(acquisition).await.unwrap();
-            let mut release = health_update(sequence, 0);
-            release.lease_owner = None;
-            release.lease_until = None;
-            service.record_health(release).await.unwrap();
-        }
-        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+        tx.commit().await.unwrap();
+        let health = service.consumer_health().await.unwrap().unwrap();
+        assert_eq!(
+            health.last_error_message.as_deref(),
+            Some("projection rejection")
+        );
+        let id: String = sqlx::query_scalar("SELECT id FROM worker_dead_letter")
+            .fetch_one(service.db.pool())
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(health.version, 1);
-        service.health_writes.lock().await.last_written =
-            Some(Instant::now() - HEALTH_WRITE_INTERVAL);
-        service.project_once(100).await.unwrap();
-        let health = AttentionRepo::get_attention_consumer_health(&*service.db, CONSUMER_NAME)
+        crate::dead_letter_service::DeadLetterService::new(service.db.clone())
+            .dismiss(
+                crate::dead_letter_service::DeadLetterActor {
+                    user_id: "admin",
+                    is_admin: true,
+                },
+                &id,
+                None,
+            )
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(health.version, 2);
-        assert_eq!(health.processed_events, 0);
-        assert!(health.lease_owner.is_none());
+        let health = service.consumer_health().await.unwrap().unwrap();
+        assert!(health.last_error_code.is_none());
+        assert!(health.last_error_message.is_none());
     }
 
     fn event(event_type: &str, payload_json: &str) -> DomainEvent {

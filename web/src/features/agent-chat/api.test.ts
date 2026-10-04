@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
-import { cancelAgentChatTurn, listAgentChatTurnLogs, agentChatApiPaths } from './api'
+import {
+  retryAgentChatTurn,
+  cancelAgentChatTurn,
+  listAgentChatTurnLogs,
+  agentChatApiPaths,
+} from './api'
 
 const apiFetch = vi.hoisted(() => vi.fn())
 
@@ -62,5 +67,17 @@ describe('agent chat turn logs API', () => {
       has_more: false,
       next_sequence: null,
     })
+  })
+})
+
+it('retries the original turn with its version and idempotency key', async () => {
+  apiFetch.mockResolvedValue({ id: 'turn-1', status: 'queued' })
+  await retryAgentChatTurn('chat-1', 'turn-1', {
+    expected_version: 7,
+    idempotency_key: 'retry:turn-1:7',
+  })
+  expect(apiFetch).toHaveBeenCalledWith('/agent-chats/chat-1/turns/turn-1/retry', {
+    method: 'POST',
+    body: JSON.stringify({ expected_version: 7, idempotency_key: 'retry:turn-1:7' }),
   })
 })

@@ -1,7 +1,103 @@
 use super::*;
-use api_types::{Actor, UserActionSource};
+use ::review::ReviewWorkspace;
+use api_types::Actor;
 
 impl TaskService {
+    pub(crate) async fn annotate_review_ci_interruption(
+        &self,
+        task: &Task,
+        ctx: &crate::workflow::HookContext,
+        reason: &str,
+        retry: bool,
+        reset: bool,
+    ) -> Result<Task> {
+        let now = now_rfc3339();
+        let mut barrier: Value = task
+            .entry_barrier_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| json!({}));
+        let disconnected = db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id)
+            .await?
+            .is_some_and(|placement| placement.state == db::PlacementState::Disconnected);
+        let attempts = barrier["infrastructure_attempts"].as_u64().unwrap_or(0)
+            + u64::from(retry && !disconnected);
+        let exhausted = retry && !disconnected && attempts >= 5;
+        let retry = retry && !exhausted;
+        let kind = if reset {
+            "workspace_reset_required"
+        } else if retry {
+            "review_ci_infrastructure"
+        } else if exhausted {
+            "review_ci_infrastructure_exhausted"
+        } else {
+            "review_ci_unavailable"
+        };
+        barrier["state"] = json!(task.status);
+        barrier["status"] = json!("blocked");
+        barrier["updated_at"] = json!(now);
+        barrier["interrupted_at"] = json!(now);
+        barrier["infrastructure_attempts"] = json!(attempts);
+        barrier["blocking_reason"] = json!(reason);
+        let annotation = json!({"type": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed },
+            "blocking_reason": kind, "blocked_at": now, "blocked_by": "system:workflow", "message": reason});
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        if let Some(version) = ctx.project_version {
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ? AND version = ? AND workflow_definition IS ?)")
+                .bind(&task.project_id).bind(version).bind(ctx.project_workflow_definition.as_deref())
+                .fetch_one(&mut *tx).await?;
+            if !valid {
+                return Err(DbError::VersionConflict.into());
+            }
+        }
+        let deferral = retry.then(|| json!({
+            "target_state": task.status, "reason": reason,
+            "not_before": (Utc::now() + chrono::Duration::seconds(5 * (1_i64 << attempts.saturating_sub(1).min(4)))).to_rfc3339(),
+        }).to_string());
+        let changed = sqlx::query("UPDATE task SET entry_barrier_json = ?, error_annotation = ?,
+            blocked_json = ?, metadata_json = CASE WHEN ? IS NULL THEN
+            json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
+            json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
+            updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ? AND status = ? AND deleted_at IS NULL")
+            .bind(barrier.to_string()).bind(annotation.to_string())
+            .bind((!retry).then(|| json!({"kind": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed }, "reason": reason, "created_at": now, "execution_id": null}).to_string()))
+            .bind(&deferral).bind(&deferral).bind(&now).bind(&task.id).bind(task.version).bind(&task.status)
+            .execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Err(DbError::VersionConflict.into());
+        }
+        if !retry {
+            crate::placement::admission::record_wait_attention_in_tx(
+                &self.db,
+                &mut tx,
+                task,
+                "execution_failed",
+                &format!("Review CI [{kind}] could not run: {reason}"),
+                &format!("review-ci:{}", task.id),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
+    }
+
+    pub(crate) async fn review_workspace_io(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Arc<dyn ReviewWorkspace>> {
+        let workspace = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &self.workspace_backend_router,
+            &self.db,
+            workspace,
+            &self.workspace_root,
+        )
+        .await?;
+        Ok(Arc::new(workspace))
+    }
+
     pub async fn rerun_review(&self, task_id: Uuid) -> Result<(Task, Review)> {
         let task_id = task_id.to_string();
         validate_required("task_id", &task_id)?;
@@ -22,11 +118,6 @@ impl TaskService {
             .settle_rerun_review_outcome(&task, &review, outcome)
             .await?;
         Ok((task, review))
-    }
-
-    pub async fn approve_review(&self, task_id: impl Into<String>) -> Result<(Task, Review)> {
-        self.approve_review_as(task_id, Actor::user(UserActionSource::Api))
-            .await
     }
 
     pub async fn approve_review_as(
@@ -64,13 +155,10 @@ impl TaskService {
             &finished_at,
             task.version,
             Some(finished_at.clone()),
+            db::ReviewEventOrigin::User,
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            review.id, review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)
@@ -106,15 +194,6 @@ impl TaskService {
             )
             .await?;
         Ok((transitioned.task, review))
-    }
-
-    pub async fn reject_review(
-        &self,
-        task_id: impl Into<String>,
-        reason: Option<String>,
-    ) -> Result<(Task, Review)> {
-        self.reject_review_as(task_id, reason, Actor::user(UserActionSource::Api))
-            .await
     }
 
     pub async fn reject_review_as(
@@ -157,13 +236,10 @@ impl TaskService {
             &finished_at,
             task.version,
             None,
+            db::ReviewEventOrigin::User,
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "review-status:{}:{}:{}",
-            review.id, review.status, finished_at
-        ))
-        .await;
+
         if let Err(error) = self
             .memory_service
             .record_review_result_if_final(&task.project_id, &review)
@@ -210,7 +286,10 @@ impl TaskService {
             crate::workflow::default_roles::CODER,
         )
         .await?;
-        if remaining_retries > 0 && !follow_up_already_dispatched {
+        if remaining_retries > 0
+            && !follow_up_already_dispatched
+            && !Self::task_action_command_active()
+        {
             self.dispatch_follow_up(
                 &task_id,
                 ::review::ReviewOutcome::AuditorFailed { reason },
@@ -240,8 +319,10 @@ impl TaskService {
             task,
             &task.id,
             self.repo_cache_locks.clone(),
+            &self.workspace_backend_router,
         )
         .await?;
+        let workspace_io = self.review_workspace_io(&workspace).await?;
         let review_config = review_config_from_json(task.task_state_config.as_deref())?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
@@ -304,10 +385,11 @@ impl TaskService {
             ServiceError::invalid_operation(format!("invalid execution id for review: {error}"))
         })?;
         let result = review_runner
+            .with_workspace_io(workspace_io)
             .run(ReviewRequest {
                 task_id,
                 executor_execution_id,
-                workspace_path: workspace.worktree_path.into(),
+                workspace_path: PathBuf::new(),
                 ci_steps: review_config.ci_steps,
                 logs_path,
                 auditor_agent_id,

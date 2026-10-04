@@ -114,15 +114,29 @@ async fn test_app(
     workspace_root: &std::path::Path,
     config_path: std::path::PathBuf,
 ) -> axum::Router {
+    let mut config: serde_yaml::Value = if config_path.exists() {
+        serde_yaml::from_str(&std::fs::read_to_string(&config_path).expect("config reads"))
+            .expect("config parses")
+    } else {
+        serde_yaml::from_str("{}").expect("empty config parses")
+    };
+    config["forge"]["data_dir"] =
+        serde_yaml::Value::String(workspace_root.join("data").to_string_lossy().into_owned());
+    std::fs::write(
+        &config_path,
+        serde_yaml::to_string(&config).expect("config serializes"),
+    )
+    .expect("isolated config writes");
+
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     let event_bus = Arc::new(events::EventBus::new(16));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -155,4 +169,280 @@ async fn test_app(
     let web_dist_dir = TestDir::new("settings-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     build_router(state, web_dist_dir.path().to_path_buf())
+}
+
+#[tokio::test]
+async fn usage_index_budget_settings_apply_live_and_persist_default_reset() {
+    let workspace = TestDir::new("usage-budget-settings");
+    let path = workspace.path().join("forge.yaml");
+    let app = test_app(workspace.path(), path.clone()).await;
+    let token = common::admin_jwt();
+    let initial: SettingsResponse = common::empty_request_with_bearer(
+        &app,
+        Method::GET,
+        "/api/v1/settings",
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        setting(&initial, "server.usage_index_budget_mb").value,
+        json!(null)
+    );
+    assert_eq!(
+        setting(&initial, "server.usage_index_budget_mb").effective_value,
+        json!(128)
+    );
+    let original: api_types::OperatorStatusResponse = common::empty_request_with_bearer(
+        &app,
+        Method::GET,
+        "/api/v1/operations/status",
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    for budget in [json!(64), json!(0), json!(null)] {
+        let response: SettingsResponse = common::json_request_with_bearer(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            &token,
+            json!({"server":{"usage_index_budget_mb":budget}}),
+            StatusCode::OK,
+        )
+        .await;
+        let entry = setting(&response, "server.usage_index_budget_mb");
+        assert_eq!(entry.value, budget);
+        let effective = budget.as_u64().unwrap_or(128);
+        assert_eq!(entry.effective_value, json!(effective));
+        assert!(!entry.restart_required);
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            yaml["server"]["usage_index_budget_mb"].as_u64(),
+            budget.as_u64()
+        );
+        let status: api_types::OperatorStatusResponse = common::empty_request_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/operations/status",
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(status.usage_index.budget_bytes, effective * 1024 * 1024);
+        assert_eq!(status.usage_index.fallback, effective == 0);
+        if effective == 0 {
+            assert_eq!(status.usage_index.current_size_bytes, 0);
+        }
+        assert_eq!(
+            serde_json::to_value(status.usage_summary).unwrap(),
+            serde_json::to_value(&original.usage_summary).unwrap()
+        );
+        // Omitted budget preserves the live setting while other keys are written.
+        let response: SettingsResponse = common::json_request_with_bearer(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            &token,
+            json!({"server":{"mcp_enabled":true}}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(
+            setting(&response, "server.usage_index_budget_mb").value,
+            budget
+        );
+    }
+    use tower::ServiceExt;
+    for invalid in [json!(-1), json!(1.5), json!(4294967296u64), json!("64")] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/settings")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::from(
+                        json!({"server":{"usage_index_budget_mb":invalid}}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+#[tokio::test]
+async fn run_budget_settings_roundtrip_live_and_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("forge.yaml");
+    let app = test_app(root.path(), path.clone()).await;
+    let token = common::admin_jwt();
+    for (jobs, nice) in [(json!(3), 7), (json!(0), 0), (json!(null), 10)] {
+        let response: SettingsResponse = common::json_request_with_bearer(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            &token,
+            json!({"server":{"max_concurrent_runs":2,"build_jobs_per_run":jobs,"run_nice":nice}}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(setting(&response, "server.build_jobs_per_run").value, jobs);
+        let expected = if jobs.is_null() {
+            config::resolved_build_jobs_for_cores(None, Some(2), config::logical_cores())
+        } else {
+            jobs.as_u64().unwrap() as u32
+        };
+        assert_eq!(
+            setting(&response, "server.build_jobs_per_run").effective_value,
+            json!(expected)
+        );
+        assert_eq!(
+            setting(&response, "server.run_nice").effective_value,
+            json!(nice)
+        );
+        assert!(!setting(&response, "server.build_jobs_per_run").restart_required);
+        assert!(!setting(&response, "server.run_nice").restart_required);
+        let read: SettingsResponse = common::empty_request_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/settings",
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(setting(&read, "server.build_jobs_per_run").value, jobs);
+        assert_eq!(setting(&read, "server.run_nice").value, json!(nice));
+        assert_eq!(
+            setting(&read, "server.logical_cores").effective_value,
+            json!(config::logical_cores())
+        );
+        let operations: api_types::OperatorStatusResponse = common::empty_request_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/operations/status",
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        let host = operations
+            .daemon_pressure
+            .iter()
+            .find(|machine| machine.daemon_id == "server_host")
+            .unwrap();
+        assert_eq!(host.build_jobs_per_run, Some(expected));
+        assert_eq!(host.run_nice, Some(nice as u32));
+        let saved: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved["server"]["build_jobs_per_run"]).unwrap(),
+            jobs
+        );
+        assert_eq!(saved["server"]["run_nice"].as_u64(), Some(nice));
+    }
+    let _: serde_json::Value = common::json_request_with_bearer(
+        &app,
+        Method::PUT,
+        "/api/v1/settings",
+        &token,
+        json!({"server":{"run_nice":20}}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    // Omitted fields preserve the live policy.
+    let response: SettingsResponse = common::json_request_with_bearer(
+        &app,
+        Method::PUT,
+        "/api/v1/settings",
+        &token,
+        json!({"server":{"max_concurrent_runs":0}}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        setting(&response, "server.build_jobs_per_run").effective_value,
+        json!(config::resolved_build_jobs_for_cores(
+            None,
+            Some(0),
+            config::logical_cores()
+        ))
+    );
+    assert_eq!(setting(&response, "server.run_nice").value, json!(10));
+}
+
+#[tokio::test]
+async fn server_resource_settings_coexist_and_update_independently() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("forge.yaml");
+    let app = test_app(root.path(), path.clone()).await;
+    let token = common::admin_jwt();
+    for (update, jobs, nice, usage) in [
+        (
+            json!({"max_concurrent_runs":2,"build_jobs_per_run":3,"run_nice":0,"usage_index_budget_mb":0}),
+            json!(3),
+            0,
+            0u32,
+        ),
+        (json!({"usage_index_budget_mb":64}), json!(3), 0, 64u32),
+        (
+            json!({"build_jobs_per_run":null,"run_nice":7}),
+            json!(null),
+            7,
+            64u32,
+        ),
+    ] {
+        let response: SettingsResponse = common::json_request_with_bearer(
+            &app,
+            Method::PUT,
+            "/api/v1/settings",
+            &token,
+            json!({"server":update}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(setting(&response, "server.build_jobs_per_run").value, jobs);
+        assert_eq!(setting(&response, "server.run_nice").value, json!(nice));
+        assert_eq!(
+            setting(&response, "server.usage_index_budget_mb").value,
+            json!(usage)
+        );
+        for key in [
+            "server.build_jobs_per_run",
+            "server.run_nice",
+            "server.usage_index_budget_mb",
+        ] {
+            assert!(!setting(&response, key).restart_required);
+        }
+        let status: api_types::OperatorStatusResponse = common::empty_request_with_bearer(
+            &app,
+            Method::GET,
+            "/api/v1/operations/status",
+            &token,
+            StatusCode::OK,
+        )
+        .await;
+        let host = status
+            .daemon_pressure
+            .iter()
+            .find(|machine| machine.daemon_id == "server_host")
+            .unwrap();
+        let expected_jobs = jobs.as_u64().map(|value| value as u32).unwrap_or_else(|| {
+            config::resolved_build_jobs_for_cores(None, Some(2), config::logical_cores())
+        });
+        assert_eq!(host.build_jobs_per_run, Some(expected_jobs));
+        assert_eq!(host.run_nice, Some(nice));
+        assert_eq!(
+            status.usage_index.budget_bytes,
+            u64::from(usage) * 1024 * 1024
+        );
+    }
+    let saved: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(saved["server"]["build_jobs_per_run"].is_null());
+    assert_eq!(saved["server"]["run_nice"].as_u64(), Some(7));
+    assert_eq!(saved["server"]["usage_index_budget_mb"].as_u64(), Some(64));
 }

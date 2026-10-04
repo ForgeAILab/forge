@@ -27,13 +27,13 @@ impl TaskService {
             return Ok(());
         }
 
-        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+        RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
             .await?
             .filter(|repo| repo.project_id == project.id)
             .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
-        let repo_path = repo
-            .local_path
-            .unwrap_or_else(|| workspace.worktree_path.clone());
+        let resolved = self.resolve_task_workspace(workspace).await?;
+        let (repo_path, worktree_path) =
+            crate::lifecycle::context::workspace_context_paths(&self.db, &resolved).await?;
         let log_dir = std::env::temp_dir()
             .join("forge")
             .join("logs")
@@ -49,14 +49,14 @@ impl TaskService {
             project_id: project.id.clone(),
             project_name: project.name.clone(),
             repo_path,
-            worktree_path: Some(workspace.worktree_path.clone()),
+            worktree_path: Some(worktree_path),
             agent_id: agent_id.map(ToOwned::to_owned),
             execution_id: execution_id.map(ToOwned::to_owned),
             log_dir: Some(log_dir),
         };
 
         if let Some(failure) =
-            LifecycleHookRunner::run_blocking_before_work_hooks(ctx, &hooks).await
+            LifecycleHookRunner::run_blocking_workspace_hooks(ctx, &hooks, &resolved).await?
         {
             self.annotate_before_work_hook_block(task, &failure).await?;
             return Err(ServiceError::invalid_operation(format!(
@@ -110,7 +110,6 @@ impl TaskService {
                 "id": format!("before_work:{}", failure.index),
                 "log_path": failure.log_path,
             },
-            "recovery_actions": ["retry_hook", "update_workspace_and_retry_hook", "skip_hook_once", "cancel_task"],
         });
 
         TaskRepo::update(

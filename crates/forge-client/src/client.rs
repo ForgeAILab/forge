@@ -204,10 +204,48 @@ async fn decode_empty(response: reqwest::Response) -> Result<()> {
     Err(request_error(status, String::from_utf8_lossy(&body).into()))
 }
 
+#[derive(Debug)]
+pub struct ActionUnavailable {
+    pub response: serde_json::Value,
+}
+impl std::fmt::Display for ActionUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "action_unavailable")
+    }
+}
+impl std::error::Error for ActionUnavailable {}
+
 fn request_error(status: StatusCode, body: String) -> anyhow::Error {
+    if status == StatusCode::CONFLICT {
+        if let Ok(response) = serde_json::from_str::<serde_json::Value>(&body) {
+            if response.get("code").and_then(serde_json::Value::as_str)
+                == Some("action_unavailable")
+            {
+                return ActionUnavailable { response }.into();
+            }
+        }
+    }
     if body.trim().is_empty() {
         anyhow!("request failed with status {status}")
     } else {
         anyhow!("request failed with status {status}: {body}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unavailable_actions_are_typed_but_stale_versions_remain_generic() {
+        let unavailable = request_error(
+            StatusCode::CONFLICT,
+            r#"{"code":"action_unavailable","details":{"available_actions":[]}}"#.into(),
+        );
+        assert!(unavailable.is::<ActionUnavailable>());
+        assert!(!request_error(
+            StatusCode::CONFLICT,
+            r#"{"code":"version_conflict"}"#.into()
+        )
+        .is::<ActionUnavailable>());
     }
 }

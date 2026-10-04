@@ -20,7 +20,7 @@ use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentContextScopeRepo, AgentRepo,
     AgentSessionRepo, AgentStatus, CreateAgentContextScope, CreateAgentIdentity,
     CreateAgentProfile, CreateAgentSession, CreateProject, CreateRepo, CreateTask, CreateWorkspace,
-    ProjectRepo, RepoRepo, SqliteDb, TaskRepo, WorkMode, WorkspaceRepo, WorkspaceStatus,
+    ProjectRepo, RepoRepo, SqliteDb, TaskRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType, Message,
@@ -183,7 +183,9 @@ async fn inquiry_fixture(
         system_prompt: Some("Answer this inquiry only.".to_owned()),
         history: Vec::new(),
         input: "first-inquiry-question".to_owned(),
+        server_state_card: None,
         command_allowlist: None,
+        environment: Default::default(),
         cancellation: CancellationToken::new(),
     };
     (db, backend, provider, request, root)
@@ -549,7 +551,9 @@ async fn native_chat_compacts_when_system_prompt_crowds_the_window() {
                         Vec::new()
                     },
                     input: format!("turn {turn}: continue the plan"),
+                    server_state_card: None,
                     command_allowlist: None,
+                    environment: Default::default(),
                     cancellation: CancellationToken::new(),
                 },
                 Arc::new(NoopSink),
@@ -714,7 +718,9 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
                         Vec::new()
                     },
                     input: format!("turn {turn}: continue the plan"),
+                    server_state_card: None,
                     command_allowlist: None,
+                    environment: Default::default(),
                     cancellation: CancellationToken::new(),
                 },
                 Arc::new(NoopSink),
@@ -805,7 +811,9 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
                 ),
                 history: Vec::new(),
                 input: format!("turn {}: continue after compaction", compaction_turn + 1),
+                server_state_card: None,
                 command_allowlist: None,
+                environment: Default::default(),
                 cancellation: CancellationToken::new(),
             },
             Arc::new(NoopSink),
@@ -868,7 +876,6 @@ async fn native_task_worker_compacts_over_budget_history_without_lcm() {
             name: "repository".to_owned(),
             remote_url: Some("https://example.invalid/repository.git".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1011,7 +1018,9 @@ async fn native_task_worker_compacts_over_budget_history_without_lcm() {
                 system_prompt: Some("Implement the assigned Task.".to_owned()),
                 history,
                 input: "continue the implementation".to_owned(),
+                server_state_card: None,
                 command_allowlist: None,
+                environment: Default::default(),
                 cancellation: CancellationToken::new(),
             },
             Arc::new(NoopSink),

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use api_types::ProjectSettings;
 use async_trait::async_trait;
-use db::{now_rfc3339, RepoRepo, WorkspaceRepo};
+use db::{now_rfc3339, RepoRepo, WorkspacePlacementRepo, WorkspaceRepo};
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::json;
 
@@ -12,7 +12,7 @@ use crate::{
     workflow::{effective_role, HookAction, HookContext, HookResult},
 };
 
-use super::common::{task, workspace_id};
+use super::common::{resolve_workspace_backend, task, workspace_id};
 
 pub struct RunBeforeWorkHooks;
 
@@ -72,7 +72,55 @@ impl HookAction for RunBeforeWorkHooks {
         };
         let workspace = match workspace_id(ctx).await {
             Some(workspace_id) => match WorkspaceRepo::get_by_id(&*ctx.db, &workspace_id).await {
-                Ok(Some(workspace)) => workspace,
+                Ok(Some(workspace)) => {
+                    let daemon_owned =
+                        match WorkspacePlacementRepo::get_by_workspace_id(&*ctx.db, &workspace.id)
+                            .await
+                        {
+                            Ok(placement) => placement.is_some_and(|placement| {
+                                placement.owner_kind == db::PlacementOwnerKind::Daemon
+                            }),
+                            Err(error) => {
+                                return HookResult::Failed {
+                                    reason: error.to_string(),
+                                };
+                            }
+                        };
+                    if daemon_owned {
+                        workspace
+                    } else {
+                        match crate::task_service::workspace::ensure_valid(
+                            &ctx.db,
+                            &ctx.workspace_root,
+                            &task,
+                            workspace,
+                            ctx.repo_cache_locks.clone(),
+                            false,
+                            &ctx.workspace_backend_router,
+                        )
+                        .await
+                        {
+                            Ok(workspace) => workspace,
+                            Err(error @ crate::ServiceError::WorkspaceResetRequired { .. }) => {
+                                if let Err(annotation_error) =
+                                    annotate_before_work_workspace_reset(ctx, &task, &error).await
+                                {
+                                    return HookResult::Failed {
+                                        reason: annotation_error.to_string(),
+                                    };
+                                }
+                                return HookResult::Failed {
+                                    reason: error.to_string(),
+                                };
+                            }
+                            Err(error) => {
+                                return HookResult::Failed {
+                                    reason: error.to_string(),
+                                };
+                            }
+                        }
+                    }
+                }
                 Ok(None) => {
                     return HookResult::Failed {
                         reason: format!("workspace not found: {workspace_id}"),
@@ -90,6 +138,7 @@ impl HookAction for RunBeforeWorkHooks {
                 &task,
                 &task.id,
                 ctx.repo_cache_locks.clone(),
+                &ctx.workspace_backend_router,
             )
             .await
             {
@@ -102,10 +151,8 @@ impl HookAction for RunBeforeWorkHooks {
             },
         };
 
-        let repo_path = match RepoRepo::get_by_id(&*ctx.db, &workspace.repo_id).await {
-            Ok(Some(repo)) if repo.project_id == project.id => repo
-                .local_path
-                .unwrap_or_else(|| workspace.worktree_path.clone()),
+        match RepoRepo::get_by_id(&*ctx.db, &workspace.repo_id).await {
+            Ok(Some(repo)) if repo.project_id == project.id => {}
             Ok(_) => {
                 return HookResult::Failed {
                     reason: format!(
@@ -119,7 +166,24 @@ impl HookAction for RunBeforeWorkHooks {
                     reason: error.to_string(),
                 };
             }
+        }
+        let resolved = match resolve_workspace_backend(ctx, &workspace).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                }
+            }
         };
+        let (repo_path, worktree_path) =
+            match crate::lifecycle::context::workspace_context_paths(&ctx.db, &resolved).await {
+                Ok(paths) => paths,
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    }
+                }
+            };
         let assigned_agent_id = target_role_agent_id(ctx).await;
         let log_dir = std::env::temp_dir()
             .join("forge")
@@ -136,14 +200,14 @@ impl HookAction for RunBeforeWorkHooks {
             project_id: project.id.clone(),
             project_name: project.name.clone(),
             repo_path,
-            worktree_path: Some(workspace.worktree_path.clone()),
+            worktree_path: Some(worktree_path),
             agent_id: assigned_agent_id,
             execution_id: ctx.execution_id.clone(),
             log_dir: Some(log_dir),
         };
 
-        match LifecycleHookRunner::run_blocking_before_work_hooks(hook_ctx, &hooks).await {
-            Some(failure) => {
+        match LifecycleHookRunner::run_blocking_workspace_hooks(hook_ctx, &hooks, &resolved).await {
+            Ok(Some(failure)) => {
                 if let Err(error) = annotate_before_work_hook_block(ctx, &task, &failure).await {
                     return HookResult::Failed {
                         reason: error.to_string(),
@@ -159,7 +223,10 @@ impl HookAction for RunBeforeWorkHooks {
                     ),
                 }
             }
-            None => HookResult::Ok,
+            Ok(None) => HookResult::Ok,
+            Err(error) => HookResult::Failed {
+                reason: error.to_string(),
+            },
         }
     }
 }
@@ -171,7 +238,7 @@ async fn target_role_agent_id(ctx: &HookContext) -> Option<String> {
         .iter()
         .find(|state| state.name == ctx.to_state)?;
     let role = effective_role(state)?;
-    db::TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role)
+    super::common::get_role_assignment(ctx, role)
         .await
         .ok()
         .flatten()
@@ -218,9 +285,32 @@ async fn annotate_before_work_hook_block(
             "id": format!("before_work:{}", failure.index),
             "log_path": failure.log_path,
         },
-        "recovery_actions": ["retry_hook", "update_workspace_and_retry_hook", "skip_hook_once", "cancel_task"],
     });
 
+    persist_before_work_annotation(ctx, task, annotation.to_string()).await
+}
+
+async fn annotate_before_work_workspace_reset(
+    ctx: &HookContext,
+    task: &db::Task,
+    error: &crate::ServiceError,
+) -> db::Result<()> {
+    let annotation = json!({
+        "type": api_types::FailureKind::WorkspaceResetRequired,
+        "blocking_reason": "workspace_reset_required",
+        "blocked_by": api_types::Actor::system(api_types::SystemComponent::LifecycleHook).display(),
+        "blocked_at": now_rfc3339(),
+        "blocked_execution_id": ctx.execution_id,
+        "message": error.to_string(),
+    });
+    persist_before_work_annotation(ctx, task, annotation.to_string()).await
+}
+
+async fn persist_before_work_annotation(
+    ctx: &HookContext,
+    task: &db::Task,
+    annotation: String,
+) -> db::Result<()> {
     // `before_enter` owns the Task version used by the surrounding workflow
     // transition, so this annotation deliberately retains that historical
     // version behavior. The recovery event still commits atomically with the
@@ -230,7 +320,7 @@ async fn annotate_before_work_hook_block(
     let update = sqlx::query(
         "UPDATE task SET error_annotation = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
     )
-    .bind(annotation.to_string())
+    .bind(&annotation)
     .bind(&updated_at)
     .bind(&task.id)
     .execute(&mut *transaction)
@@ -239,7 +329,7 @@ async fn annotate_before_work_hook_block(
         return Err(db::DbError::NotFound);
     }
     let mut interruption_snapshot = task.clone();
-    interruption_snapshot.error_annotation = Some(annotation.to_string());
+    interruption_snapshot.error_annotation = Some(annotation);
     interruption_snapshot.updated_at = updated_at;
     let mut interruption_event =
         db::CreateDomainEvent::task_interruption_changed(&interruption_snapshot);
@@ -386,10 +476,14 @@ pub struct AutoCascadeOnCompletion;
 
 #[async_trait]
 impl HookAction for AutoCascadeOnCompletion {
-    async fn execute(&self, _ctx: &HookContext) -> HookResult {
-        HookResult::Cascade {
+    fn declared_cascade(&self) -> Option<HookResult> {
+        Some(HookResult::Cascade {
             to: "done".to_string(),
             reason: "completed".to_string(),
-        }
+        })
+    }
+    async fn execute(&self, _ctx: &HookContext) -> HookResult {
+        self.declared_cascade()
+            .expect("completion declares its cascade")
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -18,9 +18,12 @@ use tracing::Instrument;
 use crate::{workflow::engine::WorkflowEngine, Result, TaskService};
 
 mod active_recovery;
+mod environment_pause_sync;
 mod helpers;
+pub(crate) use helpers::is_blocking_annotation_type;
 mod initial_scheduling;
 mod repo_pause_sync;
+pub mod slots;
 mod workspace_blocking;
 
 pub struct TaskDispatcher {
@@ -29,10 +32,14 @@ pub struct TaskDispatcher {
     task_service: Arc<TaskService>,
     check_interval: Duration,
     stopped: AtomicBool,
-    stop_notify: Notify,
+    stop_notify: Arc<Notify>,
     /// Primary Repo snapshots (`id@updated_at`) already verified ready by
     /// `sync_repository_pause`.
     ready_repositories: Mutex<HashSet<String>>,
+    environment_rechecks: Mutex<HashMap<String, tokio::task::JoinHandle<Result<bool>>>>,
+    environment_settings_observer: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
+    periodic_workers: Arc<crate::worker_runtime::PeriodicWorkers>,
+    observer_shutdown: crate::runtime::ShutdownSignal,
 }
 
 impl TaskDispatcher {
@@ -53,44 +60,89 @@ impl TaskDispatcher {
         check_interval: Duration,
     ) -> Self {
         Self {
+            periodic_workers: Arc::new(crate::worker_runtime::PeriodicWorkers::new(Arc::clone(
+                &db,
+            ))),
             db,
             event_bus,
-            task_service,
+            task_service: Arc::clone(&task_service),
             check_interval,
             stopped: AtomicBool::new(false),
-            stop_notify: Notify::new(),
+            stop_notify: task_service.dispatch_notify(),
             ready_repositories: Mutex::new(HashSet::new()),
+            environment_rechecks: Mutex::new(HashMap::new()),
+            environment_settings_observer: std::sync::OnceLock::new(),
+            observer_shutdown: crate::runtime::ShutdownSignal::new(),
         }
     }
 
+    pub fn with_periodic_workers(
+        mut self,
+        workers: Arc<crate::worker_runtime::PeriodicWorkers>,
+    ) -> Self {
+        self.periodic_workers = workers;
+        self
+    }
+
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        self.start_with_check(Duration::from_secs(3600), |dispatcher| async move {
+            dispatcher.check_once().await
+        })
+    }
+
+    fn start_with_check<F, Fut>(
+        self: Arc<Self>,
+        timeout: Duration,
+        check: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: Fn(Arc<Self>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<u64>> + Send + 'static,
+    {
+        let check = Arc::new(check);
         let event_bus_strong_count = Arc::strong_count(&self.event_bus);
-        tokio::spawn(
-            async move {
-                tracing::info!(
-                    check_interval_seconds = self.check_interval.as_secs(),
-                    "task dispatcher started"
-                );
-                while !self.is_stopped() {
-                    if let Err(error) = self.check_once().await {
-                        tracing::warn!(%error, "task dispatcher check failed");
+        let stop = Arc::clone(&self);
+        self.periodic_workers
+            .worker("task-dispatcher")
+            .with_stall_budget(timeout)
+            .start_stoppable(
+                move || stop.is_stopped(),
+                move |worker| {
+                    let dispatcher = Arc::clone(&self);
+                    let check = Arc::clone(&check);
+                    async move {
+                        tracing::info!(
+                            check_interval_seconds = dispatcher.check_interval.as_secs(),
+                            "task dispatcher started"
+                        );
+                        let result = worker
+                            .run(
+                                || dispatcher.is_stopped(),
+                                "task dispatcher check failed",
+                                || check(Arc::clone(&dispatcher)),
+                                || async {
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(dispatcher.check_interval) => {}
+                                        _ = dispatcher.stop_notify.notified() => {}
+                                        _ = dispatcher.task_service.dispatch_wake.notified() => {}
+                                    }
+                                },
+                            )
+                            .await;
+                        tracing::info!("task dispatcher stopped");
+                        result
                     }
-                    tokio::select! {
-                        _ = tokio::time::sleep(self.check_interval) => {}
-                        _ = self.stop_notify.notified() => {}
-                    }
-                }
-                tracing::info!("task dispatcher stopped");
-            }
-            .instrument(tracing::info_span!(
-                "task.dispatcher",
-                event_bus_strong_count = event_bus_strong_count
-            )),
-        )
+                    .instrument(tracing::info_span!(
+                        "task.dispatcher",
+                        event_bus_strong_count
+                    ))
+                },
+            )
     }
 
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
+        self.observer_shutdown.request();
         self.stop_notify.notify_one();
     }
 
@@ -101,6 +153,14 @@ impl TaskDispatcher {
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
         let mut dispatched = 0;
+        let environment_changed = match self.sync_due_environment_checks().await {
+            Ok(changed) => changed,
+            Err(error) => {
+                tracing::warn!(%error,"environment readiness scan failed; continuing Project dispatch");
+                HashSet::new()
+            }
+        };
+        self.observe_environment_settings();
         for project in self.list_projects().await? {
             if self.is_stopped() {
                 break;
@@ -109,8 +169,20 @@ impl TaskDispatcher {
             // since it is also what resumes a Project once its repository
             // shows up. Either direction leaves this scan's in-memory
             // `project` stale, so skip acting on it this tick either way.
-            let pause_changed = self.sync_repository_pause(&project).await?;
-            dispatched += self.reconcile_plan_publication_claims(&project).await?;
+            let pause_changed = match self.sync_repository_pause(&project).await {
+                Ok(changed) => changed,
+                Err(error) => {
+                    tracing::warn!(project_id = %project.id, %error, "repository pause synchronization failed; skipping Project");
+                    continue;
+                }
+            };
+            let pause_changed = pause_changed || environment_changed.contains(&project.id);
+            match self.reconcile_plan_publication_claims(&project).await {
+                Ok(count) => dispatched += count,
+                Err(error) => {
+                    tracing::warn!(project_id = %project.id, %error, "plan publication reconciliation failed; continuing Project scan")
+                }
+            }
             if pause_changed {
                 continue;
             }
@@ -118,17 +190,34 @@ impl TaskDispatcher {
                 continue;
             }
             let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-            dispatched += self.dispatch_queued_recoveries(&project).await?;
+            match self.dispatch_queued_recoveries(&project).await {
+                Ok(count) => dispatched += count,
+                Err(error) => {
+                    tracing::warn!(project_id = %project.id, %error, "queued recovery failed; continuing Project scan")
+                }
+            }
             // Work already in flight goes first. Scheduling new Tasks first
             // let every fresh `todo` claim a single-slot agent before an
             // interrupted Task — one whose execution a restart stopped with
             // an automatic resume — was even considered, so it waited behind
             // the whole ready queue while holding its worktree.
-            dispatched += self.recover_active_tasks(&project, &workflow).await?;
+            // Admission retains large reserve/prepare futures. Keep each
+            // phase off the scan's inline future, including concurrent scans.
+            match Box::pin(self.recover_active_tasks(&project, &workflow)).await {
+                Ok(count) => dispatched += count,
+                Err(error) => {
+                    tracing::warn!(project_id = %project.id, %error, "active recovery failed; continuing Project scan")
+                }
+            }
             if self.is_stopped() {
                 break;
             }
-            dispatched += self.dispatch_initial_tasks(&project, &workflow).await?;
+            match Box::pin(self.dispatch_initial_tasks(&project, &workflow)).await {
+                Ok(count) => dispatched += count,
+                Err(error) => {
+                    tracing::warn!(project_id = %project.id, %error, "initial scheduling failed; skipping Project")
+                }
+            }
         }
 
         tracing::info!(
@@ -213,84 +302,92 @@ impl TaskDispatcher {
         }
         let mut reconciled = 0;
         for mut task in tasks {
-            if let Some(execution_id) =
-                crate::task_service::execution::pending_plan_publication_cleanup_owner(&task)?
-            {
-                match crate::task_service::execution::cleanup_execution_plan_private_files(
-                    &self.db,
-                    &task,
-                    &execution_id,
+            let task_id = task.id.clone();
+            let result: Result<()> = async {
+                if let Some(execution_id) =
+                    crate::task_service::execution::pending_plan_publication_cleanup_owner(&task)?
+                {
+                    match crate::task_service::execution::cleanup_execution_plan_private_files(
+                        &self.db,
+                        &self.task_service.workspace_backend_router(),
+                        &task,
+                        &execution_id,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(error) => {
+                            tracing::warn!(task_id = %task.id, execution_id, %error, "plan publication private-file cleanup failed");
+                            return Ok(());
+                        }
+                    }
+                    match crate::task_service::execution::clear_plan_publication_cleanup(
+                        &self.db,
+                        &task,
+                        &execution_id,
+                    )
+                    .await
+                    {
+                        Ok(updated) => {
+                            task = updated;
+                            reconciled += 1;
+                        }
+                        Err(crate::ServiceError::Db(db::DbError::VersionConflict)) => return Ok(()),
+                        Err(error) => {
+                            tracing::warn!(task_id = %task.id, execution_id, %error, "plan publication cleanup marker release failed");
+                            return Ok(());
+                        }
+                    }
+                }
+                task = match crate::task_service::execution::clear_stale_plan_publication_claim(
+                    &self.db, &self.task_service.workspace_backend_router(), &task,
                 )
                 .await
                 {
-                    Ok(()) => {}
+                    Ok(task) => task,
+                    Err(crate::ServiceError::Db(db::DbError::VersionConflict)) => return Ok(()),
                     Err(error) => {
-                        tracing::warn!(task_id = %task.id, execution_id, %error, "plan publication private-file cleanup failed");
-                        continue;
+                        tracing::warn!(task_id = %task.id, %error, "plan publication claim cleanup failed");
+                        return Ok(());
                     }
-                }
-                match crate::task_service::execution::clear_plan_publication_cleanup(
-                    &self.db,
-                    &task,
-                    &execution_id,
-                )
-                .await
-                {
-                    Ok(updated) => {
-                        task = updated;
-                        reconciled += 1;
+                };
+                let Some(execution_id) =
+                    crate::task_service::execution::active_plan_publication_claim_owner(&task)?
+                else {
+                    return Ok(());
+                };
+                let owner = ExecutionRepo::get_by_id(&*self.db, &execution_id).await?;
+                if owner.as_ref().is_none_or(|execution| {
+                    execution.task_id != task.id || execution.status != db::ExecutionStatus::Completed
+                }) {
+                    match self
+                        .task_service
+                        .abandon_plan_publication_claim(&task, &execution_id)
+                        .await
+                    {
+                        Ok(()) => reconciled += 1,
+                        Err(crate::ServiceError::Db(db::DbError::VersionConflict)) => {}
+                        Err(error) => {
+                            tracing::warn!(task_id = %task.id, execution_id, %error, "invalid plan publication claim cleanup failed");
+                        }
                     }
-                    Err(crate::ServiceError::Db(db::DbError::VersionConflict)) => continue,
-                    Err(error) => {
-                        tracing::warn!(task_id = %task.id, execution_id, %error, "plan publication cleanup marker release failed");
-                        continue;
-                    }
+                    return Ok(());
                 }
-            }
-            task = match crate::task_service::execution::clear_stale_plan_publication_claim(
-                &self.db, &task,
-            )
-            .await
-            {
-                Ok(task) => task,
-                Err(crate::ServiceError::Db(db::DbError::VersionConflict)) => continue,
-                Err(error) => {
-                    tracing::warn!(task_id = %task.id, %error, "plan publication claim cleanup failed");
-                    continue;
-                }
-            };
-            let Some(execution_id) =
-                crate::task_service::execution::active_plan_publication_claim_owner(&task)?
-            else {
-                continue;
-            };
-            let owner = ExecutionRepo::get_by_id(&*self.db, &execution_id).await?;
-            if owner.as_ref().is_none_or(|execution| {
-                execution.task_id != task.id || execution.status != db::ExecutionStatus::Completed
-            }) {
                 match self
                     .task_service
-                    .abandon_plan_publication_claim(&task, &execution_id)
+                    .maybe_cascade_executor_completion(&execution_id)
                     .await
                 {
                     Ok(()) => reconciled += 1,
                     Err(crate::ServiceError::Db(db::DbError::VersionConflict)) => {}
                     Err(error) => {
-                        tracing::warn!(task_id = %task.id, execution_id, %error, "invalid plan publication claim cleanup failed");
+                        tracing::warn!(task_id = %task.id, execution_id, %error, "plan publication claim reconciliation failed");
                     }
                 }
-                continue;
-            }
-            match self
-                .task_service
-                .maybe_cascade_executor_completion(&execution_id)
-                .await
-            {
-                Ok(()) => reconciled += 1,
-                Err(crate::ServiceError::Db(db::DbError::VersionConflict)) => {}
-                Err(error) => {
-                    tracing::warn!(task_id = %task.id, execution_id, %error, "plan publication claim reconciliation failed");
-                }
+                Ok(())
+            }.await;
+            if let Err(error) = result {
+                tracing::warn!(%task_id, %error, "plan publication Task reconciliation failed; continuing scan");
             }
         }
         Ok(reconciled)

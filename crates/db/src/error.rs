@@ -4,11 +4,24 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
+    #[cfg(feature = "test-template")]
+    #[error("test database template failed: {0}")]
+    TestTemplate(String),
+
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
     #[error("not found")]
     NotFound,
+
+    #[error("Agent Chat turn is not retryable")]
+    TurnNotRetryable,
+
+    #[error("another Agent Chat turn is live")]
+    ChatTurnLive,
+
+    #[error("dead letter is not a whole event and cannot be replayed")]
+    DeadLetterNotReplayable,
 
     #[error("version conflict")]
     VersionConflict,
@@ -39,6 +52,8 @@ pub enum DbError {
 
     #[error("agent at capacity")]
     AgentAtCapacity,
+    #[error("machine has no available run capacity")]
+    MachineAtCapacity,
 
     #[error("agent {agent_id} is paused")]
     AgentPaused { agent_id: String },
@@ -108,4 +123,26 @@ pub enum DbError {
         applied: String,
         bundled: String,
     },
+}
+
+impl DbError {
+    /// Worker retry classification, deliberately narrower than "any DB error".
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::VersionConflict
+            | Self::TaskVersionConflict { .. }
+            | Self::BoardRevisionConflict { .. } => true,
+            Self::Sqlx(
+                sqlx::Error::PoolTimedOut
+                | sqlx::Error::PoolClosed
+                | sqlx::Error::WorkerCrashed
+                | sqlx::Error::Io(_),
+            ) => true,
+            Self::Sqlx(sqlx::Error::Database(error)) => error
+                .code()
+                .and_then(|code| code.parse::<i32>().ok())
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6 | 10 | 14)),
+            _ => false,
+        }
+    }
 }

@@ -9,8 +9,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{task::JoinHandle, time::sleep};
-use tracing::Instrument;
+use tokio::time::sleep;
 
 const SHUTDOWN_ERROR_TYPE: &str = "shutdown";
 
@@ -114,19 +113,6 @@ impl GracefulShutdown {
     }
 }
 
-pub fn install_signal_handler(shutdown: Arc<GracefulShutdown>) -> JoinHandle<()> {
-    tokio::spawn(
-        async move {
-            tracing::info!("shutdown signal handler installed");
-            if tokio::signal::ctrl_c().await.is_ok() {
-                tracing::info!("shutdown signal received");
-                let _ = shutdown.shutdown().await;
-            }
-        }
-        .instrument(tracing::info_span!("shutdown.signal_handler")),
-    )
-}
-
 #[cfg(not(test))]
 fn transaction_drain_wait() -> Duration {
     Duration::from_secs(2)
@@ -207,7 +193,6 @@ mod tests {
                 name: "forge".to_owned(),
                 remote_url: Some("https://example.com/forge.git".to_owned()),
                 local_path: None,
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now,
@@ -243,6 +228,7 @@ mod tests {
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: format!("machine-{daemon_id}"),
                 hostname: "test-host".to_owned(),

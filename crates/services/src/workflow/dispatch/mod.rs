@@ -82,6 +82,10 @@ Review report: record what you verified with `task.worklog` (append) entries -- 
 const OUTBOX_REVIEW_REPORT_CONTRACT: &str = "\
 Review report: this harness has no Forge tools. The directory named by the `FORGE_OUTBOX` environment variable is the only place you may write your report (build output and scratch files elsewhere are discarded with the worktree); Forge ingests it when this run ends. Append one JSON object per line to `$FORGE_OUTBOX/worklog.jsonl` for what you verified -- {\"kind\":\"validation\",\"summary\":\"...\"} for a check you ran, `blocker` for what stopped you -- and one JSON object per line to `$FORGE_OUTBOX/evidence.jsonl`, one per artifact, for the output behind a finding -- {\"kind\":\"log\",\"caption\":\"...\",\"content\":\"<verbatim output>\"}, or a `path` to a file you saved under `$FORGE_OUTBOX`, such as a screenshot. Evidence `kind` is `screenshot`, `walkthrough_video`, `log`, `report`, or `other`. The verdict itself belongs in the result block that ends your reply.";
 
+pub(crate) const REVIEW_FINDING_ROUTING_CONTRACT: &str = r#"Result fields: `fixable_by` is "coder" (default) or "owner". Use "owner" only when the blocking finding needs something the coder cannot provide in this Task: another OS or hardware, an external service or credential, Forge-side metadata or links, a scope/product decision, or a change to acceptance criteria; otherwise use "coder". `repeat` defaults to false; set it true only when the previous review attempt raised the same blocking finding and it is still unaddressed.
+Owner example: {"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"owner","repeat":false}.
+Repeat example: {"result":"fail","reason":"The null-input crash from the previous review is still reproducible","fixable_by":"coder","repeat":true}."#;
+
 /// Tell an implementing agent exactly which checks gate review and how they
 /// run. Without this the agent validates with whatever interpreter or command
 /// it prefers, passes locally, and learns the real gate only from a rejection.
@@ -248,20 +252,6 @@ fn default_role_builders() -> &'static DefaultRoleBuilderMap {
     })
 }
 
-pub fn register_prompt_builder(builder: Arc<dyn PromptBuilder>) {
-    let mut builders = registry()
-        .write()
-        .expect("prompt builder registry lock poisoned");
-    builders.insert(builder.id().to_string(), builder);
-}
-
-pub fn register_default_role_builder(role: &str, builder_id: &str) {
-    let mut role_defaults = default_role_builders()
-        .write()
-        .expect("default role builder mapping lock poisoned");
-    role_defaults.insert(role.to_string(), builder_id.to_string());
-}
-
 pub fn resolve_prompt_builder(builder_id: &str) -> Arc<dyn PromptBuilder> {
     if let Some(builder) = registry()
         .read()
@@ -353,26 +343,6 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             description: "Fallback prompt for custom roles without a specialized builder.",
         },
     ]
-}
-
-pub fn dispatch_intent_from_config(value: &Value) -> DispatchIntent {
-    let dispatch = value.get("dispatch").unwrap_or(value);
-    let prompt_config = dispatch
-        .get("prompt")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default()));
-
-    DispatchIntent {
-        builder_id: dispatch
-            .get("builder")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        execution_policy: dispatch
-            .get("execution_policy")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        prompt_config,
-    }
 }
 
 pub fn dispatch_intent_from_workflow_dispatch(

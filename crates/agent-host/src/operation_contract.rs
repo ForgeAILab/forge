@@ -19,9 +19,8 @@ use crate::operation_catalog::{
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
     PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION,
-    TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -526,14 +525,10 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             &["action", "title", "review_requirement_ids"],
             "Create one Task in the authenticated Project scope. The server binds the current approved Charter, optional traceability references, permissions, and Task workflow state. review_requirement_ids is an explicit ownership decision: list only non-universal Charter requirements this Task directly owns, or use [] when it owns none. Copy each ID verbatim from selectable_review_requirements in the project.charter read rather than constructing it. depends_on_task_ids expresses prerequisite DAG edges only: it does not create a parent/child hierarchy or workspace sharing. Project-wide completion is evaluated at milestone readiness.",
         ),
-        TASK_RECOVER_OPERATION => described_object_schema(
-            json!({
-                "action":{"type":"string","enum":["resume_session","reexecute","reset_to_initial","reset_retry_window","cancel_task"]},
-                "task_id":{"type":"string","minLength":1},
-                "reason":{"type":"string","minLength":1,"description":"What stopped this Task, in your own words."}
-            }),
-            &["action", "task_id", "reason"],
-            "Recover a Task that stopped so it can run again, rather than creating a replacement. Use this when the Task definition is sound and the failure was operational -- an expired worker lease, a runtime that went away, a dispatch race, an exhausted retry window. `resume_session` continues the interrupted run; `reexecute` starts a fresh run of the same Task; `reset_to_initial` returns it to the queue for normal dispatch; `reset_retry_window` clears an exhausted retry budget; `cancel_task` ends a Task whose outcome no longer needs a run at all -- a verification-shaped Task you absorbed by settling its checks yourself. Replace a Task only when what it asks for is actually wrong: a duplicate leaves the original stranded and the work double-counted.",
+        TASK_ACTION_OPERATION => described_object_schema(
+            json!({ "task_id":{"type":"string","minLength":1}, "action":api_types::task_action_schema(), "version":{"type":"integer","minimum":1} }),
+            &["task_id", "action", "version"],
+            "Apply a Task's current available_actions. Copy an offered action and supply its Task version. retry queues work, restart returns interrupted work to the initial state, and cancel ends obsolete work. Agents cannot override a gate. Unavailable actions return current offers; use them instead of repeating a denial.",
         ),
         TASK_PLAN_OPERATION => described_object_schema(
             json!({
@@ -564,26 +559,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             &["action", "kind", "caption"],
             "Capture one artifact this Task run actually produced and register it as authoritative evidence bound to this Task. Supply exactly one of `path` (a file in the Task workspace) or `content` (verbatim captured output). The server stores the bytes, computes the checksum, and returns the asset id a milestone evidence attachment references. Never describe an observation you did not make: this records what the run produced, not what you expect it to produce.",
         ),
-        TASK_REVIEW_OPERATION => described_object_schema(
-            json!({
-                "task_id":{"type":"string","minLength":1},
-                "decision":{"type":"string","enum":["accept","reject"]},
-                "expected_task_version":{"type":"integer","minimum":1},
-                "reason":string_or_null_schema()
-            }),
-            &["task_id", "decision", "expected_task_version"],
-            "Accept or reject an exact human-required Task review in the bound Project. This uses the normal Task workflow, version, CI, and evidence checks and cannot review another Project.",
-        ),
-        TASK_CANCEL_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"cancel"},
-                "task_id":{"type":"string","minLength":1},
-                "expected_task_version":{"type":"integer","minimum":1},
-                "reason":{"type":"string","minLength":1,"description":"Why this Task is no longer needed or should stop."}
-            }),
-            &["action", "task_id", "expected_task_version", "reason"],
-            "Cancel one non-terminal Task in the bound Project at an exact version. This is valid for healthy queued or running work and uses the normal Task cancellation lifecycle, including stopping active executions. Use task.recover only when stopped work should continue.",
-        ),
+
         TASK_DEPENDENCY_OPERATION => described_object_schema(
             json!({
                 "action":{"type":"string","enum":["add","remove"]},
@@ -894,10 +870,13 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "supply exactly one of workspace-relative path or inline content; filename is optional."
         ));
     }
+    if operations.contains("task.propose") || operations.contains(TASK_ADAPTIVE_OPERATION) {
+        lines.push(crate::MERGE_FRIENDLY_TASK_GUIDANCE);
+    }
     if operations.contains("task.propose") {
         lines.push(concat!(
             "task.propose — create a Task in the bound Project. Fields: ",
-            "title (required); description (outcome plus acceptance criteria); ",
+            "title (required); description (outcome, acceptance criteria, and owned repository-relative paths); ",
             "priority (integer, higher runs sooner); ",
             "task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); ",
             "plan_item_id (optional traceability to a stable item in the active execution ",
@@ -910,7 +889,7 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "those); risk_class (only when the baseline declares allowed classes). ",
             "depends_on_task_ids (optional accepted Task ids in this Project; these are ",
             "prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; ",
-            "each prerequisite must reach done before this Task can dispatch). ",
+            "each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. ",
             "Forge binds implementation authority to the Project's current approved Charter. ",
             "Baseline references are optional traceability; never echo baseline ids or digests.",
         ));
@@ -930,39 +909,10 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "and unknown fields are rejected."
         ));
     }
-    if operations.contains(TASK_RECOVER_OPERATION) {
-        lines.push(concat!(
-            "task.recover — repair a Task that stopped, instead of replacing it. ",
-            "Fields: task_id (required, a Task in this Project); ",
-            "reason (required: state what stopped it); ",
-            "action (required: \"resume_session\", \"reexecute\", \"reset_to_initial\", ",
-            "\"reset_retry_window\", or \"cancel_task\"). ",
-            "Use this to restart work that stopped for a transient reason — an expired ",
-            "lease, a lost runtime, a dispatch race — rather than proposing a duplicate ",
-            "Task. A Task that cannot succeed as specified, such as a read-only task_type ",
-            "whose work needs repository writes, will fail every retry: stop it rather ",
-            "than duplicating it. Prefer versioned `task.cancel` for stopping a ",
-            "non-terminal Task; `cancel_task` here ends one whose outcome no longer needs ",
-            "a run at all, such as a verification-shaped Task you absorbed by settling ",
-            "its checks yourself."
-        ));
+    if operations.contains(TASK_ACTION_OPERATION) {
+        lines.push("task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n");
     }
-    if operations.contains(TASK_CANCEL_OPERATION) {
-        lines.push(concat!(
-            "task.cancel — cancel one healthy or stopped non-terminal Task in the bound Project. ",
-            "Fields: action (required: \"cancel\"), task_id, expected_task_version, and a ",
-            "non-empty reason (all required). Forge stops active executions and applies the ",
-            "normal Task cancellation transition. Refresh and retry on a version conflict."
-        ));
-    }
-    if operations.contains(TASK_REVIEW_OPERATION) {
-        lines.push(concat!(
-            "task.review — record a human-required review verdict on one Task in the bound ",
-            "Project. Fields: task_id, decision (required: \"accept\" or \"reject\"), and ",
-            "expected_task_version (all required); reason is an optional note. This uses the ",
-            "normal review workflow, CI, and evidence checks."
-        ));
-    }
+
     if operations.contains(TASK_DEPENDENCY_OPERATION) {
         lines.push(concat!(
             "task.dependency — add or remove one prerequisite edge between two Tasks in the ",
@@ -1016,7 +966,7 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             },
             "description": {
                 "type": ["string", "null"],
-                "description": "task.propose: outcome plus acceptance criteria."
+                "description": "task.propose: outcome, acceptance criteria, and owned repository-relative paths."
             },
             "priority": {
                 "type": ["integer", "null"],
@@ -1041,25 +991,20 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             },
             "task_id": {
                 "type": ["string", "null"],
-                "description": "task.recover/task.cancel/task.review/task.dependency: required Task id in this Project."
-            },
-            "reason": {
-                "type": ["string", "null"],
-                "description": "task.recover/task.cancel: required explanation. task.review: optional note on the decision."
-            },
-            "decision": {
-                "type": ["string", "null"],
-                "description": "task.review: required, either \"accept\" or \"reject\". This is the whole review verdict; without it the Task cannot be reviewed through this surface."
+                "description": "task.action/task.dependency: required Task id in this Project."
             },
             "action": {
-                "type": ["string", "null"],
-                "description": concat!(
-                    "task.recover: required, one of \"resume_session\", \"reexecute\", ",
-                    "\"reset_to_initial\", \"reset_retry_window\", or \"cancel_task\". ",
-                    "task.adaptive: \"split\", \"sequence\", or \"replace\". ",
-                    "task.cancel: \"cancel\". ",
-                    "task.dependency: \"add\" or \"remove\"."
-                )
+                "type": ["string", "object", "null"],
+                "properties": {
+                    "verb": {"type":"string", "enum":["start","hold","release","retry","send_back","approve","restart","cancel"]},
+                    "reason": string_or_null_schema(),
+                    "guidance": string_or_null_schema(),
+                    "override": {"type":["boolean","null"]},
+                    "fresh_session": {"type":["boolean","null"]},
+                    "refresh_workspace": {"type":["boolean","null"]},
+                    "reset_budget": {"type":["boolean","null"]}
+                },
+                "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string."
             },
             "capability_class": {
                 "type": ["string", "null"],
@@ -1149,13 +1094,13 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             "description": "task.dependency: the single prerequisite Task the edge points at. Use task.dependency to change an existing graph; recreating Tasks changes their ids and orphans everything downstream."
         });
     }
-    if operations.contains(TASK_ADAPTIVE_OPERATION)
-        || operations.contains(TASK_CANCEL_OPERATION)
-        || operations.contains(TASK_REVIEW_OPERATION)
-    {
+    if operations.contains(TASK_ACTION_OPERATION) {
+        properties["version"] = json!({"type":["integer","null"], "description":"task.action: required current Task version from the offered actions."});
+    }
+    if operations.contains(TASK_ADAPTIVE_OPERATION) {
         properties["expected_task_version"] = json!({
             "type": ["integer", "null"],
-            "description": "task.adaptive/task.cancel/task.review: Task version precondition."
+            "description": "task.adaptive: Task version precondition. task.action uses version."
         });
     }
     if operations.contains(TASK_ADAPTIVE_OPERATION) {
@@ -1626,6 +1571,32 @@ mod tests {
     }
 
     #[test]
+    fn task_shaping_guidance_is_shared_once_for_each_admitted_surface() {
+        let rule = crate::MERGE_FRIENDLY_TASK_GUIDANCE;
+        assert_eq!(
+            rule,
+            "Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file."
+        );
+        assert!(rule.split_whitespace().count() <= 25);
+        for operations in [
+            BTreeSet::from([TASK_PROPOSE_OPERATION.to_owned()]),
+            BTreeSet::from([TASK_ADAPTIVE_OPERATION.to_owned()]),
+            BTreeSet::from([
+                TASK_PROPOSE_OPERATION.to_owned(),
+                TASK_ADAPTIVE_OPERATION.to_owned(),
+            ]),
+        ] {
+            let guidance = coordination_payload_guidance(&operations);
+            assert_eq!(guidance.matches(rule).count(), 1);
+            assert!(!guidance.contains(crate::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
+        }
+        assert!(
+            !coordination_payload_guidance(&BTreeSet::from([TASK_WORKLOG_OPERATION.to_owned()]))
+                .contains(rule)
+        );
+    }
+
+    #[test]
     fn task_proposal_requires_an_explicit_review_scope_decision() {
         let schema = orchestration_payload_schema(TASK_PROPOSE_OPERATION);
         assert!(
@@ -1654,6 +1625,9 @@ mod tests {
         }
         let operations = BTreeSet::from([TASK_PROPOSE_OPERATION.to_owned()]);
         let guidance = coordination_payload_guidance(&operations);
+        assert!(guidance.contains("owned repository-relative paths"));
+        assert!(guidance.contains("parallel Tasks disjoint files"));
+        assert!(guidance.contains("dependencies to order shared-file edits"));
         assert!(guidance.contains("prerequisite DAG edges only"));
         assert!(guidance.contains("not a parent/child hierarchy or workspace sharing"));
         let properties = coordination_payload_properties(&operations).expect("flat properties");
@@ -1662,6 +1636,12 @@ mod tests {
                 .as_str()
                 .expect("flat prerequisite guidance")
                 .contains("prerequisite DAG edges only")
+        );
+        assert!(
+            properties["description"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("owned repository-relative paths")
         );
         // A field the server requires but the flat surface never declares is
         // a field a declared-properties-only provider cannot send at all:
@@ -1727,10 +1707,17 @@ mod tests {
                 crate::operation_catalog::is_coordination_generic_proposal(operation)
             })
             .collect();
-        assert!(
-            coordination.len() >= 6,
-            "the coordination envelope should carry the task command family: {coordination:?}"
-        );
+        for required in [
+            TASK_PROPOSE_OPERATION,
+            TASK_ADAPTIVE_OPERATION,
+            TASK_DEPENDENCY_OPERATION,
+            TASK_ACTION_OPERATION,
+        ] {
+            assert!(
+                coordination.contains(&required),
+                "the coordination envelope must carry {required}: {coordination:?}"
+            );
+        }
 
         for operation in coordination {
             let alone: BTreeSet<String> = [operation.to_owned()].into_iter().collect();
@@ -1775,9 +1762,9 @@ mod tests {
     fn every_operation_resolves_its_own_payload_schema() {
         let cases = [
             (TASK_ADAPTIVE_OPERATION, "split"),
-            (TASK_CANCEL_OPERATION, "cancel"),
+            (TASK_ACTION_OPERATION, "cancel"),
             (TASK_DEPENDENCY_OPERATION, "add"),
-            (TASK_RECOVER_OPERATION, "resume_session"),
+            (TASK_ACTION_OPERATION, "retry"),
             (TASK_PLAN_OPERATION, "write"),
             (TASK_WORKLOG_OPERATION, "append"),
             (TASK_EVIDENCE_OPERATION, "capture"),
@@ -1787,15 +1774,21 @@ mod tests {
         for (operation, expected_action) in cases {
             let schema = orchestration_payload_schema(operation);
             let action = &schema["properties"]["action"];
-            let admits = action
-                .get("const")
-                .and_then(Value::as_str)
-                .map(|value| value == expected_action)
-                .unwrap_or_else(|| {
-                    action["enum"]
-                        .as_array()
-                        .is_some_and(|values| values.iter().any(|v| v == expected_action))
-                });
+            let admits = if operation == TASK_ACTION_OPERATION {
+                jsonschema::validator_for(action)
+                    .expect("closed Task action schema")
+                    .is_valid(&json!({"verb": expected_action}))
+            } else {
+                action
+                    .get("const")
+                    .and_then(Value::as_str)
+                    .map(|value| value == expected_action)
+                    .unwrap_or_else(|| {
+                        action["enum"]
+                            .as_array()
+                            .is_some_and(|values| values.iter().any(|v| v == expected_action))
+                    })
+            };
             assert!(
                 admits,
                 "{operation} resolved a schema whose action does not admit \
@@ -1939,8 +1932,7 @@ mod tests {
     fn combined_task_command_action_guidance_names_every_discriminator() {
         let operations = [
             TASK_ADAPTIVE_OPERATION.to_owned(),
-            TASK_CANCEL_OPERATION.to_owned(),
-            TASK_RECOVER_OPERATION.to_owned(),
+            TASK_ACTION_OPERATION.to_owned(),
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -1950,15 +1942,164 @@ mod tests {
             .expect("action guidance");
 
         for discriminator in [
-            "task.recover: required",
-            "\"resume_session\"",
+            "task.action: required closed verb object",
+            "retry",
             "task.adaptive: \"split\", \"sequence\", or \"replace\"",
-            "task.cancel: \"cancel\"",
+            "cancel",
         ] {
             assert!(
                 action_description.contains(discriminator),
                 "combined action guidance must name {discriminator}: {action_description}"
             );
         }
+    }
+    #[test]
+    fn task_action_flat_payload_has_version_and_no_retired_envelope_fields() {
+        let operations = [TASK_ACTION_OPERATION.to_owned()].into_iter().collect();
+        let properties = coordination_payload_properties(&operations).unwrap();
+        for required in ["task_id", "action", "version"] {
+            assert!(properties.get(required).is_some());
+        }
+        for retired in ["reason", "decision", "expected_task_version"] {
+            assert!(properties.get(retired).is_none());
+        }
+    }
+    #[tokio::test]
+    async fn task_action_flat_schema_survives_gemini_and_openai_conversion() {
+        use agent_runtime::{
+            core::{
+                cancel::Cancellation,
+                clock::Deadline,
+                content::Message,
+                ids::{AttemptId, RequestId, SessionId},
+                provider::{
+                    ModelId, Provider, ProviderAttemptPurpose, ProviderCallContext, ProviderError,
+                    ProviderRequest, ToolSchema,
+                },
+                store::Secret,
+            },
+            provider::{
+                gemini::{GeminiInteractionsConfig, GeminiInteractionsProvider},
+                openai::{OpenAiConfig, OpenAiProvider},
+                transport::{ByteStream, HttpRequest, HttpTransport},
+            },
+        };
+        use futures_util::StreamExt;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Debug, Default)]
+        struct Capture(Arc<Mutex<Vec<Value>>>);
+        #[async_trait::async_trait]
+        impl HttpTransport for Capture {
+            async fn post_stream(&self, request: HttpRequest) -> Result<ByteStream, ProviderError> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&request.body).unwrap());
+                Ok(Box::pin(futures_util::stream::empty()))
+            }
+        }
+        #[derive(Debug)]
+        struct Noop;
+        #[async_trait::async_trait]
+        impl crate::ForgeToolProvider for Noop {
+            async fn read(
+                &self,
+                _: &str,
+                _: &crate::CanonicalScope,
+                _: &str,
+                _: Value,
+            ) -> Result<Value, crate::AgentHostError> {
+                Ok(json!({}))
+            }
+            async fn propose(
+                &self,
+                _: &str,
+                _: &crate::CanonicalScope,
+                _: &str,
+                _: &str,
+                _: Value,
+            ) -> Result<Value, crate::AgentHostError> {
+                Ok(json!({}))
+            }
+        }
+        let composition = crate::ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+            "project-agent",
+            crate::CanonicalScope {
+                scope_type: crate::CanonicalScopeType::AgentChat,
+                scope_id: "chat".to_owned(),
+                workspace_access: crate::WorkspaceAccess::Deny,
+            },
+            None,
+            None,
+            &["read_project".to_owned(), "propose_task".to_owned()]
+                .into_iter()
+                .collect(),
+            true,
+            Some(Arc::new(Noop)),
+        )
+        .unwrap();
+        let tool = composition
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "forge_scope_propose")
+            .unwrap();
+        let schema = tool.spec().input_schema.clone();
+        assert_eq!(
+            schema["properties"]["action"]["properties"],
+            schema["properties"]["payload"]["properties"]["action"]["properties"]
+        );
+        let action = &schema["properties"]["payload"]["properties"]["action"];
+        for field in [
+            "verb",
+            "reason",
+            "guidance",
+            "override",
+            "fresh_session",
+            "refresh_workspace",
+            "reset_budget",
+        ] {
+            assert!(action["properties"].get(field).is_some(), "{field}");
+        }
+        let capture = Capture::default();
+        let gemini = GeminiInteractionsProvider::new(
+            capture.clone(),
+            GeminiInteractionsConfig::new("https://example.test/v1beta", "gemini-test")
+                .with_api_key(Secret::new("offline-test")),
+        )
+        .unwrap();
+        let openai = OpenAiProvider::new(
+            capture.clone(),
+            OpenAiConfig::new("https://example.test/v1", "openai-test")
+                .with_api_key(Secret::new("offline-test")),
+        );
+        for (provider, model) in [
+            (&gemini as &dyn Provider, "gemini-test"),
+            (&openai as &dyn Provider, "openai-test"),
+        ] {
+            let mut request = ProviderRequest::new(
+                ModelId::new(model),
+                vec![Message::user("Read the offered action")],
+            );
+            request.tools.push(ToolSchema {
+                name: "forge_scope_propose".to_owned(),
+                description: "Apply offered action".to_owned(),
+                input_schema: schema.clone(),
+            });
+            let context = ProviderCallContext {
+                session: SessionId::new("test"),
+                request_id: RequestId::new("test"),
+                attempt_id: AttemptId::new("test"),
+                cache_identity: None,
+                purpose: ProviderAttemptPurpose::Ordinary,
+                cancel: Cancellation::new(),
+                deadline: Deadline::never(),
+            };
+            let mut stream = provider.stream(request, context).await.unwrap();
+            while stream.next().await.is_some() {}
+        }
+        let requests = capture.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["tools"][0]["parameters"], schema);
+        assert_eq!(requests[1]["tools"][0]["function"]["parameters"], schema);
     }
 }

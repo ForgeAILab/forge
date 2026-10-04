@@ -34,7 +34,6 @@ use crate::{
     repository::{read_or_create_marker, resolve_git_repository, RepositoryError, SoloRepository},
     runtime_backend::RuntimeBackend,
     runtime_lock::{LockOwnerContext, RuntimeLock, RuntimeLockError},
-    terminal::{PanicHookGuard, TerminalGuard},
     tracing::{init_tracing, TracingError, TracingGuard},
 };
 
@@ -230,7 +229,8 @@ impl SoloStartup {
             )
             .await?,
         );
-        let daemon_handle = Arc::clone(&daemon).start();
+        let daemon_handle =
+            Arc::clone(&daemon).start(&runtime.operator_status_service.periodic_workers());
         let daemon_record = match wait_for_embedded_daemon(&db).await {
             Ok(record) => record,
             Err(error) => {
@@ -377,19 +377,6 @@ impl SoloStartup {
     #[must_use]
     pub fn lock_path(&self) -> &Path {
         self.lock.lock_path()
-    }
-
-    /// Restore a terminal that has been entered by the caller. This helper is
-    /// kept small so the binary can report restoration failures after the
-    /// controller exits while Drop remains a final best-effort fallback.
-    pub fn restore_terminal(guard: &mut TerminalGuard) -> Result<(), StartupError> {
-        guard.restore().map_err(StartupError::TerminalRestore)
-    }
-
-    /// Install the process panic restoration hook for a TUI lifetime.
-    #[must_use]
-    pub fn install_panic_hook() -> PanicHookGuard {
-        PanicHookGuard::install()
     }
 }
 

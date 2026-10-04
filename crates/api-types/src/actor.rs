@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::RecoveryAction;
+use crate::TaskAction;
 
 /// The typed actor responsible for a task transition.
 ///
@@ -30,13 +30,10 @@ pub enum UserActionSource {
     BoardDrag,
     Board,
     Override(Box<UserActionSource>),
-    Recovery(RecoveryAction),
+    Action(TaskAction),
     Reassignment,
     RoleReassignment,
-    ManualAdvance,
     Transition,
-    RetryHook,
-    SkipHookOnce,
     Test,
 }
 
@@ -132,13 +129,10 @@ impl fmt::Display for UserActionSource {
             Self::BoardDrag => f.write_str("board_drag"),
             Self::Board => f.write_str("board"),
             Self::Override(source) => write!(f, "override:{source}"),
-            Self::Recovery(action) => write!(f, "recovery:{action}"),
+            Self::Action(action) => write!(f, "action:{action}"),
             Self::Reassignment => f.write_str("reassignment"),
             Self::RoleReassignment => f.write_str("role_reassignment"),
-            Self::ManualAdvance => f.write_str("manual_advance"),
             Self::Transition => f.write_str("transition"),
-            Self::RetryHook => f.write_str("retry_hook"),
-            Self::SkipHookOnce => f.write_str("skip_hook_once"),
             Self::Test => f.write_str("test"),
         }
     }
@@ -166,26 +160,6 @@ impl fmt::Display for SystemComponent {
     }
 }
 
-impl fmt::Display for RecoveryAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::ResumeSession => "resume_session",
-            Self::Reexecute => "reexecute",
-            Self::ResetToInitial => "reset_to_initial",
-            Self::CancelTask => "cancel_task",
-            Self::MarkReviewed => "mark_reviewed",
-            Self::RetryHook => "retry_hook",
-            Self::ResumeProcess => "resume_process",
-            Self::UpdateWorkspaceAndRetryHook => "update_workspace_and_retry_hook",
-            Self::SkipHookOnce => "skip_hook_once",
-            Self::ResetRetryWindow => "reset_retry_window",
-            Self::ProceedOnce => "proceed_once",
-            Self::OpenInteractive => "open_interactive",
-        };
-        f.write_str(value)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,8 +174,8 @@ mod tests {
             "system:task_dispatcher"
         );
         assert_eq!(
-            Actor::user(UserActionSource::Recovery(RecoveryAction::ResumeProcess)).display(),
-            "user:recovery:resume_process"
+            Actor::user(UserActionSource::Action(TaskAction::retry())).display(),
+            "user:action:retry"
         );
         assert_eq!(
             Actor::user(UserActionSource::Api).into_override().display(),

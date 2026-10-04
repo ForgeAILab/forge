@@ -124,8 +124,8 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
     let approve: ErrorResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/approve"),
-        json!({}),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"approve","override":false} }),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -134,8 +134,8 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
     let reject: ErrorResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/reject"),
-        json!({ "reason": "not ready" }),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"not ready"}}),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -159,8 +159,8 @@ async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
     let mark_reviewed: ErrorResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{failed_task_id}/recover"),
-        json!({ "action": "mark_reviewed", "reason": "owner verified the change" }),
+        &format!("/api/v1/tasks/{failed_task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{failed_task_id}/actions")).await, "action": {"verb":"approve","override":true,"reason":"Manual pass after investigating the review"}}),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
@@ -202,12 +202,12 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -287,7 +287,6 @@ async fn seed_review_with_status(
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: Some("/tmp/forge-reviews-repo".to_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: None,
             default_branch: "main".to_owned(),
             created_at: now.clone(),

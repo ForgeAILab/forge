@@ -1,6 +1,6 @@
 use super::*;
 use crate::workflow::engine::WorkflowAuthority;
-use api_types::{Actor, SystemComponent, UserActionSource};
+use api_types::{Actor, SystemComponent};
 use db::UpdateTask;
 
 impl TaskService {
@@ -10,7 +10,12 @@ impl TaskService {
         new_status: TaskStatus,
         options: impl Into<TransitionOptions>,
     ) -> Result<TransitionResult> {
-        self.transition_inner(task_id.into(), new_status, options.into(), None)
+        let task_id = task_id.into();
+        crate::worker_runtime::queue::PRODUCER_TASK
+            .scope(
+                task_id.clone(),
+                self.transition_inner(task_id, new_status, options.into(), None),
+            )
             .await
     }
 
@@ -21,22 +26,25 @@ impl TaskService {
         options: impl Into<TransitionOptions>,
         execution_id: &str,
     ) -> Result<TransitionResult> {
-        self.transition_inner(
-            task_id.into(),
-            new_status,
-            options.into(),
-            Some(execution_id),
-        )
-        .await
+        let task_id = task_id.into();
+        crate::worker_runtime::queue::PRODUCER_TASK
+            .scope(
+                task_id.clone(),
+                self.transition_inner(task_id, new_status, options.into(), Some(execution_id)),
+            )
+            .await
     }
 
     async fn transition_inner(
         &self,
         task_id: String,
         new_status: TaskStatus,
-        options: TransitionOptions,
+        mut options: TransitionOptions,
         plan_publication_execution_id: Option<&str>,
     ) -> Result<TransitionResult> {
+        if Self::task_action_command_active() {
+            options.defer_dispatch_seconds = Some(0);
+        }
         let trigger_reason = options.reason.unwrap_or_else(|| "user action".to_owned());
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -130,6 +138,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         };
         let defer_dispatch_until = options
             .defer_dispatch_seconds
@@ -155,13 +164,13 @@ impl TaskService {
                 }),
             )
             .await?;
-        // Entry/after-enter hooks can update metadata without changing the
-        // Task version (for example, a manual review marker). Reload the
-        // committed row so the returned Task snapshot and its version carry
-        // the same state used by API readiness calculations.
-        let mut task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        let _step_reservation = crate::worker_runtime::queue::ProducerReservation::hold(
+            Arc::clone(&self.db),
+            result.queued_step_id.as_deref(),
+        );
+        // The engine returns the requested transition's settled inline
+        // snapshot. A concurrent writer cannot replace it in this response.
+        let mut task = result.task;
         if was_blocked {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
@@ -267,8 +276,18 @@ impl TaskService {
         }
         self.reconcile_terminal_subtask(&task).await;
 
+        if let Some(persisted) = TaskRepo::get_by_id(&*self.db, &task_id, false).await? {
+            if persisted.status == task.status && persisted.version == task.version {
+                task = persisted;
+            }
+        }
+        let pending_steps = db::TaskStepRepo::pending_steps(&*self.db, &task_id).await?;
+        if let Some(id) = &result.queued_step_id {
+            db::TaskStepRepo::ready_step(&*self.db, id).await?;
+        }
         Ok(TransitionResult {
             task,
+            pending_steps,
             review: result.review,
         })
     }
@@ -407,6 +426,7 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         };
         engine
             .manual_override_transition_with_authority(
@@ -487,12 +507,21 @@ impl TaskService {
             ));
         };
 
-        let artifact = match crate::plan_artifact::read_plan_artifact(
-            std::path::Path::new(&workspace.worktree_path),
-            None,
-        ) {
-            Ok(artifact) => artifact,
-            Err(crate::plan_artifact::PlanArtifactError::NotFound) => {
+        let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &self.workspace_backend_router,
+            &self.db,
+            &workspace,
+            &self.workspace_root,
+        )
+        .await?;
+        let bytes = match resolved
+            .backend
+            .read(&resolved.placement, "../plan.md", 1_048_576)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(crate::workspace_backend::WorkspaceBackendError::Other(error)) if matches!(&*error, ServiceError::InvalidOperation { message } if message == "plan artifact not found") =>
+            {
                 return Err(ServiceError::invalid_operation(
                     "planning cannot be approved before a plan artifact exists",
                 ));
@@ -503,6 +532,12 @@ impl TaskService {
                 )));
             }
         };
+        let content = String::from_utf8(bytes).map_err(|_| {
+            ServiceError::invalid_operation(
+                "planning plan artifact is unreadable: failed to read plan artifact: stream did not contain valid UTF-8",
+            )
+        })?;
+        let artifact = crate::plan_artifact::parse_plan_markdown(&content);
         let summary = crate::plan_artifact::to_plan_progress_summary(&artifact);
         if summary.total == 0 {
             return Err(ServiceError::invalid_operation(
@@ -776,6 +811,7 @@ impl TaskService {
                 tracing::warn!(task_id = %task.id, %error, "failed to re-project cancelled prerequisite onto dependents");
             }
             self.reconcile_terminal_subtask(&task).await;
+            crate::placement::admission::resolve_workspace_attention(&self.db, &task.id).await?;
             return TaskRepo::get_by_id(&*self.db, &task.id, false)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", task.id));
@@ -801,6 +837,7 @@ impl TaskService {
             )
             .await?;
         let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
+        crate::placement::admission::resolve_workspace_attention(&self.db, &task.id).await?;
         // Re-read after the root transition hooks and cancel once more. Any
         // child execution that committed between the pre-cancel snapshot and
         // the root transition is now visible, while the transactional parent
@@ -839,35 +876,42 @@ impl TaskService {
         Ok(())
     }
 
-    pub async fn advance_to_next_state(&self, task_id: impl Into<String>) -> Result<Task> {
-        let task_id = task_id.into();
-        validate_required("task_id", &task_id)?;
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+    pub(crate) async fn advance_task_condition(
+        &self,
+        task: &Task,
+        workflow: &api_types::WorkflowDefinition,
+        target: String,
+        reason: String,
+        actor: Actor,
+    ) -> Result<Task> {
+        super::execution::ensure_plan_publication_transition_authority(task, None)?;
+        crate::task_hierarchy::ensure_coordination_root_target_ready(
+            &self.db, task, workflow, &target,
+        )
+        .await?;
+        if workflow.state_kind(&target) != Some(api_types::StateKind::Terminal) {
+            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, task).await?;
+        }
+        let claimed = TaskRepo::mutate_metadata_and_bump_version(
+            &*self.db,
+            &task.id,
+            task.version,
+            Vec::new(),
+            &now_rfc3339(),
+        )
+        .await?;
+        self.cancel_running_executions_for_task(
+            &claimed,
+            "cancelled by manual advance",
+            actor.clone(),
+        )
+        .await?;
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &Actor::user(UserActionSource::ManualAdvance),
-        );
-        let target = next_workflow_state(&workflow, &task.status)?;
-        crate::task_hierarchy::ensure_coordination_root_target_ready(
-            &self.db, &task, &workflow, &target,
-        )
-        .await?;
-        if !matches!(
-            workflow.state_kind(&target),
-            Some(api_types::StateKind::Terminal)
-        ) {
-            crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, &task).await?;
-        }
-
-        self.cancel_running_executions_for_manual_advance(&task)
-            .await?;
         let engine = WorkflowEngine {
             db: Arc::clone(&self.db),
             event_bus: Arc::clone(&self.event_bus),
@@ -880,35 +924,34 @@ impl TaskService {
             terminal_activity: self.terminal_activity.clone(),
             workspace_root: self.workspace_root.clone(),
             repo_cache_locks: self.repo_cache_locks.clone(),
+            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
         };
         let result = engine
             .manual_override_transition_with_authority(
-                &task_id,
+                &task.id,
                 &target,
-                task.version,
-                &workflow,
-                Actor::user(UserActionSource::ManualAdvance),
-                "manual advance",
+                current.version,
+                workflow,
+                actor,
+                &reason,
                 false,
-                Some(crate::workflow::engine::WorkflowAuthority {
+                Some(WorkflowAuthority {
                     project_version: project.version,
                     workflow_definition: project.workflow_definition.clone(),
                     clear_review_passed_at_on_commit: false,
                 }),
             )
             .await?;
-        let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
-        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal)
-            && workflow.cancellation_state.as_deref() != Some(task.status.as_str())
+        let updated = clear_manual_advance_error_annotation(&self.db, task, result.task).await?;
+        if workflow.state_kind(&updated.status) == Some(api_types::StateKind::Terminal)
+            && workflow.cancellation_state.as_deref() != Some(updated.status.as_str())
         {
-            // Manual advance bypasses `transition()` entirely, so it needs
-            // its own success-path wake, mirroring the one added above.
-            if let Err(error) = self.wake_dependents_of_completed_task(&task).await {
-                tracing::warn!(task_id = %task.id, %error, "failed to wake dependents of completed task");
+            if let Err(error) = self.wake_dependents_of_completed_task(&updated).await {
+                tracing::warn!(task_id = %updated.id, %error, "failed to wake dependents of completed task");
             }
         }
-        self.reconcile_terminal_subtask(&task).await;
-        Ok(task)
+        self.reconcile_terminal_subtask(&updated).await;
+        Ok(updated)
     }
 
     pub async fn soft_delete(&self, task_id: impl Into<String>) -> Result<Task> {
@@ -1058,15 +1101,6 @@ impl TaskService {
         Ok(())
     }
 
-    async fn cancel_running_executions_for_manual_advance(&self, task: &Task) -> Result<()> {
-        self.cancel_running_executions_for_task(
-            task,
-            "cancelled by manual advance",
-            Actor::user(UserActionSource::ManualAdvance),
-        )
-        .await
-    }
-
     async fn cancel_running_executions_for_task(
         &self,
         task: &Task,
@@ -1101,7 +1135,7 @@ impl TaskService {
     }
 }
 
-fn next_workflow_state(
+pub(crate) fn next_workflow_state(
     workflow: &api_types::WorkflowDefinition,
     current_status: &str,
 ) -> Result<String> {
@@ -1157,26 +1191,23 @@ async fn clear_manual_advance_error_annotation(
         return Ok(advanced_task);
     }
 
-    TaskRepo::update(
-        db,
-        UpdateTask {
-            id: advanced_task.id.clone(),
-            expected_version: advanced_task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: Some(None),
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .map_err(Into::into)
+    // Compare the annotation, not the version: the Advance's own queued step
+    // may already have moved the Task. A replaced annotation is a no-op,
+    // never a post-commit 409. The event shares the clear's transaction.
+    let mut tx = db::begin_immediate(db.pool()).await?;
+    let cleared = sqlx::query("UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL")
+        .bind(now_rfc3339()).bind(&advanced_task.id).bind(&source_task.error_annotation)
+        .execute(&mut *tx).await?.rows_affected();
+    let current = db
+        .get_task_in_tx(&mut tx, &advanced_task.id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", advanced_task.id.clone()))?;
+    if cleared == 1 {
+        let event = db::CreateDomainEvent::task_interruption_changed(&current);
+        db::DomainEventRepo::append_event_in_tx(db, &mut tx, &event).await?;
+    }
+    tx.commit().await?;
+    Ok(current)
 }
 
 pub(super) async fn clear_manual_review_awaiting_metadata(
@@ -1458,6 +1489,51 @@ mod tests {
             version: 1,
             created_at: now.clone(),
             updated_at: now,
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn advance_annotation_clear_accepts_both_step_orderings() {
+        for step_wins in [false, true] {
+            let db = SqliteDb::new(db::create_sqlite_pool("sqlite::memory:").await.unwrap());
+            db::run_migrations(db.pool()).await.unwrap();
+            let now = now_rfc3339();
+            sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p',?,?)")
+                .bind(&now)
+                .bind(&now)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO task(id,project_id,title,status,error_annotation,created_at,updated_at) VALUES('t','p','t','todo','old annotation',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+            let source = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            sqlx::query("UPDATE task SET status='planning',version=version+1 WHERE id='t'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let advanced = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            if step_wins {
+                sqlx::query("UPDATE task SET status='in_progress',version=version+1 WHERE id='t'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let result = clear_manual_advance_error_annotation(&db, &source, advanced)
+                .await
+                .unwrap();
+            assert!(result.error_annotation.is_none());
+            if !step_wins {
+                sqlx::query("UPDATE task SET status='in_progress',version=version+1 WHERE id='t'")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let final_task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            assert_eq!(final_task.status, "in_progress");
+            assert!(final_task.error_annotation.is_none());
         }
     }
 }

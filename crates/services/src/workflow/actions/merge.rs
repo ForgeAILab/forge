@@ -92,24 +92,6 @@ impl HookAction for RunMerge {
                     reason: "merge succeeded".to_string(),
                 }
             }
-            Ok(MergeOutcome::PullRequest {
-                pr_url,
-                branch,
-                target_branch,
-            }) => {
-                let location = pr_url.unwrap_or_else(|| "provider URL pending".to_string());
-                if let Err(error) = create_system_comment(
-                    ctx,
-                    format!("Pull request published from {branch} to {target_branch}: {location}"),
-                )
-                .await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-                HookResult::Ok
-            }
             Ok(MergeOutcome::TargetMoved {
                 reason,
                 target_branch,
@@ -346,9 +328,15 @@ impl HookAction for RunMerge {
                     reason: "project paused; integration deferred".to_owned(),
                 }
             }
-            Err(error) => HookResult::Failed {
-                reason: error.to_string(),
-            },
+            Err(error) => {
+                merge_failure_result(
+                    ctx,
+                    &task,
+                    error.to_string(),
+                    api_types::FailureKind::WorkspaceError,
+                )
+                .await
+            }
         }
     }
 }
@@ -371,11 +359,6 @@ fn merge_budget_annotation(reason: &str) -> String {
         "blocking_reason": reason,
         "message": reason,
         "detected_at": db::now_rfc3339(),
-        "recovery_actions": [
-            api_types::RecoveryAction::ResetRetryWindow,
-            api_types::RecoveryAction::OpenInteractive,
-            api_types::RecoveryAction::CancelTask,
-        ],
     })
     .to_string()
 }
@@ -410,7 +393,7 @@ fn target_moved_rebases_since_boundary(entries: &[db::TransitionLog]) -> i64 {
 /// merge. A rebase conflict is a genuine failure and falls through to the
 /// manual-repair path. Managed Task agents cannot rebase or write the linked
 /// Git metadata, so Forge must not dispatch a follow-up they cannot complete.
-pub(super) async fn target_moved_result(
+pub(crate) async fn target_moved_result(
     ctx: &HookContext,
     task: &db::Task,
     reason: &str,
@@ -462,95 +445,95 @@ pub(super) async fn target_moved_result(
             };
         }
     };
-    let worktree_path = std::path::Path::new(&workspace.worktree_path);
-
-    match git::is_worktree_clean(worktree_path).await {
-        Ok(true) => {}
-        Ok(false) => {
-            // Uncommitted work in the worktree is the Worker's to resolve; a
-            // rebase would refuse anyway.
-            return merge_failure_result(
-                ctx,
-                task,
-                format!("{reason}; worktree has uncommitted changes and cannot be rebased"),
-                api_types::FailureKind::DirtyWorktree,
-            )
-            .await;
+    let daemon_owned =
+        match db::WorkspacePlacementRepo::get_by_workspace_id(&*ctx.db, &workspace.id).await {
+            Ok(placement) => placement
+                .is_some_and(|placement| placement.owner_kind == db::PlacementOwnerKind::Daemon),
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        };
+    let workspace = if daemon_owned {
+        workspace
+    } else {
+        match crate::task_service::workspace::ensure_valid(
+            &ctx.db,
+            &ctx.workspace_root,
+            task,
+            workspace,
+            ctx.repo_cache_locks.clone(),
+            false,
+            &ctx.workspace_backend_router,
+        )
+        .await
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return merge_failure_result(
+                    ctx,
+                    task,
+                    error.to_string(),
+                    api_types::FailureKind::WorkspaceError,
+                )
+                .await;
+            }
         }
+    };
+    let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+        &ctx.workspace_backend_router,
+        &ctx.db,
+        &workspace,
+        &ctx.workspace_root,
+    )
+    .await
+    .map_err(crate::ServiceError::from);
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
         Err(error) => {
             return HookResult::Failed {
                 reason: error.to_string(),
-            };
+            }
         }
-    }
-
-    match git::rebase(worktree_path, target_branch).await {
-        Ok(()) => {
-            if let Err(error) = create_system_comment(
-                ctx,
-                format!("Rebased onto {target_branch} after it advanced during review: {reason}"),
-            )
-            .await
-            {
+    };
+    let handoff_conflicts =
+        match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, task).await {
+            Ok(coordination_root) => !coordination_root,
+            Err(error) => {
                 return HookResult::Failed {
                     reason: error.to_string(),
-                };
+                }
+            }
+        };
+    match resolved.rebase_target(target_branch, handoff_conflicts).await {
+        Ok(api_types::WorkspaceOwnerOperationOutcome::Rebased) => {
+            resolved.record_head_best_effort(&ctx.db).await;
+            if let Err(error) = create_system_comment(ctx,
+                format!("Rebased onto {target_branch} after it advanced during review: {reason}"))
+                .await
+            {
+                return HookResult::Failed { reason: error.to_string() };
             }
             HookResult::Cascade {
                 to: default_states::MERGE_FAILED.to_string(),
                 reason: format!("{REVIEW_REFRESH_MARKER} {TARGET_MOVED_MARKER} {reason}; rebased onto {target_branch}, re-review required"),
             }
         }
-        Err(git::GitError::MergeConflict { stderr, .. }) => {
-            // Coordination roots aggregate subtask branches and keep the
-            // manual-repair path; everything else goes back to its Worker.
-            match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, task).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    let _ = git::abort_rebase(worktree_path).await;
-                    return merge_failure_result(
-                        ctx,
-                        task,
-                        format!("rebase onto {target_branch} conflicted: {stderr}"),
-                        api_types::FailureKind::MergeConflict,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    let _ = git::abort_rebase(worktree_path).await;
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-            }
-            match git::continue_rebase_keeping_conflicts(worktree_path).await {
-                Ok(paths) => conflict_handoff_result(ctx, task, target_branch, &paths).await,
-                // The helper aborted the rebase, so the branch is as it was.
-                Err(git::GitError::UnsupportedRebaseConflict { details }) => {
-                    merge_failure_result(
-                        ctx,
-                        task,
-                        format!("rebase onto {target_branch} has a conflict requiring manual workspace repair: {details}"),
-                        api_types::FailureKind::MergeConflict,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    merge_failure_result(
-                        ctx,
-                        task,
-                        format!(
-                            "rebase onto {target_branch} conflicted: {stderr}; committing the conflict for the Worker failed: {error}"
-                        ),
-                        api_types::FailureKind::MergeConflict,
-                    )
-                    .await
-                }
+        Ok(api_types::WorkspaceOwnerOperationOutcome::Dirty { .. }) => merge_failure_result(ctx, task,
+            format!("{reason}; worktree has uncommitted changes and cannot be rebased"), api_types::FailureKind::DirtyWorktree).await,
+        Ok(api_types::WorkspaceOwnerOperationOutcome::Conflict { details, conflict_paths }) => {
+            if handoff_conflicts && !conflict_paths.is_empty() {
+                resolved.record_head_best_effort(&ctx.db).await;
+                conflict_handoff_result(ctx, task, target_branch, &conflict_paths).await
+            } else {
+                merge_failure_result(ctx, task, format!("rebase onto {target_branch} conflicted: {details}"), api_types::FailureKind::MergeConflict).await
             }
         }
-        Err(error) => HookResult::Failed {
-            reason: error.to_string(),
-        },
+        Ok(api_types::WorkspaceOwnerOperationOutcome::UnsupportedConflict { details }) => merge_failure_result(ctx, task,
+            format!("rebase onto {target_branch} has a conflict requiring manual workspace repair: {details}"), api_types::FailureKind::MergeConflict).await,
+        Ok(_) => HookResult::Failed { reason: "workspace owner returned an invalid rebase outcome".into() },
+        Err(error) => HookResult::Failed { reason: error.to_string() },
     }
 }
 
@@ -805,10 +788,6 @@ fn manual_merge_recovery_annotation(
         artifact: None,
         message: Some(reason.to_owned()),
         hook: None,
-        recovery_actions: vec![
-            api_types::RecoveryAction::RetryHook,
-            api_types::RecoveryAction::CancelTask,
-        ],
     });
     serde_json::to_string(&annotation).expect("a blocking annotation always serializes")
 }

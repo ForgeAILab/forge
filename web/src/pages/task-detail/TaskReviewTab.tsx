@@ -1,16 +1,14 @@
-import { ArrowCounterClockwise, CaretDown, Spinner } from '@phosphor-icons/react'
+import { TaskActionButtons } from '@/components/task-detail/task-action-buttons'
+import {  CaretDown, } from '@phosphor-icons/react'
 import { useState } from 'react'
 import { ErrorBanner } from '@/components/error-banner'
 import { isTransientApiError } from '@/lib/api-error'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
-import { Label } from '@/components/ui/label'
-import { Select } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ChatEntryContainer } from '@/components/chat'
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { cn } from '@/lib/cn'
-import type { RecoveryAction, Review, Task, WorkflowExceptionAction } from '@/types/generated'
+import type { Review, Task } from '@/types/generated'
 import { formatDate } from './utils'
 import { ReviewConformancePanel } from './ReviewConformancePanel'
 
@@ -58,17 +56,7 @@ type TaskReviewTabProps = {
   reviewsIsError?: boolean
   reviewsError?: unknown
   onRetryReviews?: () => void
-  transitionPending: boolean
-  triggerReviewPending: boolean
-  recoverPending: boolean
-  cancelPending: boolean
-  terminal: boolean
   expandedHistoryAttempts: Set<number>
-  onRerunReview: () => void
-  onStatusChange: (status: string, reason?: string) => void
-  onRecover: (action: RecoveryAction, input?: { reason?: string; context?: string }) => void
-  onOpenWorkflowExceptionAction: (action: WorkflowExceptionAction) => void
-  onCancelTask: () => void
   onToggleHistoryAttempt: (attemptNumber: number) => void
 }
 
@@ -80,23 +68,10 @@ export function TaskReviewTab({
   reviewsIsError = false,
   reviewsError,
   onRetryReviews,
-  transitionPending,
-  triggerReviewPending,
-  recoverPending,
-  cancelPending,
-  terminal,
   expandedHistoryAttempts,
-  onRerunReview,
-  onStatusChange,
-  onRecover,
-  onOpenWorkflowExceptionAction,
-  onCancelTask,
   onToggleHistoryAttempt,
 }: TaskReviewTabProps) {
   const [historyOpen, setHistoryOpen] = useState(true)
-  const canAct = task.status === 'review'
-  const showMergeSelect = canAct && latestReview?.status === 'passed'
-  const workflowExceptionActions = task.workflow_exception?.actions ?? []
 
   return (
     <div className="space-y-3">
@@ -108,16 +83,8 @@ export function TaskReviewTab({
           showRetry={isTransientApiError(reviewsError)}
         />
       ) : null}
-      <WorkflowExceptionPanel
-        task={task}
-        actions={workflowExceptionActions}
-        recoverPending={recoverPending}
-        terminal={terminal}
-        cancelPending={cancelPending}
-        onRecover={onRecover}
-        onOpenInteractive={onOpenWorkflowExceptionAction}
-        onCancelTask={onCancelTask}
-      />
+      <WorkflowExceptionPanel task={task} assessment={latestReview?.details.conformance.assessment} />
+      {!task.workflow_exception ? <TaskActionButtons taskId={task.id} version={task.version} offers={task.available_actions ?? []} /> : null}
       {/* Header card — attempt info + actions */}
       {(task.status === 'review' || reviews.length > 0) && (
         <div className="rounded-lg border p-4">
@@ -142,40 +109,8 @@ export function TaskReviewTab({
               ) : null}
             </div>
 
-            {/* Actions grouped together */}
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={!canAct || triggerReviewPending}
-                onClick={onRerunReview}
-              >
-                {triggerReviewPending ? (
-                  <Spinner className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <ArrowCounterClockwise className="h-3.5 w-3.5" />
-                )}
-                Re-run review
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
 
-      {/* Merge transition */}
-      {showMergeSelect && (
-        <div className="space-y-1 rounded-lg border p-4">
-          <Label htmlFor="review-transition-merging">Transition to</Label>
-          <Select
-            id="review-transition-merging"
-            disabled={transitionPending}
-            value=""
-            placeholder="Select next status"
-            options={[{ value: 'merging', label: 'Merging' }]}
-            onChange={(v) => {
-              if (v === 'merging') onStatusChange('merging')
-            }}
-          />
+          </div>
         </div>
       )}
 

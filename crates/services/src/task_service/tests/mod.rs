@@ -1,3 +1,6 @@
+mod condition_matrix;
+mod condition_scenarios;
+mod placement_wait_actions;
 use super::*;
 
 mod action_resolver_role_targeting;
@@ -9,3 +12,4 @@ mod recovery_events;
 mod recovery_reset_retry_window;
 mod remote_terminal;
 mod service_tests;
+mod task_actions;

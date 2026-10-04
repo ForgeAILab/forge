@@ -58,6 +58,1076 @@ struct BaselineFixture {
     approval_authorization: Value,
 }
 
+async fn chat_preview(
+    harness: &common::Harness,
+    chat_id: &str,
+    turn_id: &str,
+) -> services::agent_chat_turn_worker::AgentChatPromptPreview {
+    let job = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.chat_id, chat_id);
+    services::FederatedAgentChatTurnRunner::new(
+        std::sync::Arc::clone(&harness.state.db),
+        std::sync::Arc::clone(&harness.state.embedded_agent_service),
+        std::sync::Arc::clone(&harness.state.task_executor),
+        harness.state.agent_chat_turn_logs.clone(),
+    )
+    .preview_prompt(&job)
+    .await
+    .unwrap()
+}
+
+async fn admit_preview_turn(harness: &common::Harness, chat_id: &str, text: &str) -> String {
+    let sent: api_types::SendAgentChatMessageResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{chat_id}/messages"),
+        json!({"content": text}),
+        StatusCode::CREATED,
+    )
+    .await;
+    sent.turn_job.unwrap().id
+}
+
+fn assert_preview_state_is_data(
+    preview: &services::agent_chat_turn_worker::AgentChatPromptPreview,
+) {
+    assert_eq!(preview.input_parts.len(), 2);
+    let card = &preview.input_parts[1];
+    assert!(card.starts_with("## SERVER-PROVIDED STATE CARD"));
+    assert!(!card.contains("watermark"));
+    assert!(!card.contains("Context-manifest references"));
+    assert!(!card
+        .as_bytes()
+        .windows(64)
+        .any(|b| b.iter().all(u8::is_ascii_hexdigit)));
+    assert!(!preview
+        .system_prompt
+        .as_deref()
+        .unwrap()
+        .contains("Task summary:"));
+}
+
+#[tokio::test]
+async fn split_prompt_preserves_turn_manifest_sources_revisions_and_digests() {
+    use db::AgentChatTurnJobRepo;
+    let workspace = common::TestDir::new("split-prompt-manifest");
+    let harness = common::test_app(workspace.path(), "split-prompt-manifest").await;
+    let project_id = "11111111-1111-4111-8111-111111111111";
+    let time = "2026-10-01T00:00:00Z";
+    sqlx::query("INSERT INTO project (id, name, owner_id, version, created_at, updated_at) VALUES (?, 'Manifest Project', 'test-user-id', 4, ?, ?)")
+        .bind(project_id).bind(time).bind(time).execute(harness.state.db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) VALUES (?, ?, 'test-user-id', 'admin', ?, ?)")
+        .bind(db::new_uuid_v4()).bind(project_id).bind(time).bind(time).execute(harness.state.db.pool()).await.unwrap();
+    let agent = connect_agent(
+        &harness.app,
+        &common::test_jwt(),
+        "manifest-project",
+        &["read_project", "propose_project"],
+    )
+    .await;
+    let binding_version: i64 = sqlx::query_scalar("SELECT version FROM project_agent_binding WHERE project_id = ? AND state IN ('active', 'agent_setup_required')")
+        .bind(project_id).fetch_one(harness.state.db.pool()).await.unwrap();
+    let binding = request_json(&harness.app, Method::PUT, &format!("/api/v1/projects/{project_id}/project-agent"), &common::test_jwt(),
+        json!({"identity_id": agent["agent"]["id"], "expected_version": binding_version, "autonomy_policy": {}, "permission_ceiling": {"permissions": ["read_project", "propose_project"]}}), &[StatusCode::OK]).await;
+    let chat_id = required_string(&binding, &["chat_id"]);
+    let turn_id = admit_preview_turn(&harness, &chat_id, "Explain adoption").await;
+    let job = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        std::sync::Arc::clone(&harness.state.db),
+        std::sync::Arc::clone(&harness.state.embedded_agent_service),
+        std::sync::Arc::clone(&harness.state.task_executor),
+        harness.state.agent_chat_turn_logs.clone(),
+    );
+    let preview = runner.preview_prompt(&job).await.unwrap();
+    assert_preview_state_is_data(&preview);
+    let manifest_id = runner.record_prompt_manifest_for_test(&job).await.unwrap();
+    let manifest =
+        db::ScopedMemoryRepository::get_context_manifest(&*harness.state.db, &manifest_id)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(manifest.scope_id, chat_id);
+    assert_eq!(
+        Some(manifest.identity_id.as_str()),
+        job.responder_identity_id.as_deref()
+    );
+    let rows =
+        db::ScopedMemoryRepository::list_context_manifest_sources(&*harness.state.db, &manifest_id)
+            .await
+            .unwrap();
+    let actual = json!({"manifest": {
+        "scope_type": manifest.scope_type, "policy_revision": manifest.policy_revision, "domain_revision": manifest.domain_revision,
+        "runtime_manifest_id": manifest.runtime_manifest_id, "runtime_manifest_fingerprint": manifest.runtime_manifest_fingerprint, "lcm_binding_revision": manifest.lcm_binding_revision
+    }, "sources": rows.iter().map(|row| json!({
+        "ordinal": row.ordinal, "source_type": row.source_type, "source_id": row.source_id,
+        "source_revision": row.source_revision, "fragment_fingerprint": row.fragment_fingerprint,
+        "selection_reason": row.selection_reason, "disposition": row.disposition,
+        "retention_priority": row.retention_priority
+    })).collect::<Vec<_>>()});
+    let expected: Value = serde_json::from_str(include_str!(
+        "../../services/tests/fixtures/project_chat_manifest.json"
+    ))
+    .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pauses() {
+    use db::{AgentChatTurnJobRepo, ChatSessionDenialRepo};
+    use std::sync::Arc;
+    let workspace = common::TestDir::new("terminal-denial-state-card");
+    let harness = common::test_app(workspace.path(), "terminal-denial-state-card").await;
+    let fixture = create_genesis_project(
+        &harness.app,
+        &common::test_jwt(),
+        "terminal-denial-state-card",
+    )
+    .await;
+    let first_turn = admit_preview_turn(
+        &harness,
+        &fixture.project_chat_id,
+        "Check current operations",
+    )
+    .await;
+    let first = chat_preview(&harness, &fixture.project_chat_id, &first_turn).await;
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.state.embedded_agent_service),
+        Arc::clone(&harness.state.task_executor),
+        harness.state.agent_chat_turn_logs.clone(),
+    );
+    let job = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &first_turn)
+        .await
+        .unwrap()
+        .unwrap();
+    runner.record_prompt_manifest_for_test(&job).await.unwrap();
+    let (session_id, runtime_id): (String, String) = sqlx::query_as(
+        "SELECT s.id, s.runtime_session_id FROM agent_session s JOIN agent_context_scope c ON c.id = s.context_scope_id WHERE c.scope_id = ? AND s.identity_id = ? AND s.status IN ('starting', 'ready', 'running', 'degraded')"
+    ).bind(&fixture.project_chat_id).bind(&fixture.project_identity_id)
+        .fetch_one(harness.state.db.pool()).await.unwrap();
+    let provider = services::CoordinationToolProvider::new(Arc::clone(&harness.state.db));
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::AgentChat,
+        scope_id: fixture.project_chat_id.clone(),
+        workspace_access: WorkspaceAccess::ProjectVerify,
+    };
+    for (operation, cause) in [
+        ("task.action", "permission_missing(propose_task)"),
+        ("task.review", "operation_not_in_scope"),
+        ("task.propose", "charter_not_adopted"),
+        ("task.action", "project_paused(old detail)"),
+        ("task.adaptive", "identity_paused"),
+    ] {
+        provider
+            .record_terminal_denial(
+                &fixture.project_identity_id,
+                &scope,
+                &runtime_id,
+                operation,
+                &cause.parse::<api_types::DeniedBy>().unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    // A forged chat/session pairing cannot record a denial for another chat.
+    harness
+        .state
+        .db
+        .record_chat_session_denial(
+            &fixture.project_identity_id,
+            &fixture.main_chat_id,
+            &session_id,
+            "message.send",
+            &api_types::DeniedBy::OperationNotInScope,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE project SET paused_at = 'now', system_pause_reason = 'environment_not_ready' WHERE id = ?")
+        .bind(&fixture.project_id).execute(harness.state.db.pool()).await.unwrap();
+    sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
+        .bind(&fixture.project_identity_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let paused = chat_preview(&harness, &fixture.project_chat_id, &first_turn).await;
+    assert!(paused.input_parts[1].contains("task.action (project_paused(environment_not_ready))"));
+    assert!(paused.input_parts[1].contains("task.adaptive (identity_paused)"));
+    assert!(!paused.input_parts[1].contains("old detail"));
+    assert_eq!(first.system_prompt, paused.system_prompt);
+    sqlx::query("UPDATE project SET paused_at = NULL, system_pause_reason = NULL WHERE id = ?")
+        .bind(&fixture.project_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_identity SET paused = 0 WHERE id = ?")
+        .bind(&fixture.project_identity_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let second_turn = admit_preview_turn(
+        &harness,
+        &fixture.project_chat_id,
+        "Check current operations again",
+    )
+    .await;
+    let second = chat_preview(&harness, &fixture.project_chat_id, &second_turn).await;
+    for entry in [
+        "task.action (permission_missing(propose_task))",
+        "task.propose (charter_not_adopted)",
+    ] {
+        assert!(
+            !second.input_parts[1].contains(entry),
+            "live authority already permits {entry}"
+        );
+    }
+    assert!(second.input_parts[1].contains("### Unavailable in this session"));
+    assert!(second.input_parts[1].contains("task.review (operation_not_in_scope)"));
+    assert!(!second.input_parts[1].contains("task.action (project_paused"));
+    assert!(!second.input_parts[1].contains("task.adaptive (identity_paused)"));
+    assert!(!second.input_parts[1].contains("message.send (operation_not_in_scope)"));
+    assert_eq!(
+        first.system_prompt.as_ref().unwrap().as_bytes(),
+        second.system_prompt.as_ref().unwrap().as_bytes()
+    );
+    assert_preview_state_is_data(&second);
+    // Session rotation/profile replacement must not inherit old reminders.
+    sqlx::query("UPDATE agent_session SET status = 'replaced' WHERE id = ?")
+        .bind(session_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let rotated = chat_preview(&harness, &fixture.project_chat_id, &second_turn).await;
+    assert!(!rotated.input_parts[1].contains("### Unavailable in this session"));
+}
+
+#[tokio::test]
+async fn terminal_denial_main_genesis_guards_keep_real_evaluator_causes() {
+    use forge_agent_host::{
+        CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess,
+    };
+    use std::sync::Arc;
+    let workspace = common::TestDir::new("terminal-denial-genesis-causes");
+    let harness = common::test_app(workspace.path(), "terminal-denial-genesis-causes").await;
+    let fixture = create_genesis_project(
+        &harness.app,
+        &common::test_jwt(),
+        "terminal-denial-genesis-causes",
+    )
+    .await;
+    let main = connect_agent(
+        &harness.app,
+        &common::test_jwt(),
+        "genesis-guard-main",
+        &["read_account", "read_agent_chat", "propose_discovery"],
+    )
+    .await;
+    let main_identity = required_string(&main, &["agent", "id"]);
+    let binding_version: i64 = sqlx::query_scalar("SELECT version FROM account_main_agent_binding WHERE account_id = 'test-user-id' AND state = 'active'")
+        .fetch_one(harness.state.db.pool()).await.unwrap();
+    request_json(&harness.app, Method::PUT, "/api/v1/account/main-agent", &common::test_jwt(),
+        json!({"identity_id":main_identity, "profile_id":main["profile"]["id"], "expected_version":binding_version, "autonomy_policy":{}}),
+        &[StatusCode::OK]).await;
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::AgentChat,
+        scope_id: fixture.main_chat_id.clone(),
+        workspace_access: WorkspaceAccess::Deny,
+    };
+    let provider = services::CoordinationToolProvider::new(Arc::clone(&harness.state.db));
+    let arguments = json!({"operation":"genesis.start", "payload":{}, "dedupe_key":"genesis-guard-denial", "correlation_id":"genesis-guard-denial"});
+    let refusal = provider
+        .propose(
+            &main_identity,
+            &scope,
+            "main-runtime",
+            "genesis.start",
+            arguments.clone(),
+        )
+        .await
+        .unwrap_err();
+    let forge_agent_host::AgentHostError::StructuredOutcome(refusal) = refusal else {
+        panic!("typed denial")
+    };
+    assert_eq!(
+        refusal.denied_by,
+        Some(api_types::DeniedBy::LeasedTurnRequired)
+    );
+    let turn_id = admit_preview_turn(
+        &harness,
+        &fixture.main_chat_id,
+        "Explain the current Project status",
+    )
+    .await;
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'leased', lease_owner = 'test', leased_until = '2099-01-01T00:00:00Z' WHERE id = ?")
+        .bind(turn_id).execute(harness.state.db.pool()).await.unwrap();
+    let refusal = provider
+        .propose(
+            &main_identity,
+            &scope,
+            "main-runtime",
+            "genesis.start",
+            arguments,
+        )
+        .await
+        .unwrap_err();
+    let forge_agent_host::AgentHostError::StructuredOutcome(refusal) = refusal else {
+        panic!("typed denial")
+    };
+    assert_eq!(
+        refusal.denied_by,
+        Some(api_types::DeniedBy::UserRequestRequired)
+    );
+    assert_eq!(
+        refusal.retry.unwrap().scope,
+        Some(api_types::RetryScope::Turn)
+    );
+}
+
+#[tokio::test]
+async fn terminal_denial_permission_grant_removes_next_turn_card_entry_and_preserves_system_bytes()
+{
+    use db::{AgentChatTurnJobRepo, ChatSessionDenialRepo};
+    use forge_agent_host::{
+        CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess,
+    };
+    use std::sync::Arc;
+    let workspace = common::TestDir::new("terminal-denial-permission-grant");
+    let harness = common::test_app(workspace.path(), "terminal-denial-permission-grant").await;
+    let fixture = create_genesis_project(
+        &harness.app,
+        &common::test_jwt(),
+        "terminal-denial-permission-grant",
+    )
+    .await;
+    let original_ceiling: String = sqlx::query_scalar("SELECT permission_ceiling_json FROM project_agent_binding WHERE project_id = ? AND state = 'active'")
+        .bind(&fixture.project_id).fetch_one(harness.state.db.pool()).await.unwrap();
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = '{\"permissions\":[\"read_project\"]}' WHERE project_id = ? AND state = 'active'")
+        .bind(&fixture.project_id).execute(harness.state.db.pool()).await.unwrap();
+    let first_turn =
+        admit_preview_turn(&harness, &fixture.project_chat_id, "Check available work").await;
+    let job = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &first_turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.state.embedded_agent_service),
+        Arc::clone(&harness.state.task_executor),
+        harness.state.agent_chat_turn_logs.clone(),
+    );
+    runner.record_prompt_manifest_for_test(&job).await.unwrap();
+    let runtime_id: String = sqlx::query_scalar("SELECT s.runtime_session_id FROM agent_session s JOIN agent_context_scope c ON c.id = s.context_scope_id WHERE c.scope_id = ? AND s.status IN ('starting','ready','running','degraded')")
+        .bind(&fixture.project_chat_id).fetch_one(harness.state.db.pool()).await.unwrap();
+    let provider = services::CoordinationToolProvider::new(Arc::clone(&harness.state.db));
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::AgentChat,
+        scope_id: fixture.project_chat_id.clone(),
+        workspace_access: WorkspaceAccess::Deny,
+    };
+    let arguments = json!({"operation":"project.document", "payload":{
+        "action":"draft_revision", "document_id":"permission-grant-document", "kind":"research",
+        "title":"Permission grant check", "expected_document_version":1, "base_revision_id":null,
+        "content":{"question":"Is the permission granted?", "decision_informed":"Next available work",
+            "scope":"This Project", "stopping_condition":"The document is recorded", "sources":[],
+            "findings":[], "evidence":[], "inferences":[], "alternatives":[], "recommendation":null,
+            "uncertainty":[], "unresolved_questions":[], "affected_artifact_ids":[], "affected_decision_ids":[]}},
+        "dedupe_key":"permission-grant-document", "correlation_id":"permission-grant-document"});
+    let refusal = provider
+        .propose(
+            &fixture.project_identity_id,
+            &scope,
+            &runtime_id,
+            "project.document",
+            arguments.clone(),
+        )
+        .await
+        .unwrap_err();
+    let forge_agent_host::AgentHostError::StructuredOutcome(refusal) = refusal else {
+        panic!("typed policy refusal")
+    };
+    assert_eq!(
+        refusal.denied_by,
+        Some(api_types::DeniedBy::PermissionMissing(
+            "propose_project".to_owned()
+        ))
+    );
+    provider
+        .record_terminal_denial(
+            &fixture.project_identity_id,
+            &scope,
+            &runtime_id,
+            "project.document",
+            refusal.denied_by.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    let denied_preview = chat_preview(&harness, &fixture.project_chat_id, &first_turn).await;
+    assert!(denied_preview.input_parts[1].contains("### Unavailable in this session"));
+    assert!(denied_preview.input_parts[1]
+        .contains("project.document (permission_missing(propose_project))"));
+    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = ? WHERE project_id = ? AND state = 'active'")
+        .bind(original_ceiling).bind(&fixture.project_id).execute(harness.state.db.pool()).await.unwrap();
+    let second_turn = admit_preview_turn(
+        &harness,
+        &fixture.project_chat_id,
+        "Continue with the granted permission",
+    )
+    .await;
+    let granted_preview = chat_preview(&harness, &fixture.project_chat_id, &second_turn).await;
+    assert!(!granted_preview.input_parts[1].contains("project.document (permission_missing"));
+    assert_eq!(denied_preview.system_prompt, granted_preview.system_prompt);
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat_session_denied_operation WHERE operation = 'project.document'",
+    )
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0);
+    let success = provider
+        .propose(
+            &fixture.project_identity_id,
+            &scope,
+            &runtime_id,
+            "project.document",
+            arguments,
+        )
+        .await
+        .unwrap();
+    assert_eq!(success["code"], "ok");
+    // Turn-only causes never enter durable state.
+    harness
+        .state
+        .db
+        .record_chat_session_denial(
+            &fixture.project_identity_id,
+            &scope.scope_id,
+            &runtime_id,
+            "project.document",
+            &api_types::DeniedBy::TaskTerminal,
+        )
+        .await
+        .unwrap();
+    assert!(harness
+        .state
+        .db
+        .chat_session_denials(
+            &fixture.project_identity_id,
+            &job.profile_id.unwrap(),
+            &scope.scope_id,
+            None
+        )
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn stable_prefix_project_chat_preview_tracks_state_without_creating_a_session() {
+    let workspace = common::TestDir::new("stable-prefix-project-preview");
+    let harness = common::test_app(workspace.path(), "stable-prefix-project").await;
+    let fixture =
+        create_genesis_project(&harness.app, &common::test_jwt(), "stable-prefix-project").await;
+    let chat = &fixture.project_chat_id;
+    let first_turn = admit_preview_turn(&harness, chat, "Review the delivery state").await;
+    let before_sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session")
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap();
+    let first = chat_preview(&harness, chat, &first_turn).await;
+    let state_before = services::project_runtime::load_effective_project_state(
+        &harness.state.db,
+        &fixture.project_id,
+        None,
+    )
+    .await
+    .unwrap();
+    request_json(&harness.app, Method::POST, &format!("/api/v1/projects/{}/tasks", fixture.project_id),
+        &common::test_jwt(), json!({"title": "Deliver the initial experience", "description": "Implement the chartered experience in src/experience.rs"}), &[StatusCode::OK]).await;
+    sqlx::query("UPDATE project SET version = version + 1 WHERE id = ?")
+        .bind(&fixture.project_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    db::DomainEventRepo::append_event(
+        &*harness.state.db,
+        db::CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: "project.metadata.updated".into(),
+            entity_type: "project".into(),
+            entity_id: fixture.project_id.clone(),
+            actor_type: "user".into(),
+            actor_id: Some("test-user-id".into()),
+            scope_type: "project".into(),
+            scope_id: fixture.project_id.clone(),
+            correlation_id: db::new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".into(),
+            created_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    let second_turn = admit_preview_turn(&harness, chat, "Review the delivery state again").await;
+    let second = chat_preview(&harness, chat, &second_turn).await;
+    let state_after = services::project_runtime::load_effective_project_state(
+        &harness.state.db,
+        &fixture.project_id,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        state_before.source_event_watermark,
+        state_after.source_event_watermark
+    );
+    assert_eq!(
+        state_after.project.version,
+        state_before.project.version + 1
+    );
+    assert_eq!(
+        state_after.task_summary.total,
+        state_before.task_summary.total + 1
+    );
+    assert_eq!(
+        first.system_prompt.as_ref().unwrap().as_bytes(),
+        second.system_prompt.as_ref().unwrap().as_bytes()
+    );
+    assert_ne!(first.input_parts[1], second.input_parts[1]);
+    assert!(second.input_parts[1]
+        .contains(&format!("Project version: {}", state_after.project.version)));
+    assert_preview_state_is_data(&first);
+    assert_preview_state_is_data(&second);
+    let after_sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session")
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(before_sessions, after_sessions);
+}
+
+#[tokio::test]
+async fn stable_prefix_main_baseline_preview_tracks_portfolio_versions() {
+    let workspace = common::TestDir::new("stable-prefix-main-preview");
+    let harness = common::test_app(workspace.path(), "stable-prefix-main").await;
+    let fixture =
+        create_genesis_project(&harness.app, &common::test_jwt(), "stable-prefix-main").await;
+    // Recency determines both bounded card selection and manifest sources.
+    // Reverse lexical ordering would choose a different bounded portfolio.
+    for index in 0..21 {
+        sqlx::query("INSERT INTO project (id, name, owner_id, created_at, updated_at) VALUES (?, 'Portfolio entry', 'test-user-id', ?, ?)")
+            .bind(format!("portfolio-{index:02}"))
+            .bind(format!("2026-09-01T00:00:{index:02}Z"))
+            .bind(format!("2026-09-01T00:00:{index:02}Z"))
+            .execute(harness.state.db.pool()).await.unwrap();
+    }
+    let chat = &fixture.main_chat_id;
+    let first_turn = admit_preview_turn(&harness, chat, "Which Projects exist?").await;
+    let first = chat_preview(&harness, chat, &first_turn).await;
+    sqlx::query("UPDATE project SET version = version + 1, updated_at = ? WHERE id = ?")
+        .bind(db::now_rfc3339())
+        .bind(&fixture.project_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let second_turn = admit_preview_turn(&harness, chat, "Which Projects exist now?").await;
+    let second = chat_preview(&harness, chat, &second_turn).await;
+    assert_eq!(first.system_prompt, second.system_prompt);
+    assert_ne!(first.input_parts[1], second.input_parts[1]);
+    assert!(second.input_parts[1].contains(&fixture.project_id));
+    assert!(second.input_parts[1].contains(&format!("version=v{}", fixture.project_version + 1)));
+    assert_preview_state_is_data(&second);
+    assert!(second.input_parts[1].contains("portfolio-20"));
+    assert!(!second.input_parts[1].contains("portfolio-00"));
+    assert!(
+        second.input_parts[1].find("portfolio-20").unwrap()
+            < second.input_parts[1].find("portfolio-19").unwrap()
+    );
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        std::sync::Arc::clone(&harness.state.db),
+        std::sync::Arc::clone(&harness.state.embedded_agent_service),
+        std::sync::Arc::clone(&harness.state.task_executor),
+        harness.state.agent_chat_turn_logs.clone(),
+    );
+    let job = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &second_turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let manifest_id = runner.record_prompt_manifest_for_test(&job).await.unwrap();
+    let sources: Vec<String> = sqlx::query_scalar("SELECT source_id FROM context_manifest_source WHERE manifest_id = ? AND source_type = 'main_portfolio_projection' ORDER BY ordinal")
+        .bind(&manifest_id).fetch_all(harness.state.db.pool()).await.unwrap();
+    assert_eq!(sources.len(), 20);
+    assert_eq!(
+        sources[0],
+        format!(
+            "main_baseline_context:main_portfolio_projection:{}",
+            fixture.project_id
+        )
+    );
+    assert_eq!(
+        sources[1],
+        "main_baseline_context:main_portfolio_projection:portfolio-20"
+    );
+    assert_eq!(
+        sources[19],
+        "main_baseline_context:main_portfolio_projection:portfolio-02"
+    );
+}
+
+#[tokio::test]
+async fn stable_prefix_main_genesis_preview_moves_evolving_instruction_state_to_input() {
+    let workspace = common::TestDir::new("stable-prefix-genesis-preview");
+    let harness = common::test_app(workspace.path(), "stable-prefix-genesis").await;
+    let token = common::test_jwt();
+    let agent = connect_agent(
+        &harness.app,
+        &token,
+        "stable-prefix-genesis",
+        &["read_account", "read_project", "handoff"],
+    )
+    .await;
+    let binding = request_json(
+        &harness.app,
+        Method::PUT,
+        "/api/v1/account/main-agent",
+        &token,
+        json!({"identity_id": agent["agent"]["id"], "expected_version": 0, "autonomy_policy": {}}),
+        &[StatusCode::OK],
+    )
+    .await;
+    let chat = required_string(&binding, &["chat_id"]);
+    let started = request_json(&harness.app, Method::POST, "/api/v1/account/main-agent/product-genesis", &token,
+        json!({"idempotency_key": "stable-prefix-genesis", "maturity": "mvp", "initial_idea": "A bounded useful tool"}), &[StatusCode::CREATED]).await;
+    let genesis = required_string(&started, &["session", "id"]);
+    let first_turn = admit_preview_turn(&harness, &chat, "The first audience is small teams").await;
+    let first = chat_preview(&harness, &chat, &first_turn).await;
+    let original: String = sqlx::query_scalar("SELECT body FROM agent_chat_instruction_revision WHERE chat_id = ? ORDER BY revision DESC LIMIT 1")
+        .bind(&chat).fetch_one(harness.state.db.pool()).await.unwrap();
+    let portfolio: api_types::ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name": "Genesis portfolio state"}),
+        StatusCode::OK,
+    )
+    .await;
+    sqlx::query("UPDATE project SET version = version + 1 WHERE id = ?")
+        .bind(&portfolio.id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let updated = services::render_product_genesis_prompt(
+        api_types::ProductMaturity::Mvp,
+        &services::GenesisPromptContext {
+            genesis_session_id: Some(genesis.clone()),
+            current_understanding: "An agreed team workflow".into(),
+            observed_facts: vec!["The first audience is small teams".into()],
+            assumptions: vec!["A narrow rollout is enough".into()],
+            ..Default::default()
+        },
+    );
+    // Simulate the next immutable discovery snapshot without touching an old
+    // instruction or skill revision. The turn loader must separate both.
+    sqlx::query("INSERT INTO agent_chat_instruction_revision (id, chat_id, revision, body, source_type, source_id, created_by_type, created_at)
+        SELECT ?, ?, MAX(revision) + 1, ?, 'native', ?, 'agent', ? FROM agent_chat_instruction_revision WHERE chat_id = ?")
+        .bind(db::new_uuid_v4()).bind(&chat).bind(&updated).bind(&genesis).bind(db::now_rfc3339()).bind(&chat)
+        .execute(harness.state.db.pool()).await.unwrap();
+    sqlx::query("UPDATE product_genesis_session SET version = version + 1 WHERE id = ?")
+        .bind(&genesis)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let second_turn = admit_preview_turn(&harness, &chat, "Continue with that workflow").await;
+    let second = chat_preview(&harness, &chat, &second_turn).await;
+    assert_eq!(
+        first.system_prompt.as_ref().unwrap().as_bytes(),
+        second.system_prompt.as_ref().unwrap().as_bytes()
+    );
+    assert_ne!(first.input_parts[1], second.input_parts[1]);
+    assert!(second.input_parts[1].contains("An agreed team workflow"));
+    assert!(second.input_parts[1].contains("The first audience is small teams"));
+    assert!(!second
+        .system_prompt
+        .as_deref()
+        .unwrap()
+        .contains("An agreed team workflow"));
+    assert!(second.input_parts[1].contains(&portfolio.id));
+    assert!(second.input_parts[1].contains(&format!("version=v{}", portfolio.version + 1)));
+    assert_preview_state_is_data(&second);
+    let retained: String = sqlx::query_scalar("SELECT body FROM agent_chat_instruction_revision WHERE chat_id = ? ORDER BY revision ASC LIMIT 1")
+        .bind(&chat).fetch_one(harness.state.db.pool()).await.unwrap();
+    assert_eq!(retained, original);
+}
+
+#[tokio::test]
+async fn layout_guidance_upgrade_preserves_frozen_turns_sessions_and_binding() {
+    use db::AgentChatTurnJobRepo;
+    use services::AgentChatTurnRunner;
+    use std::sync::Arc;
+
+    let workspace = common::TestDir::new("layout-guidance-upgrade");
+    let harness = common::test_app(workspace.path(), "layout-guidance-upgrade").await;
+    for (key, revision) in [
+        (
+            "forge.main.project-discovery/v2",
+            "forge.main.project-discovery/v2@6",
+        ),
+        (
+            "forge.project.orchestration/v1",
+            "forge.project.orchestration/v1@19",
+        ),
+    ] {
+        sqlx::query("UPDATE operating_skill SET current_revision_id = ? WHERE skill_key = ?")
+            .bind(revision)
+            .bind(key)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+    }
+    let genesis = create_genesis_project(&harness.app, &common::test_jwt(), "layout-upgrade").await;
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.state.embedded_agent_service),
+        Arc::clone(&harness.state.task_executor),
+        harness.state.agent_chat_turn_logs.clone(),
+    );
+    let mut frozen = Vec::new();
+    for chat in [&genesis.main_chat_id, &genesis.project_chat_id] {
+        let jobs = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*harness.state.db, chat)
+            .await
+            .unwrap();
+        for job in jobs {
+            let preview = runner.preview_prompt(&job).await.unwrap();
+            frozen.push((job, preview.system_prompt));
+        }
+    }
+    let session_before: (String, String) = sqlx::query_as(
+        "SELECT prompt_revision, prompt_body FROM product_genesis_session WHERE id = ?",
+    )
+    .bind(&genesis.genesis_session_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    let migration =
+        include_str!("../../db/migrations/V202610031431__merge_friendly_layout_guidance.sql")
+            .replace(
+                "INSERT INTO operating_skill_revision",
+                "INSERT OR IGNORE INTO operating_skill_revision",
+            );
+    sqlx::raw_sql(&migration)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let binding_revision: String = sqlx::query_scalar(
+        "SELECT operating_skill_revision_id FROM project_agent_binding WHERE id = ?",
+    )
+    .bind(required_string(
+        &genesis.create_response,
+        &["project_agent_binding_id"],
+    ))
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(binding_revision, "forge.project.orchestration/v1@20");
+    let session_after: (String, String) = sqlx::query_as(
+        "SELECT prompt_revision, prompt_body FROM product_genesis_session WHERE id = ?",
+    )
+    .bind(&genesis.genesis_session_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(session_before, session_after);
+    assert!(!frozen.is_empty());
+    for (job, prompt) in frozen {
+        let retained = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained, job);
+        assert_eq!(
+            runner
+                .preview_prompt(&retained)
+                .await
+                .unwrap()
+                .system_prompt,
+            prompt
+        );
+        runner
+            .validate_admission_authority(&retained)
+            .await
+            .unwrap();
+    }
+    let turn = admit_preview_turn(&harness, &genesis.project_chat_id, "Plan the next module").await;
+    let current = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.operating_skill_revision_id.as_deref(),
+        Some("forge.project.orchestration/v1@20")
+    );
+    assert!(runner
+        .preview_prompt(&current)
+        .await
+        .unwrap()
+        .system_prompt
+        .unwrap()
+        .contains(forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
+    runner.validate_admission_authority(&current).await.unwrap();
+}
+
+#[tokio::test]
+async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions() {
+    use db::AgentChatTurnJobRepo;
+    use services::AgentChatTurnRunner;
+    use std::sync::Arc;
+
+    let workspace = common::TestDir::new("merge-friendly-doctrine-upgrade");
+    let harness = common::test_app(workspace.path(), "merge-friendly-doctrine-upgrade").await;
+    // Model the pre-upgrade current pointers. Historical bodies remain seeded
+    // by the same immutable migrations as on an upgraded user database.
+    for (key, revision) in [
+        (
+            "forge.main.project-discovery/v2",
+            "forge.main.project-discovery/v2@5",
+        ),
+        (
+            "forge.project.orchestration/v1",
+            "forge.project.orchestration/v1@16",
+        ),
+    ] {
+        sqlx::query("UPDATE operating_skill SET current_revision_id = ? WHERE skill_key = ?")
+            .bind(revision)
+            .bind(key)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+    }
+    let genesis =
+        create_genesis_project(&harness.app, &common::test_jwt(), "doctrine-upgrade").await;
+    let main_jobs =
+        AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*harness.state.db, &genesis.main_chat_id)
+            .await
+            .unwrap();
+    let project_jobs = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(
+        &*harness.state.db,
+        &genesis.project_chat_id,
+    )
+    .await
+    .unwrap();
+    let main_job = main_jobs
+        .iter()
+        .find(|job| {
+            job.operating_skill_revision_id.as_deref() == Some("forge.main.project-discovery/v2@5")
+        })
+        .expect("old Genesis admission");
+    let project_job = project_jobs
+        .iter()
+        .find(|job| {
+            job.operating_skill_revision_id.as_deref() == Some("forge.project.orchestration/v1@16")
+        })
+        .expect("old handoff admission");
+    let session_before: (String, String) = sqlx::query_as(
+        "SELECT prompt_revision, prompt_body FROM product_genesis_session WHERE id = ?",
+    )
+    .bind(&genesis.genesis_session_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+
+    // The fixture already seeds successor rows. Replay the actual migration
+    // with only those duplicate inserts ignored, exercising its activation
+    // and binding update against admissions made under the old pointers.
+    let migration = include_str!("../../db/migrations/V202610010500__merge_friendly_doctrine.sql")
+        .replace(
+            "INSERT INTO operating_skill_revision",
+            "INSERT OR IGNORE INTO operating_skill_revision",
+        );
+    sqlx::raw_sql(&migration)
+        .execute(harness.state.db.pool())
+        .await
+        .expect("doctrine upgrade");
+    let binding_revision: String = sqlx::query_scalar(
+        "SELECT operating_skill_revision_id FROM project_agent_binding WHERE id = ?",
+    )
+    .bind(required_string(
+        &genesis.create_response,
+        &["project_agent_binding_id"],
+    ))
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(binding_revision, "forge.project.orchestration/v1@17");
+    let session_after: (String, String) = sqlx::query_as(
+        "SELECT prompt_revision, prompt_body FROM product_genesis_session WHERE id = ?",
+    )
+    .bind(&genesis.genesis_session_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(session_before, session_after);
+
+    let runner = services::FederatedAgentChatTurnRunner::new(
+        Arc::clone(&harness.state.db),
+        Arc::clone(&harness.state.embedded_agent_service),
+        Arc::clone(&harness.state.task_executor),
+        harness.state.agent_chat_turn_logs.clone(),
+    );
+    for job in [main_job, project_job] {
+        let persisted = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &job.id)
+            .await
+            .unwrap()
+            .expect("frozen admission retained");
+        assert_eq!(&persisted, job);
+        let preview = runner
+            .preview_prompt(&persisted)
+            .await
+            .expect("frozen prompt renders");
+        let body: String =
+            sqlx::query_scalar("SELECT canonical_body FROM operating_skill_revision WHERE id = ?")
+                .bind(persisted.operating_skill_revision_id.as_deref().unwrap())
+                .fetch_one(harness.state.db.pool())
+                .await
+                .unwrap();
+        assert!(preview.system_prompt.as_deref().unwrap().contains(&body));
+        assert_preview_state_is_data(&preview);
+        if job.id == main_job.id {
+            let charter_version: i64 = sqlx::query_scalar(
+                "SELECT charter_version FROM product_genesis_session WHERE id = ?",
+            )
+            .bind(&genesis.genesis_session_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+            assert!(preview.input_parts[1]
+                .contains(&format!("Current Charter version: {charter_version}")));
+        }
+        if job.id == project_job.id {
+            let manifest_id = runner
+                .record_prompt_manifest_for_test(&persisted)
+                .await
+                .unwrap();
+            let (revision, digest): (String, String) = sqlx::query_as(
+                "SELECT source_revision, fragment_fingerprint FROM context_manifest_source WHERE manifest_id = ? AND source_type = 'server_operating_skill'"
+            ).bind(&manifest_id).fetch_one(harness.state.db.pool()).await.unwrap();
+            let frozen_digest: String = sqlx::query_scalar("SELECT content_digest FROM operating_skill_revision WHERE id = 'forge.project.orchestration/v1@16'")
+                .fetch_one(harness.state.db.pool()).await.unwrap();
+            assert_eq!(revision, "forge.project.orchestration/v1@16");
+            assert_eq!(digest, frozen_digest);
+        }
+        runner
+            .validate_admission_authority(&persisted)
+            .await
+            .expect("old revision resolves through the real worker after upgrade");
+    }
+
+    let previous_turn = admit_preview_turn(
+        &harness,
+        &genesis.project_chat_id,
+        "Check before the terminal-denial upgrade",
+    )
+    .await;
+    let previous_job =
+        AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &previous_turn)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        previous_job.operating_skill_revision_id.as_deref(),
+        Some("forge.project.orchestration/v1@17")
+    );
+    let previous_preview = runner.preview_prompt(&previous_job).await.unwrap();
+    assert!(previous_preview
+        .system_prompt
+        .as_deref()
+        .unwrap()
+        .contains(services::operating_skills::LEGACY_V17_PROJECT_PROTOCOL));
+    let terminal_migration =
+        include_str!("../../db/migrations/V202610010550__chat_session_denied_operations.sql")
+            .replace(
+                "CREATE TABLE chat_session_denied_operation",
+                "CREATE TABLE IF NOT EXISTS chat_session_denied_operation",
+            )
+            .replace(
+                "INSERT INTO operating_skill_revision",
+                "INSERT OR IGNORE INTO operating_skill_revision",
+            );
+    sqlx::raw_sql(&terminal_migration)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let retained =
+        AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &previous_turn)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(retained, previous_job);
+    let retained_preview = runner.preview_prompt(&retained).await.unwrap();
+    assert_eq!(
+        previous_preview.system_prompt,
+        retained_preview.system_prompt
+    );
+    // Replay successors after the historical @18 migration, retaining frozen admissions.
+    let action_migration =
+        include_str!("../../db/migrations/V202610030100__task_action_doctrine.sql").replace(
+            "INSERT INTO operating_skill_revision",
+            "INSERT OR IGNORE INTO operating_skill_revision",
+        );
+    sqlx::raw_sql(&action_migration)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let layout_migration =
+        include_str!("../../db/migrations/V202610031431__merge_friendly_layout_guidance.sql")
+            .replace(
+                "INSERT INTO operating_skill_revision",
+                "INSERT OR IGNORE INTO operating_skill_revision",
+            );
+    sqlx::raw_sql(&layout_migration)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let current_turn = admit_preview_turn(
+        &harness,
+        &genesis.project_chat_id,
+        "Check after the terminal-denial upgrade",
+    )
+    .await;
+    let current_job =
+        AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, &current_turn)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        current_job.operating_skill_revision_id.as_deref(),
+        Some("forge.project.orchestration/v1@20")
+    );
+    let current_preview = runner.preview_prompt(&current_job).await.unwrap();
+    assert!(current_preview
+        .system_prompt
+        .as_deref()
+        .unwrap()
+        .contains(services::operating_skills::canonical_project_operating_skill_body()));
+    assert!(current_preview
+        .system_prompt
+        .as_deref()
+        .unwrap()
+        .contains("`retry: none` is final for the turn"));
+    runner
+        .validate_admission_authority(&retained)
+        .await
+        .unwrap();
+    runner
+        .validate_admission_authority(&current_job)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     let workspace = common::TestDir::new("v076-genesis-handoff-adoption");

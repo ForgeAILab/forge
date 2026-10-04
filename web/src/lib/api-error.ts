@@ -21,7 +21,8 @@ export function getApiErrorMessage(error: unknown, fallback = 'Request failed'):
     } catch {
       // Non-JSON error bodies are already usable as-is.
     }
-    return `${message}${requestId ? ` Request ID: ${requestId}` : ''}`
+    const placementRejections = getPlacementRejectionMessage(error)
+    return `${message}${placementRejections ? ` ${placementRejections}` : ''}${requestId ? ` Request ID: ${requestId}` : ''}`
   }
   if (error instanceof Error) return error.message
   return fallback
@@ -54,6 +55,63 @@ export function getApiConflictDetails(error: unknown): ApiConflictDetails | unde
   } catch {
     return undefined
   }
+}
+
+const placementFilterMessages: Record<string, string> = {
+  owner_unreachable: 'Owner is offline or unreachable',
+  daemon_upgrade_required:
+    'Upgrade the daemon to the server release (protocol revision 3 or newer)',
+  workspace_protocol_missing: 'Daemon lacks workspace protocol support',
+  location_not_ready: 'Repository location is not ready',
+  executor_unavailable: 'Executor is not installed, authenticated, or enabled',
+  capability_missing: 'Executor lacks required capabilities',
+  pin_mismatch: 'Location does not match the Agent’s pinned daemon',
+  agent_capacity: 'Agent has no available capacity',
+  machine_capacity: 'Machine has no available run capacity',
+  native_backend_unsupported: 'Daemon workspaces require CLI Agents for all worktree roles',
+  run_purpose_denied: 'Daemon policy denies a required hook, CI step, or environment setup',
+  not_visible: 'Owner is not accessible to the Task owner',
+  environment_not_ready: 'Project environment checks failed on this machine',
+  environment_probe_pending: 'Project environment checks are pending on this machine',
+  provision_failed:
+    'Repository provisioning exhausted its retries; reconnect the machine or update Project placement settings to retry',
+  environment_unverified:
+    'This machine has no copy of the repository and no machine-scope checks can verify it before cloning',
+}
+
+function getPlacementRejectionMessage(error: ApiError): string | undefined {
+  if (!['placement_unavailable', 'daemon_upgrade_required'].includes(getApiErrorCode(error) ?? ''))
+    return undefined
+  const candidates = getApiConflictDetails(error)?.rejected_candidates
+  if (!Array.isArray(candidates)) return undefined
+  if (candidates.length === 0) return 'No eligible repository locations.'
+
+  return candidates
+    .filter(isRecord)
+    .map((candidate) => {
+      const owner =
+        candidate.owner_kind === 'server'
+          ? typeof candidate.daemon_id === 'string'
+            ? `Server via daemon ${candidate.daemon_id}`
+            : 'Server'
+          : typeof candidate.daemon_id === 'string'
+            ? `Daemon ${candidate.daemon_id}`
+            : 'Daemon'
+      const location =
+        typeof candidate.repo_location_id === 'string'
+          ? `, location ${candidate.repo_location_id}`
+          : ''
+      const runtime =
+        typeof candidate.runtime_id === 'string' ? `, runtime ${candidate.runtime_id}` : ''
+      const codes = Array.isArray(candidate.filter_codes)
+        ? candidate.filter_codes.filter((code): code is string => typeof code === 'string')
+        : []
+      const reasons = codes.map(
+        (code) => `${placementFilterMessages[code] ?? code.replaceAll('_', ' ')} (${code})`,
+      )
+      return `${owner}${location}${runtime}: ${reasons.join('; ') || 'No rejection reason provided'}.`
+    })
+    .join(' ')
 }
 
 export function toastApiError(error: unknown, fallback?: string): void {

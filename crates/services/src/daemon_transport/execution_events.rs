@@ -7,8 +7,9 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use db::{
-    AgentRepo, Execution, ExecutionLeaseMutation, ExecutionRepo, ExecutionStatus,
-    RecordExecutionProgress, RenewExecutionLease, TaskRepo, UpdateExecution, WorkspaceRepo,
+    Execution, ExecutionLeaseMutation, ExecutionRepo, ExecutionStatus, PlacementState,
+    RecordExecutionProgress, RenewExecutionLease, TaskRepo, UpdateExecution,
+    WorkspacePlacementRepo, WorkspaceRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{LogKind, LogStream, LogWriter};
@@ -26,7 +27,7 @@ use crate::{
 const REMOTE_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// The daemon command stream sends a transport heartbeat every 20 seconds.
 /// Give an authenticated owner enough room for one delayed frame while still
-/// allowing the monitor to recover a genuinely disconnected daemon quickly.
+/// allowing the monitor to detect an unreachable owner before socket closure.
 const REMOTE_EXECUTION_LEASE_SECONDS: i64 = 60;
 
 pub struct ServerExecutionEventSink {
@@ -49,6 +50,20 @@ enum TerminalReportRecord {
         daemon_id: String,
         fingerprint: String,
     },
+}
+
+struct TerminalReservation<'a> {
+    sink: &'a ServerExecutionEventSink,
+    daemon_id: &'a str,
+    notification: &'a api_types::ExecutionTerminalNotification,
+}
+
+impl Drop for TerminalReservation<'_> {
+    fn drop(&mut self) {
+        // Only removes this reservation's Pending record, never Committed.
+        self.sink
+            .release_terminal(self.daemon_id, self.notification);
+    }
 }
 
 impl ServerExecutionEventSink {
@@ -172,24 +187,9 @@ impl ServerExecutionEventSink {
             return Ok(None);
         };
 
-        let Some(agent_id) = execution.agent_id.clone() else {
-            tracing::warn!(
-                sending_daemon = %daemon_id,
-                execution_id = %execution_id,
-                "rejecting execution notification: execution has no agent"
-            );
-            return Ok(None);
-        };
-
-        let Some(agent) = AgentRepo::get_by_id(&*self.db, &agent_id).await? else {
-            tracing::warn!(
-                sending_daemon = %daemon_id,
-                execution_id = %execution_id,
-                agent_id = %agent_id,
-                "rejecting execution notification: execution agent was not found"
-            );
-            return Ok(None);
-        };
+        let execution = self
+            .resume_suspended_notification(daemon_id, connection_id, execution)
+            .await?;
 
         // The daemon connection is authenticated before it reaches this
         // handler.  The execution lease is the authoritative ownership
@@ -222,11 +222,110 @@ impl ServerExecutionEventSink {
 
         tracing::warn!(
             sending_daemon = %daemon_id,
-            expected_daemon = ?agent.daemon_id,
             execution_id = %execution_id,
             "rejecting execution notification: daemon does not own this execution"
         );
         Ok(None)
+    }
+
+    async fn resume_suspended_notification(
+        &self,
+        daemon_id: &str,
+        connection_id: u64,
+        mut execution: Execution,
+    ) -> Result<Execution> {
+        let Some(workspace_id) = execution.workspace_id.as_deref() else {
+            return Ok(execution);
+        };
+        let Some(mut placement) =
+            WorkspacePlacementRepo::get_by_workspace_id(&*self.db, workspace_id).await?
+        else {
+            return Ok(execution);
+        };
+        let owner = execution_lease_owner(daemon_id, connection_id);
+        let prefix = format!("daemon:{daemon_id}:connection:");
+        if crate::recovery::placement_execution_daemon_id(&placement) != Some(daemon_id)
+            || execution
+                .lease_owner
+                .as_deref()
+                .is_none_or(|owner| !owner.starts_with(&prefix))
+        {
+            return Ok(execution);
+        }
+        if execution
+            .lease_expires_at
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .is_none_or(|expires_at| expires_at <= Utc::now())
+        {
+            crate::recovery::suspend_expired_remote_execution(
+                &self.db,
+                &self.event_bus,
+                &execution,
+            )
+            .await?;
+            placement = WorkspacePlacementRepo::get_by_id(&*self.db, &placement.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("placement", &placement.id))?;
+        }
+        if placement.state == PlacementState::Ready
+            && execution.status == ExecutionStatus::Running
+            && execution.lease_owner.as_deref() != Some(owner.as_str())
+        {
+            crate::recovery::disconnect_daemon_placements(&self.db, &self.event_bus, daemon_id)
+                .await?;
+            placement = WorkspacePlacementRepo::get_by_id(&*self.db, &placement.id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("placement", &placement.id))?;
+        }
+        if placement.state != PlacementState::Disconnected {
+            return Ok(execution);
+        }
+        for _ in 0..3 {
+            if !self.connection_is_current(daemon_id, connection_id)
+                || execution.status != ExecutionStatus::Running
+                || execution
+                    .lease_owner
+                    .as_deref()
+                    .is_none_or(|owner| !owner.starts_with(&prefix))
+            {
+                return Ok(execution);
+            }
+            let now = Utc::now();
+            if execution.lease_owner.as_deref() == Some(owner.as_str())
+                && execution
+                    .lease_expires_at
+                    .as_deref()
+                    .and_then(parse_rfc3339)
+                    .is_some_and(|expires_at| expires_at > now)
+            {
+                return Ok(execution);
+            }
+            match WorkspacePlacementRepo::resume_disconnected_execution_lease(
+                &*self.db,
+                &placement,
+                &execution,
+                RenewExecutionLease {
+                    execution_id: execution.id.clone(),
+                    expected_version: execution.execution_version,
+                    owner: owner.clone(),
+                    lease_expires_at: (now
+                        + ChronoDuration::seconds(REMOTE_EXECUTION_LEASE_SECONDS))
+                    .to_rfc3339(),
+                    now: now.to_rfc3339(),
+                },
+            )
+            .await?
+            {
+                ExecutionLeaseMutation::Updated(resumed) => return Ok(resumed),
+                ExecutionLeaseMutation::Concurrent {
+                    current: Some(current),
+                } => execution = current,
+                ExecutionLeaseMutation::Concurrent { current: None }
+                | ExecutionLeaseMutation::HardDeadline { .. } => return Ok(execution),
+            }
+        }
+        Ok(execution)
     }
 
     async fn record_semantic_progress(
@@ -306,7 +405,19 @@ impl ServerExecutionEventSink {
             // The owner is taken from the authenticated transport identity,
             // never from heartbeat payload data. Rows without a claimed lease
             // are left to the scheduler/dispatch claim path.
-            if execution.lease_owner.as_deref() != Some(lease_owner.as_str()) {
+            if execution
+                .lease_owner
+                .as_deref()
+                .is_none_or(|owner| !owner.starts_with(&format!("daemon:{daemon_id}:connection:")))
+            {
+                continue;
+            }
+            let execution = self
+                .resume_suspended_notification(daemon_id, connection_id, execution)
+                .await?;
+            if !self.connection_is_current(daemon_id, connection_id)
+                || execution.lease_owner.as_deref() != Some(lease_owner.as_str())
+            {
                 continue;
             }
 
@@ -466,6 +577,110 @@ impl ServerExecutionEventSink {
 
 #[async_trait]
 impl DaemonExecutionEventHandler for ServerExecutionEventSink {
+    async fn handle_disconnected(&self, daemon_id: &str) -> Result<()> {
+        crate::recovery::disconnect_daemon_placements(&self.db, &self.event_bus, daemon_id).await?;
+        Ok(())
+    }
+
+    async fn handle_workspace_cleanup(
+        &self,
+        daemon_id: &str,
+        connection_id: u64,
+        notification: api_types::WorkspaceCleanupResult,
+    ) -> Result<DaemonTerminalDisposition> {
+        if !self.connection_is_current(daemon_id, connection_id) {
+            return Ok(DaemonTerminalDisposition::Ignore);
+        }
+        let disposition =
+            crate::recovery::apply_owner_cleanup(&self.db, daemon_id, &notification).await?;
+        if disposition != DaemonTerminalDisposition::Acknowledge {
+            return Ok(disposition);
+        }
+        let registry = lock(&self.connection_registry)
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(registry) = registry {
+            // Retain the replayed result too: the original request may have
+            // lost its response, and its journal ACK can be interrupted.
+            let placement_id = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM workspace_placement WHERE owner_kind = 'daemon' AND daemon_id = ?
+                 AND workspace_handle = ? AND generation = ? AND state = 'cleaned'",
+            )
+            .bind(daemon_id)
+            .bind(&notification.workspace_handle)
+            .bind(
+                i64::try_from(notification.generation)
+                    .map_err(|_| ServiceError::invalid_operation("invalid cleanup generation"))?,
+            )
+            .fetch_optional(self.db.pool())
+            .await?;
+            let Some(placement_id) = placement_id else {
+                return Ok(DaemonTerminalDisposition::Ignore);
+            };
+            let placement = WorkspacePlacementRepo::get_by_id(&*self.db, &placement_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("placement", &placement_id))?;
+            let intent = sqlx::query_scalar::<_, String>(
+                "SELECT outcome_json FROM command_receipt WHERE principal_id = 'workspace-backend'
+                 AND operation = 'daemon.workspace.cleanup.intent' AND correlation_id = ?
+                 AND json_extract(outcome_json, '$.metadata.placement_id') = ?
+                 ORDER BY committed_at DESC, id DESC LIMIT 1",
+            )
+            .bind(&notification.operation_id)
+            .bind(&placement.id)
+            .fetch_optional(self.db.pool())
+            .await?;
+            let request = match intent {
+                Some(intent) => {
+                    let intent: serde_json::Value =
+                        serde_json::from_str(&intent).map_err(|error| {
+                            ServiceError::invalid_operation(format!(
+                                "invalid cleanup intent: {error}"
+                            ))
+                        })?;
+                    intent["owner_result"]["request"].clone()
+                }
+                None => serde_json::to_value(api_types::WorkspaceCleanupParams {
+                    fence: api_types::WorkspaceMutationFence {
+                        daemon_id: daemon_id.to_owned(),
+                        runtime_id: placement.runtime_id.ok_or_else(|| {
+                            ServiceError::invalid_operation("cleanup placement has no runtime")
+                        })?,
+                        placement_id: placement.id,
+                        operation_id: notification.operation_id.clone(),
+                        generation: notification.generation,
+                        expected: api_types::WorkspaceOperationExpected::Version { version: 0 },
+                    },
+                    workspace_handle: notification.workspace_handle.clone(),
+                })
+                .map_err(|error| {
+                    ServiceError::invalid_operation(format!("invalid cleanup receipt: {error}"))
+                })?,
+            };
+            let client = super::workspace_client::DaemonWorkspaceClient::new(registry)
+                .with_receipts(Arc::clone(&self.db));
+            client
+                .retain_result(
+                    daemon_id,
+                    api_types::METHOD_WORKSPACE_CLEANUP,
+                    &request,
+                    &serde_json::to_value(&notification)
+                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+                )
+                .await
+                .map_err(|error| match error {
+                    super::workspace_client::WorkspaceClientError::Transport(error) => error,
+                    super::workspace_client::WorkspaceClientError::Daemon(error) => {
+                        ServiceError::invalid_operation(error.message)
+                    }
+                })?;
+        }
+        if !self.connection_is_current(daemon_id, connection_id) {
+            return Ok(DaemonTerminalDisposition::Ignore);
+        }
+        Ok(disposition)
+    }
+
     async fn handle_heartbeat(&self, daemon_id: &str, connection_id: u64, _seq: u64) -> Result<()> {
         self.renew_owned_remote_executions(daemon_id, connection_id)
             .await
@@ -584,8 +799,20 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
         connection_id: u64,
         notification: api_types::ExecutionTerminalNotification,
     ) -> Result<DaemonTerminalDisposition> {
-        self.handle_terminal_inner(daemon_id, connection_id, notification)
-            .await
+        let execution_id = notification.execution_id.clone();
+        let disposition = self
+            .handle_terminal_inner(daemon_id, connection_id, notification)
+            .await?;
+        if disposition == DaemonTerminalDisposition::Ignore {
+            let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id).await?;
+            if execution.is_some_and(|execution| {
+                execution.status == ExecutionStatus::Running
+                    && crate::recovery::owner_execution_failure_cause(&execution).is_none()
+            }) {
+                return Ok(DaemonTerminalDisposition::Pending);
+            }
+        }
+        Ok(disposition)
     }
 }
 
@@ -603,13 +830,13 @@ impl ServerExecutionEventSink {
             return Ok(disposition);
         }
 
-        let result = self
-            .handle_terminal_inner_reserved(daemon_id, connection_id, &notification)
-            .await;
-        if result.is_err() || matches!(&result, Ok(DaemonTerminalDisposition::Ignore)) {
-            self.release_terminal(daemon_id, &notification);
-        }
-        result
+        let _reservation = TerminalReservation {
+            sink: self,
+            daemon_id,
+            notification: &notification,
+        };
+        self.handle_terminal_inner_reserved(daemon_id, connection_id, &notification)
+            .await
     }
 
     async fn handle_terminal_inner_reserved(
@@ -626,6 +853,23 @@ impl ServerExecutionEventSink {
         if !self.connection_is_current(daemon_id, connection_id) {
             return Ok(DaemonTerminalDisposition::Ignore);
         }
+        if let Some(execution) =
+            ExecutionRepo::get_by_id(&*self.db, &notification.execution_id).await?
+        {
+            if crate::recovery::owner_execution_failure_cause(&execution).is_some() {
+                task_service
+                    .record_late_remote_terminal(daemon_id, connection_id, notification)
+                    .await?;
+                return Ok(DaemonTerminalDisposition::Ignore);
+            }
+            self.resume_suspended_notification(daemon_id, connection_id, execution)
+                .await?;
+        } else {
+            return Ok(DaemonTerminalDisposition::Ignore);
+        }
+        if !self.connection_is_current(daemon_id, connection_id) {
+            return Ok(DaemonTerminalDisposition::Ignore);
+        }
         let outcome = task_service
             .complete_remote_execution(daemon_id, connection_id, notification.clone())
             .await?;
@@ -635,6 +879,39 @@ impl ServerExecutionEventSink {
                 replayed,
                 ..
             } => {
+                // A receipt can survive a crash before outbox ingestion. The
+                // owner's report stays retained until these idempotent writes
+                // also succeed, including on an exact receipt replay.
+                if !notification.outbox_entries.is_empty() {
+                    let agent_id = execution.agent_id.as_deref().ok_or_else(|| {
+                        ServiceError::invalid_operation("terminal outbox has no execution Agent")
+                    })?;
+                    let report = task_service
+                        .ingest_execution_outbox_entries(
+                            &crate::native_tools::ExecutionOutboxInput {
+                                task_id: &execution.task_id,
+                                execution_id: &execution.id,
+                                agent_id,
+                                role: Some(&execution.role),
+                                worktree_path: "",
+                            },
+                            notification.outbox_entries.clone(),
+                        )
+                        .await;
+                    if report.worklog_entries + report.evidence_items == 0
+                        && report.rejected.is_empty()
+                    {
+                        return Err(ServiceError::invalid_operation(
+                            "terminal outbox ingestion is unavailable",
+                        ));
+                    }
+                    if !report.rejected.is_empty() {
+                        return Err(ServiceError::invalid_operation(format!(
+                            "terminal outbox ingestion is incomplete: {}",
+                            report.rejected.join("; "),
+                        )));
+                    }
+                }
                 if !replayed {
                     self.writers.lock().await.remove(&notification.execution_id);
                 }
@@ -642,6 +919,13 @@ impl ServerExecutionEventSink {
                 // long enough to cascade it. The TaskService has replayed the
                 // outbox/post-commit effects; now reconcile the workflow too.
                 if execution.status != ExecutionStatus::Running {
+                    if crate::recovery::execution_placement_is_disconnected(&self.db, &execution)
+                        .await?
+                    {
+                        // Retain the owner's report through reconciliation,
+                        // including a crash after ready CAS but before cascade.
+                        return Ok(DaemonTerminalDisposition::AwaitingCascade);
+                    }
                     task_service
                         .maybe_cascade_executor_completion(&notification.execution_id)
                         .await?;
@@ -660,8 +944,10 @@ impl ServerExecutionEventSink {
                 // index handles same-process replay; a concurrent result with
                 // no matching receipt still needs authorization before it can
                 // be classified as a late/conflicting report.
-                if let Some(disposition) =
-                    self.terminal_replay_disposition(daemon_id, notification)?
+                if let Some(
+                    disposition @ (DaemonTerminalDisposition::Acknowledge
+                    | DaemonTerminalDisposition::Conflict),
+                ) = self.terminal_replay_disposition(daemon_id, notification)?
                 {
                     return Ok(disposition);
                 }
@@ -722,7 +1008,7 @@ fn terminal_record_disposition(
         if committed {
             DaemonTerminalDisposition::Acknowledge
         } else {
-            DaemonTerminalDisposition::Ignore
+            DaemonTerminalDisposition::Pending
         }
     } else {
         DaemonTerminalDisposition::Conflict
@@ -759,8 +1045,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use db::{
-        new_uuid_v4, now_rfc3339, run_migrations, AgentStatus, ClaimExecutionLease, CreateAgent,
-        CreateExecution, CreateProject, CreateTask, CreateTaskRoleAssignment,
+        new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus, ClaimExecutionLease,
+        CreateAgent, CreateExecution, CreateProject, CreateTask, CreateTaskRoleAssignment,
         ExecutionLeaseMutation, ProjectRepo, TaskRoleAssignmentRepo,
     };
     use serde_json::json;
@@ -811,7 +1097,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn daemon_transport_unauthorized_running_terminal_is_retained_without_ack() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let (_, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        // A lost lease-resume CAS can leave the row owned by an earlier incarnation.
+        sqlx::query("UPDATE execution SET lease_owner = 'dispatch-pending:old-owner' WHERE id = ?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let registry =
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+        let daemon_id = placement.daemon_id.as_deref().unwrap();
+        let (connection_id, mut outbound) =
+            crate::recovery::tests::owner_connection(&registry, daemon_id, false);
+        let bus = Arc::new(EventBus::default());
+        let service = Arc::new(TaskService::new(db.clone(), bus.clone()));
+        let sink = Arc::new(ServerExecutionEventSink::new(
+            db.clone(),
+            bus,
+            PathBuf::new(),
+        ));
+        sink.set_task_service(Arc::downgrade(&service));
+        sink.set_connection_registry(Arc::downgrade(&registry));
+        *lock(&registry.inner.execution_events) = Some(sink);
+        let mut report = notification();
+        report.execution_id = execution.id.clone();
+        let disposition = registry
+            .apply_journal_terminal(daemon_id, connection_id, report)
+            .await
+            .unwrap();
+        assert_eq!(disposition, DaemonTerminalDisposition::Pending);
+        assert!(
+            outbound.try_recv().is_err(),
+            "a running execution's ignored report must not be acked"
+        );
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Running
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_replay_retries_cascade_before_acknowledging() {
+        assert_terminal_replay(false).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_replay_disconnected_report_survives_reconcile_cascade_failure() {
+        assert_terminal_replay(true).await;
+    }
+
+    async fn assert_terminal_replay(disconnected: bool) {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("SQLite pool creates");
@@ -995,6 +1338,42 @@ mod tests {
         .expect("remote lease claims");
         assert!(matches!(claimed, ExecutionLeaseMutation::Updated(_)));
 
+        let placement_id = new_uuid_v4();
+        if disconnected {
+            let workspace_id = new_uuid_v4();
+            let location_id = new_uuid_v4();
+            db::DaemonRepo::upsert_by_machine_id(
+                &*db,
+                db::UpsertDaemon {
+                    max_concurrent_runs: None,
+                    id: daemon_id.to_owned(),
+                    machine_id: daemon_id.to_owned(),
+                    hostname: "terminal-owner".into(),
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    agent_version: None,
+                    labels_json: "{}".into(),
+                    status: db::DaemonStatus::Online,
+                    registration_token_hash: None,
+                    owner_id: None,
+                    visibility: "global".into(),
+                    created_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at) VALUES (?, ?, 'terminal-repo', '/owner/terminal', 'task/terminal', 'ready', ?, ?)")
+                .bind(&workspace_id).bind(&task_id).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+            sqlx::query("INSERT INTO repo_location (id, repo_id, owner_kind, path, kind, status, created_at, updated_at) VALUES (?, 'terminal-repo', 'server', '/owner/repo', 'primary_checkout', 'ready', ?, ?)")
+                .bind(&location_id).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+            sqlx::query("INSERT INTO workspace_placement (id, workspace_id, task_id, owner_kind, repo_location_id, execution_daemon_id, workspace_handle, state, selected_by, selection_reason, created_at, updated_at) VALUES (?, ?, ?, 'server', ?, ?, '/owner/terminal', 'disconnected', 'backfill', '{}', ?, ?)")
+                .bind(&placement_id).bind(&workspace_id).bind(&task_id).bind(&location_id).bind(daemon_id)
+                .bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+            sqlx::query("UPDATE execution SET workspace_id = ?, executor_config_snapshot_json = json_set(executor_config_snapshot_json, '$.placement_id', ?) WHERE id = ?")
+                .bind(&workspace_id).bind(&placement_id).bind(&execution_id).execute(db.pool()).await.unwrap();
+        }
+
         let task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
         let sink = ServerExecutionEventSink::new(
             Arc::clone(&db),
@@ -1018,6 +1397,24 @@ mod tests {
         notification.execution_id = execution_id.clone();
         notification.terminal_report_id = "terminal-report-cascade-replay".to_owned();
         notification.ts = now_rfc3339();
+
+        if disconnected {
+            assert_eq!(
+                sink.handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
+                    .await
+                    .unwrap(),
+                DaemonTerminalDisposition::AwaitingCascade,
+                "a suspended report has no durable cascade yet"
+            );
+            assert!(!lock(&sink.terminal_reports).contains_key(&notification.terminal_report_id));
+            // Reconciliation makes the placement ready, then the injected
+            // cascade failure models the next crash seam before advancement.
+            sqlx::query("UPDATE workspace_placement SET state = 'ready' WHERE id = ?")
+                .bind(&placement_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
 
         let first_error = sink
             .handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
@@ -1087,5 +1484,319 @@ mod tests {
             .await
             .expect("committed in-memory replay does not consult the closed database");
         assert_eq!(third, DaemonTerminalDisposition::Acknowledge);
+    }
+
+    #[test]
+    fn exact_replay_waits_for_pending_terminal_outbox() {
+        let fingerprint = terminal_fingerprint(&notification()).unwrap();
+        let record = TerminalReportRecord::Pending {
+            daemon_id: "owner-daemon".to_owned(),
+            fingerprint: fingerprint.clone(),
+        };
+        assert_eq!(
+            terminal_record_disposition(&record, "owner-daemon", &fingerprint),
+            DaemonTerminalDisposition::Pending
+        );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use crate::daemon_transport::{DaemonConnectionRegistry, DaemonExecutionEventHandler};
+
+    #[tokio::test]
+    async fn daemon_transport_live_terminal_drives_a_busy_completion_cascade() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let bus = Arc::new(EventBus::new(32));
+        let mut terminal_events = bus.subscribe();
+        let root = tempfile::tempdir().unwrap();
+        let sink = Arc::new(ServerExecutionEventSink::new(
+            db.clone(),
+            bus.clone(),
+            root.path().into(),
+        ));
+        let registry = Arc::new(DaemonConnectionRegistry::new(bus.clone(), sink.clone()));
+        sink.set_connection_registry(Arc::downgrade(&registry));
+        let service =
+            Arc::new(TaskService::new(db.clone(), bus).with_daemon_connections(registry.clone()));
+        sink.set_task_service(Arc::downgrade(&service));
+        let daemon_id = placement.daemon_id.unwrap();
+        let (connection_id, _outbound) =
+            crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+        sqlx::query(
+            "UPDATE workspace_placement SET state = 'ready', disconnected_at = NULL WHERE id = ?",
+        )
+        .bind(&placement.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE execution SET role = 'interactive', lease_owner = ?, lease_expires_at = ? WHERE id = ?")
+            .bind(execution_lease_owner(&daemon_id, connection_id)).bind((Utc::now() + ChronoDuration::hours(1)).to_rfc3339())
+            .bind(&execution.id).execute(db.pool()).await.unwrap();
+        let slot = service.claim_completion_cascade(&task.id).unwrap();
+        let notification = serde_json::from_value(
+            json!({"terminal_report_id":"live-report", "execution_id":execution.id,
+            "exit_code":0, "status":"completed", "ts":db::now_rfc3339(), "usage_reports":[]}),
+        )
+        .unwrap();
+        let attempt = tokio::spawn(async move {
+            sink.handle_terminal_with_ack(&daemon_id, connection_id, notification)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while terminal_events.recv().await.unwrap().event_type != "execution.completed" {}
+        })
+        .await
+        .unwrap();
+        assert!(
+            !attempt.is_finished(),
+            "a live terminal must wait for the occupied Task slot"
+        );
+        drop(slot);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), attempt)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            DaemonTerminalDisposition::Acknowledge
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_transport_deleted_execution_report_is_acknowledgeable() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let bus = Arc::new(EventBus::new(16));
+        let root = tempfile::tempdir().unwrap();
+        let sink = Arc::new(ServerExecutionEventSink::new(
+            db.clone(),
+            bus.clone(),
+            root.path().into(),
+        ));
+        let registry = Arc::new(DaemonConnectionRegistry::new(bus.clone(), sink.clone()));
+        sink.set_connection_registry(Arc::downgrade(&registry));
+        let service = Arc::new(TaskService::new(db, bus).with_daemon_connections(registry.clone()));
+        sink.set_task_service(Arc::downgrade(&service));
+        let (id, _outbound) = crate::recovery::tests::owner_connection(&registry, "owner", false);
+        let notification = serde_json::from_value(
+            json!({"terminal_report_id":"deleted-report", "execution_id":"deleted-execution",
+            "exit_code":0, "status":"completed", "ts":db::now_rfc3339(), "usage_reports":[]}),
+        )
+        .unwrap();
+        assert_eq!(
+            sink.handle_terminal_with_ack("owner", id, notification)
+                .await
+                .unwrap(),
+            DaemonTerminalDisposition::Ignore
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_transport_cancelled_terminal_and_slow_placement_reconcile_commit_once_and_ack()
+    {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let bus = Arc::new(EventBus::new(32));
+        let (_, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+        let root = tempfile::tempdir().unwrap();
+        let sink = Arc::new(ServerExecutionEventSink::new(
+            db.clone(),
+            bus.clone(),
+            root.path().to_path_buf(),
+        ));
+        let registry = Arc::new(DaemonConnectionRegistry::new(bus.clone(), sink.clone()));
+        sink.set_connection_registry(Arc::downgrade(&registry));
+        let service = TaskService::new(db.clone(), bus.clone())
+            .with_daemon_connections(registry.clone())
+            .with_provider_credential_env(Arc::new(
+                crate::embedded_agent_service::EmbeddedAgentService::new(
+                    db.clone(),
+                    b"cancelled-terminal-test",
+                ),
+            ));
+        let router = (*service.workspace_backend_router())
+            .clone()
+            .with_daemon(Arc::new(
+                crate::workspace_backend::DaemonWorkspaceBackend::new(db.clone(), registry.clone()),
+            ));
+        let service = Arc::new(service.with_workspace_backend_router(Arc::new(router)));
+        sink.set_task_service(Arc::downgrade(&service));
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        let (connection_id, mut outbound) =
+            crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+        let notification: api_types::ExecutionTerminalNotification = serde_json::from_value(json!({
+            "terminal_report_id": db::new_uuid_v4(), "execution_id": execution.id, "exit_code": 0,
+            "ts": db::now_rfc3339(), "status": "completed", "after_sha": "owner-head", "usage_reports": [],
+        })).unwrap();
+        // This receipt test isolates transport/cancellation from workflow role authority.
+        sqlx::query("UPDATE execution SET role = 'interactive' WHERE id = ?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // Cancellation after the durable terminal write, before the reservation
+        // is promoted. The retry must replay the receipt instead of wedging Pending.
+        let writers = sink.writers.lock().await;
+        let mut terminal_events = bus.subscribe();
+        let attempt = {
+            let sink = sink.clone();
+            let daemon_id = daemon_id.clone();
+            let notification = notification.clone();
+            tokio::spawn(async move {
+                sink.handle_terminal_with_ack(&daemon_id, connection_id, notification)
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let event = terminal_events.recv().await.unwrap();
+                if event.event_type == "execution.completed" && event.entity_id == execution.id {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        attempt.abort();
+        assert!(attempt.await.unwrap_err().is_cancelled());
+        assert!(!lock(&sink.terminal_reports).contains_key(&notification.terminal_report_id));
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Completed
+        );
+        drop(writers);
+        registry.dispatch_incoming_for_connection(
+            &daemon_id,
+            connection_id,
+            api_types::DaemonFrame::Notification {
+                method: api_types::METHOD_EXECUTION_TERMINAL.to_owned(),
+                params: serde_json::to_value(&notification).unwrap(),
+            },
+        );
+        let acked = Arc::new(tokio::sync::Notify::new());
+        let describe_started = Arc::new(tokio::sync::Notify::new());
+        let release_describe = Arc::new(tokio::sync::Notify::new());
+        let describes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let responder = {
+            let registry = registry.clone();
+            let daemon_id = daemon_id.clone();
+            let acked = acked.clone();
+            let describe_started = describe_started.clone();
+            let release_describe = release_describe.clone();
+            let describes = describes.clone();
+            tokio::spawn(async move {
+                while let Some(api_types::DaemonFrame::Request { id, method, params }) =
+                    outbound.recv().await
+                {
+                    let result = match method.as_str() {
+                        api_types::METHOD_WORKSPACE_DESCRIBE => {
+                            let attempt =
+                                describes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            describe_started.notify_one();
+                            if attempt == 0 {
+                                release_describe.notified().await;
+                            }
+                            json!({"workspace_handle": params["workspace_handle"], "generation": 1,
+                                "exists": true, "head_sha": "owner-head", "dirty": false, "branch": "task/remote",
+                                "locked": false, "active_execution_ids": [], "journaled_execution_ids": [execution.id]})
+                        }
+                        api_types::METHOD_WORKSPACE_READ => match params["operation"].as_str() {
+                            Some("git") => {
+                                json!({"kind": "git", "output": match params["query"]["kind"].as_str() {
+                                    Some("head" | "resolve_ref" | "merge_base" | "target_head") => "owner-head\n",
+                                    _ => "",
+                                }})
+                            }
+                            Some("paths") => {
+                                json!({"kind": "paths", "workspace_path": "/owner-only/workspace", "repo_path": "/owner-only/repo"})
+                            }
+                            Some("files") => json!({"kind": "files", "files": []}),
+                            _ => json!({"path": params["path"], "bytes": [], "truncated": false}),
+                        },
+                        api_types::METHOD_JOURNAL_ACK => {
+                            json!({"entry_id": params["entry_id"], "acknowledged": true})
+                        }
+                        _ => panic!("unexpected owner RPC: {method}"),
+                    };
+                    registry.dispatch_incoming_for_connection(
+                        &daemon_id,
+                        connection_id,
+                        api_types::DaemonFrame::Response { id, result },
+                    );
+                    if method == api_types::METHOD_JOURNAL_ACK {
+                        acked.notify_one();
+                        break;
+                    }
+                }
+            })
+        };
+        // Cancel a placement attempt while its owner RPC is outstanding.
+        // Its late response must not retain a pending sender or prevent retry.
+        let cancelled = {
+            let db = db.clone();
+            let bus = bus.clone();
+            let registry = registry.clone();
+            let service = service.clone();
+            let placement = placement.clone();
+            tokio::spawn(async move {
+                crate::recovery::reconcile_workspace_placement(
+                    &db,
+                    &bus,
+                    &registry,
+                    Some(&service),
+                    &placement,
+                )
+                .await
+            })
+        };
+        describe_started.notified().await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(lock(&registry.get(&daemon_id).unwrap().pending).is_empty());
+        release_describe.notify_one();
+        let monitor = crate::HeartbeatMonitor::new(db.clone(), bus)
+            .with_daemon_connections(registry.clone())
+            .with_task_service(service);
+        monitor.check_once().await.unwrap();
+        // A second tick must not start another describe for this placement.
+        monitor.check_once().await.unwrap();
+        acked.notified().await;
+        responder.await.unwrap();
+        monitor.finish_placement_workers().await;
+        assert_eq!(
+            describes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one cancelled describe and one retry, with no duplicate tick attempt"
+        );
+        assert_eq!(
+            WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            PlacementState::Ready
+        );
+        let terminals: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM execution_terminal_receipt WHERE execution_id = ?",
+        )
+        .bind(&notification.execution_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(terminals, 1);
+        let events: i64 = sqlx::query_scalar("SELECT count(*) FROM domain_event WHERE event_type = 'execution.completed' AND json_extract(payload_json, '$.execution_id') = ?")
+            .bind(&notification.execution_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(events, 1);
     }
 }

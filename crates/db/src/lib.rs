@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
 mod agent_chat_topic_repository;
+mod chat_session_denials;
 mod connection;
+mod environment_readiness;
 mod error;
 mod ids;
+pub mod machine_capacity;
 mod migration;
 mod models;
 mod orchestration;
@@ -12,12 +15,24 @@ mod repository;
 mod review_conformance;
 mod sqlite;
 mod task_metadata;
+mod task_step;
+pub use task_step::*;
 #[cfg(test)]
 mod tests;
 mod time;
+mod worker;
+pub use worker::{
+    clamp_worker_deferral, FailureState, HealthErrorKind, PoisonDecision, RetryPolicy, WorkItem,
+    WorkerHealth, WorkerWaitState,
+};
 
 pub use agent_chat_topic_repository::*;
-pub use connection::{begin_immediate, create_sqlite_pool};
+pub use chat_session_denials::*;
+pub use connection::{
+    begin_immediate, convert_sqlite_to_incremental, create_sqlite_pool, incremental_vacuum,
+    sqlite_storage_status,
+};
+pub use environment_readiness::*;
 pub use error::{DbError, Result};
 pub use ids::{new_uuid_v4, validate_uuid_v4};
 pub use migration::{run_migrations, run_migrations_from};
@@ -26,7 +41,10 @@ pub use orchestration::*;
 pub use pagination::*;
 pub use repository::*;
 pub use review_conformance::*;
-pub use sqlite::{supported_main_baseline_revision, SqliteDb};
+pub use sqlite::{
+    supported_main_baseline_revision, DeadLetter, DeadLetterAction, DeadLetterPage,
+    EventSubscription, SqliteDb, TaskListRead, WorkerDeadLetterIssue, WorkerDiagnostic,
+};
 pub use sqlx::{Sqlite, SqlitePool};
 pub use task_metadata::TaskMetadata;
 pub use time::now_rfc3339;

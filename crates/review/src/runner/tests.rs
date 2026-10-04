@@ -44,6 +44,7 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
     DaemonRepo::upsert_by_machine_id(
         &*db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -86,7 +87,6 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
             name: "forge".to_owned(),
             remote_url: Some("https://example.com/forge.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -480,7 +480,6 @@ async fn review_source_keeps_execution_workspace_repository_after_project_resele
             name: "replacement".to_owned(),
             remote_url: Some("https://example.com/replacement.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "trunk".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),

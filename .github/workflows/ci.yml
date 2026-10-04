@@ -51,9 +51,9 @@ jobs:
             exit 1
           fi
 
-      - name: Test performance collector
+      - name: Test performance tooling
         if: ${{ !cancelled() }}
-        run: python3 -m unittest discover -s scripts -p test_collect_performance.py -v
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
 
   audit:
     name: Security Audit

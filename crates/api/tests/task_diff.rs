@@ -50,7 +50,12 @@ async fn task_diff_endpoint_returns_workspace_diff_and_handles_missing_workspace
         .launch_execution(task.id.clone(), agent_id, None, None)
         .await
         .expect("launch succeeds");
-    let workspace_path = PathBuf::from(&launched.workspace.worktree_path);
+    let workspace_path = app
+        .state
+        .workspace_backend_router
+        .embedded_path(&app.state.db, &launched.workspace)
+        .await
+        .expect("workspace path resolves");
     std::fs::write(workspace_path.join("README.md"), "# Task diff\nupdated\n")
         .expect("workspace file writes");
 
@@ -117,7 +122,12 @@ async fn task_diff_uses_merge_base_when_default_branch_advances() {
     run_git(&repo_dir, &["add", "-A"]);
     run_git(&repo_dir, &["commit", "-m", "advance default branch"]);
 
-    let workspace_path = PathBuf::from(&launched.workspace.worktree_path);
+    let workspace_path = app
+        .state
+        .workspace_backend_router
+        .embedded_path(&app.state.db, &launched.workspace)
+        .await
+        .expect("workspace path resolves");
     std::fs::write(
         workspace_path.join("README.md"),
         "# Task diff\nworkspace update\n",
@@ -160,7 +170,12 @@ async fn test_app() -> Harness {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(SqliteDb::new(pool));
-    let state = AppState::new(db, Arc::new(events::EventBus::new(32)), true);
+    let state = AppState::with_adapter_registry(
+        db,
+        Arc::new(events::EventBus::new(32)),
+        true,
+        Arc::new(cli_adapters::test_support::test_registry()),
+    );
     let web_dist_dir = std::env::temp_dir().join(format!("forge-task-diff-web-{}", new_uuid_v4()));
     std::fs::create_dir_all(&web_dist_dir).expect("web dir creates");
     std::fs::write(
@@ -201,7 +216,6 @@ async fn create_project_and_repo(harness: &Harness) -> (String, String, PathBuf,
             project_id: project.id.clone(),
             name: "task-diff".to_owned(),
             local_path: Some(repo_dir.to_string_lossy().to_string()),
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: Some(repo_dir.to_string_lossy().to_string()),
             default_branch: default_branch.clone(),
             created_at: now.clone(),
@@ -238,6 +252,7 @@ async fn create_agent(harness: &Harness) -> String {
     let daemon = DaemonRepo::upsert_by_machine_id(
         &*harness.state.db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: new_uuid_v4(),
             machine_id: services::embedded_daemon::embedded_machine_id(),
             hostname: "localhost".to_owned(),
@@ -258,6 +273,7 @@ async fn create_agent(harness: &Harness) -> String {
     DaemonRepo::update_report(
         &*harness.state.db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon.id.clone(),
             last_report_at: now.clone(),
             status: DaemonStatus::Online,

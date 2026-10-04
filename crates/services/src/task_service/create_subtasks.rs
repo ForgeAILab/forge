@@ -68,31 +68,10 @@ impl TaskService {
                 .workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
         );
-        let implementation_role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == crate::workflow::default_states::IN_PROGRESS)
-            .and_then(crate::workflow::effective_role)
-            .or_else(|| {
-                workflow
-                    .states
-                    .iter()
-                    .find(|state| state.kind == api_types::StateKind::Active)
-                    .and_then(crate::workflow::effective_role)
-            });
-        let aggregate_review_roles = workflow
-            .states
-            .iter()
-            .filter(|state| {
-                state.kind == api_types::StateKind::Gate
-                    && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
-            })
-            .filter_map(|state| state.role.as_deref())
-            .filter(|role| Some(*role) != implementation_role)
-            .collect::<std::collections::HashSet<_>>();
+        let root_role_policy = crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow);
         let mut current_parent = result.source_task.clone();
         for assignment in TaskRoleAssignmentRepo::list_by_task(&*self.db, &parent.id).await? {
-            if !aggregate_review_roles.contains(assignment.role_name.as_str()) {
+            if !root_role_policy.allows_assignment(&assignment.role_name) {
                 current_parent = TaskRoleAssignmentRepo::remove_and_clear_review_authority(
                     &*self.db,
                     &assignment,

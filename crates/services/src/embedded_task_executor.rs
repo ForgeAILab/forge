@@ -14,7 +14,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use db::{AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb, TaskRepo};
+use db::{
+    AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb, TaskRepo, WorkspaceRepo,
+};
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
     LogKind, ProviderCallAdmission, TaskExecutor, UsageCounters, UsageReport, UsageTelemetryState,
@@ -230,6 +232,7 @@ pub struct EmbeddedTaskExecutor {
     db: Arc<SqliteDb>,
     embedded_agents: Arc<EmbeddedAgentService>,
     backend: Arc<NativeAgentRuntimeBackend>,
+    workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
     active: Arc<RwLock<HashMap<String, ActiveTaskTurn>>>,
     provider_admissions: Arc<StdMutex<HashMap<String, Arc<dyn ProviderCallAdmission>>>>,
 }
@@ -259,15 +262,52 @@ impl std::fmt::Debug for EmbeddedTaskExecutor {
 }
 
 impl EmbeddedTaskExecutor {
-    pub fn new(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
+    pub fn new_with_router(
+        db: Arc<SqliteDb>,
+        embedded_agents: Arc<EmbeddedAgentService>,
+        workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
         let backend = embedded_agents.native_backend();
         Self {
             db,
             embedded_agents,
             backend,
+            workspace_backend_router,
             active: Arc::new(RwLock::new(HashMap::new())),
             provider_admissions: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
+        Self::new_for_test(db, embedded_agents)
+    }
+
+    /// Embedded-only fixture constructor.
+    pub fn new_for_test(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
+        let backend = embedded_agents.native_backend();
+        let workspace_backend_router =
+            crate::lifecycle::context::embedded_workspace_router_for_test(
+                Arc::clone(&db),
+                crate::task_service::workspace::default_workspace_root(),
+                None,
+            );
+        Self {
+            db,
+            embedded_agents,
+            backend,
+            workspace_backend_router,
+            active: Arc::new(RwLock::new(HashMap::new())),
+            provider_admissions: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_workspace_backend_router(
+        mut self,
+        router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
+        self.workspace_backend_router = router;
+        self
     }
 
     async fn run_native_turn(
@@ -342,13 +382,32 @@ impl EmbeddedTaskExecutor {
             .map(str::to_owned);
 
         let role = canonical_task_role(task_role)?;
+        let execution = ExecutionRepo::get_by_id(&*self.db, &ctx.execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", ctx.execution_id.clone()))?;
+        let workspace = match execution.workspace_id.as_deref() {
+            Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?,
+            None => WorkspaceRepo::get_by_task_id(&*self.db, &ctx.task_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", ctx.task_id.clone()))?,
+        };
+        let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+            &self.workspace_backend_router,
+            &self.db,
+            &workspace,
+            &crate::task_service::workspace::default_workspace_root(),
+        )
+        .await?;
+        let worktree_path = resolved.embedded_path()?;
         let worktree_read_only =
             is_read_only_task_role(role) || executors::is_worktree_read_only(&ctx.agent_config);
         let before_sha = if worktree_read_only {
             None
         } else {
             Some(
-                git::get_current_sha(Path::new(&ctx.worktree_path))
+                git::get_current_sha(&worktree_path)
                     .await
                     .map_err(ServiceError::from)?,
             )
@@ -448,12 +507,14 @@ impl EmbeddedTaskExecutor {
                     WorkspaceAccess::TaskWrite
                 },
             },
-            workspace_path: Some(ctx.worktree_path.clone()),
+            workspace_path: Some(worktree_path.to_string_lossy().into_owned()),
             provider: native_provider.clone(),
             system_prompt: system_prompt.clone(),
             history: Vec::new(),
             input,
+            server_state_card: None,
             command_allowlist: Some(command_allowlist.clone()),
+            environment: executors::environment::task_environment(&ctx.agent_config),
             cancellation: cancellation.clone(),
         };
         let output = self
@@ -479,6 +540,7 @@ impl EmbeddedTaskExecutor {
             Err(AgentHostError::RuntimeWithUsage {
                 message,
                 usage_reports,
+                ..
             }) => {
                 let status = if cancellation.is_cancelled() {
                     ExecutionOutcome::Cancelled
@@ -561,7 +623,7 @@ impl EmbeddedTaskExecutor {
                     limit,
                 ));
             }
-            Err(error) => return Err(ServiceError::invalid_operation(error.to_string())),
+            Err(error) => return native_dispatch_failure(error),
         };
         let output =
             if role == crate::workflow::default_roles::REVIEWER && !cancellation.is_cancelled() {
@@ -632,14 +694,12 @@ impl EmbeddedTaskExecutor {
         let agent_session_id = output.runtime_session_id;
         let summary = output.text;
         let after_sha = if let Some(before_sha) = before_sha.as_deref() {
-            match validate_write_capable_delivery(Path::new(&ctx.worktree_path), before_sha).await {
+            match validate_write_capable_delivery(&worktree_path, before_sha).await {
                 Ok(after_sha) => after_sha,
                 Err(error) => {
                     return Ok(ExecutionResult {
                         status: ExecutionOutcome::Failed,
-                        after_sha: git::get_current_sha(Path::new(&ctx.worktree_path))
-                            .await
-                            .ok(),
+                        after_sha: git::get_current_sha(&worktree_path).await.ok(),
                         agent_session_id: Some(agent_session_id),
                         summary: Some(summary),
                         error: Some(error.to_string()),
@@ -654,7 +714,7 @@ impl EmbeddedTaskExecutor {
                 }
             }
         } else {
-            git::get_current_sha(Path::new(&ctx.worktree_path))
+            git::get_current_sha(&worktree_path)
                 .await
                 .map_err(ServiceError::from)?
         };
@@ -1333,6 +1393,11 @@ async fn validate_write_capable_delivery(
     Ok(after_sha)
 }
 
+/// Lifecycle failures escape dispatch, preserving the Task retry boundary.
+fn native_dispatch_failure(error: AgentHostError) -> Result<ExecutionResult> {
+    Err(ServiceError::invalid_operation(error.to_string()))
+}
+
 /// Routes embedded snapshots to the Forge-native Task adapter while keeping
 /// every existing CLI/fallback executor on its original path.
 #[derive(Clone)]
@@ -1421,6 +1486,147 @@ mod tests {
             .await
             .expect("initial commit creates");
         (repo, before_sha)
+    }
+
+    #[test]
+    fn session_open_failure_is_dispatch_error_not_task_failed_result() {
+        let outcome =
+            native_dispatch_failure(AgentHostError::Runtime("session open failed".into()));
+        assert!(
+            matches!(outcome, Err(ServiceError::InvalidOperation { message }) if message.contains("session open failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_session_open_failure_escapes_as_dispatch_error() {
+        use agent_runtime::{core::provider::Capabilities, provider::fake::FakeProvider};
+        use db::{CreateAgentIdentity, CreateAgentProfile};
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000001', 'task@example.test', 'test', ?, ?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let service = EmbeddedAgentService::new(db.clone(), b"task-session-open-test");
+        service
+            .protected_store()
+            .create_credential(
+                "10000000-0000-4000-8000-000000000009",
+                "10000000-0000-4000-8000-000000000001",
+                "openai",
+                "test",
+                forge_agent_host::Secret::new("unused-test-key"),
+                &now,
+            )
+            .await
+            .unwrap();
+        let agent = AgentRepo::create_identity_with_profile(
+            &*db,
+            CreateAgentIdentity {
+                id: "10000000-0000-4000-8000-000000000002".into(),
+                name: "10000000-0000-4000-8000-000000000002".into(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: Some("10000000-0000-4000-8000-000000000001".into()),
+                visibility: "account".into(),
+                account_permission_ceiling: "{}".into(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            CreateAgentProfile {
+                id: "10000000-0000-4000-8000-000000000003".into(),
+                identity_id: "10000000-0000-4000-8000-000000000002".into(),
+                backend_kind: "native".into(),
+                executor_type: "embedded".into(),
+                provider: Some("openai".into()),
+                model: Some("fake".into()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "{}".into(),
+                tool_policy_json: "{}".into(),
+                config_json: r#"{"base_url":"https://unused.invalid/v1"}"#.into(),
+                credential_ref: Some("10000000-0000-4000-8000-000000000009".into()),
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO project (id, name, owner_id, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000004', 'test', '10000000-0000-4000-8000-000000000001', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+             INSERT INTO project_member (project_id, user_id, role, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000004', '10000000-0000-4000-8000-000000000001', 'owner', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+             INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000005', '10000000-0000-4000-8000-000000000004', 'review', 'planning_task', 'in_progress', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+             INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000007', '10000000-0000-4000-8000-000000000005', 'worker', 'agent', '10000000-0000-4000-8000-000000000002', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+             INSERT INTO execution (id, task_id, agent_id, role, status, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000006', '10000000-0000-4000-8000-000000000005', '10000000-0000-4000-8000-000000000002', 'worker', 'running', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');"
+        ).execute(db.pool()).await.unwrap();
+        let (worktree, _) = task_repo().await;
+        sqlx::query("INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000008', '10000000-0000-4000-8000-000000000005', 'historical-repo', ?, 'test', 'ready', ?, ?)")
+            .bind(worktree.path().to_string_lossy().as_ref()).bind(&now).bind(&now)
+            .execute(db.pool()).await.unwrap();
+        let session = service
+            .create_or_resume_session(CreateScopedSession {
+                actor_user_id: "10000000-0000-4000-8000-000000000001".into(),
+                identity_id: agent.id.clone(),
+                profile_id: Some("10000000-0000-4000-8000-000000000003".into()),
+                scope: RequestedCanonicalScope::Task {
+                    task_id: "10000000-0000-4000-8000-000000000005".into(),
+                    role: "worker".into(),
+                },
+            })
+            .await
+            .unwrap();
+        // An unreadable persisted snapshot fails inside runtime.start_session,
+        // after the executor has admitted the Task and called its backend.
+        sqlx::query("INSERT INTO protected_agent_session_state (session_id, snapshot_ciphertext, snapshot_nonce, key_revision, updated_at) VALUES (?, ?, ?, 1, ?)")
+            .bind(&session.id).bind(vec![0u8; 32]).bind(vec![0u8; 12]).bind(&now)
+            .execute(db.pool()).await.unwrap();
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            vec![],
+        ));
+        let backend = NativeAgentRuntimeBackend::new(service.protected_store())
+            .with_provider_override(provider.clone());
+        let executor = EmbeddedTaskExecutor::new(
+            db.clone(),
+            Arc::new(service.with_native_backend(Arc::new(backend))),
+        );
+        let logs = tempfile::tempdir().unwrap();
+        let mut config = serde_json::json!({
+            "executor_type": "embedded", "agent_id": agent.id,
+            "profile_id": "10000000-0000-4000-8000-000000000003", "provider": "openai", "model": "fake",
+            "config": {"base_url": "https://unused.invalid/v1"},
+        });
+        config[TASK_ROLE_MARKER] = serde_json::json!("worker");
+        executors::mark_worktree_read_only(&mut config);
+        let outcome = executor
+            .execute(ExecutionContext {
+                task_id: "10000000-0000-4000-8000-000000000005".into(),
+                execution_id: "10000000-0000-4000-8000-000000000006".into(),
+                worktree_path: worktree.path().to_string_lossy().into_owned(),
+                description: "review".into(),
+                agent_config: config,
+                logs_path: logs.path().to_string_lossy().into_owned(),
+                heartbeat_interval_seconds: 30,
+                max_turns: None,
+                log_sender: None,
+            })
+            .await;
+        assert!(
+            matches!(outcome, Err(ExecutorError::Other(ref message))
+            if message.contains("runtime failed:") && message.contains("protected state nonce is invalid")),
+            "{outcome:?}"
+        );
+        assert!(provider.requests().is_empty());
+        assert!(executor.active.read().await.is_empty());
     }
 
     #[test]

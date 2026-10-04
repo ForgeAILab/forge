@@ -294,7 +294,11 @@ test('dragging a task with a running execution cancels it without error toast', 
     await assertNoErrorToast(page)
   } finally {
     for (const taskId of createdTaskIds.reverse()) {
-      await request.post(`/api/v1/tasks/${taskId}/cancel`, { failOnStatusCode: false })
+      await request.get(`/api/v1/tasks/${taskId}/actions`).then(async (response) => {
+      const current = await response.json()
+      const offer = current.available_actions?.find((item: { action: { verb: string } }) => item.action.verb === 'cancel')
+      if (offer) await request.post(`/api/v1/tasks/${taskId}/actions`, { data: { action: offer.action, version: current.version }, failOnStatusCode: false })
+    })
       await waitForNoRunningExecutions(request, taskId, 30000).catch(() => undefined)
       await request.delete(`/api/v1/tasks/${taskId}`, { failOnStatusCode: false })
     }

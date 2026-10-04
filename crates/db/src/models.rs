@@ -1,9 +1,7 @@
 use std::{fmt, str::FromStr};
 
 use crate::pagination::PageRequest;
-use crate::repository::{
-    AdmitAgentChatTurn, CompleteDomainEvent, CreateAgentActionExecution, CreateCommandReceipt,
-};
+use crate::repository::{AdmitAgentChatTurn, CreateAgentActionExecution, CreateCommandReceipt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqliteRow, Row};
@@ -22,10 +20,11 @@ pub struct Project {
     pub workflow_template_name: Option<String>,
     pub primary_repo_id: Option<String>,
     pub paused_at: Option<String>,
-    /// Set only alongside `paused_at` by the Task dispatcher's own
-    /// auto-pause (`"missing_repository"`, `"invalid_repository"`, or `"repository_not_ready"`); `None` for a user's
-    /// own pause. See migration V128.
+    /// Set alongside `paused_at` for a repository or environment auto-pause;
+    /// `None` for a user's own pause. See migrations V128 and V202610010410.
     pub system_pause_reason: Option<String>,
+    /// Durable detail and schedule for an environment-owned Project pause.
+    pub environment_pause_json: Option<String>,
     pub owner_id: Option<String>,
     pub project_hooks_json: String,
     pub project_work_epoch: i64,
@@ -41,6 +40,24 @@ pub struct Project {
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Project response inputs and the display revision from the same SELECT.
+#[derive(Debug, Clone)]
+pub struct ProjectSlotRead {
+    pub project: Project,
+    pub list_revision: i64,
+}
+
+/// Counts and revision fences read together by the batched slot statement.
+#[derive(Debug)]
+pub struct ProjectSlotCounts {
+    pub project_id: String,
+    pub project_version: i64,
+    pub list_revision: i64,
+    pub active: i64,
+    pub parked: i64,
+    pub queued: i64,
 }
 
 /// Durable, retryable work that reconciles a Project's repository and
@@ -403,7 +420,6 @@ pub struct Repo {
     pub name: String,
     pub remote_url: Option<String>,
     pub local_path: Option<String>,
-    pub work_mode: WorkMode,
     pub default_branch: String,
     pub created_at: String,
     pub updated_at: String,
@@ -414,35 +430,40 @@ pub fn normalize_repo_remote_url(remote_url: Option<String>) -> Option<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkMode {
-    DirectMerge,
-    PullRequest,
+pub enum RepoLocationOwnerKind {
+    Server,
+    Daemon,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrProviderConfig {
+pub enum RepoLocationKind {
+    PrimaryCheckout,
+    ManagedClone,
+    SharedMount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoLocationStatus {
+    Unverified,
+    Ready,
+    Unavailable,
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoLocation {
     pub id: String,
     pub repo_id: String,
-    pub provider_type: String,
-    pub base_url: Option<String>,
-    pub polling_interval_seconds: i64,
-    pub token_secret_ref: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrMetadata {
-    pub id: String,
-    pub task_id: String,
-    pub provider_type: String,
-    pub provider_pr_id: Option<String>,
-    pub pr_url: Option<String>,
-    pub source_branch: String,
-    pub target_branch: String,
-    pub pr_state: String,
-    pub merge_status: String,
-    pub last_synced_at: Option<String>,
+    pub owner_kind: RepoLocationOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub path: String,
+    pub kind: RepoLocationKind,
+    pub is_default: bool,
+    pub status: RepoLocationStatus,
+    pub last_verified_at: Option<String>,
+    pub last_error: Option<String>,
+    pub version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -817,12 +838,10 @@ pub struct CreateAgentWakeDisposition {
     pub updated_at: String,
 }
 
-/// Atomically persists the first disposition for a claimed event, its
-/// current-pointer row, and the event projection receipt/cursor checkpoint.
+/// Transaction-owned first wake disposition, current pointer and optional admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteClaimedWake {
+pub struct PersistAgentWake {
     pub disposition: CreateAgentWakeDisposition,
-    pub completion: CompleteDomainEvent,
     /// Required for `turn_admitted`.  The DB inserts/replays this message and
     /// turn inside the same transaction as the disposition and source-event
     /// checkpoint, closing the crash seam between admission and delivery.
@@ -988,37 +1007,6 @@ pub struct AttentionListQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AttentionConsumerHealth {
-    pub consumer_name: String,
-    pub last_sequence: i64,
-    pub last_started_at: Option<String>,
-    pub last_success_at: Option<String>,
-    pub last_error_at: Option<String>,
-    pub last_error_code: Option<String>,
-    pub last_error_message: Option<String>,
-    pub lease_owner: Option<String>,
-    pub lease_until: Option<String>,
-    pub processed_events: i64,
-    pub version: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpsertAttentionConsumerHealth {
-    pub consumer_name: String,
-    pub last_sequence: i64,
-    pub last_started_at: Option<String>,
-    pub last_success_at: Option<String>,
-    pub last_error_at: Option<String>,
-    pub last_error_code: Option<String>,
-    pub last_error_message: Option<String>,
-    pub lease_owner: Option<String>,
-    pub lease_until: Option<String>,
-    pub processed_events_delta: i64,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventConsumerCursor {
     pub consumer_name: String,
     pub last_sequence: i64,
@@ -1039,14 +1027,24 @@ pub struct Workspace {
     pub id: String,
     pub task_id: String,
     pub repo_id: String,
-    pub worktree_path: String,
+    pub(crate) worktree_path: String,
     pub branch: String,
     pub status: WorkspaceStatus,
     pub before_sha: Option<String>,
     pub cleanup_after: Option<String>,
+    pub cleanup_attempts: i64,
+    pub last_cleanup_error: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Workspace {
+    /// Backend-only access to the legacy server path. Consumers must resolve
+    /// the placement through `WorkspaceBackendRouter` instead.
+    pub fn embedded_worktree_path_for_backend(&self) -> &str {
+        &self.worktree_path
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1056,6 +1054,66 @@ pub enum WorkspaceStatus {
     Error,
     Cleaning,
     Cleaned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementOwnerKind {
+    Server,
+    Daemon,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementState {
+    Reserved,
+    Preparing,
+    Ready,
+    Disconnected,
+    Cleaning,
+    Cleaned,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementSelectedBy {
+    Scheduler,
+    Pin,
+    Inherited,
+    Backfill,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlacementFailureCause {
+    PlacementUnavailable,
+    PrepareFailed,
+    OwnerDisconnected,
+    OwnerDisconnectedTimeout,
+    OwnerLostExecution,
+    StaleGeneration,
+    WrongOwner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePlacement {
+    pub id: String,
+    pub workspace_id: String,
+    pub task_id: String,
+    pub agent_id: Option<String>,
+    pub owner_kind: PlacementOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub repo_location_id: String,
+    pub execution_daemon_id: Option<String>,
+    pub workspace_handle: Option<String>,
+    pub generation: i64,
+    pub state: PlacementState,
+    pub selected_by: PlacementSelectedBy,
+    pub selection_reason: String,
+    pub reserved_until: Option<String>,
+    pub disconnected_at: Option<String>,
+    pub failure_cause: Option<PlacementFailureCause>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Scheduler-issued authority for one assigned Task/repository operation.
@@ -1094,6 +1152,8 @@ pub struct WorkspaceLease {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Daemon {
+    pub run_limit: Option<u32>,
+    pub max_concurrent_runs: Option<i64>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -1225,6 +1285,7 @@ pub struct MoveTaskIdentity {
 
 #[derive(Debug, Clone)]
 pub struct CompareAndMoveTask {
+    pub cascade_step: Option<crate::EnqueueTaskStep>,
     pub operation_id: String,
     pub project_id: String,
     pub task_id: String,
@@ -1518,12 +1579,37 @@ pub struct AgentChatTurnJob {
     pub response_message_id: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub failure_class: Option<api_types::TurnFailure>,
+    pub retry_decision: Option<api_types::TurnRetryDecision>,
+    pub pre_provider_failure_count: i64,
+    pub invocation_count: i64,
+    pub usage_limit_deferral_count: i64,
+    pub usage_limit_first_deferred_at: Option<String>,
+    /// Derived from later turns for this message or any later chat message.
+    /// Computed only for failed or cancelled turns, the ones `retry_action`
+    /// consults; `false` for every other status.
+    pub retry_superseded: bool,
     pub correlation_id: String,
     pub causation_id: Option<String>,
     pub causation_depth: i64,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl AgentChatTurnJob {
+    pub fn retry_action(&self) -> Option<api_types::RetryTurnAction> {
+        (matches!(
+            self.status,
+            AgentChatTurnState::Failed | AgentChatTurnState::Cancelled
+        ) && !self.retry_superseded)
+            .then(|| api_types::RetryTurnAction {
+                kind: api_types::RetryTurnActionKind::RetryTurn,
+                chat_id: self.chat_id.clone(),
+                turn_id: self.id.clone(),
+                expected_version: self.version,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1941,12 +2027,21 @@ pub struct UsageLedgerSettlement {
     pub events: Vec<CreateUsageEvent>,
 }
 
+/// Private artifact content committed only by the winning terminal CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportedExecutionPlan {
+    pub content: Option<String>,
+    pub error: Option<String>,
+    pub size: Option<i64>,
+}
+
 /// Composite terminalization input for Task execution. The optional receipt
 /// identity is used by remote daemon delivery: it is persisted in the
 /// terminal domain event and lets a post-restart duplicate be acknowledged
 /// without mutating the execution or appending usage a second time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalizeExecutionWithLedger {
+    pub plan: Option<TransportedExecutionPlan>,
     pub terminal: TerminalizeExecution,
     pub settlements: Vec<UsageLedgerSettlement>,
     pub terminal_report_id: Option<String>,
@@ -2417,9 +2512,54 @@ macro_rules! enum_strings {
     };
 }
 
-enum_strings!(WorkMode {
-    DirectMerge => "direct_merge",
-    PullRequest => "pull_request",
+enum_strings!(RepoLocationOwnerKind {
+    Server => "server",
+    Daemon => "daemon",
+});
+
+enum_strings!(RepoLocationKind {
+    PrimaryCheckout => "primary_checkout",
+    ManagedClone => "managed_clone",
+    SharedMount => "shared_mount",
+});
+
+enum_strings!(RepoLocationStatus {
+    Unverified => "unverified",
+    Ready => "ready",
+    Unavailable => "unavailable",
+    Invalid => "invalid",
+});
+
+enum_strings!(PlacementOwnerKind {
+    Server => "server",
+    Daemon => "daemon",
+});
+
+enum_strings!(PlacementState {
+    Reserved => "reserved",
+    Preparing => "preparing",
+    Ready => "ready",
+    Disconnected => "disconnected",
+    Cleaning => "cleaning",
+    Cleaned => "cleaned",
+    Failed => "failed",
+});
+
+enum_strings!(PlacementSelectedBy {
+    Scheduler => "scheduler",
+    Pin => "pin",
+    Inherited => "inherited",
+    Backfill => "backfill",
+});
+
+enum_strings!(PlacementFailureCause {
+    PlacementUnavailable => "placement_unavailable",
+    PrepareFailed => "prepare_failed",
+    OwnerDisconnected => "owner_disconnected",
+    OwnerDisconnectedTimeout => "owner_disconnected_timeout",
+    OwnerLostExecution => "owner_lost_execution",
+    StaleGeneration => "stale_generation",
+    WrongOwner => "wrong_owner",
 });
 
 enum_strings!(IntegrationPlatform {
@@ -4846,4 +4986,36 @@ pub struct CreateCostEstimateRevision {
     pub reason_code: Option<CostCoverageReasonCode>,
     pub estimate_digest: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainEventConsumerLag {
+    pub consumer_name: String,
+    pub last_sequence: i64,
+    pub lag: i64,
+    pub last_advanced_at: Option<String>,
+    pub oldest_unprocessed_at: Option<String>,
+    pub initialized_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteStorageStatus {
+    pub incremental_vacuum: bool,
+    pub free_pages: i64,
+}
+
+impl DomainEventConsumerLag {
+    pub fn stalled(&self, now: chrono::DateTime<chrono::Utc>, seconds: i64) -> bool {
+        let old = |date: &str| {
+            chrono::DateTime::parse_from_rfc3339(date)
+                .ok()
+                .is_some_and(|date| {
+                    (now - date.with_timezone(&chrono::Utc)).num_seconds() > seconds
+                })
+        };
+        self.lag > 0
+            && self.oldest_unprocessed_at.as_deref().is_some_and(old)
+            && self.last_advanced_at.as_deref().is_none_or(old)
+            && self.initialized_at.as_deref().is_none_or(old)
+    }
 }

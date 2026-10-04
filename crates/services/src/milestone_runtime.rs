@@ -4734,7 +4734,6 @@ mod tests {
                     name: "Local Repo".to_owned(),
                     remote_url: remote_url.map(str::to_owned),
                     local_path: Some("/tmp/local-repo".to_owned()),
-                    work_mode: db::WorkMode::DirectMerge,
                     default_branch: "main".to_owned(),
                     created_at: now.to_owned(),
                     updated_at: now.to_owned(),
@@ -4794,6 +4793,80 @@ mod tests {
                 assert!(validate_repository_context_reference(&incomplete).is_err());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn repository_context_digest_includes_stored_repository_kind() {
+        let pool = create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let observed_at = "2026-09-30T10:11:12Z";
+        sqlx::query(
+            "INSERT INTO project
+             (id, name, settings, workflow_definition, primary_repo_id, created_at, updated_at)
+             VALUES ('project-digest', 'Digest Project', '{}', '{}', NULL, ?, ?)",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.pool())
+        .await
+        .expect("project inserts");
+        sqlx::query(
+            "INSERT INTO repo
+             (id, project_id, name, remote_url, work_mode, default_branch, created_at, updated_at)
+             VALUES ('repo-digest', 'project-digest', 'Digest Repo',
+                     'https://example.test/digest.git', 'pull_request', 'release', ?, ?)",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.pool())
+        .await
+        .expect("repository inserts");
+        sqlx::query(
+            "UPDATE project SET primary_repo_id = 'repo-digest' WHERE id = 'project-digest'",
+        )
+        .execute(db.pool())
+        .await
+        .expect("primary repository selects");
+        sqlx::query(
+            "INSERT INTO task
+             (id, project_id, title, task_type, status, created_at, updated_at)
+             VALUES ('task-digest', 'project-digest', 'Digest Task', 'task', 'done', ?, ?)",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.pool())
+        .await
+        .expect("task inserts");
+
+        let runtime = MilestoneRuntime::new(Arc::clone(&db));
+        let mut tx = db.pool().begin().await.expect("transaction begins");
+        let contexts = runtime
+            .commit_build_check_context_in_tx(
+                &mut tx,
+                "project-digest",
+                &[ReadinessTaskState {
+                    task_id: "task-digest".to_owned(),
+                    version: 3,
+                    task_type: "task".to_owned(),
+                    state: "done".to_owned(),
+                    observed_at: observed_at.to_owned(),
+                }],
+            )
+            .await
+            .expect("repository context builds");
+        tx.rollback().await.expect("transaction rolls back");
+
+        let reference: RepositoryContextReference =
+            serde_json::from_str(&contexts[0]).expect("repository context decodes");
+        assert_eq!(reference.repository_kind, "pull_request");
+        assert_eq!(
+            canonical_digest_with_schema(MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION, &reference)
+                .expect("release reference digest computes"),
+            "58b2fd11c4b612dda1dd63aca95a472fffc117d212c79cc95e0612aaaa587f47"
+        );
     }
 
     #[tokio::test]

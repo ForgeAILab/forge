@@ -20,6 +20,7 @@ pub mod errors;
 pub mod json;
 pub mod middleware;
 mod path_input;
+pub mod project_slots;
 pub mod routes;
 pub mod state;
 
@@ -194,6 +195,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/projects/{id}/pause",
             post(routes::projects::pause_project),
+        )
+        .route(
+            "/api/v1/projects/{id}/environment/recheck",
+            post(routes::projects::recheck_project_environment),
         )
         .route(
             "/api/v1/projects/{id}/resume",
@@ -534,6 +539,20 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(routes::repos::delete_repo),
         )
         .route("/api/v1/repos/{id}/sync", post(routes::repos::sync_repo))
+        .route(
+            "/api/v1/repos/{id}/locations",
+            get(routes::repo_locations::list_locations)
+                .post(routes::repo_locations::register_location),
+        )
+        .route(
+            "/api/v1/repos/{id}/locations/{location_id}",
+            patch(routes::repo_locations::update_location)
+                .delete(routes::repo_locations::remove_location),
+        )
+        .route(
+            "/api/v1/repos/{id}/locations/{location_id}/verify",
+            post(routes::repo_locations::verify_location),
+        )
         .route("/api/v1/fs/list", get(routes::fs::list_entries))
         .route("/api/v1/fs/branches", get(routes::fs::list_branches))
         .route(
@@ -590,42 +609,12 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::tasks::list_dependents),
         )
         .route(
-            "/api/v1/tasks/{id}/cancel",
-            post(routes::tasks::cancel_task),
-        )
-        .route(
             "/api/v1/tasks/{id}/actions",
-            get(routes::tasks::list_task_actions),
-        )
-        .route("/api/v1/tasks/{id}/start", post(routes::tasks::start_task))
-        .route("/api/v1/tasks/{id}/pause", post(routes::tasks::pause_task))
-        .route(
-            "/api/v1/tasks/{id}/resume",
-            post(routes::tasks::resume_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/submit",
-            post(routes::tasks::submit_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/request-changes",
-            post(routes::tasks::request_changes_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/approve",
-            post(routes::tasks::approve_task),
+            get(routes::tasks::list_task_actions).post(routes::tasks::apply_task_action),
         )
         .route(
             "/api/v1/tasks/{id}/archive",
             post(routes::tasks::archive_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/advance",
-            post(routes::tasks::advance_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/recover",
-            post(routes::tasks::recover_task),
         )
         .route(
             "/api/v1/tasks/{id}/duplicate",
@@ -634,14 +623,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/transition",
             post(routes::tasks::transition_task),
-        )
-        .route(
-            "/api/v1/tasks/{id}/gates/{state_name}/approve",
-            post(routes::tasks::approve_gate),
-        )
-        .route(
-            "/api/v1/tasks/{id}/gates/{state_name}/reject",
-            post(routes::tasks::reject_gate),
         )
         .route(
             "/api/v1/tasks/{id}/transitions",
@@ -654,18 +635,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/tasks/{id}/roles/{role_name}",
             put(routes::tasks::assign_task_role).delete(routes::tasks::remove_task_role),
-        )
-        .route(
-            "/api/v1/tasks/{id}/review",
-            post(routes::tasks::trigger_review),
-        )
-        .route(
-            "/api/v1/tasks/{id}/review/approve",
-            post(routes::tasks::approve_review),
-        )
-        .route(
-            "/api/v1/tasks/{id}/review/reject",
-            post(routes::tasks::reject_review),
         )
         .route(
             "/api/v1/tasks/{id}/reviews",
@@ -752,6 +721,9 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/operations/status",
             get(routes::operations::get_operations_status),
         )
+        .route("/api/v1/operations/dead-letters", get(routes::operations::list_dead_letters))
+        .route("/api/v1/operations/dead-letters/{id}/replay", post(routes::operations::replay_dead_letter))
+        .route("/api/v1/operations/dead-letters/{id}/dismiss", post(routes::operations::dismiss_dead_letter))
         .route(
             "/api/v1/operations/refresh",
             post(routes::operations::refresh_operations),
@@ -1034,7 +1006,7 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/daemons/register",
             post(routes::daemons::register_daemon),
         )
-        .route("/api/v1/daemons/{id}", get(routes::daemons::get_daemon))
+        .route("/api/v1/daemons/{id}", get(routes::daemons::get_daemon).patch(routes::daemons::update_daemon))
         .route(
             "/api/v1/daemons/{id}/connect",
             get(routes::daemons::connect_daemon),
@@ -1052,6 +1024,10 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::executions::get_execution),
         )
         .route(
+            "/api/v1/executions/{id}/stop",
+            post(routes::executions::stop_execution),
+        )
+        .route(
             "/api/v1/executions/{id}/logs",
             get(routes::executions::get_logs),
         )
@@ -1062,14 +1038,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/executions/{id}/follow-up",
             post(routes::executions::follow_up_execution),
-        )
-        .route(
-            "/api/v1/executions/{id}/re-execute",
-            post(routes::executions::re_execute_execution),
-        )
-        .route(
-            "/api/v1/executions/{id}/cancel",
-            post(routes::executions::cancel_execution),
         )
         .route(
             "/api/v1/executions/{id}/usage",

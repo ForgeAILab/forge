@@ -13,15 +13,30 @@ use crate::{workflow::dispatch::AgentDispatchContext, Result, ServiceError};
 
 const REVIEW_FEEDBACK_LIMIT: usize = 12_000;
 
+pub struct DispatchContextParams<'a> {
+    pub db: Arc<db::SqliteDb>,
+    pub router: &'a crate::workspace_backend::WorkspaceBackendRouter,
+    pub task_id: &'a str,
+    pub role: &'a str,
+    pub state_name: &'a str,
+    pub state_config: Value,
+    pub execution_policy: Option<&'a str>,
+    pub workflow: &'a WorkflowDefinition,
+}
+
 pub async fn load_agent_dispatch_context(
-    db: Arc<db::SqliteDb>,
-    task_id: &str,
-    role: &str,
-    state_name: &str,
-    state_config: Value,
-    execution_policy: Option<&str>,
-    workflow: &WorkflowDefinition,
+    params: DispatchContextParams<'_>,
 ) -> Result<AgentDispatchContext> {
+    let DispatchContextParams {
+        db,
+        router,
+        task_id,
+        role,
+        state_name,
+        state_config,
+        execution_policy,
+        workflow,
+    } = params;
     let task = TaskRepo::get_by_id(&*db, task_id, false)
         .await?
         .ok_or_else(|| ServiceError::not_found("task", task_id.to_string()))?;
@@ -65,15 +80,21 @@ pub async fn load_agent_dispatch_context(
     ) {
         let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(task_id);
         match WorkspaceRepo::get_by_task_id(&*db, workspace_task_id).await? {
-            Some(workspace) => crate::plan_artifact::read_canonical_plan_text(
-                std::path::Path::new(&workspace.worktree_path),
-            )
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "canonical plan artifact is unreadable: {error}"
-                ))
-            })?
-            .or_else(|| task.plan.clone()),
+            Some(workspace) => {
+                match crate::plan_artifact::read_plan_text_with_router(&db, router, &workspace.id)
+                    .await
+                {
+                    Ok(plan) => plan.or_else(|| task.plan.clone()),
+                    // Admission owns owner/protocol refusals. Its hard filters or
+                    // workspace preconditions must report these structurally.
+                    Err(error) if error.needs_placement_check() => task.plan.clone(),
+                    Err(error) => {
+                        return Err(
+                            error.into_service_error("canonical plan artifact is unreadable")
+                        )
+                    }
+                }
+            }
             None => task.plan.clone(),
         }
     } else {

@@ -33,11 +33,39 @@ pub async fn update_settings(
 
     validate_update(&request)?;
 
+    static SETTINGS_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = SETTINGS_WRITE_LOCK.lock().await;
+    let cap_update = request
+        .server
+        .as_ref()
+        .and_then(|server| server.max_concurrent_runs);
+    let jobs_update = request
+        .server
+        .as_ref()
+        .and_then(|server| server.build_jobs_per_run);
+    let nice_update = request.server.as_ref().and_then(|server| server.run_nice);
+    let budget_update = request
+        .server
+        .as_ref()
+        .and_then(|server| server.usage_index_budget_mb);
     let path = state.config_path.as_path();
     let mut config = read_yaml_config(path).await?;
     apply_update(&mut config, request)?;
     write_yaml_config(path, &config).await?;
+    if let Some(budget) = budget_update {
+        state.usage_ledger_index.set_budget_mb(budget);
+    }
+    if let Some(cap) = cap_update {
+        state.db.server_run_cap.set(
+            cap,
+            config::resolved_run_cap(cap),
+            &config::embedded_machine_id(),
+        );
+    }
 
+    state
+        .run_process_policy
+        .update(cap_update, jobs_update, nice_update);
     Ok(Json(settings_response(&state).await?))
 }
 
@@ -46,7 +74,52 @@ async fn settings_response(state: &AppState) -> ApiResult<SettingsResponse> {
     let pending_config = load_pending_config(path)?;
     let effective_config = state.effective_config.as_ref();
 
+    let mut transaction = state
+        .db
+        .pool()
+        .begin()
+        .await
+        .map_err(db::DbError::from)
+        .map_err(services::ServiceError::from)?;
+    let machine_cap =
+        services::placement::capacity::server_machine_cap(&state.db, &mut transaction).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(db::DbError::from)
+        .map_err(services::ServiceError::from)?;
+    let budget = state.run_process_policy.get();
     let settings = vec![
+        ForgeSettingResponse {
+            key: "server.logical_cores".into(),
+            value: serde_json::json!(config::logical_cores()),
+            effective_value: serde_json::json!(config::logical_cores()),
+            restart_required: false,
+        },
+        ForgeSettingResponse {
+            key: "server.build_jobs_per_run".into(),
+            value: serde_json::json!(budget.build_jobs_per_run),
+            effective_value: serde_json::json!(budget.build_jobs()),
+            restart_required: false,
+        },
+        ForgeSettingResponse {
+            key: "server.run_nice".into(),
+            value: serde_json::json!(budget.run_nice),
+            effective_value: serde_json::json!(budget.run_nice),
+            restart_required: false,
+        },
+        ForgeSettingResponse {
+            key: "server.usage_index_budget_mb".to_owned(),
+            value: serde_json::json!(state.usage_ledger_index.configured_budget_mb()),
+            effective_value: serde_json::json!(state.usage_ledger_index.budget_mb()),
+            restart_required: false,
+        },
+        ForgeSettingResponse {
+            key: "server.max_concurrent_runs".to_owned(),
+            value: serde_json::json!(state.db.server_run_cap.configured()),
+            effective_value: serde_json::json!(machine_cap),
+            restart_required: false,
+        },
         setting(
             "forge.data_dir",
             &effective_config.forge.data_dir.display().to_string(),
@@ -122,10 +195,14 @@ fn has_updates(request: &UpdateSettingsRequest) -> bool {
         .forge
         .as_ref()
         .is_some_and(|forge| forge.data_dir.is_some())
-        || request
-            .server
-            .as_ref()
-            .is_some_and(|server| server.bind.is_some() || server.mcp_enabled.is_some())
+        || request.server.as_ref().is_some_and(|server| {
+            server.bind.is_some()
+                || server.mcp_enabled.is_some()
+                || server.max_concurrent_runs.is_some()
+                || server.build_jobs_per_run.is_some()
+                || server.run_nice.is_some()
+                || server.usage_index_budget_mb.is_some()
+        })
         || request.workspace.as_ref().is_some_and(|workspace| {
             workspace.root.is_some() || workspace.cleanup_delay_seconds.is_some()
         })
@@ -161,6 +238,11 @@ fn validate_forge(forge: &UpdateForgePathsRequest) -> ApiResult<()> {
 }
 
 fn validate_server(server: &UpdateServerSettingsRequest) -> ApiResult<()> {
+    if server.run_nice.is_some_and(|nice| nice > 19) {
+        return Err(ApiError::bad_request(
+            "server.run_nice must be between 0 and 19",
+        ));
+    }
     if let Some(bind) = &server.bind {
         validate_non_empty("server.bind", bind)?;
     }
@@ -214,6 +296,30 @@ fn apply_update(config: &mut Value, request: UpdateSettingsRequest) -> ApiResult
         }
     }
     if let Some(server) = request.server {
+        if let Some(jobs) = server.build_jobs_per_run {
+            set_path(
+                config,
+                &["server", "build_jobs_per_run"],
+                yaml_number(jobs)?,
+            )?;
+        }
+        if let Some(nice) = server.run_nice {
+            set_path(config, &["server", "run_nice"], yaml_number(nice)?)?;
+        }
+        if let Some(budget) = server.usage_index_budget_mb {
+            set_path(
+                config,
+                &["server", "usage_index_budget_mb"],
+                yaml_number(budget)?,
+            )?;
+        }
+        if let Some(cap) = server.max_concurrent_runs {
+            set_path(
+                config,
+                &["server", "max_concurrent_runs"],
+                yaml_number(cap)?,
+            )?;
+        }
         if let Some(bind) = server.bind {
             set_path(config, &["server", "bind"], Value::String(bind))?;
         }

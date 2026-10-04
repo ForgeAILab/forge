@@ -44,7 +44,6 @@ pub(super) async fn seed_project_repo(db: &SqliteDb) -> (String, String, TempDir
             name: "forge".to_owned(),
             remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -109,6 +108,7 @@ pub(super) async fn seed_agent(db: &SqliteDb) -> String {
     DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -129,6 +129,7 @@ pub(super) async fn seed_agent(db: &SqliteDb) -> String {
     DaemonRepo::update_report(
         db,
         db::UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
             labels_json: None,
@@ -369,11 +370,6 @@ pub(super) async fn set_retry_exhausted_metadata(db: &SqliteDb, task: &Task) -> 
         artifact: None,
         message: Some("review retry budget exhausted".to_owned()),
         hook: None,
-        recovery_actions: vec![
-            api_types::RecoveryAction::ResetRetryWindow,
-            api_types::RecoveryAction::ProceedOnce,
-            api_types::RecoveryAction::CancelTask,
-        ],
     });
     TaskRepo::update(
         db,
@@ -404,4 +400,85 @@ pub(super) async fn set_retry_exhausted_metadata(db: &SqliteDb, task: &Task) -> 
     )
     .await
     .expect("retry-exhausted metadata sets")
+}
+
+pub(super) fn action_with_operator_inputs(offer: &api_types::Offer) -> api_types::TaskAction {
+    let mut action = offer.action.clone();
+    match &mut action {
+        api_types::TaskAction::Approve { reason, .. }
+        | api_types::TaskAction::Cancel { reason }
+        | api_types::TaskAction::Retry { reason, .. } => {
+            *reason = Some("Operator fixture audit reason".to_owned())
+        }
+        api_types::TaskAction::SendBack { guidance } => {
+            *guidance = "Operator fixture requested changes".to_owned()
+        }
+        _ => {}
+    }
+    action
+}
+
+#[tokio::test]
+async fn machine_capacity_automatic_review_recovery_waits_without_blocking() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, _, repo) = seed_project_repo(&db).await;
+    initialize_primary_repository(&repo);
+    let agent_id = seed_agent(&db).await;
+    sqlx::query("UPDATE daemon SET machine_id = ?, detected_clis_json = '[{\"kind\":\"shell\",\"availability\":\"authenticated\"}]'")
+        .bind(::config::embedded_machine_id()).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 10 WHERE id = ?")
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let busy = seed_task_with_status(&db, &project_id, "in_progress").await;
+    seed_execution(
+        &db,
+        &busy.id,
+        Some(&agent_id),
+        "coder",
+        ExecutionStatus::Running,
+        None,
+        &now_rfc3339(),
+    )
+    .await;
+    let waiting = seed_task_with_status(&db, &project_id, "review").await;
+    seed_role_assignment(&db, &waiting.id, "coder", Some(&agent_id)).await;
+    crate::test_support::configure_project_execution_test_setup(
+        &db,
+        &project_id,
+        &agent_id,
+        &agent_id,
+    )
+    .await;
+    sqlx::query("UPDATE project SET settings = json_set(settings, '$.automatic_recovery', json_object('enabled', json('true'), 'agent_id', ?, 'max_attempts', 1)) WHERE id = ?")
+        .bind(&agent_id).bind(&project_id).execute(db.pool()).await.unwrap();
+    db.server_run_cap
+        .set(Some(1), 1, &::config::embedded_machine_id());
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::default()));
+    let result = service
+        .try_dispatch_automatic_review_recovery(
+            &project,
+            &waiting,
+            Some("review-attempt"),
+            2,
+            3,
+            "review failure",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.0.status, waiting.status);
+    assert!(result.0.error_annotation.is_none());
+    assert!(result.0.blocked_json.is_none());
+    assert_eq!(
+        crate::deferred_dispatch::current_dispatch_disposition(&result.0)
+            .unwrap()
+            .capability,
+        "machine_capacity"
+    );
 }

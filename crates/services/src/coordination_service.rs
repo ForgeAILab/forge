@@ -288,19 +288,6 @@ impl CommitmentService {
         .await
     }
 
-    pub async fn add_evidence(
-        &self,
-        input: CommitmentEvidenceInput,
-    ) -> Result<AgentCommitmentEvidence> {
-        validate_evidence(&input)?;
-        db::AgentCommitmentRepo::add_commitment_evidence(
-            &*self.db,
-            to_db_evidence(input, now_rfc3339()),
-        )
-        .await
-        .map_err(Into::into)
-    }
-
     pub async fn evidence(&self, commitment_id: &str) -> Result<Vec<AgentCommitmentEvidence>> {
         db::AgentCommitmentRepo::list_commitment_evidence(&*self.db, commitment_id)
             .await
@@ -889,7 +876,7 @@ fn validate_scope(scope_type: &str, scope_id: &str) -> Result<()> {
     required_text("scope id", scope_id).map(|_| ())
 }
 
-fn validate_commitment_transition(
+pub(crate) fn validate_commitment_transition(
     from: &AgentCommitmentStatus,
     to: &AgentCommitmentStatus,
     reason: Option<&str>,
@@ -1670,7 +1657,7 @@ mod tests {
         CreateAgentProfile, CreateProject, CreateProjectAgentBinding, ProjectAgentBindingRepo,
         ProjectRepo, ReplaceProjectAgentBinding,
     };
-    use forge_agent_host::TASK_RECOVER_OPERATION;
+    use forge_agent_host::TASK_ACTION_OPERATION;
     use forge_agent_host::{
         MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS, PROJECT_DECISION_OPERATION,
         PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
@@ -2460,7 +2447,7 @@ mod tests {
     #[test]
     fn a_direct_command_is_refused_under_the_wrong_permission() {
         assert!(!is_admitted_direct_command(
-            TASK_RECOVER_OPERATION,
+            TASK_ACTION_OPERATION,
             "read_project",
             None
         ));

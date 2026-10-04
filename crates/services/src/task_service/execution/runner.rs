@@ -1,4 +1,5 @@
 use super::*;
+use crate::workspace_backend::ResolvedWorkspace;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -192,6 +193,27 @@ async fn embedded_execution_heartbeat_with_clock(
 }
 
 impl TaskService {
+    /// Freeze the candidate pricing selections exactly as `start_execution`
+    /// does before it sends `execution.start`, for fixtures outside this crate
+    /// that drive a daemon runtime directly instead of through dispatch.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn admit_execution_for_test(&self, execution_id: &str) -> Result<bool> {
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
+        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        let snapshot = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("execution missing executor config snapshot")
+            })?;
+        let snapshot = parse_json_value("executor config snapshot", snapshot)?;
+        super::ledger::ensure_task_execution_admission(&self.db, &task, &execution, &snapshot).await
+    }
+
     pub async fn start_execution(
         &self,
         execution_id: impl Into<String>,
@@ -228,17 +250,31 @@ impl TaskService {
         }
 
         let result = async {
-            let agent = match execution.agent_id.as_deref() {
-                Some(agent_id) => Some(
-                    AgentRepo::get_by_id(&*self.db, agent_id)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?,
-                ),
-                None => None,
-            };
-            let provider = self
-                .execution_provider_for_agent(agent.as_ref(), &execution.id)
-                .await?;
+            let provider = self.execution_provider_for_execution(&execution).await?;
+            if provider.execution_lease_owner().is_some() {
+                let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+                let workspace_id = execution
+                    .workspace_id
+                    .as_deref()
+                    .ok_or_else(|| ServiceError::invalid_operation("execution has no workspace"))?;
+                let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("workspace", workspace_id))?;
+                let resolved = self.resolve_task_workspace(&workspace).await?;
+                let mut config = json!({});
+                if self
+                    .prepare_execution_environment(&task, &execution, &resolved, &mut config)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(api_types::ExecutionStartResult {
+                        execution_id: execution.id.clone(),
+                        accepted: false,
+                    });
+                }
+            }
             let params = self.execution_start_params(&execution).await?;
             // Remote daemon execution has no in-process executor hook, so
             // freeze the complete candidate pricing selection before sending
@@ -312,7 +348,17 @@ impl TaskService {
 
                 let plan_writing_role =
                     executors::task_role_can_write_plan(Some(execution.role.as_str()));
-                if plan_writing_role {
+                let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation("execution missing workspace_id")
+                })?;
+                let placement =
+                    db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, workspace_id)
+                        .await?;
+                if plan_writing_role
+                    && placement.as_ref().is_none_or(|placement| {
+                        placement.owner_kind == db::PlacementOwnerKind::Server
+                    })
+                {
                     let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
                         .await?
                         .ok_or_else(|| {
@@ -321,7 +367,7 @@ impl TaskService {
                     crate::plan_artifact::prepare_execution_plan_outbox(
                         std::path::Path::new(&params.workspace_path),
                         &execution.id,
-                        matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                        &execution.role,
                         task.plan.as_deref(),
                     )
                     .map_err(|error| {
@@ -338,15 +384,27 @@ impl TaskService {
         match result {
             Ok(result) => Ok(result),
             Err(error) => {
-                if let Some(workspace_id) = execution.workspace_id.as_deref() {
-                    if let Ok(Some(workspace)) =
-                        WorkspaceRepo::get_by_id(&*self.db, workspace_id).await
-                    {
-                        if let Some(outbox) = executors::execution_outbox_path(
-                            std::path::Path::new(&workspace.worktree_path),
-                            &execution.id,
-                        ) {
-                            let _ = std::fs::remove_dir_all(outbox);
+                if matches!(
+                    &error,
+                    ServiceError::DaemonUnavailable { .. } | ServiceError::DaemonTimeout { .. }
+                ) {
+                    if let Some(workspace_id) = execution.workspace_id.as_deref() {
+                        if let Some(placement) =
+                            db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, workspace_id)
+                                .await?
+                                .filter(|placement| {
+                                    placement.owner_kind == db::PlacementOwnerKind::Daemon
+                                })
+                        {
+                            if let Some(daemon_id) = placement.daemon_id.as_deref() {
+                                crate::recovery::disconnect_daemon_placements(
+                                    &self.db,
+                                    &self.event_bus,
+                                    daemon_id,
+                                )
+                                .await?;
+                                return Err(error);
+                            }
                         }
                     }
                 }
@@ -398,6 +456,9 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let resolved = self.resolve_task_workspace(&workspace).await?;
+        let workspace_path = execution_workspace_path(&resolved)?;
+        let worktree_path = std::path::Path::new(&workspace_path);
         // A Task-row mutation since lease issuance (role handoff, metadata
         // clear, concurrent transition) fails the exact-match verify; recover
         // once through the normal issuance path instead of hard-failing, and
@@ -575,18 +636,18 @@ impl TaskService {
         };
 
         // The workspace lock is held, so asset copies cannot race another
-        // execution in this worktree. A failed check parks the Task before
+        // execution in this worktree. A failed check pauses the Project before
         // any provider call.
-        if let Some(parked) = self
+        if let Some(failed) = self
             .prepare_execution_environment(
                 &task,
                 &execution_before_launch,
-                &workspace.worktree_path,
+                &resolved,
                 &mut agent_config,
             )
             .await?
         {
-            return Ok(parked);
+            return Ok(failed);
         }
 
         // Freeze one pricing selection for every candidate before handing
@@ -612,10 +673,15 @@ impl TaskService {
             &self.db,
             &execution.id,
             &task.id,
-            std::path::Path::new(&workspace.worktree_path),
+            &resolved,
             matches!(execution.role.as_str(), "reviewer" | "auditor"),
             agent_config.get("executor_type").and_then(Value::as_str) == Some("shell"),
-            execution_description(&execution, &task, &agent_config),
+            execution_description(
+                &execution.role,
+                execution.summary.as_deref(),
+                &task,
+                &agent_config,
+            ),
         )
         .await
         {
@@ -703,13 +769,19 @@ impl TaskService {
         // exists.
         if plan_writing_role {
             if let Err(error) = crate::plan_artifact::prepare_execution_plan_outbox(
-                std::path::Path::new(&workspace.worktree_path),
+                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                    &self.db, &workspace,
+                )
+                .await?,
                 &execution_id,
-                matches!(execution.role.as_str(), "worker" | "coder" | "executor"),
+                &execution.role,
                 task.plan.as_deref(),
             ) {
                 if let Some(outbox) = executors::execution_outbox_path(
-                    std::path::Path::new(&workspace.worktree_path),
+                    &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                        &self.db, &workspace,
+                    )
+                    .await?,
                     &execution_id,
                 ) {
                     let _ = std::fs::remove_dir_all(outbox);
@@ -844,7 +916,7 @@ impl TaskService {
         });
 
         let read_only_head = if executors::is_worktree_read_only(&agent_config) {
-            match git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await {
+            match git::get_current_sha(worktree_path).await {
                 Ok(head) => Some(head),
                 Err(error) => {
                     crate::embedded_task_executor::unregister_execution_lease(
@@ -898,7 +970,7 @@ impl TaskService {
         let execution_context = ExecutionContext {
             task_id: task.id.clone(),
             execution_id: execution_id.clone(),
-            worktree_path: workspace.worktree_path.clone(),
+            worktree_path: workspace_path.clone(),
             description,
             agent_config,
             logs_path: logs_path.clone(),
@@ -1032,7 +1104,6 @@ impl TaskService {
         }
         let mut discarded_read_only_changes = false;
         let restore_result = if let Some(head) = read_only_head.as_deref() {
-            let worktree_path = std::path::Path::new(&workspace.worktree_path);
             // Untracked build output is not authored work. A reviewer that runs
             // the test suite necessarily leaves caches behind, and failing that
             // execution punishes the verification the role exists to perform.
@@ -1130,7 +1201,6 @@ impl TaskService {
             if let Some((branch_point, status_before, version_before)) =
                 noop_completion_baseline.as_ref()
             {
-                let worktree_path = std::path::Path::new(&workspace.worktree_path);
                 // Nothing committed on this branch at all, not merely nothing
                 // committed by this pass. Check HEAD first so a successfully
                 // finalized run never invokes another repository status
@@ -1177,7 +1247,14 @@ impl TaskService {
             if execution_outbox_disposition(&current_execution.status, false)
                 == ExecutionOutboxDisposition::Discard
             {
-                discard_execution_outbox_and_plan_stage(&workspace.worktree_path, &execution_id);
+                discard_execution_outbox_and_plan_stage(
+                    &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                        &self.db, &workspace,
+                    )
+                    .await?
+                    .to_string_lossy(),
+                    &execution_id,
+                );
             }
             if current_execution.status == ExecutionStatus::Cancelled {
                 let late_reports = result.usage_reports.clone();
@@ -1361,7 +1438,11 @@ impl TaskService {
                         == ExecutionOutboxDisposition::Discard
                 }) {
                     discard_execution_outbox_and_plan_stage(
-                        &workspace.worktree_path,
+                        &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                            &self.db, &workspace,
+                        )
+                        .await?
+                        .to_string_lossy(),
                         &execution_id,
                     );
                 }
@@ -1402,7 +1483,7 @@ impl TaskService {
                             execution_id: &execution_id,
                             agent_id,
                             role: Some(updated.role.as_str()),
-                            worktree_path: &workspace.worktree_path,
+                            worktree_path: &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(&self.db, &workspace).await?.to_string_lossy(),
                         })
                         .await;
                     if report.worklog_entries > 0 || report.evidence_items > 0 {
@@ -1423,7 +1504,14 @@ impl TaskService {
                 }
             }
             ExecutionOutboxDisposition::Discard => {
-                discard_execution_outbox_and_plan_stage(&workspace.worktree_path, &execution_id);
+                discard_execution_outbox_and_plan_stage(
+                    &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
+                        &self.db, &workspace,
+                    )
+                    .await?
+                    .to_string_lossy(),
+                    &execution_id,
+                );
             }
             ExecutionOutboxDisposition::Preserve => {
                 unreachable!("this runner won terminal settlement")
@@ -1610,12 +1698,89 @@ mod tests {
     use super::*;
     use db::{
         AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateProject, CreateRepo,
-        CreateTask, ExecutionRepo, ProjectRepo, RepoRepo, TaskRepo, WorkMode,
+        CreateTask, ExecutionRepo, ProjectRepo, RepoRepo, TaskRepo,
     };
 
     const T0: &str = "2025-01-01T00:00:00+00:00";
     const T1: &str = "2025-01-01T00:00:01+00:00";
     const T20: &str = "2025-01-01T00:00:20+00:00";
+
+    #[test]
+    fn placement_path_uses_fenced_owner_preparation_result() {
+        let placement = db::WorkspacePlacement {
+            id: "placement".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            task_id: "task".to_owned(),
+            agent_id: None,
+            owner_kind: db::PlacementOwnerKind::Daemon,
+            daemon_id: Some("daemon".to_owned()),
+            runtime_id: Some("runtime".to_owned()),
+            repo_location_id: "location".to_owned(),
+            execution_daemon_id: Some("daemon".to_owned()),
+            workspace_handle: Some("opaque-handle".to_owned()),
+            generation: 3,
+            state: db::PlacementState::Ready,
+            selected_by: db::PlacementSelectedBy::Scheduler,
+            selection_reason: "{}".to_owned(),
+            reserved_until: None,
+            disconnected_at: None,
+            failure_cause: None,
+            version: 4,
+            created_at: T0.to_owned(),
+            updated_at: T0.to_owned(),
+        };
+        let mut state = json!({
+            "workspace_handle": "opaque-handle", "generation": 3,
+            "workspace_path": "/owner/worktrees/task", "base_sha": "base", "branch": "task",
+        });
+        assert_eq!(
+            prepared_owner_execution_path(&placement, &state).unwrap(),
+            "/owner/worktrees/task",
+        );
+        state["generation"] = json!(2);
+        assert!(prepared_owner_execution_path(&placement, &state).is_err());
+        state["generation"] = json!(3);
+        state["workspace_handle"] = json!("another-handle");
+        assert!(prepared_owner_execution_path(&placement, &state).is_err());
+        state["workspace_handle"] = json!("opaque-handle");
+        state["workspace_path"] = json!("");
+        assert!(prepared_owner_execution_path(&placement, &state).is_err());
+    }
+
+    #[test]
+    fn shell_coder_runs_task_command_not_workflow_role_prompt() {
+        let task: Task = serde_json::from_value(json!({
+            "id": "task", "project_id": "project", "parent_task_id": null,
+            "assignee_type": null, "assignee_id": null, "title": "title",
+            "description": "printf ok", "task_type": "task", "status": "in_progress",
+            "is_automation": false, "priority": 0, "board_position": 0.0,
+            "subtask_order": null, "task_state_config": null, "merge_config": null,
+            "metadata_json": null, "plan": null, "error_annotation": null,
+            "blocked_json": null, "failed_json": null, "entry_barrier_json": null,
+            "review_passed_at": null, "archived_at": null, "deleted_at": null,
+            "version": 1, "created_at": T0, "updated_at": T0,
+        }))
+        .unwrap();
+        let role_prompt = Some("Forge role contract (authoritative): ...");
+        assert_eq!(
+            execution_description(
+                "coder",
+                role_prompt,
+                &task,
+                &json!({"executor_type": "shell"})
+            ),
+            "printf ok",
+        );
+        assert_eq!(
+            execution_description(
+                "coder",
+                role_prompt,
+                &task,
+                &json!({"executor_type": "codex"})
+            ),
+            "Forge role contract (authoritative): ...",
+        );
+    }
 
     async fn heartbeat_fixture() -> (
         Arc<db::SqliteDb>,
@@ -1652,7 +1817,6 @@ mod tests {
                 name: "heartbeat-test".to_owned(),
                 remote_url: Some("https://example.invalid/heartbeat.git".to_owned()),
                 local_path: None,
-                work_mode: WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: T0.to_owned(),
                 updated_at: T0.to_owned(),
@@ -1979,22 +2143,29 @@ mod tests {
 }
 
 impl TaskService {
+    /// Apply entries supplied by the owner. Embedded turns harvest them from
+    /// their backend; daemon turns supply the terminal report's entries.
+    pub(crate) async fn ingest_execution_outbox_entries(
+        &self,
+        input: &crate::native_tools::ExecutionOutboxInput<'_>,
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> crate::native_tools::ExecutionOutboxReport {
+        match self.credential_env.as_ref() {
+            Some(embedded) => {
+                embedded
+                    .ingest_execution_outbox_entries(input, entries)
+                    .await
+            }
+            None => crate::native_tools::ExecutionOutboxReport::default(),
+        }
+    }
+
     pub(in crate::task_service) async fn cancel_execution_with_provider(
         &self,
         execution: &Execution,
         reason: &str,
     ) -> Result<()> {
-        let agent = match execution.agent_id.as_deref() {
-            Some(agent_id) => Some(
-                AgentRepo::get_by_id(&*self.db, agent_id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?,
-            ),
-            None => None,
-        };
-        let provider = self
-            .execution_provider_for_agent(agent.as_ref(), &execution.id)
-            .await?;
+        let provider = self.execution_provider_for_execution(execution).await?;
         provider
             .cancel(api_types::ExecutionCancelParams {
                 execution_id: execution.id.clone(),
@@ -2004,12 +2175,57 @@ impl TaskService {
         Ok(())
     }
 
-    async fn execution_provider_for_agent(
+    async fn execution_provider_for_execution(
         &self,
-        agent: Option<&Agent>,
-        execution_id: &str,
+        execution: &Execution,
     ) -> Result<Arc<dyn crate::daemon_transport::ExecutionProvider>> {
-        let daemon_id = agent.and_then(|agent| agent.daemon_id.as_deref());
+        let snapshot = execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .map(|snapshot| parse_json_value("executor config snapshot", snapshot))
+            .transpose()?;
+        let placement = match execution.workspace_id.as_deref() {
+            Some(workspace_id) => Some(
+                db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, workspace_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::not_found("workspace placement", workspace_id.to_owned())
+                    })?,
+            ),
+            None => None,
+        };
+        let fallback_agent = if execution.workspace_id.is_none() {
+            match execution.agent_id.as_deref() {
+                Some(id) => AgentRepo::get_by_id(&*self.db, id).await?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let daemon_id = match placement.as_ref() {
+            Some(placement) => placement
+                .execution_daemon_id
+                .as_deref()
+                .or(placement.daemon_id.as_deref()),
+            None => snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("daemon_id"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .or_else(|| {
+                    fallback_agent
+                        .as_ref()
+                        .and_then(|agent| agent.daemon_id.as_deref())
+                }),
+        };
+        if placement
+            .as_ref()
+            .is_some_and(|placement| placement.state == db::PlacementState::Disconnected)
+        {
+            return Err(ServiceError::DaemonUnavailable {
+                daemon_id: daemon_id.unwrap_or_default().to_owned(),
+            });
+        }
         if let Some(registry) = self.daemon_connections.as_ref() {
             return crate::daemon_transport::select_execution_provider(
                 daemon_id, &self.db, registry,
@@ -2018,15 +2234,25 @@ impl TaskService {
             .inspect_err(|error| {
                 if let ServiceError::DaemonUnavailable { daemon_id } = error {
                     tracing::warn!(
-                        execution_id = %execution_id,
+                        execution_id = %execution.id,
                         daemon_id = %daemon_id,
-                        agent_id = ?agent.map(|agent| agent.id.as_str()),
+                        agent_id = ?execution.agent_id,
                         "remote daemon unavailable for execution dispatch"
                     );
                 }
             });
         }
 
+        if let Some(daemon_id) = daemon_id {
+            let daemon = db::DaemonRepo::get_by_id(&*self.db, daemon_id).await?;
+            if !daemon.is_some_and(|daemon| {
+                crate::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id)
+            }) {
+                return Err(ServiceError::DaemonUnavailable {
+                    daemon_id: daemon_id.to_owned(),
+                });
+            }
+        }
         let task_executor = self.task_executor.clone().ok_or_else(|| {
             ServiceError::invalid_operation(
                 "task executor is not configured for execution dispatch",
@@ -2038,6 +2264,45 @@ impl TaskService {
                 task_executor,
             ),
         ))
+    }
+
+    async fn owner_execution_path(&self, resolved: &ResolvedWorkspace) -> Result<String> {
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            return execution_workspace_path(resolved);
+        }
+        let placement = &resolved.placement;
+        let daemon_id = placement
+            .daemon_id
+            .as_deref()
+            .ok_or_else(|| ServiceError::invalid_operation("daemon placement has no owner"))?;
+        // The backend durably retains the owner's prepare/reset result before
+        // acknowledging it. Resolve the path from that result, fenced to this
+        // handle and generation, without opening or inferring any server path.
+        // Plan operations also use workspace.reset, but do not prepare a path.
+        let receipt = sqlx::query_scalar::<_, String>(
+            "SELECT outcome_json FROM command_receipt
+             WHERE principal_type = 'system' AND principal_id = 'workspace-backend'
+               AND scope_type = 'task' AND scope_id = ?
+               AND operation IN ('daemon.workspace.prepare', 'daemon.workspace.reset')
+               AND json_valid(outcome_json)
+               AND json_extract(outcome_json, '$.metadata.status') = 'result'
+               AND json_type(outcome_json, '$.owner_result.workspace_path') = 'text'
+               AND json_extract(outcome_json, '$.metadata.placement_id') = ?
+               AND json_extract(outcome_json, '$.metadata.generation') = ?
+               AND json_extract(outcome_json, '$.metadata.daemon_id') = ?
+             ORDER BY committed_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&placement.task_id)
+        .bind(&placement.id)
+        .bind(placement.generation)
+        .bind(daemon_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation("daemon placement has no retained preparation result")
+        })?;
+        let receipt = parse_json_value("workspace preparation receipt", &receipt)?;
+        prepared_owner_execution_path(placement, &receipt["owner_result"])
     }
 
     async fn execution_start_params(
@@ -2054,6 +2319,8 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let resolved = self.resolve_task_workspace(&workspace).await?;
+        let workspace_path = self.owner_execution_path(&resolved).await?;
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -2061,15 +2328,20 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
+        if let Some(config) = executor_config.as_object_mut() {
+            config.remove("terminal_plan_text");
+        }
+        executor_config["_forge_plan_transport"] =
+            json!(resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon);
         if read_only_execution_role(&execution.role)
             || matches!(task.task_type.as_str(), "planning_task" | "discovery")
         {
             executors::mark_worktree_read_only(&mut executor_config);
         }
         executors::mark_task_role(&mut executor_config, &execution.role);
-        // A remote daemon receives the Project environment variables; asset
-        // copies and checks run only for local executions, whose worktree is
-        // on this host (see `prepare_execution_environment`).
+        // A remote daemon receives the Project environment variables. Asset
+        // staging and preflight checks run through the workspace owner before
+        // launch (see `prepare_execution_environment`).
         let environment = self.project_environment(&task.project_id).await?;
         executors::environment::mark_task_environment(&mut executor_config, &environment.env);
         let executor_type = executor_config
@@ -2083,25 +2355,86 @@ impl TaskService {
             &self.db,
             &execution.id,
             &task.id,
-            std::path::Path::new(&workspace.worktree_path),
+            &resolved,
             matches!(execution.role.as_str(), "reviewer" | "auditor"),
             executor_type == "shell",
-            execution_description(execution, &task, &executor_config),
+            execution_description(
+                &execution.role,
+                execution.summary.as_deref(),
+                &task,
+                &executor_config,
+            ),
         )
         .await
         .map_err(ServiceError::invalid_operation)?;
         let max_turns = self.resolve_max_turns(&task).await?;
 
+        let canonical = if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon
+            && matches!(execution.role.as_str(), "worker" | "coder" | "executor")
+        {
+            crate::plan_artifact::read_plan_text_with_router(
+                &self.db,
+                &self.workspace_backend_router,
+                workspace_id,
+            )
+            .await
+            .map_err(|error| error.into_service_error("canonical plan artifact is unreadable"))?
+        } else {
+            None
+        };
+        let plan_text = executors::execution_plan_seed(
+            Some(&execution.role),
+            canonical.as_deref(),
+            task.plan.as_deref(),
+        )
+        .map(str::to_owned);
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+            crate::plan_artifact::transport::remember_seed(
+                &self.db,
+                &execution.id,
+                plan_text.as_deref(),
+                &environment.env,
+            )
+            .await?;
+        }
         Ok(api_types::ExecutionStartParams {
+            plan_text: (resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon)
+                .then_some(plan_text)
+                .flatten(),
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
-            workspace_path: workspace.worktree_path,
+            workspace_path,
             executor_type,
             executor_config,
             prompt: json!({ "description": description }),
             max_turns,
         })
     }
+}
+
+/// Resolve the provider's workspace argument at the placement boundary.
+/// Embedded execution requires a path on this host.
+fn execution_workspace_path(workspace: &ResolvedWorkspace) -> Result<String> {
+    Ok(workspace.embedded_path()?.to_string_lossy().into_owned())
+}
+
+fn prepared_owner_execution_path(
+    placement: &db::WorkspacePlacement,
+    state: &Value,
+) -> Result<String> {
+    let prepared: api_types::WorkspacePreparedState = serde_json::from_value(state.clone())
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!("invalid owner preparation result: {error}"))
+        })?;
+    if Some(prepared.workspace_handle.as_str()) != placement.workspace_handle.as_deref()
+        || i64::try_from(prepared.generation).ok() != Some(placement.generation)
+        || prepared.workspace_path.trim().is_empty()
+    {
+        return Err(ServiceError::conflict(
+            "owner preparation result has a different workspace handle or generation",
+        ));
+    }
+    Ok(prepared.workspace_path)
 }
 
 /// Roles whose executions never receive worktree write access, regardless of
@@ -2112,18 +2445,29 @@ fn read_only_execution_role(role: &str) -> bool {
         || role == crate::workflow::default_roles::PLANNER
 }
 
-fn execution_description(execution: &Execution, task: &Task, agent_config: &Value) -> String {
+fn execution_description(
+    role: &str,
+    summary: Option<&str>,
+    task: &Task,
+    agent_config: &Value,
+) -> String {
     let is_shell_executor =
         agent_config.get("executor_type").and_then(Value::as_str) == Some("shell");
-    if is_shell_executor && execution.role == crate::workflow::default_roles::REVIEWER {
+    if is_shell_executor && role == crate::workflow::default_roles::REVIEWER {
         task.task_state_config.as_deref()
             .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
             .and_then(|config| config.pointer("/review/review_prompt").and_then(Value::as_str).map(str::to_owned))
             .unwrap_or_else(|| "printf '%s\\n' 'Shell reviewer requires an explicit review_prompt producing a conformance assessment' >&2; exit 1".to_owned())
-    } else {
-        execution
-            .summary
+    } else if is_shell_executor {
+        // A shell executor runs its input as a script. Workflow dispatches
+        // store the LLM role prompt in `summary`, so always run the Task's
+        // own command instead.
+        task.description
             .clone()
+            .unwrap_or_else(|| task.title.clone())
+    } else {
+        summary
+            .map(str::to_owned)
             .or_else(|| task.description.clone())
             .unwrap_or_else(|| task.title.clone())
     }
@@ -2165,10 +2509,6 @@ impl TaskService {
             }),
             message: Some(message.clone()),
             hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::ResetToInitial,
-                api_types::RecoveryAction::CancelTask,
-            ],
         };
         let blocked_meta = json!({
             "reason": message,
@@ -2196,11 +2536,7 @@ impl TaskService {
             },
         )
         .await?;
-        self.publish_domain_event_by_dedupe(&format!(
-            "task-status-update:{}:{}",
-            updated.id, updated.version
-        ))
-        .await;
+
         self.publish(ForgeEvent {
             event_type: "task.blocked".to_owned(),
             entity_id: updated.id,

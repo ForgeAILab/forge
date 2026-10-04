@@ -74,6 +74,10 @@ describe('board reducer', () => {
     const response: MoveTaskResponse = {
       task: {
         ...task('b', 0, 2),
+        effective_coder: null,
+        effective_coder_source: null,
+
+        placement: null,
         execution_observability: {
           counts: emptyUsage.counts,
           tokens: emptyUsage.tokens,

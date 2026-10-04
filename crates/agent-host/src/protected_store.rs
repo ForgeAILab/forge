@@ -217,12 +217,13 @@ impl SqliteProtectedRuntimeStore {
 
     fn snapshot_digest(&self, snapshot: &SessionSnapshot) -> Result<String, RuntimeError> {
         // Runtime snapshots stamp the clock on every call, even without a state change.
+        // Diagnostic manifests are a bounded recent window and are omitted from
+        // new protected checkpoints; neither belongs to canonical state identity.
         let bytes = serde_json::to_vec(&(
             &snapshot.id,
             &snapshot.history,
             &snapshot.usage,
             &snapshot.identity,
-            &snapshot.manifests,
             &snapshot.extension_state,
         ))?;
         let mut mac = self.snapshot_mac.clone();
@@ -305,7 +306,7 @@ impl SqliteProtectedRuntimeStore {
 
     /// Loads the server-issued identity/scope binding for one runtime session.
     ///
-    /// The optional Task workspace is joined by the exact host-supplied path;
+    /// The optional Task workspace is authorized by the exact host-supplied path;
     /// a path that is not the current persisted workspace is therefore
     /// rejected before RuntimeBuilder receives a filesystem-capable tool.
     pub(crate) async fn runtime_scope_binding(
@@ -379,8 +380,7 @@ impl SqliteProtectedRuntimeStore {
                     chat.project_id AS agent_chat_project_id,
                     binding.permission_ceiling_json AS binding_permission_ceiling,
                     bound_project.charter_setup_required AS project_charter_setup_required,
-                    COALESCE(workspace.worktree_path, scope.workspace_path)
-                        AS worktree_path
+                    scope.workspace_path
              FROM agent_session AS session
              JOIN agent_identity AS identity
                ON identity.id = session.identity_id
@@ -403,16 +403,11 @@ impl SqliteProtectedRuntimeStore {
                     WHEN scope.scope_type = 'agent_chat' THEN chat.project_id
                     ELSE scope.project_id
                   END
-             LEFT JOIN workspace
-               ON workspace.task_id = scope.scope_id
-              AND workspace.status IN ('creating', 'ready', 'error')
-              AND workspace.worktree_path = ?
              WHERE session.id = ?
                AND session.runtime_session_id IS ?
                AND (? IS NOT NULL OR (session.backend_kind = 'cli' AND profile.backend_kind = 'cli'))
              LIMIT 1",
         )
-        .bind(workspace_path)
         .bind(forge_session_id)
         .bind(runtime_session_id)
         .bind(runtime_session_id)
@@ -457,8 +452,8 @@ impl SqliteProtectedRuntimeStore {
         let workspace_access: String = row
             .try_get("workspace_access")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let persisted_workspace_path: Option<String> = row
-            .try_get("worktree_path")
+        let mut persisted_workspace_path: Option<String> = row
+            .try_get("workspace_path")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let binding_permission_ceiling: Option<String> = row
             .try_get("binding_permission_ceiling")
@@ -530,12 +525,21 @@ impl SqliteProtectedRuntimeStore {
             } else {
                 None
             };
-        if matches!(scope.scope_type, crate::CanonicalScopeType::Task)
-            && persisted_workspace_path.is_none()
-        {
-            return Err(crate::AgentHostError::Authority(
-                "Task session has no active persisted workspace".to_owned(),
-            ));
+        if matches!(scope.scope_type, crate::CanonicalScopeType::Task) {
+            let mut authorized_path = None;
+            if let Some(path) = workspace_path {
+                if db::WorkspaceRepo::task_owns_embedded_path(&*self.db, &scope.scope_id, path)
+                    .await
+                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+                {
+                    authorized_path = Some(path.to_owned());
+                }
+            }
+            persisted_workspace_path = Some(authorized_path.ok_or_else(|| {
+                crate::AgentHostError::Authority(
+                    "Task session has no active persisted workspace".to_owned(),
+                )
+            })?);
         }
         // A Project Agent Chat owns its verification checkout and a Main Agent
         // Chat (or an inquiry sub-agent under the account scope) owns its
@@ -2063,7 +2067,6 @@ mod tests {
             &snapshot.history,
             &snapshot.usage,
             &snapshot.identity,
-            &snapshot.manifests,
             &snapshot.extension_state,
         ))
         .unwrap();
@@ -2096,6 +2099,94 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(stored, store.snapshot_digest(&checkpoint.snapshot).unwrap());
+    }
+
+    #[tokio::test]
+    async fn session_state_manifest_window_does_not_change_checkpoint_digest() {
+        use agent_runtime::{
+            core::{
+                ids::TurnId,
+                manifest::{CapabilityResolution, ModelResolution, RunManifest},
+                provider::ModelId,
+                store::{TurnManifest, VersionedSessionState},
+            },
+            registry::{Fingerprint, RegistryRevision},
+            runtime::MANIFEST_BOUNDARY_NAMESPACE,
+        };
+        let (store, db, mut snapshot) = session_store().await;
+        let fingerprint = Fingerprint::of(b"manifest-fixture");
+        let manifest = RunManifest::new(
+            fingerprint.clone(),
+            fingerprint.clone(),
+            ModelResolution::new(
+                "fixture",
+                ModelId::new("fixture-model"),
+                fingerprint.clone(),
+                Default::default(),
+            ),
+            CapabilityResolution::new(RegistryRevision::new("fixture-resolver")),
+            fingerprint.clone(),
+            fingerprint,
+        );
+        snapshot.manifests.push(TurnManifest::new(
+            TurnId::new("earlier-turn"),
+            manifest.clone(),
+        ));
+        snapshot.extension_state.insert(
+            MANIFEST_BOUNDARY_NAMESPACE.to_owned(),
+            VersionedSessionState::new(
+                RegistryRevision::new("manifest-boundary-1"),
+                serde_json::json!({"schema_version": 1, "planned_steps": 1}),
+            ),
+        );
+        // The ordinary snapshot retains diagnostics and the protected boundary.
+        SessionStore::save(&store, &snapshot).await.unwrap();
+        assert_eq!(
+            SessionStore::load(&store, &snapshot.id).await.unwrap(),
+            Some(snapshot.clone())
+        );
+        let mut checkpoint = session_checkpoint(snapshot);
+        let live = checkpoint.snapshot.clone();
+        assert!(!live.manifests.is_empty());
+        // Model Runtime's checkpoint capture, which preserves execution state
+        // and its boundary extension but leaves diagnostics in the live window.
+        checkpoint.snapshot.manifests.clear();
+        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        let loaded = SessionStore::load(&store, &live.id).await.unwrap().unwrap();
+        // SessionStore references the checkpoint's execution state, whose
+        // serialized snapshot omits the live diagnostic window.
+        assert!(loaded.manifests.is_empty());
+        assert_eq!(loaded.extension_state, live.extension_state);
+        assert_eq!(
+            store.snapshot_digest(&live).unwrap(),
+            store.snapshot_digest(&loaded).unwrap()
+        );
+        let mut retained = live.clone();
+        retained
+            .manifests
+            .push(TurnManifest::new(TurnId::new("latest-turn"), manifest));
+        retained.manifests.remove(0);
+        assert_eq!(
+            store.snapshot_digest(&live).unwrap(),
+            store.snapshot_digest(&retained).unwrap()
+        );
+        // Neither the restored state nor the live diagnostic window requires
+        // a conflicting independent save over the checkpoint-backed row.
+        sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
+            .execute(db.pool()).await.unwrap();
+        SessionStore::save(&store, &loaded).await.unwrap();
+        SessionStore::save(&store, &retained).await.unwrap();
+        // The runtime-owned boundary remains protected even though manifests
+        // are diagnostic: changing its frontier must change the digest.
+        retained
+            .extension_state
+            .get_mut(MANIFEST_BOUNDARY_NAMESPACE)
+            .unwrap()
+            .value = serde_json::json!({"schema_version": 1, "planned_steps": 2});
+        assert_ne!(
+            store.snapshot_digest(&live).unwrap(),
+            store.snapshot_digest(&retained).unwrap()
+        );
     }
 
     #[tokio::test]

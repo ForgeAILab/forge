@@ -70,15 +70,6 @@ impl ApiError {
         }
     }
 
-    pub fn method_not_allowed(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::METHOD_NOT_ALLOWED,
-            code,
-            message: message.into(),
-            details: None,
-        }
-    }
-
     pub fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
         let id = id.into();
         Self {
@@ -225,6 +216,24 @@ impl IntoResponse for ApiError {
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {
+            ServiceError::PlacementUnavailable(error) => Self::conflict_with_code_and_details(
+                if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED } else { "placement_unavailable" },
+                error.to_string(),
+                json!({
+                    "needs_human": error.needs_daemon_upgrade(),
+                    "task_id": error.task_id,
+                    "repo_id": error.repo_id,
+                    "rejected_candidates": error.rejected_candidates,
+                }),
+            ),
+            ServiceError::PrepareFailed {
+                placement_id,
+                message,
+            } => Self::conflict_with_code_and_details(
+                "prepare_failed",
+                message,
+                json!({ "placement_id": placement_id, "failure_cause": "prepare_failed" }),
+            ),
             ServiceError::DependencyGate => Self {
                 status: StatusCode::CONFLICT,
                 code: "dependency_gate",
@@ -274,14 +283,18 @@ impl From<ServiceError> for ApiError {
             ServiceError::TaskActionUnavailable {
                 available_actions,
                 reason,
+                wait_cause,
             } => Self::conflict_with_code_and_details(
-                "task_action.unavailable",
+                "action_unavailable",
                 reason.clone(),
                 json!({
                     "available_actions": available_actions,
                     "reason": reason,
+                    "denied_by": wait_cause.as_ref().map(ToString::to_string),
+                    "retry": wait_cause.map(|_| json!({"action":"none", "scope":"turn", "retryable":false})),
                 }),
             ),
+            ServiceError::TurnFailure { error, .. } => Self::from(*error),
             ServiceError::Conflict(message) => Self::conflict_with_code("conflict", message),
             ServiceError::ProductGenesisActiveSession { session_id } => {
                 Self::conflict_with_code_and_details(
@@ -290,6 +303,18 @@ impl From<ServiceError> for ApiError {
                     json!({ "session_id": session_id }),
                 )
             }
+            ServiceError::DaemonNotReady { daemon_id } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "daemon_not_ready",
+                message: format!("daemon {daemon_id} has not sent its command handshake; wait for it to become ready"),
+                details: Some(json!({ "daemon_id": daemon_id })),
+            },
+            ServiceError::DaemonUpgradeRequired { daemon_id } => Self {
+                status: StatusCode::CONFLICT,
+                code: api_types::DAEMON_UPGRADE_REQUIRED,
+                message: api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE.to_owned(),
+                details: Some(json!({ "daemon_id": daemon_id, "needs_human": true })),
+            },
             ServiceError::DaemonUnavailable { daemon_id } => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "daemon_unavailable",
@@ -318,20 +343,6 @@ impl From<ServiceError> for ApiError {
                 "repo_mismatch",
                 format!("repo does not match primary repo for project {project_id}"),
             ),
-            ServiceError::PrProviderMissing { repo_id } => Self::conflict_with_code(
-                "pr_provider_missing",
-                format!("PR provider missing for repo {repo_id}"),
-            ),
-            ServiceError::PrProviderTokenMissing { repo_id } => Self::conflict_with_code(
-                "pr_provider_token_missing",
-                format!("PR provider token missing for repo {repo_id}"),
-            ),
-            ServiceError::PrSyncFailure { task_id, details } => Self {
-                status: StatusCode::BAD_GATEWAY,
-                code: "pr_sync_failure",
-                message: format!("PR sync failure for task {task_id}: {details}"),
-                details: Some(json!({ "task_id": task_id, "details": details })),
-            },
             ServiceError::AgentPaused { agent_id } => Self::conflict_with_code(
                 "agent_paused",
                 format!("agent {agent_id} is paused and cannot accept new work"),
@@ -446,6 +457,9 @@ impl From<DbError> for ApiError {
                 message: "resource not found".to_owned(),
                 details: None,
             },
+            DbError::TurnNotRetryable => Self::conflict_with_code("turn_not_retryable", "Agent Chat turn is not retryable"),
+            DbError::ChatTurnLive => Self::conflict_with_code("another_turn_live", "another Agent Chat turn is live"),
+            DbError::DeadLetterNotReplayable => Self::conflict_with_code("dead_letter_not_replayable", "Only whole-event dead letters can be replayed; dismiss this item instead"),
             DbError::VersionConflict => Self {
                 status: StatusCode::CONFLICT,
                 code: "version_conflict",
@@ -501,6 +515,7 @@ impl From<DbError> for ApiError {
                 message: "invalid status transition".to_owned(),
                 details: None,
             },
+            DbError::MachineAtCapacity => Self::conflict_with_code("machine_capacity", "Machine has no available run capacity"),
             DbError::AgentAtCapacity => Self {
                 status: StatusCode::CONFLICT,
                 code: "agent_at_capacity",
@@ -593,5 +608,85 @@ impl From<serde_json::Error> for ApiError {
 impl From<std::io::Error> for ApiError {
     fn from(error: std::io::Error) -> Self {
         Self::internal(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_upgrade_maps_to_human_action_and_readiness_stays_transient() {
+        let upgrade = ApiError::from(ServiceError::DaemonUpgradeRequired {
+            daemon_id: "old".into(),
+        });
+        assert_eq!(upgrade.status, StatusCode::CONFLICT);
+        assert_eq!(upgrade.code, api_types::DAEMON_UPGRADE_REQUIRED);
+        assert!(upgrade.message.contains("upgrade the daemon"));
+        assert_eq!(upgrade.details.unwrap()["needs_human"], true);
+        let ready = ApiError::from(ServiceError::DaemonNotReady {
+            daemon_id: "new".into(),
+        });
+        assert_eq!(ready.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(ready.code, "daemon_not_ready");
+        assert!(!ready.message.contains("upgrade"));
+        let placement = ApiError::from(ServiceError::PlacementUnavailable(
+            services::placement::PlacementUnavailable {
+                task_id: "task".into(),
+                repo_id: "repo".into(),
+                rejected_candidates: vec![services::placement::CandidateRejection {
+                    failing_checks: Vec::new(),
+                    repo_location_id: "location".into(),
+                    owner_kind: "daemon".into(),
+                    daemon_id: Some("old".into()),
+                    runtime_id: Some("runtime".into()),
+                    filter_codes: vec![
+                        services::placement::PlacementFilterCode::DaemonUpgradeRequired,
+                    ],
+                }],
+            },
+        ));
+        assert_eq!(placement.code, api_types::DAEMON_UPGRADE_REQUIRED);
+        assert_eq!(placement.details.unwrap()["needs_human"], true);
+    }
+
+    #[test]
+    fn placement_unavailable_preserves_candidate_rejections_in_409() {
+        let error = ApiError::from(ServiceError::PlacementUnavailable(
+            services::placement::PlacementUnavailable {
+                task_id: "task".to_owned(),
+                repo_id: "repo".to_owned(),
+                rejected_candidates: vec![services::placement::CandidateRejection {
+                    failing_checks: Vec::new(),
+                    repo_location_id: "location".to_owned(),
+                    owner_kind: "daemon".to_owned(),
+                    daemon_id: Some("daemon".to_owned()),
+                    runtime_id: Some("runtime".to_owned()),
+                    filter_codes: vec![
+                        services::placement::PlacementFilterCode::ExecutorUnavailable,
+                    ],
+                }],
+            },
+        ));
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "placement_unavailable");
+        let details = error.details.unwrap();
+        assert_eq!(details["task_id"], "task");
+        assert_eq!(details["rejected_candidates"][0]["daemon_id"], "daemon");
+        assert_eq!(
+            details["rejected_candidates"][0]["filter_codes"][0],
+            "executor_unavailable"
+        );
+    }
+
+    #[test]
+    fn prepare_failed_exposes_placement_failure_cause() {
+        let error = ApiError::from(ServiceError::PrepareFailed {
+            placement_id: "placement".to_owned(),
+            message: "owner refused preparation".to_owned(),
+        });
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "prepare_failed");
+        assert_eq!(error.details.unwrap()["failure_cause"], "prepare_failed");
     }
 }

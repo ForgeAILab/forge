@@ -41,7 +41,7 @@ Evidence is from the NovelKit project database on 10.0.0.2, at 2026-09-30:
   the recorded failing checks re-run, so role-scoped checks (for example a
   reviewer-only browser check) are covered.
 - **Pause detail storage.** A new nullable `project.environment_pause_json`
-  column (V149). An in-memory record is not enough: the next check time and
+  column (V202610010410). An in-memory record is not enough: the next check time and
   the output must survive a restart and be visible over the API.
 - **Pre-launch failure must not block re-dispatch.** The failed pre-dispatch
   execution is tagged so `latest_stopped_execution_blocks_dispatch` skips it.
@@ -76,7 +76,7 @@ Evidence is from the NovelKit project database on 10.0.0.2, at 2026-09-30:
 
 ## Migration Plan
 
-V149:
+V202610010410:
 - adds `project.environment_pause_json TEXT NULL`;
 - clears `error_annotation` / `blocked_json` on Tasks whose annotation `type`
   is `environment_not_ready`.

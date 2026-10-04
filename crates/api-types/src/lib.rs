@@ -27,6 +27,7 @@ mod product_genesis;
 mod project_hooks;
 mod project_orchestration;
 mod provider_auth;
+mod repo_location;
 mod repo_review;
 mod requests;
 mod review_conformance;
@@ -60,6 +61,7 @@ pub use product_genesis::*;
 pub use project_hooks::*;
 pub use project_orchestration::*;
 pub use provider_auth::*;
+pub use repo_location::*;
 pub use repo_review::*;
 pub use requests::*;
 pub use review_conformance::*;
@@ -71,12 +73,17 @@ pub use workflow::*;
 #[test]
 #[ignore = "manual type export for the web client"]
 fn export_typescript() {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    export_typescript_to(crate_dir);
+    export_typescript_to(&crate_dir.join("../../web/src/types/generated"));
+}
+
+#[cfg(test)]
+fn export_typescript_to(out_dir: &std::path::Path) {
     use ts_rs::TS;
 
-    let out_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/src/types/generated");
-    std::fs::create_dir_all(&out_dir).expect("create types output directory");
-    std::env::set_current_dir(&out_dir).expect("switch to types output directory");
+    std::fs::create_dir_all(out_dir).expect("create types output directory");
+    std::env::set_current_dir(out_dir).expect("switch to types output directory");
 
     TaskType::export().expect("export TaskType");
     ProductMaturity::export().expect("export ProductMaturity");
@@ -88,11 +95,19 @@ fn export_typescript() {
     CancelProductGenesisRequest::export().expect("export CancelProductGenesisRequest");
     ApplyProductGenesisGuidedSetupRequest::export()
         .expect("export ApplyProductGenesisGuidedSetupRequest");
-    WorkMode::export().expect("export WorkMode");
     CreateRepoRequest::export().expect("export CreateRepoRequest");
     UpdateRepoRequest::export().expect("export UpdateRepoRequest");
     RepoResponse::export().expect("export RepoResponse");
     RepoSyncResponse::export().expect("export RepoSyncResponse");
+    RepoLocationOwnerKind::export().expect("export RepoLocationOwnerKind");
+    RepoLocationKind::export().expect("export RepoLocationKind");
+    RepoLocationStatus::export().expect("export RepoLocationStatus");
+    RepoLocationResponse::export().expect("export RepoLocationResponse");
+    CreateRepoLocationRequest::export().expect("export CreateRepoLocationRequest");
+    UpdateRepoLocationRequest::export().expect("export UpdateRepoLocationRequest");
+    VerifyRepoLocationRequest::export().expect("export VerifyRepoLocationRequest");
+    WorkspacePlacementResponse::export().expect("export WorkspacePlacementResponse");
+    WorkspaceResponse::export().expect("export WorkspaceResponse");
     FsEntry::export().expect("export FsEntry");
     FsListResponse::export().expect("export FsListResponse");
     BranchListResponse::export().expect("export BranchListResponse");
@@ -101,6 +116,7 @@ fn export_typescript() {
     ReviewGoverningContext::export().expect("export ReviewGoverningContext");
     ReviewContract::export().expect("export ReviewContract");
     ReviewResult::export().expect("export ReviewResult");
+    FixableBy::export().expect("export FixableBy");
     ReviewAssessment::export().expect("export ReviewAssessment");
     ConformanceStatus::export().expect("export ConformanceStatus");
     ConformanceCheckResult::export().expect("export ConformanceCheckResult");
@@ -112,21 +128,38 @@ fn export_typescript() {
     LifecycleHookDef::export().expect("export LifecycleHookDef");
     ProjectSettings::export().expect("export ProjectSettings");
     ProjectEnvironment::export().expect("export ProjectEnvironment");
+    TaskPlacementDiagnostic::export().expect("export TaskPlacementDiagnostic");
+    MachineIdentity::export().expect("export MachineIdentity");
+    EnvironmentPauseResponse::export().expect("export EnvironmentPauseResponse");
+    EnvironmentReadinessStatus::export().expect("export EnvironmentReadinessStatus");
+    EnvironmentCheckFailure::export().expect("export EnvironmentCheckFailure");
+    ProjectEnvironmentReadiness::export().expect("export ProjectEnvironmentReadiness");
+    MachineEnvironmentRecheckResult::export().expect("export MachineEnvironmentRecheckResult");
+    AgentRunnableOn::export().expect("export AgentRunnableOn");
+    ProjectEnvironmentPause::export().expect("export ProjectEnvironmentPause");
+    ProjectEnvironmentCheckResult::export().expect("export ProjectEnvironmentCheckResult");
+    ProjectEnvironmentRecheckRequest::export().expect("export ProjectEnvironmentRecheckRequest");
+    ProjectEnvironmentRecheckResponse::export().expect("export ProjectEnvironmentRecheckResponse");
     EnvironmentAsset::export().expect("export EnvironmentAsset");
     EnvironmentCheck::export().expect("export EnvironmentCheck");
+    EnvironmentCheckScope::export().expect("export EnvironmentCheckScope");
+    PlacementProvision::export().expect("export PlacementProvision");
+    ProjectPlacementSettings::export().expect("export ProjectPlacementSettings");
     FailureKind::export().expect("export FailureKind");
     LifecycleHookTestResponse::export().expect("export LifecycleHookTestResponse");
     TaskMetadata::export().expect("export TaskMetadata");
     Task::export().expect("export Task");
+    ActionParameterRequirement::export().expect("export ActionParameterRequirement");
+    ActionParameter::export().expect("export ActionParameter");
+    Offer::export().expect("export Offer");
+    ActionAuthority::export().expect("export ActionAuthority");
     TaskAction::export().expect("export TaskAction");
     TaskActionsResponse::export().expect("export TaskActionsResponse");
+    EffectiveCoderSource::export().expect("export EffectiveCoderSource");
     StopReason::export().expect("export StopReason");
     ResumePolicy::export().expect("export ResumePolicy");
-    RecoveryAction::export().expect("export RecoveryAction");
     ExecutionBehaviorKind::export().expect("export ExecutionBehaviorKind");
     ExecutionBehavior::export().expect("export ExecutionBehavior");
-    ExecutionActionKind::export().expect("export ExecutionActionKind");
-    ExecutionAction::export().expect("export ExecutionAction");
     BlockingArtifact::export().expect("export BlockingArtifact");
     TaskBlockingAnnotation::export().expect("export TaskBlockingAnnotation");
     InterruptionMetadata::export().expect("export InterruptionMetadata");
@@ -220,6 +253,7 @@ fn export_typescript() {
     AgentsResponse::export().expect("export AgentsResponse");
     Project::export().expect("export Project");
     ProjectResponse::export().expect("export ProjectResponse");
+    ProjectSlots::export().expect("export ProjectSlots");
     ProjectHookRule::export().expect("export ProjectHookRule");
     ProjectHookTrigger::export().expect("export ProjectHookTrigger");
     ProjectHookAction::export().expect("export ProjectHookAction");
@@ -329,6 +363,8 @@ fn export_typescript() {
     SetupRequirement::export().expect("export SetupRequirement");
     CurrentVersionOrRevision::export().expect("export CurrentVersionOrRevision");
     RetryAction::export().expect("export RetryAction");
+    DeniedBy::export().expect("export DeniedBy");
+    RetryScope::export().expect("export RetryScope");
     RetryInstruction::export().expect("export RetryInstruction");
     OrchestrationOutcome::export().expect("export OrchestrationOutcome");
     ToolResultSummary::export().expect("export ToolResultSummary");
@@ -338,7 +374,7 @@ fn export_typescript() {
     TransitionTaskRequest::export().expect("export TransitionTaskRequest");
     AuthorType::export().expect("export AuthorType");
     TaskMediaResponse::export().expect("export TaskMediaResponse");
-    RecoverTaskRequest::export().expect("export RecoverTaskRequest");
+    StopExecutionRequest::export().expect("export StopExecutionRequest");
     TaskActionRequest::export().expect("export TaskActionRequest");
     TestLifecycleHookRequest::export().expect("export TestLifecycleHookRequest");
     CreateCommentRequest::export().expect("export CreateCommentRequest");
@@ -379,6 +415,14 @@ fn export_typescript() {
     ReorderSubtasksRequest::export().expect("export ReorderSubtasksRequest");
     OperatorSeverity::export().expect("export OperatorSeverity");
     OperatorStatusResponse::export().expect("export OperatorStatusResponse");
+    EventRelayStatus::export().expect("export EventRelayStatus");
+    DeadLetterOutcome::export().expect("export DeadLetterOutcome");
+    DeadLetterState::export().expect("export DeadLetterState");
+    DeadLetterResponse::export().expect("export DeadLetterResponse");
+    DeadLetterListResponse::export().expect("export DeadLetterListResponse");
+    DeadLetterActionResponse::export().expect("export DeadLetterActionResponse");
+    DismissDeadLetterRequest::export().expect("export DismissDeadLetterRequest");
+    WorkerDeadLetterSummary::export().expect("export WorkerDeadLetterSummary");
     ActiveExecutionSummary::export().expect("export ActiveExecutionSummary");
     BlockedTaskSummary::export().expect("export BlockedTaskSummary");
     DaemonIssueSummary::export().expect("export DaemonIssueSummary");
@@ -636,3 +680,5 @@ fn export_typescript() {
     CostEstimationRunStatus::export().expect("export CostEstimationRunStatus");
     CostEstimationRun::export().expect("export CostEstimationRun");
 }
+
+pub mod execution_outbox;

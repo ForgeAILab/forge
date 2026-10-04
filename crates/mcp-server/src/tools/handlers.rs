@@ -46,7 +46,7 @@ use crate::{
     state::AppState,
     values::{
         agent_page_value_for_user, agent_profile_value, agent_session_value, agent_value_for_user,
-        execution_page_value, execution_value, project_page_value, project_value, task_page_value,
+        execution_page_value, execution_value, project_page_value, project_value,
         task_role_assignment_value, task_value,
     },
 };
@@ -144,7 +144,7 @@ pub(super) async fn forge_create_task(
             ),
             other => other.into(),
         })?;
-    let mut result = task_value(task);
+    let mut result = task_with_offers(state, task).await?;
     if let Some(object) = result.as_object_mut() {
         object.insert("depends_on_ids".to_owned(), json!(dependency_ids));
     }
@@ -402,15 +402,46 @@ pub(super) async fn forge_list_tasks(
         },
     )
     .await?;
-    Ok(task_page_value(page))
+    let has_more = page.next_cursor.is_some();
+    let items = tasks_with_role_assignments(state, page.items).await?;
+    Ok(
+        json!({ "items": items, "next_cursor": page.next_cursor, "has_more": has_more, "total_count": page.total_count }),
+    )
 }
 
-pub(super) async fn forge_get_task(state: &AppState, params: Value) -> Result<Value, McpToolError> {
+pub(super) async fn forge_get_task(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
     let params: GetTaskParams = parse_params(params)?;
-    let task = TaskRepo::get_by_id(&*state.db, &params.task_id, false)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("task", params.task_id))?;
-    Ok(task_value(task))
+    let actor = Actor::User {
+        user_id: Some(authenticated_user(context)?.to_owned()),
+        source: api_types::UserActionSource::Api,
+    };
+    let snapshot = state
+        .task_service
+        .task_action_snapshot(&params.task_id, &actor)
+        .await?;
+    task_snapshot_value(snapshot)
+}
+
+fn task_snapshot_value(snapshot: services::TaskSnapshot) -> Result<Value, McpToolError> {
+    let offers = services::available_actions(&snapshot);
+    let exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
+    let mut value = task_value(snapshot.task);
+    value["available_actions"] = json!(offers);
+    value["workflow_exception"] = serde_json::to_value(exception)
+        .map_err(|error| McpToolError::new(-32603, error.to_string()))?;
+    Ok(value)
+}
+
+async fn task_with_offers(state: &AppState, task: db::Task) -> Result<Value, McpToolError> {
+    let snapshot = state
+        .task_service
+        .task_action_snapshot(&task.id, &Actor::user(api_types::UserActionSource::Api))
+        .await?;
+    task_snapshot_value(snapshot)
 }
 
 pub(super) async fn forge_preview_prompt(
@@ -431,6 +462,7 @@ pub(super) async fn forge_preview_prompt(
 
     let prompt = services::preview_effective_prompt(
         Arc::clone(&state.db),
+        &state.workspace_backend_router,
         &params.task_id,
         params.role.trim(),
         params.trigger,
@@ -580,13 +612,30 @@ pub(super) async fn forge_assign_agent(
     }))
 }
 
-pub(super) async fn forge_cancel_task(
+pub(super) async fn task_action(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: GetTaskParams = parse_params(params)?;
-    let task = state.task_service.cancel_task(params.task_id).await?;
-    Ok(task_value(task))
+    let actor = Actor::User {
+        user_id: Some(authenticated_user(context)?.to_owned()),
+        source: api_types::UserActionSource::Api,
+    };
+    let task_id = params
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_field_error("task_id", "required", None))?;
+    let request: api_types::TaskActionRequest =
+        parse_params(json!({ "action": params.get("action"), "version": params.get("version") }))?;
+    let result = state
+        .task_service
+        .perform_task_action_as(task_id, request.action, request.version, actor.clone())
+        .await?;
+    let snapshot = state
+        .task_service
+        .task_action_snapshot(&result.task.id, &actor)
+        .await?;
+    task_snapshot_value(snapshot)
 }
 
 pub(super) async fn forge_get_task_diff(
@@ -594,9 +643,12 @@ pub(super) async fn forge_get_task_diff(
     params: Value,
 ) -> Result<Value, McpToolError> {
     let params: GetTaskParams = parse_params(params)?;
-    let diff = DiffService::new(std::sync::Arc::clone(&state.db))
-        .task_diff(&params.task_id)
-        .await?;
+    let diff = DiffService::new_with_router(
+        std::sync::Arc::clone(&state.db),
+        std::sync::Arc::clone(&state.workspace_backend_router),
+    )
+    .task_diff(&params.task_id)
+    .await?;
     serde_json::to_value(diff)
         .map_err(|error| McpToolError::new(-32603, format!("failed to serialize diff: {error}")))
 }
@@ -639,7 +691,7 @@ pub(super) async fn forge_update_task(
         },
     )
     .await?;
-    Ok(task_value(task))
+    task_with_offers(state, task).await
 }
 
 pub(super) async fn forge_transition_task(
@@ -665,7 +717,21 @@ pub(super) async fn forge_transition_task(
             },
         )
         .await?;
-    Ok(task_value(task.task))
+    transition_task_value(state, task.task, task.pending_steps).await
+}
+
+async fn transition_task_value(
+    state: &AppState,
+    task: db::Task,
+    pending_steps: i64,
+) -> Result<Value, McpToolError> {
+    let snapshot = state
+        .task_service
+        .task_action_snapshot_for_task(task, &Actor::user(api_types::UserActionSource::Api))
+        .await?;
+    let mut value = task_snapshot_value(snapshot)?;
+    value["pending_steps"] = json!(pending_steps);
+    Ok(value)
 }
 
 pub(super) async fn forge_register_agent(
@@ -886,14 +952,24 @@ pub(super) async fn forge_follow_up_execution(
         .follow_up_interactive_execution(execution_id, message, agent_id, overrides)
         .await?;
 
+    let workspace = state
+        .workspace_backend_router
+        .resolve(&state.db, &launched.workspace)
+        .await
+        .map_err(services::ServiceError::from)?;
+    let workspace_handle = workspace
+        .handle()
+        .map_err(services::ServiceError::from)?
+        .to_owned();
+
     Ok(json!({
-        "task": task_value(launched.task),
+        "task": task_with_offers(state, launched.task).await?,
         "execution": execution_value(launched.execution),
         "workspace": {
             "id": launched.workspace.id,
             "task_id": launched.workspace.task_id,
             "repo_id": launched.workspace.repo_id,
-            "worktree_path": launched.workspace.worktree_path,
+            "worktree_path": workspace_handle,
             "branch": launched.workspace.branch,
             "status": launched.workspace.status.to_string(),
             "before_sha": launched.workspace.before_sha,
@@ -1843,6 +1919,7 @@ async fn message_response(
 
 fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
     let error = job.error_message.clone().or_else(|| job.error_code.clone());
+    let retry_action = job.retry_action();
     AgentChatTurnJobResponse {
         id: job.id,
         chat_id: job.chat_id,
@@ -1866,6 +1943,10 @@ fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
         response_message_id: job.response_message_id,
         error_code: job.error_code,
         error_message: job.error_message,
+        failure_class: job.failure_class,
+        retry_decision: job.retry_decision,
+        pre_provider_failure_count: job.pre_provider_failure_count,
+        retry_action,
         error,
         correlation_id: job.correlation_id,
         version: job.version,
@@ -1924,4 +2005,47 @@ fn chat_status(value: &str) -> AgentChatStatus {
 
 fn parse_json(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transition_response_keeps_committed_task_after_background_advance() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let state = AppState::new(db.clone(), Arc::new(events::EventBus::new(16)));
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('p','p',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES ('t','p','task','todo',?,?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let committed = TaskRepo::get_by_id(&*db, "t", false)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE task SET status='done',version=version+1 WHERE id='t'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let value = transition_task_value(&state, committed, 1).await.unwrap();
+        assert_eq!(value["status"], "todo");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["pending_steps"], 1);
+        assert!(value["available_actions"].is_array());
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, "t", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "done"
+        );
+    }
 }

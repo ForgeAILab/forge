@@ -1,5 +1,4 @@
-use db::{Agent, DaemonRepo};
-use serde_json::Value;
+use db::Agent;
 
 use crate::Result;
 
@@ -16,71 +15,22 @@ pub(crate) async fn count_running_executions(db: &db::SqliteDb, agent_id: &str) 
     .await?)
 }
 
-pub(crate) async fn has_running_execution_capacity(
-    db: &db::SqliteDb,
-    agent: &Agent,
-) -> Result<bool> {
-    let running_count = count_running_executions(db, &agent.id).await?;
-    if running_count >= agent.max_concurrent_tasks {
-        return Ok(false);
-    }
-
-    let Some(daemon_id) = agent.daemon_id.as_deref() else {
-        return Ok(true);
-    };
-    let Some(daemon) = DaemonRepo::get_by_id(db, daemon_id).await? else {
-        return Ok(true);
-    };
-    let Some(max_sessions) = daemon_session_cap_from_labels(&daemon.labels_json) else {
-        return Ok(true);
-    };
-    let running_count = count_running_executions_for_daemon(db, daemon_id).await?;
-    let chat_count = count_active_chat_turns_for_daemon(db, daemon_id).await?;
-    Ok(running_count.saturating_add(chat_count) < max_sessions)
-}
-
-pub(crate) async fn count_running_executions_for_daemon(
-    db: &db::SqliteDb,
-    daemon_id: &str,
-) -> Result<i64> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)
-         FROM execution
-         JOIN agent_current AS agent ON agent.id = execution.agent_id
-         WHERE agent.daemon_id = ? AND execution.status = 'running'",
+pub(crate) async fn count_occupied_agent_slots(db: &db::SqliteDb, agent_id: &str) -> Result<i64> {
+    let mut transaction = db.pool().begin().await?;
+    Ok(
+        crate::placement::capacity::count_agent_capacity(&mut transaction, agent_id)
+            .await?
+            .occupied_slots(),
     )
-    .bind(daemon_id)
-    .fetch_one(db.pool())
-    .await?)
 }
 
-async fn count_active_chat_turns_for_daemon(db: &db::SqliteDb, daemon_id: &str) -> Result<i64> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)
-         FROM agent_chat_turn_job
-         JOIN agent_current AS agent
-           ON agent.id = agent_chat_turn_job.responder_identity_id
-         WHERE agent.daemon_id = ?
-           AND agent_chat_turn_job.status IN ('leased', 'running')",
+/// Agent availability uses only the identity quota. Machine saturation is a
+/// placement refusal, not an unhealthy or unconfigured Agent/Project.
+pub(crate) async fn has_execution_capacity(db: &db::SqliteDb, agent: &Agent) -> Result<bool> {
+    let mut transaction = db.pool().begin().await?;
+    Ok(
+        crate::placement::capacity::count_agent_capacity(&mut transaction, &agent.id)
+            .await?
+            .has_capacity(agent.max_concurrent_tasks),
     )
-    .bind(daemon_id)
-    .fetch_one(db.pool())
-    .await?)
-}
-
-pub(crate) fn daemon_session_cap_from_labels(labels_json: &str) -> Option<i64> {
-    let labels = serde_json::from_str::<Value>(labels_json).ok()?;
-    [
-        "max_concurrent_sessions",
-        "max_sessions",
-        "active_session_cap",
-        "max_concurrent_tasks",
-    ]
-    .into_iter()
-    .find_map(|key| {
-        labels
-            .get(key)
-            .and_then(Value::as_i64)
-            .filter(|value| *value > 0)
-    })
 }

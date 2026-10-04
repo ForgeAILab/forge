@@ -28,7 +28,6 @@ use db::{
     ProjectProvisioningRepo, ProjectRepo, ReconcileProjectProvisioningCheckpoint,
     ReconcileProjectProvisioningMetadata, Repo, RepoRepo, SortBy, SortOrder, SqliteDb,
     UpdateProject, UpdateProjectProvisioningOperation, UpsertProjectProvisioningCheckpoint,
-    WorkMode,
 };
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -1851,7 +1850,7 @@ async fn write_scaffold_exports(
     Ok(())
 }
 
-const FORGE_AGENTS_SECTION: &str = "## Forge\n\nThis repository belongs to a Forge Project. Forge owns planning and execution: the approved Charter is exported to `docs/spark/project.md`, Tasks are created, reviewed, and merged in Forge, and the Task brief you receive is the plan. Do not create `docs/spark/changes/` folders or edit a `tasks.md`; report scope discoveries as follow-up work in your Task report. The `worker-guidelines` lens is in force.\n";
+const FORGE_AGENTS_SECTION: &str = forge_agent_host::merge_friendly_guidance!("## Forge\n\nThis repository belongs to a Forge Project. Forge owns planning and execution: the approved Charter is exported to `docs/spark/project.md`, Tasks are created, reviewed, and merged in Forge, and the Task brief you receive is the plan. Do not create `docs/spark/changes/` folders or edit a `tasks.md`; report scope discoveries as follow-up work in your Task report. The `worker-guidelines` lens is in force.\n\nFor implementation and follow-up proposals: ", " Stay inside the Task's owned repository-relative paths and put new code in a new feature file instead of growing a shared one. Report a required out-of-scope edit before widening the Task.\n");
 
 async fn find_or_register_repository(
     db: &Arc<SqliteDb>,
@@ -1900,7 +1899,6 @@ async fn find_or_register_repository(
         name: repo_directory_name(&project.name, &project.id),
         local_path: Some(local_path.clone()),
         remote_url: Some(local_path.clone()),
-        work_mode: WorkMode::DirectMerge,
         default_branch: DEFAULT_BRANCH.to_owned(),
         created_at: now.clone(),
         updated_at: now,
@@ -2096,7 +2094,15 @@ fn repo_directory_name(project_name: &str, project_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::repo_directory_name;
+    use super::{repo_directory_name, FORGE_AGENTS_SECTION};
+
+    #[test]
+    fn scaffold_exports_merge_friendly_layout_guidance_once() {
+        const RULE: &str = forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE;
+        assert_eq!(FORGE_AGENTS_SECTION.matches(RULE).count(), 1);
+        assert!(FORGE_AGENTS_SECTION.contains("For implementation and follow-up proposals:"));
+        assert!(FORGE_AGENTS_SECTION.contains("Report a required out-of-scope edit"));
+    }
 
     #[test]
     fn repo_directory_name_is_slugged_and_deterministic() {

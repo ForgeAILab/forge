@@ -1,151 +1,157 @@
 import { fireEvent, render, screen } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
-
-import type { Task, WorkflowExceptionAction } from '@/types/generated'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Offer, Task } from '@/types/generated'
 import { WorkflowExceptionPanel } from './workflow-exception-panel'
-
+const { mutate } = vi.hoisted(() => ({ mutate: vi.fn() }))
+vi.mock('@/api/hooks', () => ({ useTaskAction: () => ({ mutate, isPending: false }) }))
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children: React.ReactNode }) => <a href="#evidence">{children}</a>,
 }))
-
-const now = '2026-09-27T12:00:00Z'
-
-function action(
-  kind: WorkflowExceptionAction['kind'],
-  label: string,
-  overrides: Partial<WorkflowExceptionAction> = {},
-): WorkflowExceptionAction {
+function task(offers: Offer[]): Task {
   return {
-    kind,
-    label,
-    enabled: true,
-    disabled_reason: null,
-    requires_reason: false,
-    requires_guidance: false,
-    propagates: true,
-    target_state: 'review',
-    target_role: 'reviewer',
-    target_execution_id: 'execution-1',
-    ...overrides,
-  }
+    id: 'task',
+    version: 7,
+    status: 'review',
+    workflow_exception: {
+      type: 'review_failed',
+      message: 'Checks failed',
+      actions: offers,
+      review_id: null,
+      execution_id: null,
+      state: 'review',
+      role: null,
+      target_state: null,
+      target_role: null,
+      failing_step: null,
+      related_evidence: [],
+    },
+  } as unknown as Task
 }
-
-const actions = [
-  action('reexecute', 'Retry Review with Guidance', { requires_guidance: true }),
-  action('mark_reviewed', 'Pass Review Manually', {
-    requires_reason: true,
-    target_state: 'merging',
-    target_role: null,
-    target_execution_id: null,
-  }),
-  action('open_interactive', 'Open Side Session', {
-    propagates: false,
-  }),
-]
-
-const task = {
-  id: 'task-1',
-  project_id: 'project-1',
-  title: 'Blocked review',
-  task_type: 'task',
-  status: 'review',
-  priority: 0,
-  board_position: 0,
-  role_assignments: [],
-  remaining_retries: {},
-  workflow_exception: {
-    type: 'review_blocked',
-    message: 'The reviewer could not access the provider.',
-    review_id: 'review-1',
-    execution_id: 'execution-1',
-    state: 'review',
-    role: 'reviewer',
-    target_state: null,
-    target_role: null,
-    failing_step: null,
-    related_evidence: [],
-    actions,
-  },
-  version: 4,
-  created_at: now,
-  updated_at: now,
-} as Task
-
-describe('WorkflowExceptionPanel', () => {
-  it('sends review guidance through authoritative recovery context', () => {
-    const onRecover = vi.fn()
-    render(
-      <WorkflowExceptionPanel
-        task={task}
-        actions={actions}
-        recoverPending={false}
-        terminal={false}
-        cancelPending={false}
-        onRecover={onRecover}
-        onOpenInteractive={vi.fn()}
-        onCancelTask={vi.fn()}
-      />,
-    )
-
-    fireEvent.click(screen.getByRole('button', { name: 'Retry Review with Guidance' }))
-    const confirm = screen.getByRole('button', { name: 'Confirm' })
-    expect((confirm as HTMLButtonElement).disabled).toBe(true)
-    fireEvent.change(screen.getByLabelText('Guidance'), {
-      target: { value: 'Use the configured test key and rerun the provider smoke test.' },
-    })
-    fireEvent.click(confirm)
-
-    expect(onRecover).toHaveBeenCalledWith('reexecute', {
-      reason: undefined,
-      context: 'Use the configured test key and rerun the provider smoke test.',
+const retry: Offer = {
+  action: { verb: 'retry' },
+  parameters: [],
+  authority: ['owner'],
+  reason: 'review_failed',
+  label: 'Retry Review',
+  target_execution_id: null,
+  propagates: false,
+}
+beforeEach(() => mutate.mockReset())
+describe('WorkflowExceptionPanel offers', () => {
+  it('renders and applies the supplied offer at the Task version', () => {
+    render(<WorkflowExceptionPanel task={task([retry])} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry Review' }))
+    expect(mutate.mock.calls[0][0]).toEqual({
+      taskId: 'task',
+      action: { verb: 'retry' },
+      version: 7,
     })
   })
-
-  it('requires an audit reason before manually passing review', () => {
-    const onRecover = vi.fn()
+  it('does not invent recovery or cancellation controls for an empty set', () => {
+    render(<WorkflowExceptionPanel task={task([])} />)
+    expect(screen.queryByRole('button', { name: 'Retry Review' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Open interactive' })).toBeTruthy()
+  })
+  it('collects guidance only when the offer declares that parameter', () => {
     render(
       <WorkflowExceptionPanel
-        task={task}
-        actions={actions}
-        recoverPending={false}
-        terminal={false}
-        cancelPending={false}
-        onRecover={onRecover}
-        onOpenInteractive={vi.fn()}
-        onCancelTask={vi.fn()}
+        task={task([
+          { ...retry, parameters: [{ name: 'guidance', required: false, boolean_values: null }] },
+        ])}
       />,
     )
-
+    fireEvent.click(screen.getByRole('button', { name: 'Retry Review' }))
+    fireEvent.change(screen.getByLabelText(/guidance/i), {
+      target: { value: 'Environment repaired' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(mutate.mock.calls[0][0].action).toEqual({
+      verb: 'retry',
+      guidance: 'Environment repaired',
+    })
+  })
+  it('renders the server cancellation offer without checking Task state', () => {
+    render(
+      <WorkflowExceptionPanel
+        task={task([{ ...retry, action: { verb: 'cancel' }, label: 'Cancel Task' }])}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Cancel Task' })).toBeTruthy()
+  })
+  it('requires nonblank guidance for a send-back offer', () => {
+    render(
+      <WorkflowExceptionPanel
+        task={task([
+          {
+            ...retry,
+            action: { verb: 'send_back', guidance: '' },
+            parameters: [{ name: 'guidance', required: true, boolean_values: null }],
+            label: 'Revise Candidate',
+          },
+        ])}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Revise Candidate' }))
+    const apply = screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement
+    expect(apply.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText(/guidance/i), { target: { value: '   ' } })
+    expect(apply.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText(/guidance/i), {
+      target: { value: 'Add the missing evidence' },
+    })
+    fireEvent.click(apply)
+    expect(mutate.mock.calls[0][0]).toEqual({
+      taskId: 'task',
+      version: 7,
+      action: { verb: 'send_back', guidance: 'Add the missing evidence' },
+    })
+  })
+  it('uses only server-declared retry flags and their defaults', () => {
+    render(
+      <WorkflowExceptionPanel
+        task={task([
+          {
+            ...retry,
+            action: { verb: 'retry', reset_budget: true },
+            parameters: [{ name: 'reset_budget', required: false, boolean_values: [true] }],
+          },
+        ])}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Retry Review' }))
+    expect(screen.getByText('Resets the retry budget')).toBeTruthy()
+    expect(screen.queryByRole('combobox')).toBeNull()
+    expect(screen.queryByLabelText('fresh session')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(mutate.mock.calls[0][0].action).toEqual({ verb: 'retry', reset_budget: true })
+  })
+  it('sends the explicit server override choice', () => {
+    render(
+      <WorkflowExceptionPanel
+        task={task([
+          {
+            ...retry,
+            action: { verb: 'approve', override: true },
+            parameters: [
+              { name: 'override', required: false, boolean_values: [true] },
+              { name: 'reason', required: true, boolean_values: null },
+            ],
+            label: 'Pass Review Manually',
+          },
+        ])}
+      />,
+    )
     fireEvent.click(screen.getByRole('button', { name: 'Pass Review Manually' }))
-    expect(screen.getByText(/failed review remains in history/i)).toBeTruthy()
-    const confirm = screen.getByRole('button', { name: 'Confirm' })
-    expect((confirm as HTMLButtonElement).disabled).toBe(true)
-    fireEvent.change(screen.getByLabelText('Reason'), {
-      target: { value: 'Provider request and local build were verified by the owner.' },
+    expect(screen.getByText('Overrides the failed checks')).toBeTruthy()
+    expect(screen.queryByRole('combobox')).toBeNull()
+    fireEvent.change(screen.getByLabelText(/reason/i), {
+      target: { value: 'Verified independently' },
     })
-    fireEvent.click(confirm)
-
-    expect(onRecover).toHaveBeenCalledWith('mark_reviewed', {
-      reason: 'Provider request and local build were verified by the owner.',
-      context: undefined,
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    expect(mutate.mock.calls[0][0].action).toEqual({
+      verb: 'approve',
+      override: true,
+      reason: 'Verified independently',
     })
-  })
-
-  it('uses the server label for a non-propagating side session', () => {
-    render(
-      <WorkflowExceptionPanel
-        task={task}
-        actions={actions}
-        recoverPending={false}
-        terminal={false}
-        cancelPending={false}
-        onRecover={vi.fn()}
-        onOpenInteractive={vi.fn()}
-        onCancelTask={vi.fn()}
-      />,
-    )
-
-    expect(screen.getByRole('button', { name: 'Open Side Session' })).toBeTruthy()
-    expect(screen.queryByRole('button', { name: 'Open Interactive' })).not.toBeTruthy()
   })
 })

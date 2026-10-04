@@ -2,8 +2,8 @@ use crate::{
     default_data_dir, default_workspace_root, error::ConfigError,
     DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
     DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CORS_ORIGIN,
-    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND,
-    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    DEFAULT_MAX_DISCONNECT_SECONDS, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SCAFFOLD_COMMAND,
+    DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -109,6 +109,15 @@ pub struct ForgePaths {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub max_concurrent_runs: Option<u32>,
+    #[serde(default)]
+    pub build_jobs_per_run: Option<u32>,
+    #[serde(default = "crate::default_run_nice")]
+    pub run_nice: u32,
+    /// Observation index budget in MiB; unset uses 128, zero disables indexing.
+    #[serde(default)]
+    pub usage_index_budget_mb: Option<u32>,
     pub bind: String,
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -121,12 +130,16 @@ pub struct ServerConfig {
     pub cors_origins: Vec<String>,
     #[serde(default = "default_media_upload_limit_bytes")]
     pub media_upload_limit_bytes: u64,
+    #[serde(default = "default_event_consumer_stall_seconds")]
+    pub event_consumer_stall_seconds: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub root: PathBuf,
     pub cleanup_delay_seconds: u64,
+    #[serde(default = "default_max_disconnect_seconds")]
+    pub max_disconnect_seconds: u64,
 }
 
 /// Repository scaffolding run by Genesis provisioning when the approved
@@ -235,12 +248,17 @@ pub struct ProjectSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigOverrides {
+    pub server_max_concurrent_runs: Option<u32>,
+    pub server_build_jobs_per_run: Option<u32>,
+    pub server_run_nice: Option<u32>,
+    pub server_usage_index_budget_mb: Option<u32>,
     pub server_bind: Option<String>,
     pub server_public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,
     pub data_dir: Option<PathBuf>,
     pub workspace_root: Option<PathBuf>,
     pub workspace_cleanup_delay_seconds: Option<u64>,
+    pub workspace_max_disconnect_seconds: Option<u64>,
     pub agent_max_concurrent_tasks: Option<u32>,
     pub agent_heartbeat_interval_seconds: Option<u64>,
     pub agent_max_missed_heartbeats: Option<u32>,
@@ -248,6 +266,7 @@ pub struct ConfigOverrides {
     pub bcrypt_cost: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
     pub media_upload_limit_bytes: Option<u64>,
+    pub event_consumer_stall_seconds: Option<u32>,
 }
 
 impl ForgeConfig {
@@ -337,6 +356,21 @@ impl ForgeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.server.run_nice > 19 {
+            return Err(ConfigError::InvalidConfig {
+                message: "server.run_nice must be between 0 and 19".to_owned(),
+            });
+        }
+        if self.server.event_consumer_stall_seconds == 0 {
+            return Err(ConfigError::InvalidConfig {
+                message: "server.event_consumer_stall_seconds must be positive".to_owned(),
+            });
+        }
+        if self.workspace.max_disconnect_seconds == 0 {
+            return Err(ConfigError::InvalidConfig {
+                message: "workspace.max_disconnect_seconds must be positive".to_owned(),
+            });
+        }
         self.terminal.validate()?;
         self.public_search.validate()?;
         self.providers.validate()
@@ -350,11 +384,21 @@ impl ForgeConfig {
 
 impl Default for ForgeConfig {
     fn default() -> Self {
+        Self::with_data_dir(default_data_dir())
+    }
+}
+
+impl ForgeConfig {
+    /// Construct defaults with an explicit data root, without resolving the user's directory.
+    #[must_use]
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
-            forge: ForgePaths {
-                data_dir: default_data_dir(),
-            },
+            forge: ForgePaths { data_dir },
             server: ServerConfig {
+                max_concurrent_runs: None,
+                build_jobs_per_run: None,
+                run_nice: crate::default_run_nice(),
+                usage_index_budget_mb: None,
                 bind: DEFAULT_SERVER_BIND.to_owned(),
                 public_base_url: None,
                 mcp_enabled: true,
@@ -362,10 +406,12 @@ impl Default for ForgeConfig {
                 bcrypt_cost: DEFAULT_BCRYPT_COST,
                 cors_origins: vec![DEFAULT_CORS_ORIGIN.to_owned()],
                 media_upload_limit_bytes: DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
+                event_consumer_stall_seconds: default_event_consumer_stall_seconds(),
             },
             workspace: WorkspaceConfig {
                 root: default_workspace_root(),
                 cleanup_delay_seconds: DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+                max_disconnect_seconds: DEFAULT_MAX_DISCONNECT_SECONDS,
             },
             agent: AgentDefaults {
                 max_concurrent_tasks: DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
@@ -549,8 +595,16 @@ fn default_media_upload_limit_bytes() -> u64 {
     DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES
 }
 
+fn default_max_disconnect_seconds() -> u64 {
+    DEFAULT_MAX_DISCONNECT_SECONDS
+}
+
 fn parse_trusted_origin(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
     let origin = url.origin();
     origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+fn default_event_consumer_stall_seconds() -> u32 {
+    crate::DEFAULT_EVENT_CONSUMER_STALL_SECONDS
 }

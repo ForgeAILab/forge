@@ -1,9 +1,41 @@
 use super::*;
+use crate::ProjectSlotCounts;
 use crate::{
     AssigneeKind, CreateTransitionLog, LatestExecutionMetadataClaim, RestoreQueuedRecovery,
     TaskRoleAssignment,
 };
 use std::collections::HashSet;
+
+/// Load the assignment that authorizes an execution while holding the same
+/// writer transaction that will create it. Coder rows resolve child first,
+/// then direct parent; every other role remains Task-local.
+pub(super) async fn effective_execution_assignment_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    role_name: &str,
+) -> Result<Option<SqliteRow>> {
+    Ok(sqlx::query(
+        "SELECT assignment.id,
+                assignment.assignee_type,
+                assignment.assignee_id,
+                assignment.updated_at
+         FROM task
+         JOIN task_role_assignment AS assignment
+           ON assignment.role_name = ?
+          AND (assignment.task_id = task.id
+               OR (? = 'coder'
+                   AND task.parent_task_id IS NOT NULL
+                   AND assignment.task_id = task.parent_task_id))
+         WHERE task.id = ?
+         ORDER BY CASE WHEN assignment.task_id = task.id THEN 0 ELSE 1 END
+         LIMIT 1",
+    )
+    .bind(role_name)
+    .bind(role_name)
+    .bind(task_id)
+    .fetch_optional(&mut **transaction)
+    .await?)
+}
 
 async fn load_task<'e, E>(executor: E, id: &str, include_deleted: bool) -> Result<Option<Task>>
 where
@@ -118,6 +150,11 @@ async fn latest_execution_authority_matches_in_tx(
             {
                 return Ok(false);
             }
+        } else if assignment_role == "coder" && task.parent_task_id.is_some() {
+            // Mirrors `TaskService::execution_owns_current_role_attempt`: an
+            // inherited root default worker is admission authority, not live
+            // ownership, so a started child with no coder of its own keeps
+            // its current attempt through completion.
         } else if authority.agent_id.is_some() {
             return Ok(false);
         }
@@ -697,7 +734,8 @@ async fn update_recovery_metadata_inner(
             .get("queued_recovery")
             .and_then(|queued| queued.get("id"))
             .and_then(serde_json::Value::as_str)
-            != Some(expected_id)
+            .unwrap_or_default()
+            != expected_id
         {
             return Err(DbError::VersionConflict);
         }
@@ -760,6 +798,138 @@ async fn update_recovery_metadata_inner(
 
 #[async_trait]
 impl TaskRepo for SqliteDb {
+    async fn count_project_slots(
+        &self,
+        project_id: &str,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<(i64, i64, i64)> {
+        // Every term is 0 or 1, so each CASE equals the boolean it wraps. The
+        // CASE is for evaluation order: SQLite stops a CASE condition at the
+        // first deciding operand, but as a plain result value it evaluates
+        // every operand, running the review, child and execution probes even
+        // for rows the earlier operands already decide.
+        Ok(sqlx::query_as(
+            "WITH project_states AS (
+                SELECT key AS name, json_extract(value, '$.kind') AS kind,
+                       json_extract(value, '$.owns_work') AS owns_work FROM json_each(?)
+             ), subtask_states AS (
+                SELECT key AS name, json_extract(value, '$.kind') AS kind,
+                       json_extract(value, '$.owns_work') AS owns_work FROM json_each(?)
+             ), visible AS MATERIALIZED (
+                SELECT t.id, t.parent_task_id,
+                       COALESCE(s.kind, p.kind) AS kind,
+                       COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
+                       CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
+                       (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                        OR CASE WHEN json_valid(t.metadata_json) THEN
+                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
+                           ELSE 0 END
+                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
+                        OR CASE WHEN json_valid(t.error_annotation) THEN
+                            COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
+                           ELSE 0 END
+                        OR COALESCE((SELECT r.status = 'awaiting_human' FROM review r
+                                     WHERE r.task_id = t.id
+                                     ORDER BY r.attempt_number DESC, r.created_at DESC, r.id DESC LIMIT 1), 0))
+                       THEN 1 ELSE 0 END AS parked
+                FROM task t
+                LEFT JOIN subtask_states s ON t.parent_task_id IS NOT NULL AND s.name = t.status
+                LEFT JOIN project_states p ON p.name = t.status
+                WHERE t.project_id = ? AND t.archived_at IS NULL AND t.deleted_at IS NULL
+                  AND COALESCE(s.kind, p.kind) IN ('initial', 'active', 'gate')
+             )
+             SELECT
+               COALESCE(SUM(CASE WHEN kind IN ('active', 'gate') AND NOT parked AND (
+                   parent_task_id IS NOT NULL
+                   OR NOT EXISTS (SELECT 1 FROM task child WHERE child.parent_task_id = visible.id AND child.deleted_at IS NULL)
+                   OR ((owns_work OR EXISTS (SELECT 1 FROM execution e WHERE e.task_id = visible.id AND e.status = 'running'))
+                       AND NOT EXISTS (SELECT 1 FROM visible child WHERE child.parent_task_id = visible.id
+                                       AND child.kind IN ('active', 'gate') AND NOT child.parked))
+               ) THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(kind IN ('active', 'gate') AND parked), 0),
+               COALESCE(SUM(kind = 'initial'), 0)
+             FROM visible",
+        )
+        .bind(project_states_json).bind(subtask_states_json).bind(blocking_kinds_json).bind(project_id)
+        .fetch_one(self.pool()).await?)
+    }
+
+    async fn count_projects_slots(
+        &self,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<Vec<ProjectSlotCounts>> {
+        let rows = sqlx::query(
+            "WITH projects AS MATERIALIZED (
+                SELECT key AS id, value AS states FROM json_each(?)
+             ), project_states AS (
+                SELECT projects.id AS project_id, states.key AS name, json_extract(states.value, '$.kind') AS kind,
+                       json_extract(states.value, '$.owns_work') AS owns_work FROM projects, json_each(projects.states) states
+             ), subtask_states AS (
+                SELECT key AS name, json_extract(value, '$.kind') AS kind,
+                       json_extract(value, '$.owns_work') AS owns_work FROM json_each(?)
+             ), visible AS MATERIALIZED (
+                SELECT t.id, t.project_id, t.parent_task_id,
+                       COALESCE(s.kind, p.kind) AS kind,
+                       COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
+                       CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
+                       (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
+                        OR CASE WHEN json_valid(t.metadata_json) THEN
+                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
+                           ELSE 0 END
+                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
+                        OR CASE WHEN json_valid(t.error_annotation) THEN
+                            COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
+                           ELSE 0 END
+                        OR COALESCE((SELECT r.status = 'awaiting_human' FROM review r
+                                     WHERE r.task_id = t.id
+                                     ORDER BY r.attempt_number DESC, r.created_at DESC, r.id DESC LIMIT 1), 0))
+                       THEN 1 ELSE 0 END AS parked
+                FROM projects JOIN task t ON t.project_id = projects.id
+                LEFT JOIN subtask_states s ON t.parent_task_id IS NOT NULL AND s.name = t.status
+                LEFT JOIN project_states p ON p.project_id = t.project_id AND p.name = t.status
+                WHERE t.archived_at IS NULL AND t.deleted_at IS NULL
+                  AND COALESCE(s.kind, p.kind) IN ('initial', 'active', 'gate')
+             )
+             SELECT project.id AS project_id, project.version AS project_version, project.list_revision,
+               COALESCE(SUM(CASE WHEN kind IN ('active', 'gate') AND NOT parked AND (
+                   parent_task_id IS NOT NULL
+                   OR NOT EXISTS (SELECT 1 FROM task child WHERE child.parent_task_id = visible.id AND child.deleted_at IS NULL)
+                   OR ((owns_work OR EXISTS (SELECT 1 FROM execution e WHERE e.task_id = visible.id AND e.status = 'running'))
+                       AND NOT EXISTS (SELECT 1 FROM visible child WHERE child.parent_task_id = visible.id
+                                       AND child.project_id = visible.project_id
+                                       AND child.kind IN ('active', 'gate') AND NOT child.parked))
+               ) THEN 1 ELSE 0 END), 0) AS active,
+               COALESCE(SUM(kind IN ('active', 'gate') AND parked), 0) AS parked,
+               COALESCE(SUM(kind = 'initial'), 0) AS queued
+             FROM projects JOIN project ON project.id = projects.id
+             LEFT JOIN visible ON visible.project_id = projects.id
+             GROUP BY project.id",
+        )
+        .bind(project_states_json)
+        .bind(subtask_states_json)
+        .bind(blocking_kinds_json)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ProjectSlotCounts {
+                    project_id: row.try_get("project_id")?,
+                    project_version: row.try_get("project_version")?,
+                    list_revision: row.try_get("list_revision")?,
+                    active: row.try_get("active")?,
+                    parked: row.try_get("parked")?,
+                    queued: row.try_get("queued")?,
+                })
+            })
+            .collect()
+    }
+
     async fn create(&self, input: CreateTask) -> Result<Task> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let task = TaskRepo::create_in_tx(self, &mut transaction, input).await?;
@@ -815,114 +985,8 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>> {
-        let offset = decode_offset(&query.page.cursor)?;
-        let mut where_parts = vec!["project_id = ?"];
-        if !query.include_deleted {
-            where_parts.push("deleted_at IS NULL");
-        }
-        if !query.include_archived {
-            where_parts.push("archived_at IS NULL");
-        }
-        if !query.include_cancelled && !query.statuses.iter().any(|status| status == "cancelled") {
-            where_parts.push("status != 'cancelled'");
-        }
-        if !query.statuses.is_empty() {
-            where_parts.push("status IN (__STATUSES__)");
-        }
-        if !query.agent_ids.is_empty() {
-            where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE assignee_type = 'agent' AND assignee_id IN (__AGENTS__))");
-        }
-        if !query.assignee_types.is_empty() || !query.assignee_ids.is_empty() {
-            where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE (__ASSIGNEE_TYPE_FILTER__) AND (__ASSIGNEE_ID_FILTER__))");
-        }
-        if query.priority.is_some() {
-            where_parts.push("priority = ?");
-        }
-        let search_pattern = query
-            .q
-            .as_deref()
-            .map(str::trim)
-            .filter(|term| !term.is_empty())
-            .map(search_like_pattern);
-        if search_pattern.is_some() {
-            where_parts.push("(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ? ESCAPE '\\')");
-        }
-        let status_placeholders = vec!["?"; query.statuses.len()].join(", ");
-        let agent_placeholders = vec!["?"; query.agent_ids.len()].join(", ");
-        let assignee_type_placeholders = vec!["?"; query.assignee_types.len()].join(", ");
-        let assignee_id_placeholders = vec!["?"; query.assignee_ids.len()].join(", ");
-        let assignee_type_filter = if query.assignee_types.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            format!("assignee_type IN ({assignee_type_placeholders})")
-        };
-        let assignee_id_filter = if query.assignee_ids.is_empty() {
-            "1 = 1".to_owned()
-        } else {
-            format!("assignee_id IN ({assignee_id_placeholders})")
-        };
-        let where_sql = where_parts
-            .join(" AND ")
-            .replace("__STATUSES__", &status_placeholders)
-            .replace("__AGENTS__", &agent_placeholders)
-            .replace("__ASSIGNEE_TYPE_FILTER__", &assignee_type_filter)
-            .replace("__ASSIGNEE_ID_FILTER__", &assignee_id_filter);
-        let sql = format!(
-            "SELECT {TASK_COLUMNS} FROM task WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
-            where_sql,
-            order_clause(&query.page)
-        );
-        let mut q = sqlx::query(&sql).bind(&query.project_id);
-        for status in &query.statuses {
-            q = q.bind(status);
-        }
-        for agent_id in &query.agent_ids {
-            q = q.bind(agent_id);
-        }
-        for assignee_type in &query.assignee_types {
-            q = q.bind(assignee_type);
-        }
-        for assignee_id in &query.assignee_ids {
-            q = q.bind(assignee_id);
-        }
-        if let Some(priority) = query.priority {
-            q = q.bind(priority);
-        }
-        if let Some(search_pattern) = search_pattern.as_ref() {
-            q = q.bind(search_pattern).bind(search_pattern);
-        }
-        let rows = q
-            .bind(limit(&query.page) + 1)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
-        let items = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
-        let total = if query.page.include_total {
-            let count_sql = format!("SELECT COUNT(*) FROM task WHERE {}", where_sql);
-            let mut q = sqlx::query_scalar::<_, i64>(&count_sql).bind(&query.project_id);
-            for status in &query.statuses {
-                q = q.bind(status);
-            }
-            for agent_id in &query.agent_ids {
-                q = q.bind(agent_id);
-            }
-            for assignee_type in &query.assignee_types {
-                q = q.bind(assignee_type);
-            }
-            for assignee_id in &query.assignee_ids {
-                q = q.bind(assignee_id);
-            }
-            if let Some(priority) = query.priority {
-                q = q.bind(priority);
-            }
-            if let Some(search_pattern) = search_pattern.as_ref() {
-                q = q.bind(search_pattern).bind(search_pattern);
-            }
-            Some(q.fetch_one(&self.pool).await?)
-        } else {
-            None
-        };
-        page_from_items(items, &query.page, offset, total)
+        let mut connection = self.pool.acquire().await?;
+        list_page(&mut connection, query).await
     }
 
     async fn list_by_project_with_metadata_key(
@@ -1168,7 +1232,7 @@ impl TaskRepo for SqliteDb {
             input.expected_version,
             input.error_annotation,
             input.blocked_json,
-            None,
+            input.failed_json,
             &input.updated_at,
             None,
             Vec::new(),
@@ -1239,6 +1303,19 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task> {
+        let (task, _) = self
+            .mutate_metadata_with_change(id, expected_version, mutations, updated_at)
+            .await?;
+        Ok(task)
+    }
+
+    async fn mutate_metadata_with_change(
+        &self,
+        id: &str,
+        expected_version: Option<i64>,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<(Task, bool)> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
@@ -1261,7 +1338,7 @@ impl TaskRepo for SqliteDb {
         }
         if !changed {
             transaction.commit().await?;
-            return Ok(task);
+            return Ok((task, false));
         }
         let metadata_json = metadata.to_json();
         sqlx::query(
@@ -1277,7 +1354,7 @@ impl TaskRepo for SqliteDb {
         task.metadata_json = metadata_json;
         task.updated_at = updated_at.to_owned();
         transaction.commit().await?;
-        Ok(task)
+        Ok((task, true))
     }
 
     async fn mutate_metadata_and_bump_version(
@@ -1902,14 +1979,11 @@ impl TaskRepo for SqliteDb {
                 } else {
                     input.execution.role.as_str()
                 };
-                let assignment = sqlx::query(
-                    "SELECT id, assignee_type, assignee_id, updated_at
-                     FROM task_role_assignment
-                     WHERE task_id = ? AND role_name = ?",
+                let assignment = effective_execution_assignment_in_tx(
+                    transaction,
+                    &input.task_id,
+                    assignment_role,
                 )
-                .bind(&input.task_id)
-                .bind(assignment_role)
-                .fetch_optional(&mut **transaction)
                 .await?;
                 match (
                     admission.expected_assignment_id.as_deref(),
@@ -1953,12 +2027,9 @@ impl TaskRepo for SqliteDb {
             Self::ensure_task_execution_admission_in_tx(transaction, &input.execution, admission)
                 .await?;
         }
-        let mut execution = Self::create_execution_in_tx(
-            transaction,
-            &input.execution,
-            execution_admission.as_ref(),
-        )
-        .await?;
+        let mut execution = self
+            .create_execution_in_tx(transaction, &input.execution, execution_admission.as_ref())
+            .await?;
         // A reviewer/auditor claim owns the selected Review attempt in the
         // same transaction as the Task mutation, Running execution, and
         // initial lease. This keeps claim admission from bypassing the
@@ -2194,4 +2265,118 @@ fn search_like_pattern(term: &str) -> String {
     }
     pattern.push('%');
     pattern
+}
+
+pub(super) async fn list_page(
+    connection: &mut sqlx::SqliteConnection,
+    query: TaskListQuery,
+) -> Result<Page<Task>> {
+    let offset = decode_offset(&query.page.cursor)?;
+    let mut where_parts = vec!["project_id = ?"];
+    if !query.include_deleted {
+        where_parts.push("deleted_at IS NULL");
+    }
+    if !query.include_archived {
+        where_parts.push("archived_at IS NULL");
+    }
+    if !query.include_cancelled && !query.statuses.iter().any(|status| status == "cancelled") {
+        where_parts.push("status != 'cancelled'");
+    }
+    if !query.statuses.is_empty() {
+        where_parts.push("status IN (__STATUSES__)");
+    }
+    if !query.agent_ids.is_empty() {
+        where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE assignee_type = 'agent' AND assignee_id IN (__AGENTS__))");
+    }
+    if !query.assignee_types.is_empty() || !query.assignee_ids.is_empty() {
+        where_parts.push("id IN (SELECT task_id FROM task_role_assignment WHERE (__ASSIGNEE_TYPE_FILTER__) AND (__ASSIGNEE_ID_FILTER__))");
+    }
+    if query.priority.is_some() {
+        where_parts.push("priority = ?");
+    }
+    let search_pattern = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(search_like_pattern);
+    if search_pattern.is_some() {
+        where_parts.push("(LOWER(title) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ? ESCAPE '\\')");
+    }
+    let status_placeholders = vec!["?"; query.statuses.len()].join(", ");
+    let agent_placeholders = vec!["?"; query.agent_ids.len()].join(", ");
+    let assignee_type_placeholders = vec!["?"; query.assignee_types.len()].join(", ");
+    let assignee_id_placeholders = vec!["?"; query.assignee_ids.len()].join(", ");
+    let assignee_type_filter = if query.assignee_types.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        format!("assignee_type IN ({assignee_type_placeholders})")
+    };
+    let assignee_id_filter = if query.assignee_ids.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        format!("assignee_id IN ({assignee_id_placeholders})")
+    };
+    let where_sql = where_parts
+        .join(" AND ")
+        .replace("__STATUSES__", &status_placeholders)
+        .replace("__AGENTS__", &agent_placeholders)
+        .replace("__ASSIGNEE_TYPE_FILTER__", &assignee_type_filter)
+        .replace("__ASSIGNEE_ID_FILTER__", &assignee_id_filter);
+    let sql = format!(
+        "SELECT {TASK_COLUMNS} FROM task WHERE {} ORDER BY {} LIMIT ? OFFSET ?",
+        where_sql,
+        order_clause(&query.page)
+    );
+    let mut q = sqlx::query(&sql).bind(&query.project_id);
+    for status in &query.statuses {
+        q = q.bind(status);
+    }
+    for agent_id in &query.agent_ids {
+        q = q.bind(agent_id);
+    }
+    for assignee_type in &query.assignee_types {
+        q = q.bind(assignee_type);
+    }
+    for assignee_id in &query.assignee_ids {
+        q = q.bind(assignee_id);
+    }
+    if let Some(priority) = query.priority {
+        q = q.bind(priority);
+    }
+    if let Some(search_pattern) = search_pattern.as_ref() {
+        q = q.bind(search_pattern).bind(search_pattern);
+    }
+    let rows = q
+        .bind(limit(&query.page) + 1)
+        .bind(offset)
+        .fetch_all(&mut *connection)
+        .await?;
+    let items = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
+    let total = if query.page.include_total {
+        let count_sql = format!("SELECT COUNT(*) FROM task WHERE {}", where_sql);
+        let mut q = sqlx::query_scalar::<_, i64>(&count_sql).bind(&query.project_id);
+        for status in &query.statuses {
+            q = q.bind(status);
+        }
+        for agent_id in &query.agent_ids {
+            q = q.bind(agent_id);
+        }
+        for assignee_type in &query.assignee_types {
+            q = q.bind(assignee_type);
+        }
+        for assignee_id in &query.assignee_ids {
+            q = q.bind(assignee_id);
+        }
+        if let Some(priority) = query.priority {
+            q = q.bind(priority);
+        }
+        if let Some(search_pattern) = search_pattern.as_ref() {
+            q = q.bind(search_pattern).bind(search_pattern);
+        }
+        Some(q.fetch_one(&mut *connection).await?)
+    } else {
+        None
+    };
+    page_from_items(items, &query.page, offset, total)
 }

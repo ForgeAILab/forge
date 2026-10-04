@@ -68,7 +68,7 @@ pub(crate) struct AdaptiveTaskGovernance {
     pub provenance_json: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct PreparedTaskGovernance {
     pub charter_revision_id: Option<String>,
     pub plan_item_id: Option<String>,
@@ -705,35 +705,6 @@ impl TaskService {
         }
     }
 
-    /// Issue the scheduler's short-lived internal repository authority only
-    /// after the same admission gate used by claim/launch/recovery.  The
-    /// opaque lease is persisted by `WorkspaceLeaseRepo`; no route or chat
-    /// context receives the row, its capability JSON, or a filesystem path.
-    ///
-    /// The database-side lease scope guard repeats the current-Charter and
-    /// capability predicates, so a Charter supersession racing this call
-    /// cannot turn a stale preflight into repository authority.
-    pub(super) async fn issue_workspace_lease(
-        &self,
-        task: &db::Task,
-        workspace: &db::Workspace,
-        role: &str,
-        principal_id: Option<&str>,
-        execution_id: &str,
-    ) -> Result<Option<db::WorkspaceLease>> {
-        self.issue_workspace_lease_with_operation_key(
-            task,
-            workspace,
-            role,
-            principal_id,
-            execution_id,
-            execution_id,
-            None,
-            None,
-        )
-        .await
-    }
-
     /// The issuance body with an explicit idempotency key.  Normal issuance
     /// keys on the execution id; a stale-lease reissue must use the
     /// version-derived key because `operation_idempotency_key` is globally
@@ -1223,7 +1194,9 @@ impl TaskService {
         .fetch_one(self.db.pool())
         .await?;
         if let Some(assignment) =
-            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role.trim()).await?
+            crate::task_hierarchy::effective_role_assignment(&self.db, task, role.trim())
+                .await?
+                .map(|resolved| resolved.assignment)
         {
             if assignment.assignee_type != Some(db::AssigneeKind::Agent)
                 || assignment.assignee_id.as_deref() != Some(principal_id)
@@ -1713,6 +1686,7 @@ mod tests {
             primary_repo_id: Some("repo-1".to_owned()),
             paused_at: None,
             system_pause_reason: None,
+            environment_pause_json: None,
             owner_id: None,
             project_hooks_json: "[]".to_owned(),
             project_work_epoch: 0,

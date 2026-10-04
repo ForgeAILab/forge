@@ -98,7 +98,28 @@ async fn file_backed_migrations_apply_cleanly() {
     let _ = std::fs::remove_file(&db_path);
     let url = format!("sqlite://{}", db_path.display());
     let pool = create_sqlite_pool(&url).await.expect("pool");
-    run_migrations(&pool).await.expect("migrations");
+    // Test builds copy a migrated snapshot into a fresh database, so replay
+    // the bundled directory explicitly: this is the one place every migration
+    // body runs against a real file with a multi-connection WAL pool.
+    let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    run_migrations_from(&pool, &migrations)
+        .await
+        .expect("migrations");
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("history loads");
+    let bundled = fs::read_dir(&migrations)
+        .expect("migration directory reads")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "sql"))
+        })
+        .count() as i64;
+    assert_eq!(applied, bundled);
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
 }
 
 #[tokio::test]
@@ -5099,4 +5120,165 @@ async fn timestamp_migration_merged_after_a_newer_one_still_runs() {
     pool.close().await;
     let _ = fs::remove_file(db_path);
     let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn daemon_migrations_arriving_after_integration_preserve_existing_workspaces() {
+    let dir = unique_temp_path("daemon-late-migrations");
+    fs::create_dir_all(&dir).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        // The integration branch held migrations up to 202610010600 when the
+        // two daemon migrations arrived late. Everything written after that
+        // point may depend on them and has only ever run after them.
+        if matches!(
+            migration_version(filename),
+            Some(202_610_010_400 | 202_610_010_530)
+        ) || migration_version(filename).is_some_and(|version| version > 202_610_010_600)
+        {
+            continue;
+        }
+        fs::copy(&path, dir.join(filename)).unwrap();
+    }
+    let (pool, db_path) = migration_test_pool("daemon-late-db").await;
+    run_migrations_from(&pool, &dir).await.unwrap();
+    sqlx::raw_sql("INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at) VALUES ('late-project', 'keep', '{}', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+        INSERT INTO repo (id, project_id, name, local_path, work_mode, default_branch, created_at, updated_at) VALUES ('late-repo', 'late-project', 'repo', '/existing/checkout', 'direct_merge', 'main', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+        INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at) VALUES ('late-task', 'late-project', 'keep task', 'task', 'in_progress', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+        INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at) VALUES ('late-workspace', 'late-task', 'late-repo', '/existing/worktree', 'task/keep', 'ready', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');")
+        .execute(&pool).await.unwrap();
+    for entry in fs::read_dir(&source).unwrap() {
+        let path = entry.unwrap().path();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        if !dir.join(filename).exists() {
+            fs::copy(&path, dir.join(filename)).unwrap();
+        }
+    }
+    run_migrations_from(&pool, &dir).await.unwrap();
+    let preserved: (String, String, String) = sqlx::query_as("SELECT t.title, p.workspace_handle, l.path FROM task t JOIN workspace_placement p ON p.task_id = t.id JOIN repo_location l ON l.id = p.repo_location_id WHERE t.id = 'late-task'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        preserved,
+        (
+            "keep task".into(),
+            "/existing/worktree".into(),
+            "/existing/checkout".into()
+        )
+    );
+    assert!(table_exists(&pool, "workspace_expected_head").await);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version IN (202610010400,202610010410,202610010500,202610010530,202610010550,202610010600)").fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 6);
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn conflict_hotspot_migration_seeds_current_head_on_migrated_clone() {
+    let migration_dir = unique_temp_path("conflict-hotspot-migrations");
+    fs::create_dir_all(&migration_dir).unwrap();
+    copy_migrations_up_to(202610032059, &migration_dir);
+    let db_path = unique_temp_path("conflict-hotspot-db").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.unwrap();
+    run_migrations_from(&pool, &migration_dir).await.unwrap();
+    let log_time = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+    sqlx::query("INSERT INTO project (id, name, settings, workflow_definition, created_at, updated_at) VALUES ('hotspot-format-project', 'format', '{}', '{}', ?, ?)")
+        .bind(&log_time).bind(&log_time).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO task (id, project_id, title, created_at, updated_at) VALUES ('hotspot-format-task', 'hotspot-format-project', 'format', ?, ?)")
+        .bind(&log_time).bind(&log_time).execute(&pool).await.unwrap();
+    db::TransitionLogRepo::insert(
+        &db::SqliteDb::new(pool.clone()),
+        db::CreateTransitionLog {
+            id: "hotspot-format-log".into(),
+            task_id: "hotspot-format-task".into(),
+            from_state: "merging".into(),
+            to_state: "merge_failed".into(),
+            trigger_name: None,
+            triggered_by: "system:workflow".into(),
+            trigger_reason: "format probe".into(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: log_time.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let stored: String =
+        sqlx::query_scalar("SELECT created_at FROM transition_log WHERE id = 'hotspot-format-log'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, log_time);
+    assert!(stored.ends_with("+00:00"));
+    sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, payload_json, created_at) VALUES ('hotspot-before-upgrade', 'task.transitioned', 'task', 'task-before', 'system', 'task', 'task-before', 'upgrade-test', '{\"project_id\":\"project-before\"}', '2026-10-03T20:00:00Z')")
+        .execute(&pool).await.unwrap();
+    let head: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM domain_event")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // Close and reopen the already-migrated file, as a clone upgrade does.
+    pool.close().await;
+    let pool = create_sqlite_pool(&url).await.unwrap();
+    run_migrations(&pool).await.unwrap();
+    let cursor: (i64, i64) = sqlx::query_as("SELECT last_sequence, version FROM event_consumer_cursor WHERE consumer_name = 'conflict-hotspots'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(cursor, (head, 1));
+    let cutover: i64 = sqlx::query_scalar("SELECT cutover_sequence FROM event_consumer_cutover WHERE consumer_name = 'conflict-hotspots'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(cutover, head);
+    let cutover_time: String = sqlx::query_scalar(
+        "SELECT created_at FROM event_consumer_cutover WHERE consumer_name = 'conflict-hotspots'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(cutover_time.ends_with("+00:00"));
+    assert!(stored < cutover_time);
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&cutover_time)
+            .unwrap()
+            .offset()
+            .local_minus_utc(),
+        0
+    );
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('conflict_hotspot_boundary')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(columns.contains(&"open_since".to_owned()));
+    let cascade: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('conflict_hotspot_boundary') WHERE [table] = 'project' AND on_delete = 'CASCADE'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(cascade, 1);
+    let historical: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE id = 'hotspot-before-upgrade'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(historical, 1);
+    sqlx::query("UPDATE event_consumer_cursor SET last_sequence = last_sequence + 1, version = version + 1 WHERE consumer_name = 'conflict-hotspots'")
+        .execute(&pool).await.unwrap();
+    run_migrations(&pool).await.unwrap();
+    let cursor_after: (i64, i64) = sqlx::query_as("SELECT last_sequence, version FROM event_consumer_cursor WHERE consumer_name = 'conflict-hotspots'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(cursor_after, (head + 1, 2));
+    let index: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_domain_event_type_sequence'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(index, 1);
+    let boundaries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conflict_hotspot_boundary")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(boundaries, 0);
+    pool.close().await;
+    fs::remove_file(db_path).unwrap();
+    fs::remove_dir_all(migration_dir).unwrap();
 }

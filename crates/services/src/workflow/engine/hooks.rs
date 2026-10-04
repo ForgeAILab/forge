@@ -320,6 +320,7 @@ mod tests {
             primary_repo_id: None,
             paused_at: None,
             system_pause_reason: None,
+            environment_pause_json: None,
             owner_id: None,
             project_hooks_json: "[]".to_owned(),
             project_work_epoch: 0,

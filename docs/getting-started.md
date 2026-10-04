@@ -338,9 +338,105 @@ FORGE_DATA_DIR=./test cargo run -p forge-cli    # override data dir via env
 ```
 
 Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
-`FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_PUBLIC_SEARCH_ENDPOINT`,
+`FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_MAX_DISCONNECT_SECONDS`,
+`FORGE_PUBLIC_SEARCH_ENDPOINT`,
 `FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`,
+`FORGE_EVENT_CONSUMER_STALL_SECONDS`,
 `FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
+
+### Usage index memory budget
+
+The usage observation index defaults to a **128 MiB** memory budget. Set
+`server.usage_index_budget_mb` in `forge.yaml`,
+`FORGE_SERVER_USAGE_INDEX_BUDGET_MB`, or `forge --usage-index-budget-mb N`.
+Launch precedence is CLI > environment > config file > the 128 MiB default.
+Values are non-negative integers in MiB; `0` disables the index and uses
+memoized full reads. For example:
+
+```yaml
+server:
+  usage_index_budget_mb: 64
+```
+
+In **Forge Settings → Server**, edit **Usage index memory budget**; leave it
+blank to restore 128 MiB. The saved budget applies without a restart: on the
+next usage read, a fitting index remains warm, an oversized index is discarded,
+and a changed budget retries a previously discarded index from the ledger.
+Raising the budget can therefore rebuild the index on the next read. A live
+setting supersedes launch overrides until the next restart. **Operations** shows
+the estimated index charge, budget, and incremental or memoized read path.
+
+### Limit concurrent machine runs
+
+Forge defaults to half the host's logical cores, with a minimum of two runs.
+In Forge Settings → Server, set **Max concurrent runs** to a positive integer,
+leave it blank for automatic, or use zero for unlimited. Saving applies
+immediately to new admissions and leaves current work running.
+
+Server YAML uses `server.max_concurrent_runs`; environment and launch overrides
+are `FORGE_SERVER_MAX_CONCURRENT_RUNS` and `--max-concurrent-runs`. Daemons use
+the top-level `max_concurrent_runs` in their local `daemon.yaml` (beside the
+credentials file), or the same flag when launched. Machines shows the daemon's
+reported cap, an admin-editable limit, and the effective lower ceiling.
+Operations includes server-host occupancy and all remote machines. Full
+machines leave Tasks queued until a dispatcher tick sees a free slot. Chat
+turns count toward occupancy but retain their current independent admission.
+
+### Database space and consumer health
+
+Configure the consumer stall threshold with the usual
+**CLI > environment > file > default** precedence:
+
+```yaml
+server:
+  event_consumer_stall_seconds: 300    # positive seconds; default five minutes
+```
+
+The server flag is `--event-consumer-stall-seconds`; the environment variable is
+`FORGE_EVENT_CONSUMER_STALL_SECONDS`. A consumer is stalled only while it has
+unprocessed events and its cursor has not advanced for longer than the threshold.
+A caught-up consumer is never stalled. The expected set follows the workers this
+process starts; disabled workers and their historical cursors are omitted.
+
+Pool connections use WAL with `synchronous=NORMAL`. Committed transactions survive
+process crashes; a power loss or OS crash can lose the most recent commits, while
+WAL recovery preserves database consistency. New databases enable incremental
+auto-vacuum before the first table is created. Every five seconds the storage
+maintenance worker runs
+`PRAGMA incremental_vacuum(100)` to reclaim at most 100 free pages. At 4 KiB per
+page, about 580 MB of free pages can drain in two hours, with each write-lock
+acquisition bounded to 100 pages. The worker is a no-op outside incremental mode.
+The Operations status reports the current mode and free-page count; free pages
+remain reusable even without vacuum.
+
+Existing databases keep their current auto-vacuum mode. To convert one, stop all
+Forge processes using that data directory, then run:
+
+```bash
+forge --data-dir ./test --convert-db-to-incremental-vacuum
+# Installed default data directory:
+forge --convert-db-to-incremental-vacuum
+```
+
+This command runs a one-time full `VACUUM` and exits without starting the server,
+workers, or migrations. It holds the same `<data-dir>/runtime.lock` as the server
+and Solo, and an exclusive SQLite lock for the conversion. Normal requests and
+other database connections cannot use the file during the rebuild. Plan free
+disk at least comparable to the database size; SQLite can require **up to twice
+the database size in additional free disk space** for the temporary rebuild and
+journal/WAL. Data is preserved. Conversion failure reports an error; restart
+Forge only after the command exits. Already-incremental databases are left in
+that mode without another full rebuild. Existing databases are never fully
+vacuumed automatically.
+
+`workspace.max_disconnect_seconds` in `forge.yaml` bounds how long a daemon-owned
+placement, or a server-owned workspace executed on a remote daemon, waits for
+that daemon to reconnect. Both freeze heartbeat leases to prevent a second
+execution from writing to a live worktree on a shared mount. The same bound
+covers a Task queued on an offline owner before its first placement exists.
+It defaults to `86400` (24 hours) and must be positive. `FORGE_MAX_DISCONNECT_SECONDS` overrides the file value.
+After the bound elapses, the placement and running execution fail with
+`owner_disconnected_timeout`; execution hard deadlines still apply during the wait.
 
 ### Commands an Agent may run in its workspace
 
@@ -442,6 +538,14 @@ Point the command at a local spark checkout to develop against unreleased
 templates (`bun /path/to/spark/packages/create-spark/src/cli.ts`); the
 `SPARK_ROOT` environment variable is passed through. A missing runtime is a
 typed, retryable `scaffold_runtime_unavailable` provisioning failure.
+
+Forge's layout guidance favors small feature modules with clear ownership.
+Split Tasks along module boundaries and name the modules/files each owns;
+parallel Tasks should edit disjoint files. Avoid shared hub files; prefer
+per-feature discovery or registration without shared-list edits. If a shared
+edit is unavoidable, give one Task ownership and make the others depend on it.
+The Forge section exported to a scaffold's `AGENTS.md` carries the same rule
+and tells workers to report required edits outside their Task scope.
 
 ### Local development data dir
 
@@ -963,7 +1067,7 @@ Project's current primary Repo only when admitting a new execution.
 When repository setup, dependencies, assignment, workflow, source availability,
 and the current Task version all pass, the
 scheduler assigns the selected Worker and issues one Task-scoped Workspace
-lease pinned to that Workspace's Repo. `POST /api/v1/tasks/{id}/start`/`resume` and normal workflow scheduling
+lease pinned to that Workspace's Repo. `POST /api/v1/tasks/{id}/actions` with `start` or the offered `release`/`retry` and normal workflow scheduling
 use the same admission checks. An Agent serving as Main or Project Agent may
 also receive that lease when explicitly assigned, but the Task session is
 isolated from its chat session. Inspect the linked Task, transitions, executions, and Workspace
@@ -972,7 +1076,7 @@ diff through `GET /api/v1/tasks/{id}`, `GET /api/v1/tasks/{id}/transitions`,
 `GET /api/v1/tasks/{id}/diff`.
 
 After an attempt starts, its Workspace/lease repository identity is immutable
-provenance for diff, review, pull request, evidence, and release records. A
+provenance for diff, review, evidence, and release records. A
 later Project repository change does not rewrite that history, and Forge does
 not silently reuse an old-Repo Workspace for a new attempt.
 
@@ -1174,11 +1278,132 @@ local CLI availability and keeps the command stream open. `daemon link` and
 `daemon start` create the configured workspace root if it does not already
 exist, so filesystem browsing can open the launch directory immediately.
 
-Execution dispatch expects the server-created task worktree to exist at the same
-absolute path on the daemon host. For containers, mount the server workspace
-root into the container at that same path. A daemon on an unrelated filesystem
-can still serve filesystem browsing under its own `--workspace-root`, but it
-cannot run server-created task worktrees yet.
+### Register a machine-local repository
+
+A linked daemon can own the whole Task workspace lifecycle on its machine:
+preparation, CLI execution, review checks, direct merge, and cleanup. The server
+does not need access to that machine's checkout or worktree paths.
+
+1. Link or start the daemon with `--workspace-root` containing both the checkout
+   you want to register and its generated workspaces. For example, use
+   `/Volumes/Data/codes` for a checkout at `/Volumes/Data/codes/app`; the default
+   `$HOME/.forge/workspaces` root would not contain that checkout.
+2. Register that checkout as a `daemon`-owned `primary_checkout` location for
+   the Project's repository, supplying the linked daemon ID, runtime ID, and
+   machine-local path. Use the [repository location commands](cli.md#repository-locations)
+   to add, inspect, verify, and optionally make it the default location.
+3. Check that the location is `ready`. The daemon verifies that the path is
+   within its root, is a Git worktree, resolves the repository's default branch,
+   and has a matching remote when present. `unverified`, `unavailable`, and
+   `invalid` locations cannot receive work; inspect the last error and retry
+   verification after fixing the checkout or reconnecting the daemon.
+4. Use CLI Agents for every assigned worktree role (coder, reviewer, planner).
+   Install, authenticate, and enable their executors on that daemon, and allow
+   the configured run purposes below. Native Agents are outside this slice.
+
+Claim reserves capacity, prepares the workspace on its owner, then creates the
+Task claim, Running Execution, and lease. Preparation failure creates no
+Execution and spends no retry budget. An unpinned CLI Agent runs on the owner
+selected from eligible locations; a daemon pin restricts that selection. If no
+owner qualifies, claim returns `placement_unavailable` with rejection reasons.
+Task and Workspace responses expose `placement` so you can inspect the owner
+and state. Once prepared, retries and subtasks sharing that workspace stay on
+the same owner.
+
+If the daemon disconnects, the placement becomes `disconnected` and work waits.
+Running leases are frozen until reconciliation or `max_disconnect` (default
+24 hours), while hard deadlines still apply. Reconnect reconciles active and
+journaled executions before dispatch resumes. You can wait, retry on that owner,
+or cancel. Cleanup remains `cleaning` until the owner acknowledges it. See
+[the placement and failure model](architecture.md#workspace-placement).
+
+For containers sharing server workspaces, register a server-owned `shared_mount`
+location instead. Forge verifies a server-written probe through the daemon at
+the same path before using it as an execution provider. Matching absolute paths
+alone are insufficient. Daemon ownership requires revision 3 with `workspace.v1`.
+
+Upgrade the server first, then every daemon using `forge-ctl` from that server
+release (protocol revision 3 or newer), restarting each with its existing
+`--workspace-root`.
+A revision-2 connection receives `daemon_upgrade_required` and cannot use any
+command RPC: execution, repository verification, filesystem browsing
+(`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
+shows `upgrade_required`; pinned Agents and refused Task admissions carry
+`daemon_upgrade_required` with instructions to install the daemon from the
+server's release. Repository locations retain upgrade reasons after a verification
+attempt, without changing their verification status. Task admission is an upgrade refusal only
+when an otherwise eligible owner is blocked solely by the upgrade (disregarding
+facts absent from the revision-3 handshake), and no owner is blocked solely by
+capacity or a transient condition. It creates no Execution or retry-budget charge.
+Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
+reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+is the required human action. The old daemon logs the instruction through its
+existing warning handler; a new binary also prints it to stderr on connect.
+A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
+Existing ready placements become disconnected while an upgrade is needed, with
+an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
+by default), then fail with `owner_disconnected_timeout`.
+
+### Daemon run policy
+
+The daemon reads `daemon.yaml` beside its credentials file when it starts
+(`~/.forge/daemon.yaml` by default; with `--credentials`, use that file's
+directory). This is local configuration; requests cannot override the effective
+policy loaded at startup. `workspace.run.allow` defaults to `[ci_step]`. To opt into Project hooks and
+environment setup too, save:
+
+```yaml
+workspace:
+  run:
+    allow: [ci_step, hook, environment_setup]
+```
+
+For readiness probes before cloning, also opt in to `environment_probe` and
+`repo_provision` in this same allow list. The daemon advertises
+`machine_probe.v1` and `repo_provision.v1` at protocol revision 3. These purposes
+are accepted only by their dedicated RPCs; `workspace.run` keeps its three
+existing purposes. The default remains `[ci_step]`. Keep only the purposes you
+want to permit; `allow: []` denies every purpose.
+Restart the daemon after editing the file. It advertises the effective policy,
+and claim rejects a daemon with `run_purpose_denied` if the Task's review, hooks,
+or environment needs a disallowed purpose. A refused command returns
+`purpose_denied` and is never retried.
+
+Anyone who can edit server-side review steps, Project hooks, or environment
+checks can run their permitted shell commands on the daemon's machine.
+
+The daemon run policy is not a security boundary against a compromised or
+malicious server: the shell executor and owner operations are not gated by it.
+The server can read anything under the daemon's workspace root. Choose a root
+containing only files you intend to expose to that server. Processes also have
+the daemon user's `HOME`, credentials, and network access.
+
+### Daemon journal migration
+
+Revision 3 keeps terminal reports, their bounded worklog/evidence outbox entries,
+workspace operation results, and cleanup acknowledgements in one journal at
+`<workspace-root>/.forge/journal/`. On first startup after upgrading, the daemon
+automatically converts reports from
+`<workspace-root>/.forge-daemon/terminal-reports/`. Each old report is removed
+only after its journal entry is durably saved; interrupted conversion resumes
+on the next start. Unknown files in the old directory are left intact.
+
+Restart with the same workspace root to migrate its pending reports. No manual
+copy is needed. Unacknowledged terminal and cleanup results replay after
+reconnect until `journal.ack`. After the server durably stores the result, ack
+removes the receipt and releases its space. The whole journal (including its
+registry) is capped at 32 MiB and 1,024 receipts. CI output is capped at 1 MiB per
+stream with a marker before the retained tail; execution time may remain
+unbounded. Unbounded CI retains its exit verdict even when logs are shortened or
+omitted. Completion metadata has reserved headroom in the shared budget. Cleanup
+prunes workspace handles and their execution IDs when its receipt is acknowledged;
+reset and release keep retired review handles fenced until acknowledgement too.
+Requests store environment
+variable names and a digest of the redacted request. Output and errors are
+redacted without changing identities or exit codes. Corrupt or non-regular entries
+are quarantined as `corrupt-<original name>` when possible and logged. A failed
+quarantine is logged and skipped so other entries still replay. Command-stream
+initialization failure stops the process promptly.
 
 ## Where to next
 
@@ -1186,3 +1411,36 @@ cannot run server-created task worktrees yet.
 - **How it's wired together** → [architecture.md](architecture.md)
 - **Run agents from your AI tooling** → [api.md#mcp-tools](api.md#mcp-tools)
 - **Contribute** → [../CONTRIBUTING.md](../CONTRIBUTING.md)
+
+### Per-run build budget and CPU priority
+
+Every CLI agent process (and its children), native tool command, review CI
+step, Project hook and environment check/setup command uses the executing
+machine's build budget. Unset `build_jobs_per_run` computes
+`max(1, logical_cores / run_cap)`: use the configured positive machine cap, or
+the automatic cap `max(2, logical_cores / 2)` when the cap is unset or `0`.
+`build_jobs_per_run: 0` disables Forge's defaults; a positive value is exact.
+Forge supplies `CARGO_BUILD_JOBS=k`, `RUST_TEST_THREADS=k`, `MAKEFLAGS=-j<k>`,
+`CMAKE_BUILD_PARALLEL_LEVEL=k` and `GOFLAGS=-p=<k>`. Each Project's
+`environment.env` takes precedence, then the Forge/daemon process environment,
+then these defaults. These are cooperative tool limits, not a hard CPU quota.
+
+On Unix, run children start with a niceness increment of `run_nice` (default
+`10`, range `0`–`19`; `0` disables it, resulting niceness capped at `19`). Their
+children inherit that priority; Forge's own priority stays unchanged. Failure
+to lower priority logs once and does not fail work. On Windows niceness is a
+no-op. Updates affect newly spawned processes; existing children keep their
+launch environment and priority.
+
+Server controls are `server.build_jobs_per_run` and `server.run_nice` in YAML,
+`FORGE_SERVER_BUILD_JOBS_PER_RUN` and `FORGE_SERVER_RUN_NICE` in the operator
+environment, and `forge --build-jobs-per-run N --run-nice N`. Precedence is file,
+then environment, then flag. Forge Settings changes these values live, with
+cores, effective cap and budget shown beside the machine cap; launch overrides
+apply again after a restart. Operations includes the available server facts.
+
+Daemons use top-level `build_jobs_per_run` and `run_nice` in `daemon.yaml` beside
+their credentials. `forge-daemon`, `forge-ctl daemon link` and
+`forge-ctl daemon start` accept `--build-jobs-per-run N` and `--run-nice N` to
+override the file. This is daemon-local policy, with no transport override and
+no daemon protocol change. Remote policy facts are not reported.

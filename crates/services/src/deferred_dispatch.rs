@@ -26,20 +26,24 @@ pub(crate) struct DeferredDispatch {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct QueuedRecovery {
     pub id: String,
-    pub request: QueuedRecoveryRequest,
+    pub request: QueuedTaskAction,
     pub target_state: String,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
+    #[serde(default)]
+    pub failed_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub(crate) enum QueuedRecoveryRequest {
-    Recover(api_types::RecoverTaskRequest),
-    Resume {
-        resume_reason: Option<String>,
-        agent_id: String,
-    },
+pub(crate) struct QueuedTaskAction {
+    pub action: api_types::TaskAction,
+    pub offer: api_types::Offer,
+    pub actor: api_types::Actor,
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub role_name: Option<String>,
+    #[serde(default)]
+    pub assignment_id: Option<String>,
 }
 
 pub(crate) fn queued_recovery(task: &Task) -> Option<QueuedRecovery> {
@@ -344,7 +348,7 @@ pub(crate) struct DispatchDisposition {
     pub safe_message: String,
 }
 
-fn dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
+pub(crate) fn dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).ok()?;
     serde_json::from_value(metadata.extra.get(DISPOSITION_METADATA_KEY)?.clone()).ok()
 }
@@ -354,59 +358,112 @@ fn dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
 /// changed since. Callers skip the repeat attempt and its warning entirely.
 pub(crate) fn dispatch_disposition_is_current(task: &Task, capability: &str) -> bool {
     dispatch_disposition(task).is_some_and(|disposition| {
-        disposition.task_version == task.version && disposition.capability == capability
+        (disposition.task_version == task.version
+            || matches!(
+                disposition.capability.as_str(),
+                "machine_capacity" | "project_capacity"
+            ))
+            && disposition.capability == capability
     })
 }
 
 /// The disposition still in force for this Task, if any.
 ///
-/// A recorded disposition means the dispatcher has stopped attempting this
-/// capability and will not reconsider until the Task changes or something
-/// wakes it — which is exactly the state a user needs to see, rather than the
-/// Task reading as ordinary queueing.
+/// Role dispositions wait for a Task change or explicit wake. The
+/// `project_capacity` and `machine_capacity` capabilities explain temporary
+/// queueing and are rechecked each tick, since another Task can free a slot.
 pub(crate) fn current_dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
-    dispatch_disposition(task).filter(|disposition| disposition.task_version == task.version)
+    dispatch_disposition(task).filter(|disposition| {
+        disposition.task_version == task.version
+            || matches!(
+                disposition.capability.as_str(),
+                "machine_capacity" | "project_capacity"
+            )
+    })
 }
 
 /// Persist the disposition observed for a dispatch attempt that just failed
-/// deterministically. Callers reach this only after
-/// `dispatch_disposition_is_current` established there was nothing current to
-/// skip, so every call is a genuinely new observation and is safe to log once.
+/// deterministically. Return whether the stored disposition actually changed;
+/// an identical observation preserves its timestamp and produces no refresh.
 pub(crate) async fn record_dispatch_disposition(
     db: &db::SqliteDb,
     task: &Task,
     capability: &str,
     safe_message: &str,
-) -> Result<()> {
-    TaskRepo::mutate_metadata(
+) -> Result<bool> {
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
+    })?;
+    let blocker_digest = dispatch_blocker_digest(safe_message);
+    let safe_message = bounded_safe_message(safe_message);
+    if !(capability == "machine_capacity" && metadata.extra.contains_key("environment_wait"))
+        && dispatch_disposition(task).is_some_and(|disposition| {
+            disposition.task_version == task.version
+                && disposition.capability == capability
+                && disposition.blocker_digest == blocker_digest
+                && disposition.safe_message == safe_message
+        })
+    {
+        return Ok(false);
+    }
+    let value = json!({
+        "task_version": task.version,
+        "capability": capability,
+        "blocker_digest": blocker_digest,
+        "recorded_at": now_rfc3339(),
+        "safe_message": safe_message,
+    });
+    let mutation = match metadata.extra.get(DISPOSITION_METADATA_KEY) {
+        Some(expected) => TaskMetadataMutation::SetIf {
+            key: DISPOSITION_METADATA_KEY.to_owned(),
+            expected: expected.clone(),
+            value,
+        },
+        None => TaskMetadataMutation::SetIfAbsent {
+            key: DISPOSITION_METADATA_KEY.to_owned(),
+            value,
+        },
+    };
+    let mut mutations = vec![mutation];
+    if capability == "machine_capacity" {
+        if let Some(wait) = metadata.extra.get("environment_wait") {
+            mutations.push(TaskMetadataMutation::RemoveIf {
+                key: "environment_wait".to_owned(),
+                expected: wait.clone(),
+            });
+        }
+        if let Some(deferred) = metadata.extra.get("deferred_dispatch").filter(|d| {
+            d["kind"]
+                .as_str()
+                .is_some_and(|k| k.starts_with("environment_"))
+        }) {
+            mutations.push(TaskMetadataMutation::RemoveIf {
+                key: "deferred_dispatch".to_owned(),
+                expected: deferred.clone(),
+            });
+        }
+    }
+    let (_, changed) = TaskRepo::mutate_metadata_with_change(
         db,
         &task.id,
         Some(task.version),
-        vec![TaskMetadataMutation::Set {
-            key: DISPOSITION_METADATA_KEY.to_owned(),
-            value: json!({
-                "task_version": task.version,
-                "capability": capability,
-                "blocker_digest": dispatch_blocker_digest(safe_message),
-                "recorded_at": now_rfc3339(),
-                "safe_message": bounded_safe_message(safe_message),
-            }),
-        }],
+        mutations,
         &now_rfc3339(),
     )
     .await?;
-    Ok(())
+    Ok(changed)
 }
 
-/// Clear a stored disposition, e.g. once dispatch succeeds again.
-pub(crate) async fn clear_dispatch_disposition(db: &db::SqliteDb, task: &Task) -> Result<()> {
+/// Clear a stored disposition, e.g. once dispatch succeeds again, returning
+/// whether the conditional removal actually changed stored metadata.
+pub(crate) async fn clear_dispatch_disposition(db: &db::SqliteDb, task: &Task) -> Result<bool> {
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
     let Some(expected) = metadata.extra.get(DISPOSITION_METADATA_KEY).cloned() else {
-        return Ok(());
+        return Ok(false);
     };
-    TaskRepo::mutate_metadata(
+    let (_, changed) = TaskRepo::mutate_metadata_with_change(
         db,
         &task.id,
         None,
@@ -417,7 +474,7 @@ pub(crate) async fn clear_dispatch_disposition(db: &db::SqliteDb, task: &Task) -
         &now_rfc3339(),
     )
     .await?;
-    Ok(())
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -459,5 +516,51 @@ pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) 
     }
     result?;
     tracing::info!(task_id = %task_id, %reason, "task dispatch woken");
+    Ok(())
+}
+
+/// Only real dispatch observations replace capacity waits. Ordinary edits keep
+/// the parked projection until the dispatcher observes another outcome.
+pub(crate) async fn clear_capacity_wait(db: &db::SqliteDb, task: &Task) -> Result<()> {
+    if dispatch_disposition(task).is_some_and(|d| {
+        matches!(
+            d.capability.as_str(),
+            "machine_capacity" | "project_capacity"
+        )
+    }) {
+        clear_dispatch_disposition(db, task).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn refresh_machine_wait(db: &db::SqliteDb, task: &mut Task) -> Result<()> {
+    *task = TaskRepo::get_by_id(db, &task.id, false)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", &task.id))?;
+    Ok(())
+}
+
+/// A marker older than this transition was not a refusal by its dispatch.
+/// A new refusal may be stamped at the final barrier version without trusting
+/// an old wait as evidence of current capacity.
+pub(crate) async fn finish_machine_wait(
+    db: &db::SqliteDb,
+    task: &mut Task,
+    previous_version: i64,
+) -> Result<()> {
+    refresh_machine_wait(db, task).await?;
+    if let Some(d) = dispatch_disposition(task).filter(|d| {
+        matches!(
+            d.capability.as_str(),
+            "machine_capacity" | "project_capacity"
+        )
+    }) {
+        if d.task_version <= previous_version {
+            crate::placement::machine_precheck::retire_wait(db, task).await?;
+        } else if d.task_version != task.version {
+            record_dispatch_disposition(db, task, &d.capability, &d.safe_message).await?;
+        }
+        refresh_machine_wait(db, task).await?;
+    }
     Ok(())
 }

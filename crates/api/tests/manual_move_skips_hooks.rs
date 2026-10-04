@@ -148,7 +148,7 @@ async fn board_drag_to_active_state_does_not_defer_role_dispatch_hook() {
                 .any(|hook| {
                     hook["action"] == "dispatch_role_agent"
                         && hook["outcome"] == "skipped"
-                        && hook["error"] == "dispatch deferred after board drag"
+                        && hook["error"] == "dispatch deferred to Task dispatcher"
                 })
     }));
 }
@@ -366,7 +366,7 @@ async fn board_drag_to_passive_state_defers_role_dispatch_hook() {
                 .any(|hook| {
                     hook["action"] == "dispatch_role_agent"
                         && hook["outcome"] == "skipped"
-                        && hook["error"] == "dispatch deferred after board drag"
+                        && hook["error"] == "dispatch deferred to Task dispatcher"
                 })
     }));
 }
@@ -469,7 +469,7 @@ async fn test_app() -> Harness {
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(db::SqliteDb::new(pool));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");

@@ -19,6 +19,24 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+/// Compose the shared layout rule into immutable prompt constants without runtime assembly.
+#[macro_export]
+macro_rules! merge_friendly_guidance {
+    ($before:literal, $after:literal) => {
+        concat!(
+            $before,
+            "Use small modules with clear ownership so parallel Tasks edit disjoint files. Avoid hub files (central registries, route tables, export/barrel lists, large shared libraries). Prefer per-feature files discovered/registered without shared-list edits; otherwise give one Task ownership of shared edits and make others depend on it. Split along module boundaries; name owned modules/files in each Task.",
+            $after
+        )
+    };
+}
+
+/// One shared rule for agents shaping managed code and Tasks.
+pub const MERGE_FRIENDLY_LAYOUT_GUIDANCE: &str = merge_friendly_guidance!("", "");
+
+/// Short reminder shared by native Task guidance and MCP tool descriptions.
+pub const MERGE_FRIENDLY_TASK_GUIDANCE: &str = "Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.";
+
 pub use agent_runtime::context::Sensitivity;
 pub use agent_runtime::core::clock::Deadline;
 pub use agent_runtime::core::content::{Message, Role};
@@ -60,10 +78,10 @@ pub use operation_catalog::{
     PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
     PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
     PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION,
-    PROJECT_VALIDATION_OPERATION, SHARED_ORCHESTRATION_OUTCOME, TASK_ADAPTIVE_OPERATION,
-    TASK_CANCEL_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
-    classify_operation, contains_adaptive_authority_override, contains_authority_override,
+    PROJECT_VALIDATION_OPERATION, SHARED_ORCHESTRATION_OUTCOME, TASK_ACTION_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION, classify_operation,
+    contains_adaptive_authority_override, contains_authority_override,
     descriptor as operation_descriptor, is_allowed_project_direct_payload,
     is_approval_required_operation, is_coordination_direct_command,
     is_coordination_generic_proposal, is_denied_operation, is_project_orchestration_operation,
@@ -282,10 +300,16 @@ pub struct AgentTurnRequest {
     pub system_prompt: Option<String>,
     pub history: Vec<Message>,
     pub input: String,
+    /// Bounded server context, contributed to each provider request of the
+    /// turn after the conversation and never written to the session history.
+    /// Never populated by user text or inferred from labels in that text.
+    pub server_state_card: Option<String>,
     /// Programs this turn's workspace commands may spawn, resolved by the
     /// caller from owner configuration and the owning Project. `None` uses
     /// the built-in set; the composition never takes this from model input.
     pub command_allowlist: Option<Arc<CommandAllowlist>>,
+    /// Host-resolved Project environment for build variable overrides.
+    pub environment: std::collections::BTreeMap<String, String>,
     pub cancellation: CancellationToken,
 }
 
@@ -345,9 +369,13 @@ pub struct AgentTurnOutput {
     /// Input tokens the provider wrote to its prompt cache. Disjoint from
     /// `input_tokens`.
     pub cache_write_tokens: u64,
-    /// Per-provider-attempt records from the runtime ledger. This is the
+    /// One record per provider attempt this turn made. This is the
     /// authoritative usage shape; aggregate fields above remain useful for
     /// existing host-local consumers until their projections migrate.
+    ///
+    /// Both cover this turn alone. A persistent session's runtime ledger also
+    /// holds every earlier turn's attempts; those were reported by the turn
+    /// that made them and never appear here again.
     pub usage_reports: Vec<AgentTurnUsageReport>,
     pub telemetry_state: AgentTurnTelemetryState,
     /// Final Agent Runtime context/LCM metadata. Bodies and protected state
@@ -420,6 +448,10 @@ pub enum AgentHostError {
     Configuration(String),
     #[error("runtime authority denied: {0}")]
     Authority(String),
+    #[error("agent is paused")]
+    AgentPaused { agent_id: String },
+    #[error("Project is paused")]
+    ProjectPaused { project_id: String },
     #[error("runtime session not found")]
     SessionNotFound,
     #[error("credential handle not found")]
@@ -438,18 +470,43 @@ pub enum AgentHostError {
     TurnLimitReached { limit: AgentTurnLimit },
     #[error("runtime failed: {0}")]
     Runtime(String),
-    /// The runtime reached a terminal failure after one or more provider
-    /// attempts had already emitted usage telemetry.  The normal `Runtime`
-    /// variant intentionally remains the compact error used by callers that
-    /// do not need accounting; chat and Task adapters can drain these reports
+    /// A runtime failure with typed turn evidence and any usage telemetry
+    /// collected before failure. Chat and Task adapters can drain reports
     /// without reconstructing them from the mutable session snapshot.
     #[error("runtime failed: {message}")]
     RuntimeWithUsage {
         message: String,
+        failure: api_types::TurnFailure,
+        /// The last provider attempt rejected the credential, rather than local config.
+        provider_auth_rejected: bool,
         usage_reports: Vec<AgentTurnUsageReport>,
     },
     #[error("protected persistence failed")]
     ProtectedPersistence,
+}
+
+impl AgentHostError {
+    pub fn turn_failure(&self) -> api_types::TurnFailure {
+        use api_types::{TurnFailure, TurnLimitCause};
+        match self {
+            Self::Authority(_) | Self::AgentPaused { .. } | Self::ProjectPaused { .. } => {
+                TurnFailure::Authority
+            }
+            Self::Configuration(_) | Self::CredentialNotFound | Self::Unsupported(_) => {
+                TurnFailure::Configuration
+            }
+            Self::TurnLimitReached { limit } => TurnFailure::TurnLimit {
+                cause: match limit {
+                    AgentTurnLimit::ProviderAttempts => TurnLimitCause::ProviderAttempts,
+                    AgentTurnLimit::ToolSteps => TurnLimitCause::ToolSteps,
+                    AgentTurnLimit::Time => TurnLimitCause::Time,
+                    AgentTurnLimit::Output => TurnLimitCause::Output,
+                },
+            },
+            Self::RuntimeWithUsage { failure, .. } => failure.clone(),
+            _ => TurnFailure::Unclassified,
+        }
+    }
 }
 
 #[cfg(test)]

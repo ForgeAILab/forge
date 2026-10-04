@@ -183,6 +183,17 @@ pub enum ReviewResult {
     Blocked,
 }
 
+/// Who can resolve the blocking finding within this Task.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum FixableBy {
+    Owner,
+    #[default]
+    #[serde(other)]
+    Coder,
+}
+
 /// What Forge keeps from a reviewer's reply: the result block it ended with
 /// and the Markdown review written before it.
 ///
@@ -190,12 +201,18 @@ pub enum ReviewResult {
 /// `{"result": "...", "reason": "..."}`. Unknown keys in that object are
 /// ignored so any model can produce an acceptable review; the hard guarantee
 /// comes from the required checks Forge runs itself, not from the reviewer's
-/// citations.
+/// citations. Optional `fixable_by` and `repeat` fields route blocking findings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 pub struct ReviewAssessment {
     pub result: ReviewResult,
     pub reason: String,
+    /// Owner-only findings park the Task instead of returning it to the coder.
+    #[serde(default)]
+    pub fixable_by: FixableBy,
+    /// The previous review raised the same finding and it remains unaddressed.
+    #[serde(default)]
+    pub repeat: bool,
     /// The reviewer's Markdown review, without the result block.
     #[serde(default)]
     pub report: String,
@@ -312,4 +329,21 @@ pub fn task_scope_is_read_only(source: &Value) -> bool {
             .and_then(Value::as_str),
         Some("repository_read" | "read_only" | "discovery_read" | "planning_read")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_assessments_default_finding_routing() {
+        for json in [
+            r#"{"result":"fail","reason":"legacy finding"}"#,
+            r#"{"result":"fail","reason":"legacy finding","fixable_by":"unknown"}"#,
+        ] {
+            let assessment: ReviewAssessment = serde_json::from_str(json).unwrap();
+            assert_eq!(assessment.fixable_by, FixableBy::Coder);
+            assert!(!assessment.repeat);
+        }
+    }
 }

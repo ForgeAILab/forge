@@ -386,10 +386,23 @@ impl EmbeddedAgentService {
             // so it carries the same transport the backend composes with.
             forge_agent_host::ScopeToolRuntime {
                 command_allowlist: None,
+                environment: Default::default(),
                 fetch_transport: Some(Arc::new(forge_agent_host::ForgeFetchTransport::new())),
             },
         )
         .map_err(redacted_host_error)
+    }
+
+    pub async fn chat_session_denials(
+        &self,
+        identity_id: &str,
+        profile_id: &str,
+        chat_id: &str,
+        session_id: Option<&str>,
+    ) -> Vec<(String, api_types::DeniedBy)> {
+        self.tool_provider
+            .chat_session_denials(identity_id, profile_id, chat_id, session_id)
+            .await
     }
 
     /// Attach the inquiry runner so a Main Chat can dispatch ephemeral
@@ -406,6 +419,16 @@ impl EmbeddedAgentService {
         input: &crate::native_tools::ExecutionOutboxInput<'_>,
     ) -> crate::native_tools::ExecutionOutboxReport {
         self.tool_provider.ingest_execution_outbox(input).await
+    }
+
+    pub async fn ingest_execution_outbox_entries(
+        &self,
+        input: &crate::native_tools::ExecutionOutboxInput<'_>,
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> crate::native_tools::ExecutionOutboxReport {
+        self.tool_provider
+            .ingest_execution_outbox_entries(input, entries)
+            .await
     }
 
     /// Attach the media storage root so a Task session can capture the
@@ -499,6 +522,13 @@ impl EmbeddedAgentService {
                 None
             }
         }
+    }
+
+    /// Inject an embedded backend while retaining the service's authority graph.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_native_backend(mut self, backend: Arc<NativeAgentRuntimeBackend>) -> Self {
+        self.native_backend = backend;
+        self
     }
 
     pub fn native_backend(&self) -> Arc<NativeAgentRuntimeBackend> {
@@ -2871,6 +2901,12 @@ fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError 
         | forge_agent_host::AgentHostError::Unsupported(message) => {
             ServiceError::invalid_operation(message)
         }
+        forge_agent_host::AgentHostError::AgentPaused { agent_id } => {
+            ServiceError::AgentPaused { agent_id }
+        }
+        forge_agent_host::AgentHostError::ProjectPaused { project_id } => {
+            ServiceError::ProjectPaused { project_id }
+        }
         forge_agent_host::AgentHostError::Runtime(_) => {
             ServiceError::Domain("embedded runtime failed".to_owned())
         }
@@ -2921,6 +2957,23 @@ fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &st
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn non_chat_host_errors_keep_their_service_variants() {
+        assert!(matches!(
+            redacted_host_error(forge_agent_host::AgentHostError::CredentialNotFound),
+            ServiceError::NotFound {
+                entity: "protected_runtime_resource",
+                ..
+            }
+        ));
+        assert!(matches!(
+            redacted_host_error(forge_agent_host::AgentHostError::Configuration(
+                "invalid".into()
+            )),
+            ServiceError::InvalidOperation { .. }
+        ));
+    }
 
     #[test]
     fn native_task_capabilities_keep_sessions_but_disable_lcm() {

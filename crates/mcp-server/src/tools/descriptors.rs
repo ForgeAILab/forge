@@ -4,7 +4,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
     json!([
         tool_descriptor(
             "forge_create_task",
-            "Create one standalone task or one child of a coordination root. parent_task_id creates a shared-workspace subtask relationship; depends_on_ids creates prerequisite gates without sharing a workspace. Never use the parent as a dependency.",
+            &format!("Create one standalone task or one child of a coordination root. parent_task_id creates a shared-workspace subtask relationship; depends_on_ids creates prerequisite gates without sharing a workspace. Never use the parent as a dependency. Name owned repository-relative paths in the description; keep parallel Task files disjoint and use depends_on_ids to order shared-file edits. {}", services::operating_skills::merge_friendly_task_guidance()),
             json!({
                 "project_id": { "type": "string" },
                 "title": { "type": "string" },
@@ -95,12 +95,10 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             &["task_id", "agent_id"],
         ),
         tool_descriptor(
-            "forge_cancel_task",
-            "Cancel a task.",
-            json!({
-                "task_id": { "type": "string" }
-            }),
-            &["task_id"],
+            "forge_task_action",
+            "Apply one of the Task's current available_actions at an exact version.",
+            json!({ "task_id": { "type": "string" }, "action": api_types::task_action_schema(), "version": { "type": "integer" } }),
+            &["task_id", "action", "version"],
         ),
         tool_descriptor(
             "forge_get_task_diff",
@@ -135,7 +133,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_transition_task",
-            "Transition a task to another status.",
+            "Transition a task to another status. Returns the committed Task; pending_steps counts follow-ups that run asynchronously.",
             json!({
                 "task_id": { "type": "string" },
                 "status": { "type": "string", "enum": ["todo", "in_progress", "review", "merging", "merge_failed", "done", "cancelled", "blocked"] },
@@ -304,12 +302,12 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_create_sub_tasks",
-            "Atomically create ordered children under a root coordination task. The root becomes a non-executing coordination container; children share its workspace, run serially in array order, and can be assigned to different agents. Responses include each child's role_assignments. Array order is not a dependency graph.",
+            &format!("Atomically create ordered children under a root coordination task. The root becomes a non-executing coordination container; its coder is retained as the default worker, while children may override it. Children share the root workspace and run serially in array order. Responses include each child's stored role_assignments. Array order is not a dependency graph. {}", services::operating_skills::merge_friendly_task_guidance()),
             json!({
                 "parent_task_id": { "type": "string", "description": "Root coordination task; nested subtasks are not supported" },
                 "subtasks": {
                     "type": "array",
-                    "description": "Children in execution order. Assign implementation agents per child, not to the coordination root.",
+                    "description": "Children in execution order. A child assignee overrides the coordination root's coder default worker.",
                     "items": {
                         "type": "object",
                         "properties": {

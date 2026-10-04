@@ -1,6 +1,23 @@
 use super::*;
 
 impl TaskService {
+    /// Refuse paused Projects before placement or launch side effects. The
+    /// execution INSERT still rechecks admission atomically for concurrent pauses.
+    pub(in crate::task_service) async fn ensure_project_not_paused(
+        &self,
+        task: &Task,
+    ) -> Result<()> {
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        if project.paused_at.is_some() {
+            return Err(ServiceError::ProjectPaused {
+                project_id: project.id,
+            });
+        }
+        Ok(())
+    }
+
     /// Admit an execution attempt against the coordination hierarchy before a
     /// caller transitions a Task or prepares a workspace.  A root with
     /// children is a container: only its aggregate reviewer may run after
@@ -118,7 +135,30 @@ impl TaskService {
             let agent = AgentRepo::get_by_id(&*self.db, agent_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-            let status = compute_effective_status(&self.db, &agent).await?;
+            let placed = match current_execution.workspace_id.as_deref() {
+                Some(id) => db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, id)
+                    .await?
+                    .is_some(),
+                None => false,
+            };
+            let status = if placed && agent.backend_kind == "cli" {
+                // Admission already chose the executor owner. Availability
+                // display resolves Agent pins and must not change that route.
+                if agent.paused {
+                    EffectiveStatus::Paused
+                } else if agent.status == db::AgentStatus::Error {
+                    EffectiveStatus::Error
+                } else if crate::agent_capacity::count_occupied_agent_slots(&self.db, &agent.id)
+                    .await?
+                    >= agent.max_concurrent_tasks
+                {
+                    EffectiveStatus::Busy
+                } else {
+                    EffectiveStatus::Active
+                }
+            } else {
+                compute_effective_status(&self.db, &agent, None).await?
+            };
             if status == EffectiveStatus::Active
                 || self
                     .busy_only_because_current_execution(&status, &agent, execution)
@@ -162,27 +202,35 @@ impl TaskService {
             return Ok(false);
         }
         let running_count = count_running_executions(&self.db, &agent.id).await?;
-        if running_count <= agent.max_concurrent_tasks {
+        let occupied_slots =
+            crate::agent_capacity::count_occupied_agent_slots(&self.db, &agent.id).await?;
+        if running_count > 0 && occupied_slots <= agent.max_concurrent_tasks {
             return Ok(true);
         }
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let role_assignment = match execution.role.as_str() {
-            "executor" | crate::workflow::default_roles::CODER => {
-                self.coder_assignment(&task.id).await?
-            }
-            role => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?,
-        };
-        if !matches!(
-            role_assignment.as_ref(),
+        let resolved_assignment =
+            crate::task_hierarchy::effective_role_assignment(&self.db, &task, &execution.role)
+                .await?;
+        let assignment_matches = matches!(
+            resolved_assignment.as_ref().map(|resolved| &resolved.assignment),
             Some(assignment)
                 if assignment.assignee_type == Some(AssigneeKind::Agent)
                     && assignment.assignee_id.as_deref() == Some(&agent.id)
-        ) {
+        );
+        let admitted_inherited_attempt = matches!(
+            execution.role.as_str(),
+            "executor" | crate::workflow::default_roles::CODER
+        ) && task.parent_task_id.is_some()
+            && !resolved_assignment
+                .as_ref()
+                .is_some_and(|resolved| resolved.source == api_types::EffectiveCoderSource::Own)
+            && execution.agent_id.as_deref() == Some(&agent.id);
+        if !assignment_matches && !admitted_inherited_attempt {
             return Ok(false);
         }
-        Ok(running_count <= agent.max_concurrent_tasks)
+        Ok(running_count > 0 && occupied_slots <= agent.max_concurrent_tasks)
     }
 
     pub(super) async fn ensure_no_running_interactive_execution(
@@ -272,9 +320,8 @@ impl TaskService {
     }
 
     /// Terminalize a pre-dispatch execution while leaving its Task projection
-    /// to the caller. Environment failures use their own typed blocking
-    /// annotation and must not briefly publish the generic executor-failed
-    /// projection first.
+    /// to the caller. Environment failures pause the Project and must not
+    /// publish a generic executor-failed Task blocker.
     pub(super) async fn fail_execution_before_dispatch_without_task_block(
         &self,
         execution_id: &str,
@@ -297,7 +344,11 @@ impl TaskService {
         // so these stay auto-resumable; anything else waits for a human.
         let transient_authority_race =
             error.contains("WorkspaceLease") || error.contains("version conflict");
-        let resume_policy = if transient_authority_race {
+        // Environment preflights recover through the Project pause rather
+        // than a Task recovery action or execution retry budget.
+        let environment_pre_dispatch =
+            error.starts_with(crate::project_environment::ENVIRONMENT_PRE_DISPATCH_ERROR_PREFIX);
+        let resume_policy = if transient_authority_race || environment_pre_dispatch {
             db::ResumePolicy::Auto
         } else {
             db::ResumePolicy::Manual

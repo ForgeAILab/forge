@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import {
   type InfiniteData,
+  replaceEqualDeep,
   useInfiniteQuery,
   useMutation,
   useQuery,
@@ -10,6 +11,8 @@ import {
   ApiError,
   getAccountUsageAnalytics,
   apiFetch,
+  fetchTaskList,
+  retainTaskListEtag,
   addDependency,
   addMember,
   searchUsers,
@@ -32,8 +35,11 @@ import {
   listWorkflowTemplates,
   markAllNotificationsRead,
   markNotificationRead,
-  recoverTask,
+  applyTaskAction,
+  recheckProjectEnvironment,
   refreshOperations,
+  replayDeadLetter,
+  dismissDeadLetter,
   removeDependency,
   removeMember,
   saveWorkflowTemplate,
@@ -88,7 +94,6 @@ import type {
   ValidationResult,
   Repo,
   Review,
-  ReviewDecisionResponse,
   Task,
   TaskMediaResponse,
   TaskDetailResponse,
@@ -97,10 +102,9 @@ import type {
   TransitionLogEntry,
   TransitionTaskResponse,
   TransitionTaskRequest,
-  RejectReviewRequest,
   UpdateAgentRequest,
   SaveWorkflowTemplateRequest,
-  RecoveryAction,
+  TaskActionRequest,
   UpdateProjectRequest,
   UpdateProjectWorkflowRequest,
   UpdateTaskRequest,
@@ -472,6 +476,17 @@ export function useResumeProject() {
   })
 }
 
+export function useRecheckProjectEnvironment() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: recheckProjectEnvironment,
+    onSuccess: ({ project }) => {
+      void queryClient.invalidateQueries({ queryKey: qk.project(project.id) })
+      void queryClient.invalidateQueries({ queryKey: qk.projects })
+    },
+  })
+}
+
 export function useDeleteProject() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -500,13 +515,28 @@ export function useTasksQuery(
   search: TaskSearch,
   options: { enabled?: boolean } = {},
 ) {
+  const queryClient = useQueryClient()
+  const queryKey = qk.tasks(projectId, filterKey(search))
   return useInfiniteQuery({
-    queryKey: qk.tasks(projectId, filterKey(search)),
-    queryFn: ({ pageParam, signal }) =>
-      apiFetch<TasksResponse>(`/projects/${projectId}/tasks`, {
-        search: { ...search, cursor: pageParam as string | undefined },
+    queryKey,
+    queryFn: ({ pageParam, signal }) => {
+      const cached = queryClient.getQueryData<{ pages: TasksResponse[]; pageParams: unknown[] }>(
+        queryKey,
+      )
+      const index = cached?.pageParams.findIndex((cursor) => cursor === pageParam) ?? -1
+      return fetchTaskList(
+        projectId,
+        { ...search, cursor: pageParam },
+        cached?.pages[index],
         signal,
-      }),
+      )
+    },
+    structuralSharing: (previous, incoming) => {
+      const data = incoming as InfiniteData<TasksResponse>
+      const shared = replaceEqualDeep(previous, data)
+      data.pages.forEach((page, index) => retainTaskListEtag(page, shared.pages[index]))
+      return shared
+    },
     enabled: options.enabled ?? true,
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.next_cursor ?? undefined,
@@ -649,99 +679,18 @@ export function useTransitionTask() {
   })
 }
 
-type GateDecisionRequest = {
-  version: Task['version']
-  reason?: string | null
-}
-
-type GateRejectDecisionRequest = {
-  version: Task['version']
-  reason: string
-}
-
-export function useApproveGate() {
+export function useTaskAction() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({
-      taskId,
-      stateName,
-      body,
-    }: {
-      taskId: string
-      stateName: string
-      body: GateDecisionRequest
-    }) =>
-      apiFetch<Task>(`/tasks/${taskId}/gates/${stateName}/approve`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
+    mutationFn: ({ taskId, ...request }: TaskActionRequest & { taskId: string }) => applyTaskAction(taskId, request),
     onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(task.id) })
+      for (const queryKey of [qk.task(task.id), qk.taskDetail(task.id), qk.executions(task.id), qk.reviews(task.id), qk.transitions(task.id), qk.projectTasks(task.project_id)]) {
+        void queryClient.invalidateQueries({ queryKey })
+      }
     },
-  })
-}
-
-export function useRejectGate() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({
-      taskId,
-      stateName,
-      body,
-    }: {
-      taskId: string
-      stateName: string
-      body: GateRejectDecisionRequest
-    }) =>
-      apiFetch<Task>(`/tasks/${taskId}/gates/${stateName}/reject`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(task.id) })
-    },
-  })
-}
-
-export function useRecoverTask() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({
-      taskId,
-      action,
-      reason,
-      context,
-    }: {
-      taskId: string
-      action: RecoveryAction
-      reason?: string
-      context?: string
-    }) => recoverTask(taskId, action, reason, context),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.executions(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.transitions(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-    },
-  })
-}
-
-export function useTriggerReview() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<TransitionTaskResponse>(`/tasks/${taskId}/review`, {
-        method: 'POST',
-      }),
-    onSuccess: (result) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(result.task.id) })
+    onError: (_, variables) => {
+      void queryClient.invalidateQueries({ queryKey: qk.task(variables.taskId) })
+      void queryClient.invalidateQueries({ queryKey: qk.taskDetail(variables.taskId) })
     },
   })
 }
@@ -751,37 +700,6 @@ export function useReviewsQuery(taskId: string, options: { enabled?: boolean } =
     queryKey: qk.reviews(taskId),
     queryFn: ({ signal }) => apiFetch<Review[]>(`/tasks/${taskId}/reviews`, { signal }),
     enabled: Boolean(taskId) && (options.enabled ?? true),
-  })
-}
-
-export function useApproveReview() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<ReviewDecisionResponse>(`/tasks/${taskId}/review/approve`, {
-        method: 'POST',
-      }),
-    onSuccess: (result) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(result.task.project_id) })
-    },
-  })
-}
-
-export function useRejectReview() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ taskId, reason }: { taskId: string; reason?: string }) =>
-      apiFetch<ReviewDecisionResponse>(`/tasks/${taskId}/review/reject`, {
-        method: 'POST',
-        body: JSON.stringify({ reason } satisfies RejectReviewRequest),
-      }),
-    onSuccess: (result) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(result.task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(result.task.project_id) })
-    },
   })
 }
 
@@ -930,20 +848,6 @@ export function useDeleteComment() {
   })
 }
 
-export function useCancelTask() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<Task>(`/tasks/${taskId}/cancel`, {
-        method: 'POST',
-      }),
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-    },
-  })
-}
-
 export function useArchiveTask() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -958,26 +862,6 @@ export function useArchiveTask() {
   })
 }
 
-export function useAdvanceTask() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: (taskId: string) =>
-      apiFetch<Task>(`/tasks/${taskId}/advance`, {
-        method: 'POST',
-      }),
-    onMutate: (taskId) => {
-      recordUserInitiatedTransition(taskId)
-    },
-    onSuccess: (task) => {
-      void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
-      void queryClient.invalidateQueries({ queryKey: qk.executions(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.reviews(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.transitions(task.id) })
-      void queryClient.invalidateQueries({ queryKey: qk.agents })
-    },
-  })
-}
 
 export function useDuplicateTask() {
   const queryClient = useQueryClient()
@@ -1266,6 +1150,19 @@ export function useExecutorTypesQuery() {
   })
 }
 
+export function useUpdateDaemonRunLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, version, run_limit }: { id: string; version: number; run_limit: number | null }) =>
+      apiFetch<Daemon>(`/daemons/${id}`, { method: 'PATCH', body: JSON.stringify({ version, run_limit }) }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: qk.daemons })
+      void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
+    },
+    onError: async () => { await queryClient.invalidateQueries({ queryKey: qk.daemons }) },
+  })
+}
+
 export function useDaemonsQuery(enabled = true) {
   return useQuery({
     queryKey: qk.daemons,
@@ -1286,6 +1183,24 @@ export function useRefreshOperationsMutation() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: refreshOperations,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
+    },
+  })
+}
+
+export function useDeadLetterActionMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      id,
+      action,
+      reason,
+    }: {
+      id: string
+      action: 'replay' | 'dismiss'
+      reason?: string
+    }) => (action === 'replay' ? replayDeadLetter(id) : dismissDeadLetter(id, reason)),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
     },
@@ -1968,9 +1883,9 @@ export function useRemoveMember(projectId: string) {
 // not a work item: the only mutation is cancel, and only while running.
 
 const AGENT_INQUIRY_LIST_LIMIT = 50
-const AGENT_INQUIRY_POLL_INTERVAL = 3_000
+const AGENT_INQUIRY_POLL_INTERVAL = 15_000
 /** A running inquiry's activity (tool calls, reasoning, reply deltas) is followed at this cadence. */
-const AGENT_INQUIRY_ACTIVITY_POLL_INTERVAL = 1_000
+const AGENT_INQUIRY_ACTIVITY_POLL_INTERVAL = 1_500
 const AGENT_INQUIRY_LOG_PAGE_LIMIT = 1_000
 const AGENT_INQUIRY_LOG_MAX_PAGES_PER_FETCH = 20
 
@@ -2026,6 +1941,7 @@ export function useAgentInquiryLogsQuery(
   return useQuery({
     queryKey,
     enabled: Boolean(inquiryId) && (options.enabled ?? true),
+    refetchIntervalInBackground: false,
     refetchInterval: (query) =>
       query.state.status === 'error' || !options.live
         ? false
@@ -2047,8 +1963,8 @@ export function useAgentInquiriesQuery(
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: Boolean(chatId),
-    // Creation has no event notification. Keep discovering runs while this
-    // list is mounted, including from an empty or all-terminal cache.
+    // SSE drives updates; polling is a slow foreground fallback.
+    refetchIntervalInBackground: false,
     refetchInterval: (query) =>
       query.state.status === 'error' ? false : AGENT_INQUIRY_POLL_INTERVAL,
   })

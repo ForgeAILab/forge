@@ -158,9 +158,9 @@ async fn planning_gate_approval_conflicts_while_planner_execution_is_running() {
     let _: Value = json_request_with_bearer(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/gates/planning/approve", task.id),
+        &format!("/api/v1/tasks/{}/actions", task.id),
         &admin_jwt(),
-        json!({ "version": moved.task.version, "reason": null }),
+        json!({ "action": {"verb":"approve","override":false},  "version": moved.task.version}),
         StatusCode::CONFLICT,
     )
     .await;
@@ -221,7 +221,7 @@ async fn test_app() -> Harness {
         .expect("pool creates");
     db::run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(db::SqliteDb::new(pool));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");

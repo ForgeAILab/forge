@@ -77,8 +77,64 @@ pub struct OperatorStatusResponse {
     pub workspace_cleanup: Vec<WorkspaceCleanupSummary>,
     pub retry_pressure: Vec<RetryPressureSummary>,
     pub usage_summary: Option<UsageSummary>,
+    pub usage_index: UsageIndexStatus,
     pub recent_errors: Vec<RecentErrorSummary>,
+    pub event_consumers: Vec<EventConsumerStatus>,
+    pub periodic_workers: Vec<PeriodicWorkerStatus>,
+    pub task_steps: TaskStepQueueStatus,
+    pub event_relay: EventRelayStatus,
+    pub database: DatabaseStorageStatus,
     pub computed_at: String,
+}
+
+/// Cascade queue health, separate from durable consumer dead letters.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskStepQueueStatus {
+    pub worker_name: String,
+    #[ts(type = "number")]
+    pub pending: i64,
+    #[ts(type = "number")]
+    pub claimed: i64,
+    /// Failed steps whose Task annotation still references them.
+    #[ts(type = "number")]
+    pub failed: i64,
+    /// Parked (loop-detected) steps whose Task annotation still references them.
+    #[ts(type = "number")]
+    pub parked: i64,
+    #[ts(type = "number")]
+    pub in_flight: usize,
+    #[ts(type = "number | null")]
+    pub oldest_pending_age_seconds: Option<f64>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+    #[ts(type = "number")]
+    pub restart_count: i64,
+}
+
+/// Source-free workers use the same health identity, bounded errors and
+/// persisted restart count as durable workers, without a cursor or quarantine.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PeriodicWorkerStatus {
+    pub worker_name: String,
+    pub running: bool,
+    pub last_tick_at: Option<String>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+    #[ts(type = "number")]
+    pub restart_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct UsageIndexStatus {
+    /// Conservative index charge, including allocator and read reserves; not RSS.
+    #[ts(type = "number")]
+    pub current_size_bytes: u64,
+    #[ts(type = "number")]
+    pub budget_bytes: u64,
+    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -132,8 +188,12 @@ pub struct DaemonIssueSummary {
 pub struct DaemonPressureSummary {
     pub daemon_id: String,
     pub hostname: Option<String>,
-    pub active_sessions: u32,
-    pub max_sessions: Option<u32>,
+    pub active_runs: u32,
+    #[ts(type = "number | null")]
+    pub max_concurrent_runs: Option<i64>,
+    pub logical_cores: Option<u32>,
+    pub build_jobs_per_run: Option<u32>,
+    pub run_nice: Option<u32>,
     pub at_capacity: bool,
 }
 
@@ -143,8 +203,8 @@ pub struct AgentPressureSummary {
     pub agent_id: String,
     pub agent_name: String,
     pub daemon_id: Option<String>,
-    pub active_sessions: u32,
-    pub max_sessions: u32,
+    pub active_tasks: u32,
+    pub max_concurrent_tasks: u32,
     pub at_capacity: bool,
 }
 
@@ -243,4 +303,142 @@ pub struct PlanProgressSummary {
     pub remaining: u32,
     pub available: bool,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EventConsumerStatus {
+    pub consumer_name: String,
+    #[ts(type = "number")]
+    pub last_sequence: i64,
+    /// Pending events matching the worker subscription.
+    #[ts(type = "number")]
+    pub lag: i64,
+    pub oldest_unprocessed_at: Option<String>,
+    pub oldest_unprocessed_age_seconds: Option<f64>,
+    /// Null when an expected consumer has never established its cursor.
+    pub last_advanced_at: Option<String>,
+    pub stalled: bool,
+    #[ts(type = "number")]
+    pub dead_letter_count: i64,
+    pub recent_dead_letters: Vec<WorkerDeadLetterSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkerDeadLetterSummary {
+    pub id: String,
+    pub item_key: String,
+    pub consumer_name: String,
+    pub event_type: String,
+    #[ts(type = "number")]
+    pub attempts: i64,
+    #[ts(type = "number | null")]
+    pub event_sequence: Option<i64>,
+    // Only canonical bare event sequence keys may be replayed.
+    pub replayable: bool,
+    pub event_created_at: Option<String>,
+    // Later subscribed ledger events acknowledged by the current checkpoint.
+    #[ts(type = "number")]
+    pub events_since: i64,
+    pub reason: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EventRelayStatus {
+    pub running: bool,
+    #[ts(type = "number | null")]
+    pub position: Option<i64>,
+    #[ts(type = "number | null")]
+    pub head: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DatabaseStorageStatus {
+    pub incremental_vacuum: bool,
+    #[ts(type = "number")]
+    pub free_pages: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DeadLetterState {
+    #[default]
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterResponse {
+    pub summary: WorkerDeadLetterSummary,
+    pub state: DeadLetterState,
+    pub error_kind: String,
+    pub first_failed_at: String,
+    pub last_failed_at: String,
+    pub resolved_at: Option<String>,
+    pub resolved_by: Option<String>,
+    pub resolution: Option<String>,
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterListResponse {
+    pub items: Vec<DeadLetterResponse>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterActionResponse {
+    pub dead_letter: DeadLetterResponse,
+    /// replayed, skipped, replay_failed, or dismissed. Failure is an audited
+    /// action result, with the dead letter still open; it is never auto-retried.
+    pub outcome: DeadLetterOutcome,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DismissDeadLetterRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DeadLetterOutcome {
+    Replayed,
+    Skipped,
+    ReplayFailed,
+    Dismissed,
+}
+impl DeadLetterOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replayed => "replayed",
+            Self::Skipped => "skipped",
+            Self::ReplayFailed => "replay_failed",
+            Self::Dismissed => "dismissed",
+        }
+    }
+}
+impl std::fmt::Display for DeadLetterOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl std::fmt::Display for DeadLetterState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        })
+    }
 }

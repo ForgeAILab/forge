@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+mod remote;
+pub use remote::{normalize_remote_url, redact_remote_credentials};
+
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
     #[error("git command failed: {command}\nstdout: {stdout}\nstderr: {stderr}")]

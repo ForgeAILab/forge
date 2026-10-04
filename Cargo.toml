@@ -29,10 +29,21 @@ homepage = "https://github.com/ForgeAILab/forge"
 repository = "https://github.com/ForgeAILab/forge"
 
 [workspace.dependencies]
-agent-runtime = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "ca6c17e", version = "0.1.0" }
+agent-runtime = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "fec6dc2", version = "0.1.0" }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# Migration replay and DB-backed tests spend most of their time in these crates.
+# The test profile inherits dev package overrides; workspace code stays in debug.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+
+[profile.dev.package.sqlx-sqlite]
+opt-level = 3
+
+[profile.dev.package.sqlx-core]
+opt-level = 3

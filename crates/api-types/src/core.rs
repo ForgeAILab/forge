@@ -1,3 +1,4 @@
+use crate::Offer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
@@ -11,15 +12,6 @@ pub enum TaskType {
     PlanningTask,
     SubTask,
     Discovery,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum WorkMode {
-    #[default]
-    DirectMerge,
-    PullRequest,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -73,29 +65,9 @@ pub enum ResumePolicy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
-pub enum RecoveryAction {
-    ResumeSession,
-    Reexecute,
-    ResetToInitial,
-    CancelTask,
-    MarkReviewed,
-    RetryHook,
-    ResumeProcess,
-    UpdateWorkspaceAndRetryHook,
-    SkipHookOnce,
-    ResetRetryWindow,
-    ProceedOnce,
-    OpenInteractive,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
 pub enum ExecutionBehaviorKind {
     ManualLaunch,
     SessionFollowUp,
-    WorkflowResume,
-    ReExecute,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -107,30 +79,6 @@ pub struct ExecutionBehavior {
     pub cascade_role: Option<String>,
     pub cascade_state: Option<String>,
     pub description: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ExecutionActionKind {
-    ManualLaunch,
-    SessionFollowUp,
-    WorkflowResume,
-    ReExecute,
-    StopExecution,
-    CancelTask,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-pub struct ExecutionAction {
-    pub action: ExecutionActionKind,
-    pub label: String,
-    pub enabled: bool,
-    pub propagates: bool,
-    pub requires_session: bool,
-    pub disabled_reason: Option<String>,
-    pub target_execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -153,6 +101,10 @@ pub struct BlockingArtifact {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum FailureKind {
+    DispatchFailed,
+    WorkflowLoop,
+    CascadeFailed,
+    DependencyCancelled,
     MergeConflict,
     TargetRepoDirty,
     DirtyWorktree,
@@ -162,6 +114,9 @@ pub enum FailureKind {
     /// The reviewer could not reach a verdict because of its environment
     /// (missing toolchain, dependencies, or access). The owner resolves it.
     ReviewBlocked,
+    /// A blocking review finding requires owner input, or repeats an
+    /// unaddressed finding from the previous failed Review attempt.
+    ReviewNeedsOwner,
     /// A Project environment check failed before an execution launched, so
     /// no agent run was spent. The owner fixes the host or the Project's
     /// `environment` settings and re-executes.
@@ -170,7 +125,6 @@ pub enum FailureKind {
     MergeFixBudgetExhausted,
     WorkflowGuardRejected,
     InternalCommandFailed,
-    PrClosedWithoutMerge,
     ExecutorFailed,
     WorkspaceFailed,
     WorkspaceResetRequired,
@@ -249,8 +203,6 @@ pub struct TaskBlockingAnnotation {
     #[ts(type = "Record<string, unknown> | null")]
     #[ts(optional)]
     pub hook: Option<serde_json::Value>,
-    #[serde(default)]
-    pub recovery_actions: Vec<RecoveryAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
@@ -308,7 +260,7 @@ pub struct WorkflowExceptionSummary {
     #[serde(default)]
     pub related_evidence: Vec<RelatedEvidence>,
     #[serde(default)]
-    pub actions: Vec<WorkflowExceptionAction>,
+    pub actions: Vec<Offer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
@@ -329,22 +281,6 @@ pub struct RelatedEvidence {
     pub kind: String,
     pub id: Option<String>,
     pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub struct WorkflowExceptionAction {
-    pub kind: RecoveryAction,
-    pub label: String,
-    pub enabled: bool,
-    pub disabled_reason: Option<String>,
-    pub requires_reason: bool,
-    pub requires_guidance: bool,
-    pub propagates: bool,
-    pub target_state: Option<String>,
-    pub target_role: Option<String>,
-    pub target_execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
@@ -452,6 +388,7 @@ mod failure_kind_tests {
             (FailureKind::TargetRepoDirty, "\"target_repo_dirty\""),
             (FailureKind::CiFailed, "\"ci_failed\""),
             (FailureKind::ReviewGateFailed, "\"review_gate_failed\""),
+            (FailureKind::ReviewNeedsOwner, "\"review_needs_owner\""),
             (FailureKind::RetryExhausted, "\"retry_exhausted\""),
             (
                 FailureKind::MergeFixBudgetExhausted,

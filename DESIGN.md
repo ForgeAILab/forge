@@ -485,6 +485,8 @@ current work`, `Cancel the affected work`, and `Discard the conflicting change`;
   heartbeat could not extend it. For terminal rows show the bounded interruption reason, kind,
   and time, retain the committed terminal result, and offer one authorized `Retry run` or
   `Continue session` action. Late results never overwrite the visible terminal state.
+- **Typed chat failure action:** failed and cancelled turns offer `Retry turn` when the server supplies a retry action. Retry retains the original message and admits a new turn with current authority, uses the displayed version, and disables while pending or another turn is live. A later turn for a newer message removes the older retry action. Configuration, authority, and provider rejection causes stay visible in the existing alert; only those deterministic failures offer the action in Attention.
+- **Usage-limit deferral:** show the capacity reason and resume time in the existing turn status label. Keep the composer disabled while the deferred turn occupies the single live-turn slot.
 - **Retry states:** render `Retrying`, `Retry wait`, and `Retry exhausted` with attempt budget,
   next-at time, and the server's bounded recovery action. Keep the composer/action row disabled
   while a turn is live, retain the original request when a retry is offered, and avoid an
@@ -551,6 +553,66 @@ identifiers at 375/768/1280px. Loading uses the existing Skeleton; empty results
 the absence of assessment. Failed and unverified results keep their reason visible
 when collapsed.
 
+### Operations consumer and storage diagnostics
+
+The Operations page reuses its Section, StatCard, SeverityBadge, and operator
+issue rows for durable consumer diagnostics. Consumer names and sequence counters use the
+existing mono `text-xs`; timestamps and oldest pending age use muted metadata.
+Rows wrap on compact screens. Stalls show both the word “Stalled” and the existing
+Attention badge; caught-up rows say “Caught up”. Database mode and free pages use
+existing stat cards. Current stall alerts share the Errors and Alerts section,
+using semantic warning/destructive icons. Existing page loading, error, refresh,
+and empty states remain the state harness; the healthy empty message is withheld
+while any consumer has sequence lag. Recent open dead letters use compact wrapping
+panels with event type, consumer, attempts and the existing bounded error. Replay
+is shown only on `replayable` whole-event rows, with source event age and
+later processed-event count beside its small outline Button. Item and wake-retry
+rows keep Dismiss and omit Replay. Dismiss uses the same small outline Button;
+an optional labelled Input captures the dismissal reason. Pending
+requests disable both actions, successful resolution removes the controls,
+replay failure retains them with the new attempt/error, and result/conflict/error
+text is announced inline with status/alert roles. Winning actions immediately
+invalidate the operator-status query so open counts
+refresh at once. The section keeps the last five local resolution receipts so
+inline results remain visible when refreshed status removes the resolved rows.
+The existing 30-second poll continues to refresh live history.
+No new typography, spacing, or color tokens are introduced.
+
+### Machine run capacity
+
+Reuse SettingsSection, Input, Label, Button and the existing machine detail cards.
+Server run-cap input is blank for automatic, zero for unlimited, or a positive
+integer. Show the automatic value in effect beside the input and explain that
+updates apply immediately. Machine detail shows reported cap, admin limit and
+effective cap together; only admins can edit the limit. Blank clears it, and
+validation rejects zero/fractions. Pending saves disable the action; errors use
+the existing toast and retain the entered value. Version conflicts require a
+refreshed row before another save. Operations displays active runs and the
+ceiling, with Unlimited as text. Server host links to Settings. Preserve the
+existing responsive wrapping, focus rings, loading/error states and tokens.
+
+### Environment readiness and Agent machines
+
+Reuse SettingsSection, Badge, Button, Skeleton, the existing warning/success/destructive
+and muted tokens, and native table/disclosure elements. Readiness rows name the
+machine, status, failing checks with bounded output, and checked/next-check times.
+Use the stacked SettingsSection layout for readiness: heading/description above
+its full-width table. Keep machine names, status badges and actions on one line;
+use compact relative times with absolute-time titles. The focusable table region
+owns narrow-width horizontal scrolling; it must not clip inside the settings card.
+A Project without a repository explains that checks cannot run until one is added.
+At compact widths the table scrolls inside its own container; identifiers and output
+wrap. Loading preserves the section; empty explains that no checks have recorded
+readiness; pending disables Check now and names its machine; errors remain inline
+with role="alert". Task placement diagnostics reuse the same status rows for
+not-ready checks, pending probes and machine capacity, with text as well as color.
+Agent machine summaries show Runs on, an empty warning, and an admin-only pin and
+Clear pin action with pending/error states. Show “Pinned to” with the machine's
+name (including Server host for an embedded pin); keep the ID in its title.
+A pin absent from runnable_on names the offline/unavailable/disabled state beside
+it, resolving its name through the existing admin-only daemon endpoint. Existing focus rings and button states
+apply. No new tokens or motion rules are introduced.
+
 ## 6. Motion & Interaction
 
 | Token     |  Duration | Easing                          | Usage                                        |
@@ -580,3 +642,11 @@ Forge uses a **mixed border-and-soft-shadow** strategy. Warm tonal shifts define
 | Active ember | `shadow-ember`, ember surface/border | Current work, focus, and drag intent |
 
 New surfaces must reuse these levels. The current code contains a few legacy literal status colors, arbitrary compact measurements, and generic `shadow-sm`/`shadow-lg` utilities; they are accepted debt outside this change and should be consolidated only in separately approved work.
+
+### Task action offers
+
+Task action buttons render server labels and meaningful parameters. Use the existing small outline Button, Dialog, Label and Textarea primitives; pending disables submission, errors refresh the Task projection, and an empty offer set renders no controls. Parameter inputs keep visible labels, keyboard focus and the semantic foreground, border and ring tokens.
+
+### Task action forms
+
+Use existing outline buttons, Dialog, Label and Textarea primitives. Offers supply labels and fields; required text is labelled and blocks Apply while blank. Boolean selects show only offered choices. Cancellation copy states subtask propagation. Changed-action notices use a polite status region. Dialog content scrolls within the viewport, keeping all inputs reachable.

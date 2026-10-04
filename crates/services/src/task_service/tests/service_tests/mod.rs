@@ -303,7 +303,6 @@ async fn seed_project_repo(db: &SqliteDb) -> (String, String, TempDir) {
             name: "forge".to_owned(),
             remote_url: Some(repo_dir.path().to_string_lossy().into_owned()),
             local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             default_branch,
             created_at: now.clone(),
             updated_at: now,
@@ -379,12 +378,12 @@ async fn seed_agent_with_executor_type(
     config_json: &str,
 ) -> String {
     let now = now_rfc3339();
-    let daemon_id = new_uuid_v4();
-    DaemonRepo::upsert_by_machine_id(
+    let daemon = DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
-            id: daemon_id.clone(),
-            machine_id: format!("machine-{daemon_id}"),
+            max_concurrent_runs: None,
+            id: new_uuid_v4(),
+            machine_id: crate::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
             os: "linux".to_owned(),
             arch: "x86_64".to_owned(),
@@ -400,13 +399,19 @@ async fn seed_agent_with_executor_type(
     )
     .await
     .expect("daemon creates");
+    let mut detected_clis: Vec<Value> = serde_json::from_str(&daemon.detected_clis_json)
+        .expect("embedded daemon CLI report parses");
+    if !detected_clis.iter().any(|cli| cli["kind"] == executor_type) {
+        detected_clis.push(json!({ "kind": executor_type, "availability": "authenticated" }));
+    }
+    let daemon_id = daemon.id;
     DaemonRepo::update_report(
         db,
         db::UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
-            detected_clis_json: format!(
-                r#"[{{"kind":"{executor_type}","availability":"authenticated"}}]"#
-            ),
+            detected_clis_json: serde_json::to_string(&detected_clis)
+                .expect("embedded daemon CLI report serializes"),
             labels_json: None,
             status: DaemonStatus::Online,
             last_report_at: now.clone(),
@@ -727,8 +732,20 @@ async fn seed_workspace_for_task(
 ) -> String {
     let now = now_rfc3339();
     let workspace_id = new_uuid_v4();
-    let worktree_path = workspace_root.join(&task.id).join("forge");
-    WorkspaceRepo::create(
+    let repo = RepoRepo::get_by_id(db, repo_id)
+        .await
+        .expect("repository loads")
+        .expect("repository exists");
+    let worktree_path = ::workspace::WorkspaceManager::new(workspace_root.to_path_buf())
+        .create_worktree_named(
+            repo.local_path.as_deref().expect("repository is local"),
+            &task.id,
+            &repo.name,
+            &repo.default_branch,
+        )
+        .await
+        .expect("worktree creates");
+    let workspace = WorkspaceRepo::create(
         db,
         CreateWorkspace {
             id: workspace_id.clone(),
@@ -744,7 +761,13 @@ async fn seed_workspace_for_task(
     )
     .await
     .expect("workspace creates");
-    std::fs::create_dir_all(&worktree_path).expect("worktree dir creates");
+    crate::workspace_backend::EmbeddedWorkspaceBackend::ensure_server_placement(
+        db,
+        &workspace,
+        workspace_root,
+    )
+    .await
+    .expect("server placement creates");
     workspace_id
 }
 

@@ -8,7 +8,7 @@ import {
 } from './topics-api'
 import { agentChatQueryKeys } from './hooks'
 
-const TOPICS_POLL_INTERVAL = 5_000
+const TOPICS_POLL_INTERVAL = 15_000
 
 export const agentChatTopicQueryKeys = {
   topics: (chatId: string) => ['agent-chats', chatId, 'topics'] as const,
@@ -20,6 +20,7 @@ export function useAgentChatTopicsQuery(chatId: string | undefined) {
     queryFn: () => listAgentChatTopics(chatId!),
     enabled: Boolean(chatId),
     staleTime: 3_000,
+    refetchIntervalInBackground: false,
     refetchInterval: (query) => (query.state.status === 'error' ? false : TOPICS_POLL_INTERVAL),
   })
 }

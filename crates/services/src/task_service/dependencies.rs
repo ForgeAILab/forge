@@ -172,7 +172,6 @@ impl TaskService {
                 "name": "dependency_gate",
                 "cancelled_dependency_ids": cancelled_dependency_ids,
             })),
-            recovery_actions: vec![api_types::RecoveryAction::CancelTask],
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -273,7 +272,7 @@ impl TaskService {
     /// others, and never fails the prerequisite's own transition — the
     /// dependency gate re-checks on the next scan regardless, so a missed
     /// wake here is a delay, not data loss.
-    pub(super) async fn wake_dependents_of_completed_task(&self, task: &Task) -> Result<()> {
+    pub(crate) async fn wake_dependents_of_completed_task(&self, task: &Task) -> Result<()> {
         for dependent_id in TaskDependencyRepo::list_dependents(&*self.db, &task.id).await? {
             if let Err(error) = self
                 .wake_one_dependent_of_completed_task(task, &dependent_id)

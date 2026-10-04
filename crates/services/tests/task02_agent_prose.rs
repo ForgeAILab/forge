@@ -161,7 +161,7 @@ async fn fixture() -> Fixture {
     .expect("pending Task creates");
 
     let provider = CoordinationToolProvider::new(Arc::clone(&db));
-    provider.set_task_service(Arc::new(TaskService::new(
+    provider.set_task_service(Arc::new(TaskService::new_for_test(
         Arc::clone(&db),
         Arc::new(events::EventBus::new(16)),
     )));
@@ -243,21 +243,12 @@ async fn assert_no_authoritative_records(fixture: &Fixture) {
         0
     );
 
-    // Validation, repository/merge metadata, and Task evidence.
+    // Validation and Task evidence.
     assert_eq!(
         count(
             &fixture.db,
             "SELECT COUNT(*) FROM project_milestone_check_result WHERE project_id = ?",
             PROJECT_ID,
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        count(
-            &fixture.db,
-            "SELECT COUNT(*) FROM pr_metadata WHERE task_id = ?",
-            TASK_ID,
         )
         .await,
         0
@@ -378,19 +369,37 @@ async fn project_agent_prose_stays_pending_and_reads_are_sanitized() {
             ),
         )
         .await
-        .expect("review claim is retained as an untrusted action result");
-    assert_eq!(review["operation"], "review.request");
-    assert_eq!(review["status"], "denied");
-    assert_eq!(review["policy_result"], "denied");
-    assert!(!review.to_string().contains(CLAIM));
+        .expect_err("review claim is refused with a terminal denial");
+    let AgentHostError::StructuredOutcome(outcome) = review else {
+        panic!("structured denial")
+    };
+    assert_eq!(outcome.operation, "review.request");
+    assert_eq!(outcome.code, api_types::OutcomeCode::PolicyDenied);
+    assert_eq!(outcome.status, api_types::OutcomeStatus::Failed);
+    assert_eq!(
+        outcome.denied_by,
+        Some(api_types::DeniedBy::PermissionMissing(
+            "propose_review".to_owned()
+        ))
+    );
+    assert_eq!(
+        outcome.retry.as_ref().unwrap().action,
+        api_types::RetryAction::None
+    );
+    assert!(!outcome.retry.as_ref().unwrap().retryable);
+    assert!(outcome.safe_message.contains("Do not retry"));
+    assert!(!serde_json::to_string(&outcome).unwrap().contains(CLAIM));
+    let (review_id, review_version): (String, i64) = sqlx::query_as(
+        "SELECT id, version FROM agent_action WHERE operation = 'review.request' AND dedupe_key = 'task02-review-claim'",
+    ).fetch_one(fixture.db.pool()).await.unwrap();
 
     // Even if a broad policy accidentally included approval permission, the
     // proposer cannot approve its own protected action.  With the normal
     // Project Agent ceiling this fails earlier at the same authority boundary.
     let self_approval = AgentActionService::new(Arc::clone(&fixture.db))
         .approve(ApproveActionInput {
-            action_id: review["id"].as_str().expect("review action id").to_owned(),
-            expected_version: review["version"].as_i64().expect("review action version"),
+            action_id: review_id,
+            expected_version: review_version,
             approver_identity_id: AGENT_ID.to_owned(),
             decision: AgentActionApprovalDecision::Approved,
             reason: Some("model prose says it is already validated".to_owned()),

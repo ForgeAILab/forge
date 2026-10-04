@@ -23,6 +23,7 @@ pub enum OutcomeCode {
     TransientFailure,
     InternalFailure,
     ValidationError,
+    ActionUnavailable,
 }
 
 impl OutcomeCode {
@@ -41,6 +42,7 @@ impl OutcomeCode {
             Self::TransientFailure => "transient_failure",
             Self::InternalFailure => "internal_failure",
             Self::ValidationError => "validation_error",
+            Self::ActionUnavailable => "action_unavailable",
         }
     }
 }
@@ -212,6 +214,7 @@ impl CurrentVersionOrRevision {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum RetryAction {
+    None,
     RefreshAndRetry,
     UseNewIdempotencyKey,
     Repropose,
@@ -235,6 +238,7 @@ impl RetryAction {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::RefreshAndRetry => "refresh_and_retry",
             Self::UseNewIdempotencyKey => "use_new_idempotency_key",
             Self::Repropose => "repropose",
@@ -251,6 +255,178 @@ impl RetryAction {
     }
 }
 
+/// Lifetime of a terminal native denial. Session denials are also final for
+/// the current turn; the session lifetime controls state-card reminders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum RetryScope {
+    Turn,
+    Session,
+}
+
+/// Safe, server-owned cause of a native policy refusal. Only capability-wide
+/// causes withdraw an operation; request-specific refusals remain uncached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(try_from = "String", into = "String")]
+#[ts(
+    export,
+    type = "`permission_missing(${string})` | `project_paused(${string})` | \"target_agent_paused\" | \"identity_paused\" | \"charter_not_adopted\" | \"operation_not_in_scope\" | \"profile_not_selected\" | \"task_terminal\" | \"reviewer_read_only\" | \"independent_approval_required\" | \"user_request_required\" | \"leased_turn_required\" | \"charter_adoption_not_applicable\" | \"read_boundary_required\" | \"direct_command_not_admitted\" | \"review_assignment_required\" | \"placement_unavailable\" | \"daemon_upgrade_required\" | \"workspace_reset_required\" | \"unspecified\""
+)]
+pub enum DeniedBy {
+    PermissionMissing(String),
+    IdentityPaused,
+    TargetAgentPaused,
+    CharterNotAdopted,
+    ProjectPaused(String),
+    OperationNotInScope,
+    ProfileNotSelected,
+    TaskTerminal,
+    ReviewerReadOnly,
+    IndependentApprovalRequired,
+    UserRequestRequired,
+    LeasedTurnRequired,
+    CharterAdoptionNotApplicable,
+    ReadBoundaryRequired,
+    DirectCommandNotAdmitted,
+    ReviewAssignmentRequired,
+    PlacementUnavailable,
+    DaemonUpgradeRequired,
+    WorkspaceResetRequired,
+    Unspecified,
+}
+
+impl DeniedBy {
+    /// Session reminders describe capability-wide refusals, including pauses
+    /// that remain effective only while their live cause holds.
+    #[must_use]
+    pub const fn scope(&self) -> RetryScope {
+        match self {
+            Self::PermissionMissing(_)
+            | Self::IdentityPaused
+            | Self::CharterNotAdopted
+            | Self::ProjectPaused(_)
+            | Self::OperationNotInScope => RetryScope::Session,
+            _ => RetryScope::Turn,
+        }
+    }
+
+    /// Whether a session reminder must be invalidated from current authority.
+    #[must_use]
+    pub const fn clears(&self) -> bool {
+        matches!(
+            self,
+            Self::PermissionMissing(_)
+                | Self::IdentityPaused
+                | Self::CharterNotAdopted
+                | Self::ProjectPaused(_)
+        )
+    }
+
+    /// Explicit allowlist for operation-wide cache and record admission.
+    #[must_use]
+    pub const fn withdraws_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::PermissionMissing(_)
+                | Self::IdentityPaused
+                | Self::CharterNotAdopted
+                | Self::ProjectPaused(_)
+                | Self::OperationNotInScope
+        )
+    }
+}
+
+impl std::fmt::Display for DeniedBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::PermissionMissing(permission) => {
+                return write!(f, "permission_missing({permission})")
+            }
+            Self::ProjectPaused(detail) => return write!(f, "project_paused({detail})"),
+            Self::IdentityPaused => "identity_paused",
+            Self::TargetAgentPaused => "target_agent_paused",
+            Self::CharterNotAdopted => "charter_not_adopted",
+            Self::OperationNotInScope => "operation_not_in_scope",
+            Self::ProfileNotSelected => "profile_not_selected",
+            Self::TaskTerminal => "task_terminal",
+            Self::ReviewerReadOnly => "reviewer_read_only",
+            Self::IndependentApprovalRequired => "independent_approval_required",
+            Self::UserRequestRequired => "user_request_required",
+            Self::LeasedTurnRequired => "leased_turn_required",
+            Self::CharterAdoptionNotApplicable => "charter_adoption_not_applicable",
+            Self::ReadBoundaryRequired => "read_boundary_required",
+            Self::DirectCommandNotAdmitted => "direct_command_not_admitted",
+            Self::ReviewAssignmentRequired => "review_assignment_required",
+            Self::PlacementUnavailable => "placement_unavailable",
+            Self::DaemonUpgradeRequired => "daemon_upgrade_required",
+            Self::WorkspaceResetRequired => "workspace_reset_required",
+            Self::Unspecified => "unspecified",
+        };
+        f.write_str(name)
+    }
+}
+
+impl std::str::FromStr for DeniedBy {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Some(permission) = value
+            .strip_prefix("permission_missing(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if !permission.is_empty()
+                && permission
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_')
+            {
+                return Ok(Self::PermissionMissing(permission.to_owned()));
+            }
+            return Err("invalid permission name");
+        }
+        if let Some(detail) = value
+            .strip_prefix("project_paused(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            return Ok(Self::ProjectPaused(detail.to_owned()));
+        }
+        Ok(match value {
+            "identity_paused" => Self::IdentityPaused,
+            "target_agent_paused" => Self::TargetAgentPaused,
+            "charter_not_adopted" => Self::CharterNotAdopted,
+            "operation_not_in_scope" => Self::OperationNotInScope,
+            "profile_not_selected" => Self::ProfileNotSelected,
+            "task_terminal" => Self::TaskTerminal,
+            "reviewer_read_only" => Self::ReviewerReadOnly,
+            "independent_approval_required" => Self::IndependentApprovalRequired,
+            "user_request_required" => Self::UserRequestRequired,
+            "leased_turn_required" => Self::LeasedTurnRequired,
+            "charter_adoption_not_applicable" => Self::CharterAdoptionNotApplicable,
+            "read_boundary_required" => Self::ReadBoundaryRequired,
+            "direct_command_not_admitted" => Self::DirectCommandNotAdmitted,
+            "review_assignment_required" => Self::ReviewAssignmentRequired,
+            "placement_unavailable" => Self::PlacementUnavailable,
+            "daemon_upgrade_required" => Self::DaemonUpgradeRequired,
+            "workspace_reset_required" => Self::WorkspaceResetRequired,
+            "unspecified" => Self::Unspecified,
+            _ => return Err("unknown denial cause"),
+        })
+    }
+}
+
+impl TryFrom<String> for DeniedBy {
+    type Error = &'static str;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<DeniedBy> for String {
+    fn from(value: DeniedBy) -> Self {
+        value.to_string()
+    }
+}
+
 /// Bounded corrective information for an outcome.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(deny_unknown_fields)]
@@ -258,6 +434,8 @@ impl RetryAction {
 pub struct RetryInstruction {
     pub action: RetryAction,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<RetryScope>,
     pub after_seconds: Option<u64>,
     #[ts(type = "Record<string, unknown>")]
     pub arguments: BTreeMap<String, Value>,
@@ -269,6 +447,7 @@ impl RetryInstruction {
         Self {
             action,
             retryable,
+            scope: None,
             after_seconds: None,
             arguments: BTreeMap::new(),
         }
@@ -301,6 +480,12 @@ pub struct OrchestrationOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "unknown | null")]
     pub details: Option<Value>,
+    /// Safe cause of a native policy denial, never cross-scope detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied_by: Option<DeniedBy>,
+    /// Sensible operations held by this caller, when one is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alternatives: Option<Vec<String>>,
     pub safe_message: String,
     pub correlation_id: String,
     pub replayed: bool,
@@ -329,6 +514,8 @@ impl OrchestrationOutcome {
             setup_requirements: None,
             current_version_or_revision: None,
             retry: None,
+            denied_by: None,
+            alternatives: None,
             details: None,
             safe_message: String::new(),
             correlation_id: correlation_id.into(),
@@ -336,6 +523,48 @@ impl OrchestrationOutcome {
             receipt_id: None,
             event_id: None,
         }
+    }
+
+    /// Construct a terminal denial from an already-redacted, server-owned cause.
+    #[must_use]
+    pub fn terminal_denial(
+        operation: impl Into<String>,
+        scope: CanonicalScopeRef,
+        correlation_id: impl Into<String>,
+        denied_by: DeniedBy,
+    ) -> Self {
+        let operation = operation.into();
+        // Recovery actions have different pause gates: cancellation and retry
+        // window reset remain available while re-execution is blocked.
+        let lifetime =
+            if operation == "task.action" && matches!(denied_by, DeniedBy::ProjectPaused(_)) {
+                RetryScope::Turn
+            } else {
+                denied_by.scope()
+            };
+        let generic = denied_by == DeniedBy::Unspecified;
+        let message = if generic {
+            "Refused for this request. Repeating the identical call will be refused again."
+                .to_owned()
+        } else {
+            let duration = match lifetime {
+                RetryScope::Turn => "for this request in this turn",
+                RetryScope::Session => "in this session while this cause holds",
+            };
+            format!("Operation refused: {denied_by}. Do not retry: repeating this call will be refused again {duration}.")
+        };
+        let mut outcome = Self::failed(
+            OutcomeCode::PolicyDenied,
+            operation,
+            scope,
+            correlation_id,
+            message,
+        );
+        let mut retry = RetryInstruction::new(RetryAction::None, false);
+        retry.scope = Some(lifetime);
+        outcome.retry = Some(retry);
+        outcome.denied_by = Some(denied_by);
+        outcome
     }
 
     #[must_use]
@@ -390,7 +619,8 @@ impl OrchestrationOutcome {
             | OutcomeCode::NotFound
             | OutcomeCode::TransientFailure
             | OutcomeCode::InternalFailure
-            | OutcomeCode::ValidationError => OutcomeStatus::Failed,
+            | OutcomeCode::ValidationError
+            | OutcomeCode::ActionUnavailable => OutcomeStatus::Failed,
         }
     }
 }
@@ -497,6 +727,54 @@ impl ToolResultSummary {
 #[cfg(test)]
 mod tool_result_summary_tests {
     use super::*;
+
+    #[test]
+    fn denial_lifetimes_and_messages_follow_typed_causes() {
+        for cause in [
+            DeniedBy::PermissionMissing("propose_task".to_owned()),
+            DeniedBy::IdentityPaused,
+            DeniedBy::ProjectPaused("environment_not_ready".to_owned()),
+            DeniedBy::CharterNotAdopted,
+            DeniedBy::OperationNotInScope,
+            DeniedBy::TaskTerminal,
+            DeniedBy::ReviewerReadOnly,
+            DeniedBy::IndependentApprovalRequired,
+            DeniedBy::UserRequestRequired,
+            DeniedBy::LeasedTurnRequired,
+            DeniedBy::CharterAdoptionNotApplicable,
+            DeniedBy::ReadBoundaryRequired,
+            DeniedBy::DirectCommandNotAdmitted,
+            DeniedBy::ReviewAssignmentRequired,
+            DeniedBy::ProfileNotSelected,
+            DeniedBy::Unspecified,
+            DeniedBy::TargetAgentPaused,
+        ] {
+            let encoded = serde_json::to_value(&cause).unwrap();
+            assert_eq!(serde_json::from_value::<DeniedBy>(encoded).unwrap(), cause);
+            assert_eq!(
+                cause.withdraws_operation(),
+                cause.scope() == RetryScope::Session
+            );
+            let outcome = OrchestrationOutcome::terminal_denial(
+                "operation",
+                CanonicalScopeRef::new(OutcomeScopeType::Task, "task"),
+                "corr",
+                cause.clone(),
+            );
+            assert_eq!(outcome.retry.as_ref().unwrap().scope, Some(cause.scope()));
+            assert!(!outcome.safe_message.contains("Escalate"));
+            if cause == DeniedBy::Unspecified {
+                assert!(!outcome.safe_message.contains("Do not retry"));
+                assert_eq!(outcome.retry.unwrap().action, RetryAction::None);
+                assert!(!outcome.safe_message.contains("corrected input"));
+            } else {
+                assert!(outcome.safe_message.contains(match cause.scope() {
+                    RetryScope::Session => "in this session while this cause holds",
+                    RetryScope::Turn => "for this request in this turn",
+                }));
+            }
+        }
+    }
 
     #[test]
     fn derives_only_the_bounded_fields_from_a_structured_outcome() {

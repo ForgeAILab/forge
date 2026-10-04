@@ -1,5 +1,6 @@
 import { expect, test, type Page } from './fixtures'
 import { emptyUsage } from '../src/test-utils/usage'
+import { serverPlacement } from '../src/test-utils/placement'
 
 declare global {
   interface Window {
@@ -90,6 +91,11 @@ function mockProject() {
 }
 
 function mockTask() {
+  const placement = serverPlacement({
+    workspace_id: WORKSPACE_ID,
+    task_id: TASK_ID,
+    workspace_handle: '/tmp/forge-terminal-e2e/repo',
+  })
   return {
     id: TASK_ID,
     project_id: PROJECT_ID,
@@ -106,7 +112,6 @@ function mockTask() {
     subtask_order: null,
     role_assignments: [],
     remaining_retries: {},
-    execution_actions: [],
     error_annotation: null,
     blocked: null,
     failed: null,
@@ -116,11 +121,13 @@ function mockTask() {
     external_issue_url: null,
     review_passed_at: null,
     archived_at: null,
+    placement,
     workspace: {
       id: WORKSPACE_ID,
       task_id: TASK_ID,
       repo_id: 'repo-terminal-e2e',
       worktree_path: '/tmp/forge-terminal-e2e/repo',
+      placement,
       branch: 'forge/task-terminal-e2e',
       status: 'ready',
       before_sha: null,

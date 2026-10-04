@@ -51,6 +51,10 @@ pub(crate) struct FileForgePaths {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileServerConfig {
+    pub max_concurrent_runs: Option<u32>,
+    pub build_jobs_per_run: Option<u32>,
+    pub run_nice: Option<u32>,
+    pub usage_index_budget_mb: Option<u32>,
     pub bind: Option<String>,
     pub public_base_url: Option<String>,
     pub mcp_enabled: Option<bool>,
@@ -58,12 +62,14 @@ pub(crate) struct FileServerConfig {
     pub bcrypt_cost: Option<u32>,
     pub cors_origins: Option<Vec<String>>,
     pub media_upload_limit_bytes: Option<u64>,
+    pub event_consumer_stall_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileWorkspaceConfig {
     pub root: Option<String>,
     pub cleanup_delay_seconds: Option<u64>,
+    pub max_disconnect_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

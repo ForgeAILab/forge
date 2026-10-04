@@ -22,7 +22,7 @@ use services::{
 async fn last_manual_bounce_reason_is_loaded_for_coder_dispatch() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let service = TaskService::new_for_test(Arc::clone(&db), event_bus);
     let task_id = seed_project_repo_and_task(&db, default_states::IN_PROGRESS).await;
     assign_human_reviewer(&db, &task_id).await;
 
@@ -56,13 +56,16 @@ async fn last_manual_bounce_reason_is_loaded_for_coder_dispatch() {
 
     let workflow = default_workflow::default_workflow();
     let ctx = load_agent_dispatch_context(
-        Arc::clone(&db),
-        &task_id,
-        default_roles::CODER,
-        default_states::IN_PROGRESS,
-        json!({}),
-        Some("new_execution"),
-        &workflow,
+        services::workflow::dispatch::loader::DispatchContextParams {
+            db: Arc::clone(&db),
+            router: &service.workspace_backend_router(),
+            task_id: &task_id,
+            role: default_roles::CODER,
+            state_name: default_states::IN_PROGRESS,
+            state_config: json!({}),
+            execution_policy: Some("new_execution"),
+            workflow: &workflow,
+        },
     )
     .await
     .expect("dispatch context loads");
@@ -129,7 +132,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, status: &str) -> String {
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: Some("https://example.com/repo.git".to_owned()),
             default_branch: "main".to_owned(),
             created_at: now.clone(),

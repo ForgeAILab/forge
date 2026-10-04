@@ -6,6 +6,830 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- **Task actions are now eight verbs served from server offers.** Every Task
+  mutation that recovers, pauses, resumes, approves or cancels work goes
+  through `GET /api/v1/tasks/{id}/actions`, which returns
+  `{available_actions: Offer[], version}`, and `POST /api/v1/tasks/{id}/actions`
+  with `{action, version}`, which returns `TaskResponse`. The verbs are
+  `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart` and
+  `cancel`. Only offered actions are accepted: anything else returns HTTP 409
+  `action_unavailable` with the current offers; a stale `version` is still a
+  version conflict, a missing `version` is 422, unknown fields are rejected,
+  and blank required input is 400.
+  - Each offer carries its `authority`, a stable `reason`, a `label`, an
+    optional `target_execution_id`, `propagates` (cancellation reaches
+    subtasks), and parameter descriptors (`required`, accepted
+    `boolean_values`, optional `required_when`). Parameters an offer fixes are
+    filled in when omitted and refused when contradicted; in particular an
+    omitted `override` on `approve` takes the offer's value, which can be
+    `true`.
+  - Override approvals and one-shot retries need a typed `reason`; Project
+    Agent recovery and cancellation need one too. `send_back` needs nonblank
+    `guidance` and supplies no default.
+  - A refused `start`, `retry` or `release` caused by a paused Agent or a
+    paused Project returns 409 `action_unavailable` (MCP `-32010`) with the
+    cause in `details.denied_by` (`target_agent_paused` or
+    `project_paused(<reason>)`) and `details.retry.scope: "turn"`; native
+    tools return the same cause as a policy denial.
+  - Single-Task responses carry the caller's offers in `available_actions`
+    and `workflow_exception.actions`. REST and MCP list rows carry no offers;
+    load them per Task. `TaskResponse.execution_actions`, `recovery_actions`
+    in error annotations and `task.interruption_changed` events, and
+    `disabled_reason` are removed. Attention `recovery.actions` holds offers.
+  - Error codes: `task_action.unavailable` becomes `action_unavailable`;
+    `task.actions_changed` is removed, and Task actions no longer return
+    `task.terminal` (launch and follow-up still can). Stored actor sources
+    change from `user:recovery:*` to `user:action:*`, and transition triggers
+    gain `restart` and `retry`. A dispatch hook skipped because the Task
+    dispatcher will launch the role later is logged as `dispatch deferred to
+    Task dispatcher` (was `dispatch deferred after board drag`). Stored historical payloads are kept as
+    evidence; no user data is rewritten.
+
+  | Old operation | New action |
+  | --- | --- |
+  | `resume_session` | `retry {fresh_session:false, guidance?, reason?}` |
+  | `reexecute` | `retry {fresh_session:true, guidance?, reason?}` |
+  | `reset_to_initial` | `restart {reason?}` |
+  | `cancel_task` | `cancel {reason?}` |
+  | `mark_reviewed` | `approve {override:true, reason}` |
+  | `defer_to_follow_up` | `approve {override:false, reason}` on the owner-finding offer |
+  | `retry_hook` | the offered `retry` (check, review or merge) |
+  | `resume_process` | review `send_back {guidance}` or the offered merge `retry` |
+  | `update_workspace_and_retry_hook` | `retry {refresh_workspace:true}` |
+  | `skip_hook_once` | entry-check `approve {override:true, reason}` |
+  | `reset_retry_window` | `retry {reset_budget:true, reason?}` |
+  | `proceed_once` | `retry {reset_budget:false, reason}` |
+  | Task `pause` / `resume` | `hold {reason?}` / `release {reason?}` or the offered `retry` |
+  | Task `submit`, `approve` | `approve {override:false, reason?}` |
+  | Task `request_changes` | `send_back {guidance}` |
+  | Execution `re_execute` | Task `retry {fresh_session:true}` |
+  | Execution `stop_execution` | `POST /api/v1/executions/{id}/stop` |
+
+  | Removed route (`T` = `/api/v1/tasks/{id}`, `E` = `/api/v1/executions/{id}`) | Use |
+  | --- | --- |
+  | `T/start`, `T/pause`, `T/resume`, `T/submit`, `T/request-changes`, `T/approve`, `T/cancel`, `T/recover` | `T/actions` with the matching offer |
+  | `T/advance` | owner `approve {override:true, reason}` next-state offer |
+  | `T/gates/{state}/approve`, `T/gates/{state}/reject` | offered `approve` / `send_back {guidance}` |
+  | `T/review`, `T/review/approve`, `T/review/reject` | review `retry` / `approve` / `send_back {guidance}` |
+  | `E/re-execute` | Task `retry {fresh_session:true}` |
+  | `E/cancel` | `E/stop` for one execution or side session (returns `ExecutionResponse`); Task `hold` for workflow work |
+
+  `T/launch` and `E/follow-up` remain.
+- MCP `forge_cancel_task` becomes `forge_task_action`. Native
+  `task.recover`, `task.cancel` and `task.review` become `task.action`, which
+  takes `task_id`, an action object and `version` (reasons and guidance live
+  in the action object); the native envelope's `reason` / `decision` fields
+  are removed. MCP Task pages use `items`.
+- `forge-ctl task cancel` is removed; use `forge-ctl task actions <id>` and
+  `forge-ctl task action <id> <verb> [flags]`. An `action_unavailable`
+  refusal prints the current offers and exits with code 3.
+- The Project Agent's operating doctrine moves to
+  `forge.project.orchestration/v1@19` (migration V202610030100), which
+  describes the action contract and reads live offers through
+  `forge_scope_read` `work.read`. Earlier revisions and frozen admissions are
+  unchanged.
+- `POST /api/v1/projects/{id}/environment/recheck` accepts an optional
+  `machine` (`server` or a daemon runtime id) and returns
+  `{ machines: [{ machine, checks, error }], project }`; it used to return
+  `{ checks, project }`. Without `machine` it checks every machine the
+  Project has a repository on. `forge-ctl project env-recheck` prints results
+  per machine.
+- Project `environment_pause` now includes the `machine` the pause refers to.
+- Every machine (the server host and each daemon) now has a cap on concurrent
+  runs, and the default is no longer unlimited: half the machine's logical
+  cores, never less than 2. A run is a Running Task execution, a workspace
+  reservation that has not started, or an in-flight Agent Chat turn. Set
+  `server.max_concurrent_runs` to `0` for the old behaviour on the server
+  host. A daemon that has never reported a cap and has no administrator limit
+  stays unlimited until it is upgraded.
+- A daemon's cap is no longer read from its labels
+  (`max_concurrent_sessions`, `max_sessions`, `active_session_cap`,
+  `max_concurrent_tasks`). Migration V202610020900 copies an existing
+  positive label value into the daemon's recorded cap; after that the cap
+  comes from the daemon's own `max_concurrent_runs` setting.
+- The placement filter code `daemon_capacity` is renamed `machine_capacity`
+  and now also applies to the server host.
+- Operator status: machine entries (which now include the server host) report
+  `active_runs` and `max_concurrent_runs` instead of `active_sessions` and
+  `max_sessions`; Agent pressure entries report `active_tasks` and
+  `max_concurrent_tasks`.
+- A failing environment check no longer pauses the Project when another
+  machine can run the work. The failure marks that machine not ready for the
+  Project; placement skips it (filter code `environment_not_ready`) and a
+  Task goes to another connected machine that passes. A Task that is bound to
+  the failing machine waits there with an environment Attention item. The
+  Project is paused with `environment_not_ready` only when no machine is left
+  for the Task being placed. With a single machine the outcome is the same as
+  before: the Project pauses and the Task keeps its state without a failure
+  annotation. API response shapes are unchanged.
+- Project environment checks have a `scope`: `workspace` (the default, which
+  existing checks keep) runs in a checkout; `machine` runs without one. Project
+  settings gain `placement.provision` (`when_verified`, the default, or
+  `never`) and `placement.provision_timeout_seconds` (default 1800, 1–86400).
+  Omitted fields take the defaults; regenerate API clients.
+- New deterministic placement refusals, each with a Task Attention item that
+  names the machine: `environment_unverified` (no machine-scope check can
+  verify a machine before code is copied to it) and `provision_failed` (five
+  failed provisioning attempts with the same inputs on the same connection).
+- Daemon run policies accept the purposes `environment_probe` and
+  `repo_provision`. A daemon that opts in needs a server from this release, so
+  upgrade the server first. The protocol revision stays 3; support is
+  advertised as `machine_probe.v1` and `repo_provision.v1`.
+- `GET /api/v1/events` (SSE): only durable domain-event frames carry an SSE
+  `id`, in the form `domain-event:<sequence>`. Bus-only frames, resync frames
+  and keep-alive comments carry no id, so a reconnecting client keeps its last
+  durable cursor. A connection without `Last-Event-ID`, or with one that is not
+  a durable cursor, is live only. Resuming from a durable cursor replays at most
+  1,000 missed events, in pages of 100; a larger gap, a failed read or a cursor
+  beyond the ledger head gets one `events.resync_required` frame instead (for a
+  cursor beyond the head that frame carries `id: domain-event:<head>`).
+  Frame ids were previously the entity id.
+- Operator status `event_consumers` lists four workers (memory, coordination,
+  attention, wake-turn) and no longer lists `sse-broadcast`. For all four,
+  `lag` and `oldest_unprocessed_at` describe pending events of the types the
+  worker subscribes to, not the distance between its cursor and the newest
+  event.
+- Mission Control `consumer_health`: `processed_events` is removed;
+  `last_error_code` is now `failure`, `transient` or `terminal` (was
+  `version_conflict`, `not_found`, `database_error`, `projection_error`) and
+  `last_error_message` is added; `stale` now means subscribed events have been
+  pending for longer than the threshold with no checkpoint progress, so an
+  idle or newly started consumer is healthy.
+- Migration V202610020700 drops `event_processing_lease`,
+  `event_projection_receipt` and `attention_consumer_health` and deletes the
+  `sse-broadcast` cursor. These are delivery metadata, not user data: consumer
+  cursors, wake dispositions, Attention incidents and coordination records are
+  kept, and no event is processed twice or skipped on upgrade.
+- Assigning `coder` on a coordination root now sets the default worker for
+  subtasks instead of returning an error; converting a Task into a
+  coordination root keeps its `coder` assignment instead of deleting it.
+- Projects now default to `settings.max_active_tasks = 5`, including existing
+  Projects. Planning, implementation, review, merging, and conflict repair
+  hold slots unless parked; new admission also stops at twice the limit parked.
+  Set the limit to `0` for unlimited admission. Recovery of admitted Tasks is
+  still allowed over the limit.
+- Failing Project environment checks now pause the Project instead of parking
+  individual Tasks with `environment_not_ready`. Migration V202610010410 clears legacy
+  Task environment blocks; Tasks keep their workflow states and re-dispatch
+  after the Project resumes.
+- A native Forge operation that policy refuses now returns a failed structured
+  outcome that names the cause. The outcome gains `denied_by`, `alternatives`
+  and `retry.scope`, and a refusal that cannot succeed on a repeat uses
+  `retry.action: none` where it used to say `reauthorize`. Public web search
+  and operations outside the orchestration contract return the same structured
+  outcome where they used to return an error string.
+- Retrying an Agent Chat turn now requires `expected_version` and
+  `idempotency_key`. A refused retry returns 409 `turn_not_retryable` or
+  `another_turn_live`, and a turn that is waiting for input now blocks a
+  retry. Retry is offered only for the newest failed or cancelled turn of a
+  message, and only while no later message exists in the chat.
+- Agent Chat turn responses, the `agent_chat.turn.failed` event and the MCP
+  turn response add `failure_class`, `retry_decision`,
+  `pre_provider_failure_count` and `retry_action`. Failure codes
+  `credential_unavailable`, `provider_unavailable`,
+  `usage_admission_authority_failed`, `usage_admission_failed`,
+  `awaiting_input_commit_failed`, `response_commit_failed` and
+  `turn_postcondition_check_failed` are gone; `provider_rejected`,
+  `context_overflow`, `transient`, `turn_limit` and `pre_provider_admission`
+  are new.
+- A failed chat turn raises an attention item only for a configuration error,
+  an authority refusal or a provider rejection that cannot be retried. It used
+  to raise one for every turn that failed terminally. The item recommends
+  `retry_turn`.
+- Unpinned CLI Agents now run on the owner recorded in their Task's workspace
+  placement: the server, or a daemon that owns the workspace. A claim with no
+  compatible owner returns 409 `placement_unavailable` with a reason per
+  candidate, where it used to fall back to embedded execution. Daemon-owned
+  workspaces require direct-merge repositories and CLI Agents for every
+  assigned worktree role. See [workspace placement](docs/architecture.md#workspace-placement).
+- Claim now reserves capacity and prepares the workspace before it creates the
+  Task claim, the Execution or the lease. A failed preparation creates no
+  Execution and spends no retry budget. Several refusals changed with it:
+  - an Agent or daemon at capacity returns 409 `placement_unavailable` with
+    `agent_capacity` or `daemon_capacity`, where it returned
+    `agent_at_capacity`;
+  - a CLI Agent whose executor is not installed, not signed in, disabled or
+    paused is refused at claim with `executor_unavailable`, where the failure
+    used to appear at launch;
+  - a second claim into a shared root workspace that has a running Execution
+    returns 409 `execution_already_running`, where it used to wait;
+  - a workspace that is being cleaned, or whose earlier preparation failed,
+    returns 409 `WORKSPACE_RESET_REQUIRED`; workspaces left in `error` before
+    the upgrade need `reset_to_initial`;
+  - if the server stops in the middle of preparing a workspace, claims for
+    that Task are refused for up to ten minutes.
+- Daemon protocol revision 3 is required for every daemon command: execution,
+  repository verification, filesystem browsing, workspace operations and
+  terminals. A revision-2 daemon stays connected so the upgrade can be
+  diagnosed, and every command returns `daemon_upgrade_required`. Upgrade the
+  server first, then each daemon from the same release, keeping its workspace
+  root. `journal.ack { entry_id }` replaces `execution.terminal.ack`.
+- A claim returns `daemon_upgrade_required` when the only owner that could
+  take the Task is blocked solely by needing that upgrade. The Task waits
+  without an Execution and resumes by itself once the daemon reconnects at
+  revision 3.
+- When a remote daemon disconnects, its running Executions are suspended on
+  the same owner for up to `workspace.max_disconnect_seconds`
+  (`FORGE_MAX_DISCONNECT_SECONDS`, default 24 hours). This covers
+  daemon-owned workspaces and server-owned workspaces on a shared mount; the
+  latter used to fail after about two minutes. Expiry records
+  `owner_disconnected_timeout` and spends no retry budget. Execution hard
+  deadlines still apply.
+- Agents pinned to a remote daemon need a verified `shared_mount` repository
+  location to run in a server-owned workspace; matching absolute paths alone
+  no longer qualify. Every location on a daemon is verified again when the
+  daemon reconnects. A location that fails that check stays unavailable until
+  the next reconnect or a manual verify, and claims for it are refused with
+  `location_not_ready`.
+- Executor snapshots replace `resolved_daemon_id` with `placement_id`. Task
+  and Workspace responses gain a `placement` object with the owner and state.
+  `repo_location.last_error` is a JSON string (cause, attempts, retry time,
+  redacted message) after a failed clone.
+- Daemons read a local `daemon.yaml` policy (`workspace.run.allow`, default
+  `[ci_step]`); hooks and environment setup need opt-in. The terminal store
+  moves into `<workspace-root>/.forge/journal/` on startup and keeps pending
+  reports. See [daemon configuration and migration](docs/getting-started.md#daemon-run-policy).
+- `GET /api/v1/projects/{id}/tasks` no longer returns
+  `409 board_snapshot_changed`. A page and its decorations are now read in one
+  database snapshot, so there is nothing to retry. Board moves and subtask
+  reorders still return 409 on a stale `board_revision`.
+- The pull-request work mode is removed; every repository is merged directly.
+  PR mode never completed a merge: the Task stayed in `merging` and nothing
+  reconciled the pull request.
+  - Repo create and update reject `work_mode`, `pr_provider` and
+    `pr_provider_config` with `400 validation_error`, including `null` and
+    `direct_merge`. Upgrade `forge-ctl` together with the server.
+  - Repo responses and the execution-setup repo object no longer carry
+    `work_mode`, `pr_provider` or `pr_provider_status`, and `forge-ctl repo`
+    no longer prints the work mode.
+  - Removed: failure kind `pr_closed_without_merge`, placement filter
+    `work_mode_unsupported`, error codes `pr_provider_missing`,
+    `pr_provider_token_missing` and `pr_sync_failure`.
+  - A Task that was waiting in `merging` for a pull request stays parked and
+    is not merged automatically. Choose **Retry Merge** to merge it directly,
+    or cancel it.
+  - The upgrade clears stored pull-request provider tokens. The stored work
+    mode of existing repositories is kept unchanged because it is part of
+    release and evidence digests.
+- The `knowledge-inject` and `knowledge-capture` lifecycle plugins are
+  removed. Forge no longer writes `.forge/knowledge-context.md` (nothing read
+  it) or commits `docs/knowledge` into the workspace after each Task. The
+  upgrade removes those two hook entries from Project settings and keeps
+  every other hook.
+- **Task transitions return before their follow-up cascades run.** A REST or
+  MCP transition returns the Task as committed by that transition plus
+  `pending_steps`, the number of queued follow-up steps; later states arrive
+  through SSE or a fresh GET. `pending_steps: 0` does not mean the Task has
+  settled.
+  - `transition.cascade_depth_exceeded` (`{task_id, state, depth}`) is
+    replaced by `transition.loop_detected`
+    (`{task_id, state, chain_id, chain_position, reason}`).
+  - New durable event `transition.step_superseded`
+    (`{task_id, step_id, expected_status, expected_epoch, observed_status,
+    observed_epoch, reason}`) when a queued step no longer applies because
+    the Task left that status.
+  - Queue failures annotate the Task with the new failure kinds
+    `workflow_loop` and `cascade_failed` instead of `dispatch_failed`; the
+    same recovery offers apply.
+
+### Changed
+
+- Workflow cascades are durable `task_step` rows run by a leased per-Task
+  worker instead of recursive calls inside the request (refactor 2.3a).
+  - A step fences on the Task's status and a status epoch that every status
+    change bumps, so edits, annotation clears, same-column reorders and
+    recovery markers no longer drop a queued cascade.
+  - A repeated transition without new evidence (a new candidate, target or
+    rebase) parks as a loop; the old fixed depth limit of 3 is gone.
+  - Steps that run a merge or CI review checks use a separate lane of 4 so
+    other cascades (lane of 8) never wait behind them.
+  - A started step is never cancelled by a claim error, a failed lease
+    renewal or a laptop sleep; shutdown drains in-flight steps.
+  - Operator status gains `task_steps` (pending, claimed, failed and parked
+    counts and the oldest pending age). Settled steps are pruned after 7
+    days, failed and parked ones after 30.
+  - Dispatcher admission counts only role entries that are about to take a
+    slot.
+- Agents that shape a managed project or split its work get one
+  merge-friendly layout rule: small modules with clear ownership so parallel
+  Tasks edit disjoint files, no hub files every feature must edit (central
+  registries, route tables, export lists, one large shared library),
+  per-feature registration or one owning Task for an unavoidable shared edit,
+  and each Task names the modules it owns. It is in the Genesis skill (new
+  revision `forge.main.project-discovery/v2@7`), the Project skill
+  (`forge.project.orchestration/v1@20`), the Document and Task doctrine
+  sections, the planner prompt and the scaffolded `AGENTS.md`; native Task
+  guidance and the two MCP task-creation tools carry a one-sentence form.
+  About +37 tokens per Genesis turn, +66 per Project Agent request and +106
+  per planner run; Main Agent requests outside Genesis are unchanged.
+  Migration V202610031431 adds the revisions; older revisions stay resolvable
+  for turns that reference them.
+- Forge uses agent-runtime `fec6dc2` (was `ca6c17e`): runtime failure
+  classes, a bounded window of turn manifests, cache diagnostics and cheaper
+  history and LCM accounting per provider call. A turn that fails before
+  Forge sees a provider attempt is now classified from the runtime's failure
+  class (authority, context overflow, configuration, usage limit with its
+  reset time, provider rejection, turn limit) instead of only transient or
+  unclassified; a class never grants a retry by itself. Agent sessions keep
+  turn manifests for the last 32 planned steps, and protected checkpoints no
+  longer store them, so they no longer count toward the session-state digest:
+  each existing session is written once more on its next save. Rolling back
+  to an earlier build may fail to resume an agent session checkpointed by
+  this one.
+- Runs no longer compete with the server for every core. Each process Forge
+  starts for a run (CLI agents and everything they launch, native tool
+  commands, review checks, Project hooks, environment checks and setup, on
+  the server and on daemons) gets `CARGO_BUILD_JOBS`, `RUST_TEST_THREADS`,
+  `MAKEFLAGS=-j<k>`, `CMAKE_BUILD_PARALLEL_LEVEL` and `GOFLAGS=-p=<k>`, where
+  `k` is the machine's cores divided by its run cap (at least 1), and starts
+  with a Unix niceness increment of 10 so the server, web UI and daemon stay
+  responsive. A value set in the Project's environment, an Agent profile's
+  environment or the server's own environment wins over the budget. Windows
+  priority is unchanged.
+
+- The web app renders every Task action from server offers: forms show
+  required reasons and guidance, explain fixed parameters and subtask
+  cancellation, and refresh after a conflict. Row and bulk actions load
+  offers on demand, and bulk cancel skips children a root cancellation
+  already covers. Each running role execution and side session has its own
+  Stop control. Solo collects typed review guidance and required reasons.
+- Hold is offered while work waits to be dispatched (a queued action, or a
+  wait such as a paused Agent or Project). Releasing a Task that no Agent can
+  take yet returns it to the dispatch queue instead of launching it.
+
+- An administrator can clear an Agent's machine pin by sending
+  `daemon_id: null` in the Agent update, or with "Clear pin" on the Agent
+  page, which names the pinned machine. Omitting `daemon_id` leaves the pin
+  unchanged.
+- Planner, coder and worker executions now run on daemon-owned workspaces.
+  Until now only reviewer and interactive runs worked there: a coder or
+  worker on an existing workspace was never started and showed no reason,
+  and a planner failed with "failed to prepare the remote execution plan
+  outbox", because the server read and wrote the plan at the daemon's path on
+  its own disk. The plan now travels to the daemon in `execution.start` and
+  back with the terminal report, and publishing, restoring and discarding a
+  plan go through the machine that owns the workspace.
+  - Daemons advertise the capability `execution.plan_transport`, which these
+    roles require on a daemon-owned workspace. The protocol revision stays at
+    3, so a daemon that has not been upgraded keeps reviewer, interactive,
+    shared-mount, file and terminal use. A Task whose only machine lacks the
+    capability shows a reason naming the machine and the capability, and is
+    dispatched once an eligible machine appears.
+  - An empty or unchanged plan from a planner is rejected by the planning
+    guard, as on a server-owned workspace. A plan larger than 128 KiB fails
+    the execution with the limit and the actual size. If the owning machine
+    is unreachable when a plan must be published, the Task waits with a
+    visible reason and retries with back-off.
+  - Migration V202610020800 adds `execution_plan_transport`, where a plan
+    returned by a daemon is kept. It is not part of the execution's config
+    snapshot or of the execution API.
+  - A daemon below the minimum protocol revision is reported as needing an
+    upgrade (`daemon_upgrade_required`) whatever its revision; previously
+    only revision 2 was recognised.
+- Environment readiness is recorded per Project and machine (the server host
+  or a daemon) in `project_machine_readiness`. Migration V202610020600 adds
+  the table and carries each environment-paused Project over as a not-ready
+  record for the machine it failed on.
+  - When a Project has environment checks and no environment assets, the
+    dispatcher runs the checks on the server host before the first launch
+    there, once, and waits for the result (`environment_probe_pending`)
+    rather than sending the Task to a less preferred machine. A failure
+    pauses the Project before any execution is created; previously the first
+    launch failed and then paused it. Projects with environment assets,
+    direct claims through the API, and daemons are judged by the launch-time
+    preflight, as before.
+  - Only the checks that apply to the role being launched gate that launch.
+  - Resuming a Project clears its not-ready records, so the next dispatch
+    checks again at once instead of waiting for the scheduled re-check. A
+    failure with no named check (asset staging, a denied run purpose) is not
+    re-checked on a schedule; it waits for a manual resume or "Check now".
+  - Changing a Project's checks while it is paused for a named check ends
+    that pause and checks again with the new set.
+  - A Task waiting for a machine's environment does not hold one of the
+    Project's `max_active_tasks` slots.
+  - A dispatch refused because the Project is paused for its environment
+    waits; it no longer records a `dispatch_failed` annotation.
+- The coordination, Attention and wake-turn consumers run on the supervised
+  worker runtime, like the memory indexer. Each event's effects and the cursor
+  advance commit in one transaction. Idle polling backs off from 250 ms to
+  5 s and is woken by committed events (it was a fixed 1 s). An unexpected
+  failure, a panic or a handle timeout counts a strike against the event, and
+  the event is quarantined after eight. A worker's periodic `tick` has its own
+  30 s timeout and its own back-off (1 s to 5 min); while a tick is backing
+  off, events are still handled every cycle.
+- Project hooks and notifications run on the supervised worker runtime as
+  durable consumers of committed events (`task.transitioned`,
+  `task.status_changed`, `review.status_changed`, `notification.requested` and
+  the hook Task created/archived events) instead of an in-memory bus
+  subscription, so a lagging bus or a server restart no longer loses a hook
+  run or an inbox notification. A hook's database actions and each
+  notification commit with the consumer's cursor; the `notification.created`
+  SSE frame is a live hint after the commit. Migration V202610030200 starts
+  both consumers at the end of the event log, so upgrading does not replay old
+  hooks or notifications. Operator status lists them as `project-hooks` and
+  `notifications`.
+- A hook that dispatches an Agent is launched at most once: the run is
+  recorded as `running` first and launched after the commit, so a crash in
+  between leaves a `running` run with no execution that is never launched
+  again. After ten minutes the worker settles such a run as `dispatched` (an
+  execution exists) or `failed` (none), which frees its concurrency slot. A
+  launch is bounded to five minutes, and a rule that fails to prepare no
+  longer stops the other rules for the same event. Owner Hold, review-CI
+  infrastructure blocks, restoring a queued action and human review decisions
+  stay silent, as before.
+- The server's long-lived background loops (task dispatcher, heartbeat
+  monitor, Agent Chat turn poller, workspace cleanup, storage maintenance,
+  operator status emitter, lifecycle hooks, daemon monitor, embedded daemon,
+  shared media cleanup, external sync, environment settings observer) run
+  under the worker-runtime supervisor. A loop that panics or returns is
+  restarted with back-off (250 ms to 5 s) instead of staying dead until the
+  server restarts. Each pass has a budget: loops whose pass is safe to
+  interrupt are cancelled past it; the task dispatcher, heartbeat monitor,
+  Agent Chat admission and external sync run workflow transitions or CI
+  inline, so past their budget they keep running and report "running longer
+  than" instead. A poller panic cancels and drains in-flight Agent Chat turns
+  (up to 15 s) before restarting. Intervals, wake-ups and log messages are
+  unchanged; warnings gain a `worker` field.
+- The SSE relay is the only publisher of durable event frames. Services no
+  longer publish a durable event directly after their own commit; the relay
+  reads the ledger in order and is woken by the commit hook (measured: 72 µs
+  median from commit to broadcast, was 9 µs). It runs under the supervisor,
+  keeps its position across restarts of the task, and never broadcasts
+  historical events when its first read of the ledger head fails.
+- Operator status `event_consumers[].lag` for the Agent Chat memory indexer is
+  now the live count of pending events of the types it subscribes to, not the
+  distance between its cursor and the newest event. `recent_errors` gains
+  entries for that worker: its last runtime, event, tick or post-commit error,
+  a current deferral with its reason, and a quarantined event (shown for one
+  hour).
+- The Agent Chat memory indexer runs on a supervised worker runtime. A worker
+  that exits or panics is restarted with back-off; an event that keeps failing
+  is retried eight times over about two minutes and then recorded in
+  `worker_dead_letter` so later events are not blocked; database and other
+  infrastructure failures never count against an event. An idle worker writes
+  nothing, and an event of a type it ignores costs no write. Migration
+  V202610012200 adds `worker_health` and `worker_dead_letter` and deletes the
+  indexer's old delivery lease and receipt rows; its cursor is kept, so no
+  event is skipped or indexed twice.
+- Committed domain events wake waiting workers through one database-connection
+  hook instead of a call at each write site.
+- Project GET and Project list responses reuse slot counts while the Project's
+  Tasks, reviews, executions, workflow and settings are unchanged, and the
+  Project list loads counts for the whole page in one query. Migration
+  V202610020410 adds triggers so a child Task in another Project also
+  invalidates its parent's Project. Dispatcher admission still reads fresh
+  counts.
+
+- Agents now get guidance that keeps a Project easy to merge. Charter
+  discovery asks for small modules with clear ownership and no hub file that
+  every feature must edit. The Project Agent names the paths each Task owns,
+  gives parallel Tasks disjoint files, and orders shared-file edits with
+  dependencies. Task planners and the `AGENTS.md` written into a scaffolded
+  repository tell workers to stay inside those paths and report a required
+  edit outside them. Sessions and turns admitted before the upgrade keep the
+  text they started with.
+- Rust tests set up a fresh database by copying a migrated snapshot, built
+  once per test process, where they used to replay every migration. Production
+  builds, existing databases and custom migration directories are unchanged.
+  `libsqlite3-sys`, `sqlx-core` and `sqlx-sqlite` build at `opt-level = 3` in
+  the dev profile. See `docs/ci.md`.
+- SQLite connections now use `synchronous=NORMAL` under WAL. A new database is
+  created in incremental auto-vacuum mode and Forge releases its free pages in
+  the background. An existing database keeps its mode until you convert it
+  once, with the server stopped: `forge --convert-db-to-incremental-vacuum`.
+  The conversion runs a full `VACUUM`, which locks the database and can need
+  up to twice the database's size in free disk space.
+- Operator status and the Operations page show each event consumer's lag, its
+  oldest pending event and whether it is stalled, plus the database's vacuum
+  mode and free pages. A consumer that has pending events and has not advanced
+  for `event_consumer_stall_seconds` (default 300) raises an attention issue.
+- The server holds `runtime.lock` in the data directory while it runs. A
+  second Forge server, or a database conversion, on the same data directory
+  now refuses to start.
+- Agent Chat keeps its system prompt identical from turn to turn, so provider
+  prompt caching can reuse it. For Project, Main and Product Genesis chats the
+  system prompt now holds only the operating skill, the server's rules and the
+  agent's Profile (in full, as quoted text). Task counts, versions, milestones,
+  open decisions and the permission ceiling arrive in a server-created state
+  card. Each request carries one card, after the conversation, and the card
+  is not stored in the chat's history, so a long chat sends the current card
+  only and never the earlier ones. The Gemini provider receives the card at
+  the end of its system instruction. The card lists permissions folded by
+  shared prefix, for example `read_{account,project}`. Content digests, the
+  event watermark and context-manifest references are no longer shown to the
+  agent; they are still recorded in each turn's context manifest, and the
+  agent reads current state through its tools.
+- A Project Agent or Main Agent that is refused an operation for a reason that
+  covers the whole operation (a missing permission, its own identity paused,
+  no adopted Charter, a paused Project, an operation outside its scope) gets
+  the same refusal immediately if it calls the operation again in that turn.
+  Later turns list the operation under "Unavailable in this session" in the
+  state card for as long as the cause still holds. A refusal about one target
+  or one argument does not block other calls. The operation stays in the tool
+  list, because the runtime fixes the tool list when a turn starts.
+- The Project operating skill is now revision 18: it tells the agent to
+  recover or re-execute a Task only when the operation is offered and the
+  earlier cause is addressed, and to treat a final refusal as final. Turns
+  admitted before the upgrade keep revision 17.
+- A failed Agent Chat turn is retried according to what failed, where it used
+  to be retried three times regardless. A configuration error, an authority
+  refusal, a non-retryable provider rejection and a context overflow fail on
+  the first attempt. A network, timeout or server error backs off within the
+  attempt budget and honours the provider's retry hint. A usage limit waits
+  for the provider's reset time without spending an attempt, with growing
+  waits when the reset time is unknown, and gives up after 24 deferrals or 24
+  hours. A failure before any provider call retries on its own budget of
+  three.
+- Manual retry writes the new `agent_chat.turn.retried` event with
+  `source_turn_job_id`. The web "Retry turn" button calls the retry endpoint
+  where it used to resend the message as a new one. Solo offers retry for a
+  cancelled turn. CLI chat executors defer on usage exhaustion. A server
+  shutdown re-queues a leased turn without spending an attempt.
+- Managed Codex resolves symlinked package cache directories before granting
+  them to the sandbox, so a relocated `~/.npm` no longer stops it from
+  starting. A cache directory is refused when it resolves to your home
+  directory or a parent of it, to a Task or managed-home directory, or into a
+  credential directory (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.docker`,
+  `.config/gh`, `.codex`, `.claude`, `.forge`). A cache reached through a
+  symlink is also refused when it resolves to the root of a mounted volume. A
+  cache moved with an environment variable is exempt from that last rule.
+- The daemon documentation states that anyone who can edit server-side review
+  steps, hooks or environment checks can run commands on the daemon, that the
+  run policy is not a security boundary against a malicious server, and that
+  the server can read files under the daemon's workspace root.
+- Daemon execution starts stage Project environment assets and run the role's
+  environment checks on the workspace owner before the provider starts. A
+  failing check fails the attempt before launch and pauses the Project; it
+  does not change the Task's workflow state or spend a provider retry.
+- `ProjectResponse.environment_pause` has a nullable `workspace_id`: the
+  workspace whose check caused the pause. Re-checks run on that workspace
+  while its daemon placement is ready and reachable, and otherwise in the
+  Project's primary checkout.
+- Agent tool outcomes can carry `placement_unavailable`,
+  `daemon_upgrade_required` and `workspace_reset_required` in `denied_by`.
+  They apply to that request only and do not withdraw the operation for the
+  rest of the turn.
+- The task list supports conditional requests: responses carry an `ETag` and
+  `Cache-Control: private, no-cache`, and `If-None-Match` returns `304` when
+  nothing a list item shows has changed. The validator is a new
+  `project.list_revision`, separate from `board_revision`, and is not used
+  while any Task in the Project has a deferred dispatch. Execution heartbeats,
+  progress and log writes do not change it.
+- Task and execution usage totals are aggregated with indexed, batched
+  queries instead of one query per Task.
+- The web app sends list validators, applies `task.moved` and
+  `task.status_changed` events to cached lists directly, and throttles full
+  list refetches to one per 1.5 s (was 0.5 s).
+- Chat views are driven by events instead of polling every 2-5 s: new durable
+  events `agent_chat.message.appended`, `agent_chat.turn.status_changed`,
+  `agent_chat.inquiry.updated` and `agent_chat.topic.started` are relayed as
+  `domain_event.committed`. Polling is a 15 s foreground fallback, plus 1.5 s
+  for live activity while a turn or inquiry is running; it stops while the tab
+  is hidden and reconciles at once when the tab becomes visible again.
+- Reassigning a role with `reset_worktree` when the server-owned worktree is
+  missing now recreates it from the Task branch, or returns
+  `409 WORKSPACE_RESET_REQUIRED` when the branch is gone; it used to fail with
+  a not-found error. Reassigning a subtask leaves the shared root worktree
+  unchanged.
+- A malformed repo create or update body returns `400` with the standard
+  error envelope instead of `422`.
+- Operations status reads the usage ledger in batches (about 5× faster on a
+  large ledger). The chat switcher and chat detail count pending turns without
+  loading the turn history.
+- Operations status and both Agent lists (account and Project) read lifetime
+  usage from one shared incremental index: each read folds in only the ledger
+  rows added or changed since the previous read, so warm reads no longer grow
+  with the size of the ledger. A page of Agents loads usage, execution
+  statistics, assignments and effective status in a few batched queries
+  instead of several per Agent. By default the index keeps up to about
+  41,000 usage events (128 MiB) per server process; a larger ledger falls
+  back to a memoized full read. The budget is `server.usage_index_budget_mb`
+  (config file, `FORGE_SERVER_USAGE_INDEX_BUDGET_MB`,
+  `forge --usage-index-budget-mb N`, the Settings API and the Forge Settings
+  page; `0` turns the index off). A change applies on the next usage read,
+  and the Operations page shows the index size, the budget and whether reads
+  use the fallback. A new migration adds change markers for the index
+  (`usage_ledger_revision` and changed-row tables); ledger rows are unchanged.
+- A paused Agent reports no runnable machines (`runnable_on.count` 0) and no
+  longer runs a CLI availability probe when an Agent list is loaded.
+
+### Added
+
+- Forge flags conflict hot spots. When conflict handoffs name the same file
+  (lockfiles excluded) in 3 or more Tasks of one Project within 7 days, Forge
+  emits `project.conflict_hotspot.detected` and opens one Project-scoped
+  `conflict_hotspot` Attention item. The Project Agent is woken once and asked
+  to propose a Task that splits the file. The item stays until you resolve
+  it; after that, only newer handoffs count toward a new alert. Detection
+  starts at upgrade (no backfill).
+- Mission Control attention cards have a **Resolve** button.
+- Admins can replay or dismiss a dead-lettered event (an event a durable
+  worker gave up on after its retries). `GET /api/v1/operations/dead-letters`
+  lists them (open or resolved, by consumer, keyset pages);
+  `POST …/{id}/replay` re-delivers that one event to its own consumer
+  through the normal commit path (the cursor never moves, no other consumer
+  sees it) and `POST …/{id}/dismiss` resolves it with an optional reason.
+  Only whole-event rows can be replayed (`replayable`); per-item rows
+  (one commitment or inbox item, wake retries) can only be dismissed. Replay
+  finishes even if the client disconnects; a repeat failure reopens the row.
+  Replay applies an old event on top of newer ones, so the list shows its age
+  and how many later events the consumer has processed. Resolved rows stay
+  for audit and leave the open counts. Also `forge-ctl operations
+  dead-letters list|replay|dismiss` and Replay/Dismiss on the Operations page.
+  Migration V202610030300.
+
+- Operator status `periodic_workers` lists each supervised background loop
+  with running state, last tick, last error, restart count and an over-budget
+  warning. A failing or over-budget loop adds a `recent_errors` entry with
+  `entity_type: "periodic_worker"` and raises `overall_severity` to Attention
+  until it recovers.
+
+- Per-machine environment readiness is visible.
+  - Project responses carry `environment_readiness`: one entry per machine
+    with its status (`ready`, `not_ready`, `unknown`), the failing checks and
+    the last and next check times.
+  - Project settings, Environment tab: a readiness table with "Check now"
+    for each machine.
+  - `forge-ctl project env-status <project>` and
+    `forge-ctl project env-recheck <project> --machine <id>`.
+  - Task responses carry `placement_diagnostics`, and the Task page shows why
+    a Task is waiting for a machine: the machine, the failing checks, a
+    pending probe, or machine capacity.
+  - Agent responses carry `runnable_on`: the machines that have the Agent's
+    executor (administrators see the machines; other users see a count). The
+    Agents page shows it, and "Cannot run" when there is none.
+- Placement can use a daemon that does not have the Project's code yet. With
+  `placement.provision = when_verified`, Forge runs the Project's
+  machine-scope checks on that daemon, clones the repository into
+  `workspace_root/repos/<repo id>` on the configured branch, runs the full
+  checks, and then dispatches there. Failed clones retry with backoff across
+  server restarts and stop after five attempts (`provision_failed`); a
+  relevant settings change or a reconnect starts over. URL credentials are
+  redacted from errors. A Task that only waits for capacity never triggers a
+  clone. Migration V202610021500 adds the retry records.
+  - A machine-scope check that fails on a daemon without the code marks only
+    that machine not ready; the Project is not paused.
+  - On daemons that support machine probes, "Check now"
+    (`POST /api/v1/projects/{id}/environment/recheck`) runs without a recorded
+    workspace.
+  - Project settings, Environment tab: per-check scope and the provisioning
+    policy. `forge-ctl project env-check --scope workspace|machine`.
+- Build budget and run priority settings on every machine:
+  `build_jobs_per_run` (unset = automatic, `0` = Forge sets none of the
+  variables, `n` = exactly `n`) and `run_nice` (default 10, `0` = off). Server:
+  `server.build_jobs_per_run` / `server.run_nice` in the config file,
+  `FORGE_SERVER_BUILD_JOBS_PER_RUN` / `FORGE_SERVER_RUN_NICE`,
+  `forge --build-jobs-per-run N` / `--run-nice N`, the Settings API and the
+  Forge Settings page (applies to the next run without a restart). Daemons:
+  `build_jobs_per_run` / `run_nice` in `daemon.yaml` or the same flags on
+  `forge-daemon` and `forge-ctl daemon link|start`. Forge Settings and
+  Operations show the machine's cores and the effective values.
+- Machine run caps.
+  - Server host: `server.max_concurrent_runs` in the config file,
+    `FORGE_SERVER_MAX_CONCURRENT_RUNS`, `forge --max-concurrent-runs N`, the
+    Settings API and the Forge Settings page. Unset is automatic, `0` is
+    unlimited. A change made in Settings applies to the next admission without
+    a restart; an environment or command-line override applies again at the
+    next start.
+  - Daemons: `max_concurrent_runs` in `daemon.yaml` or
+    `--max-concurrent-runs N` on `forge-daemon` and
+    `forge-ctl daemon link|start|report`, reported to the server at
+    registration and in status reports. An administrator can also set a limit
+    for a daemon with `PATCH /api/v1/daemons/{id}` (`run_limit`) or on the
+    Machines page; the lower of the two applies. Daemon responses carry
+    `max_concurrent_runs`, `run_limit` and `effective_max_concurrent_runs`.
+  - When every machine a Task could run on is at its cap, the Task waits in
+    its state with a machine-capacity reason. It gets no failure annotation,
+    no Attention item and no retry-budget charge, does not hold one of its
+    Project's `max_active_tasks` slots, and starts on a dispatcher tick after
+    a run ends. Work that is already running is never stopped, including when
+    the cap is lowered below the current load.
+  - Limits: Agent Chat turns count towards a machine's load but are never
+    refused; review check runs and merges do not take a slot; a freed slot
+    goes to the first Task the dispatcher reaches, with no fairness across
+    Projects.
+- Operator status exposes the SSE relay as `event_relay { running, position,
+  head, last_error, last_error_at }`, and each worker's dead letters as a
+  total plus the five most recent (`id`, item key, event sequence, reason,
+  time). The list does not expire; the degraded-health signal still covers
+  only the last hour. Migrations V202610020859 and V202610021051 add the error
+  kind, per-item retry state and a stable id to the worker tables. Replay and
+  dismiss actions for dead letters are not available yet.
+- Persisted Project environment pause detail, automatic re-check and resume,
+  `POST /api/v1/projects/{id}/environment/recheck`, and
+  `forge-ctl project env-recheck`. Project cards/list and headers show the
+  failing checks, output tail, next check time, and Check now. Settings expose
+  the active task limit and environment re-check interval (default 600 seconds).
+- Project `slots` usage and visible Task capacity queue reasons, including the
+  parked-owner guard.
+- Reviewer result fields `fixable_by` and `repeat`, owner parks with
+  `review_needs_owner` without coder dispatch or review retry budget spent,
+  and `defer_to_follow_up` recovery with a required reason. Deferring atomically
+  creates a linked backlog Task and records a manual review pass for the original.
+- A Task whose owner is offline or at capacity waits without an Execution and
+  without spending retry budget. A first-time wait for an offline owner shows
+  an attention item and blocks the Task after `workspace.max_disconnect_seconds`.
+- On a daemon-owned or remote-provider workspace, review CI that cannot reach
+  its owner is retried with backoff and spends no review budget. After five
+  failed attempts while the owner is connected, the Task is parked with a
+  blocker and an attention item naming the cause. A real CI failure is charged
+  as before.
+- The daemon deletes an operation's receipt once the server has recorded its
+  result and acknowledged it. Journal files and the workspace registry share a
+  32 MiB budget, and the journal holds at most 1,024 entries. CI output keeps
+  the last 1 MiB per stream; the exit code decides the verdict even when the
+  log was shortened.
+- The daemon replaces the values of a request's environment variables with
+  `[REDACTED]` in the commands, output, error messages and terminal reports it
+  stores, and stores only the variable names. Other secrets written inline in
+  a command are stored as written.
+
+### Fixed
+
+- Dropdown menus near the bottom of the window open upwards instead of
+  off-screen, and their height is capped to the space available.
+- An event that a consumer can never apply no longer blocks every later event
+  for that consumer. Previously a Task outcome for a commitment that had been
+  cancelled was retried forever, and every later outcome for every Agent
+  waited behind it. Now a cancelled commitment needs
+  no outcome; a commitment or inbox delivery that is rejected is recorded as
+  a dead letter on its own while the other commitments and inbox items of the
+  same event are applied; and a rejection at commit time is retried once with
+  fresh data before the event is quarantined.
+- Wake retries: one retry row that keeps failing no longer stops the retries
+  behind it. Database-busy failures back off without counting against the
+  row, rows that are still waiting are skipped in the query, and a row that
+  exhausts its attempts ends with a `wake_retry_failed` disposition and a
+  dead letter. Resolving the "decision recorded" Attention item now commits
+  with the wake's admission instead of after it.
+- Token and cost figures for embedded Agents were too high. Each chat turn
+  recorded its own provider calls and, again, every earlier call of the same
+  chat session, so a chat of `n` single-call turns was counted as
+  `1 + 2 + … + n` calls instead of `n`: an 8-turn chat showed about four times
+  its real usage, and the factor grew with the length of the chat. A turn
+  retried after a failed attempt counted the failed attempt's calls twice, and
+  an embedded worker or planner that ran the same Task more than once counted
+  its earlier runs again. Every provider call is now recorded once. This
+  corrects the per-reply usage in Agent Chat, Task and Agent usage, Project
+  analytics and `GET /api/v1/analytics/usage`, for tokens and for estimated
+  cost. Reviewer runs, inquiries and CLI Agents were not affected. Usage
+  recorded before this release is not rewritten, so totals that include
+  earlier chat turns still read high.
+- A Main Agent turn admitted under the second baseline revision is no longer
+  treated as a discovery turn after an upgrade.
+- A Project Agent chat turn admitted before an upgrade no longer fails when
+  the upgrade moves the Project Agent to a newer operating-skill revision. The
+  turn runs with the revision it was admitted under, and its context manifest
+  records that revision.
+- Retrying a chat turn after editing the Agent no longer returns the earlier
+  retry's turn; it admits a new turn with the Agent's current model,
+  credential and policy.
+- An invalid artifact path or `project.summary` id now returns
+  `validation_error` with the reason, and a failure to load
+  `project.current_state` returns `internal_failure`; both used to be reported
+  as `policy_denied`.
+- Shell Agents re-dispatched by the workflow (re-execute, rework after review)
+  now run the Task's command again instead of executing the LLM role prompt as
+  a shell script.
+- A remote Execution's result that arrives while its daemon was frozen or
+  disconnected is applied once after the daemon reconnects, without a reset.
+- Workspace reconciliation that is waiting on an operator `reset_to_initial`
+  no longer logs a warning every recovery tick.
+- Running the test suites no longer writes media, project directories or
+  workflow files into the developer's real `~/.forge`, and the `forge-ctl`
+  integration tests no longer read the stored login. Test harnesses use
+  temporary data directories, and a test that resolves the default data
+  directory now panics with instructions (see `docs/ci.md`).
+- A failing heartbeat recovery pass no longer stops the passes after it in the
+  same tick. Two orderings are kept: Agent timeouts are not evaluated in a
+  tick where owner suspension failed, and workspace leases are not expired in
+  a tick where their renewal failed.
+- A workspace whose cleanup keeps failing is retried with exponential
+  back-off (one minute, doubling, capped at one hour) and its last error is
+  recorded, instead of being retried every minute. An unreachable daemon
+  owner keeps the fixed one-minute retry.
+- The notification and Project-hook services keep delivering after they fall
+  behind on the event bus; they used to stop until the server restarted.
+- A server-owned Task worktree that was deleted or left without git metadata
+  no longer fails review entry, merge, target-moved rebase, review carry or
+  reset with `not a git repository`: it is recreated from the Task branch
+  first, as launch already did. A transient failure to run git is returned as
+  an error and never treated as a damaged worktree.
+- An execution whose Project and Agent have no owner is now priced and its
+  usage recorded. Pricing admission used to be skipped for it, so its usage
+  never reached the ledger. It is admitted at the models.dev catalogue price
+  under the Project owner, else the Agent owner, else the instance's first
+  administrator.
+
+### Known issues
+
+- A damaged worktree on a daemon owner is not repaired; the Task needs
+  `reset_to_initial`. A deleted worktree is recreated from the Task branch.
+- Claims for a location that failed re-verification after a reconnect are
+  refused and not queued.
+
 ## [0.13.12] - 2026-10-01
 
 ### Breaking

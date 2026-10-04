@@ -65,3 +65,6 @@ docs/spec/
 /test-archives/
 /test-backup-*/
 /test.*/
+
+# Python bytecode
+__pycache__/

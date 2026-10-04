@@ -193,6 +193,9 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             // turns narrating instead of verifying.
             assert!(!prompt.system.contains(FAILURE_TAXONOMY_LINE));
             assert!(!prompt.system.contains("Before acting, restate objective"));
+            assert!(prompt
+                .system
+                .contains("owner-only or repeated findings may park for the owner"));
             continue;
         }
         assert!(
@@ -630,6 +633,23 @@ fn planner_prompt_includes_parent_task_context() {
 }
 
 #[test]
+fn planner_layout_guidance_is_shared_by_native_and_outbox_delivery() {
+    const RULE: &str = forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE;
+    for delivery in [TaskDelivery::NativeTools, TaskDelivery::Outbox] {
+        let mut ctx = fake_context(default_roles::PLANNER);
+        ctx.delivery = delivery;
+        let prompt = PlannerPromptBuilder.build(&ctx);
+        assert_eq!(prompt.system.matches(RULE).count(), 1);
+        assert!(prompt.system.contains("For sub-task planning:"));
+        assert!(prompt.user.contains("owned repository-relative paths"));
+        assert!(
+            !prompt.user.contains(RULE),
+            "doctrine is paid for once per run"
+        );
+    }
+}
+
+#[test]
 fn cli_plan_writers_use_the_brokered_plan_path() {
     let mut planner = fake_context(default_roles::PLANNER);
     planner.delivery = TaskDelivery::Outbox;
@@ -852,7 +872,6 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
             name: "repo".to_owned(),
             remote_url: Some("https://example.com/repo.git".to_owned()),
             local_path: None,
-            work_mode: db::WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1006,13 +1025,16 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
         .expect("assessment persists");
 
     let context = crate::workflow::dispatch::loader::load_agent_dispatch_context(
-        db.clone(),
-        &task.id,
-        default_roles::CODER,
-        default_states::IN_PROGRESS,
-        json!({}),
-        None,
-        &crate::workflow::default_workflow::default_workflow(),
+        crate::workflow::dispatch::loader::DispatchContextParams {
+            db: db.clone(),
+            router: &crate::diff::embedded_read_router_for_test(db.clone()),
+            task_id: &task.id,
+            role: default_roles::CODER,
+            state_name: default_states::IN_PROGRESS,
+            state_config: json!({}),
+            execution_policy: None,
+            workflow: &crate::workflow::default_workflow::default_workflow(),
+        },
     )
     .await
     .expect("dispatch context loads");

@@ -105,10 +105,11 @@ async fn forge_mvp_rest_api_flow() {
     // barrier its blocking before-work hook opens and closes.
     assert_eq!(claimed_task.version, 5);
 
-    let cancelled_task: TaskResponse = empty_request(
+    let cancelled_task: TaskResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/cancel"),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({"action":{"verb":"cancel"},"version":claimed_task.version}),
         StatusCode::OK,
     )
     .await;
@@ -148,26 +149,36 @@ async fn forge_mvp_rest_api_flow() {
         StatusCode::OK,
     )
     .await;
-    let second_task_id = second_task.id;
+    let second_task_id = second_task.id.clone();
 
-    let cancelled_task: TaskResponse = empty_request(
+    let cancelled_task: TaskResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{second_task_id}/cancel"),
+        &format!("/api/v1/tasks/{second_task_id}/actions"),
+        json!({"action":{"verb":"cancel"},"version":second_task.version}),
         StatusCode::OK,
     )
     .await;
     assert_eq!(cancelled_task.status, "cancelled".to_owned());
 
-    let cancelled_again: TaskResponse = empty_request(
+    let cancelled_again: api_types::ErrorResponse = json_request(
         &app,
         Method::POST,
-        &format!("/api/v1/tasks/{second_task_id}/cancel"),
+        &format!("/api/v1/tasks/{second_task_id}/actions"),
+        json!({"action":{"verb":"cancel"},"version":cancelled_task.version}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(cancelled_again.code, "action_unavailable");
+    let current: TaskResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/tasks/{second_task_id}"),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(cancelled_again.status, "cancelled".to_owned());
-    assert_eq!(cancelled_again.version, cancelled_task.version);
+    assert_eq!(current.status, "cancelled");
+    assert_eq!(current.version, cancelled_task.version);
 }
 
 #[tokio::test]
@@ -688,6 +699,7 @@ async fn test_app_with_state() -> (Router, AppState) {
     db::DaemonRepo::upsert_by_machine_id(
         &db_instance,
         db::UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: services::embedded_daemon::embedded_machine_id(),
             hostname: "test-host".to_owned(),
@@ -708,6 +720,7 @@ async fn test_app_with_state() -> (Router, AppState) {
     db::DaemonRepo::update_report(
         &db_instance,
         db::UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             last_report_at: now.clone(),
             status: db::DaemonStatus::Online,
@@ -743,7 +756,7 @@ async fn test_app_with_state() -> (Router, AppState) {
         db,
         event_bus,
         true,
-        Arc::new(cli_adapters::default_registry()),
+        Arc::new(cli_adapters::test_support::test_registry()),
     );
 
     let web_dist_dir = std::env::temp_dir().join(format!("forge-api-e2e-{}", uuid::Uuid::new_v4()));

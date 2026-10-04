@@ -23,6 +23,18 @@ const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
     about = "Forge — local-first workflow engine for coding agents"
 )]
 struct Cli {
+    /// Maximum concurrent runs on the server host (default: automatic; 0: unlimited).
+    #[arg(long)]
+    max_concurrent_runs: Option<u32>,
+    /// Build jobs per run (unset: automatic; 0: disabled).
+    #[arg(long)]
+    build_jobs_per_run: Option<u32>,
+    /// Unix niceness increment for run children (0: off).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
+    run_nice: Option<u32>,
+    /// Usage observation index budget in MiB (default: 128; 0: memoized full reads).
+    #[arg(long)]
+    usage_index_budget_mb: Option<u32>,
     #[arg(long)]
     demo: bool,
     #[arg(long = "no-mcp")]
@@ -33,6 +45,13 @@ struct Cli {
     /// Defaults to ~/.forge. Use --data-dir ./test for local testing.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Cursor inactivity threshold for stalled event consumers, in seconds.
+    #[arg(long)]
+    event_consumer_stall_seconds: Option<u32>,
+    /// Convert an existing database to incremental auto-vacuum, then exit.
+    /// Stop Forge first. Full VACUUM locks the database and needs extra disk space.
+    #[arg(long, conflicts_with_all = ["demo", "no_mcp", "no_embedded_daemon"])]
+    convert_db_to_incremental_vacuum: bool,
 }
 
 fn main() {
@@ -49,14 +68,43 @@ async fn run() {
     let config = ForgeConfig::load(
         None,
         ConfigOverrides {
+            server_max_concurrent_runs: cli.max_concurrent_runs,
+            server_build_jobs_per_run: cli.build_jobs_per_run,
+            server_run_nice: cli.run_nice,
+            server_usage_index_budget_mb: cli.usage_index_budget_mb,
             mcp_enabled: if cli.no_mcp { Some(false) } else { None },
             data_dir: cli.data_dir,
+            event_consumer_stall_seconds: cli.event_consumer_stall_seconds,
             ..Default::default()
         },
     )
     .expect("Failed to load config");
 
+    // The offline conversion and all Forge runtimes share this data-root
+    // process lock. Hold it through shutdown (the OS releases it on crashes).
+    let _runtime_lock = acquire_runtime_lock(&config.forge.data_dir).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    if cli.convert_db_to_incremental_vacuum {
+        let db_path = config.db_path();
+        let database_url = format!("sqlite:{}", db_path.display());
+        eprintln!("Converting {}: full VACUUM holds an exclusive database lock and may need up to twice the database size in additional free disk space.", db_path.display());
+        if let Err(error) = db::convert_sqlite_to_incremental(&database_url).await {
+            eprintln!("Database conversion failed: {error}");
+            std::process::exit(1);
+        }
+        println!(
+            "Database is in incremental auto-vacuum mode: {}",
+            db_path.display()
+        );
+        return;
+    }
+
     init_tracing(&config.forge.data_dir.join("logs"));
+    executors::run_process::install_machine_policy(Arc::new(
+        executors::run_process::MachineRunPolicy::new((&config.server).into()),
+    ));
 
     let configured_addr: SocketAddr = config
         .server
@@ -191,7 +239,10 @@ async fn run() {
             .expect("embedded daemon init"),
         ))
     };
-    let _embedded_handle = embedded_daemon.as_ref().map(|d| Arc::clone(d).start());
+    let periodic_workers = runtime.operator_status_service.periodic_workers();
+    let _embedded_handle = embedded_daemon
+        .as_ref()
+        .map(|d| Arc::clone(d).start(&periodic_workers));
 
     // 5. Build app state and start server
     if !effective_config.server.mcp_enabled {
@@ -231,17 +282,18 @@ async fn run() {
         Arc::clone(&db),
         Arc::clone(&event_bus),
     ));
-    let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start();
+    let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start(&periodic_workers);
     let state =
         api::AppState::from_runtime_arc(Arc::clone(&runtime), effective_config.server.mcp_enabled);
-    let shared_media_cleanup_handle =
-        Arc::clone(&shared_media_cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
+    executors::run_process::install_machine_policy(Arc::clone(&state.run_process_policy));
+    let shared_media_cleanup_handle = Arc::clone(&shared_media_cleanup_scheduler)
+        .spawn(&periodic_workers, state.shutdown_signal.subscribe());
     let external_sync = Arc::new(services::ExternalSyncService::new(
         Arc::clone(&state.db),
         Arc::clone(&state.event_bus),
         Arc::clone(&state.task_service),
     ));
-    let _external_sync_handle = Arc::clone(&external_sync).start();
+    let _external_sync_handle = Arc::clone(&external_sync).start(&periodic_workers);
 
     // 6. Install graceful shutdown. The shared supervisor owns the core
     // signal and joins its worker handles; this loop only coordinates the
@@ -472,13 +524,84 @@ fn local_url(port: u16, path: &str) -> String {
     format!("http://127.0.0.1:{port}{path}")
 }
 
+fn acquire_runtime_lock(data_dir: &Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|error| format!("Failed to create {}: {error}", data_dir.display()))?;
+    let path = data_dir.join("runtime.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
+        .open(&path)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|error| format!(
+        "Cannot lock {}: another Forge runtime or database conversion may be running. Stop it before retrying ({error}).", path.display()
+    ))?;
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{absolute_path, media_storage_root, server_url_for_addr, web_dist_dir};
+    use super::{
+        absolute_path, acquire_runtime_lock, media_storage_root, server_url_for_addr, web_dist_dir,
+        Cli,
+    };
+    use clap::Parser;
     use std::{
         net::SocketAddr,
         path::{Path, PathBuf},
     };
+
+    #[test]
+    fn usage_index_budget_cli_accepts_zero_and_mib() {
+        assert_eq!(
+            Cli::try_parse_from(["forge"])
+                .unwrap()
+                .usage_index_budget_mb,
+            None
+        );
+        for budget in ["0", "64", "4294967295"] {
+            assert_eq!(
+                Cli::try_parse_from(["forge", "--usage-index-budget-mb", budget])
+                    .unwrap()
+                    .usage_index_budget_mb,
+                Some(budget.parse().unwrap())
+            );
+        }
+        for budget in ["-1", "1.5", "4294967296"] {
+            assert!(Cli::try_parse_from(["forge", "--usage-index-budget-mb", budget]).is_err());
+        }
+    }
+
+    #[test]
+    fn storage_cli_parses_stall_setting_and_offline_conversion() {
+        let cli = Cli::try_parse_from(["forge", "--event-consumer-stall-seconds", "60"]).unwrap();
+        assert_eq!(cli.event_consumer_stall_seconds, Some(60));
+        assert!(
+            Cli::try_parse_from(["forge", "--convert-db-to-incremental-vacuum"])
+                .unwrap()
+                .convert_db_to_incremental_vacuum
+        );
+        assert!(
+            Cli::try_parse_from(["forge", "--convert-db-to-incremental-vacuum", "--demo"]).is_err()
+        );
+    }
+
+    #[test]
+    fn storage_conversion_runtime_lock_excludes_a_live_server() {
+        let dir = std::env::temp_dir().join(format!("forge-outbox-lock-{}", db::new_uuid_v4()));
+        let first = acquire_runtime_lock(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(first.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+        assert!(acquire_runtime_lock(&dir).is_err());
+        drop(first);
+        drop(acquire_runtime_lock(&dir).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn absolute_path_preserves_absolute_paths() {

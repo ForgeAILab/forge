@@ -29,6 +29,15 @@ const DEFAULT_LOG_FILTER: &str =
 #[derive(Parser)]
 #[command(name = "forge-daemon", about = "Forge standalone remote daemon")]
 struct Cli {
+    /// Maximum concurrent runs (default: automatic; 0: unlimited).
+    #[arg(long)]
+    max_concurrent_runs: Option<u32>,
+    /// Build jobs per run (unset: automatic; 0: disabled).
+    #[arg(long)]
+    build_jobs_per_run: Option<u32>,
+    /// Unix niceness increment for run children (0: off).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
+    run_nice: Option<u32>,
     /// Forge server URL, for example https://forge.example.com.
     #[arg(long)]
     server: String,
@@ -77,6 +86,17 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| credentials::default_path(&cli.server));
     let owner_token = resolve_owner_token(cli.token.as_deref());
+    let daemon_config = forge_client::daemon_config::DaemonConfig::load(&credentials_path)?;
+    let run_policy = daemon_config.run_policy();
+    let max_concurrent_runs = daemon_config.run_cap(cli.max_concurrent_runs);
+    let budget = daemon_config.run_budget(
+        cli.max_concurrent_runs,
+        cli.build_jobs_per_run,
+        cli.run_nice,
+    )?;
+    executors::run_process::install_machine_policy(Arc::new(
+        executors::run_process::MachineRunPolicy::new(budget),
+    ));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -92,6 +112,7 @@ async fn main() -> Result<()> {
         &machine_id,
         &hostname,
         &labels,
+        max_concurrent_runs,
         owner_token.as_deref(),
         shutdown_rx.clone(),
     )
@@ -108,18 +129,28 @@ async fn main() -> Result<()> {
         Arc::clone(&client),
         workspace_root.clone(),
         labels.clone(),
+        max_concurrent_runs,
         cli.interval_seconds,
         active_executions.clone(),
         shutdown_rx.clone(),
     ));
-    let connect_handle = tokio::spawn(connect::run(
+    let mut connect_handle = tokio::spawn(connect::run(
         Arc::clone(&client),
         workspace_root.clone(),
         active_executions,
         shutdown_rx.clone(),
+        run_policy,
     ));
 
-    wait_for_shutdown(shutdown_rx.clone()).await;
+    tokio::select! {
+        result = &mut connect_handle => {
+            reporter_handle.abort();
+            result.context("daemon command loop task failed")??;
+            if *shutdown_rx.borrow() { return Ok(()); }
+            anyhow::bail!("daemon command loop stopped unexpectedly");
+        }
+        () = wait_for_shutdown(shutdown_rx.clone()) => {}
+    }
     tracing::info!("forge-daemon shutting down");
 
     if let Err(error) = reporter_handle.await.context("join daemon reporter task")? {
@@ -145,6 +176,7 @@ async fn register_or_load_credentials(
     machine_id: &str,
     hostname: &str,
     labels: &BTreeMap<String, String>,
+    max_concurrent_runs: u32,
     owner_token: Option<&str>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<Option<DaemonCredentials>> {
@@ -158,6 +190,7 @@ async fn register_or_load_credentials(
                 client,
                 workspace_root,
                 labels,
+                max_concurrent_runs,
                 &forge_client::daemon_runtime::ActiveExecutionTracker::default(),
             )
             .await
@@ -197,7 +230,13 @@ async fn register_or_load_credentials(
             return Ok(None);
         }
 
-        let request = registration_request(machine_id, hostname, workspace_root, labels);
+        let request = registration_request(
+            machine_id,
+            hostname,
+            workspace_root,
+            labels,
+            max_concurrent_runs,
+        );
         tokio::select! {
             result = register_with_retry(client, &request, owner_token) => {
                 match result {
@@ -246,8 +285,10 @@ fn registration_request(
     hostname: &str,
     workspace_root: &Path,
     labels: &BTreeMap<String, String>,
+    max_concurrent_runs: u32,
 ) -> DaemonRegisterRequest {
     DaemonRegisterRequest {
+        max_concurrent_runs: Some(max_concurrent_runs),
         machine_id: machine_id.to_owned(),
         hostname: hostname.to_owned(),
         os: std::env::consts::OS.to_owned(),

@@ -8,7 +8,9 @@ use std::collections::HashSet;
 impl ExecutionRepo for SqliteDb {
     async fn create(&self, input: CreateExecution) -> Result<Execution> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
+        let execution = self
+            .create_execution_in_tx(&mut transaction, &input, None)
+            .await?;
         transaction.commit().await?;
         Ok(execution)
     }
@@ -28,6 +30,21 @@ impl ExecutionRepo for SqliteDb {
         lease: ClaimExecutionLease,
         admission: Option<ExecutionAdmission>,
     ) -> Result<Execution> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let execution = self
+            .create_with_lease_and_admission_in_tx(&mut transaction, input, lease, admission)
+            .await?;
+        transaction.commit().await?;
+        Ok(execution)
+    }
+
+    async fn create_with_lease_and_admission_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateExecution,
+        lease: ClaimExecutionLease,
+        admission: Option<ExecutionAdmission>,
+    ) -> Result<Execution> {
         let invalid_deadline = lease
             .hard_deadline_at
             .as_deref()
@@ -43,13 +60,13 @@ impl ExecutionRepo for SqliteDb {
                     .to_owned(),
             ));
         }
-        let mut transaction = crate::begin_immediate(&self.pool).await?;
-        Self::create_execution_in_tx(&mut transaction, &input, admission.as_ref()).await?;
+        self.create_execution_in_tx(transaction, &input, admission.as_ref())
+            .await?;
         // Reviewer/auditor executions are durably owned by the exact Review
         // attempt selected by the admission snapshot. Keep this binding in
         // the same writer transaction as the execution row and lease
         // reservation.
-        SqliteDb::bind_role_execution_to_review_in_tx(&mut transaction, &input, admission.as_ref())
+        SqliteDb::bind_role_execution_to_review_in_tx(transaction, &input, admission.as_ref())
             .await?;
         let result = sqlx::query(
             "UPDATE execution
@@ -70,15 +87,14 @@ impl ExecutionRepo for SqliteDb {
         .bind(&lease.now)
         .bind(&lease.now)
         .bind(&lease.execution_id)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         if result.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
-        let execution = execution_in_tx(&mut transaction, &input.id)
+        let execution = execution_in_tx(transaction, &input.id)
             .await?
             .ok_or(DbError::NotFound)?;
-        transaction.commit().await?;
         Ok(execution)
     }
 
@@ -219,42 +235,8 @@ impl ExecutionRepo for SqliteDb {
         &self,
         tasks: &[crate::TaskExecutionProjectionQuery],
     ) -> Result<Vec<Execution>> {
-        if tasks.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut query = sqlx::QueryBuilder::<Sqlite>::new(
-            "WITH requested(task_id, current_role, blocked_execution_id) AS (",
-        );
-        query.push_values(tasks, |mut row, task| {
-            row.push_bind(&task.task_id)
-                .push_bind(task.current_role.as_deref())
-                .push_bind(task.blocked_execution_id.as_deref());
-        });
-        query.push(
-            ") SELECT execution.* FROM execution WHERE id IN (
-                 SELECT candidate.id FROM execution candidate
-                 JOIN requested ON candidate.task_id = requested.task_id
-                 WHERE candidate.status = 'running'
-                    OR candidate.id = requested.blocked_execution_id",
-        );
-        // Each class contributes one representative, regardless of history length.
-        // Running rows are kept separately for session-aware health precedence.
-        for predicate in [
-            "1 = 1",
-            "candidate.status != 'running'",
-            "candidate.status != 'running' AND candidate.agent_session_id IS NOT NULL",
-            "candidate.agent_id IS NOT NULL",
-            "candidate.status != 'running' AND (candidate.role = requested.current_role OR (requested.current_role = 'coder' AND candidate.role = 'executor'))",
-            "candidate.status != 'running' AND candidate.agent_session_id IS NOT NULL AND (candidate.role = requested.current_role OR (requested.current_role = 'coder' AND candidate.role = 'executor'))",
-            "candidate.status != 'running' AND candidate.agent_id IS NOT NULL AND (candidate.role = requested.current_role OR (requested.current_role = 'coder' AND candidate.role = 'executor'))",
-        ] {
-            query.push(" UNION SELECT (SELECT candidate.id FROM execution candidate WHERE candidate.task_id = requested.task_id AND ")
-                .push(predicate)
-                .push(" ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1) FROM requested");
-        }
-        query.push(") ORDER BY execution.task_id, execution.id");
-        let rows = query.build().fetch_all(&self.pool).await?;
-        rows.into_iter().map(map_execution).collect()
+        let mut connection = self.pool.acquire().await?;
+        projection_executions(&mut connection, tasks).await
     }
 
     async fn list_by_task_and_role(
@@ -1823,6 +1805,18 @@ impl ExecutionRepo for SqliteDb {
             )
             .await?;
         }
+        // Late accounting may settle after cancellation; only the winning
+        // terminal update owns an execution's plan candidate.
+        if let Some(plan) = input.plan.as_ref().filter(|_| terminal_cas_won) {
+            sqlx::query("INSERT INTO execution_plan_transport (execution_id, candidate_text, candidate_error, candidate_size, terminal_report_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(execution_id) DO UPDATE SET
+                candidate_text=excluded.candidate_text, candidate_error=excluded.candidate_error,
+                candidate_size=excluded.candidate_size, terminal_report_id=excluded.terminal_report_id,
+                updated_at=excluded.updated_at")
+                .bind(&terminal.execution_id).bind(&plan.content).bind(&plan.error).bind(plan.size)
+                .bind(&input.terminal_report_id).bind(&terminal.updated_at)
+                .execute(&mut *transaction).await?;
+        }
         transaction.commit().await?;
         Ok(ExecutionTerminalOutcome::Committed {
             execution: updated,
@@ -2147,4 +2141,46 @@ fn progress_timestamp_is_before(value: &str, threshold: &str) -> bool {
         (Ok(value), Ok(threshold)) => value < threshold,
         _ => value < threshold,
     }
+}
+
+pub(super) async fn projection_executions(
+    connection: &mut sqlx::SqliteConnection,
+    tasks: &[crate::TaskExecutionProjectionQuery],
+) -> Result<Vec<Execution>> {
+    if tasks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        "WITH requested(task_id, current_role, blocked_execution_id) AS (",
+    );
+    query.push_values(tasks, |mut row, task| {
+        row.push_bind(&task.task_id)
+            .push_bind(task.current_role.as_deref())
+            .push_bind(task.blocked_execution_id.as_deref());
+    });
+    query.push(
+        ") SELECT execution.* FROM execution WHERE id IN (
+                 SELECT candidate.id FROM execution candidate
+                 JOIN requested ON candidate.task_id = requested.task_id
+                 WHERE candidate.status = 'running'
+                    OR candidate.id = requested.blocked_execution_id",
+    );
+    // Each class contributes one representative, regardless of history length.
+    // Running rows are kept separately for session-aware health precedence.
+    for predicate in [
+            "1 = 1",
+            "candidate.status != 'running'",
+            "candidate.status != 'running' AND candidate.agent_session_id IS NOT NULL",
+            "candidate.agent_id IS NOT NULL",
+            "candidate.status != 'running' AND (candidate.role = requested.current_role OR (requested.current_role = 'coder' AND candidate.role = 'executor'))",
+            "candidate.status != 'running' AND candidate.agent_session_id IS NOT NULL AND (candidate.role = requested.current_role OR (requested.current_role = 'coder' AND candidate.role = 'executor'))",
+            "candidate.status != 'running' AND candidate.agent_id IS NOT NULL AND (candidate.role = requested.current_role OR (requested.current_role = 'coder' AND candidate.role = 'executor'))",
+        ] {
+            query.push(" UNION SELECT (SELECT candidate.id FROM execution candidate WHERE candidate.task_id = requested.task_id AND ")
+                .push(predicate)
+                .push(" ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1) FROM requested");
+        }
+    query.push(") ORDER BY execution.task_id, execution.id");
+    let rows = query.build().fetch_all(&mut *connection).await?;
+    rows.into_iter().map(map_execution).collect()
 }

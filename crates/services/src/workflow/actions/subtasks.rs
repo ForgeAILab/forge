@@ -179,7 +179,6 @@ mod subtask_hook_test_support {
                 name: "forge".to_owned(),
                 remote_url: Some("https://example.com/forge.git".to_owned()),
                 local_path: None,
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -274,6 +273,9 @@ mod subtask_hook_test_support {
                 project_id,
                 from_state: from_state.to_owned(),
                 to_state: to_state.to_owned(),
+                workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(
+                    &db,
+                )),
                 db,
                 event_bus,
                 gate_config: None,

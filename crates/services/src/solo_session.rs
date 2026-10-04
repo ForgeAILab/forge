@@ -8,9 +8,7 @@
 //! * [`SoloSessionService`] binds every read and command to one owner,
 //!   Project, repository, and Project Agent Chat;
 //! * [`SoloSessionSnapshot`] contains only bounded, redaction-safe values
-//!   suitable for any presentation; and
-//! * [`SoloProjection`] treats live events as invalidation hints and always
-//!   obtains rendered state from an authoritative refresh.
+//!   suitable for any presentation.
 //!
 //! Runtime composition and the `forge-solo` crate can construct this facade
 //! after bootstrap without introducing a second persistence boundary.
@@ -171,20 +169,6 @@ impl SoloSessionDependencies {
     #[must_use]
     pub fn with_execution_logs_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.execution_logs_root = Some(root.into());
-        self
-    }
-
-    /// Attach the protected runtime interaction broker and its exact durable
-    /// Agent Session identifier.  An empty session identifier is rejected at
-    /// command time and is not persisted in a presentation object.
-    #[must_use]
-    pub fn with_interaction_broker(
-        mut self,
-        broker: InteractionBrokerHandle,
-        forge_session_id: impl Into<String>,
-    ) -> Self {
-        self.interaction_broker = Some(broker);
-        self.forge_session_id = Some(forge_session_id.into());
         self
     }
 }
@@ -415,22 +399,11 @@ pub struct SoloTurnSnapshot {
     pub response_message_id: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
+    pub retry_action: Option<api_types::RetryTurnAction>,
     pub correlation_id: String,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SoloTaskAction {
-    Start,
-    Pause,
-    Resume,
-    Submit,
-    RequestChanges,
-    Approve,
-    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,7 +412,6 @@ pub struct SoloTaskInterruption {
     pub reason: Option<String>,
     pub source: Option<String>,
     pub execution_id: Option<String>,
-    pub recovery_actions: Vec<api_types::RecoveryAction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,7 +483,7 @@ pub struct SoloTaskSnapshot {
     pub assignee_id: Option<String>,
     pub priority: i64,
     pub interruption: Option<SoloTaskInterruption>,
-    pub available_actions: Vec<SoloTaskAction>,
+    pub available_actions: Vec<api_types::Offer>,
     pub roles: Vec<SoloTaskRoleSnapshot>,
     pub executions: Vec<SoloTaskExecutionSnapshot>,
     pub latest_review: Option<SoloReviewSnapshot>,
@@ -733,13 +705,6 @@ pub struct SoloCharterApprovalResult {
     pub project_chat_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SoloProjectionInvalidation {
-    pub event_type: String,
-    pub entity_id: Option<String>,
-    pub lagged: bool,
-}
-
 #[derive(Clone)]
 pub struct SoloSessionService {
     scope: SoloSessionScope,
@@ -784,16 +749,10 @@ impl SoloSessionService {
         &self.scope
     }
 
-    /// Subscribe to invalidation hints for this Project Chat.  The receiver
-    /// is also available through [`SoloProjection::new`].
+    /// Subscribe to invalidation hints for this Project Chat.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<ForgeEvent> {
         self.event_bus.subscribe()
-    }
-
-    #[must_use]
-    pub fn projection(&self) -> SoloProjection {
-        SoloProjection::new(Arc::new(self.clone()))
     }
 
     /// Read every visible Solo surface from current authoritative records.
@@ -910,63 +869,21 @@ impl SoloSessionService {
         Ok(turn_snapshot(&cancelled))
     }
 
-    /// Retry a failed turn from its original triggering message.  The source
-    /// version is checked before any replay, and the canonical deterministic
-    /// child is returned when a prior response was lost.
+    /// Admit a fresh retry through the canonical versioned/idempotent command.
     pub async fn retry_turn(&self, input: SoloRetryTurnInput) -> Result<SoloTurnSnapshot> {
-        let (turn_job_id, _idempotency_key, expected_version) = validate_retry_input(input)?;
-        let job = self.authorized_turn(&turn_job_id).await?;
-        ensure_expected_turn_version(job.version, expected_version)?;
-        if job.status != AgentChatTurnState::Failed {
-            return Err(ServiceError::conflict(
-                "only a failed Agent Chat turn can be retried",
-            ));
-        }
-        if job.attempt_count < 0 {
-            return Err(ServiceError::invalid_operation(
-                "failed Agent Chat turn has an invalid attempt count",
-            ));
-        }
-        let next_attempt = job.attempt_count.checked_add(1).ok_or_else(|| {
-            ServiceError::invalid_operation("failed Agent Chat turn attempt count overflowed")
-        })?;
-        let dedupe_key = retry_dedupe_key(&job.id, next_attempt)?;
-
-        // A response can be lost after the canonical service commits its
-        // child.  Resolve that child before admission so replay converges to
-        // one durable retry rather than attempting a second turn.
-        if let Some(existing) = self.find_retry_child(&job, &dedupe_key).await? {
-            return Ok(turn_snapshot(&existing));
-        }
-
-        let retried = self
+        let (turn_job_id, idempotency_key, expected_version) = validate_retry_input(input)?;
+        self.authorized_turn(&turn_job_id).await?;
+        let turn = self
             .agent_chat_service
             .retry_turn(RetryAgentChatTurnInput {
                 actor_user_id: self.scope.owner_id.clone(),
                 chat_id: self.scope.project_chat_id.clone(),
-                turn_job_id: turn_job_id.clone(),
+                turn_job_id,
+                expected_version,
+                idempotency_key,
             })
-            .await;
-        match retried {
-            Ok(retried) => {
-                // Re-authorize the returned row instead of trusting the
-                // service result's scope metadata at this presentation
-                // boundary.
-                let retried = self.authorized_turn(&retried.id).await?;
-                Ok(turn_snapshot(&retried))
-            }
-            Err(error) => {
-                // A concurrent retry may have won the insert between the
-                // preflight read and the canonical admission.  If its
-                // deterministic child is now durable, return it as the
-                // replay result; otherwise preserve the canonical error.
-                if let Some(existing) = self.find_retry_child(&job, &dedupe_key).await? {
-                    Ok(turn_snapshot(&existing))
-                } else {
-                    Err(error)
-                }
-            }
-        }
+            .await?;
+        Ok(turn_snapshot(&turn))
     }
 
     /// Answer a protected runtime questionnaire only when the exact pending
@@ -1148,19 +1065,10 @@ impl SoloSessionService {
                 "expected_task_version must be positive",
             ));
         }
-        let reason = input.reason.and_then(|reason| safe_diagnostic(&reason));
-        let action = match input.decision {
-            SoloReviewDecision::Accept => api_types::TaskAction::Approve,
-            SoloReviewDecision::RequestChanges => api_types::TaskAction::RequestChanges,
-        };
+        let action = solo_review_action(input.decision, input.reason)?;
         let result = self
             .task_service
-            .perform_task_action(
-                task.id.clone(),
-                action,
-                reason,
-                Some(input.expected_task_version),
-            )
+            .perform_task_action(task.id.clone(), action, input.expected_task_version)
             .await?;
         Ok(SoloReviewDecisionResult {
             task_id: result.task.id,
@@ -1325,31 +1233,6 @@ impl SoloSessionService {
         Ok(job)
     }
 
-    async fn find_retry_child(
-        &self,
-        source: &AgentChatTurnJob,
-        dedupe_key: &str,
-    ) -> Result<Option<AgentChatTurnJob>> {
-        let mut matches =
-            AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*self.db, &self.scope.project_chat_id)
-                .await?
-                .into_iter()
-                .filter(|job| {
-                    job.id != source.id
-                        && job.dedupe_key == dedupe_key
-                        && job.triggering_message_id == source.triggering_message_id
-                        && turn_belongs_to_scope(job, &self.scope)
-                })
-                .collect::<Vec<_>>();
-        match matches.len() {
-            0 => Ok(None),
-            1 => Ok(matches.pop()),
-            _ => Err(ServiceError::conflict(
-                "multiple deterministic retry children exist for the failed turn",
-            )),
-        }
-    }
-
     async fn authorized_task(&self, task_id: &str) -> Result<Task> {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
@@ -1468,15 +1351,14 @@ impl SoloSessionService {
                     .then_with(|| left.created_at.cmp(&right.created_at))
                     .then_with(|| left.id.cmp(&right.id))
             });
-        let available_actions = match self
+        let available_actions = self
             .task_service
-            .available_task_actions(task_id.clone())
-            .await
-        {
-            Ok(actions) => actions.into_iter().map(task_action).collect(),
-            Err(ServiceError::InvalidOperation { .. }) => Vec::new(),
-            Err(error) => return Err(error),
-        };
+            .task_action_offers(
+                &task_id,
+                &api_types::Actor::user(api_types::UserActionSource::Api),
+            )
+            .await?
+            .available_actions;
         Ok(SoloTaskSnapshot {
             id: safe_identifier(&task.id),
             project_id: safe_identifier(&task.project_id),
@@ -1761,93 +1643,6 @@ impl SoloSessionService {
     }
 }
 
-/// Event-backed projection.  Events only mark this object dirty; rendering
-/// code receives no event payload and therefore cannot mistake a delta for an
-/// authoritative state transition.
-pub struct SoloProjection {
-    service: Arc<SoloSessionService>,
-    receiver: broadcast::Receiver<ForgeEvent>,
-    invalidated: bool,
-    snapshot: Option<SoloSessionSnapshot>,
-}
-
-impl fmt::Debug for SoloProjection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SoloProjection")
-            .field("invalidated", &self.invalidated)
-            .field("has_snapshot", &self.snapshot.is_some())
-            .finish_non_exhaustive()
-    }
-}
-
-impl SoloProjection {
-    #[must_use]
-    pub fn new(service: Arc<SoloSessionService>) -> Self {
-        let receiver = service.subscribe();
-        Self {
-            service,
-            receiver,
-            invalidated: true,
-            snapshot: None,
-        }
-    }
-
-    #[must_use]
-    pub fn is_invalidated(&self) -> bool {
-        self.invalidated
-    }
-
-    pub async fn refresh(&mut self) -> Result<SoloSessionSnapshot> {
-        let snapshot = self.service.refresh().await?;
-        self.snapshot = Some(snapshot.clone());
-        self.invalidated = false;
-        Ok(snapshot)
-    }
-
-    pub async fn refresh_if_invalidated(&mut self) -> Result<Option<SoloSessionSnapshot>> {
-        if self.invalidated || self.snapshot.is_none() {
-            return self.refresh().await.map(Some);
-        }
-        Ok(None)
-    }
-
-    #[must_use]
-    pub fn snapshot(&self) -> Option<&SoloSessionSnapshot> {
-        self.snapshot.as_ref()
-    }
-
-    /// Wait for the next relevant event. A lagged receiver is itself a dirty
-    /// signal: the next refresh reads all state instead of trying to replay a
-    /// partial event stream.
-    pub async fn next_invalidation(&mut self) -> Option<SoloProjectionInvalidation> {
-        loop {
-            match self.receiver.recv().await {
-                Ok(event) => {
-                    let Some(entity_id) = relevant_event_entity(&self.service.scope, &event) else {
-                        continue;
-                    };
-                    self.invalidated = true;
-                    return Some(SoloProjectionInvalidation {
-                        event_type: safe_identifier(&event.event_type),
-                        entity_id,
-                        lagged: false,
-                    });
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    self.invalidated = true;
-                    return Some(SoloProjectionInvalidation {
-                        event_type: "events.lagged".to_owned(),
-                        entity_id: None,
-                        lagged: true,
-                    });
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    }
-}
-
 struct AuthorizedScopeRecords {
     project: Project,
     repo: Repo,
@@ -1986,22 +1781,11 @@ fn turn_snapshot(job: &AgentChatTurnJob) -> SoloTurnSnapshot {
         response_message_id: job.response_message_id.as_deref().map(safe_identifier),
         error_code: job.error_code.as_deref().map(safe_identifier),
         error_message: job.error_message.as_deref().and_then(safe_diagnostic),
+        retry_action: job.retry_action(),
         correlation_id: safe_identifier(&job.correlation_id),
         version: job.version,
         created_at: safe_text(&job.created_at, SOLO_MAX_SHORT_TEXT_CHARS),
         updated_at: safe_text(&job.updated_at, SOLO_MAX_SHORT_TEXT_CHARS),
-    }
-}
-
-fn task_action(action: api_types::TaskAction) -> SoloTaskAction {
-    match action {
-        api_types::TaskAction::Start => SoloTaskAction::Start,
-        api_types::TaskAction::Pause => SoloTaskAction::Pause,
-        api_types::TaskAction::Resume => SoloTaskAction::Resume,
-        api_types::TaskAction::Submit => SoloTaskAction::Submit,
-        api_types::TaskAction::RequestChanges => SoloTaskAction::RequestChanges,
-        api_types::TaskAction::Approve => SoloTaskAction::Approve,
-        api_types::TaskAction::Cancel => SoloTaskAction::Cancel,
     }
 }
 
@@ -2024,11 +1808,6 @@ fn task_interruption(task: &Task) -> Option<SoloTaskInterruption> {
                         .blocked_execution_id
                         .as_deref()
                         .map(safe_identifier),
-                    recovery_actions: annotation
-                        .recovery_actions
-                        .into_iter()
-                        .take(SOLO_MAX_ROLES_PER_TASK as usize)
-                        .collect(),
                 });
             }
         }
@@ -2043,7 +1822,6 @@ fn task_interruption(task: &Task) -> Option<SoloTaskInterruption> {
             reason: safe_optional_diagnostic(Some(metadata.reason.as_str())),
             source: metadata.source.and_then(|source| safe_diagnostic(&source)),
             execution_id: metadata.execution_id.as_deref().map(safe_identifier),
-            recovery_actions: Vec::new(),
         })
 }
 
@@ -2431,20 +2209,6 @@ fn path_component_id(name: &str, value: String) -> Result<String> {
     Ok(value)
 }
 
-fn retry_dedupe_key(source_id: &str, next_attempt: i64) -> Result<String> {
-    if next_attempt < 1 {
-        return Err(ServiceError::invalid_operation(
-            "retry attempt must be positive",
-        ));
-    }
-    let source_id = path_component_id("turn_job_id", source_id.to_owned())?;
-    bounded_owned(
-        "retry dedupe_key",
-        format!("retry:{source_id}:{next_attempt}"),
-        SOLO_MAX_ID_CHARS,
-    )
-}
-
 fn validate_retry_input(input: SoloRetryTurnInput) -> Result<(String, String, i64)> {
     let turn_job_id = path_component_id("turn_job_id", input.turn_job_id)?;
     let idempotency_key = bounded_owned(
@@ -2458,13 +2222,6 @@ fn validate_retry_input(input: SoloRetryTurnInput) -> Result<(String, String, i6
         ));
     }
     Ok((turn_job_id, idempotency_key, input.expected_version))
-}
-
-fn ensure_expected_turn_version(actual: i64, expected: i64) -> Result<()> {
-    if actual != expected {
-        return Err(ServiceError::Db(db::DbError::VersionConflict));
-    }
-    Ok(())
 }
 
 fn scoped_execution_log_path(
@@ -2715,60 +2472,6 @@ fn tool_result_summary(value: Option<&Value>) -> Option<String> {
         .and_then(|value| safe_diagnostic(&value))
 }
 
-fn relevant_event_entity(scope: &SoloSessionScope, event: &ForgeEvent) -> Option<Option<String>> {
-    let context = serde_json::to_value(&event.context).ok()?;
-    let entity_hint = || safe_event_entity_id(&event.entity_id);
-    let exact_project = context
-        .get("project_id")
-        .and_then(Value::as_str)
-        .is_some_and(|project_id| project_id == scope.project_id)
-        || (context.get("scope_type").and_then(Value::as_str) == Some("project")
-            && context
-                .get("scope_id")
-                .and_then(Value::as_str)
-                .is_some_and(|scope_id| scope_id == scope.project_id));
-    if exact_project {
-        return Some(entity_hint());
-    }
-    let exact_chat = context
-        .get("chat_id")
-        .and_then(Value::as_str)
-        .is_some_and(|chat_id| chat_id == scope.project_chat_id)
-        || (context.get("scope_type").and_then(Value::as_str) == Some("agent_chat")
-            && context
-                .get("scope_id")
-                .and_then(Value::as_str)
-                .is_some_and(|scope_id| scope_id == scope.project_chat_id));
-    if exact_chat {
-        return Some(entity_hint());
-    }
-    if event.entity_id == scope.project_id {
-        return Some(Some(scope.project_id.clone()));
-    }
-    // Task/review/execution events often carry only a Task id.  They are
-    // harmless invalidation hints; do not echo that opaque id to the TUI until
-    // an authoritative refresh proves it belongs to this Project.
-    if event.event_type.starts_with("task.")
-        || event.event_type.starts_with("review.")
-        || event.event_type.starts_with("execution.")
-    {
-        return Some(None);
-    }
-    None
-}
-
-fn safe_event_entity_id(entity_id: &str) -> Option<String> {
-    if entity_id.trim().is_empty()
-        || entity_id.chars().count() > SOLO_MAX_ID_CHARS
-        || entity_id.chars().any(char::is_control)
-        || contains_secret_marker(entity_id)
-    {
-        None
-    } else {
-        Some(safe_identifier(entity_id))
-    }
-}
-
 fn visible_content(content: &str, sensitivity: &str) -> (String, bool) {
     let protected_sensitivity = matches!(
         sensitivity.to_ascii_lowercase().as_str(),
@@ -2891,10 +2594,56 @@ fn bounded_limit(name: &str, value: i64, max: i64) -> Result<i64> {
     Ok(value)
 }
 
+fn solo_review_action(
+    decision: SoloReviewDecision,
+    reason: Option<String>,
+) -> Result<api_types::TaskAction> {
+    let reason = reason.and_then(|reason| safe_diagnostic(&reason));
+    match decision {
+        SoloReviewDecision::Accept => Ok(api_types::TaskAction::Approve {
+            reason,
+            override_checks: Some(false),
+        }),
+        SoloReviewDecision::RequestChanges => {
+            let guidance = reason
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("send_back requires nonblank guidance")
+                })?;
+            Ok(api_types::TaskAction::SendBack { guidance })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use events::EventContext;
+    #[test]
+    fn review_decisions_preserve_typed_guidance_and_reason() {
+        assert!(solo_review_action(SoloReviewDecision::RequestChanges, None).is_err());
+        assert!(solo_review_action(SoloReviewDecision::RequestChanges, Some("  ".into())).is_err());
+        assert_eq!(
+            solo_review_action(
+                SoloReviewDecision::RequestChanges,
+                Some("Fix the missing coverage".into())
+            )
+            .unwrap(),
+            api_types::TaskAction::SendBack {
+                guidance: "Fix the missing coverage".into()
+            }
+        );
+        assert_eq!(
+            solo_review_action(
+                SoloReviewDecision::Accept,
+                Some("Track in follow-up".into())
+            )
+            .unwrap(),
+            api_types::TaskAction::Approve {
+                override_checks: Some(false),
+                reason: Some("Track in follow-up".into())
+            }
+        );
+    }
 
     #[test]
     fn finite_turn_states_keep_terminal_and_waiting_distinct() {
@@ -2944,22 +2693,6 @@ mod tests {
             idempotency_key: "k".repeat(SOLO_MAX_ID_CHARS + 1),
         })
         .is_err());
-        assert!(ensure_expected_turn_version(7, 7).is_ok());
-        assert!(matches!(
-            ensure_expected_turn_version(8, 7),
-            Err(ServiceError::Db(db::DbError::VersionConflict))
-        ));
-    }
-
-    #[test]
-    fn retry_child_dedupe_key_is_deterministic_and_bounded() {
-        assert_eq!(
-            retry_dedupe_key("turn-123", 2).expect("retry key"),
-            "retry:turn-123:2"
-        );
-        assert!(retry_dedupe_key("turn-123", 0).is_err());
-        assert!(retry_dedupe_key("../turn", 2).is_err());
-        assert!(retry_dedupe_key(&"t".repeat(SOLO_MAX_ID_CHARS), 2).is_err());
     }
 
     #[test]
@@ -3010,20 +2743,6 @@ mod tests {
         assert!(!redacted);
         assert!(contains_secret_marker("sk-live-secret"));
         assert!(!contains_secret_marker("task-123"));
-    }
-
-    #[test]
-    fn unrelated_project_events_are_not_projected_as_entity_hints() {
-        let scope = SoloSessionScope::new("owner", "project", "repo", "chat");
-        let event = ForgeEvent {
-            event_type: "task.updated".to_owned(),
-            entity_id: "task-other".to_owned(),
-            timestamp: "2026-01-01T00:00:00Z".to_owned(),
-            context: EventContext::TaskUpdated {
-                project_id: "other-project".to_owned(),
-            },
-        };
-        assert_eq!(relevant_event_entity(&scope, &event), Some(None));
     }
 
     #[test]

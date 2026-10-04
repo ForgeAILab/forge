@@ -4,7 +4,10 @@ mod common;
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use api_types::{AgentResponse, TaskResponse, METHOD_EXECUTION_START};
+use api_types::{
+    AgentResponse, DaemonFrame, RepoLocationResponse, TaskResponse, METHOD_EXECUTION_START,
+    METHOD_REPO_LOCATION_VERIFY,
+};
 use axum::http::{Method, StatusCode};
 use db::{ExecutionRepo, ExecutionStatus as DbExecutionStatus, StopReason, TaskRepo};
 use futures_util::SinkExt;
@@ -24,11 +27,17 @@ use common::{
 };
 
 async fn poll_task_status_after_execution(
-    db: &Arc<db::SqliteDb>,
+    state: &api::AppState,
     task_id: &str,
     expected: &str,
 ) -> db::Task {
+    let db = &state.db;
     for _ in 0..200 {
+        state
+            .task_service
+            .drain(task_id)
+            .await
+            .expect("cascade steps drain");
         if let Some(task) = TaskRepo::get_by_id(&**db, task_id, false)
             .await
             .expect("task lookup")
@@ -99,18 +108,17 @@ struct RemoteRoundtripFixture {
     agent_id: String,
     reviewer_id: String,
     _repo_dir: TestDir,
-    _workspaces_root: TestDir,
 }
 
 async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
     let repo_dir = TestDir::new(&format!("{prefix}-repo"));
     let repo_path = setup_git_repo(repo_dir.path());
-    let workspaces_root = TestDir::new(&format!("{prefix}-workspaces"));
-    let harness = test_app(workspaces_root.path(), prefix).await;
+    let workspaces_root = repo_dir.path().join("workspaces");
+    let harness = test_app(&workspaces_root, prefix).await;
 
     let registration = register_daemon(&harness.app, &format!("{prefix}-machine"), prefix).await;
     let server = TestServer::start(Arc::clone(&harness.state)).await;
-    let daemon_socket = connect_daemon(
+    let mut daemon_socket = connect_daemon(
         &server,
         &registration.daemon_id,
         Some(&registration.registration_token),
@@ -122,13 +130,68 @@ async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
         &harness.app,
         &registration.daemon_id,
         &registration.registration_token,
-        workspaces_root.path(),
+        repo_dir.path(),
         prefix,
     )
     .await;
 
     let (project_id, repo_id) =
         create_project_and_repo(&harness.app, &format!("{prefix} Project"), &repo_path).await;
+
+    let runtime_id = db::RuntimeRepo::get_by_daemon_id(&*harness.state.db, &registration.daemon_id)
+        .await
+        .expect("runtime loads")
+        .expect("runtime exists")
+        .id;
+    let app = harness.app.clone();
+    let locations_path = format!("/api/v1/repos/{repo_id}/locations");
+    let location_request = json!({
+        "owner_kind": "server",
+        "daemon_id": registration.daemon_id,
+        "runtime_id": runtime_id,
+        "path": repo_path,
+        "kind": "shared_mount",
+    });
+    let registering = tokio::spawn(async move {
+        json_request_with_bearer::<RepoLocationResponse>(
+            &app,
+            Method::POST,
+            &locations_path,
+            &admin_jwt(),
+            location_request,
+            StatusCode::OK,
+        )
+        .await
+    });
+    let (id, params) = next_daemon_request(&mut daemon_socket, METHOD_REPO_LOCATION_VERIFY).await;
+    // Use the real verifier so the fake execution transport proves it can
+    // read the server's probe within its advertised root.
+    let (outbound, _unused) = tokio::sync::mpsc::unbounded_channel();
+    let runtime = forge_client::daemon_runtime::DaemonRuntime::new_owned(
+        outbound,
+        repo_dir.path().to_path_buf(),
+        Default::default(),
+        registration.daemon_id.clone(),
+        Default::default(),
+    )
+    .expect("shared-mount verifier starts");
+    let response = runtime
+        .handle_request(DaemonFrame::Request {
+            id,
+            method: METHOD_REPO_LOCATION_VERIFY.to_owned(),
+            params,
+        })
+        .await;
+    daemon_socket
+        .send(WsMessage::Text(
+            serde_json::to_string(&response).unwrap().into(),
+        ))
+        .await
+        .expect("shared-mount verification response sends");
+    let location = registering
+        .await
+        .expect("shared-mount registration completes");
+    assert_eq!(location.status, api_types::RepoLocationStatus::Ready);
 
     let agent: AgentResponse = json_request_with_bearer(
         &harness.app,
@@ -187,7 +250,6 @@ async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
         agent_id: agent.id,
         reviewer_id: reviewer.id,
         _repo_dir: repo_dir,
-        _workspaces_root: workspaces_root,
     }
 }
 
@@ -354,8 +416,7 @@ async fn remote_execution_completes_and_transitions_task() {
     // part of this round-trip instead of leaving the task at the review gate.
     complete_remote_reviewer(&mut fixture.daemon_socket, &fixture.harness.state.db).await;
 
-    let reviewed =
-        poll_task_status_after_execution(&fixture.harness.state.db, &task_id, "done").await;
+    let reviewed = poll_task_status_after_execution(&fixture.harness.state, &task_id, "done").await;
     assert_eq!(reviewed.status, "done");
 
     let logs = poll_execution_logs(&fixture.harness.app, &execution_id, 3).await;
@@ -432,7 +493,7 @@ async fn remote_execution_failure_takes_failure_path() {
 }
 
 #[tokio::test]
-async fn remote_daemon_disconnect_fails_running_execution() {
+async fn remote_daemon_disconnect_suspends_server_workspace_until_expiry() {
     let mut fixture = setup_remote_roundtrip("remote-roundtrip-disconnect").await;
 
     let (task_id, execution_id) = claim_task_with_accepted_start(
@@ -451,7 +512,6 @@ async fn remote_daemon_disconnect_fails_running_execution() {
         .send(WsMessage::Close(None))
         .await
         .expect("close daemon websocket");
-    drop(fixture.server);
     wait_until_disconnected(&fixture.harness.state, &fixture.registration.daemon_id).await;
 
     let monitor = HeartbeatMonitor::new(
@@ -459,11 +519,32 @@ async fn remote_daemon_disconnect_fails_running_execution() {
         Arc::clone(&fixture.harness.state.event_bus),
     )
     .with_task_service(fixture.harness.state.task_service.clone())
-    .with_daemon_connections(fixture.harness.state.daemon_connections.clone())
-    .with_daemon_disconnect_grace(Duration::ZERO);
+    .with_daemon_connections(fixture.harness.state.daemon_connections.clone());
 
-    let interrupted = monitor.check_once().await.expect("heartbeat monitor runs");
-    assert_eq!(interrupted, 1);
+    assert_eq!(
+        monitor.check_once().await.expect("heartbeat monitor runs"),
+        0
+    );
+    let placement = db::WorkspacePlacementRepo::get_for_task(&*fixture.harness.state.db, &task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placement.owner_kind, db::PlacementOwnerKind::Server);
+    assert_eq!(placement.state, db::PlacementState::Disconnected);
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*fixture.harness.state.db, &execution_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DbExecutionStatus::Running
+    );
+    let before = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let expired = monitor.with_max_disconnect(Duration::ZERO);
+    assert_eq!(expired.check_once().await.expect("expiry monitor runs"), 1);
 
     let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &execution_id)
         .await
@@ -476,14 +557,94 @@ async fn remote_daemon_disconnect_fails_running_execution() {
         .await
         .expect("task loads")
         .expect("task exists");
-    assert!(
-        task.blocked_json.is_some(),
-        "disconnect failure should block the task for recovery"
+    let placement = db::WorkspacePlacementRepo::get_for_task(&*fixture.harness.state.db, &task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        placement.failure_cause,
+        Some(db::PlacementFailureCause::OwnerDisconnectedTimeout)
     );
-    assert!(
-        task.error_annotation.is_some(),
-        "disconnect failure should expose recovery annotation"
+    let retry_count = |task: &db::Task| {
+        serde_json::from_str::<serde_json::Value>(task.metadata_json.as_deref().unwrap_or("{}"))
+            .unwrap()["execution_retry_count"]
+            .clone()
+    };
+    assert_eq!(retry_count(&task), retry_count(&before));
+    assert_eq!(task.status, before.status);
+    let annotation: Value = serde_json::from_str(
+        task.error_annotation
+            .as_deref()
+            .expect("expiry exposes recovery annotation"),
+    )
+    .unwrap();
+    assert_eq!(annotation["blocking_reason"], "owner_disconnected_timeout");
+    assert_eq!(annotation["blocked_execution_id"], execution_id);
+
+    fixture.daemon_socket = connect_daemon(
+        &fixture.server,
+        &fixture.registration.daemon_id,
+        Some(&fixture.registration.registration_token),
+    )
+    .await
+    .unwrap();
+    wait_until_connected(&fixture.harness.state, &fixture.registration.daemon_id).await;
+    report_remote_daemon_shell(
+        &fixture.harness.app,
+        &fixture.registration.daemon_id,
+        &fixture.registration.registration_token,
+        fixture._repo_dir.path(),
+        "remote-roundtrip-disconnect",
+    )
+    .await;
+    let task_service = fixture.harness.state.task_service.clone();
+    let recovery_task_id = task_id.clone();
+    let recovered = tokio::spawn(async move {
+        task_service
+            .test_apply_action(
+                recovery_task_id,
+                api_types::TaskAction::Retry {
+                    reason: None,
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                Some("owner reconnected".into()),
+                None,
+            )
+            .await
+            .unwrap()
+    });
+    let (start_id, params) =
+        next_daemon_request(&mut fixture.daemon_socket, METHOD_EXECUTION_START).await;
+    let retry_id = params["execution_id"].as_str().unwrap().to_owned();
+    assert_ne!(retry_id, execution_id);
+    send_daemon_response(
+        &mut fixture.daemon_socket,
+        start_id,
+        api_types::ExecutionStartResult {
+            execution_id: retry_id.clone(),
+            accepted: true,
+        },
+    )
+    .await;
+    let recovered = recovered.await.unwrap();
+    assert!(recovered.error_annotation.is_none());
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*fixture.harness.state.db, &retry_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DbExecutionStatus::Running
     );
+    let ready = db::WorkspacePlacementRepo::get_for_task(&*fixture.harness.state.db, &task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ready.state, db::PlacementState::Ready);
+    assert_eq!(ready.execution_daemon_id, placement.execution_daemon_id);
 }
 
 /// Fallback-chain round-trip over the daemon protocol: the snapshot carries
@@ -593,6 +754,8 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
             summary: None,
             after_sha: None,
             usage_reports: Vec::new(),
+            outbox_entries: Vec::new(),
+            plan_text: None,
             failure_class: Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable),
             retry_at: Some(retry_at),
             resolved_candidate: None,

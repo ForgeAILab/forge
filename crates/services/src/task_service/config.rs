@@ -195,26 +195,6 @@ pub(super) fn executor_snapshot_with_sticky_resume(
     }
 }
 
-#[allow(dead_code)]
-pub(super) fn executor_snapshot_without_resume_thread(snapshot_json: &str) -> Result<String> {
-    let mut snapshot = parse_json_value("executor config snapshot", snapshot_json)?;
-    if let Some(config) = snapshot.get_mut("config").and_then(Value::as_object_mut) {
-        config.remove(RESUME_THREAD_ID_CONFIG_KEY);
-        config.remove("resume_thread_in_place");
-        config.remove("resume_fallback_prompt");
-        config.remove("resume_session_id");
-    }
-    if let Some(obj) = snapshot.as_object_mut() {
-        obj.remove("dispatch_metadata");
-        if let Some(dispatch_obj) = obj.get_mut("dispatch").and_then(Value::as_object_mut) {
-            dispatch_obj.remove("execution_policy");
-        }
-    }
-    serde_json::to_string(&snapshot).map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid executor config snapshot: {error}"))
-    })
-}
-
 pub(super) fn truncate_utf8_bytes(bytes: &[u8], max_bytes: usize) -> String {
     let text = String::from_utf8_lossy(bytes);
     if text.len() <= max_bytes {
@@ -244,17 +224,13 @@ pub(super) async fn build_executor_config_snapshot(
             "hard_deadline_seconds must be greater than zero when set; omit it for no limit",
         ));
     }
-    // Native profiles are hosted by Forge itself and deliberately have no
-    // daemon authority.  CLI profiles retain the existing daemon resolution
-    // and snapshot provenance.
-    let resolved_daemon_id = if agent.backend_kind == "native" {
-        None
-    } else {
-        Some(
-            crate::agent_service::resolve_daemon_for_agent(db, agent)
-                .await?
-                .id,
-        )
+    let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
+    let workspace = WorkspaceRepo::get_by_task_id(db, workspace_task_id).await?;
+    let placement_id = match workspace.as_ref() {
+        Some(workspace) => db::WorkspacePlacementRepo::get_by_workspace_id(db, &workspace.id)
+            .await?
+            .map(|placement| placement.id),
+        None => None,
     };
     let mut base_config = parse_json_value("agent config_json", &agent.config_json)?;
     // Extract before normalization: the typed config round-trip drops
@@ -300,12 +276,15 @@ pub(super) async fn build_executor_config_snapshot(
         "permission_policy": agent.permission_policy,
         "config": normalized_config,
         "capabilities": capabilities,
-        "resolved_daemon_id": resolved_daemon_id,
+        "placement_id": placement_id,
         "overrides_applied": overrides_applied.to_json(),
         "snapshotted_at": now_rfc3339(),
     });
     if let Some(seconds) = hard_deadline_seconds {
         snapshot["hard_deadline_seconds"] = json!(seconds);
+    }
+    if workspace.is_none() && agent.backend_kind == "cli" {
+        snapshot["daemon_id"] = json!(agent.daemon_id);
     }
     if let Some(routing) = routing_snapshot_value(kind, &snapshot["config"], &fallbacks)? {
         snapshot[executors::ROUTING_SNAPSHOT_KEY] = routing;

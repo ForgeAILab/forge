@@ -19,11 +19,36 @@ pub struct ProjectArgs {
 
 #[derive(Subcommand)]
 enum ProjectCmd {
+    /// Add or replace a named, read-only Project environment check.
+    EnvCheck {
+        project: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        command: String,
+        #[arg(long, default_value = "workspace", value_parser = ["workspace", "machine"])]
+        scope: String,
+        #[arg(long, default_value_t = 120)]
+        timeout_seconds: u64,
+        #[arg(long = "role")]
+        roles: Vec<String>,
+    },
     Create {
         #[arg(long)]
         name: String,
     },
     List,
+    /// Read recorded Project environment readiness by machine.
+    EnvStatus {
+        project: String,
+    },
+    /// Run Project environment checks and resume an environment pause on success.
+    EnvRecheck {
+        /// Project id.
+        project: String,
+        #[arg(long)]
+        machine: Option<String>,
+    },
     /// Token and cost accounting for one Project, by surface, model and agent.
     Analytics {
         /// Project id.
@@ -40,6 +65,38 @@ enum ProjectCmd {
 impl ProjectArgs {
     pub async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
         match &self.cmd {
+            ProjectCmd::EnvCheck {
+                project,
+                name,
+                command,
+                scope,
+                timeout_seconds,
+                roles,
+            } => {
+                let current: ProjectResponse =
+                    client.get(&format!("/api/v1/projects/{project}")).await?;
+                let settings = check_settings(
+                    current.settings.clone(),
+                    api_types::EnvironmentCheck {
+                        name: name.clone(),
+                        command: command.clone(),
+                        scope: if scope == "machine" {
+                            api_types::EnvironmentCheckScope::Machine
+                        } else {
+                            api_types::EnvironmentCheckScope::Workspace
+                        },
+                        roles: roles.clone(),
+                        timeout_seconds: *timeout_seconds,
+                    },
+                )?;
+                let saved: ProjectResponse = client
+                    .patch(
+                        &format!("/api/v1/projects/{project}"),
+                        &serde_json::json!({"version":current.version,"settings":settings}),
+                    )
+                    .await?;
+                print_project(output, &saved)
+            }
             ProjectCmd::Create { name } => {
                 let request = CreateProjectRequest {
                     name: name.clone(),
@@ -67,6 +124,75 @@ impl ProjectArgs {
                     }
                 }
             }
+            ProjectCmd::EnvStatus { project } => {
+                let response: ProjectResponse =
+                    client.get(&format!("/api/v1/projects/{project}")).await?;
+                match output {
+                    OutputFormat::Json => print_json(&response.environment_readiness),
+                    OutputFormat::Table => {
+                        if response.environment_readiness.is_empty() {
+                            println!("No environment readiness recorded.");
+                        }
+                        for row in &response.environment_readiness {
+                            println!(
+                                "{} ({}) · {} · {} · checked {} · next {}",
+                                row.machine.name,
+                                row.machine.id,
+                                match row.status {
+                                    api_types::EnvironmentReadinessStatus::Ready => "ready",
+                                    api_types::EnvironmentReadinessStatus::NotReady => "not_ready",
+                                    api_types::EnvironmentReadinessStatus::Unknown => "unknown",
+                                },
+                                row.failing_checks
+                                    .iter()
+                                    .map(|c| c.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                row.checked_at.as_deref().unwrap_or("-"),
+                                row.next_check_at.as_deref().unwrap_or("-")
+                            );
+                            if !row.output_tail.is_empty() {
+                                println!("{}", row.output_tail);
+                            }
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            ProjectCmd::EnvRecheck { project, machine } => {
+                let response: api_types::ProjectEnvironmentRecheckResponse = client
+                    .post(
+                        &format!("/api/v1/projects/{project}/environment/recheck"),
+                        &api_types::ProjectEnvironmentRecheckRequest {
+                            machine: machine.clone(),
+                        },
+                    )
+                    .await?;
+                match output {
+                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Table => {
+                        for machine in &response.machines {
+                            println!("{} ({})", machine.machine.name, machine.machine.id);
+                            if let Some(error) = &machine.error {
+                                println!("{error}");
+                            }
+                            for check in &machine.checks {
+                                let status = if check.passed { "passed" } else { "failed" };
+                                let exit = check
+                                    .exit_code
+                                    .map(|code| code.to_string())
+                                    .unwrap_or_else(|| "-".to_owned());
+                                println!("{}: {status} (exit {exit})", check.name);
+                                if !check.output_tail.is_empty() {
+                                    println!("{}", check.output_tail);
+                                }
+                            }
+                        }
+                        print_table_projects(std::slice::from_ref(&response.project));
+                        Ok(())
+                    }
+                }
+            }
             ProjectCmd::List => {
                 let response: PaginatedResponse<ProjectResponse> =
                     client.get("/api/v1/projects").await?;
@@ -80,6 +206,29 @@ impl ProjectArgs {
             }
         }
     }
+}
+
+fn check_settings(
+    mut settings: serde_json::Value,
+    check: api_types::EnvironmentCheck,
+) -> Result<serde_json::Value> {
+    let mut environment: api_types::ProjectEnvironment = settings
+        .get("environment")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(existing) = environment
+        .checks
+        .iter_mut()
+        .find(|existing| existing.name == check.name)
+    {
+        *existing = check;
+    } else {
+        environment.checks.push(check);
+    }
+    settings["environment"] = serde_json::to_value(environment)?;
+    Ok(settings)
 }
 
 fn print_project(output: &OutputFormat, project: &ProjectResponse) -> Result<()> {
@@ -268,7 +417,90 @@ fn surface_name(surface: api_types::UsageSurface) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn environment_check_scope_flag_and_upsert_preserve_settings() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: super::ProjectArgs,
+        }
+        let cli = Cli::try_parse_from([
+            "forge-ctl",
+            "env-check",
+            "p",
+            "--name",
+            "cargo",
+            "--command",
+            "cargo --version",
+            "--scope",
+            "machine",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.args.cmd, super::ProjectCmd::EnvCheck { scope, .. } if scope == "machine")
+        );
+        assert!(Cli::try_parse_from([
+            "forge-ctl",
+            "env-check",
+            "p",
+            "--name",
+            "x",
+            "--command",
+            "true",
+            "--scope",
+            "host"
+        ])
+        .is_err());
+        let check: api_types::EnvironmentCheck = serde_json::from_value(
+            serde_json::json!({"name":"cargo","command":"true","scope":"machine"}),
+        )
+        .unwrap();
+        let settings = super::check_settings(serde_json::json!({"placement":{"provision":"never"},"environment":{"env":{"X":"value"},"checks":[{"name":"cargo","command":"false"}]}}), check).unwrap();
+        assert_eq!(
+            settings["environment"]["checks"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(settings["environment"]["checks"][0]["scope"], "machine");
+        assert_eq!(settings["environment"]["env"]["X"], "value");
+        assert_eq!(settings["placement"]["provision"], "never");
+    }
+
     use super::analytics_path;
+
+    #[test]
+    fn environment_recheck_subcommand_parses_project() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: super::ProjectArgs,
+        }
+        let cli = Cli::try_parse_from(["project", "env-recheck", "project-1"]).unwrap();
+        assert!(
+            matches!(cli.args.cmd, super::ProjectCmd::EnvRecheck { project, machine: None } if project == "project-1")
+        );
+    }
+
+    #[test]
+    fn environment_status_and_machine_selector_parse() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: super::ProjectArgs,
+        }
+        let cli = Cli::try_parse_from(["project", "env-status", "project-1"]).unwrap();
+        assert!(
+            matches!(cli.args.cmd, super::ProjectCmd::EnvStatus { project } if project == "project-1")
+        );
+        let cli =
+            Cli::try_parse_from(["project", "env-recheck", "project-1", "--machine", "server"])
+                .unwrap();
+        assert!(
+            matches!(cli.args.cmd, super::ProjectCmd::EnvRecheck { project, machine: Some(machine) } if project == "project-1" && machine == "server")
+        );
+    }
 
     #[test]
     fn analytics_path_percent_encodes_rfc3339_offset() {

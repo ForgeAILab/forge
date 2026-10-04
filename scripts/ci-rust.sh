@@ -22,6 +22,11 @@ export FORGE_SKIP_WEB_BUILD=1
 # need nothing from the host.
 export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_NOSYSTEM=1
+# The workspace has over 150 integration-test binaries. With full debug info
+# they overflow the hosted runner's disk and the linker dies with a bus error.
+# Line tables keep file:line in panics and backtraces at a fraction of the size.
+export CARGO_PROFILE_DEV_DEBUG=line-tables-only
+export CARGO_PROFILE_TEST_DEBUG=line-tables-only
 
 failed=()
 

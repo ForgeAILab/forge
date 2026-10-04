@@ -552,12 +552,10 @@ where
             .await?)
     }
 
-    /// Index one finalized Agent Chat message in the chat's canonical memory
-    /// scope. The singular-chat visibility label and chat id are the
-    /// canonical ACL/provenance boundary. The
-    /// source-receipt write is part of the repository transaction, so replay
-    /// after a lease expiry cannot create a duplicate memory item.
-    pub async fn record_agent_chat_message_event(
+    /// Build the projection for one finalized Agent Chat message without
+    /// writing it. WorkerRuntime performs this preparation before opening the
+    /// short transaction that applies the item and advances its cursor.
+    pub(crate) fn prepare_agent_chat_message_event(
         &self,
         event: &DomainEvent,
         chat: &AgentChat,
@@ -647,11 +645,7 @@ where
             created_by_id: message.author_id.clone(),
             created_at: now,
         };
-        let (item, inserted) = self
-            .db
-            .insert_memory_item_if_source_absent(&item, "agent_chat", &message.id)
-            .await?;
-        Ok(inserted.then_some(item))
+        Ok(Some(item))
     }
 }
 
@@ -659,10 +653,6 @@ impl<R> MemoryService<R>
 where
     R: MemoryBackfillRepository + Send + Sync,
 {
-    pub async fn backfill_all(db: Arc<R>) -> Result<BackfillSummary> {
-        Self::new(db).backfill_sources().await
-    }
-
     pub async fn backfill_sources(&self) -> Result<BackfillSummary> {
         let mut results = backfill_results_by_type();
         for source in self.db.list_memory_backfill_sources().await? {

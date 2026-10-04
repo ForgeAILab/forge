@@ -1,9 +1,10 @@
 {
   "id": "add-project-flow-control",
   "created_at": "2026-09-30T20:30:00Z",
-  "updated_at": "2026-09-30T20:10:00Z",
-  "status": "approved",
+  "updated_at": "2026-09-30T20:07:40Z",
+  "status": "implementing",
   "change_id": "add-project-flow-control",
   "change_ref": "add-project-flow-control-2026-09-30",
-  "completed_at": null
+  "completed_at": null,
+  "implementation_started_at": "2026-09-30T20:07:40Z"
 }

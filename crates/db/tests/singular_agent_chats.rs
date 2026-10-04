@@ -882,6 +882,11 @@ async fn failed_turn_emits_one_bounded_replay_safe_event() {
     let failed = AgentChatTransactionRepo::fail_agent_chat_turn(
         &db,
         FailAgentChatTurn {
+            failure_class: api_types::TurnFailure::Unclassified,
+            retry_decision: api_types::TurnRetryDecision::Retry,
+            pre_provider_failure_count: 0,
+            usage_limit_deferral_count: 0,
+            usage_limit_first_deferred_at: None,
             turn_job_id: leased.id.clone(),
             expected_version: leased.version,
             lease_owner: "failure-owner".to_owned(),
@@ -923,6 +928,11 @@ async fn failed_turn_emits_one_bounded_replay_safe_event() {
     let replay = AgentChatTransactionRepo::fail_agent_chat_turn(
         &db,
         FailAgentChatTurn {
+            failure_class: api_types::TurnFailure::Unclassified,
+            retry_decision: api_types::TurnRetryDecision::Retry,
+            pre_provider_failure_count: 0,
+            usage_limit_deferral_count: 0,
+            usage_limit_first_deferred_at: None,
             turn_job_id: leased.id.clone(),
             expected_version: leased.version,
             lease_owner: "failure-owner".to_owned(),
@@ -1043,6 +1053,11 @@ async fn failure_persistence_survives_sqlite_contention_and_restart() {
     // the optimistic predicate must produce exactly one durable winner.
     let contender = database_url(&url).await;
     let left = FailAgentChatTurn {
+        failure_class: api_types::TurnFailure::Unclassified,
+        retry_decision: api_types::TurnRetryDecision::Retry,
+        pre_provider_failure_count: 0,
+        usage_limit_deferral_count: 0,
+        usage_limit_first_deferred_at: None,
         turn_job_id: leased.id.clone(),
         expected_version: leased.version,
         lease_owner: "failure-worker-a".to_owned(),
@@ -1054,6 +1069,11 @@ async fn failure_persistence_survives_sqlite_contention_and_restart() {
         updated_at: "2026-08-13T00:00:11.000Z".to_owned(),
     };
     let right = FailAgentChatTurn {
+        failure_class: api_types::TurnFailure::Unclassified,
+        retry_decision: api_types::TurnRetryDecision::Retry,
+        pre_provider_failure_count: 0,
+        usage_limit_deferral_count: 0,
+        usage_limit_first_deferred_at: None,
         turn_job_id: leased.id.clone(),
         expected_version: leased.version,
         lease_owner: "failure-worker-a".to_owned(),
@@ -1148,6 +1168,11 @@ async fn failure_persistence_survives_sqlite_contention_and_restart() {
     let second_failure = AgentChatTransactionRepo::fail_agent_chat_turn(
         &restarted,
         FailAgentChatTurn {
+            failure_class: api_types::TurnFailure::Unclassified,
+            retry_decision: api_types::TurnRetryDecision::Retry,
+            pre_provider_failure_count: 0,
+            usage_limit_deferral_count: 0,
+            usage_limit_first_deferred_at: None,
             turn_job_id: leased_after_restart.id.clone(),
             expected_version: leased_after_restart.version,
             lease_owner: "failure-worker-after-restart".to_owned(),
@@ -1183,4 +1208,421 @@ async fn failure_persistence_survives_sqlite_contention_and_restart() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
     let _ = std::fs::remove_file(path.with_extension("db-wal"));
+}
+
+#[tokio::test]
+async fn unknown_turn_failure_evidence_preserves_chat_readability_and_cancel_clears_it() {
+    let (db, account, _, identity, profile) = fixture().await;
+    let chat = AgentChatRepo::get_main_chat(&db, &account)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = "2026-10-01T06:00:00Z";
+    let admitted = AgentChatTransactionRepo::admit_agent_chat_turn(
+        &db,
+        AdmitAgentChatTurn {
+            message: user_message("unknown-evidence", &chat.id, now),
+            turn: turn(
+                "unknown-turn",
+                &chat.id,
+                "unknown-evidence",
+                &identity,
+                &profile,
+                "unknown-dedupe",
+                now,
+            ),
+        },
+    )
+    .await
+    .unwrap();
+    for (class, decision) in [
+        (r#"{"kind":"future_failure"}"#, "fail"),
+        (r#"{"kind":"configuration"}"#, "future_decision"),
+    ] {
+        sqlx::query("UPDATE agent_chat_turn_job SET failure_class_json = ?, retry_decision = ? WHERE id = ?")
+            .bind(class).bind(decision).bind(&admitted.turn.id).execute(db.pool()).await.unwrap();
+        let listed = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&db, &chat.id)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].failure_class.is_none());
+        assert!(listed[0].retry_decision.is_none());
+    }
+    sqlx::query(
+        "UPDATE agent_chat_turn_job SET failure_class_json = ?, retry_decision = ? WHERE id = ?",
+    )
+    .bind(r#"{"kind":"usage_limit","resets_at":null}"#)
+    .bind(api_types::TurnRetryDecision::Defer.as_str())
+    .bind(&admitted.turn.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let cancelled = AgentChatTransactionRepo::cancel_agent_chat_turn(
+        &db,
+        CancelAgentChatTurn {
+            turn_job_id: admitted.turn.id,
+            expected_version: admitted.turn.version,
+            actor_user_id: account,
+            idempotency_key: "cancel-evidence".into(),
+            updated_at: now.into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(cancelled.failure_class.is_none());
+    assert!(cancelled.retry_decision.is_none());
+    assert!(cancelled.retry_action().is_some());
+}
+
+#[tokio::test]
+async fn retry_supersession_uses_turn_insertion_order_even_when_timestamps_tie() {
+    let (db, account_id, _, identity_id, profile_id) = fixture().await;
+    let chat = AgentChatRepo::get_main_chat(&db, &account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = "2026-08-13T00:00:01.000Z";
+    let source = AgentChatTransactionRepo::admit_agent_chat_turn(
+        &db,
+        AdmitAgentChatTurn {
+            message: user_message("same-message", &chat.id, now),
+            turn: turn(
+                "z-source",
+                &chat.id,
+                "same-message",
+                &identity_id,
+                &profile_id,
+                "source",
+                now,
+            ),
+        },
+    )
+    .await
+    .unwrap();
+    AgentChatTurnJobRepo::create_agent_chat_turn_job(
+        &db,
+        turn(
+            "a-child",
+            &chat.id,
+            &source.message.id,
+            &identity_id,
+            &profile_id,
+            "child",
+            now,
+        ),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'failed' WHERE chat_id = ?")
+        .bind(&chat.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let source = AgentChatTurnJobRepo::get_agent_chat_turn_job(&db, "z-source")
+        .await
+        .unwrap()
+        .unwrap();
+    let child = AgentChatTurnJobRepo::get_agent_chat_turn_job(&db, "a-child")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(source.retry_action().is_none());
+    assert!(child.retry_action().is_some());
+    let listed = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&db, &chat.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|turn| turn.retry_action().is_some())
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn superseded_cancel_response_and_failure_event_agree_with_get() {
+    for settlement in ["cancel", "fail", "fail_with_usage"] {
+        let (db, account_id, _, identity_id, profile_id) = fixture().await;
+        let chat = AgentChatRepo::get_main_chat(&db, &account_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = "2026-08-13T00:00:01.000Z";
+        let admitted = AgentChatTransactionRepo::admit_agent_chat_turn(
+            &db,
+            AdmitAgentChatTurn {
+                message: user_message("old-message", &chat.id, now),
+                turn: turn(
+                    "old-turn",
+                    &chat.id,
+                    "old-message",
+                    &identity_id,
+                    &profile_id,
+                    "old",
+                    now,
+                ),
+            },
+        )
+        .await
+        .unwrap();
+        // A later message without a turn supersedes the old turn too.
+        db::AgentChatMessageRepo::append_agent_chat_message(
+            &db,
+            user_message("divider", &chat.id, "2026-08-13T00:00:02.000Z"),
+        )
+        .await
+        .unwrap();
+        let settled = if settlement == "cancel" {
+            let input = CancelAgentChatTurn {
+                turn_job_id: admitted.turn.id.clone(),
+                expected_version: admitted.turn.version,
+                actor_user_id: account_id,
+                idempotency_key: "cancel-old".into(),
+                updated_at: now.into(),
+            };
+            let cancelled = AgentChatTransactionRepo::cancel_agent_chat_turn(&db, input.clone())
+                .await
+                .unwrap();
+            let replay = AgentChatTransactionRepo::cancel_agent_chat_turn(&db, input)
+                .await
+                .unwrap();
+            assert!(replay.retry_action().is_none());
+            cancelled
+        } else {
+            sqlx::query("UPDATE agent_chat_turn_job SET status = 'leased', lease_owner = 'worker', attempt_count = 1 WHERE id = ?")
+                .bind(&admitted.turn.id).execute(db.pool()).await.unwrap();
+            let terminal = FailAgentChatTurn {
+                turn_job_id: admitted.turn.id.clone(),
+                expected_version: admitted.turn.version,
+                lease_owner: "worker".into(),
+                status: AgentChatTurnState::Failed,
+                attempt_count: 1,
+                next_attempt_at: None,
+                error_code: "configuration_invalid".into(),
+                error_message: "invalid".into(),
+                failure_class: api_types::TurnFailure::Configuration,
+                retry_decision: api_types::TurnRetryDecision::Fail,
+                pre_provider_failure_count: 0,
+                usage_limit_deferral_count: 0,
+                usage_limit_first_deferred_at: None,
+                updated_at: now.into(),
+            };
+            let failed = if settlement == "fail_with_usage" {
+                AgentChatTransactionRepo::fail_agent_chat_turn_with_usage(
+                    &db,
+                    db::FailAgentChatTurnWithUsage {
+                        terminal,
+                        settlements: vec![],
+                    },
+                )
+                .await
+                .unwrap()
+            } else {
+                AgentChatTransactionRepo::fail_agent_chat_turn(&db, terminal)
+                    .await
+                    .unwrap()
+            };
+            let event = DomainEventRepo::get_event_by_dedupe(
+                &db,
+                &format!(
+                    "agent-chat-event:agent_chat.turn.failed:{}:{}",
+                    failed.id, admitted.turn.version
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+            assert!(payload["retry_action"].is_null(), "{settlement}: {payload}");
+            failed
+        };
+        let fetched = AgentChatTurnJobRepo::get_agent_chat_turn_job(&db, &settled.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(settled.retry_action().is_none(), "{settlement}");
+        assert!(fetched.retry_action().is_none(), "{settlement}");
+    }
+}
+
+/// The supersession probes the turn readers ran for every row before they were
+/// limited to failed and cancelled turns.
+const UNGATED_RETRY_STATE: &str = "SELECT t.id, t.status, (
+    EXISTS (
+        SELECT 1 FROM agent_chat_turn_job newer
+        WHERE newer.chat_id = t.chat_id
+          AND newer.triggering_message_id = t.triggering_message_id
+          AND newer.rowid > t.rowid
+    ) OR EXISTS (
+        SELECT 1 FROM agent_chat_message m
+        WHERE m.chat_id = t.chat_id AND m.sequence > (
+            SELECT original.sequence FROM agent_chat_message original
+            WHERE original.id = t.triggering_message_id
+        )
+    )
+) AS superseded FROM agent_chat_turn_job t WHERE t.chat_id = ?
+ ORDER BY t.created_at ASC, t.id ASC";
+
+#[tokio::test]
+async fn turn_list_and_pending_count_match_the_ungated_retry_state_for_every_status() {
+    let (db, account_id, project_id, identity_id, profile_id) = fixture().await;
+    let chat = AgentChatRepo::get_main_chat(&db, &account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let project_chat = AgentChatRepo::get_project_chat(&db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // (message, [(turn id, status)]): every status, a failed turn superseded
+    // by a later message, turns superseded by a newer turn for the same
+    // message (ids sort against insertion order), and one retryable turn.
+    let history: [(&str, &[(&str, &str)]); 7] = [
+        ("m1", &[("t1-succeeded", "succeeded")]),
+        ("m2", &[("t2-failed", "failed")]),
+        ("m3", &[("t3-queued", "queued")]),
+        ("m4", &[("t4-retry-wait", "retry_wait")]),
+        ("m5", &[("t5-awaiting", "awaiting_input")]),
+        (
+            "m6",
+            &[("t6-z-cancelled", "cancelled"), ("t6-a-leased", "leased")],
+        ),
+        (
+            "m7",
+            &[("t7-z-failed", "failed"), ("t7-a-cancelled", "cancelled")],
+        ),
+    ];
+    for (second, (message, turns)) in history.iter().enumerate() {
+        let now = format!("2026-08-13T00:00:{:02}.000Z", second + 1);
+        db::AgentChatMessageRepo::append_agent_chat_message(
+            &db,
+            user_message(message, &chat.id, &now),
+        )
+        .await
+        .unwrap();
+        for (id, status) in turns.iter() {
+            AgentChatTurnJobRepo::create_agent_chat_turn_job(
+                &db,
+                turn(id, &chat.id, message, &identity_id, &profile_id, id, &now),
+            )
+            .await
+            .unwrap();
+            sqlx::query("UPDATE agent_chat_turn_job SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+    let other_now = "2026-08-13T00:01:00.000Z";
+    db::AgentChatMessageRepo::append_agent_chat_message(
+        &db,
+        user_message("project-message", &project_chat.id, other_now),
+    )
+    .await
+    .unwrap();
+    AgentChatTurnJobRepo::create_agent_chat_turn_job(
+        &db,
+        turn(
+            "project-queued",
+            &project_chat.id,
+            "project-message",
+            &identity_id,
+            &profile_id,
+            "project-queued",
+            other_now,
+        ),
+    )
+    .await
+    .unwrap();
+
+    let reference: Vec<(String, String, bool)> = sqlx::query_as(UNGATED_RETRY_STATE)
+        .bind(&chat.id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    let listed = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&db, &chat.id)
+        .await
+        .unwrap();
+    // Same rows in the same order.
+    assert_eq!(
+        listed.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+        reference
+            .iter()
+            .map(|(id, _, _)| id.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(listed.len(), 9);
+    for (job, (id, status, superseded)) in listed.iter().zip(&reference) {
+        let terminal_failure = matches!(status.as_str(), "failed" | "cancelled");
+        assert_eq!(
+            job.retry_action().is_some(),
+            terminal_failure && !superseded,
+            "retry action for {id} ({status})"
+        );
+        assert_eq!(
+            job.retry_superseded,
+            terminal_failure && *superseded,
+            "supersession for {id} ({status})"
+        );
+        let single = AgentChatTurnJobRepo::get_agent_chat_turn_job(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&single, job, "single read of {id}");
+    }
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|job| job.retry_action().is_some())
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        ["t7-a-cancelled"]
+    );
+    // Both superseded shapes are present, so the gate is exercised either way.
+    assert_eq!(
+        reference
+            .iter()
+            .filter(|(_, _, superseded)| *superseded)
+            .count(),
+        8
+    );
+
+    let pending = |jobs: &[db::AgentChatTurnJob]| {
+        jobs.iter()
+            .filter(|job| {
+                matches!(
+                    job.status,
+                    AgentChatTurnState::Queued
+                        | AgentChatTurnState::Leased
+                        | AgentChatTurnState::RetryWait
+                )
+            })
+            .count() as i64
+    };
+    assert_eq!(
+        AgentChatTurnJobRepo::count_pending_agent_chat_turn_jobs(&db, &chat.id)
+            .await
+            .unwrap(),
+        pending(&listed)
+    );
+    assert_eq!(pending(&listed), 3);
+    let project_turns = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&db, &project_chat.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        AgentChatTurnJobRepo::count_pending_agent_chat_turn_jobs(&db, &project_chat.id)
+            .await
+            .unwrap(),
+        pending(&project_turns)
+    );
+    assert_eq!(pending(&project_turns), 1);
+    assert_eq!(
+        AgentChatTurnJobRepo::count_pending_agent_chat_turn_jobs(&db, "missing-chat")
+            .await
+            .unwrap(),
+        0
+    );
 }

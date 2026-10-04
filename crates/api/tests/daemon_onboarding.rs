@@ -199,7 +199,14 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
         .await
         .expect("workspace query succeeds")
         .expect("claim created a workspace");
-    std::fs::create_dir_all(&workspace.worktree_path).expect("create shell worktree");
+    std::fs::create_dir_all(
+        state
+            .workspace_backend_router
+            .embedded_path(&state.db, &workspace)
+            .await
+            .expect("workspace path resolves"),
+    )
+    .expect("create shell worktree");
 
     let completed_execution = poll_execution_status(
         &app,
@@ -233,7 +240,7 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     .await;
     assert!(logs.contains("forge-e2e-ok"));
 
-    let agent_detail = poll_agent_active(&app, &agent_id).await;
+    let agent_detail = poll_agent_active(&state, &app, &task.id, &agent_id).await;
     assert_eq!(agent_detail.effective_status.as_deref(), Some("active"));
     assert_eq!(agent_detail.active_assigned_task_count, Some(0));
 }
@@ -245,7 +252,7 @@ async fn test_app_with_state() -> (Router, Arc<AppState>) {
     db::run_migrations(&pool).await.expect("migrations run");
 
     let db = Arc::new(db::SqliteDb::new(pool));
-    let adapter_registry = Arc::new(cli_adapters::default_registry());
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
     services::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
@@ -337,9 +344,17 @@ async fn poll_execution_status(
     }
 }
 
-async fn poll_agent_active(app: &Router, agent_id: &str) -> AgentResponse {
+async fn poll_agent_active(
+    state: &AppState,
+    app: &Router,
+    task_id: &str,
+    agent_id: &str,
+) -> AgentResponse {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
+        // Terminal execution storage precedes its completion producer. An
+        // empty queue can become nonempty while we wait for that producer.
+        common::drain(state, app, task_id).await;
         let agent: AgentResponse = empty_request(
             app,
             Method::GET,

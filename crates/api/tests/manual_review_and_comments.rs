@@ -11,8 +11,7 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AuthorType, CommentResponse, PaginatedResponse, ProjectResponse, RepoResponse,
-    ReviewDecisionResponse, TaskResponse, TransitionTaskResponse,
+    AuthorType, CommentResponse, PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -100,21 +99,27 @@ async fn reject_review_bounces_to_in_progress() {
     )
     .await;
 
-    let result: ReviewDecisionResponse = json_request(
+    let result: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/reject"),
-        json!({ "reason": "bad code quality" }),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"bad code quality"}}),
         StatusCode::OK,
     )
     .await;
 
-    assert_eq!(result.review.status, api_types::ReviewStatus::Failed);
-    assert_eq!(result.task.status, "in_progress".to_owned());
+    let decision_review = ReviewRepo::list_by_task(&*harness.state.db, &result.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| review.attempt_number)
+        .expect("decision Review persists");
+    assert_eq!(decision_review.status, db::ReviewStatus::Failed);
+    assert_eq!(result.status, "in_progress".to_owned());
 }
 
 #[tokio::test]
-async fn reject_review_without_reason_uses_default() {
+async fn send_back_carries_required_guidance() {
     let workspace_root = common::TestDir::new("forge-manual-review-reject-default");
     let harness = test_app(workspace_root.path()).await;
 
@@ -125,17 +130,23 @@ async fn reject_review_without_reason_uses_default() {
     )
     .await;
 
-    let result: ReviewDecisionResponse = json_request(
+    let result: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/reject"),
-        json!({}),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"Return for revisions"} }),
         StatusCode::OK,
     )
     .await;
 
-    assert_eq!(result.review.status, api_types::ReviewStatus::Failed);
-    assert_eq!(result.task.status, "in_progress".to_owned());
+    let decision_review = ReviewRepo::list_by_task(&*harness.state.db, &result.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| review.attempt_number)
+        .expect("decision Review persists");
+    assert_eq!(decision_review.status, db::ReviewStatus::Failed);
+    assert_eq!(result.status, "in_progress".to_owned());
 }
 
 #[tokio::test]
@@ -184,28 +195,40 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
     harness
         .state
         .task_service
-        .recover_task(
+        .test_apply_action(
             task_id.clone(),
-            api_types::RecoveryAction::ResetRetryWindow,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: Some(true),
+                guidance: None,
+            },
             Some("start a fresh review window".to_owned()),
             None,
         )
         .await
         .expect("retry window reset succeeds");
 
-    let result: ReviewDecisionResponse = json_request(
+    let result: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/reject"),
-        json!({ "reason": "request one more pass" }),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"request one more pass"}}),
         StatusCode::OK,
     )
     .await;
 
-    assert_eq!(result.review.status, api_types::ReviewStatus::Failed);
-    assert_eq!(result.task.status, "in_progress");
+    let decision_review = ReviewRepo::list_by_task(&*harness.state.db, &result.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| review.attempt_number)
+        .expect("decision Review persists");
+    assert_eq!(decision_review.status, db::ReviewStatus::Failed);
+    assert_eq!(result.status, "in_progress");
     assert_eq!(
-        result.task.remaining_retries.get("review"),
+        result.remaining_retries.get("review"),
         Some(&1),
         "the API projection must share the fresh retry window with runtime admission"
     );
@@ -219,6 +242,13 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
         1,
         "the rejection after an explicit reset consumes only the fresh window"
     );
+    // Task actions commit dispatch intent; this fixture has no background dispatcher.
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .expect("the accepted human send-back dispatches its fresh follow-up");
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*harness.state.db, &task_id, "coder")
             .await
@@ -238,8 +268,8 @@ async fn approve_review_returns_409_when_not_awaiting_human() {
     let response = raw_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/approve"),
-        json!({}),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"approve","override":false} }),
     )
     .await;
 
@@ -375,11 +405,11 @@ async fn reject_review_creates_system_comment_with_reason() {
     )
     .await;
 
-    let _result: ReviewDecisionResponse = json_request(
+    let _result: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review/reject"),
-        json!({ "reason": "needs refactoring" }),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await, "action": {"verb":"send_back","guidance":"needs refactoring"}}),
         StatusCode::OK,
     )
     .await;
@@ -451,17 +481,24 @@ async fn approve_review_cascades_via_merge() {
     )
     .await;
 
-    let result: ReviewDecisionResponse = json_request(
+    let result: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{seeded_task_id}/review/approve"),
-        json!({}),
+        &format!("/api/v1/tasks/{seeded_task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{seeded_task_id}/actions")).await, "action": {"verb":"approve","override":false} }),
         StatusCode::OK,
     )
     .await;
 
-    assert_eq!(result.review.status, api_types::ReviewStatus::Passed);
-    assert_eq!(result.task.status, "done".to_owned());
+    let decision_review = ReviewRepo::list_by_task(&*harness.state.db, &result.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| review.attempt_number)
+        .expect("decision Review persists");
+    assert_eq!(decision_review.status, db::ReviewStatus::Passed);
+    let settled = common::drain(&harness.state, &harness.app, &result.id).await;
+    assert_eq!(settled.status, "done".to_owned());
 
     // Verify system comment was created
     let comments: PaginatedResponse<CommentResponse> = empty_request(
@@ -537,20 +574,40 @@ async fn rerun_review_pass_cascades_through_merge_instead_of_parking() {
     )
     .await;
 
-    let result: TransitionTaskResponse = json_request(
+    let accepted: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review"),
-        json!({}),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await,"action":{"verb":"retry"}}),
         StatusCode::OK,
     )
     .await;
 
-    assert_eq!(
-        result.review.expect("rerun review").status,
-        api_types::ReviewStatus::Passed
-    );
-    assert_eq!(result.task.status, "done");
+    assert!(accepted.error_annotation.is_none());
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .unwrap();
+    let result: TaskResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        json!(null),
+        StatusCode::OK,
+    )
+    .await;
+    let result_review = ReviewRepo::list_by_task(&*harness.state.db, &task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| review.attempt_number)
+        .unwrap();
+
+    assert_eq!(result_review.status, db::ReviewStatus::Passed);
+    let settled = common::drain(&harness.state, &harness.app, &result.id).await;
+    assert_eq!(settled.status, "done");
 }
 
 #[tokio::test]
@@ -613,21 +670,40 @@ async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
     .await
     .expect("review CI config updates");
 
-    let result: TransitionTaskResponse = json_request(
+    let accepted: TaskResponse = json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{task_id}/review"),
-        json!({}),
+        &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({ "version": common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await,"action":{"verb":"retry"}}),
         StatusCode::OK,
     )
     .await;
 
-    assert_eq!(
-        result.review.expect("rerun review").status,
-        api_types::ReviewStatus::Failed
-    );
-    assert_eq!(result.task.status, "in_progress");
-    assert!(result.task.review_passed_at.is_none());
+    assert!(accepted.error_annotation.is_none());
+    harness
+        .state
+        .task_service
+        .test_dispatch_task_action(&task_id)
+        .await
+        .unwrap();
+    let result: TaskResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        json!(null),
+        StatusCode::OK,
+    )
+    .await;
+    let result_review = ReviewRepo::list_by_task(&*harness.state.db, &task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| review.attempt_number)
+        .unwrap();
+
+    assert_eq!(result_review.status, db::ReviewStatus::Failed);
+    assert_eq!(result.status, "in_progress");
+    assert!(result.review_passed_at.is_none());
 }
 
 // ── Harness ──
@@ -652,7 +728,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
-    let merge_service = Arc::new(services::MergeService::new(
+    let merge_service = Arc::new(services::MergeService::new_for_test(
         Arc::clone(&db),
         Arc::clone(&event_bus),
         workspace_root.to_path_buf(),
@@ -792,7 +868,6 @@ async fn seed_awaiting_human_review(
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: Some(repo_path.to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: None,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
@@ -943,6 +1018,7 @@ async fn seed_codex_agent(db: &db::SqliteDb) -> String {
     DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: services::embedded_daemon::embedded_machine_id(),
             hostname: "manual-review-host".to_owned(),
@@ -963,6 +1039,7 @@ async fn seed_codex_agent(db: &db::SqliteDb) -> String {
     DaemonRepo::update_report(
         db,
         db::UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             detected_clis_json: r#"[{"kind":"codex","availability":"authenticated"}]"#.to_owned(),
             labels_json: None,
@@ -1045,7 +1122,6 @@ async fn seed_awaiting_human_review_with_workspace(
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: Some(repo_path.to_string_lossy().into_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: None,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
@@ -1196,7 +1272,6 @@ async fn seed_review_with_status(db: &db::SqliteDb, status: ReviewStatus) -> Str
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: Some("/tmp/forge-review-status-repo".to_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: None,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
@@ -1325,7 +1400,6 @@ async fn seed_task_with_system_comment(db: &db::SqliteDb) -> String {
             project_id: project_id.clone(),
             name: "repo".to_owned(),
             local_path: Some("/tmp/forge-sys-comment-repo".to_owned()),
-            work_mode: db::WorkMode::DirectMerge,
             remote_url: None,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
@@ -1484,31 +1558,7 @@ async fn json_request<T>(
 where
     T: DeserializeOwned,
 {
-    let token = test_jwt();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(body.to_string()))
-                .expect("build request"),
-        )
-        .await
-        .expect("router response");
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    assert_eq!(
-        status,
-        expected_status,
-        "unexpected status with body: {}",
-        String::from_utf8_lossy(&bytes)
-    );
-    serde_json::from_slice(&bytes).expect("parse JSON")
+    common::json_request(app, method, uri, body, expected_status).await
 }
 
 async fn empty_request<T>(app: &Router, method: Method, uri: &str, expected_status: StatusCode) -> T
@@ -1547,22 +1597,5 @@ async fn raw_request(
     uri: &str,
     body: serde_json::Value,
 ) -> axum::http::Response<Body> {
-    let token = test_jwt();
-    let body = if body.is_null() {
-        Body::empty()
-    } else {
-        Body::from(body.to_string())
-    };
-    app.clone()
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {token}"))
-                .body(body)
-                .expect("build request"),
-        )
-        .await
-        .expect("router response")
+    common::raw_json_request(app, method, uri, body).await
 }

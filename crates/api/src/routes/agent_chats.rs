@@ -311,13 +311,13 @@ pub async fn cancel_agent_chat_turn(
     Ok(Json(turn_response(job)))
 }
 
-/// Re-run a failed turn from its own triggering message, with freshly
-/// resolved authority. Nothing is re-sent: the original message stays the one
-/// request it always was.
+/// Admit a fresh turn from a failed or cancelled turn’s triggering message
+/// with current authority and versioned, durable idempotency.
 pub async fn retry_agent_chat_turn(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((chat_id, turn_id)): Path<(String, String)>,
+    Json(request): Json<api_types::RetryAgentChatTurnRequest>,
 ) -> ApiResult<Json<AgentChatTurnJobResponse>> {
     let job = state
         .agent_chat_service
@@ -325,6 +325,8 @@ pub async fn retry_agent_chat_turn(
             actor_user_id: user.user_id,
             chat_id,
             turn_job_id: turn_id,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
         })
         .await?;
     Ok(Json(turn_response(job)))
@@ -552,18 +554,7 @@ async fn switcher_item(state: &AppState, chat: AgentChat) -> ApiResult<AgentChat
             .map(|identity| identity.name),
         None => None,
     };
-    let pending_turn_count = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, &chat.id)
-        .await?
-        .into_iter()
-        .filter(|job| {
-            matches!(
-                job.status,
-                AgentChatTurnState::Queued
-                    | AgentChatTurnState::Leased
-                    | AgentChatTurnState::RetryWait
-            )
-        })
-        .count() as i64;
+    let pending_turn_count = pending_turn_count(state, &chat.id).await?;
     Ok(AgentChatSwitcherItem {
         chat_id: chat.id,
         kind,
@@ -628,20 +619,7 @@ async fn project_binding_response(
 }
 
 async fn pending_turn_count(state: &AppState, chat_id: &str) -> ApiResult<i64> {
-    Ok(
-        AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, chat_id)
-            .await?
-            .into_iter()
-            .filter(|job| {
-                matches!(
-                    job.status,
-                    AgentChatTurnState::Queued
-                        | AgentChatTurnState::Leased
-                        | AgentChatTurnState::RetryWait
-                )
-            })
-            .count() as i64,
-    )
+    Ok(AgentChatTurnJobRepo::count_pending_agent_chat_turn_jobs(&*state.db, chat_id).await?)
 }
 
 fn chat_response(
@@ -734,6 +712,7 @@ async fn message_response(
 }
 
 fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
+    let retry_action = job.retry_action();
     let error = job.error_message.clone().or_else(|| job.error_code.clone());
     AgentChatTurnJobResponse {
         id: job.id,
@@ -758,6 +737,10 @@ fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
         response_message_id: job.response_message_id,
         error_code: job.error_code,
         error_message: job.error_message,
+        failure_class: job.failure_class,
+        retry_decision: job.retry_decision,
+        pre_provider_failure_count: job.pre_provider_failure_count,
+        retry_action,
         error,
         correlation_id: job.correlation_id,
         version: job.version,

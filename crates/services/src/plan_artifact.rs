@@ -3,24 +3,36 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 
+use crate::workspace_backend::{ResolvedWorkspace, WorkspaceBackendError, WorkspaceBackendRouter};
 use api_types::{PlanArtifactDetail, PlanChecklistItem, PlanProgressSummary};
 use db::{SqliteDb, WorkspaceRepo};
 
+pub(crate) mod transport;
+
 pub const DEFAULT_PLAN_ARTIFACT_PATH: &str = executors::OUTBOX_PLAN_FILE;
-pub const PLAN_ARTIFACT_AGENT_INSTRUCTION: &str = "Write the implementation plan with `task.plan` (`write`) as a Markdown checklist. Forge publishes that execution-scoped candidate as the Task's canonical plan only after this execution completes successfully. This plan will be handed to the coder agent for execution. Each checklist item represents implementation work or verification the coder should complete. Use `- [ ]` for pending work and `- [x]` only for work that is already complete. Nest sub-items with 2-space indentation.";
-pub const OUTBOX_PLAN_ARTIFACT_AGENT_INSTRUCTION: &str = "Write an implementation plan as a Markdown checklist to the file named by `$FORGE_PLAN_PATH`. Forge publishes that file as the Task's canonical plan only after this execution completes successfully. This plan will be handed to the coder agent for execution. Each checklist item represents implementation work or verification the coder should complete. Use `- [ ]` for pending work and `- [x]` only for work that is already complete. Nest sub-items with 2-space indentation.";
+// Both delivery channels render the same planning doctrine.
+macro_rules! plan_instruction {
+    ($delivery:literal) => {
+        concat!(
+            $delivery,
+            " Forge publishes that execution-scoped candidate as the Task's canonical plan only after this execution completes successfully. This plan will be handed to the coder agent for execution. Each checklist item represents implementation work or verification the coder should complete. Use `- [ ]` for pending work and `- [x]` only for work that is already complete. Nest sub-items with 2-space indentation. ",
+            "Name the Task's owned repository-relative paths and keep planned changes inside them. Report a required out-of-scope edit instead of widening the plan silently."
+        )
+    };
+}
+
+pub const PLAN_ARTIFACT_AGENT_INSTRUCTION: &str = plan_instruction!(
+    "Write the implementation plan with `task.plan` (`write`) as a Markdown checklist."
+);
+pub const OUTBOX_PLAN_ARTIFACT_AGENT_INSTRUCTION: &str = plan_instruction!(
+    "Write an implementation plan as a Markdown checklist to the file named by `$FORGE_PLAN_PATH`."
+);
 
 pub(crate) const MAX_PLAN_ARTIFACT_SIZE_BYTES: u64 = 1_048_576;
 const PLAN_STAGE_DIR: &str = ".forge-plan-staging";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanArtifactMetadata {
-    pub task_id: Option<String>,
-    pub workspace_id: Option<String>,
-    pub execution_id: Option<String>,
-    pub source_path: PathBuf,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedPlanItem {
@@ -48,6 +60,7 @@ pub enum PlanArtifactError {
     StagedConflict { path: PathBuf },
     IoError(io::Error),
     DbError(db::DbError),
+    BackendError(WorkspaceBackendError),
     FileTooLarge { size: u64, max: u64 },
 }
 
@@ -88,10 +101,58 @@ impl fmt::Display for PlanArtifactError {
             ),
             Self::IoError(error) => write!(f, "plan artifact I/O failed: {error}"),
             Self::DbError(error) => write!(f, "failed to read workspace: {error}"),
+            Self::BackendError(WorkspaceBackendError::Other(error)) => match error.as_ref() {
+                crate::ServiceError::InvalidOperation { message } => write!(f, "{message}"),
+                error => write!(f, "{error}"),
+            },
+            Self::BackendError(error) => write!(f, "{error}"),
             Self::FileTooLarge { size, max } => write!(
                 f,
                 "plan artifact is too large: {size} bytes exceeds {max} bytes"
             ),
+        }
+    }
+}
+
+impl PlanArtifactError {
+    pub(crate) fn needs_placement_check(&self) -> bool {
+        match self {
+            Self::BackendError(
+                WorkspaceBackendError::OwnerUnsupported { .. }
+                | WorkspaceBackendError::WrongOwner { .. }
+                | WorkspaceBackendError::StaleGeneration { .. },
+            ) => true,
+            Self::BackendError(WorkspaceBackendError::Other(error)) => {
+                matches!(
+                    error.as_ref(),
+                    crate::ServiceError::DaemonUpgradeRequired { .. }
+                ) || matches!(error.as_ref(), crate::ServiceError::InvalidOperation { message }
+                    if message.starts_with(api_types::UNSUPPORTED_METHOD))
+            }
+            _ => false,
+        }
+    }
+    /// Owner transport refusals must retain their classification so dispatch
+    /// can queue an outage or surface an upgrade instead of parking silently.
+    pub(crate) fn into_service_error(self, context: &str) -> crate::ServiceError {
+        use crate::ServiceError;
+        match self {
+            Self::DbError(error) => error.into(),
+            Self::BackendError(WorkspaceBackendError::Other(error)) => match *error {
+                error @ (ServiceError::DaemonUnavailable { .. }
+                | ServiceError::DaemonTimeout { .. }
+                | ServiceError::DaemonUpgradeRequired { .. }
+                | ServiceError::Db(_)) => error,
+                ServiceError::InvalidOperation { message } => {
+                    ServiceError::invalid_operation(format!("{context}: {message}"))
+                }
+                error => ServiceError::invalid_operation(format!("{context}: {error}")),
+            },
+            Self::BackendError(
+                error @ (WorkspaceBackendError::OwnerUnreachable { .. }
+                | WorkspaceBackendError::RpcTimeoutBeforeStart { .. }),
+            ) => error.into(),
+            error => ServiceError::invalid_operation(format!("{context}: {error}")),
         }
     }
 }
@@ -101,6 +162,7 @@ impl Error for PlanArtifactError {
         match self {
             Self::IoError(error) => Some(error),
             Self::DbError(error) => Some(error),
+            Self::BackendError(error) => Some(error),
             _ => None,
         }
     }
@@ -115,6 +177,29 @@ impl From<io::Error> for PlanArtifactError {
 impl From<db::DbError> for PlanArtifactError {
     fn from(error: db::DbError) -> Self {
         Self::DbError(error)
+    }
+}
+
+impl From<crate::ServiceError> for PlanArtifactError {
+    fn from(error: crate::ServiceError) -> Self {
+        Self::from(WorkspaceBackendError::from(error))
+    }
+}
+
+impl From<WorkspaceBackendError> for PlanArtifactError {
+    fn from(error: WorkspaceBackendError) -> Self {
+        match error {
+            WorkspaceBackendError::Other(error) => match *error {
+                crate::ServiceError::Db(error) => Self::DbError(error),
+                crate::ServiceError::InvalidOperation { ref message }
+                    if message == "plan artifact not found" =>
+                {
+                    Self::NotFound
+                }
+                error => Self::BackendError(error.into()),
+            },
+            error => Self::BackendError(error),
+        }
     }
 }
 
@@ -135,8 +220,18 @@ pub fn parse_plan_markdown(content: &str) -> ParsedPlanArtifact {
     ParsedPlanArtifact { items, warnings }
 }
 
-pub async fn read_plan_for_workspace(
+#[cfg(test)]
+async fn read_plan_for_workspace(
     db: &SqliteDb,
+    workspace_id: &str,
+) -> Result<Option<(PlanProgressSummary, PlanArtifactDetail)>, PlanArtifactError> {
+    let router = crate::diff::embedded_read_router_for_test(Arc::new(db.clone()));
+    read_plan_with_router(db, &router, workspace_id).await
+}
+
+pub async fn read_plan_with_router(
+    db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
     workspace_id: &str,
 ) -> Result<Option<(PlanProgressSummary, PlanArtifactDetail)>, PlanArtifactError> {
     let workspace = WorkspaceRepo::get_by_id(db, workspace_id)
@@ -144,27 +239,220 @@ pub async fn read_plan_for_workspace(
         .ok_or_else(|| PlanArtifactError::WorkspaceNotFound {
             workspace_id: workspace_id.to_string(),
         })?;
-    let worktree_path = Path::new(&workspace.worktree_path);
+    let resolved = router.resolve(db, &workspace).await?;
+    read_plan_for_resolved_workspace(&resolved).await
+}
 
-    match read_plan_artifact(worktree_path, None) {
-        Ok(artifact) => {
-            let source_path = default_plan_artifact_path(worktree_path)
-                .to_string_lossy()
-                .to_string();
+pub(crate) async fn read_plan_for_resolved_workspace(
+    resolved: &ResolvedWorkspace,
+) -> Result<Option<(PlanProgressSummary, PlanArtifactDetail)>, PlanArtifactError> {
+    let artifact = read_plan_text_for_resolved_workspace(resolved)
+        .await
+        .map(|content| content.map(|text| parse_plan_markdown(&text)));
+    match artifact {
+        Ok(Some(artifact)) => {
+            let source_path = match resolved.placement.owner_kind {
+                db::PlacementOwnerKind::Server => {
+                    default_plan_artifact_path(&resolved.embedded_path()?)
+                        .to_string_lossy()
+                        .to_string()
+                }
+                db::PlacementOwnerKind::Daemon => "../plan.md".to_owned(),
+            };
             Ok(Some((
                 to_plan_progress_summary(&artifact),
                 to_plan_artifact_detail(&artifact, Some(source_path), None),
             )))
         }
-        Err(PlanArtifactError::NotFound) => Ok(None),
+        Ok(None) => Ok(None),
         Err(error) => Err(error),
     }
 }
 
-pub fn read_plan_artifact(
+/// Canonical plan text always comes through the recorded owner.
+pub async fn read_plan_text_with_router(
+    db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
+    workspace_id: &str,
+) -> Result<Option<String>, PlanArtifactError> {
+    let workspace = WorkspaceRepo::get_by_id(db, workspace_id)
+        .await?
+        .ok_or_else(|| PlanArtifactError::WorkspaceNotFound {
+            workspace_id: workspace_id.into(),
+        })?;
+    let resolved = router.resolve(db, &workspace).await?;
+    read_plan_text_for_resolved_workspace(&resolved).await
+}
+
+pub(crate) async fn read_plan_text_for_resolved_workspace(
+    resolved: &ResolvedWorkspace,
+) -> Result<Option<String>, PlanArtifactError> {
+    if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+        return read_canonical_plan_text(&resolved.embedded_path()?);
+    }
+    match resolved
+        .backend
+        .read(
+            &resolved.placement,
+            "../plan.md",
+            MAX_PLAN_ARTIFACT_SIZE_BYTES,
+        )
+        .await
+    {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| {
+            PlanArtifactError::IoError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            ))
+        }),
+        Err(error) => match PlanArtifactError::from(error) {
+            PlanArtifactError::NotFound => Ok(None),
+            error => Err(error),
+        },
+    }
+}
+
+/// Owner-aware publication boundary. Local/shared-mount files retain their
+/// existing layout; daemon files are mutated only by fenced owner operations.
+pub(crate) struct ExecutionPlan<'a> {
+    db: &'a SqliteDb,
+    resolved: &'a ResolvedWorkspace,
+}
+impl<'a> ExecutionPlan<'a> {
+    pub(crate) fn new(db: &'a SqliteDb, resolved: &'a ResolvedWorkspace) -> Self {
+        Self { db, resolved }
+    }
+    async fn operation(
+        &self,
+        execution_id: &str,
+        name: &str,
+        operation: api_types::WorkspaceOwnerOperation,
+    ) -> Result<(), PlanArtifactError> {
+        transport::retry_due(self.db, execution_id, name).await?;
+        match self.resolved.apply_plan_operation(operation).await {
+            Ok(_) => transport::clear_retry(self.db, execution_id).await?,
+            Err(error) => {
+                transport::record_retry(
+                    self.db,
+                    execution_id,
+                    name,
+                    self.resolved
+                        .placement
+                        .daemon_id
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    &error,
+                )
+                .await?;
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+    pub(crate) async fn rejected_candidate(
+        &self,
+        execution_id: &str,
+    ) -> Result<bool, PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            return Ok(false);
+        }
+        let (content, issue) = transport::stored(self.db, execution_id).await?;
+        Ok(issue.is_some() || content.is_some_and(|text| !executors::plan_has_checklist(&text)))
+    }
+    pub(crate) async fn publish(
+        &self,
+        execution: &db::Execution,
+    ) -> Result<bool, PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            return publish_staged_execution_plan(&self.resolved.embedded_path()?, &execution.id);
+        }
+        let (content, issue) = transport::stored(self.db, &execution.id).await?;
+        let Some(content) =
+            content.filter(|content| issue.is_none() && executors::plan_has_checklist(content))
+        else {
+            return Ok(false);
+        };
+        self.operation(
+            &execution.id,
+            "publish",
+            api_types::WorkspaceOwnerOperation::PublishPlan {
+                execution_id: execution.id.clone(),
+                content,
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+    pub(crate) async fn restore(&self, execution_id: &str) -> Result<(), PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            return restore_plan_before_abandon(&self.resolved.embedded_path()?, execution_id);
+        }
+        self.operation(
+            execution_id,
+            "restore",
+            api_types::WorkspaceOwnerOperation::RestorePlan {
+                execution_id: execution_id.into(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+    pub(crate) async fn discard(&self, execution_id: &str) -> Result<(), PlanArtifactError> {
+        if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+            let path = self.resolved.embedded_path()?;
+            discard_staged_execution_plan(&path, execution_id)?;
+            if let Some(outbox) = executors::execution_outbox_path(&path, execution_id) {
+                match fs::remove_dir_all(outbox) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(PlanArtifactError::IoError(error)),
+                }
+            }
+            return Ok(());
+        }
+        self.operation(
+            execution_id,
+            "discard",
+            api_types::WorkspaceOwnerOperation::DiscardPlan {
+                execution_id: execution_id.into(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+/// Read a bounded owner-relative file with plan containment and file-type checks.
+pub(crate) fn read_workspace_bytes(
+    workspace_root: &Path,
+    rel_path: &str,
+    limit: u64,
+) -> Result<Vec<u8>, PlanArtifactError> {
+    let plan_path = if rel_path == "../plan.md" {
+        None
+    } else {
+        Some(rel_path)
+    };
+    let path = bounded_artifact_path(workspace_root, plan_path, limit)?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(PlanArtifactError::FileTooLarge {
+            size: bytes.len() as u64,
+            max: limit,
+        });
+    }
+    Ok(bytes)
+}
+
+fn bounded_artifact_path(
     workspace_root: &Path,
     plan_path: Option<&str>,
-) -> Result<ParsedPlanArtifact, PlanArtifactError> {
+    limit: u64,
+) -> Result<PathBuf, PlanArtifactError> {
     let candidate = match plan_path {
         Some(plan_path) => workspace_root.join(plan_path),
         None => default_plan_artifact_path(workspace_root),
@@ -173,8 +461,25 @@ pub fn read_plan_artifact(
         Some(_) => workspace_root,
         None => workspace_root.parent().unwrap_or(workspace_root),
     };
-    let content = read_bounded_plan_text(&candidate, allowed_root, false)?;
-    Ok(parse_plan_markdown(&content))
+    let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            PlanArtifactError::NotFound
+        } else {
+            PlanArtifactError::IoError(error)
+        }
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(PlanArtifactError::InvalidFileType { path: candidate });
+    }
+    let canonical = candidate.canonicalize()?;
+    if !canonical.starts_with(allowed_root.canonicalize()?) {
+        return Err(PlanArtifactError::PathEscape { path: canonical });
+    }
+    let size = fs::metadata(&canonical)?.len();
+    if size > limit {
+        return Err(PlanArtifactError::FileTooLarge { size, max: limit });
+    }
+    Ok(candidate)
 }
 
 /// Read the canonical Task plan text for dispatch without bypassing the plan
@@ -198,7 +503,7 @@ pub fn read_canonical_plan_text(worktree_root: &Path) -> Result<Option<String>, 
 pub fn prepare_execution_plan_outbox(
     worktree_root: &Path,
     execution_id: &str,
-    seed_existing_plan: bool,
+    role: &str,
     fallback_plan: Option<&str>,
 ) -> Result<bool, PlanArtifactError> {
     let outbox = executors::prepare_execution_outbox(worktree_root, execution_id)
@@ -211,30 +516,28 @@ pub fn prepare_execution_plan_outbox(
         Err(error) => return Err(error),
     }
 
-    if !seed_existing_plan {
+    if !matches!(role, "worker" | "coder" | "executor") {
         return Ok(false);
     }
 
     let canonical = default_plan_artifact_path(worktree_root);
     let task_root = worktree_root.parent().unwrap_or(worktree_root);
-    let content = match read_bounded_plan_text(&canonical, task_root, false) {
-        Ok(content) => content,
-        Err(PlanArtifactError::NotFound) => {
-            match fallback_plan.filter(|content| !parse_plan_markdown(content).items.is_empty()) {
-                Some(content) if content.len() as u64 <= MAX_PLAN_ARTIFACT_SIZE_BYTES => {
-                    content.to_owned()
-                }
-                Some(content) => {
-                    return Err(PlanArtifactError::FileTooLarge {
-                        size: content.len() as u64,
-                        max: MAX_PLAN_ARTIFACT_SIZE_BYTES,
-                    });
-                }
-                None => return Ok(false),
-            }
-        }
+    let canonical_text = match read_bounded_plan_text(&canonical, task_root, false) {
+        Ok(content) => Some(content),
+        Err(PlanArtifactError::NotFound) => None,
         Err(error) => return Err(error),
     };
+    let Some(content) =
+        executors::execution_plan_seed(Some(role), canonical_text.as_deref(), fallback_plan)
+    else {
+        return Ok(false);
+    };
+    if content.len() as u64 > MAX_PLAN_ARTIFACT_SIZE_BYTES {
+        return Err(PlanArtifactError::FileTooLarge {
+            size: content.len() as u64,
+            max: MAX_PLAN_ARTIFACT_SIZE_BYTES,
+        });
+    }
     install_private_file_no_replace(&outbox_plan, content.as_bytes())?;
     Ok(true)
 }
@@ -276,20 +579,6 @@ pub fn write_execution_outbox_plan(
     read_bounded_plan_text(&destination, &outbox, true)?;
     sync_parent_directory(&outbox)?;
     Ok(())
-}
-
-/// Validate whether an authorized execution left a publishable plan candidate.
-pub fn validate_execution_outbox_plan(outbox: &Path) -> Result<bool, PlanArtifactError> {
-    let path = outbox.join(DEFAULT_PLAN_ARTIFACT_PATH);
-    let content = match read_bounded_plan_text(&path, outbox, true) {
-        Ok(content) => content,
-        Err(PlanArtifactError::NotFound) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if parse_plan_markdown(&content).items.is_empty() {
-        return Err(PlanArtifactError::MissingChecklist { path });
-    }
-    Ok(true)
 }
 
 /// Freeze one validated candidate outside the agent-writable outbox.
@@ -982,27 +1271,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absent_plan_returns_not_found() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        fs::create_dir_all(&worktree).expect("create worktree");
-
-        let error = read_plan_artifact(&worktree, None).expect_err("missing plan fails");
-
-        assert!(matches!(error, PlanArtifactError::NotFound));
+    fn owner_plan_read_preserves_transport_refusals() {
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::Other(Box::new(
+            crate::ServiceError::DaemonUpgradeRequired {
+                daemon_id: "owner".into(),
+            },
+        )));
+        assert!(error.needs_placement_check());
+        assert!(
+            matches!(error.into_service_error("canonical plan artifact is unreadable"), crate::ServiceError::DaemonUpgradeRequired { daemon_id } if daemon_id == "owner")
+        );
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::OwnerUnreachable {
+            daemon_id: "owner".into(),
+        });
+        assert!(matches!(
+            error.into_service_error("canonical plan artifact is unreadable"),
+            crate::ServiceError::DaemonUnavailable { .. }
+        ));
     }
 
     #[test]
-    fn empty_file_returns_empty_items() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        fs::create_dir_all(&worktree).expect("create worktree");
-        fs::write(tempdir.path().join("plan.md"), "").expect("write plan");
-
-        let artifact = read_plan_artifact(&worktree, None).expect("read plan");
-
-        assert!(artifact.items.is_empty());
-        assert!(artifact.warnings.is_empty());
+    fn unsupported_plan_owner_reaches_placement_checks() {
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::OwnerUnsupported {
+            owner_kind: db::PlacementOwnerKind::Daemon,
+        });
+        assert!(error.needs_placement_check());
+        let error = PlanArtifactError::BackendError(WorkspaceBackendError::OwnerUnreachable {
+            daemon_id: "owner".into(),
+        });
+        assert!(!error.needs_placement_check());
     }
 
     #[test]
@@ -1050,6 +1347,35 @@ mod tests {
     }
 
     #[test]
+    fn owner_seed_policy_preserves_server_files_and_never_seeds_planners() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("repo");
+        fs::create_dir_all(&worktree).unwrap();
+        for (id, role, text) in [
+            ("planner-seed", "planner", "- [ ] old"),
+            ("prose-seed", "coder", "prose"),
+            ("empty-seed", "worker", ""),
+        ] {
+            assert!(!prepare_execution_plan_outbox(&worktree, id, role, Some(text)).unwrap());
+            let outbox = executors::execution_outbox_path(&worktree, id).unwrap();
+            assert!(!outbox.join("plan.md").exists());
+        }
+        assert!(prepare_execution_plan_outbox(
+            &worktree,
+            "coder-seed",
+            "coder",
+            Some("- [ ] original\n")
+        )
+        .unwrap());
+        let outbox = executors::execution_outbox_path(&worktree, "coder-seed").unwrap();
+        assert_eq!(
+            fs::read_to_string(outbox.join("plan.md")).unwrap(),
+            "- [ ] original\n"
+        );
+        assert!(!temp.path().join(".forge-plan-staging").exists());
+    }
+
+    #[test]
     fn malformed_markdown_produces_warnings() {
         let content = "\
 - [o] invalid marker
@@ -1063,76 +1389,6 @@ mod tests {
         assert_eq!(artifact.items.len(), 1);
         assert_eq!(artifact.items[0].label, "valid");
         assert_eq!(artifact.warnings.len(), 3);
-    }
-
-    #[test]
-    fn large_file_returns_file_too_large() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        fs::create_dir_all(&worktree).expect("create worktree");
-        fs::write(
-            tempdir.path().join("plan.md"),
-            vec![b'a'; MAX_PLAN_ARTIFACT_SIZE_BYTES as usize + 1],
-        )
-        .expect("write large plan");
-
-        let error = read_plan_artifact(&worktree, None).expect_err("large plan fails");
-
-        assert!(matches!(
-            error,
-            PlanArtifactError::FileTooLarge {
-                size,
-                max: MAX_PLAN_ARTIFACT_SIZE_BYTES
-            } if size == MAX_PLAN_ARTIFACT_SIZE_BYTES + 1
-        ));
-    }
-
-    #[test]
-    fn path_escape_returns_path_escape() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-
-        let error = read_plan_artifact(tempdir.path(), Some("../outside-plan.md"))
-            .expect_err("escape fails");
-
-        assert!(matches!(error, PlanArtifactError::PathEscape { .. }));
-    }
-
-    #[test]
-    fn non_regular_plan_is_rejected() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        fs::create_dir_all(&worktree).expect("create worktree");
-        fs::create_dir(tempdir.path().join("plan.md")).expect("create plan directory");
-
-        let error = read_plan_artifact(&worktree, None).expect_err("directory plan fails");
-
-        assert!(matches!(error, PlanArtifactError::InvalidFileType { .. }));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn plan_reader_rejects_leaf_and_intermediate_symlink_escapes() {
-        use std::os::unix::fs::symlink;
-
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let worktree = tempdir.path().join("repo");
-        let outside = tempfile::tempdir().expect("outside tempdir");
-        fs::create_dir_all(&worktree).expect("create worktree");
-        fs::write(outside.path().join("secret.md"), "- [ ] secret\n").expect("outside plan");
-
-        symlink(
-            outside.path().join("secret.md"),
-            tempdir.path().join("plan.md"),
-        )
-        .expect("leaf symlink");
-        let leaf = read_plan_artifact(&worktree, None).expect_err("leaf symlink fails");
-        assert!(matches!(leaf, PlanArtifactError::InvalidFileType { .. }));
-
-        fs::remove_file(tempdir.path().join("plan.md")).expect("remove leaf symlink");
-        symlink(outside.path(), worktree.join("linked")).expect("intermediate symlink");
-        let intermediate = read_plan_artifact(&worktree, Some("linked/secret.md"))
-            .expect_err("intermediate escape fails");
-        assert!(matches!(intermediate, PlanArtifactError::PathEscape { .. }));
     }
 
     #[test]
@@ -1218,36 +1474,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn outbox_plan_validation_rejects_symlinks_and_hard_links() {
-        use std::os::unix::fs::symlink;
-
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let outside = tempfile::tempdir().expect("outside tempdir");
-        let outbox = tempdir.path().join("outbox");
-        fs::create_dir_all(&outbox).expect("create outbox");
-        let outside_plan = outside.path().join("plan.md");
-        fs::write(&outside_plan, "- [ ] outside\n").expect("outside plan");
-        symlink(&outside_plan, outbox.join("plan.md")).expect("source symlink");
-
-        let symlink_error =
-            validate_execution_outbox_plan(&outbox).expect_err("source symlink fails");
-        assert!(matches!(
-            symlink_error,
-            PlanArtifactError::InvalidFileType { .. }
-        ));
-
-        fs::remove_file(outbox.join("plan.md")).expect("remove source symlink");
-        fs::hard_link(&outside_plan, outbox.join("plan.md")).expect("source hard link");
-        let hard_link_error =
-            validate_execution_outbox_plan(&outbox).expect_err("source hard link fails");
-        assert!(matches!(
-            hard_link_error,
-            PlanArtifactError::MultipleHardLinks { .. }
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn plan_outbox_creation_rejects_symlinked_root_and_execution_directory() {
         use std::os::unix::fs::symlink;
 
@@ -1273,7 +1499,7 @@ mod tests {
             tempdir.path().join(".forge-outbox").join("exec-1"),
         )
         .expect("execution symlink");
-        let execution_error = prepare_execution_plan_outbox(&worktree, "exec-1", false, None)
+        let execution_error = prepare_execution_plan_outbox(&worktree, "exec-1", "planner", None)
             .expect_err("symlinked execution fails");
         assert!(matches!(
             execution_error,
@@ -1284,33 +1510,6 @@ mod tests {
             "untouched\n"
         );
         assert!(!outside.path().join(DEFAULT_PLAN_ARTIFACT_PATH).exists());
-    }
-
-    #[test]
-    fn outbox_plan_validation_rejects_oversize_invalid_utf8_and_empty_checklist() {
-        let tempdir = tempfile::tempdir().expect("create tempdir");
-        let outbox = tempdir.path().join("outbox");
-        fs::create_dir_all(&outbox).expect("create outbox");
-        let plan = outbox.join("plan.md");
-
-        fs::write(&plan, vec![b'a'; MAX_PLAN_ARTIFACT_SIZE_BYTES as usize + 1])
-            .expect("oversize plan");
-        assert!(matches!(
-            validate_execution_outbox_plan(&outbox).expect_err("oversize fails"),
-            PlanArtifactError::FileTooLarge { .. }
-        ));
-
-        fs::write(&plan, [0xff, 0xfe]).expect("invalid UTF-8 plan");
-        assert!(matches!(
-            validate_execution_outbox_plan(&outbox).expect_err("invalid UTF-8 fails"),
-            PlanArtifactError::InvalidUtf8 { .. }
-        ));
-
-        fs::write(&plan, "# No checklist\n").expect("empty checklist plan");
-        assert!(matches!(
-            validate_execution_outbox_plan(&outbox).expect_err("empty checklist fails"),
-            PlanArtifactError::MissingChecklist { .. }
-        ));
     }
 
     #[cfg(unix)]
@@ -1338,7 +1537,7 @@ mod tests {
         let seeded = prepare_execution_plan_outbox(
             &worktree,
             "exec-1",
-            true,
+            "coder",
             Some("- [ ] fallback must not replace the candidate\n"),
         )
         .expect("recover seeded outbox");
@@ -1372,7 +1571,7 @@ mod tests {
         let seeded = prepare_execution_plan_outbox(
             &worktree,
             "exec-1",
-            true,
+            "coder",
             Some("- [ ] authoritative fallback\n"),
         )
         .expect("recover and seed outbox");

@@ -18,6 +18,24 @@ pub trait TaskRepo: Send + Sync {
         include_deleted: bool,
     ) -> Result<Option<Task>>;
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>>;
+    /// One aggregate over visible Tasks and their latest Reviews. Workflow maps
+    /// carry effective state kinds and whether the state holds root-owned work.
+    /// Returns (active, parked, queued), without loading Task or Review bodies.
+    async fn count_project_slots(
+        &self,
+        project_id: &str,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<(i64, i64, i64)>;
+    /// One grouped statement for a JSON object mapping Project IDs to state maps.
+    /// Revision fences come from the same SQLite snapshot as the counts.
+    async fn count_projects_slots(
+        &self,
+        project_states_json: &str,
+        subtask_states_json: &str,
+        blocking_kinds_json: &str,
+    ) -> Result<Vec<ProjectSlotCounts>>;
     /// List non-deleted Tasks in a Project whose metadata contains `key`.
     /// Recovery uses this narrow query for durable claims that must be found
     /// independently of the current workflow's state classification.
@@ -150,6 +168,15 @@ pub trait TaskRepo: Send + Sync {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task>;
+    /// Also report whether the mutations changed stored metadata, under the
+    /// same write lock. Conditional no-ops must not trigger refresh events.
+    async fn mutate_metadata_with_change(
+        &self,
+        id: &str,
+        expected_version: Option<i64>,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<(Task, bool)>;
     /// Apply key-level metadata mutations under a Task version CAS and bump
     /// that version when anything changes. Use this for metadata that grants
     /// exclusive authority over a subsequent side effect: an already-started
@@ -807,11 +834,10 @@ pub trait DomainEventRepo: Send + Sync {
         &self,
         consumer_name: &str,
     ) -> Result<Option<EventConsumerCutover>>;
-    async fn claim_event_batch(&self, input: ClaimDomainEvents) -> Result<Vec<DomainEvent>>;
-    async fn complete_claimed_event(&self, input: CompleteDomainEvent) -> Result<bool>;
 }
 
-/// Durable wake dispositions and their atomic event checkpoint boundary.
+/// Durable wake dispositions and semantic retry lineage. Initial persistence
+/// uses SqliteDb::persist_agent_wake_in_tx inside the runtime checkpoint boundary.
 /// Disposition attempts are immutable; deferred/setup-required retry paths
 /// append a later attempt and move the current pointer.
 #[async_trait]
@@ -844,13 +870,6 @@ pub trait AgentWakeDispositionRepo: Send + Sync {
         now: &str,
         limit: i64,
     ) -> Result<Vec<AgentWakeDisposition>>;
-    /// Persist the first disposition and complete the claimed source event
-    /// in one transaction.  A replay of the same attempt is exact and does
-    /// not create a second row or advance the cursor twice.
-    async fn complete_claimed_agent_wake(
-        &self,
-        input: CompleteClaimedWake,
-    ) -> Result<AgentWakeDisposition>;
     /// Append a due deferred/setup-required retry attempt and move the
     /// current pointer without rewriting the prior immutable attempt.
     async fn retry_agent_wake(
@@ -877,14 +896,6 @@ pub trait AttentionRepo: Send + Sync {
         source_event_id: &str,
         updated_at: &str,
     ) -> Result<Option<AttentionProjection>>;
-    async fn get_attention_consumer_health(
-        &self,
-        consumer_name: &str,
-    ) -> Result<Option<AttentionConsumerHealth>>;
-    async fn upsert_attention_consumer_health(
-        &self,
-        input: UpsertAttentionConsumerHealth,
-    ) -> Result<AttentionConsumerHealth>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -926,30 +937,17 @@ impl CreateDomainEvent {
             .as_deref()
             .map(parse_event_json_object)
             .unwrap_or_default();
-        let recovery_actions = event_recovery_actions(&annotation);
         let requires_intervention = task_interruption_requires_intervention(
             task.error_annotation.as_deref(),
             task.blocked_json.as_deref(),
             task.failed_json.as_deref(),
         );
         let interruption = if task.failed_json.is_some() {
-            Some(event_interruption_details(
-                "failed",
-                &failed,
-                &recovery_actions,
-            ))
+            Some(event_interruption_details("failed", &failed))
         } else if task.blocked_json.is_some() {
-            Some(event_interruption_details(
-                "blocked",
-                &blocked,
-                &recovery_actions,
-            ))
-        } else if !recovery_actions.is_empty() {
-            Some(event_interruption_details(
-                "annotation",
-                &annotation,
-                &recovery_actions,
-            ))
+            Some(event_interruption_details("blocked", &blocked))
+        } else if task.error_annotation.is_some() {
+            Some(event_interruption_details("annotation", &annotation))
         } else {
             None
         };
@@ -1046,11 +1044,7 @@ impl CreateDomainEvent {
     }
 }
 
-fn event_interruption_details(
-    source: &str,
-    value: &serde_json::Value,
-    recovery_actions: &[String],
-) -> serde_json::Value {
+fn event_interruption_details(source: &str, value: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "source": source,
         "kind": value
@@ -1069,7 +1063,6 @@ fn event_interruption_details(
             .or_else(|| value.get("blocked_execution_id"))
             .and_then(serde_json::Value::as_str)
             .map(|text| interruption_bounded_text(text, 128)),
-        "recovery_actions": recovery_actions,
     })
 }
 
@@ -1088,8 +1081,16 @@ pub fn task_interruption_requires_intervention(
     let annotation = error_annotation
         .map(parse_event_json_object)
         .unwrap_or_default();
-    annotation.get("type").and_then(serde_json::Value::as_str) != Some("manual_stop")
-        && !event_recovery_actions(&annotation).is_empty()
+    annotation
+        .get("type")
+        .cloned()
+        .and_then(|kind| serde_json::from_value::<api_types::FailureKind>(kind).ok())
+        .is_some_and(|kind| {
+            !matches!(
+                kind,
+                api_types::FailureKind::ManualStop | api_types::FailureKind::Unknown
+            )
+        })
 }
 
 fn parse_event_json_object(raw: &str) -> serde_json::Value {
@@ -1097,18 +1098,6 @@ fn parse_event_json_object(raw: &str) -> serde_json::Value {
         .ok()
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
-}
-
-fn event_recovery_actions(value: &serde_json::Value) -> Vec<String> {
-    value
-        .get("recovery_actions")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .take(16)
-        .map(|text| interruption_bounded_text(text, 128))
-        .collect()
 }
 
 fn interruption_bounded_text(value: &str, max_chars: usize) -> String {
@@ -1128,30 +1117,22 @@ fn bounded_event_text(value: &str, max_bytes: usize) -> String {
     output
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaimDomainEvents {
-    pub consumer_name: String,
-    pub lease_owner: String,
-    pub now: String,
-    pub leased_until: String,
-    pub limit: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompleteDomainEvent {
-    pub consumer_name: String,
-    pub lease_owner: String,
-    pub event_sequence: i64,
-    pub event_id: String,
-    pub dedupe_key: String,
-    pub completed_at: String,
-}
-
 #[async_trait]
 pub trait WorkspaceRepo: Send + Sync {
     async fn create(&self, input: CreateWorkspace) -> Result<Workspace>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Workspace>>;
     async fn get_by_task_id(&self, task_id: &str) -> Result<Option<Workspace>>;
+    /// Cleanup ownership guard for the legacy embedded path, under the same
+    /// writer lock as the caller's filesystem quarantine operation.
+    async fn embedded_path_is_owned_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        path: &str,
+    ) -> Result<bool>;
+    /// Authorize an embedded runtime path without exposing the legacy column.
+    /// A recorded placement is authoritative; unplaced rows retain their
+    /// exact-path guard until the backend records their server placement.
+    async fn task_owns_embedded_path(&self, task_id: &str, path: &str) -> Result<bool>;
     async fn set_cleanup_after(
         &self,
         id: &str,
@@ -1168,6 +1149,62 @@ pub trait WorkspaceRepo: Send + Sync {
         updated_at: &str,
     ) -> Result<Workspace>;
     async fn delete(&self, id: &str) -> Result<()>;
+}
+
+#[async_trait]
+pub trait WorkspacePlacementRepo: Send + Sync {
+    async fn create(&self, input: CreateWorkspacePlacement) -> Result<WorkspacePlacement>;
+    async fn create_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateWorkspacePlacement,
+    ) -> Result<WorkspacePlacement>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<WorkspacePlacement>>;
+    async fn get_by_id_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+    ) -> Result<Option<WorkspacePlacement>>;
+    async fn get_by_workspace_id(&self, workspace_id: &str) -> Result<Option<WorkspacePlacement>>;
+    async fn get_by_workspace_id_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspacePlacement>>;
+    async fn update(&self, input: UpdateWorkspacePlacement) -> Result<WorkspacePlacement>;
+    async fn update_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: UpdateWorkspacePlacement,
+    ) -> Result<WorkspacePlacement>;
+    async fn list_by_daemon_and_state(
+        &self,
+        daemon_id: &str,
+        state: PlacementState,
+    ) -> Result<Vec<WorkspacePlacement>>;
+    async fn list_by_state(&self, state: PlacementState) -> Result<Vec<WorkspacePlacement>>;
+    async fn get_for_task(&self, task_id: &str) -> Result<Option<WorkspacePlacement>>;
+    /// Suspend a ready placement only while the observed execution version
+    /// still has an expired heartbeat lease and a live hard deadline.
+    async fn suspend_expired_execution_lease(
+        &self,
+        placement: &WorkspacePlacement,
+        execution: &Execution,
+        now: &str,
+    ) -> Result<Option<WorkspacePlacement>>;
+    /// Rebind a suspended attempt to a new authenticated incarnation of its
+    /// existing owner. Both the placement and execution versions are fenced.
+    async fn resume_disconnected_execution_lease(
+        &self,
+        placement: &WorkspacePlacement,
+        execution: &Execution,
+        input: RenewExecutionLease,
+    ) -> Result<ExecutionLeaseMutation>;
+    async fn expire_unsuspended_workspace_leases(
+        &self,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceLease>>;
 }
 
 /// Internal scheduler authority for a Task workspace.  A lease is deliberately
@@ -1234,6 +1271,12 @@ pub trait DaemonRepo: Send + Sync {
     async fn list_visible(&self, user_id: Option<&str>, page: PageRequest) -> Result<Page<Daemon>>;
     async fn get_visible(&self, id: &str, user_id: Option<&str>) -> Result<Option<Daemon>>;
     async fn update_report(&self, input: UpdateDaemonReport) -> Result<Daemon>;
+    async fn update_run_limit(
+        &self,
+        id: &str,
+        version: i64,
+        run_limit: Option<u32>,
+    ) -> Result<Daemon>;
     async fn mark_online(&self, id: &str, last_report_at: &str) -> Result<Daemon>;
     async fn mark_offline(&self, id: &str, updated_at: &str) -> Result<Daemon>;
     async fn list_available_for_executor(&self, executor_type: &str) -> Result<Vec<Daemon>>;
@@ -1272,6 +1315,14 @@ pub trait ExecutionRepo: Send + Sync {
     /// versioned Task decision; service dispatch paths should always supply it.
     async fn create_with_lease_and_admission(
         &self,
+        input: CreateExecution,
+        lease: ClaimExecutionLease,
+        admission: Option<ExecutionAdmission>,
+    ) -> Result<Execution>;
+    /// Share the caller's writer transaction with placement start fencing.
+    async fn create_with_lease_and_admission_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
         input: CreateExecution,
         lease: ClaimExecutionLease,
         admission: Option<ExecutionAdmission>,
@@ -1562,6 +1613,8 @@ pub trait AgentChatMessageRepo: Send + Sync {
 pub trait AgentChatTurnJobRepo: Send + Sync {
     async fn get_agent_chat_turn_job(&self, id: &str) -> Result<Option<AgentChatTurnJob>>;
     async fn list_agent_chat_turn_jobs(&self, chat_id: &str) -> Result<Vec<AgentChatTurnJob>>;
+    /// Turns of one chat that still owe work: `queued`, `leased` or `retry_wait`.
+    async fn count_pending_agent_chat_turn_jobs(&self, chat_id: &str) -> Result<i64>;
     async fn create_agent_chat_turn_job(
         &self,
         input: CreateAgentChatTurnJob,
@@ -1647,8 +1700,12 @@ pub trait AgentChatTransactionRepo: Send + Sync {
     ) -> Result<AgentChatTurnJob> {
         self.park_agent_chat_turn(input.terminal).await
     }
+    /// Fence the terminal source and atomically admit a fresh retry with a
+    /// durable idempotency event. Authority is prepared by the admission service.
+    async fn retry_agent_chat_turn(&self, input: RetryAgentChatTurn) -> Result<AgentChatTurnJob>;
+
     /// Cancel a queued/leased/retry-wait turn and append the cancellation
-    /// event in the same transaction.  The idempotency key is represented by
+    /// event in the same transaction. The idempotency key is represented by
     /// the event dedupe key so retries do not require a second turn-job store.
     async fn cancel_agent_chat_turn(&self, input: CancelAgentChatTurn) -> Result<AgentChatTurnJob>;
     async fn cancel_agent_chat_turn_with_usage(
@@ -1697,12 +1754,6 @@ pub trait MemoryRepository: Send + Sync {
 /// authorization context when it is migrated to scoped retrieval.
 #[async_trait]
 pub trait ScopedMemoryRepository: Send + Sync {
-    async fn insert_memory_item_if_source_absent(
-        &self,
-        item: &MemoryItem,
-        source_type: &str,
-        source_ref: &str,
-    ) -> std::result::Result<(MemoryItem, bool), DbError>;
     async fn get_memory_item_scoped(
         &self,
         query: MemoryGetQuery,
@@ -1758,6 +1809,23 @@ pub trait ScopedMemoryRepository: Send + Sync {
     ) -> std::result::Result<Vec<ContextManifestSource>, DbError>;
 }
 
+/// Producer of a terminal review mutation; human decisions never impersonate
+/// the runner's completion notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewEventOrigin {
+    Runner,
+    User,
+}
+
+impl ReviewEventOrigin {
+    pub(crate) fn actor_type(self) -> &'static str {
+        match self {
+            Self::Runner => "review_runner",
+            Self::User => "user",
+        }
+    }
+}
+
 #[async_trait]
 pub trait ReviewRepo: Send + Sync {
     async fn create(&self, input: CreateReview) -> Result<Review>;
@@ -1781,6 +1849,13 @@ pub trait ReviewRepo: Send + Sync {
     /// transaction.
     async fn create_manual_pass_with_task_authority(
         &self,
+        input: CreateManualReviewPass,
+    ) -> Result<(Review, Task)>;
+    /// Transactional variant used to commit a linked follow-up Task together
+    /// with the manual pass. The caller owns commit and post-commit events.
+    async fn create_manual_pass_with_task_authority_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
         input: CreateManualReviewPass,
     ) -> Result<(Review, Task)>;
     /// Atomically reserve the next Review attempt with its Running execution
@@ -1832,6 +1907,7 @@ pub trait ReviewRepo: Send + Sync {
         updated_at: &str,
         expected_task_version: i64,
         review_passed_at: Option<String>,
+        origin: ReviewEventOrigin,
     ) -> Result<(Review, Task)>;
     /// Terminal Review settlement variant that also binds the result to the
     /// exact implementation execution currently selected for the Task.
@@ -2177,6 +2253,24 @@ pub trait ProjectRepo: Send + Sync {
         paused_at: &str,
         reason: &str,
     ) -> Result<bool>;
+    /// Pause only an unchanged, unpaused Project. User and other system
+    /// pauses always win; a stale snapshot is a benign no-op.
+    async fn set_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        paused_at: &str,
+        detail_json: &str,
+    ) -> Result<bool>;
+    /// Refresh the check detail only while the observed environment pause
+    /// remains current. Does not change the pause's original timestamp.
+    async fn update_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_paused_at: &str,
+        detail_json: &str,
+    ) -> Result<bool>;
     /// Clear a dispatcher-owned Project pause only when the exact pause
     /// snapshot that the dispatcher observed is still current.  This is the
     /// compare-and-set boundary used by repository reconciliation: a manual
@@ -2300,12 +2394,11 @@ pub trait ProjectHookRunRepo: Send + Sync {
 #[async_trait]
 pub trait RepoRepo: Send + Sync {
     async fn create(&self, input: CreateRepo) -> Result<Repo>;
-    /// Create a primary repository, optional provider configuration, and the
-    /// Project's primary-repository link plus dispatch wake atomically.
+    /// Create a primary repository and the Project's primary-repository link
+    /// plus dispatch wake atomically.
     async fn create_primary_for_project(
         &self,
         input: CreateRepo,
-        provider_config: Option<CreatePrProviderConfig>,
         expected_project_version: i64,
         project_updated_at: String,
     ) -> Result<Repo>;
@@ -2316,19 +2409,15 @@ pub trait RepoRepo: Send + Sync {
 }
 
 #[async_trait]
-pub trait PrProviderConfigRepo: Send + Sync {
-    async fn create(&self, input: CreatePrProviderConfig) -> Result<PrProviderConfig>;
-    async fn get_by_repo_id(&self, repo_id: &str) -> Result<Option<PrProviderConfig>>;
-    async fn update(&self, input: UpdatePrProviderConfig) -> Result<PrProviderConfig>;
+pub trait RepoLocationRepo: Send + Sync {
+    async fn create(&self, input: CreateRepoLocation) -> Result<RepoLocation>;
+    async fn get_by_id(&self, id: &str) -> Result<Option<RepoLocation>>;
+    async fn list_by_repo(&self, repo_id: &str, page: PageRequest) -> Result<Page<RepoLocation>>;
+    async fn update(&self, input: UpdateRepoLocation) -> Result<RepoLocation>;
+    /// Returns VersionConflict while a non-cleaned placement references the location.
     async fn delete(&self, id: &str) -> Result<()>;
-}
-
-#[async_trait]
-pub trait PrMetadataRepo: Send + Sync {
-    async fn create(&self, input: CreatePrMetadata) -> Result<PrMetadata>;
-    async fn get_by_task_id(&self, task_id: &str) -> Result<Option<PrMetadata>>;
-    async fn update(&self, input: UpdatePrMetadata) -> Result<PrMetadata>;
-    async fn delete(&self, id: &str) -> Result<()>;
+    /// Supplies the Task identity for the delete-in-use response.
+    async fn get_blocking_placement(&self, id: &str) -> Result<Option<WorkspacePlacement>>;
 }
 
 #[async_trait]
@@ -2471,7 +2560,6 @@ pub struct CreateRepo {
     pub name: String,
     pub remote_url: Option<String>,
     pub local_path: Option<String>,
-    pub work_mode: WorkMode,
     pub default_branch: String,
     pub created_at: String,
     pub updated_at: String,
@@ -2483,60 +2571,37 @@ pub struct UpdateRepo {
     pub name: Option<String>,
     pub local_path: Option<Option<String>>,
     pub remote_url: Option<Option<String>>,
-    pub work_mode: Option<WorkMode>,
     pub default_branch: Option<String>,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatePrProviderConfig {
+pub struct CreateRepoLocation {
     pub id: String,
     pub repo_id: String,
-    pub provider_type: String,
-    pub base_url: Option<String>,
-    pub polling_interval_seconds: i64,
-    pub token_secret_ref: Option<String>,
+    pub owner_kind: RepoLocationOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub path: String,
+    pub kind: RepoLocationKind,
+    pub is_default: bool,
+    pub status: RepoLocationStatus,
+    pub last_verified_at: Option<String>,
+    pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdatePrProviderConfig {
+pub struct UpdateRepoLocation {
     pub id: String,
-    pub provider_type: Option<String>,
-    pub base_url: Option<Option<String>>,
-    pub polling_interval_seconds: Option<i64>,
-    pub token_secret_ref: Option<Option<String>>,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatePrMetadata {
-    pub id: String,
-    pub task_id: String,
-    pub provider_type: String,
-    pub provider_pr_id: Option<String>,
-    pub pr_url: Option<String>,
-    pub source_branch: String,
-    pub target_branch: String,
-    pub pr_state: String,
-    pub merge_status: String,
-    pub last_synced_at: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdatePrMetadata {
-    pub id: String,
-    pub provider_type: Option<String>,
-    pub provider_pr_id: Option<Option<String>>,
-    pub pr_url: Option<Option<String>>,
-    pub source_branch: Option<String>,
-    pub target_branch: Option<String>,
-    pub pr_state: Option<String>,
-    pub merge_status: Option<String>,
-    pub last_synced_at: Option<Option<String>>,
+    pub expected_version: i64,
+    pub path: Option<String>,
+    pub kind: Option<RepoLocationKind>,
+    pub is_default: Option<bool>,
+    pub status: Option<RepoLocationStatus>,
+    pub last_verified_at: Option<Option<String>>,
+    pub last_error: Option<Option<String>>,
     pub updated_at: String,
 }
 
@@ -2714,6 +2779,50 @@ pub struct CreateWorkspace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateWorkspacePlacement {
+    pub id: String,
+    pub workspace_id: String,
+    pub task_id: String,
+    pub agent_id: Option<String>,
+    pub owner_kind: PlacementOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub repo_location_id: String,
+    pub execution_daemon_id: Option<String>,
+    pub workspace_handle: Option<String>,
+    pub generation: i64,
+    pub state: PlacementState,
+    pub selected_by: PlacementSelectedBy,
+    pub selection_reason: String,
+    pub reserved_until: Option<String>,
+    pub disconnected_at: Option<String>,
+    pub failure_cause: Option<PlacementFailureCause>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateWorkspacePlacement {
+    pub id: String,
+    pub expected_version: i64,
+    pub agent_id: Option<Option<String>>,
+    pub owner_kind: Option<PlacementOwnerKind>,
+    pub daemon_id: Option<Option<String>>,
+    pub runtime_id: Option<Option<String>>,
+    pub repo_location_id: Option<String>,
+    pub execution_daemon_id: Option<Option<String>>,
+    pub workspace_handle: Option<Option<String>>,
+    pub generation: Option<i64>,
+    pub state: Option<PlacementState>,
+    pub selected_by: Option<PlacementSelectedBy>,
+    pub selection_reason: Option<String>,
+    pub reserved_until: Option<Option<String>>,
+    pub disconnected_at: Option<Option<String>>,
+    pub failure_cause: Option<Option<PlacementFailureCause>>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateWorkspaceLease {
     pub id: String,
     pub project_id: String,
@@ -2739,6 +2848,7 @@ pub struct CreateWorkspaceLease {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpsertDaemon {
+    pub max_concurrent_runs: Option<u32>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -2756,6 +2866,7 @@ pub struct UpsertDaemon {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateDaemonReport {
+    pub max_concurrent_runs: Option<u32>,
     pub id: String,
     pub last_report_at: String,
     pub status: DaemonStatus,
@@ -2985,6 +3096,7 @@ pub struct RestoreQueuedRecovery {
     pub task_id: String,
     pub expected_version: i64,
     pub queued_recovery_id: String,
+    pub failed_json: Option<String>,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
     pub updated_at: String,
@@ -3280,6 +3392,11 @@ pub struct FailAgentChatTurn {
     pub next_attempt_at: Option<String>,
     pub error_code: String,
     pub error_message: String,
+    pub failure_class: api_types::TurnFailure,
+    pub retry_decision: api_types::TurnRetryDecision,
+    pub pre_provider_failure_count: i64,
+    pub usage_limit_deferral_count: i64,
+    pub usage_limit_first_deferred_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -3306,6 +3423,16 @@ pub struct ParkAgentChatTurnWithUsage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelAgentChatTurn {
+    pub turn_job_id: String,
+    pub expected_version: i64,
+    pub actor_user_id: String,
+    pub idempotency_key: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryAgentChatTurn {
+    pub new_turn: CreateAgentChatTurnJob,
     pub turn_job_id: String,
     pub expected_version: i64,
     pub actor_user_id: String,

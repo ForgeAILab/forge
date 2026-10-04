@@ -6,7 +6,7 @@ use api_types::{ErrorResponse, ProjectExecutionSetupResponse, ProjectResponse};
 use axum::{http::Method, http::StatusCode, Router};
 use db::{
     now_rfc3339, AgentConnectionHealthRepo, AgentRepo, AgentStatus, CreateAgentIdentity,
-    CreateAgentProfile, CreateRepo, RepoRepo, UpsertAgentConnectionHealth, WorkMode,
+    CreateAgentProfile, CreateRepo, RepoRepo, UpsertAgentConnectionHealth,
 };
 use serde_json::json;
 
@@ -80,7 +80,6 @@ async fn create_remote_repo(app: &common::Harness, project_id: &str) -> String {
             name: "remote-setup-repo".to_owned(),
             remote_url: Some("https://example.invalid/forge/setup".to_owned()),
             local_path: None,
-            work_mode: WorkMode::DirectMerge,
             default_branch: "main".to_owned(),
             created_at: now.clone(),
             updated_at: now,

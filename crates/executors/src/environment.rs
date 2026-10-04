@@ -20,8 +20,17 @@ use api_types::{EnvironmentAsset, EnvironmentCheck, ProjectEnvironment};
 /// execution snapshot is loaded, never authored profile configuration.
 pub const TASK_ENVIRONMENT_CONFIG_KEY: &str = "_forge_task_environment";
 
-/// Bytes of check output kept for the blocking annotation.
+/// Bytes of check output retained from a preflight probe.
 const CHECK_OUTPUT_TAIL_BYTES: usize = 4096;
+
+/// Maximum runtime of a host environment check, including legacy settings.
+pub const MAX_ENVIRONMENT_CHECK_TIMEOUT_SECONDS: u64 = 300;
+
+fn check_timeout_seconds(check: &EnvironmentCheck) -> u64 {
+    check
+        .timeout_seconds
+        .clamp(1, MAX_ENVIRONMENT_CHECK_TIMEOUT_SECONDS)
+}
 
 /// Makes sibling staging paths unique within this Forge process.
 static ASSET_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -52,6 +61,9 @@ pub fn task_environment(config: &serde_json::Value) -> BTreeMap<String, String> 
 
 /// Reject an environment Forge could not apply safely.
 pub fn validate_project_environment(environment: &ProjectEnvironment) -> Result<(), String> {
+    if !(60..=86400).contains(&environment.recheck_interval_seconds) {
+        return Err("recheck_interval_seconds must be between 60 and 86400".to_owned());
+    }
     for key in environment.env.keys() {
         let valid = !key.is_empty()
             && !key.starts_with(|c: char| c.is_ascii_digit())
@@ -96,9 +108,9 @@ pub fn validate_project_environment(environment: &ProjectEnvironment) -> Result<
         if check.command.trim().is_empty() {
             return Err(format!("environment check {} has no command", check.name));
         }
-        if check.timeout_seconds == 0 {
+        if !(1..=MAX_ENVIRONMENT_CHECK_TIMEOUT_SECONDS).contains(&check.timeout_seconds) {
             return Err(format!(
-                "environment check {} needs a positive timeout",
+                "environment check {} timeout_seconds must be between 1 and 300",
                 check.name
             ));
         }
@@ -384,6 +396,54 @@ impl EnvironmentCheckFailure {
     }
 }
 
+/// Outcome of a single check, including bounded, redacted output on success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentCheckResult {
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub output_tail: String,
+}
+
+/// Run one check independently of its role selector. Used by the owner's
+/// on-demand re-check, which must report every configured check.
+pub async fn run_environment_check(
+    worktree: &Path,
+    env: &BTreeMap<String, String>,
+    check: &EnvironmentCheck,
+) -> EnvironmentCheckResult {
+    let mut command = environment_check_command(worktree, env, check);
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(check_timeout_seconds(check)),
+        command.output(),
+    )
+    .await;
+    match outcome {
+        Err(_) => EnvironmentCheckResult {
+            passed: false,
+            exit_code: None,
+            timed_out: true,
+            output_tail: String::new(),
+        },
+        Ok(Err(error)) => EnvironmentCheckResult {
+            passed: false,
+            exit_code: None,
+            timed_out: false,
+            output_tail: output_tail(&redact_environment_values(&error.to_string(), env)),
+        },
+        Ok(Ok(output)) => {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            EnvironmentCheckResult {
+                passed: output.status.success(),
+                exit_code: output.status.code(),
+                timed_out: false,
+                output_tail: output_tail(&redact_environment_values(&text, env)),
+            }
+        }
+    }
+}
+
 /// Run the checks gating `role`, in order, stopping at the first failure.
 pub async fn run_environment_checks(
     worktree: &Path,
@@ -392,33 +452,15 @@ pub async fn run_environment_checks(
     role: &str,
 ) -> Option<EnvironmentCheckFailure> {
     for check in checks.iter().filter(|check| check.applies_to(role)) {
-        let mut command = tokio::process::Command::new("bash");
-        command
-            .args(["-lc", &check.command])
-            .current_dir(worktree)
-            .envs(env)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(check.timeout_seconds), command.output())
-                .await;
-        let failure = |exit_code, timed_out, output_tail| EnvironmentCheckFailure {
-            name: check.name.clone(),
-            command: check.command.clone(),
-            exit_code,
-            timed_out,
-            output_tail,
-        };
-        match outcome {
-            Err(_) => return Some(failure(None, true, String::new())),
-            Ok(Err(error)) => return Some(failure(None, false, error.to_string())),
-            Ok(Ok(output)) if !output.status.success() => {
-                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-                let text = redact_environment_values(&text, env);
-                return Some(failure(output.status.code(), false, output_tail(&text)));
-            }
-            Ok(Ok(_)) => {}
+        let result = run_environment_check(worktree, env, check).await;
+        if !result.passed {
+            return Some(EnvironmentCheckFailure {
+                name: check.name.clone(),
+                command: check.command.clone(),
+                exit_code: result.exit_code,
+                timed_out: result.timed_out,
+                output_tail: result.output_tail,
+            });
         }
     }
     None
@@ -435,17 +477,98 @@ fn output_tail(text: &str) -> String {
     text[start..].to_owned()
 }
 
+fn environment_check_command(
+    worktree: &Path,
+    env: &BTreeMap<String, String>,
+    check: &EnvironmentCheck,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("bash");
+    command
+        .args(["-lc", &check.command])
+        .current_dir(worktree)
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    crate::run_process::apply(&mut command, env);
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn check(name: &str, command: &str, roles: &[&str]) -> EnvironmentCheck {
         EnvironmentCheck {
+            scope: Default::default(),
             name: name.to_owned(),
             command: command.to_owned(),
             roles: roles.iter().map(|role| (*role).to_owned()).collect(),
             timeout_seconds: 10,
         }
+    }
+
+    #[test]
+    fn environment_timeout_is_bounded_on_write_and_legacy_read() {
+        let mut environment = ProjectEnvironment::default();
+        let mut check = EnvironmentCheck {
+            scope: Default::default(),
+            name: "slow".to_owned(),
+            command: "true".to_owned(),
+            roles: Vec::new(),
+            timeout_seconds: u64::MAX,
+        };
+        environment.checks.push(check.clone());
+        assert!(validate_project_environment(&environment)
+            .unwrap_err()
+            .contains("timeout_seconds"));
+        assert_eq!(check_timeout_seconds(&check), 300);
+        check.timeout_seconds = 0;
+        assert_eq!(check_timeout_seconds(&check), 1);
+        environment.checks[0].timeout_seconds = 300;
+        assert!(validate_project_environment(&environment).is_ok());
+    }
+
+    #[test]
+    fn environment_recheck_interval_defaults_and_rejects_invalid_values() {
+        let default: ProjectEnvironment = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.recheck_interval_seconds, 600);
+        assert_eq!(ProjectEnvironment::default().recheck_interval_seconds, 600);
+        for interval in [0, 5, 59, 86401, u64::MAX] {
+            let environment = ProjectEnvironment {
+                recheck_interval_seconds: interval,
+                ..Default::default()
+            };
+            assert!(validate_project_environment(&environment)
+                .unwrap_err()
+                .contains("recheck_interval_seconds"));
+        }
+        for interval in [60, 600, 86400] {
+            assert!(validate_project_environment(&ProjectEnvironment {
+                recheck_interval_seconds: interval,
+                ..Default::default()
+            })
+            .is_ok());
+        }
+        assert!(
+            serde_json::from_str::<ProjectEnvironment>(r#"{"recheck_interval_seconds":-1}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<ProjectEnvironment>(r#"{"unknown":true}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn individual_environment_check_keeps_success_output_and_ignores_roles() {
+        let root = tempfile::TempDir::new().unwrap();
+        let env = BTreeMap::from([("TOKEN".to_owned(), "private-value".to_owned())]);
+        let result = run_environment_check(
+            root.path(),
+            &env,
+            &check("browser", "printf '%s ready' \"$TOKEN\"", &["reviewer"]),
+        )
+        .await;
+        assert!(result.passed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output_tail, "[REDACTED] ready");
     }
 
     #[test]
@@ -683,5 +806,45 @@ mod tests {
             .expect("check fails");
         assert!(!failure.output_tail.contains("very-secret"));
         assert!(failure.output_tail.contains("[REDACTED]"));
+    }
+}
+
+#[cfg(test)]
+mod run_budget_tests {
+    use super::*;
+    #[test]
+    fn launch_environment_preserves_project_and_fills_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let env =
+            std::collections::BTreeMap::from([("CARGO_BUILD_JOBS".into(), "project-value".into())]);
+        let check = EnvironmentCheck {
+            name: "budget".into(),
+            command: "cargo test".into(),
+            scope: api_types::EnvironmentCheckScope::Workspace,
+            roles: Vec::new(),
+            timeout_seconds: 30,
+        };
+        let command = environment_check_command(temp.path(), &env, &check);
+        let envs: std::collections::BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_owned(), v.to_owned())))
+            .collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CARGO_BUILD_JOBS")).unwrap(),
+            "project-value"
+        );
+        let jobs = crate::run_process::machine_policy().get().build_jobs();
+        for (key, default) in [
+            ("RUST_TEST_THREADS", jobs.to_string()),
+            ("MAKEFLAGS", format!("-j{jobs}")),
+            ("CMAKE_BUILD_PARALLEL_LEVEL", jobs.to_string()),
+            ("GOFLAGS", format!("-p={jobs}")),
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(key)),
+                Some(&std::env::var_os(key).unwrap_or(default.into()))
+            );
+        }
     }
 }

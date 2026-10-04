@@ -1,19 +1,18 @@
 use api_types::{
-    daemon_protocol_is_compatible, DaemonHandshakeNotification, ExecutionTerminalAckParams,
-    DAEMON_PROTOCOL_INCOMPATIBLE, DAEMON_UNAVAILABLE, METHOD_DAEMON_HANDSHAKE,
-    METHOD_EXECUTION_TERMINAL_ACK,
+    daemon_protocol_is_compatible, DaemonHandshakeNotification, JournalAckParams,
+    DAEMON_PROTOCOL_INCOMPATIBLE, DAEMON_UNAVAILABLE, METHOD_DAEMON_HANDSHAKE, METHOD_JOURNAL_ACK,
 };
 use async_trait::async_trait;
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{
-    atomic::{AtomicU64, AtomicU8, Ordering},
+    atomic::{AtomicU32, AtomicU8, Ordering},
     Arc, Mutex, MutexGuard, Weak,
 };
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use uuid::Uuid;
 
 use crate::{ServiceError, TaskService};
@@ -24,6 +23,7 @@ pub mod fs_local;
 pub mod providers;
 pub mod remote;
 pub mod router;
+pub mod workspace_client;
 
 #[cfg(test)]
 mod tests;
@@ -36,7 +36,12 @@ pub use remote::{RemoteExecutionProvider, RemoteFilesystemProvider};
 pub use router::{select_execution_provider, select_filesystem_provider};
 
 pub const DAEMON_OUTBOUND_BUFFER: usize = 256;
-static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+fn new_connection_id() -> u64 {
+    let uuid = Uuid::new_v4().as_u128();
+    // Mix both halves so UUID version/variant bits do not reduce the numeric
+    // token's entropy. Keep it positive for SQLite INTEGER retry epochs.
+    (((uuid >> 64) as u64 ^ uuid as u64) & i64::MAX as u64).max(1)
+}
 
 const PROTOCOL_UNKNOWN: u8 = 0;
 const PROTOCOL_COMPATIBLE: u8 = 1;
@@ -59,12 +64,28 @@ pub type PendingRequests = HashMap<String, PendingResponse>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonTerminalDisposition {
     Acknowledge,
+    Pending,
+    /// The report committed, but reconciliation must finish before cascade/ACK.
+    AwaitingCascade,
     Conflict,
     Ignore,
 }
 
 #[async_trait]
 pub trait DaemonExecutionEventHandler: Send + Sync {
+    async fn handle_disconnected(&self, _daemon_id: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_workspace_cleanup(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::WorkspaceCleanupResult,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        Ok(DaemonTerminalDisposition::Ignore)
+    }
+
     /// Handle the authenticated command-stream heartbeat.  This is separate
     /// from execution output: a remote daemon can keep an in-flight provider
     /// request alive even when it emits no log, text, or tool events.
@@ -97,6 +118,7 @@ pub trait DaemonExecutionEventHandler: Send + Sync {
     /// usage reports, and its `(terminal_report_id, payload_digest)` receipt
     /// are committed together. It must return `Acknowledge` for an exact
     /// replay found in that durable receipt (including after a server restart),
+    /// `Pending` while an identical report is still committing its outbox,
     /// `Conflict` for a reused identity with a different payload, and
     /// `Ignore` only for an unknown late report that has no durable receipt.
     /// Existing handlers keep the narrower method above; durable sinks
@@ -144,15 +166,25 @@ struct EmbeddedExecutionContext {
     task_executor: Arc<dyn executors::TaskExecutor>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DaemonConnectionSnapshot {
+    pub connection_id: u64,
+    pub handshake: DaemonHandshakeNotification,
+    pub workspace_incapable: bool,
+}
+
 #[derive(Clone)]
 pub struct DaemonConnection {
     id: u64,
+    connected_at: String,
     pub daemon_id: String,
     pub outbound: mpsc::Sender<api_types::DaemonFrame>,
     pub pending: Arc<Mutex<PendingRequests>>,
     stale_tx: watch::Sender<bool>,
     stale_rx: watch::Receiver<bool>,
     protocol_state: Arc<AtomicU8>,
+    protocol_revision: Arc<AtomicU32>,
+    handshake: Arc<Mutex<Option<DaemonHandshakeNotification>>>,
 }
 
 impl DaemonConnection {
@@ -161,13 +193,16 @@ impl DaemonConnection {
         let (stale_tx, stale_rx) = watch::channel(false);
         (
             Self {
-                id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+                id: new_connection_id(),
+                connected_at: db::now_rfc3339(),
                 daemon_id,
                 outbound,
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 stale_tx,
                 stale_rx,
                 protocol_state: Arc::new(AtomicU8::new(PROTOCOL_UNKNOWN)),
+                protocol_revision: Arc::new(AtomicU32::new(0)),
+                handshake: Arc::new(Mutex::new(None)),
             },
             receiver,
         )
@@ -175,6 +210,10 @@ impl DaemonConnection {
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub(crate) fn connected_at(&self) -> &str {
+        &self.connected_at
     }
 
     pub fn stale_receiver(&self) -> watch::Receiver<bool> {
@@ -201,6 +240,34 @@ impl DaemonConnection {
         self.protocol_compatible()
     }
 
+    pub fn negotiated_revision(&self) -> Option<u32> {
+        (!self.is_stale() && self.protocol_known())
+            .then(|| self.protocol_revision.load(Ordering::Acquire))
+    }
+
+    pub fn needs_upgrade(&self) -> bool {
+        self.negotiated_revision()
+            .is_some_and(|revision| revision < api_types::DAEMON_MIN_PROTOCOL_REVISION)
+    }
+
+    pub fn snapshot(&self) -> Option<DaemonConnectionSnapshot> {
+        let retained = lock(&self.handshake);
+        if self.is_stale() || !self.protocol_compatible() {
+            return None;
+        }
+        let handshake = retained.clone()?;
+        let workspace_incapable = handshake.protocol_revision < 3
+            || !handshake
+                .capabilities
+                .iter()
+                .any(|capability| capability == api_types::DAEMON_CAPABILITY_WORKSPACE);
+        Some(DaemonConnectionSnapshot {
+            connection_id: self.id,
+            handshake,
+            workspace_incapable,
+        })
+    }
+
     fn set_protocol_compatibility(&self, compatible: bool) {
         self.protocol_state.store(
             if compatible {
@@ -224,6 +291,9 @@ struct DaemonConnectionRegistryInner {
     execution_events: Mutex<Option<Arc<dyn DaemonExecutionEventHandler>>>,
     terminal_events: Mutex<Option<Arc<dyn DaemonTerminalEventHandler>>>,
     embedded_execution: Mutex<Option<EmbeddedExecutionContext>>,
+    reconciliation_notify: Arc<Notify>,
+    journal_terminals:
+        Mutex<HashMap<(String, u64, String), api_types::ExecutionTerminalNotification>>,
 }
 
 impl DaemonConnectionRegistry {
@@ -238,6 +308,8 @@ impl DaemonConnectionRegistry {
                 execution_events: Mutex::new(Some(execution_events)),
                 terminal_events: Mutex::new(None),
                 embedded_execution: Mutex::new(None),
+                reconciliation_notify: Arc::new(Notify::new()),
+                journal_terminals: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -250,6 +322,8 @@ impl DaemonConnectionRegistry {
                 execution_events: Mutex::new(None),
                 terminal_events: Mutex::new(None),
                 embedded_execution: Mutex::new(None),
+                reconciliation_notify: Arc::new(Notify::new()),
+                journal_terminals: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -304,6 +378,7 @@ impl DaemonConnectionRegistry {
                     details: None,
                 },
             );
+            self.notify_disconnected(&daemon_id);
         }
         prior
     }
@@ -311,6 +386,7 @@ impl DaemonConnectionRegistry {
     pub fn unregister(&self, daemon_id: &str) {
         let removed = lock(&self.inner.connections).remove(daemon_id);
         if let Some(connection) = removed {
+            connection.mark_stale();
             fail_pending(
                 &connection,
                 api_types::DaemonErrorPayload {
@@ -319,6 +395,7 @@ impl DaemonConnectionRegistry {
                     details: None,
                 },
             );
+            self.notify_disconnected(daemon_id);
             if let Some(event_bus) = self.inner.event_bus.as_ref() {
                 event_bus.publish(ForgeEvent {
                     event_type: "daemon.disconnected".to_owned(),
@@ -332,6 +409,34 @@ impl DaemonConnectionRegistry {
 
     pub fn get(&self, daemon_id: &str) -> Option<DaemonConnection> {
         lock(&self.inner.connections).get(daemon_id).cloned()
+    }
+
+    pub fn connection_snapshots(&self) -> BTreeMap<String, DaemonConnectionSnapshot> {
+        lock(&self.inner.connections)
+            .iter()
+            .filter_map(|(id, connection)| connection.snapshot().map(|facts| (id.clone(), facts)))
+            .collect()
+    }
+
+    pub fn reconciliation_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.inner.reconciliation_notify)
+    }
+
+    fn notify_disconnected(&self, daemon_id: &str) {
+        lock(&self.inner.journal_terminals).retain(|(id, _, _), _| id != daemon_id);
+        let Some(handler) = lock(&self.inner.execution_events).clone() else {
+            return;
+        };
+        let daemon_id = daemon_id.to_owned();
+        let notify = self.reconciliation_notify();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = handler.handle_disconnected(&daemon_id).await {
+                    tracing::warn!(%error, daemon_id, "failed to suspend disconnected placements");
+                }
+                notify.notify_one();
+            });
+        }
     }
 
     pub fn is_connected(&self, daemon_id: &str) -> bool {
@@ -352,8 +457,18 @@ impl DaemonConnectionRegistry {
         if connection.protocol_allows_dispatch() {
             return Ok(());
         }
+        if connection.needs_upgrade() {
+            return Err(ServiceError::DaemonUpgradeRequired {
+                daemon_id: daemon_id.to_owned(),
+            });
+        }
+        if !connection.protocol_known() {
+            return Err(ServiceError::DaemonNotReady {
+                daemon_id: daemon_id.to_owned(),
+            });
+        }
         Err(ServiceError::invalid_operation(format!(
-            "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} does not support the required command protocol"
+            "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} is missing required command capabilities"
         )))
     }
 
@@ -424,12 +539,20 @@ impl DaemonConnectionRegistry {
         })?;
         let (sender, receiver) = oneshot::channel();
         lock(&connection.pending).insert(request_id.clone(), sender);
+        let _pending = workspace_client::PendingRequest {
+            connection: connection.clone(),
+            request_id: request_id.clone(),
+        };
 
         if !connection.protocol_allows_dispatch() {
             lock(&connection.pending).remove(&request_id);
-            return Err(ServiceError::invalid_operation(format!(
-                "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} does not support the required command protocol"
-            )));
+            return self
+                .ensure_protocol_dispatchable(daemon_id, &connection)
+                .and_then(|()| {
+                    Err(ServiceError::DaemonUnavailable {
+                        daemon_id: daemon_id.to_owned(),
+                    })
+                });
         }
 
         let frame = api_types::DaemonFrame::Request {
@@ -438,14 +561,21 @@ impl DaemonConnectionRegistry {
             params,
         };
 
-        if connection.outbound.send(frame).await.is_err() {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        let sent = tokio::time::timeout_at(deadline, connection.outbound.send(frame))
+            .await
+            .map_err(|_| ServiceError::DaemonTimeout {
+                daemon_id: daemon_id.to_owned(),
+                method: method.to_owned(),
+            })?;
+        if sent.is_err() {
             lock(&connection.pending).remove(&request_id);
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             });
         }
 
-        let result = match tokio::time::timeout(timeout_duration, receiver).await {
+        let result = match tokio::time::timeout_at(deadline, receiver).await {
             Ok(Ok(Ok(result))) => result,
             Ok(Ok(Err(error))) => {
                 return Err(remote::daemon_error_to_service_error(
@@ -496,6 +626,10 @@ impl DaemonConnectionRegistry {
         })?;
         let (sender, receiver) = oneshot::channel();
         lock(&connection.pending).insert(request_id.clone(), sender);
+        let _pending = workspace_client::PendingRequest {
+            connection: connection.clone(),
+            request_id: request_id.clone(),
+        };
 
         // The connection can be replaced after the lookup above.  Do not
         // leave a request registered on a stale incarnation, and never route
@@ -503,9 +637,13 @@ impl DaemonConnectionRegistry {
         if !self.is_current(daemon_id, connection_id) || !connection.protocol_allows_dispatch() {
             lock(&connection.pending).remove(&request_id);
             if !connection.protocol_allows_dispatch() {
-                return Err(ServiceError::invalid_operation(format!(
-                    "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} does not support the required command protocol"
-                )));
+                return self
+                    .ensure_protocol_dispatchable(daemon_id, &connection)
+                    .and_then(|()| {
+                        Err(ServiceError::DaemonUnavailable {
+                            daemon_id: daemon_id.to_owned(),
+                        })
+                    });
             }
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
@@ -518,14 +656,21 @@ impl DaemonConnectionRegistry {
             params,
         };
 
-        if connection.outbound.send(frame).await.is_err() {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        let sent = tokio::time::timeout_at(deadline, connection.outbound.send(frame))
+            .await
+            .map_err(|_| ServiceError::DaemonTimeout {
+                daemon_id: daemon_id.to_owned(),
+                method: method.to_owned(),
+            })?;
+        if sent.is_err() {
             lock(&connection.pending).remove(&request_id);
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             });
         }
 
-        let result = match tokio::time::timeout(timeout_duration, receiver).await {
+        let result = match tokio::time::timeout_at(deadline, receiver).await {
             Ok(Ok(Ok(result))) => result,
             Ok(Ok(Err(error))) => {
                 return Err(remote::daemon_error_to_service_error(
@@ -693,81 +838,73 @@ impl DaemonConnectionRegistry {
                 }
             }
             api_types::METHOD_EXECUTION_TERMINAL => {
+                match serde_json::from_value::<api_types::ExecutionTerminalNotification>(params) {
+                    Ok(notification) => {
+                        let key = (
+                            daemon_id.to_owned(),
+                            connection_id,
+                            notification.execution_id.clone(),
+                        );
+                        let should_apply = {
+                            let mut terminals = lock(&self.inner.journal_terminals);
+                            if terminals.get(&key) == Some(&notification) {
+                                false
+                            } else {
+                                terminals.insert(key, notification.clone());
+                                true
+                            }
+                        };
+                        if !should_apply {
+                            return;
+                        }
+                        let registry = self.clone();
+                        let daemon_id = daemon_id.to_owned();
+                        tokio::spawn(async move {
+                            if let Err(error) = registry
+                                .apply_journal_terminal(&daemon_id, connection_id, notification)
+                                .await
+                            {
+                                tracing::warn!(%error, daemon_id, connection_id,
+                                    "failed to drain daemon terminal report");
+                            }
+                        });
+                    }
+                    Err(error) => tracing::warn!(daemon_id, %error,
+                        "dropping malformed execution.terminal notification"),
+                }
+            }
+            api_types::METHOD_WORKSPACE_CLEANUP => {
                 let Some(handler) = lock(&self.inner.execution_events).clone() else {
-                    tracing::info!(
-                        daemon_id,
-                        method,
-                        "dropping daemon notification; no execution event handler is configured"
-                    );
                     return;
                 };
-                match serde_json::from_value::<api_types::ExecutionTerminalNotification>(params) {
+                match serde_json::from_value::<api_types::WorkspaceCleanupResult>(params) {
                     Ok(notification) => {
                         let registry = self.clone();
                         let daemon_id = daemon_id.to_owned();
                         tokio::spawn(async move {
-                            match handler
-                                .handle_terminal_with_ack(
-                                    &daemon_id,
-                                    connection_id,
-                                    notification.clone(),
-                                )
-                                .await
-                            {
-                                Ok(DaemonTerminalDisposition::Acknowledge) => {
-                                    let params = ExecutionTerminalAckParams {
-                                        terminal_report_id: notification.terminal_report_id,
-                                        execution_id: notification.execution_id,
-                                    };
-                                    if let Err(error) = registry
-                                        .send_request_with_timeout_for_connection::<
-                                            _,
-                                            api_types::ExecutionTerminalAckResult,
-                                        >(
-                                            &daemon_id,
-                                            connection_id,
-                                            METHOD_EXECUTION_TERMINAL_ACK,
-                                            params,
-                                            Duration::from_secs(
-                                                api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
-                                            ),
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            %error,
-                                            daemon_id = %daemon_id,
-                                            connection_id,
-                                            "failed to acknowledge daemon execution terminal notification"
-                                        );
+                            let result = async {
+                                if handler.handle_workspace_cleanup(
+                                    &daemon_id, connection_id, notification.clone(),
+                                ).await? == DaemonTerminalDisposition::Acknowledge {
+                                    let ack = registry.send_request_for_connection::<_, api_types::JournalAckResult>(
+                                        &daemon_id, connection_id, METHOD_JOURNAL_ACK,
+                                        JournalAckParams { entry_id: notification.entry_id },
+                                        api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
+                                    ).await?;
+                                    if !ack.acknowledged {
+                                        return Err(ServiceError::invalid_operation("daemon did not acknowledge cleanup journal entry"));
                                     }
                                 }
-                                Ok(DaemonTerminalDisposition::Conflict) => {
-                                    tracing::warn!(
-                                        daemon_id = %daemon_id,
-                                        connection_id,
-                                        "daemon execution terminal notification conflicts with a durable report"
-                                    );
-                                }
-                                Ok(DaemonTerminalDisposition::Ignore) => {}
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        daemon_id = %daemon_id,
-                                        connection_id,
-                                        "failed to handle daemon execution terminal notification"
-                                    );
-                                }
+                                Ok::<_, ServiceError>(())
+                            }.await;
+                            if let Err(error) = result {
+                                tracing::warn!(%error, daemon_id, connection_id,
+                                    "failed to apply daemon cleanup acknowledgement");
                             }
                         });
                     }
-                    Err(error) => {
-                        tracing::warn!(
-                            daemon_id,
-                            %error,
-                            "dropping malformed execution.terminal notification"
-                        );
-                    }
+                    Err(error) => tracing::warn!(daemon_id, %error,
+                        "dropping malformed workspace.cleanup notification"),
                 }
             }
             api_types::METHOD_TERMINAL_OUTPUT => {
@@ -846,6 +983,118 @@ impl DaemonConnectionRegistry {
         }
     }
 
+    async fn apply_journal_terminal(
+        &self,
+        daemon_id: &str,
+        connection_id: u64,
+        notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        if !self.is_current(daemon_id, connection_id) {
+            return Ok(DaemonTerminalDisposition::Ignore);
+        }
+        let Some(handler) = lock(&self.inner.execution_events).clone() else {
+            return Ok(DaemonTerminalDisposition::Ignore);
+        };
+        let disposition = handler
+            .handle_terminal_with_ack(daemon_id, connection_id, notification.clone())
+            .await?;
+        if matches!(
+            disposition,
+            DaemonTerminalDisposition::Acknowledge | DaemonTerminalDisposition::Ignore
+        ) {
+            let acknowledgement = self
+                .send_request_for_connection::<_, api_types::JournalAckResult>(
+                    daemon_id,
+                    connection_id,
+                    METHOD_JOURNAL_ACK,
+                    JournalAckParams {
+                        entry_id: notification.terminal_report_id.clone(),
+                    },
+                    api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
+                )
+                .await?;
+            if !acknowledgement.acknowledged {
+                return Err(ServiceError::invalid_operation(
+                    "daemon did not acknowledge terminal journal entry",
+                ));
+            }
+            lock(&self.inner.journal_terminals).remove(&(
+                daemon_id.to_owned(),
+                connection_id,
+                notification.execution_id,
+            ));
+        }
+        Ok(disposition)
+    }
+
+    pub(crate) fn retained_terminal_execution_ids(&self) -> Vec<String> {
+        lock(&self.inner.journal_terminals)
+            .iter()
+            .filter(|((daemon_id, connection_id, _), _)| self.is_current(daemon_id, *connection_id))
+            .map(|((_, _, execution_id), _)| execution_id.clone())
+            .collect()
+    }
+
+    pub(crate) async fn retry_retained_terminals(
+        &self,
+        daemon_id: &str,
+    ) -> Result<(), ServiceError> {
+        let Some(connection) = self.get(daemon_id) else {
+            return Ok(());
+        };
+        let notifications: Vec<_> = lock(&self.inner.journal_terminals)
+            .iter()
+            .filter(|((owner, incarnation, _), _)| {
+                owner == daemon_id && *incarnation == connection.id()
+            })
+            .map(|(_, notification)| notification.clone())
+            .collect();
+        let mut first_error = None;
+        for notification in notifications {
+            if let Err(error) = self
+                .apply_journal_terminal(daemon_id, connection.id(), notification)
+                .await
+            {
+                // A failed cascade/ACK must not starve another placement on
+                // the same daemon. The worker logs its placement/owner context.
+                if matches!(
+                    error,
+                    ServiceError::DaemonTimeout { .. } | ServiceError::DaemonUnavailable { .. }
+                ) {
+                    return Err(error);
+                }
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Describe replays the journal before its response. Drain the retained
+    /// payloads through the same durable terminal sink as live notifications.
+    pub async fn drain_execution_journal(
+        &self,
+        daemon_id: &str,
+        connection_id: u64,
+        execution_ids: &[String],
+    ) -> Result<bool, ServiceError> {
+        for execution_id in execution_ids {
+            let notification = lock(&self.inner.journal_terminals)
+                .get(&(daemon_id.to_owned(), connection_id, execution_id.clone()))
+                .cloned();
+            let Some(notification) = notification else {
+                return Ok(false);
+            };
+            if matches!(
+                self.apply_journal_terminal(daemon_id, connection_id, notification)
+                    .await?,
+                DaemonTerminalDisposition::Pending | DaemonTerminalDisposition::Conflict
+            ) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn dispatch_handshake(&self, daemon_id: &str, connection_id: u64, params: Value) {
         let Some(connection) = self
             .get(daemon_id)
@@ -861,18 +1110,32 @@ impl DaemonConnectionRegistry {
 
         match serde_json::from_value::<DaemonHandshakeNotification>(params) {
             Ok(handshake) => {
+                connection
+                    .protocol_revision
+                    .store(handshake.protocol_revision, Ordering::Release);
                 let compatible = daemon_protocol_is_compatible(
                     handshake.protocol_revision,
                     &handshake.capabilities,
                 );
-                connection.set_protocol_compatibility(compatible);
+                {
+                    let mut retained = lock(&connection.handshake);
+                    *retained = Some(handshake.clone());
+                    connection.set_protocol_compatibility(compatible);
+                }
                 if compatible {
                     tracing::debug!(
                         daemon_id,
                         connection_id,
                         protocol_revision = handshake.protocol_revision,
+                        workspace_incapable = connection
+                            .snapshot()
+                            .is_none_or(|facts| facts.workspace_incapable),
                         "accepted daemon command protocol"
                     );
+                    self.inner.reconciliation_notify.notify_one();
+                } else if handshake.protocol_revision < api_types::DAEMON_MIN_PROTOCOL_REVISION {
+                    self.send_upgrade_required(&connection);
+                    self.inner.reconciliation_notify.notify_one();
                 } else {
                     self.reject_incompatible_protocol(&connection, daemon_id, connection_id);
                 }
@@ -890,20 +1153,37 @@ impl DaemonConnectionRegistry {
         }
     }
 
+    fn send_upgrade_required(&self, connection: &DaemonConnection) {
+        let _ = connection.outbound.try_send(api_types::DaemonFrame::Error {
+            id: None,
+            error: api_types::DaemonErrorPayload {
+                code: api_types::DAEMON_UPGRADE_REQUIRED.to_owned(),
+                message: api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE.to_owned(),
+                details: None,
+            },
+        });
+    }
+
     fn reject_incompatible_protocol(
         &self,
         connection: &DaemonConnection,
         daemon_id: &str,
         connection_id: u64,
     ) {
-        let _ = connection.outbound.try_send(api_types::DaemonFrame::Error {
-            id: None,
-            error: api_types::DaemonErrorPayload {
-                code: DAEMON_PROTOCOL_INCOMPATIBLE.to_owned(),
-                message: "daemon does not advertise the required command protocol".to_owned(),
-                details: None,
-            },
-        });
+        if connection.needs_upgrade() {
+            self.send_upgrade_required(connection);
+        } else {
+            let _ = connection.outbound.try_send(api_types::DaemonFrame::Error {
+                id: None,
+                error: api_types::DaemonErrorPayload {
+                    code: DAEMON_PROTOCOL_INCOMPATIBLE.to_owned(),
+                    message:
+                        "daemon handshake is malformed or missing required command capabilities"
+                            .to_owned(),
+                    details: None,
+                },
+            });
+        }
         connection.mark_stale();
         tracing::warn!(
             daemon_id,

@@ -104,9 +104,6 @@ const POW10_I64: [i64; 10] = [
     1_000_000_000,
 ];
 
-/// Stable name of the rounding algorithm persisted with estimates.
-pub const COST_ROUNDING_MODE: &str = "half_away_from_zero";
-
 /// Revision of the persisted rounding behavior.
 pub const COST_ROUNDING_REVISION: &str = "cost-rounding-v1";
 
@@ -413,11 +410,6 @@ pub enum EventCostError {
     Overflow,
 }
 
-/// Returns whether a decoded models.dev response body is within the bound.
-pub const fn models_dev_response_body_is_within_limit(body_len: usize) -> bool {
-    body_len <= MODELS_DEV_MAX_RESPONSE_BYTES
-}
-
 /// Returns whether a catalog snapshot is stale at `now`.
 ///
 /// A clock that moves backwards does not make a snapshot stale. The boundary
@@ -541,16 +533,6 @@ pub fn parse_models_dev_json_number(
     Ok(NanoUsdPerMillion(nanos))
 }
 
-/// Serializes a nano-USD amount as canonical USD decimal text.
-pub fn serialize_usd_decimal(amount: NanoUsd) -> String {
-    amount.to_usd_decimal()
-}
-
-/// Serializes a per-million rate as canonical USD decimal text.
-pub fn serialize_usd_per_million_decimal(rate: NanoUsdPerMillion) -> String {
-    rate.to_usd_decimal_per_million()
-}
-
 /// Calculates one event's four-bucket estimate using checked integer
 /// arithmetic and exactly one division/rounding step after the bucket sum.
 ///
@@ -601,12 +583,6 @@ pub fn calculate_four_bucket_cost(
         NanoUsd::from_nano_usd(i64::try_from(rounded).map_err(|_| EventCostError::Overflow)?)
             .ok_or(EventCostError::Overflow)?;
     Ok(EventCostEstimate::Complete(amount))
-}
-
-/// Adds two aggregate amounts with checked i64 storage and no floating-point
-/// conversion.
-pub fn checked_add_aggregate_nano_usd(left: NanoUsd, right: NanoUsd) -> Option<NanoUsd> {
-    left.checked_add(right)
 }
 
 fn parse_i64_digits(digits: &[u8]) -> Option<i64> {
@@ -874,12 +850,6 @@ mod tests {
         assert_eq!(MODELS_DEV_MAX_JSON_NESTING_DEPTH, 64);
         assert_eq!(MODELS_DEV_REQUEST_TIMEOUT, Duration::from_secs(30));
         assert!(MODELS_DEV_MAX_RESPONSE_BYTES > MODELS_DEV_PROVIDER_FIXTURE.len());
-        assert!(models_dev_response_body_is_within_limit(
-            MODELS_DEV_PROVIDER_FIXTURE.len()
-        ));
-        assert!(!models_dev_response_body_is_within_limit(
-            MODELS_DEV_MAX_RESPONSE_BYTES + 1
-        ));
     }
 
     #[test]
@@ -904,7 +874,6 @@ mod tests {
         assert_eq!(NANO_USD_SCALE, 9);
         assert_eq!(NANO_USD_PER_USD, 1_000_000_000);
         assert_eq!(TOKENS_PER_MILLION, 1_000_000);
-        assert_eq!(COST_ROUNDING_MODE, "half_away_from_zero");
         assert_eq!(COST_ROUNDING_REVISION, "cost-rounding-v1");
         assert_eq!(COST_FORMULA_REVISION, "token-cost-v1");
 
@@ -1068,7 +1037,6 @@ mod tests {
         for (nanos, expected) in cases {
             let value = amount(nanos);
             assert_eq!(value.to_usd_decimal(), expected);
-            assert_eq!(serialize_usd_decimal(value), expected);
             assert!(!value.to_string().contains('e'));
             assert!(value
                 .to_usd_decimal()
@@ -1079,7 +1047,6 @@ mod tests {
 
         let rate = rate(1_250_000_000);
         assert_eq!(rate.to_string(), "1.25");
-        assert_eq!(serialize_usd_per_million_decimal(rate), "1.25");
     }
 
     #[test]
@@ -1144,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn event_and_aggregate_arithmetic_overflow_is_checked() {
+    fn event_arithmetic_overflow_is_checked() {
         let max_rate = rate(i64::MAX);
         let result = calculate_four_bucket_cost([u64::MAX; 4], [Some(max_rate); 4]);
         assert_eq!(result, Err(EventCostError::Overflow));
@@ -1154,11 +1121,6 @@ mod tests {
         assert_eq!(result, Err(EventCostError::Overflow));
 
         let maximum = amount(i64::MAX);
-        assert_eq!(
-            checked_add_aggregate_nano_usd(maximum, NanoUsd::ZERO),
-            Some(maximum)
-        );
-        assert_eq!(checked_add_aggregate_nano_usd(maximum, amount(1)), None);
         assert_eq!(maximum.checked_add(amount(1)), None);
         assert_eq!(NanoUsd::from_nano_usd(-1), None);
         assert_eq!(NanoUsdPerMillion::from_nano_usd(-1), None);
@@ -1168,9 +1130,6 @@ mod tests {
 // ---------------------------------------------------------------------------
 // models.dev catalog ingestion
 // ---------------------------------------------------------------------------
-
-/// The exact parser revision used for normalized catalog rows.
-pub const MODELS_DEV_SCHEMA_REVISION: &str = MODELS_DEV_PARSER_REVISION;
 
 /// Freshness of a catalog snapshot at the time it is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1299,14 +1258,6 @@ impl CatalogModelRate {
         self.received_rates_json.is_some()
     }
 
-    /// Returns whether at least one positive counter needs context evidence.
-    pub fn requires_context_evidence(&self, counters: EventTokenCounts) -> bool {
-        if counters.as_array().iter().all(|counter| *counter == 0) {
-            return false;
-        }
-        !self.tiers.is_empty() || self.legacy_context_over_200k.is_some()
-    }
-
     /// Looks up this exact provider/model row in a snapshot-independent list.
     pub fn exact_key(&self) -> (&str, &str) {
         (&self.provider_id, &self.model_id)
@@ -1370,11 +1321,6 @@ pub struct ParsedModelsDevCatalog {
 }
 
 impl ParsedModelsDevCatalog {
-    /// Number of normalized provider/model rows.
-    pub fn model_count(&self) -> usize {
-        self.models.len()
-    }
-
     /// Finds an exact provider/model row without aliases or fuzzy matching.
     pub fn model_rate(&self, provider_id: &str, model_id: &str) -> Option<&CatalogModelRate> {
         self.models
@@ -1477,18 +1423,6 @@ impl CatalogSnapshot {
         } else {
             CatalogFreshness::Fresh
         }
-    }
-
-    /// Computes freshness using repository status when it refers to this
-    /// active snapshot.  In particular, a successful conditional 304 check
-    /// advances `last_successful_check_at` without changing this immutable
-    /// snapshot's original `fetched_at`.
-    pub fn freshness_with_status_at(
-        &self,
-        status: &CatalogStatus,
-        now: SystemTime,
-    ) -> CatalogFreshness {
-        status.freshness_for_snapshot(self, now)
     }
 }
 
@@ -1778,11 +1712,6 @@ pub fn parse_models_dev_catalog(body: &[u8]) -> Result<ParsedModelsDevCatalog, C
         parser_revision: MODELS_DEV_PARSER_REVISION.to_owned(),
         models,
     })
-}
-
-/// Short alias for callers that refer to the source as a generic catalog.
-pub fn parse_catalog_payload(body: &[u8]) -> Result<ParsedModelsDevCatalog, CatalogParseError> {
-    parse_models_dev_catalog(body)
 }
 
 #[derive(Debug)]
@@ -2725,15 +2654,6 @@ impl ModelsDevClient {
         }
     }
 
-    /// Convenience wrapper for the common current-time refresh path.
-    pub async fn refresh_with_idempotency_key(
-        &self,
-        idempotency_key: impl Into<String>,
-    ) -> Result<CatalogRefreshOutcome, CatalogClientError> {
-        self.refresh(CatalogRefreshRequest::new(idempotency_key))
-            .await
-    }
-
     async fn handle_ok(
         &self,
         current: CatalogStatus,
@@ -3122,13 +3042,6 @@ impl FrozenPriceSelection {
     /// this gate before reading fields for a durable pricing-selection row.
     pub fn validated(&self) -> Result<&Self, FrozenPriceSelectionError> {
         self.validate().map(|()| self)
-    }
-
-    /// Returns the frozen catalog freshness after digest verification.
-    pub fn validated_catalog_freshness(
-        &self,
-    ) -> Result<CatalogFreshness, FrozenPriceSelectionError> {
-        self.validate().map(|()| self.catalog_freshness)
     }
 
     /// Returns the canonical selection digest after digest verification.
@@ -3583,11 +3496,6 @@ pub fn estimate_usage_event(input: UsageEventEstimateInput) -> EventEstimate {
     }
 }
 
-/// Alias for callers using the shorter estimate verb.
-pub fn estimate_event(input: UsageEventEstimateInput) -> EventEstimate {
-    estimate_usage_event(input)
-}
-
 fn estimate_provenance(
     selection: &FrozenPriceSelection,
     selected_tier: Option<String>,
@@ -3869,17 +3777,6 @@ pub fn preview_retrospective_estimates_with_freshness(
     })
 }
 
-/// Alias for callers using the cost-estimation naming in the REST contract.
-pub fn preview_cost_estimation(
-    project_id: impl Into<String>,
-    snapshot: &CatalogSnapshot,
-    events: &[RetrospectiveUsageEvent],
-    created_at: SystemTime,
-    expires_after: Duration,
-) -> Result<RetrospectivePreview, RetrospectivePreviewError> {
-    preview_retrospective_estimates(project_id, snapshot, events, created_at, expires_after)
-}
-
 /// Freshness-aware alias for [`preview_retrospective_estimates_with_freshness`].
 pub fn preview_cost_estimation_with_freshness(
     project_id: impl Into<String>,
@@ -4137,7 +4034,6 @@ mod catalog_domain_tests {
     #[test]
     fn parser_preserves_exact_keys_absence_zero_legacy_and_tiers() {
         let parsed = parse_models_dev_catalog(FIXTURE).expect("fixture parses");
-        assert_eq!(parsed.model_count(), 3);
         assert_eq!(parsed.payload_sha256, sha256_hex(FIXTURE));
         let priced = parsed.model_rate("openai", "gpt-5").expect("priced row");
         assert_eq!(priced.source_model_key, "gpt-5");
@@ -4339,11 +4235,6 @@ mod catalog_domain_tests {
             status.freshness_for_snapshot(&snapshot, now),
             CatalogFreshness::Fresh
         );
-        assert_eq!(
-            snapshot.freshness_with_status_at(&status, now),
-            CatalogFreshness::Fresh
-        );
-
         let mut incomplete_status = status;
         incomplete_status.last_successful_check_at = None;
         assert_eq!(

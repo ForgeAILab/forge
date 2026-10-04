@@ -42,6 +42,15 @@ enum DaemonCmd {
         /// Directory this daemon should advertise as its workspace root.
         #[arg(long)]
         workspace_root: Option<PathBuf>,
+        /// Maximum concurrent runs (default: automatic; 0: unlimited).
+        #[arg(long)]
+        max_concurrent_runs: Option<u32>,
+        /// Build jobs per run (unset: automatic; 0: disabled).
+        #[arg(long)]
+        build_jobs_per_run: Option<u32>,
+        /// Unix niceness increment for run children (0: off).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
+        run_nice: Option<u32>,
         /// Stable daemon machine id. Defaults to the local machine id when available.
         #[arg(long)]
         machine_id: Option<String>,
@@ -69,6 +78,15 @@ enum DaemonCmd {
         /// Directory this daemon should advertise as its workspace root.
         #[arg(long)]
         workspace_root: Option<PathBuf>,
+        /// Maximum concurrent runs (default: automatic; 0: unlimited).
+        #[arg(long)]
+        max_concurrent_runs: Option<u32>,
+        /// Build jobs per run (unset: automatic; 0: disabled).
+        #[arg(long)]
+        build_jobs_per_run: Option<u32>,
+        /// Unix niceness increment for run children (0: off).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=19))]
+        run_nice: Option<u32>,
         /// Credentials file created by daemon link.
         #[arg(long)]
         credentials: Option<PathBuf>,
@@ -84,6 +102,9 @@ enum DaemonCmd {
         /// Directory this daemon should advertise as its workspace root.
         #[arg(long)]
         workspace_root: Option<PathBuf>,
+        /// Maximum concurrent runs (default: automatic; 0: unlimited).
+        #[arg(long)]
+        max_concurrent_runs: Option<u32>,
         /// Credentials file created by daemon link.
         #[arg(long)]
         credentials: Option<PathBuf>,
@@ -104,6 +125,9 @@ impl DaemonArgs {
         match &self.cmd {
             DaemonCmd::Link {
                 workspace_root,
+                max_concurrent_runs,
+                build_jobs_per_run,
+                run_nice,
                 machine_id,
                 hostname,
                 credentials,
@@ -114,6 +138,16 @@ impl DaemonArgs {
             } => {
                 let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
+                let daemon_config = crate::daemon_config::DaemonConfig::load(&credentials_path)?;
+                let budget = daemon_config.run_budget(
+                    *max_concurrent_runs,
+                    *build_jobs_per_run,
+                    *run_nice,
+                )?;
+                executors::run_process::install_machine_policy(Arc::new(
+                    executors::run_process::MachineRunPolicy::new(budget),
+                ));
+                let max_concurrent_runs = daemon_config.run_cap(*max_concurrent_runs);
                 let hostname = hostname
                     .clone()
                     .filter(|value| !value.trim().is_empty())
@@ -132,6 +166,7 @@ impl DaemonArgs {
                     &machine_id,
                     &hostname,
                     &labels,
+                    max_concurrent_runs,
                     owner_token.as_deref(),
                 )
                 .await?;
@@ -154,6 +189,7 @@ impl DaemonArgs {
                     &linked.credentials,
                     &workspace_root,
                     &labels,
+                    max_concurrent_runs,
                     Some(&active_executions),
                 )
                 .await?;
@@ -165,6 +201,7 @@ impl DaemonArgs {
                         initial_credentials: &linked.credentials,
                         workspace_root: &workspace_root,
                         labels: &labels,
+                        max_concurrent_runs,
                         interval_seconds: *interval_seconds,
                         stopped_message: "daemon link stopped",
                         active_executions: &active_executions,
@@ -174,12 +211,25 @@ impl DaemonArgs {
             }
             DaemonCmd::Start {
                 workspace_root,
+                max_concurrent_runs,
+                build_jobs_per_run,
+                run_nice,
                 credentials,
                 labels,
                 interval_seconds,
             } => {
                 let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
+                let daemon_config = crate::daemon_config::DaemonConfig::load(&credentials_path)?;
+                let budget = daemon_config.run_budget(
+                    *max_concurrent_runs,
+                    *build_jobs_per_run,
+                    *run_nice,
+                )?;
+                executors::run_process::install_machine_policy(Arc::new(
+                    executors::run_process::MachineRunPolicy::new(budget),
+                ));
+                let max_concurrent_runs = daemon_config.run_cap(*max_concurrent_runs);
                 let credentials = read_credentials(&credentials_path)?.ok_or_else(|| {
                     anyhow!(
                         "missing daemon credentials at {}; run `forge-ctl daemon link` first",
@@ -196,6 +246,7 @@ impl DaemonArgs {
                     &credentials,
                     &workspace_root,
                     &labels,
+                    max_concurrent_runs,
                     Some(&active_executions),
                 )
                 .await?;
@@ -212,6 +263,7 @@ impl DaemonArgs {
                         initial_credentials: &credentials,
                         workspace_root: &workspace_root,
                         labels: &labels,
+                        max_concurrent_runs,
                         interval_seconds: *interval_seconds,
                         stopped_message: "daemon start stopped",
                         active_executions: &active_executions,
@@ -221,11 +273,15 @@ impl DaemonArgs {
             }
             DaemonCmd::Report {
                 workspace_root,
+                max_concurrent_runs,
                 credentials,
                 labels,
             } => {
                 let workspace_root = prepare_workspace_root(workspace_root.as_deref())?;
                 let credentials_path = credentials_path(credentials.as_deref());
+                let max_concurrent_runs =
+                    crate::daemon_config::DaemonConfig::load(&credentials_path)?
+                        .run_cap(*max_concurrent_runs);
                 let credentials = read_credentials(&credentials_path)?.ok_or_else(|| {
                     anyhow!(
                         "missing daemon credentials at {}; run `forge-ctl daemon link` first",
@@ -233,8 +289,15 @@ impl DaemonArgs {
                     )
                 })?;
                 let labels = parse_labels(labels)?;
-                let daemon =
-                    report_once(client, &credentials, &workspace_root, &labels, None).await?;
+                let daemon = report_once(
+                    client,
+                    &credentials,
+                    &workspace_root,
+                    &labels,
+                    max_concurrent_runs,
+                    None,
+                )
+                .await?;
                 print_daemon(output, &daemon)
             }
         }
@@ -251,6 +314,7 @@ struct DaemonLoopConfig<'a> {
     initial_credentials: &'a DaemonCredentials,
     workspace_root: &'a Path,
     labels: &'a BTreeMap<String, String>,
+    max_concurrent_runs: u32,
     interval_seconds: u64,
     stopped_message: &'a str,
     active_executions: &'a daemon_runtime::ActiveExecutionTracker,
@@ -268,14 +332,21 @@ async fn run_daemon_loop(
         config.initial_credentials.token.clone(),
     );
     let active_executions = config.active_executions.clone();
-    let connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
+    let run_policy =
+        crate::daemon_config::DaemonConfig::load(config.credentials_path)?.run_policy();
+    let mut connect_handle = tokio::spawn(daemon_runtime::run_command_stream(
         Arc::new(daemon_client),
         config.workspace_root.to_path_buf(),
         shutdown_rx,
         active_executions.clone(),
+        run_policy,
     ));
     loop {
         tokio::select! {
+            result = &mut connect_handle => {
+                result.context("daemon command stream task failed")??;
+                return Err(anyhow!("daemon command stream stopped unexpectedly"));
+            }
             result = tokio::signal::ctrl_c() => {
                 result.context("listen for Ctrl-C")?;
                 let _ = shutdown_tx.send(true);
@@ -297,6 +368,7 @@ async fn run_daemon_loop(
                     &credentials,
                     config.workspace_root,
                     config.labels,
+                    config.max_concurrent_runs,
                     Some(&active_executions),
                 )
                 .await?;
@@ -310,6 +382,7 @@ async fn run_daemon_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn link_and_report(
     client: &ForgeClient,
     credentials_path: &Path,
@@ -317,12 +390,22 @@ async fn link_and_report(
     machine_id: &str,
     hostname: &str,
     labels: &BTreeMap<String, String>,
+    max_concurrent_runs: u32,
     owner_token: Option<&str>,
 ) -> Result<LinkResult> {
     // A supplied user token should claim/rotate the daemon even if old daemon credentials exist.
     if owner_token.is_none() {
         if let Some(credentials) = read_credentials(credentials_path)? {
-            match report_once(client, &credentials, workspace_root, labels, None).await {
+            match report_once(
+                client,
+                &credentials,
+                workspace_root,
+                labels,
+                max_concurrent_runs,
+                None,
+            )
+            .await
+            {
                 Ok(daemon) => {
                     return Ok(LinkResult {
                         credentials,
@@ -342,11 +425,20 @@ async fn link_and_report(
         hostname,
         workspace_root,
         labels,
+        max_concurrent_runs,
         owner_token,
     )
     .await?;
     write_credentials(credentials_path, &credentials)?;
-    let daemon = report_once(client, &credentials, workspace_root, labels, None).await?;
+    let daemon = report_once(
+        client,
+        &credentials,
+        workspace_root,
+        labels,
+        max_concurrent_runs,
+        None,
+    )
+    .await?;
     Ok(LinkResult {
         credentials,
         daemon,
@@ -359,9 +451,11 @@ async fn register(
     hostname: &str,
     workspace_root: &Path,
     labels: &BTreeMap<String, String>,
+    max_concurrent_runs: u32,
     owner_token: Option<&str>,
 ) -> Result<DaemonCredentials> {
     let request = DaemonRegisterRequest {
+        max_concurrent_runs: Some(max_concurrent_runs),
         machine_id: machine_id.to_owned(),
         hostname: hostname.to_owned(),
         os: std::env::consts::OS.to_owned(),
@@ -388,9 +482,11 @@ async fn report_once(
     credentials: &DaemonCredentials,
     workspace_root: &Path,
     labels: &BTreeMap<String, String>,
+    max_concurrent_runs: u32,
     active_executions: Option<&daemon_runtime::ActiveExecutionTracker>,
 ) -> Result<DaemonResponse> {
     let request = DaemonReportRequest {
+        max_concurrent_runs: Some(max_concurrent_runs),
         detected_clis: detect_clis().await,
         runtimes: Some(vec![runtime_report(workspace_root)]),
         labels: Some(labels_value(labels)),
@@ -553,16 +649,14 @@ fn default_forge_home() -> PathBuf {
     if let Some(path) = std::env::var_os("FORGE_DATA_DIR").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
     }
-    if let Some(home) = home_dir() {
-        return home.join(".forge");
+    let data_dir = config::default_data_dir();
+    // Keep the client's USERPROFILE fallback when HOME is absent.
+    if std::env::var_os("HOME").is_none() {
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(home).join(data_dir);
+        }
     }
-    PathBuf::from(".forge")
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    data_dir
 }
 
 fn read_credentials(path: &Path) -> Result<Option<DaemonCredentials>> {

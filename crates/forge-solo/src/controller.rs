@@ -23,8 +23,8 @@ use crate::backend::{
     ensure_activity_scope, ensure_snapshot_scope, ActivityBatch, ActivityReadRequest,
     ActivityTarget, BackendCommand, BackendCommandResult, BackendError, BackendEvent,
     BackendEventKind, BackendEventPoll, BackendEventSource, BackendFuture, BackendResult,
-    ChannelBackendEventSource, IdempotencyKey, ShutdownIntent, ShutdownOutcome, SnapshotLimits,
-    SnapshotRequest, SoloBackend, SoloSnapshot,
+    IdempotencyKey, ShutdownIntent, ShutdownOutcome, SnapshotLimits, SnapshotRequest, SoloBackend,
+    SoloSnapshot,
 };
 
 /// Keyboard-independent key code used by the reducer boundary.  The terminal
@@ -424,17 +424,8 @@ where
         self
     }
 
-    /// Replace or clear the redraw hook after construction.
-    pub fn set_render_hook(&mut self, hook: Option<RenderHook<R>>) {
-        self.render_hook = hook;
-    }
-
     pub fn reducer(&self) -> &R {
         &self.reducer
-    }
-
-    pub fn reducer_mut(&mut self) -> &mut R {
-        &mut self.reducer
     }
 
     pub fn backend(&self) -> Arc<B> {
@@ -905,10 +896,6 @@ where
     }
 }
 
-/// Convenience adapter for callers that already have a channel-backed event
-/// source but want the concrete type visible in signatures.
-pub type SoloChannelEventSource = ChannelBackendEventSource;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +953,7 @@ mod tests {
             setup_agents: Vec::new(),
             live_activity: Vec::new(),
             tasks: vec![TaskSnapshot {
+                review_actions: Vec::new(),
                 id: "task".into(),
                 title: "task".into(),
                 state: TaskState::Done,

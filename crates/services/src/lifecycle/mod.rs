@@ -1,7 +1,5 @@
 pub mod context;
 pub mod emitter;
-pub mod knowledge_capture;
-pub mod knowledge_inject;
 pub mod plugin;
 pub mod runner;
 

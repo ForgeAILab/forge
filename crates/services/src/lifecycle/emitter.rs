@@ -12,20 +12,82 @@ use tracing::{info, warn};
 use crate::{
     lifecycle::{LifecycleHookContext, LifecycleHookRunner, PluginRegistry},
     workflow::engine::WorkflowEngine,
+    workspace_backend::{ResolvedWorkspace, WorkspaceBackendRouter},
 };
 
 #[derive(Clone)]
 pub struct LifecycleEventEmitter {
     db: Arc<db::SqliteDb>,
     plugin_registry: Arc<PluginRegistry>,
+    workspace_backend_router: Arc<WorkspaceBackendRouter>,
 }
 
 impl LifecycleEventEmitter {
-    pub fn new(db: Arc<db::SqliteDb>, plugin_registry: Arc<PluginRegistry>) -> Self {
+    pub fn new_with_router(
+        db: Arc<db::SqliteDb>,
+        plugin_registry: Arc<PluginRegistry>,
+        workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
         Self {
             db,
             plugin_registry,
+            workspace_backend_router,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<db::SqliteDb>, plugin_registry: Arc<PluginRegistry>) -> Self {
+        Self::new_for_test(db, plugin_registry)
+    }
+
+    /// Embedded-only fixture constructor.
+    pub fn new_for_test(db: Arc<db::SqliteDb>, plugin_registry: Arc<PluginRegistry>) -> Self {
+        let workspace_backend_router =
+            crate::lifecycle::context::embedded_workspace_router_for_test(
+                Arc::clone(&db),
+                crate::task_service::workspace::default_workspace_root(),
+                None,
+            );
+        Self {
+            db,
+            plugin_registry,
+            workspace_backend_router,
+        }
+    }
+
+    pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
+        self.workspace_backend_router = router;
+        self
+    }
+
+    pub fn start(
+        self: Arc<Self>,
+        bus: Arc<events::EventBus>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let initial = std::sync::Mutex::new(Some(bus.subscribe()));
+        workers
+            .worker("lifecycle-projection")
+            .with_tick_timeout(std::time::Duration::from_secs(3600))
+            .start(
+                shutdown,
+                || false,
+                move |worker, shutdown| {
+                    let emitter = Arc::clone(&self);
+                    let rx = initial
+                        .lock()
+                        .expect("lifecycle receiver")
+                        .take()
+                        .unwrap_or_else(|| bus.subscribe());
+                    async move {
+                        emitter
+                            .run_until_shutdown(rx, Some(shutdown), Some(worker))
+                            .await;
+                        Ok(())
+                    }
+                },
+            )
     }
 
     /// Run the emitter until the event bus closes.
@@ -34,7 +96,7 @@ impl LifecycleEventEmitter {
     /// assembly should prefer [`Self::run_with_shutdown`] so the receiver
     /// loop has an explicit lifecycle boundary.
     pub async fn run(&self, rx: broadcast::Receiver<ForgeEvent>) {
-        self.run_until_shutdown(rx, None).await;
+        self.run_until_shutdown(rx, None, None).await;
     }
 
     /// Run the emitter until the event bus closes or shutdown is requested.
@@ -46,13 +108,14 @@ impl LifecycleEventEmitter {
         rx: broadcast::Receiver<ForgeEvent>,
         shutdown: watch::Receiver<bool>,
     ) {
-        self.run_until_shutdown(rx, Some(shutdown)).await;
+        self.run_until_shutdown(rx, Some(shutdown), None).await;
     }
 
     async fn run_until_shutdown(
         &self,
         mut rx: broadcast::Receiver<ForgeEvent>,
         shutdown: Option<watch::Receiver<bool>>,
+        worker: Option<crate::worker_runtime::PeriodicWorker>,
     ) {
         if shutdown.as_ref().is_some_and(|receiver| *receiver.borrow()) {
             return;
@@ -71,8 +134,15 @@ impl LifecycleEventEmitter {
                 result = rx.recv() => {
                     match result {
                         Ok(event) => {
-                            if let Err(error) = self.handle_event(event).await {
-                                warn!(%error, "lifecycle event emitter failed");
+                            if !handles_event(&event) { continue; }
+                            if let Some(worker) = &worker {
+                                if let Err(error) = worker.tick(async {
+                                    self.handle_event(event).await.map_err(crate::ServiceError::invalid_operation)
+                                }).await {
+                                    warn!(worker = worker.name(), %error, "lifecycle event emitter failed");
+                                }
+                            } else if let Err(error) = self.handle_event(event).await {
+                                warn!(worker = "lifecycle-projection", %error, "lifecycle event emitter failed");
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -262,23 +332,52 @@ impl LifecycleEventEmitter {
                 .await
                 .unwrap_or_else(|| task.status.clone()),
         };
-        let workspace = if before_execution {
-            None
-        } else {
-            self.resolve_workspace(&task, execution.as_ref()).await
+        let workspace = self.resolve_workspace(&task, execution.as_ref()).await;
+        let resolved = match workspace.as_ref() {
+            Some(workspace) => Some(
+                crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+                    &self.workspace_backend_router,
+                    &self.db,
+                    workspace,
+                    &crate::task_service::workspace::default_workspace_root(),
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+            ),
+            None => None,
         };
-        let worktree_path = workspace
-            .as_ref()
-            .filter(|workspace| Path::new(&workspace.worktree_path).exists())
-            .map(|workspace| workspace.worktree_path.clone());
-        let repo_path = self
-            .resolve_repo_path(
-                &project,
-                execution.as_ref(),
-                workspace.as_ref(),
-                worktree_path.as_deref(),
-            )
-            .await;
+        // Before preparation, server hooks retain their primary-checkout
+        // context. An existing daemon placement remains the routing authority.
+        let resolved = resolved.filter(|workspace| {
+            !before_execution || workspace.placement.owner_kind != db::PlacementOwnerKind::Server
+        });
+        let (repo_path, worktree_path) = match resolved.as_ref() {
+            Some(resolved) => {
+                let (repo_path, handle) =
+                    crate::lifecycle::context::workspace_context_paths(&self.db, resolved)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                let exists = workspace_exists(resolved).await?;
+                if !exists && resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+                    return Err(format!(
+                        "workspace {} does not exist on its owner",
+                        resolved.placement.workspace_id
+                    ));
+                }
+                let repo_path = if exists {
+                    repo_path
+                } else {
+                    self.resolve_repo_path(&project, execution.as_ref(), workspace.as_ref(), None)
+                        .await
+                };
+                (repo_path, exists.then_some(handle))
+            }
+            None => (
+                self.resolve_repo_path(&project, execution.as_ref(), None, None)
+                    .await,
+                None,
+            ),
+        };
         let log_dir = resolve_log_dir(execution.as_ref(), resolved_execution_id.as_deref());
 
         let ctx = LifecycleHookContext {
@@ -297,7 +396,20 @@ impl LifecycleEventEmitter {
             log_dir,
         };
 
-        LifecycleHookRunner::run_hooks(ctx, &hooks, Arc::clone(&self.plugin_registry)).await;
+        match resolved.as_ref().filter(|_| ctx.worktree_path.is_some()) {
+            Some(resolved) => {
+                LifecycleHookRunner::run_workspace_hooks(
+                    ctx,
+                    &hooks,
+                    Arc::clone(&self.plugin_registry),
+                    resolved,
+                )
+                .await
+            }
+            None => {
+                LifecycleHookRunner::run_hooks(ctx, &hooks, Arc::clone(&self.plugin_registry)).await
+            }
+        }
         Ok(())
     }
 
@@ -355,9 +467,12 @@ impl LifecycleEventEmitter {
                 .ok()?;
         }
 
-        WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
-            .await
-            .ok()?
+        WorkspaceRepo::get_by_task_id(
+            &*self.db,
+            task.parent_task_id.as_deref().unwrap_or(&task.id),
+        )
+        .await
+        .ok()?
     }
 
     async fn resolve_repo_path(
@@ -389,6 +504,23 @@ impl LifecycleEventEmitter {
     }
 }
 
+async fn workspace_exists(workspace: &ResolvedWorkspace) -> Result<bool, String> {
+    if workspace.placement.owner_kind == db::PlacementOwnerKind::Server {
+        // Lifecycle hooks previously accepted any existing directory, even
+        // while its Git metadata was being repaired.
+        return workspace
+            .embedded_path()
+            .map(|path| path.exists())
+            .map_err(|error| error.to_string());
+    }
+    workspace
+        .backend
+        .describe(&workspace.placement)
+        .await
+        .map(|state| state.exists)
+        .map_err(|error| error.to_string())
+}
+
 async fn wait_for_shutdown(mut shutdown: Option<watch::Receiver<bool>>) {
     let Some(mut shutdown) = shutdown.take() else {
         std::future::pending::<()>().await;
@@ -405,6 +537,19 @@ async fn wait_for_shutdown(mut shutdown: Option<watch::Receiver<bool>>) {
             Ok(()) => {}
             Err(_) => return,
         }
+    }
+}
+
+// Match the handler's existing context/type gates before allocating tick health.
+fn handles_event(event: &ForgeEvent) -> bool {
+    match &event.context {
+        EventContext::TaskStatusChanged { .. } => event.event_type == "task.status_changed",
+        EventContext::TaskMoved(payload) => {
+            event.event_type == events::TASK_MOVED_EVENT && payload.old_status != payload.new_status
+        }
+        EventContext::TaskAssigned { .. } => event.event_type == "task.execution_launched",
+        EventContext::ExecutionStarted { .. } => true,
+        _ => false,
     }
 }
 
@@ -454,6 +599,39 @@ mod tests {
     use db::{create_sqlite_pool, SqliteDb};
     use events::EventBus;
     use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn ignored_streaming_events_do_not_tick_or_touch_health() {
+        let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let workers = crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db));
+        let emitter = LifecycleEventEmitter::new_for_test(db, Arc::new(PluginRegistry::default()));
+        let bus = EventBus::new(1024);
+        let rx = bus.subscribe();
+        for _ in 0..512 {
+            bus.publish(ForgeEvent {
+                event_type: "execution.log".to_owned(),
+                entity_id: "execution".to_owned(),
+                timestamp: events::event_timestamp(),
+                context: EventContext::ReconciliationEvent {
+                    task_id: None,
+                    execution_id: None,
+                    reason: "stream".to_owned(),
+                },
+            });
+        }
+        // A closed bus drains its queued events before Closed: the loop must
+        // process all 512 hints without creating even its first health tick.
+        drop(bus);
+        timeout(
+            Duration::from_secs(5),
+            emitter.run_until_shutdown(rx, None, Some(workers.worker("lifecycle-projection"))),
+        )
+        .await
+        .unwrap();
+        assert!(workers.status().await.unwrap()[0].last_tick_at.is_none());
+    }
 
     #[tokio::test]
     async fn run_with_shutdown_stops_the_receiver_loop() {

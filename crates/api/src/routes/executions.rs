@@ -61,7 +61,7 @@ pub async fn get_execution(
         .await?
         .ok_or_else(|| ApiError::not_found("execution", id))?;
     Ok(Json(
-        execution_response_with_plan(&state.db, execution).await?,
+        execution_response_with_plan(&state.db, &state.workspace_backend_router, execution).await?,
     ))
 }
 
@@ -270,54 +270,17 @@ pub async fn follow_up_execution(
 
     Ok(Json(LaunchExecutionResponse {
         data: api_types::LaunchExecutionData {
-            task: task_response(&state.db, launched.task).await?,
+            task: task_response(&state.db, &state.workspace_backend_router, launched.task).await?,
             execution: execution_response(launched.execution),
-            workspace: workspace_response(launched.workspace),
+            workspace: workspace_response(
+                &state.db,
+                &state.workspace_backend_router,
+                launched.workspace,
+            )
+            .await?,
             execution_behavior,
         },
     }))
-}
-
-pub async fn re_execute_execution(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<LaunchExecutionResponse>> {
-    let launched = state
-        .task_service
-        .re_execute_execution(id)
-        .await
-        .map_err(map_re_execute_error)?;
-
-    let execution_id = launched.execution.id.clone();
-    state.task_service.start_execution(execution_id).await?;
-
-    let execution_behavior = Some(api_types::ExecutionBehavior {
-        kind: api_types::ExecutionBehaviorKind::ReExecute,
-        propagates: true,
-        cascade_role: Some(launched.execution.role.clone()),
-        cascade_state: Some(launched.task.status.clone()),
-        description: "Re-execute — completion may auto-transition the task".to_owned(),
-    });
-
-    Ok(Json(LaunchExecutionResponse {
-        data: api_types::LaunchExecutionData {
-            task: task_response(&state.db, launched.task).await?,
-            execution: execution_response(launched.execution),
-            workspace: workspace_response(launched.workspace),
-            execution_behavior,
-        },
-    }))
-}
-
-pub async fn cancel_execution(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<ExecutionResponse>> {
-    let execution = state
-        .task_service
-        .cancel_execution(id, "cancelled by user".to_owned())
-        .await?;
-    Ok(Json(execution_response(execution)))
 }
 
 fn map_follow_up_error(error: ServiceError) -> ApiError {
@@ -329,21 +292,6 @@ fn map_follow_up_error(error: ServiceError) -> ApiError {
                 ApiError::conflict_with_code("follow_up.no_session", message)
             } else if message.contains("follow-up requires same executor type") {
                 ApiError::conflict_with_code("follow_up.executor_mismatch", message)
-            } else if message.contains("terminal status") {
-                ApiError::conflict_with_code("task.terminal", message)
-            } else {
-                ApiError::invalid_operation_conflict(message)
-            }
-        }
-        other => ApiError::from(other),
-    }
-}
-
-fn map_re_execute_error(error: ServiceError) -> ApiError {
-    match error {
-        ServiceError::InvalidOperation { message } => {
-            if message.contains("re-execute requires a completed, failed, or cancelled execution") {
-                ApiError::conflict_with_code("re_execute.execution_active", message)
             } else if message.contains("terminal status") {
                 ApiError::conflict_with_code("task.terminal", message)
             } else {
@@ -371,6 +319,31 @@ pub async fn get_task_usage(
 ) -> ApiResult<Json<api_types::UsageAggregate>> {
     let usage = services::usage_projection::usage_aggregate_for_task(&state.db, &task_id).await?;
     Ok(Json(usage))
+}
+
+/// Stop one execution without cancelling its Task or another side session.
+pub async fn stop_execution(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<api_types::StopExecutionRequest>,
+) -> ApiResult<Json<ExecutionResponse>> {
+    if request
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.trim().is_empty())
+    {
+        return Err(ApiError::bad_request("reason must not be empty"));
+    }
+    let execution = state
+        .task_service
+        .stop_execution(
+            id,
+            request
+                .reason
+                .unwrap_or_else(|| "Execution stopped by user".to_owned()),
+        )
+        .await?;
+    Ok(Json(execution_response(execution)))
 }
 
 #[cfg(test)]

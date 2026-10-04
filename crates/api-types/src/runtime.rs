@@ -51,11 +51,39 @@ pub struct AgentAvailabilityResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
+pub struct WorkspacePlacementResponse {
+    pub id: String,
+    pub workspace_id: String,
+    pub task_id: String,
+    pub agent_id: Option<String>,
+    pub owner_kind: String,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+    pub repo_location_id: String,
+    pub execution_daemon_id: Option<String>,
+    pub workspace_handle: Option<String>,
+    pub generation: i64,
+    pub state: String,
+    pub selected_by: String,
+    #[ts(type = "Record<string, unknown>")]
+    pub selection_reason: Value,
+    pub reserved_until: Option<String>,
+    pub disconnected_at: Option<String>,
+    pub failure_cause: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct WorkspaceResponse {
     pub id: String,
     pub task_id: String,
     pub repo_id: String,
+    /// A host path for server placements; empty for daemon placements.
     pub worktree_path: String,
+    pub placement: WorkspacePlacementResponse,
     pub branch: String,
     pub status: String,
     pub before_sha: Option<String>,
@@ -102,12 +130,23 @@ pub struct UpdateAgentRequest {
     pub prompt_template: Option<Option<String>>,
     pub capabilities: Option<Vec<String>>,
     pub config_json: Option<Value>,
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_agent_pin"
+    )]
     pub daemon_id: Option<Option<String>>,
     pub max_concurrent_tasks: Option<i64>,
     pub is_default: Option<bool>,
     pub paused: Option<bool>,
     pub version: i64,
+}
+
+fn deserialize_agent_pin<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,4 +383,28 @@ pub struct EffectivePermissionsResponse {
     pub allowed: Vec<String>,
     pub denied: Vec<String>,
     pub requires_approval: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn agent_pin_update_distinguishes_omitted_null_and_identity() {
+        let absent: super::UpdateAgentRequest =
+            serde_json::from_value(serde_json::json!({"version":1})).unwrap();
+        assert_eq!(absent.daemon_id, None);
+        assert!(serde_json::to_value(absent)
+            .unwrap()
+            .get("daemon_id")
+            .is_none());
+        let clear: super::UpdateAgentRequest =
+            serde_json::from_value(serde_json::json!({"version":1,"daemon_id":null})).unwrap();
+        assert_eq!(clear.daemon_id, Some(None));
+        assert_eq!(
+            serde_json::to_value(clear).unwrap()["daemon_id"],
+            serde_json::Value::Null
+        );
+        let pin: super::UpdateAgentRequest =
+            serde_json::from_value(serde_json::json!({"version":1,"daemon_id":"daemon"})).unwrap();
+        assert_eq!(pin.daemon_id, Some(Some("daemon".into())));
+    }
 }

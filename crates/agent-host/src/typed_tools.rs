@@ -13,7 +13,7 @@ use std::{
     io::ErrorKind,
     path::{Component, Path},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use agent_runtime::core::{
@@ -37,6 +37,7 @@ use agent_runtime::core::{
 };
 use agent_runtime::registry::{Permission, TrustClass};
 use agent_runtime::runtime::RuntimeBuilder;
+use api_types::{DeniedBy, OrchestrationOutcome, OutcomeCode, RetryAction};
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::process::Command;
@@ -128,6 +129,38 @@ pub struct CommandObservation {
 
 #[async_trait]
 pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
+    /// Persist a safe terminal-denial reminder using host-issued session and
+    /// scope values. Inspection-only providers need no durable storage.
+    async fn record_terminal_denial(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        session_token: &str,
+        operation: &str,
+        denied_by: &DeniedBy,
+    ) -> Result<(), AgentHostError> {
+        let _ = (
+            actor_identity_id,
+            scope,
+            session_token,
+            operation,
+            denied_by,
+        );
+        Ok(())
+    }
+
+    /// Remove session reminders after a successful evaluation of the operation.
+    async fn clear_terminal_denials(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        session_token: &str,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        let _ = (actor_identity_id, scope, session_token, operation);
+        Ok(())
+    }
+
     /// Performs one already-scope-bound, read-only domain operation.
     async fn read(
         &self,
@@ -262,6 +295,7 @@ pub struct ProjectChatToolContext {
 pub struct ScopeToolRuntime {
     /// Programs workspace commands may spawn. `None` uses the built-in set.
     pub command_allowlist: Option<Arc<CommandAllowlist>>,
+    pub environment: std::collections::BTreeMap<String, String>,
     /// Outbound transport for the runtime's web fetch tool. `None` leaves
     /// `fetch` out of the catalog entirely, which is what an inspection-only
     /// composition wants.
@@ -369,6 +403,7 @@ impl ScopeToolComposition {
         runtime: ScopeToolRuntime,
     ) -> Result<Self, AgentHostError> {
         scope.validate()?;
+        let denial_provider = provider.clone();
         // `None` is the built-in set. An owner widens or replaces it in the
         // Forge config and per Project; the resolved list arrives with the
         // turn, so model input can never reach this.
@@ -452,6 +487,7 @@ impl ScopeToolComposition {
                         if task_write_allowed {
                             tools.push(Arc::new(TaskWriteTool));
                             tools.push(Arc::new(TaskCommandTool {
+                                environment: runtime.environment.clone(),
                                 allowlist: Arc::clone(&command_allowlist),
                                 observer: None,
                                 command_dir: None,
@@ -462,7 +498,9 @@ impl ScopeToolComposition {
                     }
                     TaskToolRole::Reviewer => {
                         if task_read_allowed {
-                            tools.push(Arc::new(TaskValidateTool));
+                            tools.push(Arc::new(TaskValidateTool {
+                                environment: runtime.environment.clone(),
+                            }));
                             coverage_set.insert(Permission::ProcessSpawn);
                         }
                     }
@@ -524,6 +562,7 @@ impl ScopeToolComposition {
                     tools.push(Arc::new(TaskReadTool));
                     tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskCommandTool {
+                        environment: runtime.environment.clone(),
                         allowlist: Arc::clone(&command_allowlist),
                         observer: provider.clone().map(|provider| CommandObserver {
                             actor_identity_id: actor_identity_id.clone(),
@@ -547,6 +586,7 @@ impl ScopeToolComposition {
                     tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskWriteTool));
                     tools.push(Arc::new(TaskCommandTool {
+                        environment: runtime.environment.clone(),
                         allowlist: Arc::clone(&command_allowlist),
                         observer: None,
                         command_dir: None,
@@ -709,6 +749,37 @@ impl ScopeToolComposition {
                     }
                 }
             }
+        }
+        // The runtime seals and caches ToolSpec at registration. It cannot
+        // withdraw an operation between model calls. Keep that catalog and
+        // suppress repeat evaluations in the Forge composition instead.
+        if let Some(provider) = denial_provider {
+            let denials = Arc::new(Mutex::new(BTreeMap::new()));
+            tools = tools
+                .into_iter()
+                .map(|inner| {
+                    if matches!(
+                        inner.spec().name.as_str(),
+                        "forge_scope_read"
+                            | "forge_scope_propose"
+                            | FORGE_MAIN_ORCHESTRATION_READ_TOOL
+                            | FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL
+                            | FORGE_PROJECT_ORCHESTRATION_READ_TOOL
+                            | FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL
+                            | FORGE_PUBLIC_WEB_SEARCH_TOOL
+                    ) {
+                        Arc::new(TerminalDenialTool {
+                            inner,
+                            denials: Arc::clone(&denials),
+                            provider: Arc::clone(&provider),
+                            actor_identity_id: actor_identity_id.clone(),
+                            scope: scope.clone(),
+                        }) as Arc<dyn Tool>
+                    } else {
+                        inner
+                    }
+                })
+                .collect();
         }
         coverage_set.extend(custom_permissions);
         let coverage: PermissionSet = coverage_set.into_iter().collect();
@@ -957,6 +1028,114 @@ impl ScopeToolComposition {
 /// composition returns it to the runtime.
 pub type ToolResultObserver =
     Arc<dyn Fn(&ToolCallId, &Result<ToolOutcome, RuntimeError>) + Send + Sync>;
+
+type DenialKey = (String, Option<String>, String);
+type TurnDenials = Arc<Mutex<BTreeMap<DenialKey, Value>>>;
+
+#[derive(Debug)]
+struct TerminalDenialTool {
+    inner: Arc<dyn Tool>,
+    denials: TurnDenials,
+    provider: Arc<dyn ForgeToolProvider>,
+    actor_identity_id: String,
+    scope: CanonicalScope,
+}
+
+#[async_trait]
+impl Tool for TerminalDenialTool {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+
+    async fn prepare(
+        &self,
+        arguments: Value,
+        ctx: &PreparationContext,
+    ) -> Result<PreparedToolCall, RuntimeError> {
+        self.inner.prepare(arguments, ctx).await
+    }
+
+    async fn invoke(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        let operation = prepared
+            .arguments()
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or(FORGE_PUBLIC_WEB_SEARCH_TOOL)
+            .to_owned();
+        let key = (
+            ctx.session.to_string(),
+            ctx.turn.as_ref().map(ToString::to_string),
+            operation.clone(),
+        );
+        let cached = self
+            .denials
+            .lock()
+            .map_err(|_| RuntimeError::tool("Forge denial cache is unavailable"))?
+            .get(&key)
+            .cloned();
+        if let Some(value) = cached {
+            return Ok(tool_error_outcome(value));
+        }
+        // Never hold a cache lock across provider work. Already-running calls
+        // evaluate independently; later calls observe a completed denial.
+        let result = self.inner.invoke(prepared, ctx).await?;
+        let outcome = if result.is_error {
+            serde_json::from_value::<OrchestrationOutcome>(result.value.clone()).ok()
+        } else {
+            None
+        };
+        if let Some(cause) = outcome
+            .as_ref()
+            .filter(|outcome| {
+                result.is_error
+                    && outcome.code == OutcomeCode::PolicyDenied
+                    && outcome.retry.as_ref().is_some_and(|retry| {
+                        retry.action == RetryAction::None
+                            && retry.scope == Some(api_types::RetryScope::Session)
+                    })
+            })
+            .and_then(|outcome| outcome.denied_by.as_ref())
+            .filter(|cause| cause.withdraws_operation())
+        {
+            self.denials
+                .lock()
+                .map_err(|_| RuntimeError::tool("Forge denial cache is unavailable"))?
+                .insert(key, result.value.clone());
+            if let Err(error) = self
+                .provider
+                .record_terminal_denial(
+                    &self.actor_identity_id,
+                    &self.scope,
+                    ctx.session.as_str(),
+                    &operation,
+                    cause,
+                )
+                .await
+            {
+                tracing::warn!(operation, denied_by = %cause, error = %error,
+                    "could not persist native terminal denial");
+            }
+        } else if !result.is_error {
+            if let Err(error) = self
+                .provider
+                .clear_terminal_denials(
+                    &self.actor_identity_id,
+                    &self.scope,
+                    ctx.session.as_str(),
+                    &operation,
+                )
+                .await
+            {
+                tracing::warn!(operation, error = %error, "could not clear native terminal denial");
+            }
+        }
+        Ok(result)
+    }
+}
 
 struct ObservedTool {
     inner: Arc<dyn Tool>,
@@ -1738,18 +1917,17 @@ impl Tool for ForgePublicWebSearchTool {
             .get("limit")
             .and_then(Value::as_u64)
             .unwrap_or(MAX_PUBLIC_SEARCH_RESULTS);
-        let output = self
-            .provider
-            .public_search(
-                &self.actor_identity_id,
-                &self.scope,
-                self.search_scope,
-                query,
-                limit,
-            )
-            .await
-            .map_err(host_error_to_runtime)?;
-        Ok(ToolOutcome::json(output))
+        provider_result_to_tool_outcome(
+            self.provider
+                .public_search(
+                    &self.actor_identity_id,
+                    &self.scope,
+                    self.search_scope,
+                    query,
+                    limit,
+                )
+                .await,
+        )
     }
 }
 
@@ -2198,6 +2376,7 @@ struct CommandObserver {
 
 #[derive(Debug)]
 struct TaskCommandTool {
+    environment: std::collections::BTreeMap<String, String>,
     /// Programs this composition may spawn. Resolved by the host from owner
     /// configuration and the owning Project, never from model input.
     allowlist: Arc<CommandAllowlist>,
@@ -2279,7 +2458,9 @@ impl Tool for TaskCommandTool {
     ) -> Result<ToolOutcome, RuntimeError> {
         let program = required_string(prepared.arguments(), "program")?;
         let args = string_array(prepared.arguments(), "args")?;
-        let run = execute_workspace_command(program, &args, self.command_dir, ctx).await?;
+        let run =
+            execute_workspace_command(program, &args, self.command_dir, &self.environment, ctx)
+                .await?;
         let Some(observer) = &self.observer else {
             return Ok(command_outcome(&run, None));
         };
@@ -2323,7 +2504,9 @@ impl Tool for TaskCommandTool {
 }
 
 #[derive(Debug)]
-struct TaskValidateTool;
+struct TaskValidateTool {
+    environment: std::collections::BTreeMap<String, String>,
+}
 
 #[async_trait]
 impl Tool for TaskValidateTool {
@@ -2365,9 +2548,14 @@ impl Tool for TaskValidateTool {
         _prepared: PreparedToolCall,
         ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
-        let run =
-            execute_workspace_command("git", &["diff".to_owned(), "--check".to_owned()], None, ctx)
-                .await?;
+        let run = execute_workspace_command(
+            "git",
+            &["diff".to_owned(), "--check".to_owned()],
+            None,
+            &self.environment,
+            ctx,
+        )
+        .await?;
         Ok(command_outcome(&run, None))
     }
 }
@@ -2401,6 +2589,7 @@ async fn execute_workspace_command(
     program: &str,
     args: &[String],
     command_dir: Option<&str>,
+    environment: &std::collections::BTreeMap<String, String>,
     ctx: &InvocationContext,
 ) -> Result<ExecutedCommand, RuntimeError> {
     if ctx.should_stop() {
@@ -2417,6 +2606,7 @@ async fn execute_workspace_command(
         .current_dir(&current_dir)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default());
+    executors::run_process::apply(&mut command, environment);
     let output = run_bounded_command(command, TASK_COMMAND_TIMEOUT)
         .await
         .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?;
@@ -3042,6 +3232,9 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
         AgentHostError::Authority(message)
         | AgentHostError::Configuration(message)
         | AgentHostError::Unsupported(message) => RuntimeError::tool(message),
+        AgentHostError::AgentPaused { .. } | AgentHostError::ProjectPaused { .. } => {
+            RuntimeError::tool("Forge operation is paused")
+        }
         AgentHostError::CredentialNotFound | AgentHostError::SessionNotFound => {
             RuntimeError::not_found("Forge runtime resource unavailable")
         }
@@ -3145,6 +3338,40 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_commands_receive_project_and_machine_build_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: dir.path().to_string_lossy().into_owned(),
+        });
+        let env = std::collections::BTreeMap::from([("CARGO_BUILD_JOBS".into(), "project".into())]);
+        let ctx = command_invocation_context(workspace);
+        let output = super::execute_workspace_command(
+            "sh",
+            &[
+                "-c".into(),
+                "printf '%s\\n' \"$CARGO_BUILD_JOBS\" \"$MAKEFLAGS\"".into(),
+            ],
+            None,
+            &env,
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(output.success);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines[0], "project");
+        let expected = std::env::var("MAKEFLAGS").unwrap_or_else(|_| {
+            format!(
+                "-j{}",
+                executors::run_process::machine_policy().get().build_jobs()
+            )
+        });
+        assert_eq!(lines[1], expected);
+    }
+
     #[tokio::test]
     async fn verification_commands_run_inside_the_checkout_never_at_the_workspace_root() {
         // The verification workspace root is the parent of the checkout. A
@@ -3167,6 +3394,7 @@ mod tests {
             root: root.to_string_lossy().into_owned(),
         });
         let tool = TaskCommandTool {
+            environment: Default::default(),
             allowlist: std::sync::Arc::new(CommandAllowlist::builtin()),
             observer: None,
             command_dir: Some(PROJECT_VERIFICATION_CHECKOUT_DIR),
@@ -3381,7 +3609,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_recovery_lifts_flat_provider_fields_into_payload() {
-        let operation = crate::operation_catalog::TASK_RECOVER_OPERATION;
+        let operation = crate::operation_catalog::TASK_ACTION_OPERATION;
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
             CanonicalScope {
@@ -3399,8 +3627,8 @@ mod tests {
             "parameters": {
                 "operation": operation,
                 "task_id": "task-1",
-                "reason": "the executor stopped",
-                "action": "reexecute"
+                "version": 1,
+                "action": {"verb":"retry","fresh_session":true,"guidance":"the executor stopped"}
             }
         });
         let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
@@ -3418,10 +3646,10 @@ mod tests {
         assert_eq!(prepared.arguments()["operation"], operation);
         assert_eq!(prepared.arguments()["payload"]["task_id"], "task-1");
         assert_eq!(
-            prepared.arguments()["payload"]["reason"],
+            prepared.arguments()["payload"]["action"]["guidance"],
             "the executor stopped"
         );
-        assert_eq!(prepared.arguments()["payload"]["action"], "reexecute");
+        assert_eq!(prepared.arguments()["payload"]["action"]["verb"], "retry");
         assert!(prepared.arguments().get("parameters").is_none());
         assert!(prepared.arguments().get("task_id").is_none());
 
@@ -3431,10 +3659,10 @@ mod tests {
                     "operation": operation,
                     "payload": {
                         "task_id": "task-1",
-                        "reason": "the executor stopped",
-                        "action": "cancel_task"
+                        "version": 1,
+                        "action": {"verb":"cancel"}
                     },
-                    "action": "reexecute",
+                    "action": {"verb":"retry","fresh_session":true},
                     "dedupe_key": "recover-task-1-conflict",
                     "correlation_id": "recover-task-1-conflict"
                 }),
@@ -3447,7 +3675,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_cancellation_lifts_the_versioned_payload_fields() {
-        let operation = crate::operation_catalog::TASK_CANCEL_OPERATION;
+        let operation = crate::operation_catalog::TASK_ACTION_OPERATION;
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
             CanonicalScope {
@@ -3460,10 +3688,9 @@ mod tests {
         );
         let flat = json!({
             "operation": operation,
-            "action": "cancel",
+            "action": {"verb":"cancel"},
             "task_id": "task-1",
-            "expected_task_version": 7,
-            "reason": "Duplicate Task",
+            "version": 7,
             "dedupe_key": "cancel-task-1",
             "correlation_id": "cancel-task-1"
         });
@@ -3479,10 +3706,9 @@ mod tests {
             .prepare(flat, &command_preparation_context(workspace))
             .await
             .expect("flat cancellation call prepares");
-        assert_eq!(prepared.arguments()["payload"]["action"], "cancel");
+        assert_eq!(prepared.arguments()["payload"]["action"]["verb"], "cancel");
         assert_eq!(prepared.arguments()["payload"]["task_id"], "task-1");
-        assert_eq!(prepared.arguments()["payload"]["expected_task_version"], 7);
-        assert_eq!(prepared.arguments()["payload"]["reason"], "Duplicate Task");
+        assert_eq!(prepared.arguments()["payload"]["version"], 7);
     }
 
     #[tokio::test]
@@ -3503,6 +3729,7 @@ mod tests {
         });
         let provider = Arc::new(TestProvider::default());
         let tool = TaskCommandTool {
+            environment: Default::default(),
             allowlist: std::sync::Arc::new(CommandAllowlist::builtin()),
             observer: Some(CommandObserver {
                 actor_identity_id: "agent-1".to_owned(),
@@ -4877,6 +5104,230 @@ mod tests {
             true,
         ));
         outcome
+    }
+
+    #[derive(Debug, Default)]
+    struct TerminalDenialProvider {
+        cause: Option<DeniedBy>,
+        record_failure: bool,
+        barrier: Option<tokio::sync::Barrier>,
+        succeeds: std::sync::atomic::AtomicBool,
+        evaluations: std::sync::atomic::AtomicUsize,
+        records: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ForgeToolProvider for TerminalDenialProvider {
+        async fn read(
+            &self,
+            _: &str,
+            _: &CanonicalScope,
+            operation: &str,
+            _: Value,
+        ) -> Result<Value, AgentHostError> {
+            self.evaluations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+                return Ok(json!({"done": true}));
+            }
+            if self.succeeds.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(json!({"done": true}));
+            }
+            Err(AgentHostError::StructuredOutcome(Box::new(
+                OrchestrationOutcome::terminal_denial(
+                    operation,
+                    CanonicalScopeRef::new(OutcomeScopeType::Account, "scope-1"),
+                    "first-correlation",
+                    self.cause
+                        .clone()
+                        .unwrap_or_else(|| DeniedBy::PermissionMissing("read_account".to_owned())),
+                ),
+            )))
+        }
+
+        async fn propose(
+            &self,
+            _: &str,
+            _: &CanonicalScope,
+            _: &str,
+            _: &str,
+            _: Value,
+        ) -> Result<Value, AgentHostError> {
+            unreachable!("read test")
+        }
+
+        async fn record_terminal_denial(
+            &self,
+            _: &str,
+            _: &CanonicalScope,
+            _: &str,
+            _: &str,
+            _: &DeniedBy,
+        ) -> Result<(), AgentHostError> {
+            self.records
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.record_failure {
+                return Err(AgentHostError::ProtectedPersistence);
+            }
+            Ok(())
+        }
+    }
+
+    fn terminal_test_tool(provider: Arc<TerminalDenialProvider>) -> Arc<dyn Tool> {
+        ScopeToolComposition::for_scope_with_permissions(
+            "actor",
+            scope(CanonicalScopeType::Account, WorkspaceAccess::Deny),
+            None,
+            None,
+            &BTreeSet::from(["read_account".to_owned()]),
+            Some(provider),
+        )
+        .unwrap()
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == "forge_scope_read")
+        .unwrap()
+    }
+
+    async fn invoke_terminal_test_tool(tool: &dyn Tool, call_id: &str) -> ToolOutcome {
+        let mut preparation = test_preparation_context(call_id);
+        preparation.turn = Some(TurnId::new("same-turn"));
+        let mut invocation = test_invocation_context(call_id);
+        invocation.turn = preparation.turn.clone();
+        tool.invoke(
+            tool.prepare(json!({"operation":"account.summary"}), &preparation)
+                .await
+                .unwrap(),
+            &invocation,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_cache_ignores_request_specific_and_turn_only_causes() {
+        use std::sync::atomic::Ordering;
+        for cause in [
+            DeniedBy::Unspecified,
+            DeniedBy::TargetAgentPaused,
+            DeniedBy::TaskTerminal,
+            DeniedBy::ReviewerReadOnly,
+            DeniedBy::IndependentApprovalRequired,
+            DeniedBy::UserRequestRequired,
+            DeniedBy::LeasedTurnRequired,
+            DeniedBy::CharterAdoptionNotApplicable,
+            DeniedBy::ReadBoundaryRequired,
+            DeniedBy::DirectCommandNotAdmitted,
+            DeniedBy::ReviewAssignmentRequired,
+            DeniedBy::ProfileNotSelected,
+        ] {
+            let provider = Arc::new(TerminalDenialProvider {
+                cause: Some(cause),
+                ..Default::default()
+            });
+            let tool = terminal_test_tool(provider.clone());
+            assert!(invoke_terminal_test_tool(&*tool, "first").await.is_error);
+            assert!(invoke_terminal_test_tool(&*tool, "second").await.is_error);
+            assert_eq!(provider.evaluations.load(Ordering::SeqCst), 2);
+            assert_eq!(provider.records.load(Ordering::SeqCst), 0);
+            provider.succeeds.store(true, Ordering::SeqCst);
+            assert!(
+                !invoke_terminal_test_tool(&*tool, "corrected")
+                    .await
+                    .is_error
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_record_failure_preserves_denial_and_cache() {
+        use std::sync::atomic::Ordering;
+        let provider = Arc::new(TerminalDenialProvider {
+            record_failure: true,
+            ..Default::default()
+        });
+        let tool = terminal_test_tool(provider.clone());
+        let first = invoke_terminal_test_tool(&*tool, "first").await;
+        let second = invoke_terminal_test_tool(&*tool, "second").await;
+        assert!(first.is_error);
+        assert_eq!(first.value, second.value);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.records.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_cache_allows_parallel_same_operation_evaluations() {
+        let provider = Arc::new(TerminalDenialProvider {
+            barrier: Some(tokio::sync::Barrier::new(2)),
+            ..Default::default()
+        });
+        let tool = terminal_test_tool(provider);
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                invoke_terminal_test_tool(&*tool, "first"),
+                invoke_terminal_test_tool(&*tool, "second")
+            )
+        })
+        .await
+        .expect("same-operation provider calls must execute concurrently");
+        assert!(!first.is_error);
+        assert!(!second.is_error);
+    }
+
+    #[tokio::test]
+    async fn terminal_denial_composition_skips_repeat_evaluation_and_resets_next_turn() {
+        use std::sync::atomic::Ordering;
+        let provider = Arc::new(TerminalDenialProvider::default());
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            "actor",
+            scope(CanonicalScopeType::Account, WorkspaceAccess::Deny),
+            None,
+            None,
+            &BTreeSet::from(["read_account".to_owned()]),
+            Some(provider.clone()),
+        )
+        .unwrap();
+        let tool = composition
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "forge_scope_read")
+            .unwrap();
+        let catalog = tool.spec().input_schema;
+        let mut preparation = test_preparation_context("first");
+        preparation.turn = Some(TurnId::new("first-turn"));
+        let mut invocation = test_invocation_context("first");
+        invocation.turn = preparation.turn.clone();
+        let args = json!({"operation":"account.summary"});
+        let first = tool
+            .invoke(
+                tool.prepare(args.clone(), &preparation).await.unwrap(),
+                &invocation,
+            )
+            .await
+            .unwrap();
+        assert!(first.is_error);
+        // A second call has a new call id and still receives the exact original denial.
+        preparation.call_id = ToolCallId::new("second");
+        invocation.call_id = preparation.call_id.clone();
+        let second = tool
+            .invoke(
+                tool.prepare(args.clone(), &preparation).await.unwrap(),
+                &invocation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.value, second.value);
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.records.load(Ordering::SeqCst), 1);
+        // The runtime caches this catalog; Forge deliberately keeps its schema stable.
+        assert_eq!(catalog, tool.spec().input_schema);
+        preparation.turn = Some(TurnId::new("next-turn"));
+        invocation.turn = preparation.turn.clone();
+        tool.invoke(tool.prepare(args, &preparation).await.unwrap(), &invocation)
+            .await
+            .unwrap();
+        assert_eq!(provider.evaluations.load(Ordering::SeqCst), 2);
     }
 
     fn test_preparation_context(call_id: &str) -> PreparationContext {

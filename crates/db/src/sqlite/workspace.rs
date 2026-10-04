@@ -38,19 +38,60 @@ impl WorkspaceRepo for SqliteDb {
             .transpose()
     }
 
+    async fn embedded_path_is_owned_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        path: &str,
+    ) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM workspace WHERE worktree_path = ? LIMIT 1")
+                .bind(path)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .is_some(),
+        )
+    }
+
+    async fn task_owns_embedded_path(&self, task_id: &str, path: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM workspace
+             LEFT JOIN workspace_placement AS placement
+               ON placement.workspace_id = workspace.id
+             WHERE workspace.task_id = ?
+               AND workspace.status IN ('creating', 'ready', 'error')
+               AND ((placement.owner_kind = 'server' AND placement.workspace_handle = ?)
+                    OR (placement.id IS NULL AND workspace.worktree_path = ?))
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(path)
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?
+        .is_some())
+    }
+
     async fn set_cleanup_after(
         &self,
         id: &str,
         cleanup_after: Option<String>,
         updated_at: &str,
     ) -> Result<Workspace> {
-        let result =
-            sqlx::query("UPDATE workspace SET cleanup_after = ?, updated_at = ? WHERE id = ?")
-                .bind(cleanup_after.as_deref())
-                .bind(updated_at)
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE workspace
+             SET cleanup_after = ?,
+                 cleanup_attempts = CASE WHEN ? IS NULL THEN 0 ELSE cleanup_attempts END,
+                 last_cleanup_error = CASE WHEN ? IS NULL THEN NULL ELSE last_cleanup_error END,
+                 updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(cleanup_after.as_deref())
+        .bind(cleanup_after.as_deref())
+        .bind(cleanup_after.as_deref())
+        .bind(updated_at)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
@@ -61,7 +102,10 @@ impl WorkspaceRepo for SqliteDb {
 
     async fn mark_cleaned(&self, id: &str, updated_at: &str) -> Result<Workspace> {
         let result = sqlx::query(
-            "UPDATE workspace SET status = 'cleaned', cleanup_after = NULL, error = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE workspace
+             SET status = 'cleaned', cleanup_after = NULL, cleanup_attempts = 0,
+                 last_cleanup_error = NULL, error = NULL, updated_at = ?
+             WHERE id = ?",
         )
         .bind(updated_at)
         .bind(id)

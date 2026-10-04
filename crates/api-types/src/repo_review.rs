@@ -4,7 +4,7 @@ use ts_rs::TS;
 
 use crate::{
     project_hooks::ProjectHookRule, AuthorType, ProjectExecutionSetupResponse, ReviewConfig,
-    ReviewStatus, TaskResponse, WorkMode, WorkflowDefinition,
+    ReviewStatus, TaskResponse, WorkflowDefinition,
 };
 
 fn default_json_object() -> Value {
@@ -63,6 +63,123 @@ pub struct DiffEnvelope {
     pub data: DiffResponse,
 }
 
+/// Persisted detail for a Project paused by a pre-launch environment failure.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ProjectEnvironmentPause {
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    pub checks: Vec<String>,
+    pub role: Option<String>,
+    pub output: String,
+    pub paused_at: String,
+    pub last_checked_at: String,
+    pub next_check_at: String,
+}
+
+/// Run every configured check on all known targets or one requested machine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ProjectEnvironmentRecheckRequest {
+    /// `server` or a daemon runtime ID; omitted checks every known target.
+    pub machine: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct MachineIdentity {
+    pub id: String,
+    pub name: String,
+    pub owner_kind: crate::RepoLocationOwnerKind,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct EnvironmentPauseResponse {
+    #[serde(flatten)]
+    pub detail: ProjectEnvironmentPause,
+    pub machine: MachineIdentity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum EnvironmentReadinessStatus {
+    Ready,
+    NotReady,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct EnvironmentCheckFailure {
+    pub name: String,
+    pub output_tail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ProjectEnvironmentReadiness {
+    pub machine: MachineIdentity,
+    pub status: EnvironmentReadinessStatus,
+    pub failing_checks: Vec<EnvironmentCheckFailure>,
+    /// Includes unnamed launch failures.
+    pub output_tail: String,
+    pub scope_covered: String,
+    pub checked_at: Option<String>,
+    pub next_check_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct MachineEnvironmentRecheckResult {
+    pub machine: MachineIdentity,
+    pub checks: Vec<ProjectEnvironmentCheckResult>,
+    /// No result is asserted when the machine cannot be checked.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ProjectEnvironmentCheckResult {
+    pub name: String,
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    pub output_tail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProjectEnvironmentRecheckResponse {
+    pub machines: Vec<MachineEnvironmentRecheckResult>,
+    pub project: ProjectResponse,
+}
+
+/// Project admission capacity, derived from the effective Task workflows.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ProjectSlots {
+    /// Maximum active Tasks; 0 means unlimited.
+    pub limit: u32,
+    pub active: u32,
+    pub parked: u32,
+    pub queued: u32,
+}
+
+impl Default for ProjectSlots {
+    fn default() -> Self {
+        Self {
+            limit: crate::ProjectSettings::default().max_active_tasks,
+            active: 0,
+            parked: 0,
+            queued: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ProjectResponse {
@@ -85,11 +202,16 @@ pub struct ProjectResponse {
     pub workflow_template_name: Option<String>,
     #[serde(default)]
     pub paused_at: Option<String>,
-    /// Only set alongside `paused_at` when the Task dispatcher paused this
-    /// Project automatically (`"missing_repository"`, `"invalid_repository"`, or `"repository_not_ready"`); `None`
-    /// for a user's own pause via `POST /projects/{id}/pause`.
+    /// Set alongside `paused_at` for a repository or environment auto-pause;
+    /// `None` for a user's own pause via `POST /projects/{id}/pause`.
     #[serde(default)]
     pub system_pause_reason: Option<String>,
+    #[serde(default)]
+    pub environment_pause: Option<EnvironmentPauseResponse>,
+    #[serde(default)]
+    pub environment_readiness: Vec<ProjectEnvironmentReadiness>,
+    #[serde(default)]
+    pub slots: ProjectSlots,
     #[serde(default)]
     pub paused: bool,
     #[serde(default = "default_charter_status")]
@@ -160,29 +282,8 @@ pub struct RepoResponse {
     pub local_path: Option<String>,
     pub remote_url: Option<String>,
     pub default_branch: String,
-    pub work_mode: WorkMode,
-    pub pr_provider: Option<String>,
-    pub pr_provider_status: Option<PrProviderStatus>,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-pub struct PrProviderStatus {
-    pub provider_type: String,
-    pub has_token: bool,
-    pub polling_interval_seconds: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct PrSummary {
-    pub pr_url: Option<String>,
-    pub pr_state: String,
-    pub source_branch: String,
-    pub target_branch: String,
-    pub merge_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -269,17 +370,6 @@ pub struct ReviewResponse {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReviewDecisionResponse {
-    pub task: TaskResponse,
-    pub review: ReviewResponse,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RejectReviewRequest {
-    pub reason: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct CreateCommentRequest {
@@ -334,9 +424,16 @@ pub struct UnreadCountResponse {
     pub count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct TransitionTaskResponse {
+    /// Pending and claimed cascades at response preparation; later state is
+    /// delivered by SSE or GET, not by waiting in this request.
+    #[ts(type = "number")]
+    pub pending_steps: i64,
+    #[ts(type = "import('../api').Task")]
     pub task: TaskResponse,
+    #[ts(type = "import('../api').Review | null")]
     pub review: Option<ReviewResponse>,
 }
 
