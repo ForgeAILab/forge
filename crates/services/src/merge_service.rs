@@ -470,6 +470,10 @@ impl MergeService {
         {
             return Ok(None);
         }
+        // Reviewed integration fast-forwards the target to this exact
+        // object, so the candidate is the merge result. The target's tip may
+        // since be a sibling's commit and is never recorded here.
+        let merged_sha = intent.candidate_sha.clone();
         ExecutionRepo::update(
             &*self.db,
             db::UpdateExecution {
@@ -485,7 +489,7 @@ impl MergeService {
                 summary: None,
                 logs_path: None,
                 before_sha: None,
-                after_sha: Some(Some(target.clone())),
+                after_sha: Some(Some(merged_sha.clone())),
                 error: None,
                 executor_config_snapshot_json: None,
                 updated_at: now_rfc3339(),
@@ -494,7 +498,7 @@ impl MergeService {
         .await?;
         Ok(Some(MergeOutcome::Done {
             before_sha: intent.candidate_sha.clone(),
-            after_sha: target,
+            after_sha: merged_sha,
             branch: intent.target_branch.clone(),
         }))
     }
@@ -699,8 +703,10 @@ impl MergeService {
         };
         match merged {
             Ok(()) => {
+                // An already-landed candidate is the merge result; the
+                // target's tip may be a sibling merged after it.
                 let after_sha = if already_merged {
-                    target_sha
+                    worktree_sha
                 } else {
                     git::get_current_sha(repo_path).await?
                 };

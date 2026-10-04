@@ -34,7 +34,36 @@ pub(crate) struct HookPayload {
 
 pub(crate) struct HookPhaseResult {
     pub follow_up: Option<db::EnqueueTaskStep>,
+    /// First hook failure of any policy: the step settles `failed` with it.
     pub failure: Option<String>,
+    /// First failure of a `Block`-policy hook. It annotates the Task; any
+    /// other `Log`-policy failure is logged and leaves the Task alone.
+    pub blocking_failure: Option<String>,
+    /// First `run_merge` failure, whatever its policy. A merge that cannot
+    /// complete must never leave the Task silently in its merge state, so it
+    /// annotates the Task as a merge failure.
+    pub merge_failure: Option<String>,
+    /// `run_merge` hit a transient error. Its checkpoint stays open and no
+    /// later hook ran; the step queue retries the step with back-off.
+    pub retry: Option<String>,
+}
+
+impl HookPhaseResult {
+    fn retry(reason: String) -> Self {
+        Self {
+            follow_up: None,
+            failure: Some(reason.clone()),
+            blocking_failure: None,
+            merge_failure: Some(reason.clone()),
+            retry: Some(reason),
+        }
+    }
+}
+
+/// A hook's settled result, or a transient `run_merge` failure to retry.
+pub(crate) enum DurableHook {
+    Done(HookResult),
+    Retry(String),
 }
 
 #[derive(Clone)]
@@ -43,6 +72,8 @@ pub(crate) struct HookAttempt {
     pub step: db::TaskStep,
     pub index: i64,
     pub interrupted: bool,
+    /// Set when the hook's failure came from a transient error.
+    pub transient: Arc<std::sync::atomic::AtomicBool>,
 }
 tokio::task_local! { static HOOK_ATTEMPT: HookAttempt; }
 pub(crate) fn current_hook(task_id: &str) -> Option<HookAttempt> {
@@ -50,6 +81,17 @@ pub(crate) fn current_hook(task_id: &str) -> Option<HookAttempt> {
         .try_with(Clone::clone)
         .ok()
         .filter(|attempt| attempt.step.task_id == task_id)
+}
+
+/// Classify a hook failure with the step queue's retry rule.
+pub(crate) fn note_hook_failure(task_id: &str, error: &ServiceError) {
+    if let Some(attempt) = current_hook(task_id) {
+        if crate::worker_runtime::queue::retryable(error) {
+            attempt
+                .transient
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 pub(crate) async fn hook_effect(task_id: &str, key: &str) -> crate::Result<Option<String>> {
@@ -106,20 +148,30 @@ impl WorkflowEngine {
         index: i64,
         hook: &api_types::HookSpec,
         ctx: &HookContext,
-    ) -> crate::Result<HookResult> {
+    ) -> crate::Result<DurableHook> {
         let (recorded, interrupted) = self.db.start_hook(step, index).await?;
         if let Some(recorded) = recorded {
             return serde_json::from_str(&recorded)
+                .map(DurableHook::Done)
                 .map_err(|e| ServiceError::invalid_operation(e.to_string()));
         }
         let action = registry::resolve_action(&hook.action)?;
+        let transient = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let attempt = HookAttempt {
             db: self.db.clone(),
             step: step.clone(),
             index,
             interrupted,
+            transient: transient.clone(),
         };
         let result = HOOK_ATTEMPT.scope(attempt, action.execute(ctx)).await;
+        if let HookResult::Failed { reason } = &result {
+            if hook.action == "run_merge" && transient.load(std::sync::atomic::Ordering::Relaxed) {
+                // Leave the checkpoint open: the retried step resumes this
+                // hook from its recorded effects.
+                return Ok(DurableHook::Retry(reason.clone()));
+            }
+        }
         self.db
             .finish_hook(
                 step,
@@ -128,7 +180,7 @@ impl WorkflowEngine {
                     .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
             )
             .await?;
-        Ok(result)
+        Ok(DurableHook::Done(result))
     }
 
     pub(crate) async fn execute_hook_step(
@@ -211,6 +263,8 @@ impl WorkflowEngine {
         let enter_ctx = context(to_state, payload.to_config.clone());
         let mut hook_results = payload.pre_results.clone();
         let mut failure = None;
+        let mut blocking_failure = None;
+        let mut merge_failure = None;
         let mut cascade = None;
         let mut cascade_skip_before_exit = false;
         let mut before_enter_rejection_cascade = false;
@@ -257,9 +311,13 @@ impl WorkflowEngine {
                 &actor,
             );
             let started = Instant::now();
-            let result = self
+            let result = match self
                 .run_durable_hook(step, index as i64, hook, &exit_ctx)
-                .await?;
+                .await?
+            {
+                DurableHook::Done(result) => result,
+                DurableHook::Retry(reason) => return Ok(HookPhaseResult::retry(reason)),
+            };
             self.refresh_task_after_hook(&mut task, &target_state, Some(step))
                 .await?;
             let duration_ms = elapsed_ms(started);
@@ -282,6 +340,12 @@ impl WorkflowEngine {
             match result {
                 HookResult::Failed { reason: error } => {
                     failure.get_or_insert_with(|| error.clone());
+                    if matches!(hook.on_failure, FailurePolicy::Block) {
+                        blocking_failure.get_or_insert_with(|| error.clone());
+                    }
+                    if hook.action == "run_merge" {
+                        merge_failure.get_or_insert_with(|| error.clone());
+                    }
                     tracing::warn!(
                         action = %hook.action,
                         task_id = %task.id,
@@ -337,14 +401,18 @@ impl WorkflowEngine {
                     &actor,
                 );
                 let started = Instant::now();
-                let result = self
+                let result = match self
                     .run_durable_hook(
                         step,
                         (index + from_state.hooks.on_exit.len()) as i64,
                         hook,
                         &enter_ctx,
                     )
-                    .await?;
+                    .await?
+                {
+                    DurableHook::Done(result) => result,
+                    DurableHook::Retry(reason) => return Ok(HookPhaseResult::retry(reason)),
+                };
                 self.refresh_task_after_hook(&mut task, &target_state, Some(step))
                     .await?;
                 let duration_ms = elapsed_ms(started);
@@ -367,6 +435,12 @@ impl WorkflowEngine {
                 match result {
                     HookResult::Failed { reason: error } => {
                         failure.get_or_insert_with(|| error.clone());
+                        if matches!(hook.on_failure, FailurePolicy::Block) {
+                            blocking_failure.get_or_insert_with(|| error.clone());
+                        }
+                        if hook.action == "run_merge" {
+                            merge_failure.get_or_insert_with(|| error.clone());
+                        }
                         tracing::warn!(
                             action = %hook.action,
                             task_id = %task.id,
@@ -614,7 +688,7 @@ impl WorkflowEngine {
                     &actor,
                 );
                 let started = Instant::now();
-                let result = self
+                let result = match self
                     .run_durable_hook(
                         step,
                         (index + from_state.hooks.on_exit.len() + to_state.hooks.before_enter.len())
@@ -622,7 +696,11 @@ impl WorkflowEngine {
                         hook,
                         &enter_ctx,
                     )
-                    .await?;
+                    .await?
+                {
+                    DurableHook::Done(result) => result,
+                    DurableHook::Retry(reason) => return Ok(HookPhaseResult::retry(reason)),
+                };
                 self.refresh_task_after_hook(&mut task, &target_state, Some(step))
                     .await?;
                 let duration_ms = elapsed_ms(started);
@@ -645,6 +723,12 @@ impl WorkflowEngine {
                 match result {
                     HookResult::Failed { reason: error } => {
                         failure.get_or_insert_with(|| error.clone());
+                        if matches!(hook.on_failure, FailurePolicy::Block) {
+                            blocking_failure.get_or_insert_with(|| error.clone());
+                        }
+                        if hook.action == "run_merge" {
+                            merge_failure.get_or_insert_with(|| error.clone());
+                        }
                         tracing::warn!(
                             action = %hook.action,
                             task_id = %task.id,
@@ -777,7 +861,7 @@ impl WorkflowEngine {
                     &actor,
                 );
                 let started = Instant::now();
-                let result = self
+                let result = match self
                     .run_durable_hook(
                         step,
                         (index
@@ -787,7 +871,11 @@ impl WorkflowEngine {
                         hook,
                         &enter_ctx,
                     )
-                    .await?;
+                    .await?
+                {
+                    DurableHook::Done(result) => result,
+                    DurableHook::Retry(reason) => return Ok(HookPhaseResult::retry(reason)),
+                };
                 self.refresh_task_after_hook(&mut task, &target_state, Some(step))
                     .await?;
                 let duration_ms = elapsed_ms(started);
@@ -810,6 +898,12 @@ impl WorkflowEngine {
                 match result {
                     HookResult::Failed { reason: error } => {
                         failure.get_or_insert_with(|| error.clone());
+                        if matches!(hook.on_failure, FailurePolicy::Block) {
+                            blocking_failure.get_or_insert_with(|| error.clone());
+                        }
+                        if hook.action == "run_merge" {
+                            merge_failure.get_or_insert_with(|| error.clone());
+                        }
                         tracing::warn!(
                             action = %hook.action,
                             task_id = %task.id,
@@ -915,6 +1009,9 @@ impl WorkflowEngine {
                 return Ok(HookPhaseResult {
                     follow_up: None,
                     failure,
+                    blocking_failure,
+                    merge_failure,
+                    retry: None,
                 });
             }
 
@@ -925,16 +1022,11 @@ impl WorkflowEngine {
                     && !cascade_reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
                     && !Self::is_terminal(workflow, &cascade_to));
             // Fence the entry this transition committed, not a later
-            // writer's: its epoch was recorded on its log row.
-            let entry_epoch: Option<i64> =
-                sqlx::query_scalar("SELECT status_epoch FROM transition_log WHERE id = ?")
-                    .bind(&transition_log_id)
-                    .fetch_optional(self.db.pool())
-                    .await?
-                    .flatten();
-            let entry_epoch = entry_epoch.ok_or_else(|| {
-                ServiceError::invalid_operation("committed transition has no status epoch")
-            })?;
+            // writer's. The hook row carries that entry's epoch (read inside
+            // the status CAS, or by the startup recovery sweep for an entry
+            // a pre-upgrade binary logged without one), and the step fence
+            // has already proved it is still current.
+            let entry_epoch = step.expected_epoch;
             let input = self
                 .cascade_step_input(
                     &task,
@@ -958,6 +1050,157 @@ impl WorkflowEngine {
             step.expected_version - 1,
         )
         .await?;
-        Ok(HookPhaseResult { follow_up, failure })
+        Ok(HookPhaseResult {
+            follow_up,
+            failure,
+            blocking_failure,
+            merge_failure,
+            retry: None,
+        })
+    }
+
+    /// Enqueue the post-commit hooks of a Task's current entry when that
+    /// entry has no hooks row: it was committed by a binary that ran hooks
+    /// inline and lost them (crash or shutdown before the durable-hooks
+    /// upgrade). The row is keyed `<entry transition_log id>:recovered`, so
+    /// repeated startup sweeps never duplicate it. Exit hooks of the prior
+    /// state already ran with that commit and are skipped.
+    ///
+    /// Returns `None` when the current entry cannot be identified.
+    pub(crate) async fn enqueue_recovered_entry_hooks(
+        &self,
+        task: &db::Task,
+        status_epoch: i64,
+        project: &db::Project,
+        workflow: &WorkflowDefinition,
+    ) -> crate::Result<Option<String>> {
+        let Some(to_state) = Self::find_state(workflow, &task.status) else {
+            return Ok(None);
+        };
+        // An engine or board entry logs its epoch. A pre-upgrade entry has
+        // none; it is only the current one while the Task has not changed
+        // status since the upgrade (epoch still 0).
+        let mut entry: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, from_state FROM transition_log WHERE task_id = ? AND to_state = ? AND status_epoch = ? ORDER BY created_at, rowid LIMIT 1",
+        )
+        .bind(&task.id)
+        .bind(&task.status)
+        .bind(status_epoch)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if entry.is_none() && status_epoch == 0 {
+            entry = sqlx::query_as(
+                "SELECT id, from_state FROM transition_log WHERE task_id = ? AND to_state = ? AND status_epoch IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            )
+            .bind(&task.id)
+            .bind(&task.status)
+            .fetch_optional(self.db.pool())
+            .await?;
+        }
+        let Some((entry_id, from)) = entry else {
+            return Ok(None);
+        };
+        let from_state = Self::find_state(workflow, &from).unwrap_or(to_state);
+        let from = from_state.name.clone();
+        let actor = Actor::system(api_types::SystemComponent::TaskDispatcher);
+        let reason = "recovering post-commit hooks lost before restart".to_owned();
+        let input = self
+            .cascade_step_input(
+                task,
+                workflow,
+                task.status.clone(),
+                reason.clone(),
+                false,
+                false,
+                Some(WorkflowAuthority {
+                    project_version: project.version,
+                    workflow_definition: project.workflow_definition.clone(),
+                    clear_review_passed_at_on_commit: false,
+                }),
+                None,
+                format!("{entry_id}:recovered"),
+                Some(status_epoch),
+            )
+            .await?;
+        let cascade_payload: crate::worker_runtime::queue::CascadePayload =
+            serde_json::from_str(&input.payload_json)
+                .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+        let frozen = self
+            .db
+            .store_step_workflow(
+                &serde_json::to_string(&HookDefinition {
+                    workflow: workflow.clone(),
+                    project_workflow_definition: Some(project.workflow_definition.clone()),
+                })
+                .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+            )
+            .await?;
+        let latest_execution = latest_execution_context(&self.db, &task.id).await?;
+        let latest_executor = latest_executor_context(&self.db, &task.id).await?;
+        let workspace_id = latest_execution
+            .as_ref()
+            .and_then(|execution| execution.workspace_id.clone())
+            .or_else(|| {
+                latest_executor
+                    .as_ref()
+                    .and_then(|execution| execution.workspace_id.clone())
+            });
+        let execution_id = latest_executor
+            .as_ref()
+            .or(latest_execution.as_ref())
+            .map(|execution| execution.id.clone());
+        let dispatch_index = to_state
+            .hooks
+            .on_enter
+            .iter()
+            .position(|h| {
+                registry::is_dispatch_action(&h.action)
+                    && hook_audience_matches(h.applies_to, &actor)
+            })
+            .map(|i| {
+                (from_state.hooks.on_exit.len() + to_state.hooks.before_enter.len() + i) as i64
+            });
+        let payload = HookPayload {
+            from: from.clone(),
+            to: task.status.clone(),
+            actor,
+            reason,
+            transition_log_id: entry_id,
+            workflow_ref: crate::worker_runtime::queue::WorkflowReference::Snapshot(frozen),
+            authority: Some(project.version),
+            from_config: merged_state_config(
+                from_state,
+                Some(project),
+                task.task_state_config.as_deref(),
+            ),
+            to_config: merged_state_config(
+                to_state,
+                Some(project),
+                task.task_state_config.as_deref(),
+            ),
+            workspace_id,
+            execution_id,
+            agent_id: latest_execution
+                .as_ref()
+                .and_then(|execution| execution.agent_id.clone()),
+            skip_before_enter: false,
+            skip_on_exit: true,
+            defer_dispatch_until: None,
+            action_dispatch: false,
+            pre_results: Vec::new(),
+            admission_agent_id: dispatch_index.and(cascade_payload.admission_agent_id),
+            dispatch_index,
+            evidence: cascade_payload.evidence,
+        };
+        let step = db::EnqueueTaskStep {
+            kind: "hooks".into(),
+            // Exit hooks are skipped, so only the entered state sets the lane.
+            lane: hooks_lane(workflow, "", &task.status).into(),
+            payload_json: serde_json::to_string(&payload)
+                .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+            available_at: now_rfc3339(),
+            ..input
+        };
+        Ok(Some(self.db.enqueue_step(&step).await?))
     }
 }

@@ -460,3 +460,128 @@ async fn review_rerun_recovers_deleted_worktree_from_existing_branch() {
     assert_eq!(recovered.branch, workspace.branch);
     assert_eq!(git::get_current_sha(worktree_path).await.unwrap(), sha);
 }
+
+// While the current entry's hook step (CI, before-work scripts, dispatch) is
+// pending or running, the latest Review may be a stale one from an earlier
+// entry. Readiness and owner offers wait for the step, as they did for the
+// running entry barrier.
+#[tokio::test]
+async fn readiness_and_offers_wait_while_review_entry_hooks_run() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
+    crate::task_service::tests::helpers::seed_role_assignment(
+        &db,
+        &task.id,
+        "coder",
+        Some(&agent_id),
+    )
+    .await;
+    crate::task_service::tests::helpers::seed_role_assignment(
+        &db,
+        &task.id,
+        "reviewer",
+        Some(&agent_id),
+    )
+    .await;
+    let now = now_rfc3339();
+    let execution = crate::task_service::tests::helpers::seed_execution(
+        &db,
+        &task.id,
+        Some(&agent_id),
+        "coder",
+        ExecutionStatus::Completed,
+        Some("session"),
+        &now,
+    )
+    .await;
+    ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: execution.id,
+            attempt_number: 1,
+            status: ReviewStatus::AwaitingHuman,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("stale review creates");
+    let actor = api_types::Actor::user(api_types::UserActionSource::Test);
+    let offers = |snapshot: &crate::TaskSnapshot| {
+        crate::available_actions(snapshot)
+            .into_iter()
+            .map(|offer| offer.action.verb().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(service.is_task_awaiting_human(&task).await.unwrap());
+    let settled = offers(
+        &service
+            .task_action_snapshot(&task.id, &actor)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        settled.iter().any(|verb| verb != "cancel"),
+        "a settled gate offers decisions: {settled:?}"
+    );
+
+    // The entry's hook step is queued behind CI.
+    let step_id = db::TaskStepRepo::enqueue_step(
+        &*db,
+        &db::EnqueueTaskStep {
+            kind: "hooks".into(),
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: "review-entry".into(),
+            chain_id: new_uuid_v4(),
+            chain_position: 1,
+            expected_status: "review".into(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "long".into(),
+            available_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !service.is_task_awaiting_human(&task).await.unwrap(),
+        "a stale Review is not a decision point while entry checks run"
+    );
+    let running = offers(
+        &service
+            .task_action_snapshot(&task.id, &actor)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        running.iter().all(|verb| verb == "cancel"),
+        "only cancellation while entry checks run: {running:?}"
+    );
+
+    // A hooks row of an earlier entry does not hold the current one.
+    sqlx::query("UPDATE task_step SET expected_epoch = expected_epoch - 1 WHERE id = ?")
+        .bind(&step_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(service.is_task_awaiting_human(&task).await.unwrap());
+    sqlx::query(
+        "UPDATE task_step SET expected_epoch = expected_epoch + 1, status = 'done' WHERE id = ?",
+    )
+    .bind(&step_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(service.is_task_awaiting_human(&task).await.unwrap());
+}

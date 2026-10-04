@@ -317,7 +317,17 @@ impl ResolvedWorkspace {
                 .await;
         }
         let path = self.embedded_path()?;
-        if git::detect_rebase_in_progress(&path).await? && handoff_conflicts {
+        let in_progress = git::detect_rebase_in_progress(&path).await?;
+        if in_progress && !handoff_conflicts {
+            // Resume an interrupted rebase the way a fresh conflicting one
+            // ends without handoff: abort, restoring the branch.
+            git::abort_rebase(&path).await?;
+            return Ok(WorkspaceOwnerOperationOutcome::Conflict {
+                details: "aborted interrupted rebase".into(),
+                conflict_paths: Vec::new(),
+            });
+        }
+        if in_progress {
             return match git::continue_rebase_keeping_conflicts(&path).await {
                 Ok(conflict_paths) => Ok(WorkspaceOwnerOperationOutcome::Conflict {
                     details: "resumed interrupted rebase".into(),

@@ -53,6 +53,8 @@ pub struct TaskSnapshot {
     pub action_agent_id: Option<String>,
     pub planning_approval_ready: bool,
     pub advance_target: Option<String>,
+    /// The current entry's post-commit hook step is pending or claimed.
+    pub entry_hooks_running: bool,
 }
 
 impl TaskSnapshot {
@@ -214,24 +216,28 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         .latest_review
         .as_ref()
         .is_some_and(|review| review.status == ReviewStatus::Failed);
-    let awaiting_human = snapshot
-        .latest_review
-        .as_ref()
-        .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-        || (metadata["awaiting_human"] == true
-            && (task.status != "review" || snapshot.latest_review.is_none()))
-        || (task.status == "review"
-            && snapshot.latest_review.is_none()
-            && !running
-            && state.gate_config.as_ref().is_some_and(|gate| {
-                gate.requires_user_approval()
-                    && (!gate.optional_when_unassigned()
-                        || role.is_some_and(|role| {
-                            snapshot.role_assignments.iter().any(|assignment| {
-                                assignment.role_name == role && assignment.assignee_id.is_some()
-                            })
-                        }))
-            }));
+    // While the entry's hook step runs, the latest Review may belong to an
+    // earlier entry; nothing waits for a human until its checks settle.
+    let entry_hooks_running = snapshot.entry_hooks_running;
+    let awaiting_human = !entry_hooks_running
+        && (snapshot
+            .latest_review
+            .as_ref()
+            .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
+            || (metadata["awaiting_human"] == true
+                && (task.status != "review" || snapshot.latest_review.is_none()))
+            || (task.status == "review"
+                && snapshot.latest_review.is_none()
+                && !running
+                && state.gate_config.as_ref().is_some_and(|gate| {
+                    gate.requires_user_approval()
+                        && (!gate.optional_when_unassigned()
+                            || role.is_some_and(|role| {
+                                snapshot.role_assignments.iter().any(|assignment| {
+                                    assignment.role_name == role && assignment.assignee_id.is_some()
+                                })
+                            }))
+                })));
     let target = |trigger| {
         workflow
             .outgoing_trigger_targets(&task.status)
@@ -533,7 +539,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             return offers;
         }
     }
-    if queued {
+    if entry_hooks_running || queued {
         return offers;
     }
     if matches!(
@@ -1513,6 +1519,7 @@ pub async fn load_snapshot(
                 })
         }
     };
+    let entry_hooks_running = db::TaskStepRepo::entry_hooks_pending(db, &task.id).await?;
     let advance_target =
         if crate::task_service::execution::ensure_plan_publication_transition_authority(&task, None)
             .is_ok()
@@ -1554,6 +1561,7 @@ pub async fn load_snapshot(
         action_agent_id,
         planning_approval_ready,
         advance_target,
+        entry_hooks_running,
     })
 }
 async fn select_action_agent(
@@ -1801,6 +1809,7 @@ mod tests {
             action_agent_id: None,
             planning_approval_ready: true,
             advance_target: None,
+            entry_hooks_running: false,
         }
     }
 
@@ -2145,6 +2154,13 @@ mod tests {
             .iter()
             .any(|offer| offer.reason == "entry_barrier_override"));
         snapshot.task.entry_barrier_json = None;
+        snapshot.entry_hooks_running = true;
+        assert_eq!(
+            available_actions(&snapshot).len(),
+            1,
+            "only cancellation while entry checks run"
+        );
+        snapshot.entry_hooks_running = false;
         snapshot.task.error_annotation =
             Some(json!({"type":"review_needs_owner","blocking_reason":"finding"}).to_string());
         snapshot.executions.push(super::condition_matrix::exec(
@@ -2436,6 +2452,7 @@ mod condition_matrix {
                                         action_agent_id: None,
                                         planning_approval_ready: true,
                                         advance_target: None,
+                                        entry_hooks_running: false,
                                     };
                                     let offers = available_actions(&snapshot);
                                     let verbs: Vec<String> = offers

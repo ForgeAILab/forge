@@ -438,3 +438,71 @@ async fn concurrent_transition_attempts_during_ci_leave_one_winner_and_supersede
         1
     );
 }
+
+// A Log-policy effect failure settles its step `failed` and is logged; it
+// writes no Task annotation and does not block, as before durable hooks.
+#[tokio::test]
+async fn log_policy_effect_failure_settles_step_failed_without_blocking_task() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = "log-policy-failure";
+    seed_project_repo_and_task(&db, task_id, default_states::TODO).await;
+    assign_agent_role_without_agent(&db, task_id, default_roles::CODER).await;
+    let workflow = WorkflowDefinition {
+        roles: Vec::new(),
+        states: vec![
+            with_trigger(
+                state(
+                    default_states::TODO,
+                    StateKind::Initial,
+                    None,
+                    StateHooks::default(),
+                ),
+                WorkflowTrigger::Accept,
+                default_states::IN_PROGRESS,
+            ),
+            state(
+                default_states::IN_PROGRESS,
+                StateKind::Active,
+                Some(default_roles::CODER),
+                StateHooks {
+                    on_enter: vec![hook("notify_role_holder", FailurePolicy::Log)],
+                    ..StateHooks::default()
+                },
+            ),
+        ],
+        configuration: Vec::new(),
+        cancellation_state: None,
+    };
+    let current = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            task_id,
+            default_states::IN_PROGRESS,
+            current.version,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "start work",
+            false,
+        )
+        .await
+        .unwrap();
+    let result = drain_result(engine(db.clone(), Arc::new(EventBus::new(32))), result).await;
+    let steps = db.task_steps(task_id).await.unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].status, "failed");
+    assert!(steps[0]
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("invalid coder role assignment")));
+    assert!(result.task.blocked_json.is_none());
+    assert!(result.task.entry_barrier_json.is_none());
+    assert!(
+        result.task.error_annotation.is_none(),
+        "Log-policy failure installed an annotation: {:?}",
+        result.task.error_annotation
+    );
+}

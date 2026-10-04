@@ -74,6 +74,10 @@ pub trait TaskStepRepo: Send + Sync {
     async fn enqueue_step(&self, input: &EnqueueTaskStep) -> Result<String>;
     async fn task_steps(&self, task_id: &str) -> Result<Vec<TaskStep>>;
     async fn pending_steps(&self, task_id: &str) -> Result<i64>;
+    /// The current entry's post-commit hooks row is still pending or
+    /// claimed: its entry checks (CI, before-work scripts, dispatch) have not
+    /// settled. Matched on status and epoch, as the step fence is.
+    async fn entry_hooks_pending(&self, task_id: &str) -> Result<bool>;
     async fn chain_steps(&self, chain_id: &str) -> Result<Vec<TaskStep>>;
     async fn step_workflow(&self, id: &str) -> Result<String>;
     async fn store_step_workflow(&self, definition: &str) -> Result<String>;
@@ -259,6 +263,14 @@ impl TaskStepRepo for SqliteDb {
     async fn pending_steps(&self, task_id: &str) -> Result<i64> {
         Ok(sqlx::query_scalar(
             "SELECT COUNT(*) FROM task_step WHERE task_id = ? AND status IN ('pending','claimed')",
+        )
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+    async fn entry_hooks_pending(&self, task_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id = s.task_id WHERE s.task_id = ? AND s.kind = 'hooks' AND s.status IN ('pending','claimed') AND s.expected_status = t.status AND s.expected_epoch = t.status_epoch)",
         )
         .bind(task_id)
         .fetch_one(self.pool())
@@ -1194,5 +1206,73 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["status"], "blocked");
         assert_eq!(value["infrastructure_attempts"], 2);
+    }
+
+    // A real upgrade from the pre-durable-hooks schema with in-flight step rows.
+    #[tokio::test]
+    async fn upgrade_preserves_in_flight_steps_and_converts_running_barrier() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let old = tempfile::TempDir::new().unwrap();
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("V202610040225") {
+                std::fs::copy(entry.path(), old.path().join(&name)).unwrap();
+            }
+        }
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        crate::run_migrations_from(&pool, old.path()).await.unwrap();
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('p','p',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at,entry_barrier_json) VALUES ('a','p','a','review',?,?,?)")
+            .bind(&now).bind(&now).bind(serde_json::json!({"status":"running","state":"review"}).to_string()).execute(&pool).await.unwrap();
+        for (id, seq, status, cause, lease) in [
+            ("s1", 1, "done", None, Some("2099-01-01T00:00:00Z")),
+            ("s2", 2, "claimed", Some("s1"), Some("2099-01-01T00:00:00Z")),
+            ("s3", 3, "pending", Some("s2"), None),
+        ] {
+            sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,status,claimed_by,lease_until,available_at,created_at,updated_at,expected_epoch,lane) VALUES (?,'a',?,'cascade',?,?,?,'c',?,'review',1,?,?,?,?,?,?,4,'long')")
+                .bind(id).bind(seq).bind(r#"{"workflow_ref":{"id":"wf"}}"#).bind(cause).bind(format!("k{seq}")).bind(seq).bind(status)
+                .bind(lease.map(|_| "owner")).bind(lease).bind(&now).bind(&now).bind(&now).execute(&pool).await.unwrap();
+        }
+        crate::run_migrations_from(&pool, &src).await.unwrap();
+        type UpgradedStep = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            String,
+            Option<String>,
+        );
+        let rows: Vec<UpgradedStep> = sqlx::query_as(
+            "SELECT id,status,causation_step_id,lease_until,expected_epoch,lane,workflow_ref_id FROM task_step ORDER BY seq").fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].2.as_deref(), Some("s1"));
+        assert_eq!(rows[1].3.as_deref(), Some("2099-01-01T00:00:00Z"));
+        assert_eq!(rows[2].4, 4);
+        assert_eq!(rows[2].6.as_deref(), Some("wf"));
+        let (barrier, ann): (String, Option<String>) =
+            sqlx::query_as("SELECT entry_barrier_json,error_annotation FROM task WHERE id='a'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(barrier.contains("blocked"));
+        assert!(ann.is_some_and(|a| a.contains("before_work_hook_failed")));
+        let fk: Vec<(String,)> =
+            sqlx::query_as("SELECT sql FROM sqlite_master WHERE name='task_step'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !fk[0].0.contains("task_step_new"),
+            "self-reference not renamed: {}",
+            fk[0].0
+        );
     }
 }

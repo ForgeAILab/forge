@@ -3906,16 +3906,33 @@ in the compact Task list's existing `workflow_health` projection.
    and task.transitioned, and insert a `hooks` task_step keyed by the log ID.
    A leased cascade's done acknowledgment shares this same transaction.
 4. Return the Task produced by that CAS, its current Review and pending_steps.
-   Post-commit hooks and their cascades run asynchronously. A transition with
-   hooks immediately has at least one pending step; tests use drain(task_id).
+   The Review is the one current at commit, before any entry hook ran: a Review
+   that entry CI creates appears on later reads. Post-commit hooks and their
+   cascades run asynchronously. A transition with hooks immediately has at least
+   one pending step; tests use drain(task_id).
 5. The hook step executes on_exit → before_enter → on_enter → effective
    after_enter in workflow order, filtered by the committed actor's audience.
    Gate retry-budget hooks retain their ordering. Board moves also defer
-   before_enter effects; blocked entry retry inserts a fresh hook phase.
+   before_enter effects: a failing blocking before_enter no longer rejects the
+   move; the move commits and its entry then blocks (entry barrier `blocked`,
+   owner Retry Entry Checks). Blocked entry retry inserts a fresh hook phase.
 6. Each hook checkpoints its index and full outcome before proceeding. Hook
    settlement and any discovered cascade enqueue share one transaction, so a
-   crash cannot lose a completed effect's follow-up. Hook failures settle failed
-   with the existing compensation, annotations and owner Advance/Restart offers.
+   crash cannot lose a completed effect's follow-up. A hook that returns
+   `Failed` under `on_failure: log` settles its checkpoint and the step `failed`
+   (with `last_error`), emits transition.effect_failed and logs; it writes no
+   Task annotation and does not block, as before. `run_merge` is the exception,
+   whatever its policy: a failure caused by a transient error (the step queue's
+   retry classification: database contention, version conflicts, daemon
+   unavailable/not ready/timeout, rate limits) leaves its checkpoint open and
+   retries the step with the cascade back-off (1 s doubling to 64 s, eight
+   attempts in all). Once that budget is spent, or on any other error, the step
+   settles failed and the Task gets a blocking `workspace_error` merge-failure
+   annotation, which surfaces in Attention; the owner's Retry
+   (`merge_gate_retry`) re-enters the merge state and re-runs the merge. A
+   `block`-policy failure keeps its blocking compensation and annotation, and a
+   thrown hook error settles through the committed-hook failure path with
+   cascade_failed. Owner Advance/Restart offers are unchanged.
 
 The task_step outbox is a leased FIFO per Task. Only the earliest unfinished
 row is eligible. Eight fast slots and four long slots preserve capacity across
@@ -3934,8 +3951,15 @@ in the same transaction as admission and reuses that execution even if it has
 already finished. Provisioning retains its existing placement/location/input
 checkpoints. Merge checks that the target contains the exact candidate before
 integrating again; merge/rebase outcomes and the recorded rebase target are
-checkpointed. Committed rebase/conflict Git facts reconstruct an interrupted
-handoff; review-authority carry records its hook identity with the Review/carry
+checkpointed. A rebase still in progress in the worktree (a crash inside `git
+rebase`) is resumed before any ancestry check, exactly as a fresh rebase ends:
+with conflict handoff the stopped rebase is continued, committing markers, and
+handed to the coder with every marker path; without handoff it is aborted. The
+coder never receives a worktree mid-rebase. Committed rebase/conflict Git facts
+reconstruct an interrupted handoff that had already finished the rebase. A merge
+found already landed records the candidate commit (the exact object reviewed
+integration fast-forwards to) as its result and in the merge comment, never the
+target's later tip. Review-authority carry records its hook identity with the Review/carry
 settlement so replay returns the same successful cascade. Conflict-handoff actor
 and marker/path JSON remain unchanged for the hot-spot detector.
 
@@ -3959,11 +3983,35 @@ transition.step_superseded and runs no further hooks. Direct dispatcher, recover
 claim and completion writers remain direct until C and are not locked by the
 queue. The running-entry soft lock, completion/merge in-memory slots and two-minute
 merge re-drive are removed. Blocked entry failure metadata remains recoverable.
+Upgrading converts a legacy `running` entry barrier into a blocked entry with a
+`before_work_hook_failed` annotation; the owner's Retry Entry Checks re-runs it.
+
+The step table replaces the in-memory exclusions. While the current entry's
+`hooks` row (matched on status and status_epoch) is pending or claimed, its entry
+checks have not settled: `awaiting_human` stays false and owner offers are
+Cancel only, even when the latest Review is a stale one from an earlier entry.
+Workspace reset returns 409 while the Task has any pending or claimed step,
+because those steps hold the worktree and Workspace they captured. Paused
+integration resume does nothing while the Task has a pending or claimed step;
+the queued attempt's success consumes the marker.
+
+On every start, before the step worker and dispatcher, a recovery sweep enqueues
+the hooks of a Task's current entry when the Task is in a state whose on_enter
+runs `run_merge`, has no pending or claimed step, and its current entry has no
+hooks row. That is the shape of a `merging` Task whose inline merge a pre-upgrade
+binary lost. The row is keyed `<entry transition_log id>:recovered`, skips the
+prior state's exit hooks, and the merge resumes safely because it first checks
+whether the target already contains the candidate; repeated sweeps never
+duplicate it. Tasks that are paused (manual stop), held for a human, blocked by an
+annotation or entry barrier, or carrying a paused-integration marker are skipped.
+Other states are not swept: they have no durable completion witness, and a
+missing hooks row there is the normal shape of an upgraded Task whose inline
+hooks finished, or of a settled row that storage maintenance pruned.
 
 Only cascades consume automatic chain positions and edges. Repeated unchanged-
 evidence edges or more than 64 hops park with workflow_loop; fresh Review/rebase
-head evidence starts a new segment. Failed steps retain cascade_failed or the
-existing specific blocking annotation. Failed/parked history and operator status
+head evidence starts a new segment. Failed steps whose failure blocks retain
+cascade_failed or the existing specific blocking annotation. Failed/parked history and operator status
 keep the established queue retention and recovery contract.
 
 Initial admission counts imminent available/claimed fast role-entry work until a

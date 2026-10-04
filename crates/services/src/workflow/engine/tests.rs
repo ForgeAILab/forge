@@ -1392,6 +1392,7 @@ async fn effect_failure_log_policy_continues() {
             && entry.phase == "on_enter"
             && entry.outcome == "failed"
     }));
+    assert!(result.task.error_annotation.is_none());
 }
 
 #[tokio::test]

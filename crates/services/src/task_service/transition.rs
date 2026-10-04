@@ -308,6 +308,12 @@ impl TaskService {
                 .await?;
             return Ok(false);
         }
+        // A previous resume's hook step (or any other step) is still queued
+        // or running. Re-entering now would supersede it mid-merge; its
+        // settlement consumes the marker on success.
+        if db::TaskStepRepo::pending_steps(&*self.db, &task.id).await? > 0 {
+            return Ok(false);
+        }
 
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
@@ -528,6 +534,12 @@ impl TaskService {
     pub async fn is_task_awaiting_human(&self, task: &Task) -> Result<bool> {
         if task.blocked_json.is_some() {
             return Ok(true);
+        }
+        if db::TaskStepRepo::entry_hooks_pending(&*self.db, &task.id).await? {
+            // The entry's checks (CI, before-work scripts, dispatch) are
+            // still queued or running in its hook step. A gate decision
+            // taken now would act on the previous Review, not this entry's.
+            return Ok(false);
         }
         let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid task metadata: {error}"))

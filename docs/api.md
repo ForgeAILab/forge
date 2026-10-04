@@ -133,6 +133,7 @@ database for historical provenance.
 | DELETE | `/api/v1/tasks/{id}/dependencies/{dep_id}` | Remove one prerequisite dependency edge |
 | GET    | `/api/v1/tasks/{id}/dependents` | List Tasks that depend on this prerequisite |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
+| POST   | `/api/v1/tasks/{id}/workspace/reset` | Replace the task workspace with a fresh one on the primary Repo; `409` while the Task has a pending or claimed transition step |
 | GET    | `/api/v1/tasks/{id}/transitions` | Audit log of state transitions |
 | GET    | `/api/v1/tasks/{id}/roles` | List explicit Task role assignments |
 | PUT    | `/api/v1/tasks/{id}/roles/{role_name}` | Assign any currently eligible Project Task agent to this role; Project defaults do not constrain the identity |
@@ -2655,7 +2656,7 @@ separate `release` command.
 ### Transition responses and queued cascades
 
 `POST /api/v1/tasks/{id}/transition` returns the Task snapshot produced by the
-requested transition, its current Review (or `null`), and `pending_steps` (the
+requested transition, the Review current at that commit (or `null`), and `pending_steps` (the
 number of pending or claimed hook and cascade rows for that Task at response preparation).
 The status CAS inserts a durable hook step; the response does not wait for hooks or their follow-up transitions. A transition with post-commit hooks therefore has at least one pending step immediately after its CAS. For example, entering
 `planning` without a planner returns `task.status = "planning"` and
@@ -2667,7 +2668,7 @@ parked, superseded and done rows do not count as pending.
 
 `forge_transition_task` retains its Task-with-offers result and adds the same
 `pending_steps` integer. The returned Task belongs to the requested transition;
-post-commit hooks (including CI, merge and dispatch) and follow-up cascades are asynchronous on both REST and MCP. Hook outcomes are checkpointed; interrupted CI and user scripts may run again after restart.
+post-commit hooks (including CI, merge and dispatch) and follow-up cascades are asynchronous on both REST and MCP. The returned `review` is therefore the pre-hook Review: a Review created by the entry's CI appears on a later `GET`. Hook outcomes are checkpointed; interrupted CI and user scripts may run again after restart. A hook whose failure policy is `log` and that fails settles its step `failed` without annotating or blocking the Task, except `run_merge`: it retries transient errors with back-off, then (or on any other error) annotates the Task with a blocking `workspace_error` merge failure that the owner's Retry re-runs.
 
 ## Task hierarchy, workspaces, and prerequisite dependencies
 
@@ -2861,12 +2862,11 @@ state, the server auto-escalates to the user-routing-override path. MCP
 and does not support user override (REST-only for now).
 
 `approve` and `send_back` at `POST /api/v1/tasks/{id}/actions` accept the
-current Task `version`. A gate with blocking entry checks is not decision-ready
-until its entry barrier settles: Task responses keep `awaiting_human = false`
-for that Task snapshot, and an early decision returns HTTP 409 with
-`code: "action_unavailable"` and current offers. The response's `awaiting_human` value and `version`
-are derived from the same Task snapshot so a barrier-clear write cannot expose
-readiness paired with the version it just invalidated. The default planning
+current Task `version`. A gate is not decision-ready while the hook step of its
+current entry (CI, before-work scripts, dispatch) is pending or running: Task
+responses keep `awaiting_human = false`, offers are Cancel only, and an early
+decision returns HTTP 409 with `code: "action_unavailable"` and current offers,
+even when the latest Review is a stale one from an earlier entry. The default planning
 gate does not require this decision: after a successful planner execution has
 delivered a valid checklist, Forge advances the Task to implementation. A
 workflow whose planning gate sets `requires_user_approval` keeps the Task in
@@ -3034,7 +3034,11 @@ task. Both are null only for an empty destination workflow column group. The
 server validates task and board versions, the target workflow column, neighbor
 project/column membership and adjacency, then writes status and position in one
 transaction. Same-column moves skip status hooks; cross-column moves retain
-workflow guards, cancellation, audit, hooks, dispatch, and cascades.
+workflow guards, cancellation, audit, hooks, dispatch, and cascades. `before_exit`
+guards still reject before commit (`412 guard_rejected`). The destination's
+`before_enter` checks run after commit in the move's hook step: a failing
+blocking check no longer rejects the move; the move commits and the entry blocks
+(entry barrier `blocked`, owner Retry Entry Checks).
 
 The response contains the Task committed by the move, its board revision, and
 the submitted operation ID. Automatic cascade steps run asynchronously; their

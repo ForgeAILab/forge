@@ -214,6 +214,14 @@ impl TaskService {
     }
 
     pub async fn reset_task_workspace(&self, task_id: &str) -> Result<Workspace> {
+        // A queued or running step (a cascade, or hooks running CI, a merge
+        // or a dispatch in this worktree) holds the workspace it captured.
+        // Deleting it underneath fails that work and races its Task writes.
+        if db::TaskStepRepo::pending_steps(&*self.db, task_id).await? > 0 {
+            return Err(ServiceError::Conflict(
+                "task transition steps are in progress; retry the workspace reset".to_owned(),
+            ));
+        }
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;

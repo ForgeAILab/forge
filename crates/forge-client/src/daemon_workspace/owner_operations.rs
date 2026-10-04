@@ -118,11 +118,18 @@ impl DaemonWorkspaceBackend {
                 validate_branch(&owned.path, &target_branch).await?;
                 let target =
                     resolve_commit(&owned.path, &format!("refs/heads/{target_branch}")).await?;
-                if git::detect_rebase_in_progress(&owned.path)
+                let in_progress = git::detect_rebase_in_progress(&owned.path)
                     .await
-                    .map_err(git_error)?
-                    && handoff_conflicts
-                {
+                    .map_err(git_error)?;
+                if in_progress && !handoff_conflicts {
+                    // Resume an interrupted rebase the way a fresh
+                    // conflicting one ends without handoff.
+                    git::abort_rebase(&owned.path).await.map_err(git_error)?;
+                    WorkspaceOwnerOperationOutcome::Conflict {
+                        details: "aborted interrupted rebase".into(),
+                        conflict_paths: Vec::new(),
+                    }
+                } else if in_progress {
                     match git::continue_rebase_keeping_conflicts(&owned.path).await {
                         Ok(conflict_paths) => WorkspaceOwnerOperationOutcome::Conflict {
                             details: "resumed interrupted rebase".into(),

@@ -269,10 +269,10 @@ impl TaskStepWorker {
                 } else if step.kind == "hooks" {
                     self.fail_committed_hook_phase(&step, &error.to_string())
                         .await?;
-                } else if retryable(&error) && step.attempts < 8 {
-                    let delay = 1_i64 << (step.attempts - 1).clamp(0, 6);
-                    let due = (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339();
-                    self.db.retry_step(&step, &error.to_string(), &due).await?;
+                } else if retryable(&error) && step.attempts < MAX_STEP_ATTEMPTS {
+                    self.db
+                        .retry_step(&step, &error.to_string(), &retry_due(step.attempts))
+                        .await?;
                 } else {
                     self.settle(&step, "failed", Some(&error.to_string()), true)
                         .await?;
@@ -301,6 +301,17 @@ impl TaskStepWorker {
                 serde_json::from_str(&step.payload_json)
                     .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
             let result = self.engine.execute_hook_step(step, &payload).await?;
+            if let Some(reason) = result.retry.as_deref() {
+                // A transient `run_merge` failure takes the cascade retry
+                // budget and back-off; once spent it settles as a merge failure.
+                if step.attempts < MAX_STEP_ATTEMPTS {
+                    tracing::info!(step_id = %step.id, task_id = %step.task_id, attempts = step.attempts, error = %reason, "transient merge failure; retrying hook step");
+                    self.db
+                        .retry_step(step, reason, &retry_due(step.attempts))
+                        .await?;
+                    return Ok(());
+                }
+            }
             let mut tx = db::begin_immediate(self.db.pool()).await?;
             self.db.fence_hook_in_tx(&mut tx, step).await?;
             let merged:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_hook_checkpoint WHERE step_id=? AND json_type(json_extract(effects_json,'$.merge_outcome'),'$.Done') IS NOT NULL)").bind(&step.id).fetch_one(&mut *tx).await?;
@@ -328,7 +339,26 @@ impl TaskStepWorker {
             if let Some(mut follow_up) = result.follow_up {
                 follow_up.available_at = db::now_rfc3339();
                 self.db.enqueue_step_in_tx(&mut tx, &follow_up).await?;
-            } else if let Some(error) = result.failure {
+            } else if let Some(error) = result.merge_failure {
+                // Whatever its policy, a merge that cannot complete must not
+                // sit silently in its merge state: annotate it as a failed
+                // merge, which the owner's Retry re-runs.
+                let mut task = self
+                    .db
+                    .get_task_in_tx(&mut tx, &step.task_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                self.annotate_failure_in_tx(
+                    &mut tx,
+                    step,
+                    &mut task,
+                    api_types::FailureKind::WorkspaceError,
+                    &format!("Merge failed: {error}"),
+                )
+                .await?;
+            } else if let Some(error) = result.blocking_failure {
+                // Any other `Log`-policy failure only settles the step
+                // `failed` and is logged; it never blocks the Task.
                 let mut task = self
                     .db
                     .get_task_in_tx(&mut tx, &step.task_id)
@@ -555,8 +585,42 @@ impl TaskStepWorker {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
+        let kind = if status == "parked" {
+            api_types::FailureKind::WorkflowLoop
+        } else {
+            api_types::FailureKind::CascadeFailed
+        };
+        self.write_annotation_in_tx(tx, step, task, status, kind, error)
+            .await
+    }
+
+    /// A failed hook phase's own failure kind (a merge failure).
+    async fn annotate_failure_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        step: &TaskStep,
+        task: &mut db::Task,
+        kind: api_types::FailureKind,
+        message: &str,
+    ) -> Result<()> {
+        self.write_annotation_in_tx(tx, step, task, "failed", kind, Some(message))
+            .await
+    }
+
+    async fn write_annotation_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        step: &TaskStep,
+        task: &mut db::Task,
+        status: &str,
+        kind: api_types::FailureKind,
+        error: Option<&str>,
+    ) -> Result<()> {
         let now = db::now_rfc3339();
-        let mut annotation = serde_json::json!({"type":if status=="parked" {"workflow_loop"} else {"cascade_failed"}, "state":step.expected_status, "message":error, "detected_at":now, "task_step_id":step.id});
+        let mut annotation = serde_json::json!({"type":kind, "state":step.expected_status, "message":error, "detected_at":now, "task_step_id":step.id});
+        if kind == api_types::FailureKind::WorkspaceError {
+            annotation["blocking_reason"] = serde_json::json!(error);
+        }
         if status != "parked" {
             if let Some(mut existing) = task
                 .error_annotation
@@ -621,7 +685,16 @@ fn log_job(result: Option<std::result::Result<Result<()>, tokio::task::JoinError
 fn lease_deadline() -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(LEASE_SECONDS)).to_rfc3339()
 }
-fn retryable(error: &ServiceError) -> bool {
+/// Attempts (including the first) a step gets for retryable failures.
+const MAX_STEP_ATTEMPTS: i64 = 8;
+
+/// Exponential back-off for the next attempt: 1 s doubling to 64 s.
+fn retry_due(attempts: i64) -> String {
+    let delay = 1_i64 << (attempts - 1).clamp(0, 6);
+    (chrono::Utc::now() + chrono::Duration::seconds(delay)).to_rfc3339()
+}
+
+pub(crate) fn retryable(error: &ServiceError) -> bool {
     matches!(error, ServiceError::Db(db::DbError::VersionConflict))
         || consumer_error_kind(error) == WorkerErrorKind::Transient
 }

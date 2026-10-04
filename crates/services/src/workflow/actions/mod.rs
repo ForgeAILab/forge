@@ -18,6 +18,8 @@ pub use lifecycle::{
     AutoCascadeOnCompletion, CleanupWorkspaceNow, PublishTaskBlocked, RunBeforeWorkHooks,
     ScheduleWorkspaceCleanup,
 };
+#[cfg(test)]
+pub(crate) use merge::test_faults as merge_test_faults;
 pub use merge::{
     AutoCascadeOnMergeResult, CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge,
 };
