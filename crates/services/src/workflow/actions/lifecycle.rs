@@ -16,6 +16,12 @@ use super::common::{resolve_workspace_backend, task, workspace_id};
 
 pub struct RunBeforeWorkHooks;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BeforeWorkInput {
+    hooks: Vec<api_types::LifecycleHookDef>,
+    env: std::collections::BTreeMap<String, String>,
+}
+
 #[async_trait]
 impl HookAction for RunBeforeWorkHooks {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
@@ -32,19 +38,47 @@ impl HookAction for RunBeforeWorkHooks {
                 };
             }
         };
-        let settings = match serde_json::from_str::<ProjectSettings>(&project.settings) {
-            Ok(settings) => settings,
+        // Script checkpoints use indexes into this input. Keep those indexes
+        // bound to the original commands even if Project settings change.
+        let input: crate::Result<BeforeWorkInput> = async {
+            use crate::workflow::engine::durable::{hook_effect, record_hook_effect};
+            if let Some(recorded) = hook_effect(&ctx.task_id, "before_work_input").await? {
+                return serde_json::from_str(&recorded)
+                    .map_err(|error| crate::ServiceError::invalid_operation(error.to_string()));
+            }
+            let settings =
+                serde_json::from_str::<ProjectSettings>(&project.settings).map_err(|error| {
+                    crate::ServiceError::invalid_operation(format!(
+                        "invalid project settings: {error}"
+                    ))
+                })?;
+            let input = BeforeWorkInput {
+                hooks: settings
+                    .lifecycle_hooks
+                    .get(&api_types::LifecycleEvent::BeforeWork)
+                    .cloned()
+                    .unwrap_or_default(),
+                env: settings.environment.env,
+            };
+            record_hook_effect(
+                &ctx.task_id,
+                "before_work_input",
+                &serde_json::to_value(&input)
+                    .map_err(|error| crate::ServiceError::invalid_operation(error.to_string()))?,
+            )
+            .await?;
+            Ok(input)
+        }
+        .await;
+        let input = match input {
+            Ok(input) => input,
             Err(error) => {
                 return HookResult::Failed {
-                    reason: format!("invalid project settings: {error}"),
-                };
+                    reason: error.to_string(),
+                }
             }
         };
-        let hooks = settings
-            .lifecycle_hooks
-            .get(&api_types::LifecycleEvent::BeforeWork)
-            .cloned()
-            .unwrap_or_default();
+        let hooks = input.hooks;
         let skip_once = ctx
             .state_config
             .get("skip_before_work_hook_once")
@@ -191,7 +225,7 @@ impl HookAction for RunBeforeWorkHooks {
             .join(&task.id)
             .join("hooks");
         let hook_ctx = LifecycleHookContext {
-            env: settings.environment.env.clone(),
+            env: input.env,
             event: api_types::LifecycleEvent::BeforeWork,
             task_id: task.id.clone(),
             task_title: task.title.clone(),
@@ -355,6 +389,46 @@ fn truncate_annotation_output(output: &str) -> String {
     output[..end].to_owned()
 }
 
+/// The schedule and the hook's successful outcome share a writer transaction;
+/// replay cannot extend a delayed cleanup after the request already persisted.
+async fn schedule_cleanup(
+    ctx: &HookContext,
+    scheduler: &crate::workspace_cleanup::WorkspaceCleanupScheduler,
+    workspace_id: impl AsRef<str>,
+    delay: Duration,
+) -> crate::Result<()> {
+    if let Some(attempt) = crate::workflow::engine::durable::current_hook(&ctx.task_id) {
+        let mut tx = db::begin_immediate(ctx.db.pool()).await?;
+        ctx.db.fence_hook_in_tx(&mut tx, &attempt.step).await?;
+        let deadline = (chrono::Utc::now()
+            + chrono::Duration::from_std(delay)
+                .map_err(|e| crate::ServiceError::invalid_operation(e.to_string()))?)
+        .to_rfc3339();
+        let changed = sqlx::query("UPDATE workspace SET cleanup_after=?,updated_at=? WHERE id=?")
+            .bind(deadline)
+            .bind(now_rfc3339())
+            .bind(workspace_id.as_ref())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if changed != 1 {
+            return Err(db::DbError::NotFound.into());
+        }
+        sqlx::query(
+            "UPDATE task_hook_checkpoint SET result_json=? WHERE step_id=? AND hook_index=?",
+        )
+        .bind(serde_json::to_string(&HookResult::Ok).expect("hook outcome serializes"))
+        .bind(&attempt.step.id)
+        .bind(attempt.index)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    } else {
+        scheduler.schedule(workspace_id, delay).await
+    }
+}
+
 pub struct CleanupWorkspaceNow;
 
 #[async_trait]
@@ -380,9 +454,8 @@ impl HookAction for CleanupWorkspaceNow {
                 reason: "nothing to clean up".to_string(),
             };
         };
-        if let Err(error) = cleanup_scheduler
-            .schedule(workspace_id, Duration::ZERO)
-            .await
+        if let Err(error) =
+            schedule_cleanup(ctx, cleanup_scheduler, workspace_id, Duration::ZERO).await
         {
             tracing::warn!(task_id = %ctx.task_id, %error, "workspace cleanup scheduling failed");
             return HookResult::Skipped {
@@ -436,7 +509,7 @@ impl HookAction for ScheduleWorkspaceCleanup {
                 api_types::CleanupPolicy::Delayed { seconds } => Duration::from_secs(seconds),
             })
             .unwrap_or(Duration::from_secs(86_400));
-        if let Err(error) = cleanup_scheduler.schedule(&workspace_id, delay).await {
+        if let Err(error) = schedule_cleanup(ctx, cleanup_scheduler, &workspace_id, delay).await {
             tracing::warn!(task_id = %ctx.task_id, %error, "workspace cleanup scheduling failed");
             return HookResult::Skipped {
                 reason: error.to_string(),
@@ -476,14 +549,10 @@ pub struct AutoCascadeOnCompletion;
 
 #[async_trait]
 impl HookAction for AutoCascadeOnCompletion {
-    fn declared_cascade(&self) -> Option<HookResult> {
-        Some(HookResult::Cascade {
-            to: "done".to_string(),
-            reason: "completed".to_string(),
-        })
-    }
     async fn execute(&self, _ctx: &HookContext) -> HookResult {
-        self.declared_cascade()
-            .expect("completion declares its cascade")
+        HookResult::Cascade {
+            to: "done".into(),
+            reason: "completed".into(),
+        }
     }
 }

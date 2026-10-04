@@ -168,7 +168,7 @@ impl TaskService {
             Arc::clone(&self.db),
             result.queued_step_id.as_deref(),
         );
-        // The engine returns the requested transition's settled inline
+        // The engine returns the requested transition's committed CAS
         // snapshot. A concurrent writer cannot replace it in this response.
         let mut task = result.task;
         if was_blocked {
@@ -346,13 +346,24 @@ impl TaskService {
             .iter()
             .any(|hook| hook.action == "run_merge")
         {
-            self.retry_merge_state_entry(
-                task,
-                &project,
-                &workflow,
-                "resuming integration after project pause",
-            )
-            .await
+            let engine = self.workflow_engine();
+            engine
+                .manual_override_transition_with_authority(
+                    &task.id,
+                    &task.status,
+                    task.version,
+                    &workflow,
+                    actor.clone(),
+                    "resuming integration after project pause",
+                    false,
+                    Some(WorkflowAuthority {
+                        project_version: project.version,
+                        workflow_definition: project.workflow_definition.clone(),
+                        clear_review_passed_at_on_commit: false,
+                    }),
+                )
+                .await
+                .map(|_| ())
         } else if let Some(target) = workflow.auto_transition_target(&task.status) {
             self.transition(
                 task.id.clone(),
@@ -389,6 +400,10 @@ impl TaskService {
             return Err(error);
         }
 
+        if db::TaskStepRepo::pending_steps(&*self.db, &task.id).await? > 0 {
+            return Ok(true);
+        }
+
         if paused_integration_transition_failed(&self.db, &task.id, &prior_transition_ids).await? {
             // The transition may have advanced `review -> merging` before its
             // `run_merge` hook failed. Move the marker to the committed state
@@ -402,55 +417,6 @@ impl TaskService {
         // retry is harmlessly idempotent.
         crate::deferred_dispatch::clear_paused_integration(&self.db, &task.id, &deferred).await?;
         Ok(true)
-    }
-
-    /// Re-enter an integration gate through the engine's ordinary entry hooks
-    /// and cascades. The same-state transition claims the observed Task version
-    /// before any merge side effect and records a fresh entry for the grace.
-    pub(crate) async fn retry_merge_state_entry(
-        &self,
-        task: &Task,
-        project: &db::Project,
-        workflow: &api_types::WorkflowDefinition,
-        reason: &str,
-    ) -> Result<()> {
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
-        };
-        engine
-            .manual_override_transition_with_authority(
-                &task.id,
-                &task.status,
-                task.version,
-                workflow,
-                Actor::system(SystemComponent::TaskDispatcher),
-                reason,
-                false,
-                Some(WorkflowAuthority {
-                    project_version: project.version,
-                    workflow_definition: project.workflow_definition.clone(),
-                    clear_review_passed_at_on_commit: false,
-                }),
-            )
-            .await
-            .map(|_| ())
-    }
-
-    pub(crate) fn merge_hook_available(&self, task_id: &str) -> bool {
-        self.merge_service
-            .as_ref()
-            .is_some_and(|service| !service.merge_hook_running(task_id))
     }
 
     async fn retain_paused_integration_marker(&self, task_id: &str) -> Result<()> {
@@ -562,13 +528,6 @@ impl TaskService {
     pub async fn is_task_awaiting_human(&self, task: &Task) -> Result<bool> {
         if task.blocked_json.is_some() {
             return Ok(true);
-        }
-        if task.entry_barrier_is_running() {
-            // The state's blocking before_enter hooks are still running. The
-            // status change is visible but the transition has not settled: the
-            // engine clears the barrier (bumping the task version) once they
-            // finish, so a gate decision taken now would race that write.
-            return Ok(false);
         }
         let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid task metadata: {error}"))

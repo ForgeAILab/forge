@@ -185,6 +185,48 @@ impl HookAction for RunCiSteps {
             };
         }
         let mut review_details = json!({ "ci_steps": ci_results });
+        if let Some(attempt) = crate::workflow::engine::durable::current_hook(&ctx.task_id) {
+            for entry in review_details["ci_steps"]
+                .as_array_mut()
+                .expect("CI results array")
+            {
+                entry["step_id"] = json!(attempt.step.id);
+                if attempt.interrupted {
+                    entry["rerun_after_interruption"] = json!(true);
+                }
+                if attempt.interrupted {
+                    let log_ctx = crate::lifecycle::LifecycleHookContext {
+                        event: api_types::LifecycleEvent::BeforeWork,
+                        task_id: ctx.task_id.clone(),
+                        task_title: task.title.clone(),
+                        task_status: ctx.to_state.clone(),
+                        previous_status: ctx.from_state.clone(),
+                        project_id: ctx.project_id.clone(),
+                        project_name: String::new(),
+                        repo_path: String::new(),
+                        worktree_path: None,
+                        agent_id: ctx.agent_id.clone(),
+                        execution_id: ctx.execution_id.clone(),
+                        log_dir: Some(
+                            std::env::temp_dir()
+                                .join("forge")
+                                .join("logs")
+                                .join(&ctx.task_id)
+                                .join("hooks"),
+                        ),
+                        env: Default::default(),
+                    };
+                    let mut log = entry.clone();
+                    log["event"] = json!("review_ci");
+                    log["hook_type"] = json!("script");
+                    crate::lifecycle::LifecycleHookRunner::write_log_entry(
+                        &log_ctx,
+                        entry["index"].as_u64().unwrap_or(0) as usize,
+                        &log,
+                    );
+                }
+            }
+        }
         let now = now_rfc3339();
 
         let user_approval_required =
@@ -371,10 +413,51 @@ impl HookAction for AutoCascadeOnReviewPass {
             Ok(review) => review,
             Err(reason) => return HookResult::Failed { reason },
         };
+        let review_id = latest_review.as_ref().map(|r| r.id.clone());
+        let input = match crate::workflow::engine::durable::hook_effect(
+            &ctx.task_id,
+            "review_pass_input",
+        )
+        .await
+        {
+            Ok(Some(value)) => match serde_json::from_str::<Value>(&value) {
+                Ok(value) => value,
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    }
+                }
+            },
+            Ok(None) => {
+                let value = json!({"review_id":review_id,"had_review_passed":task.review_passed_at.is_some()});
+                if let Err(error) = crate::workflow::engine::durable::record_hook_effect(
+                    &ctx.task_id,
+                    "review_pass_input",
+                    &value,
+                )
+                .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+                value
+            }
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        let had_review_passed = if input["review_id"] == json!(review_id) {
+            input["had_review_passed"].as_bool().unwrap_or(false)
+        } else {
+            task.review_passed_at.is_some()
+        };
         match latest_review {
             Some(review)
                 if review.status == ReviewStatus::Passed
-                    && task.review_passed_at.is_some()
+                    && had_review_passed
                     && !user_approval_required
                     && (!reviewer_assigned || review_has_auditor_verdict(&review)) =>
             {
@@ -416,7 +499,7 @@ impl HookAction for AutoCascadeOnReviewPass {
                 if review.status == ReviewStatus::Failed
                     && Some(review.execution_id.as_str()) == ctx.execution_id.as_deref() =>
             {
-                if task.review_passed_at.is_some() && !review_has_auditor_verdict(&review) {
+                if had_review_passed && !review_has_auditor_verdict(&review) {
                     if let Err(error) = TaskRepo::set_review_passed_at_cas(
                         &*ctx.db,
                         &ctx.task_id,

@@ -176,9 +176,6 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         .entry_barrier_json
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-    let barrier_running = barrier
-        .as_ref()
-        .is_some_and(|barrier| barrier["status"] == "running");
     let barrier_blocked = barrier
         .as_ref()
         .is_some_and(|barrier| barrier["status"] == "blocked");
@@ -217,25 +214,24 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         .latest_review
         .as_ref()
         .is_some_and(|review| review.status == ReviewStatus::Failed);
-    let awaiting_human = !barrier_running
-        && (snapshot
-            .latest_review
-            .as_ref()
-            .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-            || (metadata["awaiting_human"] == true
-                && (task.status != "review" || snapshot.latest_review.is_none()))
-            || (task.status == "review"
-                && snapshot.latest_review.is_none()
-                && !running
-                && state.gate_config.as_ref().is_some_and(|gate| {
-                    gate.requires_user_approval()
-                        && (!gate.optional_when_unassigned()
-                            || role.is_some_and(|role| {
-                                snapshot.role_assignments.iter().any(|assignment| {
-                                    assignment.role_name == role && assignment.assignee_id.is_some()
-                                })
-                            }))
-                })));
+    let awaiting_human = snapshot
+        .latest_review
+        .as_ref()
+        .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
+        || (metadata["awaiting_human"] == true
+            && (task.status != "review" || snapshot.latest_review.is_none()))
+        || (task.status == "review"
+            && snapshot.latest_review.is_none()
+            && !running
+            && state.gate_config.as_ref().is_some_and(|gate| {
+                gate.requires_user_approval()
+                    && (!gate.optional_when_unassigned()
+                        || role.is_some_and(|role| {
+                            snapshot.role_assignments.iter().any(|assignment| {
+                                assignment.role_name == role && assignment.assignee_id.is_some()
+                            })
+                        }))
+            }));
     let target = |trigger| {
         workflow
             .outgoing_trigger_targets(&task.status)
@@ -537,7 +533,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             return offers;
         }
     }
-    if barrier_running || queued {
+    if queued {
         return offers;
     }
     if matches!(
@@ -2148,13 +2144,6 @@ mod tests {
         assert!(offers
             .iter()
             .any(|offer| offer.reason == "entry_barrier_override"));
-        snapshot.task.entry_barrier_json =
-            Some(json!({"status":"running","state":"review"}).to_string());
-        assert_eq!(
-            available_actions(&snapshot).len(),
-            1,
-            "only cancellation while entry checks run"
-        );
         snapshot.task.entry_barrier_json = None;
         snapshot.task.error_annotation =
             Some(json!({"type":"review_needs_owner","blocking_reason":"finding"}).to_string());
@@ -2292,7 +2281,6 @@ mod condition_matrix {
             "failed_json",
             "legacy_annotation",
             "barrier_blocked",
-            "barrier_running",
             "queued",
             "awaiting_human_meta",
             "pr_merge_wait",
@@ -2367,7 +2355,6 @@ mod condition_matrix {
                                             "failed_json" => task.failed_json = Some(json!({"kind":"executor_failed","reason":"fixture"}).to_string()),
                                             "legacy_annotation" => task.error_annotation = Some(json!({"message":"old free-form annotation"}).to_string()),
                                             "barrier_blocked" => task.entry_barrier_json = Some(json!({"status":"blocked","state":state.name}).to_string()),
-                                            "barrier_running" => task.entry_barrier_json = Some(json!({"status":"running","state":state.name}).to_string()),
                                             "queued" => metadata["queued_recovery"] = json!({"id":"q"}),
                                             "awaiting_human_meta" => metadata["awaiting_human"] = json!(true),
                                             "pr_merge_wait" => { metadata["awaiting_human"] = json!(true); metadata["awaiting_human_reason"] = json!("pull_request_merge"); }
@@ -2459,8 +2446,7 @@ mod condition_matrix {
                                         .collect();
                                     let _ = writeln!(full, "{wf_name}\t{}\t{:?}\t{condition}\t{flag}\trev={review_name}\texec={exec_name}\trej_max={exhausted}\t{}", state.name, state.kind, verbs.join(","));
                                     let terminal = state.kind == StateKind::Terminal;
-                                    let in_flight =
-                                        exec_name == "running" || condition == "barrier_running";
+                                    let in_flight = exec_name == "running";
                                     let only_cancel =
                                         offers.iter().all(|offer| offer.action.verb() == "cancel");
                                     let key = format!(

@@ -3900,109 +3900,81 @@ in the compact Task list's existing `workflow_health` projection.
 
 `WorkflowEngine::transition` lifecycle for `A → B`:
 
-1. Load task, check optimistic version, validate that `A` and `B` are defined
-   states in the applicable workflow (undefined current or target rejects with
-   an error enumerating defined state names), then validate the graph edge or
-   implicit cancellation path.
-2. Run filtered `A.before_exit` guards unless `B` is the cancellation target;
-   `FailurePolicy::Block` failures return `GuardRejection` (HTTP 412).
-3. Update `task.status`, increment `version`, write `transition_log`, publish
-   `task.status_changed`.
-4. Run filtered `A.on_exit`, filtered `B.on_enter`, then effective
-   `B.after_enter` hooks. Gate states with `max_rejections` get
-   `check_retry_budget` prepended unless already present.
-5. Backfill `transition_log.hook_results_json`.
-6. If an entry/exit hook returns `HookResult::Cascade`, enqueue a durable
-   `task_step` instead of recursively transitioning. The requested transition
-   returns its own Task snapshot, inline Review, and `pending_steps` count;
-   cascades settle asynchronously. The final state arrives through SSE
-   `task.status_changed` or a later GET. Tests use `TaskService::drain(task_id)`.
+1. Validate the Task version, applicable workflow authority and graph edge.
+2. Run filtered `A.before_exit` guards. Blocking failures reject before commit.
+3. In one writer transaction, update status/version/epoch, write transition_log
+   and task.transitioned, and insert a `hooks` task_step keyed by the log ID.
+   A leased cascade's done acknowledgment shares this same transaction.
+4. Return the Task produced by that CAS, its current Review and pending_steps.
+   Post-commit hooks and their cascades run asynchronously. A transition with
+   hooks immediately has at least one pending step; tests use drain(task_id).
+5. The hook step executes on_exit → before_enter → on_enter → effective
+   after_enter in workflow order, filtered by the committed actor's audience.
+   Gate retry-budget hooks retain their ordering. Board moves also defer
+   before_enter effects; blocked entry retry inserts a fresh hook phase.
+6. Each hook checkpoints its index and full outcome before proceeding. Hook
+   settlement and any discovered cascade enqueue share one transaction, so a
+   crash cannot lose a completed effect's follow-up. Hook failures settle failed
+   with the existing compensation, annotations and owner Advance/Restart offers.
 
-The `task_step` cascade outbox orders rows by a monotonically increasing `seq`
-per Task. Its leased worker lives in `worker_runtime/queue.rs` and is registered
-with the common runtime supervisor. Jobs run in two lanes: eight fast slots and
-four long slots. A step is long only when its target state's hooks include
-`run_merge` or `run_ci_steps`; those can wait on one repository's integration or
-checkout lock for the whole hook. Everything else is fast, including
-`run_before_work_hooks` and the dispatch hooks, which only launch an execution
-(`provider.start` returns once the run is launched). A full long lane therefore
-stalls only merges and CI review checks; other Projects' planning, dispatch,
-reject and terminal cascades keep running. Per-repository head-of-line limits
-inside the long lane are a follow-up (refactor item 3.2): today four steps
-waiting on one repository's lock can still delay another repository's merge.
-Project before-work hooks are user commands that run in a fast slot.
-Only the earliest unfinished row of each Task is eligible, whatever its lane. Claims carry a unique
-owner token and a renewable 60-second lease. A missed in-process commit kick
-falls back to a 250 ms poll; expired claims are reclaimed after a restart. The
-step's `done` write shares the transition's status/version CAS transaction.
-Each hop resolves the current applicable workflow at its own system entry and
-fences that observed Project authority in the CAS. A removed cascade target or newly required approval supersedes visibly rather than applying an old workflow. Its
-lease remains held through the existing inline hook phase, so the next queued
-hop cannot overlap those hooks even in another process.
+The task_step outbox is a leased FIFO per Task. Only the earliest unfinished
+row is eligible. Eight fast slots and four long slots preserve capacity across
+Projects. A hook step is long only if its hooks contain run_merge or
+run_ci_steps, including exit hooks. Dispatch, provisioning and before-work hooks
+are fast. Repository/workspace integration locks remain; a per-target integration
+queue is refactor 3.2. Unique owner tokens and renewable 60-second leases fence
+checkpoint/effect writes. A 250 ms poll backs up commit notifications. Shutdown
+drains for eight seconds within the supervisor's ten-second grace; otherwise
+unfinished leases expire and restart resumes their checkpoints.
 
-Each step fences on a **status epoch**. `task.status_epoch` starts at 0 and an
-`AFTER UPDATE OF status ON task` trigger increments it whenever the status value
-changes, so every writer is covered, direct ones included. The workflow engine's
-status CAS also bumps it for a real self-transition (the default workflow's
-`planning` gate reject re-enters `planning`); board same-column reorders do not.
-A step records `expected_status` and `expected_epoch`, and its CAS requires
-`status = expected_status AND status_epoch = expected_epoch` inside the immediate
-transaction. Steps enqueued in the producing CAS transaction read the epoch after
-that status update. Post-commit producers read the epoch recorded on their own
-`transition_log` row (`transition_log.status_epoch`, written by the engine CAS
-and board moves); a blocked-barrier retry reads it with its version check. Title
-edits, annotation clears, reorders, version-only writes and same-state recovery
-markers never move the epoch, so they never drop a queued cascade. Leaving and
-returning to a status does. A step whose entry has changed becomes `superseded`
-with a durable `transition.step_superseded` event and no transition or retry.
-Rebuilding the `task` table in a future migration must recreate the
-`task_status_epoch` trigger. Producers reserve eligibility until their
-inline hook and service-wrapper writes finish; readiness releases that reserved row without rebinding a version. A lost reservation
-becomes eligible after 60 seconds and is still checked against its recorded
-status and epoch. Transient availability/database failures retry with exponential
-backoff (1–64 seconds, at most eight attempts). Deterministic failures become
-`failed` and persist a `cascade_failed` Task annotation consumed by existing recovery views; loops use `workflow_loop`. An exception from the retained inline hook phase after the CAS
-records `failed` with an explicit "transition committed" annotation; it never
-replays that applied transition. If a later Task entry interrupted the hooks,
-the predecessor remains `done` with its diagnostic and the later entry is not
-annotated. Queue history retains every outcome.
+Hooks use a shared immutable definition of their committed order/config and
+Project authority, rather than repeating complete workflow definitions in rows.
+Completed hooks are skipped on resume. Dispatch records its execution association
+in the same transaction as admission and reuses that execution even if it has
+already finished. Provisioning retains its existing placement/location/input
+checkpoints. Merge checks that the target contains the exact candidate before
+integrating again; merge/rebase outcomes and the recorded rebase target are
+checkpointed. Committed rebase/conflict Git facts reconstruct an interrupted
+handoff; review-authority carry records its hook identity with the Review/carry
+settlement so replay returns the same successful cascade. Conflict-handoff actor
+and marker/path JSON remain unchanged for the hot-spot detector.
 
-Loop detection replaces recursion depth. Within an uninterrupted automatic
-chain, a repeated `(from_status, to_status)` edge or position greater than 64
-parks the Task with `blocked_json`, a recovery annotation, and
-`transition.loop_detected`. Sixty-four exceeds four times the longest legitimate
-nine-hop carry sequence found during inventory. Human/agent/execution entries
-start new chains. A fresh completed CI/Review result is also an execution-result
-boundary: review-authority carry after a rebase may legitimately repeat the
-review-to-merging edge, and the new Review evidence starts a new chain. This is
-recorded using the Review id and update timestamp in the step payload.
+CI and user-defined before-work scripts run **at least once**. A started script
+without a recorded result restarts from the beginning after interruption;
+completed before-work sub-scripts are skipped. The attempt saves its commands and
+environment before running them, so later Project settings cannot rebind script
+checkpoint indexes. These scripts already run on
+entries to planning, in_progress, review and merge_failed: retrying or sending a
+Task back runs them again, so they already must be repeatable and crash resumption
+adds no new requirement. A resumed script's hook log includes
+rerun_after_interruption: true and its step_id; resumed CI command entries carry
+the same evidence. CI may restart the entire check sequence after a crash.
 
-Slice A preserves post-commit hooks. A cascade known before the status CAS
-(including board-move before-enter hooks) is inserted in the same transaction.
-A context-independent completion cascade also declares its intent when it is
-the first reachable hook and no earlier exit/entry hook can intercept it. Its
-hook still runs in its existing post-commit phase; the intent is already durable.
-A cascade learned by post-commit CI, merge, dispatch or entry-retry hooks is
-idempotently enqueued immediately after hook settlement, keyed by the producing
-transition-log id (or the versioned entry-retry identity). Those effects cannot
-be moved into the CAS transaction without moving the hook phase itself; a
-crash before their enqueue remains the explicit slice-B gap. Completion
-serialization, merge-hook single-flight tracking, running entry barriers and
-the stale-merging re-drive remain in place. Direct non-cascade writers remain
-until slice C; queued-step leases alone are not yet a universal Task writer.
+Every hook start/checkpoint and final settlement checks Task status plus
+status_epoch, and the step owner token. The status trigger covers direct writers;
+real workflow self-transitions also increment the epoch. Title edits, annotation
+clears and board reorders do not. A direct writer may move the Task while a hook
+is executing; before the next hook, the old phase settles superseded with
+transition.step_superseded and runs no further hooks. Direct dispatcher, recovery,
+claim and completion writers remain direct until C and are not locked by the
+queue. The running-entry soft lock, completion/merge in-memory slots and two-minute
+merge re-drive are removed. Blocked entry failure metadata remains recoverable.
 
-Initial admission on the background dispatcher enqueues and kicks the leased worker; queued execution entries reserve admission capacity only in the short window before they take their real run slot (see the task-step reservation rules above). This preserves admission ordering
-and stable refusal annotations without delaying REST/MCP cascade responses.
-Recovery replay retains its original command-marker cleanup; version-only cleanup does not change the status epoch.
+Only cascades consume automatic chain positions and edges. Repeated unchanged-
+evidence edges or more than 64 hops park with workflow_loop; fresh Review/rebase
+head evidence starts a new segment. Failed steps retain cascade_failed or the
+existing specific blocking annotation. Failed/parked history and operator status
+keep the established queue retention and recovery contract.
 
-A state with blocking `before_enter` hooks is persisted with a running entry
-barrier until those hooks and the target state's inline `on_enter` dispatch
-settle. Keeping the barrier through dispatch prevents the periodic dispatcher
-from claiming the role before an inline continuation (such as resuming the
-latest worker thread) records its execution. Task responses derive
-`awaiting_human` from the same Task snapshot as the returned optimistic
-`version`; a running barrier therefore cannot expose a gate decision using a
-version that the barrier-clear write is about to invalidate.
+Initial admission counts imminent available/claimed fast role-entry work until a
+real execution holds its slot. A completed status step's remaining lease reserves
+nothing; its hook row owns the dispatch reservation. Completed/deferred dispatch
+checkpoints, superseded entries, backoff, rows behind another step and long CI/merge
+hooks reserve no agent or server capacity. Paused integration retries enqueue and
+keep their marker until durable hook success, rather than interpreting a CAS
+response as completed integration. Producer reservations protect the short
+service-wrapper bookkeeping window and expire after a crash without rebinding
+Task versions.
 
 When `run_ci_steps` finalizes a failed Review during a non-user entry (including
 an entry-barrier retry), the engine clears the barrier and settles the verdict
@@ -4018,37 +3990,25 @@ behavior.
 Active-task recovery also settles a reviewer state's latest Failed Review
 after two minutes from its failure write, when the verdict belongs to the
 current non-user state entry, the Task has no blocker or blocked entry barrier,
-is not awaiting a human, and has no running execution or completion cascade. It claims
+is not awaiting a human, and has no running execution. It claims
 the Task version before using that same failure routing; stale snapshots lose
 the CAS, and a remediation transition or budget blocker makes repeat scans inert.
-An abandoned running entry barrier is cleared if its checks already produced
-that failed verdict; a newer entry retry remains fenced. Recovery rechecks the
+Recovery rechecks the
 latest Review and running executions after claiming the Task snapshot.
 User routing overrides and historical verdicts from earlier entries are excluded.
 If failed-review recovery cannot parse details or conformance, it logs a warning
 and uses plain review-failure remediation without finding routing. Live reviewer
 completion retains strict parsing.
 
-The dispatcher's active-task recovery also re-drives a Gate whose `on_enter`
-runs `run_merge` when its last entry is at least two minutes old, it has no
-blocking annotation or running entry barrier, and no execution, merge hook, or
-completion cascade is running for the Task. Human approval gates and legacy
-pull-request merge waits remain parked until an operator chooses Retry Merge.
-Recovery uses the same versioned, same-state engine entry path as paused
-integration retries, so entry hooks and their normal success/failure cascades
-run again; a version conflict skips the tick. The merge hook is tracked through
-its target-moved rebase handling, so a slow in-flight merge is never raced.
 Integration recognizes a candidate already ancestral to the target as successful
 before comparing its reviewed base with the target tip, retaining the normal
 review-authority and candidate checks. This completes a merge whose terminal
 cascade was interrupted even if sibling merges subsequently moved the target.
 
-Terminal execution settlement is serialized per Task. If two executions for
-the same Task finish while one completion is cascading the workflow, the later
-completion waits and re-evaluates its authority after the first cascade instead
-of being acknowledged and dropped. Workflow hook dispatch clones the
-originating `TaskService`, so nested roles share that coordinator and the same
-provider/outbox dependencies. Recovery treats a terminal workflow-role result
+Terminal execution settlement uses its existing durable claims and CAS authority;
+its post-commit hook effects are serialized and resumed by the per-Task queue.
+Workflow hook dispatch uses the originating TaskService's provider/outbox dependencies.
+Recovery treats a terminal workflow-role result
 whose immutable Project revision is missing or superseded as unsettled and
 dispatches a replacement under current authority; it never converts the
 cascade's intentional no-op into a reconciliation receipt.
@@ -4093,9 +4053,9 @@ renormalized inside that transaction, so revisions are monotonic but not
 gapless.
 
 Same-column moves use the repository transaction directly and skip status
-hooks. Cross-column moves run `before_exit`/`before_enter` guards before the
-write, then reuse engine audit, `on_exit`, `on_enter`, `after_enter`, dispatch,
-and cascade behavior from the committed task. The direct persistence step
+hooks. Cross-column moves run `before_exit` guards before the write, then insert
+and run the same durable `on_exit`, `before_enter`, `on_enter`, `after_enter`,
+dispatch and cascade phase as ordinary transitions. The direct persistence step
 increments the task version exactly once; a later cascade is a separate normal
 transition and can increment it again. Rejected guards write no task, move
 operation, or transition log.
@@ -4886,4 +4846,4 @@ column `task_step.workflow_ref_id`, not a JSON scan.
 
 Initial dispatcher admission only commits/enqueues and kicks the worker. A queued rollback to the initial state finalizes the existing placement-refusal bookkeeping; the dispatcher does not drain chains inline.
 
-Board reorders and recovery markers remain audit rows only; neither changes the status epoch. expected_version remains a diagnostic stamp and is never rebound. Replay-marker cleanup stays with its original recovery writer. Queued role-entry agent references reserve admission capacity only for the short window before the entry takes its slot: a Task's available fast-lane head step, a claimed fast-lane step, and a done step still leased for the inline dispatch after its CAS. Steps behind another step, in retry back-off, under a producer reservation, or waiting for or inside a long-lane merge/CI hook hold no agent or server capacity; if their later dispatch finds the agent full it is skipped and the dispatcher's active-task recovery re-drives it. The dispatcher kicks and continues rather than running the queue. Lane classification is checked again against the resolved workflow at execution and requeues a changed lane before any transition starts.
+Board reorders and recovery markers remain audit rows only; neither changes the status epoch. expected_version remains a diagnostic stamp and is never rebound. Replay-marker cleanup stays with its original recovery writer. Queued role-entry agent references reserve admission capacity only for the short window before the entry takes its slot: a Task's available fast-lane head step, a claimed fast cascade or hook step whose dispatch has no recorded result. Steps behind another step, in retry back-off, under a producer reservation, or waiting for or inside a long-lane merge/CI hook hold no agent or server capacity; if their later dispatch finds the agent full it is skipped and the dispatcher's active-task recovery re-drives it. The dispatcher kicks and continues rather than running the queue. Lane classification is checked again against the resolved workflow at execution and requeues a changed lane before any transition starts.

@@ -2,17 +2,14 @@ use std::{path::PathBuf, sync::Arc};
 
 use api_types::{
     FailurePolicy, GateConfig, HookAudience, HookResultEntry, HookSpec, StateDefinition,
-    StateHooks, StateKind, WorkflowDefinition, WorkflowDispatch, WorkflowExecutionPolicy,
-    WorkflowTrigger, WorkflowTriggerDefinition,
+    StateHooks, StateKind, WorkflowDefinition, WorkflowTrigger, WorkflowTriggerDefinition,
 };
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
-    CreateAgent, CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, DaemonRepo,
-    DaemonStatus, ProjectRepo, RepoRepo, SqliteDb, TaskRepo, TaskRoleAssignmentRepo,
-    TransitionLogRepo, UpdateDaemonReport, UpdateProject, UpsertDaemon, WorkspaceRepo,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, CreateProject, CreateRepo,
+    CreateTask, CreateTaskRoleAssignment, ProjectRepo, RepoRepo, SqliteDb, TaskRepo,
+    TaskRoleAssignmentRepo, TaskStepRepo, TransitionLogRepo, UpdateProject, WorkspaceRepo,
 };
 use events::{EventBus, ForgeEvent};
-use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -198,23 +195,6 @@ fn initialize_git_repo(path: &std::path::Path) {
     std::fs::write(path.join("README.md"), "# Forge\n").expect("README writes");
     run_git(path, &["add", "-A"]);
     run_git(path, &["commit", "-m", "initial commit"]);
-}
-
-struct PendingExecutor;
-
-#[async_trait::async_trait]
-impl TaskExecutor for PendingExecutor {
-    async fn execute(
-        &self,
-        _ctx: ExecutionContext,
-    ) -> std::result::Result<ExecutionResult, ExecutorError> {
-        std::future::pending::<()>().await;
-        unreachable!()
-    }
-
-    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
-        Ok(())
-    }
 }
 
 fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
@@ -1199,6 +1179,8 @@ async fn default_workflow_keeps_user_requested_review_when_unassigned() {
         .await
         .expect("user-requested review gate is entered");
 
+    let result = drain_result(engine(db.clone(), Arc::new(EventBus::new(32))), result).await;
+
     assert_eq!(result.task.status.to_string(), default_states::REVIEW);
     let stored = TaskRepo::get_by_id(&*db, task_id, false)
         .await
@@ -1401,6 +1383,8 @@ async fn effect_failure_log_policy_continues() {
         .await
         .expect("transition succeeds despite logged effect failure");
 
+    let result = drain_result(engine(db.clone(), Arc::new(EventBus::new(32))), result).await;
+
     assert_eq!(result.task.status.to_string(), default_states::IN_PROGRESS);
     let results = hook_results(&db, task_id).await;
     assert!(results.iter().any(|entry| {
@@ -1442,8 +1426,13 @@ async fn dispatch_failure_entering_active_state_rolls_task_back_to_initial() {
         .await
         .expect("transition succeeds");
 
-    assert!(result.cascaded);
     let result = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
+    assert!(db
+        .task_steps(task_id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.kind == "cascade"));
     assert_eq!(
         result.task.status.to_string(),
         default_states::TODO,
@@ -1512,207 +1501,6 @@ async fn dispatch_failure_entering_active_state_rolls_task_back_to_initial() {
 }
 
 #[tokio::test]
-async fn entry_barrier_stays_running_through_inline_role_dispatch() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let task_id = "task-entry-barrier-inline-dispatch";
-    let agent_id = "agent-entry-barrier-inline-dispatch";
-    let repo_dir = TempDir::new().expect("repo dir creates");
-    let workspace_root = TempDir::new().expect("workspace root creates");
-    initialize_git_repo(repo_dir.path());
-    seed_project_repo_and_task(&db, task_id, "review").await;
-
-    let task = TaskRepo::get_by_id(&*db, task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let project = ProjectRepo::get_by_id(&*db, &task.project_id)
-        .await
-        .expect("project loads")
-        .expect("project exists");
-    let repo_id = project
-        .primary_repo_id
-        .as_deref()
-        .expect("fixture project has a primary repo");
-    sqlx::query(
-        "UPDATE repo SET local_path = ?, remote_url = ?, default_branch = 'main' WHERE id = ?",
-    )
-    .bind(repo_dir.path().to_string_lossy().as_ref())
-    .bind(repo_dir.path().to_string_lossy().as_ref())
-    .bind(repo_id)
-    .execute(db.pool())
-    .await
-    .expect("fixture repo becomes local");
-
-    let now = now_rfc3339();
-    let daemon_id = "daemon-entry-barrier-inline-dispatch";
-    DaemonRepo::upsert_by_machine_id(
-        &*db,
-        UpsertDaemon {
-            max_concurrent_runs: None,
-            id: daemon_id.to_owned(),
-            machine_id: crate::embedded_daemon::embedded_machine_id(),
-            hostname: "test-host".to_owned(),
-            os: "linux".to_owned(),
-            arch: "x86_64".to_owned(),
-            agent_version: None,
-            labels_json: "{}".to_owned(),
-            status: DaemonStatus::Online,
-            registration_token_hash: None,
-            owner_id: None,
-            visibility: "global".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("daemon creates");
-    DaemonRepo::update_report(
-        &*db,
-        UpdateDaemonReport {
-            max_concurrent_runs: None,
-            id: daemon_id.to_owned(),
-            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
-            labels_json: None,
-            status: DaemonStatus::Online,
-            last_report_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("daemon report updates");
-    AgentRepo::create(
-        &*db,
-        CreateAgent {
-            id: agent_id.to_owned(),
-            name: "entry-barrier-agent".to_owned(),
-            description: None,
-            executor_type: "shell".to_owned(),
-            model: None,
-            reasoning_effort: None,
-            permission_policy: None,
-            prompt_template: None,
-            capabilities_json: "[]".to_owned(),
-            config_json: "{}".to_owned(),
-            credential_ref: None,
-            daemon_id: Some(daemon_id.to_owned()),
-            max_concurrent_tasks: 1,
-            heartbeat_interval_seconds: 30,
-            max_missed_heartbeats: 3,
-            status: AgentStatus::Idle,
-            last_heartbeat_at: None,
-            is_default: false,
-            paused: false,
-            owner_id: None,
-            visibility: "global".to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("agent creates");
-    assign_agent_role(&db, task_id, default_roles::WORKER, agent_id).await;
-
-    let review = with_trigger(
-        state("review", StateKind::Gate, None, StateHooks::default()),
-        WorkflowTrigger::Reject,
-        "working",
-    );
-    let mut working = state(
-        "working",
-        StateKind::Active,
-        Some(default_roles::WORKER),
-        StateHooks {
-            before_enter: vec![hook("run_before_work_hooks", FailurePolicy::Block)],
-            on_enter: vec![hook("dispatch_role_agent", FailurePolicy::Log)],
-            ..StateHooks::default()
-        },
-    );
-    working.dispatch = Some(WorkflowDispatch {
-        builder: None,
-        execution_policy: Some(WorkflowExecutionPolicy::ResumeLatestTargetRoleThread),
-        prompt: None,
-    });
-    let workflow = WorkflowDefinition {
-        roles: Vec::new(),
-        states: vec![
-            state("ready", StateKind::Initial, None, StateHooks::default()),
-            review,
-            working,
-        ],
-        configuration: Vec::new(),
-        cancellation_state: None,
-    };
-    ProjectRepo::update_workflow(
-        &*db,
-        &project.id,
-        &serde_json::to_string(&workflow).expect("workflow serializes"),
-        None,
-        project.version,
-        &now_rfc3339(),
-    )
-    .await
-    .expect("project workflow updates");
-
-    // This turns the former scheduling window into a deterministic failure:
-    // execution admission may commit only while the target state's entry
-    // barrier is still present. The engine clears it after `on_enter` settles.
-    sqlx::query(
-        "CREATE TRIGGER require_entry_barrier_during_inline_dispatch
-         BEFORE INSERT ON execution
-         WHEN NEW.task_id = 'task-entry-barrier-inline-dispatch'
-          AND (SELECT entry_barrier_json FROM task WHERE id = NEW.task_id) IS NULL
-         BEGIN
-           SELECT RAISE(ABORT, 'entry barrier cleared before inline dispatch');
-         END",
-    )
-    .execute(db.pool())
-    .await
-    .expect("entry-barrier assertion trigger creates");
-
-    let mut eng = engine(Arc::clone(&db), event_bus);
-    let workspace_root = workspace_root.path().to_path_buf();
-    eng.task_service = eng
-        .task_service
-        .clone()
-        .with_task_executor(Arc::new(PendingExecutor))
-        .with_workspace_root(workspace_root.clone());
-    eng.workspace_backend_router = eng.task_service.workspace_backend_router();
-    eng.workspace_root = workspace_root;
-    let result = eng
-        .transition(
-            task_id,
-            "working",
-            task.version,
-            &workflow,
-            &api_types::Actor::user(api_types::UserActionSource::Test),
-            "human requested changes",
-            true,
-        )
-        .await
-        .expect("inline dispatch settles before the entry barrier clears");
-
-    let results = hook_results(&db, task_id).await;
-    assert_eq!(
-        result.task.status, "working",
-        "inline dispatch hook results: {results:?}; annotation: {:?}",
-        result.task.error_annotation
-    );
-    assert!(result.task.entry_barrier_json.is_none());
-    let running_execution_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
-    )
-    .bind(task_id)
-    .fetch_one(db.pool())
-    .await
-    .expect("running execution count loads");
-    assert_eq!(running_execution_count, 1);
-    assert!(results.iter().any(|entry| {
-        entry.phase == "on_enter" && entry.action == "dispatch_role_agent" && entry.outcome == "ok"
-    }));
-}
-
-#[tokio::test]
 async fn successful_dispatch_clears_stale_dispatch_failure_annotation() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -1751,6 +1539,8 @@ async fn successful_dispatch_clears_stale_dispatch_failure_annotation() {
         )
         .await
         .expect("transition succeeds");
+
+    let result = drain_result(engine(db.clone(), Arc::new(EventBus::new(32))), result).await;
 
     assert_eq!(result.task.status.to_string(), default_states::IN_PROGRESS);
     let task = TaskRepo::get_by_id(&*db, task_id, false)
@@ -1830,6 +1620,8 @@ async fn cancellation_implicit_edge() {
         )
         .await
         .expect("implicit cancellation transition succeeds");
+
+    let result = drain_result(engine(db.clone(), Arc::new(EventBus::new(32))), result).await;
 
     assert_eq!(result.task.status.to_string(), default_states::CANCELLED);
     let results = hook_results(&db, task_id).await;
@@ -2748,6 +2540,7 @@ async fn system_review_ci_failure_records_review_budget_exhausted_blocker() {
         )
         .await
         .unwrap();
+    let result = drain_result(fixture.engine.clone(), result).await;
     assert_eq!(result.task.status, "review");
     assert!(result.task.entry_barrier_json.is_none());
     assert!(result.task.blocked_json.is_some());
@@ -2783,9 +2576,16 @@ async fn user_review_ci_success_still_waits_for_human() {
         )
         .await
         .unwrap();
+    let result = drain_result(fixture.engine.clone(), result).await;
     assert_eq!(result.task.status, "review");
     assert!(result.task.entry_barrier_json.is_none());
-    assert!(!result.cascaded);
+    assert!(
+        !db::TaskStepRepo::task_steps(&*fixture.db, &fixture.task.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.kind == "cascade")
+    );
     let review = result.review.unwrap();
     assert_eq!(review.status, db::ReviewStatus::AwaitingHuman);
     let details: serde_json::Value = serde_json::from_str(&review.step_results_json).unwrap();
@@ -2818,7 +2618,11 @@ async fn user_approval_gate_passing_hooks_pauses_forward_cascade_for_human() {
 
     assert_eq!(result.task.status, "review");
     assert!(result.task.entry_barrier_json.is_none());
-    assert!(!result.cascaded);
+    assert!(!db::TaskStepRepo::task_steps(&*db, &task_id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.kind == "cascade"));
     let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
         .await
         .expect("transition logs load");
@@ -2917,6 +2721,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
         )
         .await
         .expect("coding → review");
+    let result = drain_result(eng.clone(), result).await;
     assert_eq!(result.task.status, "review");
 
     let transition_logs = TransitionLogRepo::list_by_task(&*db, &task_id)
@@ -3963,6 +3768,7 @@ async fn system_review_ci_placement_error_retries_without_review_rejection() {
         )
         .await
         .unwrap();
+    let result = drain_result(fixture.engine.clone(), result).await;
     assert_eq!(result.task.status, "review");
     assert!(result.review.is_none());
     let annotation: serde_json::Value =
@@ -3991,6 +3797,7 @@ async fn system_review_ci_placement_error_retries_without_review_rejection() {
         )
         .await
         .unwrap();
+    let retried = drain_result(fixture.engine.clone(), retried).await;
     assert!(retried.task.error_annotation.is_none());
     assert!(retried.task.entry_barrier_json.is_none());
     assert_eq!(
@@ -4108,6 +3915,7 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
         )
         .await
         .unwrap();
+    result = drain_result(fixture.engine.clone(), result).await;
     let placement = db::WorkspacePlacementRepo::get_for_task(&*fixture.db, &fixture.task.id)
         .await
         .unwrap()
@@ -4130,6 +3938,7 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
             )
             .await
             .unwrap();
+        result = drain_result(fixture.engine.clone(), result).await;
         assert!(
             result.task.blocked_json.is_none(),
             "an owner outage waits for max_disconnect"
@@ -4177,6 +3986,7 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
             )
             .await
             .unwrap();
+        result = drain_result(fixture.engine.clone(), result).await;
     }
     let annotation: serde_json::Value =
         serde_json::from_str(result.task.error_annotation.as_deref().unwrap()).unwrap();
@@ -4602,143 +4412,6 @@ async fn dispatch_failure_upgrade_wake_preserves_a_concurrent_manual_deferral() 
     .is_some());
 }
 
-#[tokio::test]
-async fn declared_pure_cascade_enqueue_failure_rolls_back_producing_transition() {
-    let db = Arc::new(sqlite_db().await);
-    let bus = Arc::new(EventBus::new(16));
-    let id = "atomic-declared";
-    seed_project_repo_and_task(&db, id, "start").await;
-    sqlx::query("CREATE TRIGGER reject_enqueue BEFORE INSERT ON task_step BEGIN SELECT RAISE(ABORT,'injected enqueue failure'); END")
-        .execute(db.pool()).await.unwrap();
-    let result = engine(db.clone(), bus)
-        .transition(
-            id,
-            "step_0",
-            1,
-            &cascade_chain_workflow(1),
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-            "start",
-            false,
-        )
-        .await;
-    assert!(result.is_err());
-    let task = TaskRepo::get_by_id(&*db, id, false).await.unwrap().unwrap();
-    assert_eq!(task.status, "start");
-    assert_eq!(task.version, 1);
-    assert!(TransitionLogRepo::list_by_task(&*db, id)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(db::TaskStepRepo::task_steps(&*db, id)
-        .await
-        .unwrap()
-        .is_empty());
-}
-
-#[tokio::test]
-async fn periodic_warning_budgets_finish_inline_ci_and_clear_entry_barriers() {
-    for (name, component) in [
-        (
-            "task-dispatcher",
-            api_types::SystemComponent::TaskDispatcher,
-        ),
-        (
-            "heartbeat-monitor",
-            api_types::SystemComponent::HeartbeatMonitor,
-        ),
-    ] {
-        let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
-        let gate = TempDir::new().unwrap();
-        let started = gate.path().join("started");
-        let release = gate.path().join("release");
-        let finished = gate.path().join("finished");
-        let quote = |path: &std::path::Path| {
-            format!("'{}'", path.to_str().unwrap().replace('\'', "'\"'\"'"))
-        };
-        let step = format!(
-            "touch {}; while [ ! -f {} ] && [ -d {} ]; do sleep 0.01; done; touch {}",
-            quote(&started),
-            quote(&release),
-            quote(gate.path()),
-            quote(&finished)
-        );
-        sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
-            .bind(json!({"retry_budgets":{"review":3}, "review":{"ci_steps":[step]}}).to_string())
-            .bind(&fixture.task.id)
-            .execute(fixture.db.pool())
-            .await
-            .unwrap();
-        let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
-            .await
-            .unwrap()
-            .unwrap();
-        let authority = fixture.workflow_authority().await;
-        let db = Arc::clone(&fixture.db);
-        let id = task.id.clone();
-        let registry = crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db));
-        let worker = registry
-            .worker(name)
-            .with_stall_budget(std::time::Duration::from_millis(100));
-        let handle = tokio::spawn(async move {
-            let _fixture_roots = (&fixture._repo_dir, &fixture._workspace_root);
-            worker
-                .tick(fixture.engine.transition_with_authority(
-                    &task.id,
-                    "review",
-                    task.version,
-                    &fixture.workflow,
-                    &api_types::Actor::system(component),
-                    "periodic warning budget regression",
-                    false,
-                    authority,
-                ))
-                .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let state = TaskRepo::get_by_id(&*db, &id, false)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let health = registry.status().await.unwrap();
-                if started.exists()
-                    && state.entry_barrier_is_running()
-                    && health[0]
-                        .last_error
-                        .as_deref()
-                        .is_some_and(|error| error.contains("tick running longer than 100ms"))
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(
-            !handle.is_finished(),
-            "an over-budget transition is still awaited"
-        );
-        std::fs::write(&release, "release").unwrap();
-        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(completed.task.entry_barrier_json.is_none());
-        assert!(
-            finished.exists(),
-            "CI completed before the transition returned"
-        );
-        assert!(registry.status().await.unwrap()[0].last_error.is_none());
-        let persisted = TaskRepo::get_by_id(&*db, &id, false)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!persisted.entry_barrier_is_running());
-    }
-}
-
 /// Audit 2.3a: with no ci_steps and no reviewer (the default workflow's
 /// "unconfigured review"), one target-moved refresh round repeats
 /// review -> merging inside one chain without creating a Review row, so the
@@ -4839,3 +4512,6 @@ async fn audit_23a_unconfigured_review_target_moved_round_keeps_running() {
 
 #[path = "tests/audit_23a_worker.rs"]
 mod audit_worker;
+
+#[path = "tests/durable_23b.rs"]
+mod durable_23b;

@@ -118,7 +118,22 @@ impl DaemonWorkspaceBackend {
                 validate_branch(&owned.path, &target_branch).await?;
                 let target =
                     resolve_commit(&owned.path, &format!("refs/heads/{target_branch}")).await?;
-                if !git::is_worktree_clean(&owned.path)
+                if git::detect_rebase_in_progress(&owned.path)
+                    .await
+                    .map_err(git_error)?
+                    && handoff_conflicts
+                {
+                    match git::continue_rebase_keeping_conflicts(&owned.path).await {
+                        Ok(conflict_paths) => WorkspaceOwnerOperationOutcome::Conflict {
+                            details: "resumed interrupted rebase".into(),
+                            conflict_paths,
+                        },
+                        Err(git::GitError::UnsupportedRebaseConflict { details }) => {
+                            WorkspaceOwnerOperationOutcome::UnsupportedConflict { details }
+                        }
+                        Err(error) => return Err(git_error(error)),
+                    }
+                } else if !git::is_worktree_clean(&owned.path)
                     .await
                     .map_err(git_error)?
                 {

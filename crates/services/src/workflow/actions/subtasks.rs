@@ -11,6 +11,21 @@ pub struct SatisfyDependents;
 #[async_trait]
 impl HookAction for SatisfyDependents {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        if let Ok(Some(task)) = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false).await {
+            if ctx.workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal)
+                && ctx.workflow.cancellation_state.as_deref() != Some(task.status.as_str())
+            {
+                if let Err(error) = ctx
+                    .task_service
+                    .wake_dependents_of_completed_task(&task)
+                    .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+        }
         let dependents = match TaskDependencyRepo::list_dependents(&*ctx.db, &ctx.task_id).await {
             Ok(dependents) => dependents,
             Err(error) => {

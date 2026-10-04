@@ -1444,3 +1444,7 @@ their credentials. `forge-daemon`, `forge-ctl daemon link` and
 `forge-ctl daemon start` accept `--build-jobs-per-run N` and `--run-nice N` to
 override the file. This is daemon-local policy, with no transport override and
 no daemon protocol change. Remote policy facts are not reported.
+
+## Before-work hooks
+
+Before-work hooks may run more than once, including after an interrupted step resumes, and must be safe to repeat.

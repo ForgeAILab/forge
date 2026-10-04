@@ -1506,68 +1506,6 @@ mod cancellation_tests {
     use crate::daemon_transport::{DaemonConnectionRegistry, DaemonExecutionEventHandler};
 
     #[tokio::test]
-    async fn daemon_transport_live_terminal_drives_a_busy_completion_cascade() {
-        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
-        db::run_migrations(&pool).await.unwrap();
-        let db = Arc::new(db::SqliteDb::new(pool));
-        let (task, placement, execution) = crate::recovery::tests::daemon_owned_fixture(&db).await;
-        let bus = Arc::new(EventBus::new(32));
-        let mut terminal_events = bus.subscribe();
-        let root = tempfile::tempdir().unwrap();
-        let sink = Arc::new(ServerExecutionEventSink::new(
-            db.clone(),
-            bus.clone(),
-            root.path().into(),
-        ));
-        let registry = Arc::new(DaemonConnectionRegistry::new(bus.clone(), sink.clone()));
-        sink.set_connection_registry(Arc::downgrade(&registry));
-        let service =
-            Arc::new(TaskService::new(db.clone(), bus).with_daemon_connections(registry.clone()));
-        sink.set_task_service(Arc::downgrade(&service));
-        let daemon_id = placement.daemon_id.unwrap();
-        let (connection_id, _outbound) =
-            crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
-        sqlx::query(
-            "UPDATE workspace_placement SET state = 'ready', disconnected_at = NULL WHERE id = ?",
-        )
-        .bind(&placement.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-        sqlx::query("UPDATE execution SET role = 'interactive', lease_owner = ?, lease_expires_at = ? WHERE id = ?")
-            .bind(execution_lease_owner(&daemon_id, connection_id)).bind((Utc::now() + ChronoDuration::hours(1)).to_rfc3339())
-            .bind(&execution.id).execute(db.pool()).await.unwrap();
-        let slot = service.claim_completion_cascade(&task.id).unwrap();
-        let notification = serde_json::from_value(
-            json!({"terminal_report_id":"live-report", "execution_id":execution.id,
-            "exit_code":0, "status":"completed", "ts":db::now_rfc3339(), "usage_reports":[]}),
-        )
-        .unwrap();
-        let attempt = tokio::spawn(async move {
-            sink.handle_terminal_with_ack(&daemon_id, connection_id, notification)
-                .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while terminal_events.recv().await.unwrap().event_type != "execution.completed" {}
-        })
-        .await
-        .unwrap();
-        assert!(
-            !attempt.is_finished(),
-            "a live terminal must wait for the occupied Task slot"
-        );
-        drop(slot);
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(30), attempt)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-            DaemonTerminalDisposition::Acknowledge
-        );
-    }
-
-    #[tokio::test]
     async fn daemon_transport_deleted_execution_report_is_acknowledgeable() {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();

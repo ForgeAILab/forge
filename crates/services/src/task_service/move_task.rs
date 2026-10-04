@@ -321,7 +321,7 @@ impl TaskService {
         let persistence = TaskBoardRepo::compare_and_move_task(
             &*self.db,
             CompareAndMoveTask {
-                cascade_step: None,
+                post_commit_step: None,
                 operation_id: request.operation_id.clone(),
                 project_id: task.project_id.clone(),
                 task_id: task.id.clone(),

@@ -317,6 +317,18 @@ impl ResolvedWorkspace {
                 .await;
         }
         let path = self.embedded_path()?;
+        if git::detect_rebase_in_progress(&path).await? && handoff_conflicts {
+            return match git::continue_rebase_keeping_conflicts(&path).await {
+                Ok(conflict_paths) => Ok(WorkspaceOwnerOperationOutcome::Conflict {
+                    details: "resumed interrupted rebase".into(),
+                    conflict_paths,
+                }),
+                Err(git::GitError::UnsupportedRebaseConflict { details }) => {
+                    Ok(WorkspaceOwnerOperationOutcome::UnsupportedConflict { details })
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
         if !git::is_worktree_clean(&path).await? {
             return Ok(WorkspaceOwnerOperationOutcome::Dirty {
                 files: git::status_porcelain(&path).await?,

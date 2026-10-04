@@ -2655,22 +2655,19 @@ separate `release` command.
 ### Transition responses and queued cascades
 
 `POST /api/v1/tasks/{id}/transition` returns the Task snapshot produced by the
-requested transition, its inline Review (or `null`), and `pending_steps` (the
-number of pending or claimed cascade rows for that Task at response preparation).
-It does not wait for those follow-up transitions. For example, entering
+requested transition, its current Review (or `null`), and `pending_steps` (the
+number of pending or claimed hook and cascade rows for that Task at response preparation).
+The status CAS inserts a durable hook step; the response does not wait for hooks or their follow-up transitions. A transition with post-commit hooks therefore has at least one pending step immediately after its CAS. For example, entering
 `planning` without a planner returns `task.status = "planning"` and
 `pending_steps = 1`; the queued hop later enters `in_progress`. Observe subsequent
 `task.status_changed` SSE events or issue a later `GET /api/v1/tasks/{id}` for the
-settled state. `pending_steps = 0` does not mean settled: a done step can still
-be running inline hooks and enqueue more steps. It is a snapshot, not a promise
+settled state. `pending_steps = 0` is a snapshot, not a promise
 that future agent or execution actions will never enqueue more work. Failed,
 parked, superseded and done rows do not count as pending.
 
 `forge_transition_task` retains its Task-with-offers result and adds the same
 `pending_steps` integer. The returned Task belongs to the requested transition;
-follow-up cascades are asynchronous on both REST and MCP. In this first outbox
-slice, the requested transition still runs its existing inline post-commit
-hooks (including CI and merge); moving that phase off requests is slice B.
+post-commit hooks (including CI, merge and dispatch) and follow-up cascades are asynchronous on both REST and MCP. Hook outcomes are checkpointed; interrupted CI and user scripts may run again after restart.
 
 ## Task hierarchy, workspaces, and prerequisite dependencies
 

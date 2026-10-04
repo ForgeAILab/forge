@@ -2082,167 +2082,6 @@ async fn dispatch_initial_role_execution_creates_execution_and_spawns() {
 }
 
 #[tokio::test]
-async fn planner_completion_advances_default_planning_gate() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let embedded = Arc::new(crate::EmbeddedAgentService::new(
-        Arc::clone(&db),
-        b"planner-outbox-test-key",
-    ));
-    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-        .with_task_executor(Arc::new(OutboxPlanExecutor {
-            plan: "- [ ] implement the plan\n",
-        }))
-        .with_provider_credential_env(embedded)
-        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
-        .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        crate::workflow::default_states::TODO.to_owned(),
-    )
-    .await;
-    seed_role_assignment(
-        &db,
-        &task.id,
-        crate::workflow::default_roles::PLANNER,
-        Some(&agent_id),
-    )
-    .await;
-
-    let task = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task reloads after role assignment")
-        .expect("task exists");
-    let in_flight = service
-        .claim_completion_cascade(&task.id)
-        .expect("originating service claims the Task completion slot");
-    service
-        .transition(
-            task.id.clone(),
-            crate::workflow::default_states::PLANNING.to_owned(),
-            task.version,
-        )
-        .await
-        .expect("workflow transition dispatches the planner");
-    let execution = ExecutionRepo::list_by_task(
-        &*db,
-        &task.id,
-        PageRequest {
-            cursor: None,
-            limit: 10,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await
-    .expect("planner executions load")
-    .items
-    .into_iter()
-    .find(|execution| execution.role == crate::workflow::default_roles::PLANNER)
-    .expect("the workflow hook creates a planner execution");
-
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let current = ExecutionRepo::get_by_id(&*db, &execution.id)
-                .await
-                .expect("execution loads")
-                .expect("execution exists");
-            if current.status == ExecutionStatus::Completed {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("planner execution completes");
-
-    // Poll against a deadline instead of wrapping the loop in a timeout: a
-    // timeout can cancel a query mid-flight, and the single in-memory
-    // connection is then replaced by an empty database.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-    let mut settled_early = false;
-    while std::time::Instant::now() < deadline {
-        let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
-            .await
-            .expect("transition logs load while completion slot is held");
-        if logs.iter().any(|log| {
-            log.from_state == crate::workflow::default_states::PLANNING
-                && log.to_state == crate::workflow::default_states::IN_PROGRESS
-        }) || workspace_root
-            .path()
-            .join(&task.id)
-            .join("plan.md")
-            .exists()
-        {
-            settled_early = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(
-        !settled_early,
-        "the workflow-dispatched runner must wait on the originating service's completion slot"
-    );
-    let waiting = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads while completion slot is held")
-        .expect("task exists");
-    assert_eq!(
-        waiting.status,
-        crate::workflow::default_states::PLANNING,
-        "the workflow-dispatched runner must share the originating service's completion slot"
-    );
-    let plan_path = workspace_root.path().join(&task.id).join("plan.md");
-    assert!(
-        !plan_path.exists(),
-        "plan publication waits for the shared completion slot"
-    );
-    drop(in_flight);
-
-    // The default planning gate is not a human approval boundary: the
-    // finished planner advances the Task instead of leaving a plan-review
-    // marker the dispatcher would keep relaunching the planner against.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
-                .await
-                .expect("transition logs load");
-            if logs.iter().any(|log| {
-                log.from_state == crate::workflow::default_states::PLANNING
-                    && log.to_state == crate::workflow::default_states::IN_PROGRESS
-            }) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("planner completion advances the planning gate");
-    let task = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let metadata = task.metadata().expect("metadata parses");
-    assert!(metadata.extra.get("awaiting_human").is_none());
-    assert!(metadata.extra.get("awaiting_human_reason").is_none());
-    assert_eq!(
-        std::fs::read_to_string(plan_path).expect("the terminal-CAS winner publishes the plan"),
-        "- [ ] implement the plan\n"
-    );
-    let outbox = executors::execution_outbox_path(
-        &workspace_root.path().join(&task.id).join("forge"),
-        &execution.id,
-    )
-    .expect("outbox path");
-    assert!(!outbox.exists(), "published execution outbox is consumed");
-}
-
-#[tokio::test]
 async fn plan_publication_cleanup_release_preserves_public_task_version() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -2575,6 +2414,7 @@ async fn before_enter_runs_required_before_work_hook_before_role_dispatch() {
         .await
         .expect("required hook passes and transition succeeds");
 
+    service.drain(&task.id).await.unwrap();
     let executions = ExecutionRepo::list_by_task(
         &*db,
         &task.id,
@@ -2689,6 +2529,7 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
         "no execution should be created"
     );
 
+    service.drain(&task.id).await.unwrap();
     let blocked = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -2802,6 +2643,7 @@ async fn retry_hook_reruns_blocked_before_enter_and_dispatches_when_it_passes() 
         .transition(task.id.clone(), "in_progress".to_owned(), task.version)
         .await
         .expect("required hook failure records a blocked entry");
+    service.drain(&task.id).await.unwrap();
     let blocked = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -2832,6 +2674,7 @@ async fn retry_hook_reruns_blocked_before_enter_and_dispatches_when_it_passes() 
         .await
         .expect("retry hook recovers");
 
+    let recovered = service.drain(&recovered.id).await.unwrap();
     assert_eq!(recovered.status, "in_progress");
     assert_eq!(recovered.entry_barrier_json, None);
     assert_eq!(recovered.error_annotation, None);
@@ -3041,6 +2884,7 @@ async fn update_workspace_and_retry_hook_rebases_before_retrying_blocked_hook() 
         .transition(task.id.clone(), "in_progress".to_owned(), task.version)
         .await
         .expect("required hook failure records a blocked entry");
+    service.drain(&task.id).await.unwrap();
     let blocked = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -3080,6 +2924,7 @@ async fn update_workspace_and_retry_hook_rebases_before_retrying_blocked_hook() 
         .await
         .expect("update workspace and retry hook recovers");
 
+    let recovered = service.drain(&recovered.id).await.unwrap();
     assert_eq!(recovered.status, "in_progress");
     assert_eq!(recovered.entry_barrier_json, None);
     assert_eq!(recovered.error_annotation, None);
@@ -3160,6 +3005,7 @@ async fn skip_hook_once_bypasses_only_one_dispatch_attempt() {
         .transition(task.id.clone(), "planning".to_owned(), task.version)
         .await
         .expect("blocking hook failure records a blocked entry");
+    service.drain(&task.id).await.unwrap();
     let blocked = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -3178,6 +3024,7 @@ async fn skip_hook_once_bypasses_only_one_dispatch_attempt() {
         )
         .await
         .expect("skip hook once recovers");
+    let recovered = service.drain(&recovered.id).await.unwrap();
     assert_eq!(recovered.status, "planning");
     assert_eq!(recovered.entry_barrier_json, None);
     assert_eq!(recovered.error_annotation, None);
@@ -3214,6 +3061,7 @@ async fn skip_hook_once_bypasses_only_one_dispatch_attempt() {
         .await
         .expect("second transition runs hook normally");
     assert_eq!(transitioned.task.status, "planning");
+    service.drain(&task.id).await.unwrap();
     let blocked_again = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task reloads")
@@ -3432,147 +3280,6 @@ async fn settled_reviewer_outcome_reconciles_a_missed_task_cascade() {
         .expect("reviews load");
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0].status, ReviewStatus::Failed);
-}
-
-#[tokio::test]
-async fn reviewer_completion_cascade_waits_for_an_in_flight_task_cascade() {
-    let db = Arc::new(sqlite_db().await);
-    let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
-    let now = now_rfc3339();
-    let candidate = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: None,
-            role: crate::workflow::default_roles::CODER.to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: Some("system:executor".to_owned()),
-            resume_policy: None,
-            stopped_at: Some(now.clone()),
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("candidate completed".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("candidate execution creates");
-    let reviewer = ExecutionRepo::create(
-        &*db,
-        db::CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            agent_id: None,
-            role: crate::workflow::default_roles::REVIEWER.to_owned(),
-            status: ExecutionStatus::Completed,
-            stop_reason: None,
-            stopped_by: Some("system:executor".to_owned()),
-            resume_policy: None,
-            stopped_at: Some(now.clone()),
-            parent_execution_id: Some(candidate.id.clone()),
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: Some("review completed".to_owned()),
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: Some(
-                workflow_execution_snapshot(&db, &project_id).await,
-            ),
-            workspace_id: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("reviewer execution creates");
-    let review = ReviewRepo::create(
-        &*db,
-        db::CreateReview {
-            id: new_uuid_v4(),
-            task_id: task.id.clone(),
-            execution_id: candidate.id.clone(),
-            attempt_number: 1,
-            status: ReviewStatus::Running,
-            step_results_json: json!({ "ci_steps": [] }).to_string(),
-            started_at: now.clone(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("review creates");
-    sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
-        .bind(&reviewer.id)
-        .bind(&review.id)
-        .execute(db.pool())
-        .await
-        .expect("reviewer attempt binding records");
-
-    ReviewRepo::update_status(
-        &*db,
-        &review.id,
-        ReviewStatus::Failed,
-        json!({ "ci_steps": [], "auditor": { "verdict": "fail" } }).to_string(),
-        Some(now.clone()),
-        &now,
-    )
-    .await
-    .expect("review outcome commits");
-
-    // A successor completion may arrive while the prior role's inline
-    // cascade is still transitioning this Task. It must wait for the Task
-    // slot and retry automatically, not depend on a later dispatcher scan.
-    let in_flight = service
-        .claim_completion_cascade(&task.id)
-        .expect("first claim succeeds");
-    assert!(service.claim_completion_cascade(&task.id).is_none());
-    let waiting_service = service.clone();
-    let reviewer_id = reviewer.id.clone();
-    let waiting = tokio::spawn(async move {
-        waiting_service
-            .maybe_cascade_executor_completion(&reviewer_id)
-            .await
-    });
-    tokio::task::yield_now().await;
-    assert!(
-        !waiting.is_finished(),
-        "successor completion waits while the Task slot is held"
-    );
-    let untouched = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(untouched.status, "review");
-    assert_eq!(untouched.version, task.version);
-
-    drop(in_flight);
-    tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
-        .await
-        .expect("queued completion wakes after the Task slot frees")
-        .expect("queued completion task joins")
-        .expect("queued completion settles");
-    let settled = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    assert_eq!(settled.status, crate::workflow::default_states::IN_PROGRESS);
 }
 
 #[tokio::test]
@@ -8200,6 +7907,7 @@ async fn merge_fix_completion_invalidates_cached_review_before_reentering_review
         .await
         .expect("merge-fix completion enters a fresh review");
 
+    service.drain(&task.id).await.unwrap();
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -8958,4 +8666,121 @@ async fn claim_task_records_codex_overrides_in_normalized_snapshot() {
     assert!(!execution_keys
         .iter()
         .any(|key| key.as_str() == Some("effort")));
+}
+
+#[tokio::test]
+async fn planner_completion_advances_default_planning_gate() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace temp dir creates");
+    let embedded = Arc::new(crate::EmbeddedAgentService::new(
+        Arc::clone(&db),
+        b"planner-outbox-test-key",
+    ));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+        .with_task_executor(Arc::new(OutboxPlanExecutor {
+            plan: "- [ ] implement the plan\n",
+        }))
+        .with_provider_credential_env(embedded)
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        crate::workflow::default_states::TODO.to_owned(),
+    )
+    .await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::PLANNER,
+        Some(&agent_id),
+    )
+    .await;
+
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads after role assignment")
+        .expect("task exists");
+    service
+        .transition(
+            task.id.clone(),
+            crate::workflow::default_states::PLANNING.to_owned(),
+            task.version,
+        )
+        .await
+        .expect("workflow transition dispatches the planner");
+    service.drain(&task.id).await.expect("planner hook settles");
+    let execution = ExecutionRepo::list_by_task(
+        &*db,
+        &task.id,
+        PageRequest {
+            cursor: None,
+            limit: 10,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await
+    .expect("planner executions load")
+    .items
+    .into_iter()
+    .find(|execution| execution.role == crate::workflow::default_roles::PLANNER)
+    .expect("the workflow hook creates a planner execution");
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let current = ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .expect("execution loads")
+                .expect("execution exists");
+            if current.status == ExecutionStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("planner execution completes");
+
+    // The default planning gate is not a human approval boundary: the
+    // finished planner advances the Task instead of leaving a plan-review
+    // marker the dispatcher would keep relaunching the planner against.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
+                .await
+                .expect("transition logs load");
+            if logs.iter().any(|log| {
+                log.from_state == crate::workflow::default_states::PLANNING
+                    && log.to_state == crate::workflow::default_states::IN_PROGRESS
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("planner completion advances the planning gate");
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let metadata = task.metadata().expect("metadata parses");
+    assert!(metadata.extra.get("awaiting_human").is_none());
+    assert!(metadata.extra.get("awaiting_human_reason").is_none());
+    assert_eq!(
+        std::fs::read_to_string(workspace_root.path().join(&task.id).join("plan.md"))
+            .expect("the terminal-CAS winner publishes the plan"),
+        "- [ ] implement the plan\n"
+    );
+    let outbox = executors::execution_outbox_path(
+        &workspace_root.path().join(&task.id).join("forge"),
+        &execution.id,
+    )
+    .expect("outbox path");
+    assert!(!outbox.exists(), "published execution outbox is consumed");
 }

@@ -507,6 +507,14 @@ impl Fixture {
         )
         .check_once()
         .await;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(self.harness.state.db.pool())
+        .await?;
+        for id in ids {
+            self.harness.state.task_service.drain(&id).await?;
+        }
         result
     }
     async fn settled(&self, task_id: &str, expected: &str) {
@@ -516,6 +524,12 @@ impl Fixture {
                 .unwrap()
                 .unwrap();
             if task.status == expected {
+                self.harness
+                    .state
+                    .task_service
+                    .drain(task_id)
+                    .await
+                    .unwrap();
                 assert!(!task
                     .metadata_json
                     .unwrap_or_default()

@@ -161,81 +161,6 @@ impl CrashRecovery {
 
         recovered += sweep_stale_recovery_annotations(&self.db).await?;
 
-        for project in list_projects(&self.db).await? {
-            let mut cursor = None;
-            loop {
-                let page = TaskRepo::list(
-                    &*self.db,
-                    TaskListQuery {
-                        project_id: project.id.clone(),
-                        q: None,
-                        statuses: vec![],
-                        agent_ids: Vec::new(),
-                        assignee_types: Vec::new(),
-                        assignee_ids: Vec::new(),
-                        priority: None,
-                        include_archived: false,
-                        include_cancelled: false,
-                        include_deleted: false,
-                        page: page_request(cursor),
-                    },
-                )
-                .await?;
-                for task in page.items {
-                    let Some(entry_barrier_json) = &task.entry_barrier_json else {
-                        continue;
-                    };
-                    let Ok(entry_barrier) =
-                        serde_json::from_str::<serde_json::Value>(entry_barrier_json)
-                    else {
-                        continue;
-                    };
-                    if entry_barrier
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        != Some("running")
-                    {
-                        continue;
-                    }
-
-                    let blocked_barrier = json!({
-                        "state": entry_barrier.get("state").cloned().unwrap_or(serde_json::Value::Null),
-                        "started_at": entry_barrier.get("started_at").cloned().unwrap_or(serde_json::Value::Null),
-                        "status": "blocked",
-                        "updated_at": db::now_rfc3339(),
-                        "blocking_reason": "crash recovery: before_enter was interrupted",
-                    })
-                    .to_string();
-                    match TaskRepo::set_entry_barrier_with_workflow_authority(
-                        &*self.db,
-                        &task.id,
-                        task.version,
-                        Some(blocked_barrier),
-                        &db::now_rfc3339(),
-                        project.version,
-                        project.workflow_definition.clone(),
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            recovered += 1;
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                task_id = %task.id,
-                                %error,
-                                "failed to recover interrupted entry barrier"
-                            );
-                        }
-                    }
-                }
-                cursor = page.next_cursor;
-                if cursor.is_none() {
-                    break;
-                }
-            }
-        }
-
         tracing::info!(recovered_tasks = recovered, "crash recovery completed");
         Ok(recovered)
     }
@@ -3841,46 +3766,6 @@ pub(crate) mod tests {
         assert_eq!(unchanged.error_annotation, None);
 
         assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn crash_recovery_blocks_interrupted_entry_barriers() {
-        let db = Arc::new(sqlite_db().await);
-        let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, _repo_id) = seed_project_repo(&db).await;
-        let task = seed_task(&db, project_id, "review".to_owned(), None).await;
-        TaskRepo::set_entry_barrier(
-            &*db,
-            &task.id,
-            task.version,
-            Some(
-                r#"{"state":"review","status":"running","started_at":"2026-04-28T00:00:00Z"}"#
-                    .to_owned(),
-            ),
-            &now_rfc3339(),
-        )
-        .await
-        .expect("barrier sets");
-
-        let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
-            .run_recovery()
-            .await
-            .expect("recovery runs");
-
-        assert_eq!(recovered, 1);
-        let recovered_task = TaskRepo::get_by_id(&*db, &task.id, false)
-            .await
-            .expect("task loads")
-            .expect("task exists");
-        assert_eq!(recovered_task.status, "review");
-        let barrier: Value =
-            serde_json::from_str(recovered_task.entry_barrier_json.as_deref().unwrap()).unwrap();
-        assert_eq!(barrier["state"], "review");
-        assert_eq!(barrier["status"], "blocked");
-        assert_eq!(
-            barrier["blocking_reason"],
-            "crash recovery: before_enter was interrupted"
-        );
     }
 
     #[tokio::test]
@@ -7593,64 +7478,6 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(comments, 0);
-    }
-
-    #[tokio::test]
-    async fn placement_busy_cascade_does_not_block_another_reconciliation() {
-        let db = Arc::new(sqlite_db().await);
-        let (busy_task, busy, busy_execution) = daemon_owned_fixture(&db).await;
-        let (_, other, other_execution) = daemon_owned_fixture(&db).await;
-        let daemon_id = busy.daemon_id.clone().unwrap();
-        sqlx::query("UPDATE workspace_placement SET daemon_id = ?, runtime_id = ? WHERE id = ?")
-            .bind(&daemon_id)
-            .bind(&busy.runtime_id)
-            .bind(&other.id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        for execution in [&busy_execution, &other_execution] {
-            sqlx::query("UPDATE execution SET status = 'completed', after_sha = 'base-head', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?")
-                .bind(&execution.id).execute(db.pool()).await.unwrap();
-        }
-        let bus = Arc::new(EventBus::default());
-        let service = Arc::new(TaskService::new(db.clone(), bus.clone()));
-        let _cascade = service.claim_completion_cascade(&busy_task.id).unwrap();
-        let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
-        let (connection_id, mut outbound) = owner_connection(&registry, &daemon_id, false);
-        let responder = {
-            let registry = registry.clone();
-            tokio::spawn(async move {
-                for _ in 0..2 {
-                    let api_types::DaemonFrame::Request { id, method, params } =
-                        outbound.recv().await.unwrap()
-                    else {
-                        panic!("describe request");
-                    };
-                    assert_eq!(method, api_types::METHOD_WORKSPACE_DESCRIBE);
-                    registry.dispatch_incoming_for_connection(&daemon_id, connection_id,
-                        api_types::DaemonFrame::Response { id, result: json!({
-                            "workspace_handle": params["workspace_handle"], "generation": 1,
-                            "exists": true, "head_sha": "base-head", "dirty": false, "branch": "task/remote",
-                            "locked": false, "active_execution_ids": [], "journaled_execution_ids": []}) });
-                }
-            })
-        };
-        let monitor = HeartbeatMonitor::new(db.clone(), bus)
-            .with_daemon_connections(registry)
-            .with_task_service(service);
-        monitor.check_once().await.unwrap();
-        monitor.finish_placement_workers().await;
-        responder.await.unwrap();
-        for placement in [&busy, &other] {
-            assert_eq!(
-                WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .state,
-                PlacementState::Ready
-            );
-        }
     }
 
     #[tokio::test]

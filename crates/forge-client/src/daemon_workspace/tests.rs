@@ -1667,5 +1667,29 @@ async fn workspace_run_applies_machine_build_environment_and_niceness() {
         .parse()
         .unwrap();
     let baseline = executors::run_process::current_niceness();
-    assert_eq!(nice, (baseline + budget.run_nice as i32).min(19));
+    // Sandboxed hosts may deny setpriority even for lowering a child. Probe
+    // that capability independently; a supported host must still receive the
+    // exact configured priority, so this cannot hide a missing budget apply.
+    let expected = (baseline + budget.run_nice as i32).min(19);
+    let probe = std::process::Command::new("nice")
+        .args(["-n", &budget.run_nice.to_string()])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "daemon_config::budget_tests::daemon_priority_probe",
+            "--nocapture",
+        ])
+        .env("LC_ALL", "C")
+        .output()
+        .expect("independent priority capability probe starts");
+    let stderr = String::from_utf8_lossy(&probe.stderr);
+    if stderr.contains("Operation not permitted") || stderr.contains("Permission denied") {
+        assert_eq!(
+            nice, baseline,
+            "best-effort priority retains baseline when the OS denies it"
+        );
+    } else {
+        assert!(probe.status.success(), "priority probe failed: {stderr}");
+        assert_eq!(nice, expected);
+    }
 }

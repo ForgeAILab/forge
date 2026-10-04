@@ -13,12 +13,6 @@ use workspace::RepoCacheLockManager;
 
 #[async_trait]
 pub trait HookAction: Send + Sync {
-    /// A context-independent, effect-free cascade. The engine may persist this
-    /// intent with the status CAS only when no earlier hook can intercept it.
-    /// The hook still executes in its original post-commit phase.
-    fn declared_cascade(&self) -> Option<HookResult> {
-        None
-    }
     async fn execute(&self, ctx: &HookContext) -> HookResult;
 }
 
@@ -41,9 +35,8 @@ pub struct HookContext {
     pub review_runner: Option<Arc<review::ReviewRunner>>,
     pub merge_service: Option<Arc<MergeService>>,
     pub cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
-    /// Originating service clone for nested dispatch. Cloning preserves the
-    /// shared terminal-cascade coordination and is the single authority for
-    /// execution dispatch dependencies.
+    /// Originating service clone for nested dispatch; preserves the provider,
+    /// outbox and workspace dependencies of the dispatch authority.
     pub task_service: crate::TaskService,
     pub daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     pub workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
@@ -57,7 +50,7 @@ pub struct HookContext {
     pub state_config: Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum HookResult {
     Ok,
     Skipped { reason: String },

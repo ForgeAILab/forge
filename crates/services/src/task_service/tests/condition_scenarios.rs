@@ -1164,6 +1164,7 @@ async fn condition_send_back_prompt_scenarios() {
                         .map(|result| result.task.status)
                         .map_err(|error| error.to_string())
                 };
+                service.drain(&task.id).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let after = reload(&db, &task.id).await;
                 let latest = latest_execution(&db, &task.id).await;

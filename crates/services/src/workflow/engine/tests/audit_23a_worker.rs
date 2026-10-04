@@ -101,7 +101,7 @@ async fn audit_23a_renewal_and_claim_errors_do_not_cancel_started_ci_and_shutdow
         .await
         .unwrap()
         .unwrap();
-    assert!(!task.entry_barrier_is_running());
+    assert!(task.entry_barrier_json.is_none());
     let row = fixture
         .db
         .task_steps(&task.id)
@@ -289,11 +289,15 @@ async fn audit_23a_before_exit_cascade_does_not_suppress_target_hooks() {
             false,
         )
         .await;
-    assert!(
-        result.is_err(),
-        "the target hook must run despite before_exit's Cascade"
+    assert!(result.is_ok(), "the CAS returns before target hooks");
+    let settled = drain(engine(db.clone(), Arc::new(EventBus::new(32))), id).await;
+    assert_eq!(settled.status, "target");
+    let rows = db.task_steps(id).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].status, "failed",
+        "undefined target hook ran despite before_exit Cascade"
     );
-    assert!(db.task_steps(id).await.unwrap().is_empty());
 }
 
 /// Four CI steps on one repository fill the long lane: the first holds the

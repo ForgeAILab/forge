@@ -259,29 +259,6 @@ impl WorkspaceCleanupScheduler {
         Ok(())
     }
 
-    pub(crate) async fn schedule_terminal_task(
-        &self,
-        task_id: &str,
-        delay: Duration,
-    ) -> Result<()> {
-        let cleanup_after = chrono::Utc::now()
-            + chrono::Duration::from_std(delay).map_err(|error| {
-                ServiceError::invalid_operation(format!("invalid cleanup delay: {error}"))
-            })?;
-        // Do not decode the workspace here: a malformed row must still get a
-        // retry deadline when cleanup fails before loading it.
-        sqlx::query(
-            "UPDATE workspace SET cleanup_after = ?, updated_at = ?
-             WHERE task_id = ? AND status != 'cleaned'",
-        )
-        .bind(cleanup_after.to_rfc3339())
-        .bind(now_rfc3339())
-        .bind(task_id)
-        .execute(self.db.pool())
-        .await?;
-        Ok(())
-    }
-
     async fn clear_cleanup_after(&self, task_id: &str) -> Result<()> {
         sqlx::query(
             "UPDATE workspace
@@ -1171,6 +1148,7 @@ mod tests {
                 .await
                 .expect("terminal transition succeeds");
             assert_eq!(updated.task.status, terminal);
+            service.drain(&task.id).await.unwrap();
             assert!(
                 worktree_path.exists(),
                 "deletion must run outside the transition"
@@ -1480,6 +1458,7 @@ mod tests {
         .expect("transition succeeds");
         drop(guard);
         assert_eq!(outcome.task.status, "done");
+        service.drain(&task.id).await.unwrap();
         assert!(worktree_path.exists());
         assert!(logs_dir(temp.path(), &task)
             .join(".codex-managed-home")

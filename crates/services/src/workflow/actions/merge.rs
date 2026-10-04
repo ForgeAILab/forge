@@ -26,18 +26,66 @@ impl HookAction for RunMerge {
                 reason: "merge service not configured".to_string(),
             };
         };
-        let Some(_merge_slot) = merge_service.claim_merge_hook(&ctx.task_id) else {
-            return HookResult::Skipped {
-                reason: "merge hook already running".to_string(),
-            };
-        };
         if workspace_id(ctx).await.is_none() {
             return HookResult::Skipped {
                 reason: "no worktree".to_string(),
             };
         }
 
-        let outcome = merge_service.merge(ctx.task_id.clone()).await;
+        let outcome = match crate::workflow::engine::durable::hook_effect(
+            &ctx.task_id,
+            "merge_outcome",
+        )
+        .await
+        {
+            Ok(Some(recorded)) => serde_json::from_str::<MergeOutcome>(&recorded)
+                .map_err(|e| crate::ServiceError::invalid_operation(e.to_string())),
+            Ok(None) => {
+                let result = async {
+                    use crate::workflow::engine::durable::{
+                        current_hook, hook_effect, record_hook_effect,
+                    };
+                    if current_hook(&ctx.task_id).is_some() {
+                        if let Some(value) = hook_effect(&ctx.task_id, "merge_intent").await? {
+                            let intent: crate::merge_service::MergeIntent =
+                                serde_json::from_str(&value).map_err(|e| {
+                                    crate::ServiceError::invalid_operation(e.to_string())
+                                })?;
+                            if let Some(done) = merge_service.completed_hook_merge(&intent).await? {
+                                return Ok(done);
+                            }
+                        } else {
+                            let intent = merge_service.hook_merge_intent(&ctx.task_id).await?;
+                            record_hook_effect(
+                                &ctx.task_id,
+                                "merge_intent",
+                                &serde_json::to_value(intent).map_err(|e| {
+                                    crate::ServiceError::invalid_operation(e.to_string())
+                                })?,
+                            )
+                            .await?;
+                        }
+                    }
+                    merge_service.merge(ctx.task_id.clone()).await
+                }
+                .await;
+                if let Ok(outcome) = &result {
+                    if let Err(error) = crate::workflow::engine::durable::record_hook_effect(
+                        &ctx.task_id,
+                        "merge_outcome",
+                        &serde_json::to_value(outcome).expect("merge outcome serializes"),
+                    )
+                    .await
+                    {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                }
+                result
+            }
+            Err(error) => Err(error),
+        };
         // The merge writes through the workspace and execution ledgers, so a
         // Task snapshot read before it is already stale. Every compare-and-set
         // below has to carry the version the merge left behind: with the
@@ -506,7 +554,83 @@ pub(crate) async fn target_moved_result(
                 }
             }
         };
-    match resolved.rebase_target(target_branch, handoff_conflicts).await {
+    let durable = async {
+        use crate::workflow::engine::durable::{hook_effect, record_hook_effect};
+        if let Some(recorded) = hook_effect(&ctx.task_id, "rebase_outcome").await? {
+            return serde_json::from_str::<api_types::WorkspaceOwnerOperationOutcome>(&recorded)
+                .map_err(|e| crate::ServiceError::invalid_operation(e.to_string()));
+        }
+        let previous = hook_effect(&ctx.task_id, "rebase_target").await?;
+        let target = match previous.as_deref() {
+            Some(value) => serde_json::from_str::<String>(value)
+                .map_err(|e| crate::ServiceError::invalid_operation(e.to_string()))?,
+            None => {
+                let target = resolved
+                    .git_query(
+                        api_types::WorkspaceGitQuery::ResolveRef {
+                            reference: target_branch.to_owned(),
+                        },
+                        false,
+                    )
+                    .await?
+                    .ok_or_else(|| crate::ServiceError::invalid_operation("rebase target missing"))?
+                    .trim()
+                    .to_owned();
+                record_hook_effect(&ctx.task_id, "rebase_target", &serde_json::json!(target))
+                    .await?;
+                target
+            }
+        };
+        // A committed clean/conflicted rebase contains the recorded target.
+        // Reconstruct its handoff rather than applying another rebase.
+        let landed = previous.is_some()
+            && resolved
+                .git_query(
+                    api_types::WorkspaceGitQuery::IsAncestor {
+                        base: target.clone(),
+                        head: "HEAD".into(),
+                    },
+                    true,
+                )
+                .await?
+                .is_some();
+        let outcome = if landed {
+            let paths = resolved
+                .git_query(
+                    api_types::WorkspaceGitQuery::MarkerPaths {
+                        base: target,
+                        head: "HEAD".into(),
+                    },
+                    false,
+                )
+                .await?
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if handoff_conflicts && !paths.is_empty() {
+                api_types::WorkspaceOwnerOperationOutcome::Conflict {
+                    details: "resumed committed conflict handoff".into(),
+                    conflict_paths: paths,
+                }
+            } else {
+                api_types::WorkspaceOwnerOperationOutcome::Rebased
+            }
+        } else {
+            resolved
+                .rebase_target(target_branch, handoff_conflicts)
+                .await?
+        };
+        record_hook_effect(
+            &ctx.task_id,
+            "rebase_outcome",
+            &serde_json::to_value(&outcome).expect("rebase outcome serializes"),
+        )
+        .await?;
+        Ok::<_, crate::ServiceError>(outcome)
+    }
+    .await;
+    match durable {
         Ok(api_types::WorkspaceOwnerOperationOutcome::Rebased) => {
             resolved.record_head_best_effort(&ctx.db).await;
             if let Err(error) = create_system_comment(ctx,

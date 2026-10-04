@@ -64,6 +64,7 @@ fn workflow() -> WorkflowDefinition {
 }
 fn step(to: &str) -> EnqueueTaskStep {
     EnqueueTaskStep {
+        kind: "cascade".into(),
         id: db::new_uuid_v4(),
         task_id: "t".into(),
         payload_json: serde_json::to_string(&CascadePayload {
@@ -133,7 +134,7 @@ async fn reclaimed_step_drains_after_worker_restart_and_completes_atomically() {
 }
 
 #[tokio::test]
-async fn drain_waits_for_committed_steps_inline_hook_lease_to_release() {
+async fn drain_waits_for_status_step_lease_handover() {
     let (db, worker) = fixture().await;
     db.enqueue_step(&step("done")).await.unwrap();
     let claimed = db
@@ -245,7 +246,7 @@ async fn supervised_worker_consumes_commit_kick_and_stops_on_shutdown() {
 }
 
 #[tokio::test]
-async fn throwing_inline_hook_records_committed_failure_without_replaying_transition() {
+async fn durable_hook_failure_keeps_the_committed_status_step() {
     let (db, worker) = fixture().await;
     let mut input = step("done");
     let mut payload: CascadePayload = serde_json::from_str(&input.payload_json).unwrap();
@@ -272,8 +273,10 @@ async fn throwing_inline_hook_records_committed_failure_without_replaying_transi
         .error_annotation
         .as_deref()
         .unwrap()
-        .contains("Transition committed; inline hook failed"));
-    let failed = &db.task_steps("t").await.unwrap()[0];
+        .contains("Transition committed; hook failed"));
+    let rows = db.task_steps("t").await.unwrap();
+    assert_eq!(rows[0].status, "done");
+    let failed = rows.last().unwrap();
     assert_eq!(failed.status, "failed");
     assert_eq!(failed.attempts, 1);
     assert!(failed
@@ -288,16 +291,43 @@ async fn throwing_inline_hook_records_committed_failure_without_replaying_transi
     assert_eq!(logs[0].id, input.id);
 }
 
-#[tokio::test]
-async fn interrupted_committed_hook_does_not_annotate_later_task_entry() {
-    let (db, worker) = fixture().await;
-    db.enqueue_step(&step("done")).await.unwrap();
-    let claimed = db
-        .claim_step("owner", Some("t"), &lease_deadline())
+async fn claim_committed_hooks(db: &Arc<db::SqliteDb>, worker: &TaskStepWorker) -> TaskStep {
+    let mut input = step("done");
+    let mut payload: CascadePayload = serde_json::from_str(&input.payload_json).unwrap();
+    let mut definition = workflow();
+    definition.states[1]
+        .hooks
+        .on_enter
+        .push(api_types::HookSpec {
+            action: "undefined_action".into(),
+            params: serde_json::json!({}),
+            applies_to: api_types::HookAudience::All,
+            on_failure: api_types::FailurePolicy::Log,
+        });
+    payload.workflow_ref = WorkflowReference::Snapshot(
+        db.store_step_workflow(&serde_json::to_string(&definition).unwrap())
+            .await
+            .unwrap(),
+    );
+    input.payload_json = serde_json::to_string(&payload).unwrap();
+    db.enqueue_step(&input).await.unwrap();
+    let status = db
+        .claim_step("status-owner", Some("t"), &lease_deadline())
         .await
         .unwrap()
         .unwrap();
-    worker.execute_inner(&claimed).await.unwrap();
+    worker.execute_inner(&status).await.unwrap();
+    db.release_step(&status.id, "status-owner").await.unwrap();
+    db.claim_step("hook-owner", Some("t"), &lease_deadline())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn interrupted_committed_hook_does_not_annotate_later_task_entry() {
+    let (db, worker) = fixture().await;
+    let claimed = claim_committed_hooks(&db, &worker).await;
     let now = db::now_rfc3339();
     sqlx::query("UPDATE task SET status='todo',version=version+1 WHERE id='t'")
         .execute(db.pool())
@@ -315,8 +345,10 @@ async fn interrupted_committed_hook_does_not_annotate_later_task_entry() {
         .unwrap();
     assert_eq!(task.status, "todo");
     assert!(task.error_annotation.is_none());
-    let predecessor = &db.task_steps("t").await.unwrap()[0];
-    assert_eq!(predecessor.status, "done");
+    let rows = db.task_steps("t").await.unwrap();
+    assert_eq!(rows[0].status, "done");
+    let predecessor = rows.last().unwrap();
+    assert_eq!(predecessor.status, "superseded");
     assert!(predecessor
         .last_error
         .as_deref()
@@ -329,14 +361,8 @@ async fn interrupted_committed_hook_does_not_annotate_later_task_entry() {
 #[tokio::test]
 async fn committed_hook_failure_after_sleep_is_recorded_for_live_owner() {
     let (db, worker) = fixture().await;
-    db.enqueue_step(&step("done")).await.unwrap();
-    let claimed = db
-        .claim_step("owner", Some("t"), &lease_deadline())
-        .await
-        .unwrap()
-        .unwrap();
+    let claimed = claim_committed_hooks(&db, &worker).await;
     let _activity = db.hold_task_step(&claimed);
-    worker.execute_inner(&claimed).await.unwrap();
     sqlx::query("UPDATE task_step SET lease_until='2000-01-01T00:00:00+00:00' WHERE id=?")
         .bind(&claimed.id)
         .execute(db.pool())
@@ -346,7 +372,8 @@ async fn committed_hook_failure_after_sleep_is_recorded_for_live_owner() {
         .fail_committed_hook_phase(&claimed, "hook failed after wake")
         .await
         .unwrap();
-    let row = &db.task_steps("t").await.unwrap()[0];
+    let rows = db.task_steps("t").await.unwrap();
+    let row = rows.last().unwrap();
     assert_eq!(row.status, "failed");
     let task = TaskRepo::get_by_id(&*db, "t", false)
         .await

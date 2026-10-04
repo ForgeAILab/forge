@@ -45,6 +45,7 @@ async fn review_rejection_notifies_role_holder_via_event_bus() {
     )
     .await;
     task = transition(&harness.app, &task, "in_progress").await;
+    harness._state.task_service.drain(&task.id).await.unwrap();
     task = transition(&harness.app, &task, "review").await;
 
     let mut rx = harness.event_bus.subscribe();
@@ -58,6 +59,7 @@ async fn review_rejection_notifies_role_holder_via_event_bus() {
     )
     .await;
     assert_eq!(rejected.status, "in_progress");
+    harness._state.task_service.drain(&task.id).await.unwrap();
 
     let events = drain_events(&mut rx).await;
     assert!(

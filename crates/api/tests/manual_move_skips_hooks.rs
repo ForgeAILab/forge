@@ -36,9 +36,9 @@ async fn manual_transitions_without_workspace_skip_contextual_hooks() {
         StatusCode::OK,
     )
     .await;
-    let in_progress = transition(&harness.app, &task, "in_progress").await;
-    let reviewed = transition(&harness.app, &in_progress, "review").await;
-    let done = transition(&harness.app, &reviewed, "done").await;
+    let in_progress = transition(&harness, &task, "in_progress").await;
+    let reviewed = transition(&harness, &in_progress, "review").await;
+    let done = transition(&harness, &reviewed, "done").await;
     assert_eq!(done.status, "done");
 
     let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task.id)
@@ -210,8 +210,8 @@ async fn default_workflow_user_move_to_review_waits_for_human() {
         StatusCode::OK,
     )
     .await;
-    let in_progress = transition(&harness.app, &task, "in_progress").await;
-    let review = transition(&harness.app, &in_progress, "review").await;
+    let in_progress = transition(&harness, &task, "in_progress").await;
+    let review = transition(&harness, &in_progress, "review").await;
 
     assert_eq!(review.status, "review");
     assert!(review.awaiting_human);
@@ -227,7 +227,7 @@ async fn default_workflow_user_move_to_review_waits_for_human() {
         .iter()
         .any(|entry| { entry["from_state"] == "review" && entry["to_state"] == "merging" }));
 
-    let merging = transition(&harness.app, &review, "merging").await;
+    let merging = transition(&harness, &review, "merging").await;
     assert_eq!(merging.status, "merging");
     assert!(!merging.awaiting_human);
 }
@@ -294,7 +294,7 @@ async fn manual_transition_clears_executor_failure_annotation() {
     .await;
     assert!(annotated_response.error_annotation.is_some());
 
-    let moved = transition(&harness.app, &annotated_response, "in_progress").await;
+    let moved = transition(&harness, &annotated_response, "in_progress").await;
     assert_eq!(moved.status, "in_progress");
     assert!(
         moved.error_annotation.is_none(),
@@ -338,6 +338,7 @@ async fn board_drag_to_passive_state_defers_role_dispatch_hook() {
     .await;
     assert_eq!(response.task.status, "planning");
 
+    harness.state.task_service.drain(&task.id).await.unwrap();
     let stored = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
         .await
         .expect("task loads")
@@ -429,7 +430,8 @@ fn gate_dispatch_workflow() -> Value {
     })
 }
 
-async fn transition(app: &Router, task: &TaskResponse, status: &str) -> TaskResponse {
+async fn transition(harness: &Harness, task: &TaskResponse, status: &str) -> TaskResponse {
+    let app = &harness.app;
     let response: TransitionTaskResponse = json_request(
         app,
         Method::POST,
@@ -439,7 +441,7 @@ async fn transition(app: &Router, task: &TaskResponse, status: &str) -> TaskResp
     )
     .await;
     assert_eq!(response.task.status, status);
-    response.task
+    common::drain(&harness.state, app, &task.id).await
 }
 
 fn state(name: &str, kind: &str, hooks: Value, config: Value, triggers: Value) -> Value {

@@ -156,7 +156,15 @@ async fn environment_due_recheck_clears_pause_created_later_in_same_tick() {
     let agent = seed_agent(&db, 2, DaemonStatus::Online, AgentStatus::Idle).await;
     let task = seed_task(&db, &project, "same tick", "todo", 0).await;
     assign_role(&db, &task.id, "coder", &agent).await;
-    let environment:api_types::ProjectEnvironment=serde_json::from_value(serde_json::json!({"checks":[{"name":"disk","command":"sleep 0.2; true"}],"recheck_interval_seconds":86400})).unwrap();
+    let gate = TempDir::new().unwrap();
+    let release = gate.path().join("release");
+    let quote = |p: &std::path::Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\"'\"'"));
+    let command = format!(
+        "while [ ! -f {} ] && [ -d {} ]; do sleep 0.01; done; true",
+        quote(&release),
+        quote(gate.path())
+    );
+    let environment:api_types::ProjectEnvironment=serde_json::from_value(serde_json::json!({"checks":[{"name":"disk","command":command}],"recheck_interval_seconds":86400})).unwrap();
     configure(&db, &project, serde_json::to_value(&environment).unwrap()).await;
     let mut row = crate::placement::environment::unknown_record(
         &project,
@@ -178,6 +186,7 @@ async fn environment_due_recheck_clears_pause_created_later_in_same_tick() {
         .unwrap()
         .paused_at
         .is_some());
+    std::fs::write(&release, "continue").unwrap();
     wait_running(&dispatcher, &task).await;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), launches.recv())

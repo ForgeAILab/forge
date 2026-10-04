@@ -838,17 +838,18 @@ async fn execution_log_from_owner_records_semantic_progress_without_heartbeat() 
             .await
             .expect("execution loads")
             .expect("execution exists");
-        if updated.last_progress_at.is_some() {
+        // Progress and log-path persistence are separate asynchronous writes.
+        // Wait for both rather than asserting inside their completion window.
+        if updated.last_progress_at.is_some() && updated.logs_path.is_some() {
             assert_eq!(
                 updated.last_activity_at.as_deref(),
                 Some("1970-01-01T00:00:00Z")
             );
-            assert!(updated.logs_path.is_some());
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "execution last_progress_at was not updated"
+            "execution log progress and path were not both persisted"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
