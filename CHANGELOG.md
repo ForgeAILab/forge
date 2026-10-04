@@ -293,6 +293,27 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - Queue failures annotate the Task with the new failure kinds
     `workflow_loop` and `cascade_failed` instead of `dispatch_failed`; the
     same recovery offers apply.
+- **Transition hooks run after the transition returns (refactor 2.3b).** A
+  REST or MCP transition, a board move or a Task action commits the status
+  change and returns before any post-commit hook runs. CI, merge, role
+  dispatch, before-work scripts, provisioning and cleanup run in a durable
+  hook step afterwards, so right after a transition into a state with
+  post-commit hooks `pending_steps` is at least 1.
+  - The response's `review` is the Review current at commit; a Review created
+    by the entry's CI arrives later through SSE or a fresh GET.
+  - A board move into a state whose blocking `before_enter` check fails is no
+    longer rejected with `412 guard_rejected`. The move commits, then the
+    entry blocks; use **Retry Entry Checks**. `before_exit` guards still
+    reject before commit.
+  - While the current entry's hooks are queued or running, the Task reports
+    `awaiting_human: false` and offers only Cancel, even if its latest Review
+    is from an earlier entry; an early decision returns 409
+    `action_unavailable`.
+  - `POST /api/v1/tasks/{id}/workspace/reset` returns 409 while the Task has
+    a queued or running step.
+  - Upgrade: a Task whose entry checks were running at upgrade becomes a
+    blocked entry with a `before_work_hook_failed` annotation; use **Retry
+    Entry Checks**. Queued and in-flight steps are kept.
 
 ### Changed
 
@@ -312,6 +333,33 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     days, failed and parked ones after 30.
   - Dispatcher admission counts only role entries that are about to take a
     slot.
+- Post-commit hooks are durable, checkpointed `task_step` rows run by the
+  per-Task worker; a crash or shutdown resumes them from their checkpoints
+  (refactor 2.3b). The running-entry barrier, the in-memory completion and
+  merge slots and the two-minute merge re-drive are removed.
+  - A merge that already landed is recognised (the target contains the
+    candidate); its comment and `after_sha` name the candidate commit.
+  - A rebase interrupted mid-conflict finishes as a conflict handoff with
+    every conflicted path, or is aborted; the coder never receives a
+    worktree mid-rebase.
+  - A dispatch reuses the execution it already admitted.
+  - CI checks and before-work scripts run at least once: one interrupted
+    mid-run starts again after restart (CI reruns its whole sequence;
+    completed before-work scripts are skipped). Reruns log
+    `rerun_after_interruption: true` with the step id. Before-work scripts
+    must be safe to repeat, which retries and send-backs already required.
+  - A failing hook with `on_failure: log` marks its step failed and logs
+    `transition.effect_failed` without annotating or blocking the Task.
+    `run_merge` is the exception: transient errors (database contention,
+    version conflicts, an unavailable or slow daemon, rate limits) retry
+    with back-off (1 s doubling to 64 s, up to 8 attempts); after that, or
+    on any other error, the Task gets a blocking `workspace_error`
+    merge-failure annotation shown in Attention, and **Retry** re-runs the
+    merge.
+  - On every start, a root Task in a merge state with no queued step and no
+    hook step for its current entry (a merge lost by an older version) gets
+    that entry's hooks enqueued once. Paused, held, blocked and
+    paused-integration Tasks are skipped.
 - Agents that shape a managed project or split its work get one
   merge-friendly layout rule: small modules with clear ownership so parallel
   Tasks edit disjoint files, no hub files every feature must edit (central
