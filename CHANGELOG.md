@@ -617,6 +617,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Forge flags conflict hot spots. When conflict handoffs name the same file
+  (lockfiles excluded) in 3 or more Tasks of one Project within 7 days, Forge
+  emits `project.conflict_hotspot.detected` and opens one Project-scoped
+  `conflict_hotspot` Attention item. The Project Agent is woken once and asked
+  to propose a Task that splits the file. The item stays until you resolve
+  it; after that, only newer handoffs count toward a new alert. Detection
+  starts at upgrade (no backfill).
+- Mission Control attention cards have a **Resolve** button.
 - Admins can replay or dismiss a dead-lettered event (an event a durable
   worker gave up on after its retries). `GET /api/v1/operations/dead-letters`
   lists them (open or resolved, by consumer, keyset pages);
