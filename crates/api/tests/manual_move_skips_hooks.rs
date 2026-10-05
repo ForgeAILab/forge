@@ -120,6 +120,9 @@ async fn board_drag_to_active_state_does_not_defer_role_dispatch_hook() {
     .await;
     assert_eq!(response.task.status, "in_progress");
 
+    // The entry's on_enter hooks run in their own queued step; settle it so
+    // the assertions below see what the hook did rather than nothing.
+    harness.state.task_service.drain(&task.id).await.unwrap();
     let stored = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
         .await
         .expect("task loads")
@@ -138,18 +141,20 @@ async fn board_drag_to_active_state_does_not_defer_role_dispatch_hook() {
     )
     .await;
     let entries = log["items"].as_array().expect("transition items");
-    assert!(!entries.iter().any(|entry| {
-        entry["to_state"] == "in_progress"
-            && entry["triggered_by"] == "user:board_drag"
-            && entry["hook_results_json"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|hook| {
-                    hook["action"] == "dispatch_role_agent"
-                        && hook["outcome"] == "skipped"
-                        && hook["error"] == "dispatch deferred to Task dispatcher"
-                })
+    let drag_dispatch_hooks: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| {
+            entry["to_state"] == "in_progress" && entry["triggered_by"] == "user:board_drag"
+        })
+        .flat_map(|entry| entry["hook_results_json"].as_array().unwrap())
+        .filter(|hook| hook["action"] == "dispatch_role_agent")
+        .collect();
+    assert!(
+        !drag_dispatch_hooks.is_empty(),
+        "the drag's on_enter dispatch hook ran"
+    );
+    assert!(!drag_dispatch_hooks.iter().any(|hook| {
+        hook["outcome"] == "skipped" && hook["error"] == "dispatch deferred to Task dispatcher"
     }));
 }
 
@@ -181,6 +186,9 @@ async fn default_workflow_board_drag_from_todo_to_in_progress_succeeds() {
     .await;
 
     assert_eq!(response.task.status, "in_progress");
+    // Settle the entry's queued hooks step: nothing it does may route the
+    // drag into planning either.
+    harness.state.task_service.drain(&task.id).await.unwrap();
     let log: Value = empty_request(
         &harness.app,
         Method::GET,
