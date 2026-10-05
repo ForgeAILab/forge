@@ -8,6 +8,26 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Transition reasons no longer carry workflow markers (refactor 2.4).** New
+  `trigger_reason` text drops the `[review-refresh]`, `[target-moved-rebase]`,
+  `[conflict-handoff]` and `[review-carry]` tags and the `; paths_json=[…]`
+  suffix; classify transitions by `bridge_kind` / `bridge_payload` instead.
+  Reasons already in history are unchanged. Examples:
+  - `[review-refresh] conformance review required: {reason}` →
+    `conformance review required: {reason}`
+  - `[review-refresh] [target-moved-rebase] {reason}; rebased onto {branch},
+    re-review required` → `{reason}; rebased onto {branch}, re-review required`
+  - `[conflict-handoff] rebased onto {branch}; conflicts were committed with
+    markers in: {files}; paths_json=[…]` → the same text without the tag and
+    suffix (paths are in `bridge_payload.paths`)
+  - `[review-carry] …; CI passed; re-review skipped` → the same text without
+    the tag
+  - `gate skipped: no {role} role assigned` →
+    `No {role} role assigned; optional gate skipped`
+  - Automatic review-recovery prompts and summaries start with
+    `Forge automatic review recovery` (no brackets).
+  - `gate approved` is unchanged.
+
 - **Task commands can return `409 task_busy`; the request stays queued
   (refactor 2.3c).** Task workflow writes run one at a time per Task. A command
   waits at most 5 seconds (Cancel/Hold: 15 seconds) for work queued ahead of it,
@@ -387,6 +407,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **One workflow engine, typed classification (refactor 2.4).** Task services
+  share one workflow engine. Automatic review-recovery runs carry
+  `execution.purpose = automatic_review_recovery` and are counted by purpose;
+  only running attempts count, so the allowance is unchanged. Only a plain
+  approval or rejection records a gate decision, as before. Failure memories
+  come from typed evidence (rejection, failure state, failed hook, failure
+  interruption, failed Review) instead of words in reasons; history rows whose
+  only signal was such a word are no longer indexed. Recovery markers applied
+  by an agent are classified like user-applied ones.
 
 - **One writer per Task (refactor 2.3c).** Every write to a Task's workflow
   state runs through that Task's leased step queue. Cancel/Hold stops CI,
@@ -787,6 +817,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- **Typed transition bridges (refactor 2.4).** Items from
+  `GET /api/v1/tasks/{id}/transitions` and MCP transition history include
+  nullable `bridge_kind` (`review_refresh`, `target_moved_rebase`,
+  `conflict_handoff`, `retry_window_reset`, `recovery`, `gate_skipped`,
+  `gate_approved`, `gate_rejected`, `ci_only_review_passed`, `review_carry`) and
+  `bridge_payload` (`{"paths":[…]}` for conflict handoffs, `{"verb":…}` for
+  recovery and reset rows). The server derives them; transition requests cannot
+  set them. Migration `V202610051343` backfills history, queued steps and saved
+  hook checkpoints once, without touching reason text or queue identity.
 
 - Forge flags conflict hot spots. When conflict handoffs name the same file
   (lockfiles excluded) in 3 or more Tasks of one Project within 7 days, Forge
