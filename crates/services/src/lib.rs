@@ -641,3 +641,6 @@ mod execution_admission_error_tests {
 mod pricing_auto_tests;
 
 pub mod project_escalation;
+
+mod topic_rotation;
+pub use topic_rotation::{TopicRotationCoordinator, TopicRotator};

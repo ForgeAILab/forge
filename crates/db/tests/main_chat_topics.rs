@@ -227,6 +227,8 @@ async fn database_with_ready_main_chat(name: &str) -> (SqliteDb, String) {
 fn rotate_input(chat_id: &str, topic_id: &str, label: &str) -> RotateAgentChatTopic {
     let now = now_rfc3339();
     RotateAgentChatTopic {
+        runtime_session_id: None,
+        rotation_owner: None,
         topic: CreateAgentChatTopic {
             id: topic_id.to_owned(),
             chat_id: chat_id.to_owned(),
@@ -434,4 +436,230 @@ async fn rotate_is_denied_while_a_genesis_session_needs_a_decision() {
         .await
         .expect("topics list");
     assert_eq!(topics.len(), 1, "only the backfilled topic exists");
+}
+
+/// Binds the account's Main Agent to a fresh identity whose selected Profile
+/// runs on `backend_kind`; automatic rotation intents are raised only for a
+/// native responder.
+async fn bind_main_agent(db: &SqliteDb, chat_id: &str, backend_kind: &str) -> String {
+    let account: String = sqlx::query_scalar("SELECT account_id FROM agent_chat WHERE id = ?")
+        .bind(chat_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    let identity_id = format!("{account}-{backend_kind}-identity");
+    let profile_id = format!("{account}-{backend_kind}-profile");
+    AgentRepo::create_identity_with_profile(
+        db,
+        CreateAgentIdentity {
+            id: identity_id.clone(),
+            name: format!("{backend_kind} Main Agent"),
+            description: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(account.clone()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        CreateAgentProfile {
+            id: profile_id.clone(),
+            identity_id: identity_id.clone(),
+            backend_kind: backend_kind.to_owned(),
+            executor_type: if backend_kind == "native" {
+                "embedded".to_owned()
+            } else {
+                "codex".to_owned()
+            },
+            provider: Some("test".to_owned()),
+            model: Some("test-model".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Main Agent identity/profile creates");
+    db::AccountMainAgentBindingRepo::create_main_binding(
+        db,
+        db::CreateAccountMainAgentBinding {
+            id: format!("{account}-binding"),
+            account_id: account.clone(),
+            identity_id,
+            profile_id,
+            autonomy_policy_json: "{}".to_owned(),
+            tool_policy_revision: "main-policy@1".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Main binding creates");
+    account
+}
+
+async fn append_user_message(db: &SqliteDb, chat_id: &str, account: &str, id: &str, at: &str) {
+    let mut message = db::topic_divider_message(
+        id.into(),
+        chat_id.to_owned(),
+        "user message",
+        id.into(),
+        at.into(),
+    );
+    message.author_type = AgentChatMessageAuthorType::User;
+    message.author_id = Some(account.to_owned());
+    AgentChatMessageRepo::append_agent_chat_message(db, message)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn genesis_mark_is_atomic_and_idle_user_message_marks_one_durable_intent() {
+    let (db, chat_id) = database_with_ready_main_chat("durable-rotation").await;
+    let account = bind_main_agent(&db, &chat_id, "native").await;
+    let now = now_rfc3339();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO product_genesis_session (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity, lifecycle, version, created_at, updated_at) VALUES ('atomic-genesis', ?, ?, 'test', 'idea', 'mvp', 'discovering', 1, ?, ?)")
+        .bind(&account).bind(&chat_id).bind(&now).bind(&now).execute(&mut *tx).await.unwrap();
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(pending, 1);
+    tx.rollback().await.unwrap();
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        pending, 0,
+        "rolled-back Genesis must not leave a rotation mark"
+    );
+    for (id, time) in [
+        ("before-idle", "2026-08-10T00:00:00Z"),
+        ("after-idle", "2026-08-10T08:00:00Z"),
+    ] {
+        append_user_message(&db, &chat_id, &account, id, time).await;
+    }
+    let (id, cause, successor): (String, String, String) = sqlx::query_as(
+        "SELECT id, cause, successor_runtime_id FROM agent_chat_topic_rotation WHERE chat_id = ?",
+    )
+    .bind(&chat_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(cause, "idle");
+    assert!(!id.is_empty());
+    assert!(!successor.is_empty());
+    let replay = AgentChatTopicTransactionRepo::request_agent_chat_topic(
+        &db,
+        rotate_input(&chat_id, "another-request", "coalesced"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay, id,
+        "pending request keeps its crash-recovery identity"
+    );
+    let (label, cause): (String, String) =
+        sqlx::query_as("SELECT label, cause FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        (label.as_str(), cause.as_str()),
+        ("coalesced", "idle"),
+        "a REST request that meets a pending intent applies its label to it"
+    );
+}
+
+#[tokio::test]
+async fn a_cli_chat_neither_rotates_nor_loses_history_after_eight_idle_hours() {
+    let (db, chat_id) = database_with_ready_main_chat("cli-idle").await;
+    let account = bind_main_agent(&db, &chat_id, "cli").await;
+    let topic_before = AgentChatTopicRepo::get_current_agent_chat_topic(&db, &chat_id)
+        .await
+        .unwrap()
+        .expect("the backfilled topic exists");
+    append_user_message(
+        &db,
+        &chat_id,
+        &account,
+        "cli-before",
+        "2026-08-10T00:00:00Z",
+    )
+    .await;
+    append_user_message(&db, &chat_id, &account, "cli-after", "2026-08-10T09:00:00Z").await;
+    let now = now_rfc3339();
+    sqlx::query("INSERT INTO product_genesis_session (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity, lifecycle, version, created_at, updated_at) VALUES ('cli-genesis', ?, ?, 'test', 'idea', 'mvp', 'discovering', 1, ?, ?)")
+        .bind(&account).bind(&chat_id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        pending, 0,
+        "idle and Genesis raise no intent for a CLI chat"
+    );
+    let topic_after = AgentChatTopicRepo::get_current_agent_chat_topic(&db, &chat_id)
+        .await
+        .unwrap()
+        .expect("the topic still exists");
+    assert_eq!(topic_after, topic_before, "no topic boundary moved");
+    let before = AgentChatMessageRepo::get_agent_chat_message(&db, "cli-before")
+        .await
+        .unwrap()
+        .expect("the earlier message is kept");
+    assert!(
+        before.sequence >= topic_after.starting_message_sequence,
+        "the pre-idle message stays inside the current topic's history"
+    );
+}
+
+#[tokio::test]
+async fn a_topic_request_is_denied_while_genesis_needs_a_decision() {
+    let (db, chat_id) = database_with_ready_main_chat("request-genesis").await;
+    let account = bind_main_agent(&db, &chat_id, "native").await;
+    let now = now_rfc3339();
+    sqlx::query("INSERT INTO product_genesis_session (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity, lifecycle, version, created_at, updated_at) VALUES ('request-genesis', ?, ?, 'test', 'idea', 'mvp', 'ready_for_project', 1, ?, ?)")
+        .bind(&account).bind(&chat_id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    // Genesis itself raised its rotation; a user request may not add to it.
+    let error = AgentChatTopicTransactionRepo::request_agent_chat_topic(
+        &db,
+        rotate_input(&chat_id, "denied-request", "user label"),
+    )
+    .await
+    .expect_err("a pending Genesis decision denies a topic request");
+    assert!(matches!(
+        error,
+        db::DbError::AgentChatTopicDenied(AgentChatTopicDenialReason::GenesisDecisionPending)
+    ));
+    let label: String =
+        sqlx::query_scalar("SELECT label FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(label, "Product Genesis");
 }

@@ -1448,3 +1448,29 @@ no daemon protocol change. Remote policy facts are not reported.
 ## Before-work hooks
 
 Before-work hooks may run more than once, including after an interrupted step resumes, and must be safe to repeat.
+
+### Native chat working-set budgets
+
+These server keys bound each native request, including tool schemas, history and
+the transient state card. Target controls LCM pressure; hard caps planner input.
+The provider's smaller input window remains authoritative. Values require
+`0 < target <= hard`; CLI chat and other surfaces retain their existing policy.
+
+```yaml
+server:
+  main_working_set_target_tokens: 48000
+  main_working_set_hard_tokens: 64000
+  project_working_set_target_tokens: 96000
+  project_working_set_hard_tokens: 128000
+```
+
+Environment overrides are `FORGE_SERVER_MAIN_WORKING_SET_TARGET_TOKENS`,
+`FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS`,
+`FORGE_SERVER_PROJECT_WORKING_SET_TARGET_TOKENS` and
+`FORGE_SERVER_PROJECT_WORKING_SET_HARD_TOKENS`.
+
+Native chat topics rotate after Genesis/handoff turns and before their successors,
+or before the next user turn following eight hours idle; CLI chats never rotate
+automatically. An explicit topic request during a live turn is saved and completed
+at that same idle admission boundary. A rotation that fails three times is
+abandoned with a visible notice, and the chat continues on its current topic.

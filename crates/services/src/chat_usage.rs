@@ -23,6 +23,9 @@ use sqlx::Row;
 use crate::{Result, ServiceError};
 
 const CHAT_CANDIDATE: &str = "chat";
+/// Candidate key of a topic-rotation summary call: its own invocation on the
+/// chat's surface, distinct from every turn's provider calls.
+const TOPIC_SUMMARY_CANDIDATE: &str = "topic_summary";
 #[derive(Debug, Clone)]
 struct ScopeSnapshot {
     owner_user_id: String,
@@ -40,6 +43,10 @@ enum AdmissionGuard<'a> {
     Inquiry {
         id: &'a str,
         expected_version: i64,
+    },
+    /// An unsettled rotation-summary outbox row (no turn owns the call).
+    TopicSummary {
+        id: &'a str,
     },
 }
 
@@ -341,14 +348,15 @@ async fn create_chat_invocation(
     scope: &ScopeSnapshot,
     agent: &Agent,
     profile: &AgentProfile,
+    candidate: &str,
     guard: AdmissionGuard<'_>,
 ) -> Result<UsageInvocation> {
     let (provider_id, runtime_model) = provider_model(profile);
     let admitted_at = now_rfc3339();
     let provider_entry = profile.credential_ref.clone();
     let daemon_id = profile.daemon_id.clone();
-    let selection_id = stable_id("pricing-selection", source_id, CHAT_CANDIDATE, ordinal)?;
-    let invocation_id = stable_id("usage-invocation", source_id, CHAT_CANDIDATE, ordinal)?;
+    let selection_id = stable_id("pricing-selection", source_id, candidate, ordinal)?;
+    let invocation_id = stable_id("usage-invocation", source_id, candidate, ordinal)?;
     let mut transaction = db::begin_immediate(db.pool()).await?;
     match guard {
         AdmissionGuard::ChatTurn {
@@ -381,6 +389,18 @@ async fn create_chat_invocation(
             )
             .bind(id)
             .bind(expected_version)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .is_some();
+            if !valid {
+                return Err(db::DbError::VersionConflict.into());
+            }
+        }
+        AdmissionGuard::TopicSummary { id } => {
+            let valid = sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM agent_topic_summary_usage WHERE id = ? AND settled_at IS NULL",
+            )
+            .bind(id)
             .fetch_optional(&mut *transaction)
             .await?
             .is_some();
@@ -525,7 +545,7 @@ async fn create_chat_invocation(
         source_id: source_id.to_owned(),
         execution_id: None,
         task_id: None,
-        candidate_key: Some(CHAT_CANDIDATE.to_owned()),
+        candidate_key: Some(candidate.to_owned()),
         attempt_ordinal: ordinal,
         invocation_id: None,
         subject_id: subject_id.clone(),
@@ -567,7 +587,7 @@ async fn create_chat_invocation(
             source_id: source_id.to_owned(),
             execution_id: None,
             task_id: None,
-            candidate_key: Some(CHAT_CANDIDATE.to_owned()),
+            candidate_key: Some(candidate.to_owned()),
             attempt_ordinal: ordinal,
             subject_id,
             subject_revision_id,
@@ -602,7 +622,7 @@ async fn create_chat_invocation(
             execution_id: None,
             task_id: None,
             domain_idempotency_key: format!("chat-provider-call:{invocation_id}"),
-            candidate_key: Some(CHAT_CANDIDATE.to_owned()),
+            candidate_key: Some(candidate.to_owned()),
             attempt_ordinal: ordinal,
             pricing_selection_id: selection.id.clone(),
             admitted_provider_id: selection.admitted_provider_id.clone(),
@@ -694,6 +714,7 @@ pub(crate) async fn admit_chat_usage(
         &scope,
         &agent,
         &profile,
+        CHAT_CANDIDATE,
         AdmissionGuard::ChatTurn {
             id: &job.id,
             expected_version: job.version,
@@ -751,6 +772,7 @@ pub(crate) async fn admit_inquiry_usage(
         &scope,
         &agent,
         profile,
+        CHAT_CANDIDATE,
         AdmissionGuard::Inquiry {
             id: &inquiry.id,
             expected_version: inquiry.version,
@@ -885,6 +907,131 @@ pub(crate) async fn settle_late_chat_usage(
         db::UsageLedgerRepo::settle_usage_invocations_with_events(db, settlements).await?;
     }
     Ok(())
+}
+
+/// Settles one rotation-summary usage outbox row into the usage ledger.
+///
+/// The summary call is its own invocation (source = the outbox row id,
+/// candidate `topic_summary`) on the chat's usage surface, admitted and
+/// settled in one step: no turn owns it, so it is charged even if the new
+/// topic never runs one. Idempotent by row id: the invocation and selection
+/// ids are stable, settlement skips an already settled invocation, and the
+/// row is marked settled last. `false` when there was nothing to settle.
+pub(crate) async fn settle_topic_summary_usage(db: &SqliteDb, row_id: &str) -> Result<bool> {
+    let Some(row) = sqlx::query(
+        "SELECT runtime_session_id, provider, model, input_tokens, output_tokens, failed,
+                chat_id, settled_at
+         FROM agent_topic_summary_usage WHERE id = ?",
+    )
+    .bind(row_id)
+    .fetch_optional(db.pool())
+    .await?
+    else {
+        return Ok(false);
+    };
+    if row.try_get::<Option<String>, _>("settled_at")?.is_some() {
+        return Ok(false);
+    }
+    let runtime_session_id: String = row.try_get("runtime_session_id")?;
+    let session: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT session.identity_id, session.profile_id, scope.scope_id
+         FROM agent_session AS session
+         JOIN agent_context_scope AS scope ON scope.id = session.context_scope_id
+         WHERE session.runtime_session_id = ? AND scope.scope_type = 'agent_chat'
+         LIMIT 1",
+    )
+    .bind(&runtime_session_id)
+    .fetch_optional(db.pool())
+    .await?;
+    let chat_id = row
+        .try_get::<Option<String>, _>("chat_id")?
+        .or_else(|| session.as_ref().map(|session| session.2.clone()));
+    let chat = match chat_id {
+        Some(chat_id) => AgentChatRepo::get_agent_chat(db, &chat_id).await?,
+        None => None,
+    };
+    let (Some(chat), Some((identity_id, profile_id, _))) = (chat, session) else {
+        // The chat (and with it the session) is gone: there is no surface
+        // left to attribute the call to. Stop retrying it.
+        tracing::warn!(
+            row_id,
+            "topic summary usage has no chat or session left to attribute; dropping it"
+        );
+        sqlx::query("UPDATE agent_topic_summary_usage SET settled_at = ? WHERE id = ?")
+            .bind(now_rfc3339())
+            .bind(row_id)
+            .execute(db.pool())
+            .await?;
+        return Ok(false);
+    };
+    let scope = scope_snapshot(db, &chat, None).await?;
+    let (agent, profile) = load_agent_profile(db, Some(&identity_id), Some(&profile_id)).await?;
+    create_chat_invocation(
+        db,
+        row_id,
+        0,
+        PricingDomainKind::Chat,
+        &scope,
+        &agent,
+        &profile,
+        TOPIC_SUMMARY_CANDIDATE,
+        AdmissionGuard::TopicSummary { id: row_id },
+    )
+    .await?;
+    let input = u64::try_from(row.try_get::<i64, _>("input_tokens")?).unwrap_or(0);
+    let output = u64::try_from(row.try_get::<i64, _>("output_tokens")?).unwrap_or(0);
+    let report = UsageReport {
+        report_id: row_id.to_owned(),
+        request_id: Some(row_id.to_owned()),
+        report_sequence: 0,
+        candidate_key: Some(TOPIC_SUMMARY_CANDIDATE.to_owned()),
+        attempt_ordinal: 0,
+        provider_id: row.try_get("provider")?,
+        model_id: row.try_get("model")?,
+        counters: UsageCounters {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+        },
+        telemetry_state: ExecutorTelemetryState::Metered,
+        context_tokens: Some(input),
+        selected_tier: None,
+        reported_cost_usd: None,
+        outcome: None,
+        partial: row.try_get::<bool, _>("failed")?,
+    };
+    let now = now_rfc3339();
+    settle_late_chat_usage(db, row_id, &[report], &now).await?;
+    sqlx::query(
+        "UPDATE agent_topic_summary_usage SET settled_at = ? WHERE id = ? AND settled_at IS NULL",
+    )
+    .bind(&now)
+    .bind(row_id)
+    .execute(db.pool())
+    .await?;
+    Ok(true)
+}
+
+/// Drains rotation-summary usage the rotation itself could not settle (a
+/// crash between the summary and its settlement). Bounded per pass.
+pub(crate) async fn settle_unsettled_topic_summary_usage(db: &SqliteDb) -> Result<usize> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM agent_topic_summary_usage WHERE settled_at IS NULL ORDER BY id LIMIT 16",
+    )
+    .fetch_all(db.pool())
+    .await?;
+    let mut settled = 0;
+    for id in ids {
+        match settle_topic_summary_usage(db, &id).await {
+            Ok(true) => settled += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(row_id = %id, %error, "topic summary usage settlement deferred");
+            }
+        }
+    }
+    Ok(settled)
 }
 
 #[cfg(test)]

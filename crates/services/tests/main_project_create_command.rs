@@ -613,6 +613,11 @@ async fn concurrent_project_creation_service_replays_frozen_packet_ids() {
 #[tokio::test]
 async fn main_project_create_is_one_account_receipt_and_exactly_replayable() {
     let fixture = fixture().await;
+    sqlx::query("DELETE FROM agent_chat_topic_rotation WHERE chat_id = ?")
+        .bind(&fixture.main_chat_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
     let service = MainOrchestrationActionService::new(Arc::clone(&fixture.db));
     let input = command_input(&fixture);
 
@@ -620,6 +625,12 @@ async fn main_project_create_is_one_account_receipt_and_exactly_replayable() {
         .execute(input.clone())
         .await
         .expect("Main Project command executes");
+    let marks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ? AND cause IN ('project.create','handoff')")
+        .bind(&fixture.main_chat_id).fetch_one(fixture.db.pool()).await.unwrap();
+    assert_eq!(
+        marks, 1,
+        "atomic Project creation/handoff marks one coalesced topic intent"
+    );
     let result = execution
         .result_json
         .clone()

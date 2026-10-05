@@ -57,15 +57,15 @@ pub use interaction::{
     InteractionAnswer, InteractionAnswerValue, InteractionBrokerHandle, ProtectedInteractionSummary,
 };
 pub use lcm::{
-    DeterministicLcmSummaryModel, FORGE_LCM_POLICY_REVISION, FORGE_LCM_SIZER_REVISION,
-    FORGE_LCM_STORE_REVISION, FORGE_TASK_LCM_PROJECTION_REVISION, ForgeLcmSizer, SqliteLcmStore,
-    TaskLcmProjectionPolicy, TaskRuntimeLcmRecord,
+    DeterministicLcmSummaryModel, FORGE_LCM_POLICY_REVISION, FORGE_LCM_STORE_REVISION,
+    FORGE_TASK_LCM_PROJECTION_REVISION, SqliteLcmStore, TaskLcmProjectionPolicy,
+    TaskRuntimeLcmRecord,
 };
 pub use manifest::{
     RuntimeClassificationLink, RuntimeContextManifestLink, RuntimeContextSegmentLink,
     RuntimeLosslessSummaryLink, RuntimeSummaryCoverageLink,
 };
-pub use native::NativeAgentRuntimeBackend;
+pub use native::{NativeAgentRuntimeBackend, TOPIC_SUMMARY_TIMEOUT, topic_summary_usage_id};
 pub use operation_catalog::{
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
@@ -387,6 +387,9 @@ pub struct AgentTurnOutput {
 #[async_trait]
 pub trait TurnEventSink: Send + Sync + fmt::Debug {
     async fn text_delta(&self, _text: &str) {}
+
+    /// Redaction-safe cache-prefix diagnostics from the authoritative planner.
+    async fn cache_plan_changed(&self, _first_changed_fragment: Option<&str>) {}
 
     /// A reasoning fragment. `redacted` fragments carry no readable text and
     /// exist only as liveness/progress signals.

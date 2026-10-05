@@ -110,7 +110,7 @@ async fn native_identity(
             prompt_template: None,
             capabilities_json: "{}".to_owned(),
             tool_policy_json: tool_policy.to_string(),
-            config_json: "{}".to_owned(),
+            config_json: serde_json::json!({"base_url": "https://unused.invalid/v1"}).to_string(),
             credential_ref: Some(credential_id.to_owned()),
             daemon_id: None,
             created_at: now.clone(),
@@ -315,13 +315,51 @@ impl ChatFixture {
     }
 }
 
+#[derive(Debug, Default)]
+struct CacheDiagnosticSink(std::sync::Mutex<Vec<Option<String>>>);
+#[async_trait::async_trait]
+impl TurnEventSink for CacheDiagnosticSink {
+    async fn cache_plan_changed(&self, fragment: Option<&str>) {
+        self.0.lock().unwrap().push(fragment.map(str::to_owned));
+    }
+}
+
 /// The card is the request's last block, on its own outside the user
 /// message, so user text that imitates a card stays plain user text and the
 /// durable history never holds a card to send again.
 #[tokio::test]
 async fn server_state_card_trails_the_request_outside_the_user_message_with_a_stable_system() {
     let fixture = chat_fixture().await;
-    let provider = scripted_provider(vec![text_step("first reply"), text_step("second reply")]);
+    let mut capabilities = Capabilities::basic_streaming();
+    capabilities.cache = true;
+    capabilities.override_prompt_cache(agent_runtime::core::provider::PromptCacheControl::Implicit);
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        capabilities,
+        vec![
+            ScriptedStream::new(vec![
+                ProviderStreamEvent::TextDelta {
+                    text: "first reply".into(),
+                },
+                usage_event(600, 60),
+                ProviderStreamEvent::cache_observation(Some(0), None).unwrap(),
+                ProviderStreamEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]),
+            ScriptedStream::new(vec![
+                ProviderStreamEvent::TextDelta {
+                    text: "second reply".into(),
+                },
+                usage_event(600, 60),
+                ProviderStreamEvent::cache_observation(Some(500), None).unwrap(),
+                ProviderStreamEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]),
+        ],
+    ));
+    let diagnostics = Arc::new(CacheDiagnosticSink::default());
     let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
         .with_provider_override(provider.clone());
     let project_id = new_uuid_v4();
@@ -347,7 +385,7 @@ async fn server_state_card_trails_the_request_outside_the_user_message_with_a_st
         turn.server_state_card = Some(card.clone());
         cards.push(card);
         backend
-            .run_turn(turn, Arc::new(NoopSink))
+            .run_turn(turn, diagnostics.clone())
             .await
             .expect("native chat turn completes");
         if input == forged {
@@ -376,7 +414,7 @@ async fn server_state_card_trails_the_request_outside_the_user_message_with_a_st
         // The runtime renders a contributed block on the system role; the
         // current card is the only system-role message after the prompt.
         let trailing = request.messages.last().unwrap();
-        assert_eq!(trailing.role, forge_agent_host::Role::System);
+        assert_eq!(trailing.role, forge_agent_host::Role::User);
         assert_eq!(trailing.content.len(), 1);
         assert_eq!(trailing.content[0].as_text(), Some(card.as_str()));
         let system_messages = request
@@ -384,7 +422,7 @@ async fn server_state_card_trails_the_request_outside_the_user_message_with_a_st
             .iter()
             .filter(|message| message.role == forge_agent_host::Role::System)
             .count();
-        assert_eq!(system_messages, 2, "the system prompt and the one card");
+        assert_eq!(system_messages, 1, "only the stable system prompt");
         // Every user message, the newest and the ones in history, is the
         // user's text alone.
         for message in &request.messages {
@@ -401,6 +439,17 @@ async fn server_state_card_trails_the_request_outside_the_user_message_with_a_st
         .messages
         .iter()
         .all(|message| !message.joined_text().contains("version=v4")));
+    let changes = diagnostics.0.lock().unwrap();
+    println!("CACHE_PREFIX_DIAGNOSTICS {:?}", *changes);
+    assert!(changes.len() >= 2);
+    assert!(
+        changes
+            .iter()
+            .skip(1)
+            .flatten()
+            .all(|id| id.starts_with("history:") || id == "forge:server-state-card"),
+        "stable topic prefix changed: {changes:?}"
+    );
 }
 
 /// A turn that runs tools sends several provider requests. Each one carries
@@ -1150,8 +1199,9 @@ async fn tool_exchange_history_reaches_hard_pressure_before_the_planner_refuses_
 /// attempt, so before the protected store tracked
 /// `FORGE_LCM_POLICY_REVISION`, shipping any change to those policies — the
 /// sizer fix above included — would have failed every turn of every live
-/// chat with no recovery path. The component's state is a cache over the
-/// durable timeline, so the host drops it and lets the coordinator rebuild.
+/// chat with no recovery path. The runtime (U6) now tolerates superseded
+/// tuning revisions and rebuilds the metadata from the durable timeline, so
+/// the host keeps the state and no longer drops it.
 #[tokio::test]
 async fn a_superseded_lcm_policy_revision_rebuilds_instead_of_failing_every_turn() {
     use agent_runtime::core::checkpoint::{CheckpointStore, TurnCheckpoint};
@@ -1212,20 +1262,17 @@ async fn a_superseded_lcm_policy_revision_rebuilds_instead_of_failing_every_turn
             .expect("checkpoint saves");
     };
 
-    // Control: the marker matches this binary, so the state is taken at face
-    // value and the runtime rejects it — the failure mode being fixed.
+    // The marker still matches this binary, so the host keeps the state as
+    // written; the runtime (U6) rebuilds the superseded tuning metadata
+    // itself instead of rejecting it.
     stamp_superseded_state().await;
-    let error = backend
+    backend
         .run_turn(
-            fixture.turn("turn 1: continue over unreadable component state"),
+            fixture.turn("turn 1: continue across tuning revisions"),
             Arc::new(NoopSink),
         )
         .await
-        .expect_err("component state this binary cannot decode must fail the turn");
-    assert!(
-        error.to_string().contains("LCM component revision changed"),
-        "the control case must fail on the component revision, not something else: {error}"
-    );
+        .expect("U6 rebuilds tuning metadata without a host marker change");
 
     // A policy change leaves exactly this behind: state from the old policy,
     // beside the old policy's marker. The snapshot and the checkpoint each
@@ -2063,4 +2110,1067 @@ async fn a_retried_turn_does_not_record_the_failed_attempts_calls_again() {
     calls.push(retried);
     chat.assert_totals_count_each_call_once(&calls, 2, 3).await;
     assert_eq!(chat.provider.requests().len(), calls.len());
+}
+
+#[tokio::test]
+async fn topic_rotation_recovers_after_mark_and_after_fork_before_commit() {
+    use db::{AgentChatTopicRepo, AgentChatTopicTransactionRepo};
+    use services::TopicRotator;
+    let fixture = chat_fixture().await;
+    let provider = scripted_provider(vec![
+        text_step("Prior plan and unresolved work."),
+        text_step("Keep the plan and unresolved work."),
+    ]);
+    let backend = Arc::new(
+        NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+            .with_provider_override(provider.clone()),
+    );
+    backend
+        .run_turn(
+            fixture.turn("Remember the existing plan."),
+            Arc::new(NoopSink),
+        )
+        .await
+        .unwrap();
+    let source_timeline: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+    )
+    .bind(&fixture.runtime_session_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    let service = Arc::new(fixture.service.with_native_backend(backend));
+    let intent = new_uuid_v4();
+    fixture
+        .db
+        .request_agent_chat_topic(db::RotateAgentChatTopic {
+            runtime_session_id: None,
+            rotation_owner: None,
+            topic: db::CreateAgentChatTopic {
+                id: intent.clone(),
+                chat_id: fixture.scope.scope_id.clone(),
+                label: "New topic".into(),
+                summary: None,
+                principal_type: "user".into(),
+                principal_id: Some("user-1".into()),
+                created_at: now_rfc3339(),
+            },
+            divider_message: db::topic_divider_message(
+                new_uuid_v4(),
+                fixture.scope.scope_id.clone(),
+                "New topic",
+                new_uuid_v4(),
+                now_rfc3339(),
+            ),
+        })
+        .await
+        .unwrap();
+    // Simulate restart after the mark, then fail the topic commit after fork.
+    sqlx::query("CREATE TRIGGER fail_topic_commit BEFORE INSERT ON agent_chat_topic BEGIN SELECT RAISE(ABORT, 'injected crash after native fork'); END;")
+        .execute(fixture.db.pool()).await.unwrap();
+    let coordinator = services::TopicRotationCoordinator::new(fixture.db.clone(), service.clone());
+    assert!(coordinator
+        .rotate_pending(&fixture.scope.scope_id)
+        .await
+        .is_err());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE id = ? AND summary_ciphertext IS NOT NULL")
+        .bind(&intent).fetch_one(fixture.db.pool()).await.unwrap();
+    assert_eq!(count, 1);
+    sqlx::query("DROP TRIGGER fail_topic_commit")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let calls = provider.requests().len();
+    // The failed attempt backs off; the replay runs once it is due.
+    assert!(
+        services::TopicRotationCoordinator::new(fixture.db.clone(), service)
+            .rotate_pending_at(
+                &fixture.scope.scope_id,
+                chrono::Utc::now() + chrono::Duration::seconds(10),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        provider.requests().len(),
+        calls,
+        "replay reuses the protected summary seed"
+    );
+    assert_eq!(
+        fixture
+            .db
+            .list_agent_chat_topics(&fixture.scope.scope_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let successor: String =
+        sqlx::query_scalar("SELECT runtime_session_id FROM agent_chat_topic WHERE id = ?")
+            .bind(&intent)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    let next_timeline: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+    )
+    .bind(&successor)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_ne!(source_timeline, next_timeline);
+    let store = fixture
+        .db
+        .get_current_agent_chat_topic(&fixture.scope.scope_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.id, intent);
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&fixture.scope.scope_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(pending, 0);
+}
+
+#[tokio::test]
+async fn pre_u7_resume_adopts_once_and_retired_timeline_still_loads() {
+    let fixture = chat_fixture().await;
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(text_only_provider(3));
+    backend
+        .run_turn(fixture.turn("First turn"), Arc::new(NoopSink))
+        .await
+        .unwrap();
+    let timeline: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+    )
+    .bind(&fixture.runtime_session_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE agent_lcm_timeline SET claim_owner = NULL, claim_generation = 0, scope_id = canonical_scope_id || '#retired:' || id, retired_at = ? WHERE id = ?")
+        .bind(now_rfc3339()).bind(&timeline).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("DELETE FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?")
+        .bind(&fixture.runtime_session_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    backend
+        .run_turn(fixture.turn("Resume after upgrade"), Arc::new(NoopSink))
+        .await
+        .unwrap();
+    backend
+        .run_turn(fixture.turn("Resume again"), Arc::new(NoopSink))
+        .await
+        .unwrap();
+    let (owner, generation, retired): (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT claim_owner, claim_generation, retired_at FROM agent_lcm_timeline WHERE id = ?",
+    )
+    .bind(timeline)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(owner, fixture.runtime_session_id);
+    assert_eq!(generation, 1, "only the first upgraded resume adopts");
+    assert!(retired.is_some(), "historical V149 data is preserved");
+}
+
+#[derive(Debug, Default)]
+struct WorkingSetMeasurementProvider {
+    requests: std::sync::Mutex<Vec<(u32, agent_runtime::core::provider::ProviderRequest)>>,
+    ordinary: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl agent_runtime::core::provider::Provider for WorkingSetMeasurementProvider {
+    fn describe(&self) -> Vec<agent_runtime::core::provider::ModelDescriptor> {
+        Vec::new()
+    }
+    fn capabilities(&self, _: &agent_runtime::core::provider::ModelId) -> Option<Capabilities> {
+        Some(Capabilities::basic_streaming())
+    }
+    async fn stream(
+        &self,
+        request: agent_runtime::core::provider::ProviderRequest,
+        ctx: agent_runtime::core::provider::ProviderCallContext,
+    ) -> Result<
+        agent_runtime::core::provider::ProviderStream,
+        agent_runtime::core::provider::ProviderError,
+    > {
+        use agent_runtime::context::RequestSizer;
+        let sizer = agent_runtime::context::CharRatioSizer::default();
+        let tokens = request
+            .messages
+            .iter()
+            .map(|m| sizer.size_message(m))
+            .sum::<u32>()
+            + request
+                .tools
+                .iter()
+                .map(|t| sizer.size_tool_schema(t))
+                .sum::<u32>();
+        let summary = request.messages.first().is_some_and(|m| {
+            m.joined_text()
+                .starts_with("Summarize the supplied conversation")
+        });
+        self.requests
+            .lock()
+            .unwrap()
+            .push((tokens, request.clone()));
+        let events = if summary {
+            vec![ProviderStreamEvent::TextDelta { text: "The user is planning a Project. Preserve the constraints, prior decisions, and next actions; consult current state for authority.".into() }, usage_event(u64::from(tokens), 32), ProviderStreamEvent::Finish { reason: FinishReason::Stop }]
+        } else {
+            let call = self
+                .ordinary
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call & 1 == 0 {
+                vec![
+                    ProviderStreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: Some(format!("measurement-{call}")),
+                        name: Some("forge_scope_read".into()),
+                        arguments_fragment: serde_json::json!({"operation": "agent_chat.summary"})
+                            .to_string(),
+                    },
+                    usage_event(u64::from(tokens), 40),
+                    ProviderStreamEvent::Finish {
+                        reason: FinishReason::ToolCalls,
+                    },
+                ]
+            } else {
+                vec![
+                    ProviderStreamEvent::TextDelta {
+                        text: "Documented Project planning detail. ".repeat(480),
+                    },
+                    usage_event(u64::from(tokens), 4_000),
+                    ProviderStreamEvent::Finish {
+                        reason: FinishReason::Stop,
+                    },
+                ]
+            }
+        };
+        agent_runtime::core::provider::Provider::stream(
+            &*scripted_provider(vec![ScriptedStream::new(events)]),
+            request,
+            ctx,
+        )
+        .await
+    }
+}
+#[derive(Debug)]
+struct WorkingSetMeasurementReads {
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl forge_agent_host::ForgeToolProvider for WorkingSetMeasurementReads {
+    async fn read(
+        &self,
+        _: &str,
+        _: &CanonicalScope,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, forge_agent_host::AgentHostError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(
+            serde_json::json!({"charter": "Approved requirements and acceptance detail. ".repeat(760)}),
+        )
+    }
+    async fn propose(
+        &self,
+        _: &str,
+        _: &CanonicalScope,
+        _: &str,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, forge_agent_host::AgentHostError> {
+        unreachable!()
+    }
+}
+
+/// The Project Agent Chat of a fresh Project, answered by the fixture's
+/// native identity with Project read permissions.
+async fn project_chat_fixture() -> ChatFixture {
+    let mut fixture = chat_fixture_with_policy(
+        serde_json::json!({"permissions": ["read_project", "read_agent_chat", "read_memory"]}),
+        serde_json::json!({"allowed": ["read_project", "read_agent_chat", "read_memory"]}),
+    )
+    .await;
+    let project = new_uuid_v4();
+    let now = now_rfc3339();
+    sqlx::query("INSERT INTO project (id, name, owner_id, version, created_at, updated_at) VALUES (?, 'Measurement Project', 'user-1', 1, ?, ?)")
+        .bind(&project).bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    let project_chat: String = sqlx::query_scalar("SELECT id FROM agent_chat WHERE project_id = ?")
+        .bind(&project)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    let original = db::AgentSessionRepo::get_agent_session(&*fixture.db, &fixture.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE project_agent_binding SET identity_id = ?, profile_id = ?, state = 'active', permission_ceiling_json = ? WHERE project_id = ?")
+        .bind(&original.identity_id).bind(&original.profile_id)
+        .bind(serde_json::json!({"allowed": ["read_project", "read_agent_chat", "read_memory"]}).to_string())
+        .bind(&project).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("INSERT OR IGNORE INTO project_member (id, project_id, user_id, role, created_at, updated_at) VALUES (?, ?, 'user-1', 'owner', ?, ?)")
+        .bind(new_uuid_v4()).bind(&project).bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    let session = fixture
+        .service
+        .create_or_resume_session(CreateScopedSession {
+            actor_user_id: "user-1".into(),
+            identity_id: original.identity_id,
+            profile_id: Some(original.profile_id),
+            scope: RequestedCanonicalScope::AgentChat {
+                chat_id: project_chat.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    fixture.session_id = session.id;
+    fixture.runtime_session_id = session.runtime_session_id.unwrap();
+    fixture.scope.scope_id = project_chat;
+    fixture
+}
+
+/// Runs the scripted 40-turn workload (each turn: one large user message, one
+/// real scoped tool read, one long reply) and reports, per turn, the largest
+/// ordinary request and, separately, the provider summary calls the turn
+/// made (LCM leaf/condensation summaries).
+async fn run_working_set_measurement(mut fixture: ChatFixture, surface: &str, hard_cap: u32) {
+    fixture.provider_config.context_tokens = 1_000_000;
+    fixture.provider_config.max_input_tokens = 800_000;
+    fixture.provider_config.max_output_tokens = 8_192;
+    let provider = Arc::new(WorkingSetMeasurementProvider::default());
+    let reads = Arc::new(WorkingSetMeasurementReads {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(provider.clone())
+        .with_forge_tool_provider(reads.clone());
+    let is_summary = |request: &agent_runtime::core::provider::ProviderRequest| {
+        request.messages.first().is_some_and(|m| {
+            m.joined_text()
+                .starts_with("Summarize the supplied conversation")
+        })
+    };
+    let mut turn_maxima = Vec::new();
+    let mut summary_per_turn = Vec::new();
+    for turn in 0..40 {
+        let before = provider.requests.lock().unwrap().len();
+        let mut request = fixture.turn(&format!(
+            "{surface} planning turn {turn}: {}",
+            "Constraints and unresolved delivery questions. ".repeat(400)
+        ));
+        request.server_state_card = Some(format!(
+            "{surface} state card: turn {turn}; review current records before acting."
+        ));
+        backend
+            .run_turn(request, Arc::new(NoopSink))
+            .await
+            .unwrap_or_else(|error| panic!("{surface} measurement turn {turn}: {error}"));
+        let records = provider.requests.lock().unwrap();
+        let largest = records[before..]
+            .iter()
+            .filter(|(_, r)| !is_summary(r))
+            .map(|(tokens, _)| *tokens)
+            .max()
+            .unwrap();
+        let summaries: Vec<u32> = records[before..]
+            .iter()
+            .filter(|(_, r)| is_summary(r))
+            .map(|(tokens, _)| *tokens)
+            .collect();
+        turn_maxima.push(largest);
+        summary_per_turn.push((summaries.len(), summaries.iter().sum::<u32>()));
+    }
+    assert_eq!(
+        reads.calls.load(std::sync::atomic::Ordering::SeqCst),
+        40,
+        "every turn must execute a real scoped tool read"
+    );
+    let mut sorted = turn_maxima.clone();
+    sorted.sort_unstable();
+    let summary_calls: usize = summary_per_turn.iter().map(|(calls, _)| calls).sum();
+    let summary_input: u32 = summary_per_turn.iter().map(|(_, input)| input).sum();
+    let summary_max = provider
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, r)| is_summary(r))
+        .map(|(tokens, _)| *tokens)
+        .max()
+        .unwrap_or(0);
+    let mut with_summaries: Vec<u32> = turn_maxima
+        .iter()
+        .zip(&summary_per_turn)
+        .map(|(largest, (_, input))| largest + input)
+        .collect();
+    with_summaries.sort_unstable();
+    println!(
+        "WORKING_SET_MEASUREMENT surface={surface} turns=40 p50={} max={} summary_calls={summary_calls} summary_input_total={summary_input} summary_input_max={summary_max} turn_plus_summary_p50={} turn_plus_summary_max={} per_turn={:?} summaries_per_turn={:?}",
+        sorted[19], sorted[39], with_summaries[19], with_summaries[39], turn_maxima, summary_per_turn
+    );
+    if std::env::var("FORGE_MEASUREMENT_EXPECT_CAP").as_deref() == Ok("1") {
+        assert!(
+            sorted[39] <= hard_cap,
+            "{surface}'s planner hard cap must apply to every request"
+        );
+    }
+}
+
+/// Forty native Project turns; records the actual planner-sized requests, including tool schemas.
+#[tokio::test]
+async fn forty_turn_project_working_set_measurement() {
+    run_working_set_measurement(project_chat_fixture().await, "Project", 128_000).await;
+}
+
+/// The same workload on the Main Chat (48k target, 64k hard cap).
+#[tokio::test]
+async fn forty_turn_main_working_set_measurement() {
+    run_working_set_measurement(chat_fixture().await, "Main", 64_000).await;
+}
+
+// ---- topic working set: upgrade, usage and rotation admission ----
+
+/// Adopt claims generation 1 and then saves the rebuilt snapshot. If that
+/// save fails (crash, busy DB), the claim is durable but the snapshot still
+/// carries generation 0. The same session re-adopts idempotently, so the next
+/// turn resumes.
+#[tokio::test]
+async fn a_failed_save_after_the_adopt_claim_does_not_wedge_the_chat() {
+    let fixture = chat_fixture().await;
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(text_only_provider(4));
+    backend
+        .run_turn(fixture.turn("First turn"), Arc::new(NoopSink))
+        .await
+        .unwrap();
+    let timeline: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+    )
+    .bind(&fixture.runtime_session_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    // Pre-U7 store shape: populated, unclaimed timeline, no binding row.
+    sqlx::query(
+        "UPDATE agent_lcm_timeline SET claim_owner = NULL, claim_generation = 0 WHERE id = ?",
+    )
+    .bind(&timeline)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?")
+        .bind(&fixture.runtime_session_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    // Crash window: the snapshot save after Adopt's claim fails.
+    sqlx::query("CREATE TRIGGER fail_snapshot_save_u BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'injected crash before snapshot save'); END;")
+        .execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_snapshot_save_i BEFORE INSERT ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'injected crash before snapshot save'); END;")
+        .execute(fixture.db.pool()).await.unwrap();
+    let crashed = backend
+        .run_turn(fixture.turn("Upgrade turn"), Arc::new(NoopSink))
+        .await;
+    assert!(
+        crashed.is_err(),
+        "the injected save failure fails this turn"
+    );
+    let (owner, generation): (Option<String>, i64) =
+        sqlx::query_as("SELECT claim_owner, claim_generation FROM agent_lcm_timeline WHERE id = ?")
+            .bind(&timeline)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    println!("adopt crash: after crash: owner={owner:?} generation={generation}");
+    sqlx::query("DROP TRIGGER fail_snapshot_save_u")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER fail_snapshot_save_i")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let first_retry = backend
+        .run_turn(fixture.turn("Retry after restart"), Arc::new(NoopSink))
+        .await;
+    println!("adopt crash: retry 1: {:?}", first_retry.as_ref().err());
+    let second_retry = backend
+        .run_turn(fixture.turn("Retry again"), Arc::new(NoopSink))
+        .await;
+    println!("adopt crash: retry 2: {:?}", second_retry.as_ref().err());
+    assert!(
+        first_retry.is_ok() && second_retry.is_ok(),
+        "a failed save after Adopt's claim wedges every later resume"
+    );
+}
+
+/// Rotation-summary usage is charged once (an outbox row settled by id), not
+/// on every turn of the successor topic.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn topic_summary_usage_is_settled_once() {
+    let chat = ledger_chat(
+        MEASURED_CALLS[..3]
+            .iter()
+            .enumerate()
+            .map(|(turn, call)| metered_text_step(&format!("reply {turn}"), *call))
+            .collect(),
+    )
+    .await;
+    let first = chat.turn("message 0").await;
+    assert_eq!(first.status, db::AgentChatTurnState::Succeeded);
+    let runtime_id: String = sqlx::query_scalar(
+        "SELECT runtime_session_id FROM agent_session WHERE runtime_session_id IS NOT NULL AND backend_kind = 'native' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(chat.db.pool())
+    .await
+    .unwrap();
+    // Exactly the row fork_topic writes for a completed rotation summary.
+    sqlx::query("INSERT INTO agent_topic_summary_usage (id, runtime_session_id, provider, model, input_tokens, output_tokens, failed, purpose) VALUES ('topic-summary:audit', ?, 'openai', 'fake', 7777, 55, 0, 'topic_summary')")
+        .bind(&runtime_id).execute(chat.db.pool()).await.unwrap();
+    println!(
+        "summary usage: runtime={runtime_id} sessions={:?}",
+        sqlx::query_as::<_, (String, Option<String>, String)>(
+            "SELECT id, runtime_session_id, status FROM agent_session"
+        )
+        .fetch_all(chat.db.pool())
+        .await
+        .unwrap()
+    );
+    for turn in 1..3 {
+        let job = chat.turn(&format!("message {turn}")).await;
+        assert_eq!(job.status, db::AgentChatTurnState::Succeeded, "turn {turn}");
+    }
+    let charged: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_event WHERE input_tokens = 7777")
+            .fetch_one(chat.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(charged, 1, "rotation summary usage charged {charged} times");
+}
+
+/// A timeline written before any post-V149 turn has `runtime_session_id IS
+/// NULL`. The upgrade turn adopts it (stamping its owner), and the first topic
+/// rotation still forks onto a new timeline.
+#[tokio::test]
+async fn rotation_after_adopting_a_pre_v149_owner_less_timeline_forks_a_new_timeline() {
+    use db::AgentChatTopicTransactionRepo;
+    use services::TopicRotator;
+    let fixture = chat_fixture().await;
+    let provider = scripted_provider(vec![
+        text_step("Prior plan."),
+        text_step("Upgrade turn reply."),
+        text_step("Topic summary."),
+        text_step("After rotation."),
+    ]);
+    let backend = Arc::new(
+        NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+            .with_provider_override(provider.clone()),
+    );
+    backend
+        .run_turn(fixture.turn("Remember the plan."), Arc::new(NoopSink))
+        .await
+        .unwrap();
+    let timeline: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+    )
+    .bind(&fixture.runtime_session_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    // Pre-V149-owner row: V149 backfilled canonical_scope_id but left runtime_session_id NULL.
+    sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id = NULL, claim_owner = NULL, claim_generation = 0 WHERE id = ?")
+        .bind(&timeline).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("DELETE FROM agent_runtime_lcm_binding")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    backend
+        .run_turn(fixture.turn("First turn after upgrade"), Arc::new(NoopSink))
+        .await
+        .expect("upgrade turn adopts the legacy timeline");
+    let service = Arc::new(fixture.service.with_native_backend(backend));
+    fixture
+        .db
+        .request_agent_chat_topic(db::RotateAgentChatTopic {
+            runtime_session_id: None,
+            rotation_owner: None,
+            topic: db::CreateAgentChatTopic {
+                id: new_uuid_v4(),
+                chat_id: fixture.scope.scope_id.clone(),
+                label: "New topic".into(),
+                summary: None,
+                principal_type: "user".into(),
+                principal_id: Some("user-1".into()),
+                created_at: now_rfc3339(),
+            },
+            divider_message: db::topic_divider_message(
+                new_uuid_v4(),
+                fixture.scope.scope_id.clone(),
+                "New topic",
+                new_uuid_v4(),
+                now_rfc3339(),
+            ),
+        })
+        .await
+        .unwrap();
+    let coordinator = services::TopicRotationCoordinator::new(fixture.db.clone(), service);
+    let first = coordinator.rotate_pending(&fixture.scope.scope_id).await;
+    let bindings: Vec<(String, String)> =
+        sqlx::query_as("SELECT runtime_session_id, timeline_id FROM agent_runtime_lcm_binding")
+            .fetch_all(fixture.db.pool())
+            .await
+            .unwrap();
+    println!("legacy rotation: first={first:?} bindings={bindings:?}");
+    let second = coordinator.rotate_pending(&fixture.scope.scope_id).await;
+    println!("legacy rotation: replay={second:?}");
+    assert!(
+        matches!(first, Ok(true)) || matches!(second, Ok(true)),
+        "rotation of an adopted pre-V149 chat never completes"
+    );
+}
+
+/// Through the real worker: a chat whose legacy timeline was adopted rotates
+/// before its next turn, and that turn is then admitted rather than left
+/// queued.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_turn_queued_behind_a_legacy_chat_rotation_is_admitted() {
+    use db::AgentChatTopicTransactionRepo;
+    let chat = ledger_chat(
+        MEASURED_CALLS
+            .iter()
+            .enumerate()
+            .map(|(turn, call)| metered_text_step(&format!("reply {turn}"), *call))
+            .collect(),
+    )
+    .await;
+    assert_eq!(
+        chat.turn("message 0").await.status,
+        db::AgentChatTurnState::Succeeded
+    );
+    sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id = NULL, claim_owner = NULL, claim_generation = 0")
+        .execute(chat.db.pool()).await.unwrap();
+    sqlx::query("DELETE FROM agent_runtime_lcm_binding")
+        .execute(chat.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        chat.turn("message 1").await.status,
+        db::AgentChatTurnState::Succeeded
+    );
+    chat.db
+        .request_agent_chat_topic(db::RotateAgentChatTopic {
+            runtime_session_id: None,
+            rotation_owner: None,
+            topic: db::CreateAgentChatTopic {
+                id: new_uuid_v4(),
+                chat_id: chat.chat_id.clone(),
+                label: "New topic".into(),
+                summary: None,
+                principal_type: "user".into(),
+                principal_id: Some("user-1".into()),
+                created_at: now_rfc3339(),
+            },
+            divider_message: db::topic_divider_message(
+                new_uuid_v4(),
+                chat.chat_id.clone(),
+                "New topic",
+                new_uuid_v4(),
+                now_rfc3339(),
+            ),
+        })
+        .await
+        .unwrap();
+    let admitted = chat
+        .chats
+        .send_message(services::SendAgentChatMessageInput {
+            actor_user_id: "user-1".into(),
+            chat_id: chat.chat_id.clone(),
+            content: "message 2".into(),
+            dedupe_key: Some("message 2".into()),
+        })
+        .await
+        .unwrap();
+    let mut claimed = 0;
+    for _ in 0..5 {
+        claimed += chat.worker.run_once().await.unwrap();
+    }
+    let job = chat.job(&admitted.turn_job.id).await;
+    println!(
+        "queued turn: claimed={claimed} status={:?} attempts={} error={:?}",
+        job.status, job.attempt_count, job.error_code
+    );
+    assert_ne!(
+        job.status,
+        db::AgentChatTurnState::Queued,
+        "the turn is neither run nor failed while the rotation cannot complete"
+    );
+}
+
+fn topic_request(chat_id: &str, label: &str) -> db::RotateAgentChatTopic {
+    db::RotateAgentChatTopic {
+        runtime_session_id: None,
+        rotation_owner: None,
+        topic: db::CreateAgentChatTopic {
+            id: new_uuid_v4(),
+            chat_id: chat_id.to_owned(),
+            label: label.into(),
+            summary: None,
+            principal_type: "user".into(),
+            principal_id: Some("user-1".into()),
+            created_at: now_rfc3339(),
+        },
+        divider_message: db::topic_divider_message(
+            new_uuid_v4(),
+            chat_id.to_owned(),
+            label,
+            new_uuid_v4(),
+            now_rfc3339(),
+        ),
+    }
+}
+
+/// Where a repeatedly failing rotation breaks.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RotationBreak {
+    /// The runtime fork cannot save the successor.
+    Fork,
+    /// The fork completes; Forge's topic commit fails.
+    TopicCommit,
+}
+
+/// A rotation that keeps failing is bounded: three attempts with back-off,
+/// then it is abandoned with a visible notice and a typed `rotation_failed`
+/// event, the summary call is still charged once, and the turn that was
+/// waiting runs. A failed fork keeps the chat on its current session; a fork
+/// that completed hands the chat to the successor (the source is superseded).
+#[cfg(feature = "test-support")]
+async fn abandon_a_failing_rotation(fault: RotationBreak) {
+    use db::{AgentChatTopicRepo, AgentChatTopicTransactionRepo};
+    let chat = ledger_chat(
+        MEASURED_CALLS[..3]
+            .iter()
+            .enumerate()
+            .map(|(turn, call)| metered_text_step(&format!("reply {turn}"), *call))
+            .collect(),
+    )
+    .await;
+    assert_eq!(
+        chat.turn("message 0").await.status,
+        db::AgentChatTurnState::Succeeded
+    );
+    let topics_before = chat.db.list_agent_chat_topics(&chat.chat_id).await.unwrap();
+    let intent = chat
+        .db
+        .request_agent_chat_topic(topic_request(&chat.chat_id, "Doomed topic"))
+        .await
+        .unwrap();
+    let successor: String = sqlx::query_scalar(
+        "SELECT successor_session_id FROM agent_chat_topic_rotation WHERE id = ?",
+    )
+    .bind(&intent)
+    .fetch_one(chat.db.pool())
+    .await
+    .unwrap();
+    match fault {
+        RotationBreak::Fork => {
+            for event in ["INSERT", "UPDATE"] {
+                sqlx::query(&format!("CREATE TRIGGER fail_successor_save_{event} BEFORE {event} ON protected_agent_session_state WHEN NEW.session_id = '{successor}' BEGIN SELECT RAISE(ABORT, 'injected successor save failure'); END;"))
+                    .execute(chat.db.pool()).await.unwrap();
+            }
+        }
+        RotationBreak::TopicCommit => {
+            sqlx::query("CREATE TRIGGER fail_topic_commit BEFORE INSERT ON agent_chat_topic BEGIN SELECT RAISE(ABORT, 'injected topic commit failure'); END;")
+                .execute(chat.db.pool()).await.unwrap();
+        }
+    }
+    // The chat's only session so far, whatever its idle status.
+    let (original, original_status): (String, String) =
+        sqlx::query_as("SELECT id, status FROM agent_session WHERE backend_kind = 'native'")
+            .fetch_one(chat.db.pool())
+            .await
+            .unwrap();
+    let admitted = chat
+        .chats
+        .send_message(services::SendAgentChatMessageInput {
+            actor_user_id: "user-1".into(),
+            chat_id: chat.chat_id.clone(),
+            content: "message 1".into(),
+            dedupe_key: Some("message 1".into()),
+        })
+        .await
+        .unwrap();
+    let start = chrono::Utc::now();
+    let mut claimed = Vec::new();
+    for offset in [0, 10, 60] {
+        claimed.push(
+            chat.worker
+                .run_once_at(start + chrono::Duration::seconds(offset))
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        claimed,
+        vec![0, 0, 1],
+        "the turn waits while attempts remain, then runs"
+    );
+    let job = chat.job(&admitted.turn_job.id).await;
+    assert_eq!(
+        job.status,
+        db::AgentChatTurnState::Succeeded,
+        "{:?}",
+        job.error_message
+    );
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation")
+        .fetch_one(chat.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(pending, 0, "the abandoned intent no longer blocks the chat");
+    assert_eq!(
+        chat.db.list_agent_chat_topics(&chat.chat_id).await.unwrap(),
+        topics_before,
+        "the chat keeps its current topic"
+    );
+    let statuses: (String, String) = sqlx::query_as(
+        "SELECT (SELECT status FROM agent_session WHERE id = ?1),
+                (SELECT status FROM agent_session WHERE id = ?2)",
+    )
+    .bind(&original)
+    .bind(&successor)
+    .fetch_one(chat.db.pool())
+    .await
+    .unwrap();
+    let event: String = sqlx::query_scalar(
+        "SELECT payload_json FROM domain_event WHERE event_type = 'agent_chat.topic.rotation_failed'",
+    )
+    .fetch_one(chat.db.pool())
+    .await
+    .unwrap();
+    let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+    assert_eq!(event["attempts"], 3);
+    let notice: (String, String) = sqlx::query_as(
+        "SELECT author_type, content FROM agent_chat_message WHERE outcome = 'topic_rotation_failed'",
+    )
+    .fetch_one(chat.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(notice.0, "system");
+    assert!(notice.1.contains("Doomed topic"));
+    match fault {
+        RotationBreak::Fork => {
+            assert_eq!(statuses, (original_status, "failed".to_owned()));
+            assert_eq!(event["error_kind"], "runtime");
+            assert_eq!(event["session_handed_over"], false);
+        }
+        RotationBreak::TopicCommit => {
+            assert_eq!(statuses.0, "replaced");
+            assert_ne!(statuses.1, "failed");
+            assert_eq!(event["error_kind"], "persistence");
+            assert_eq!(event["session_handed_over"], true);
+        }
+    }
+    let summary_calls = chat
+        .provider
+        .requests()
+        .iter()
+        .filter(|request| {
+            request.messages.first().is_some_and(|message| {
+                message
+                    .joined_text()
+                    .starts_with("Summarize the supplied conversation")
+            })
+        })
+        .count();
+    assert_eq!(summary_calls, 1, "replays reuse the sealed summary seed");
+    let charged: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_event WHERE input_tokens = ?")
+            .bind(i64::try_from(MEASURED_CALLS[1].0).unwrap())
+            .fetch_one(chat.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        charged, 1,
+        "the summary call is charged once although the new topic never ran a turn"
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_rotation_whose_fork_keeps_failing_is_abandoned_and_the_queued_turn_runs() {
+    abandon_a_failing_rotation(RotationBreak::Fork).await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn a_rotation_whose_topic_commit_keeps_failing_hands_the_chat_to_its_successor() {
+    abandon_a_failing_rotation(RotationBreak::TopicCommit).await;
+}
+
+/// A provider summary failure alone never fails the rotation: the seed falls
+/// back to the deterministic summary.
+#[tokio::test]
+async fn a_failed_topic_summary_falls_back_to_the_deterministic_seed() {
+    use agent_runtime::core::provider::{ProviderError, ProviderErrorKind};
+    use db::{AgentChatTopicRepo, AgentChatTopicTransactionRepo};
+    use services::TopicRotator;
+    let fixture = chat_fixture().await;
+    let provider = scripted_provider(vec![
+        text_step("The plan is agreed."),
+        ScriptedStream::new(vec![ProviderStreamEvent::Error {
+            error: ProviderError::new(ProviderErrorKind::BadRequest, "summary rejected"),
+        }]),
+    ]);
+    let backend = Arc::new(
+        NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+            .with_provider_override(provider.clone()),
+    );
+    backend
+        .run_turn(fixture.turn("Agree the plan."), Arc::new(NoopSink))
+        .await
+        .unwrap();
+    let service = Arc::new(fixture.service.with_native_backend(backend));
+    let intent = fixture
+        .db
+        .request_agent_chat_topic(topic_request(&fixture.scope.scope_id, "Next topic"))
+        .await
+        .unwrap();
+    assert!(
+        services::TopicRotationCoordinator::new(fixture.db.clone(), service)
+            .rotate_pending(&fixture.scope.scope_id)
+            .await
+            .expect("the rotation succeeds without a provider summary"),
+    );
+    let topic = fixture
+        .db
+        .get_current_agent_chat_topic(&fixture.scope.scope_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(topic.id, intent);
+    assert_eq!(topic.label, "Next topic");
+}
+
+#[derive(Debug)]
+struct ProjectStateReads {
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl forge_agent_host::ForgeToolProvider for ProjectStateReads {
+    async fn read(
+        &self,
+        _: &str,
+        _: &CanonicalScope,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, forge_agent_host::AgentHostError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(serde_json::json!({"state": "Milestone M1 open; three Tasks in review."}))
+    }
+    async fn propose(
+        &self,
+        _: &str,
+        _: &CanonicalScope,
+        _: &str,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, forge_agent_host::AgentHostError> {
+        unreachable!()
+    }
+}
+
+fn project_state_read_step(id: &str) -> ScriptedStream {
+    ScriptedStream::new(vec![
+        ProviderStreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some(id.to_owned()),
+            name: Some(forge_agent_host::FORGE_PROJECT_ORCHESTRATION_READ_TOOL.to_owned()),
+            arguments_fragment: serde_json::json!({
+                "operation": "project.current_state",
+                "arguments": {}
+            })
+            .to_string(),
+        },
+        usage_event(600, 60),
+        ProviderStreamEvent::Finish {
+            reason: FinishReason::ToolCalls,
+        },
+    ])
+}
+
+fn last_tool_result(request: &agent_runtime::core::provider::ProviderRequest) -> String {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == agent_runtime::core::content::Role::Tool)
+        .map(|message| serde_json::to_string(message).unwrap())
+        .expect("the request carries the tool result")
+}
+
+/// The unchanged-read marker is returned only while its referenced result is
+/// visible. A failed turn clears the references, so the next repeated read
+/// sends the full body again.
+#[tokio::test]
+async fn an_unchanged_read_after_a_failed_turn_returns_the_full_body() {
+    use agent_runtime::core::provider::{ProviderError, ProviderErrorKind};
+    let fixture = project_chat_fixture().await;
+    let provider = scripted_provider(vec![
+        project_state_read_step("call_1"),
+        text_step("State noted."),
+        project_state_read_step("call_1"),
+        ScriptedStream::new(vec![ProviderStreamEvent::Error {
+            error: ProviderError::new(ProviderErrorKind::BadRequest, "request rejected"),
+        }]),
+        project_state_read_step("call_1"),
+        text_step("State noted again."),
+    ]);
+    let reads = Arc::new(ProjectStateReads {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(provider.clone())
+        .with_forge_tool_provider(reads.clone());
+    let turn = |input: &str| {
+        let mut request = fixture.turn(input);
+        request.server_state_card = Some("Project state card.".to_owned());
+        request
+    };
+    backend
+        .run_turn(turn("Read the state."), Arc::new(NoopSink))
+        .await
+        .expect("first turn");
+    assert!(backend
+        .run_turn(turn("Read it again."), Arc::new(NoopSink))
+        .await
+        .is_err());
+    backend
+        .run_turn(turn("And once more."), Arc::new(NoopSink))
+        .await
+        .expect("third turn");
+    assert_eq!(reads.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 6);
+    let first = last_tool_result(&requests[1]);
+    assert!(
+        first.contains("Milestone M1") && first.contains("read_ref"),
+        "{first}"
+    );
+    let repeated = last_tool_result(&requests[3]);
+    assert!(
+        repeated.contains("unchanged_since_call") && !repeated.contains("Milestone M1"),
+        "an unchanged read inside the topic returns the reference: {repeated}"
+    );
+    let after_failure = last_tool_result(&requests[5]);
+    assert!(
+        after_failure.contains("Milestone M1") && !after_failure.contains("unchanged_since_call"),
+        "after a failed turn the full body is sent again: {after_failure}"
+    );
 }

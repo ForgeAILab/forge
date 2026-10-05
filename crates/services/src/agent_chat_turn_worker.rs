@@ -564,6 +564,16 @@ impl AgentChatTurnLogRoot {
 
 #[async_trait]
 pub trait AgentChatTurnRunner: Send + Sync {
+    /// One attempt at the chat's pending topic rotation, if it is due at
+    /// `now`. Runs off the turn-claim path (the worker's rotation pass).
+    async fn rotate_pending_topic(
+        &self,
+        _chat_id: &str,
+        _now: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn run_turn(
         &self,
         job: &AgentChatTurnJob,
@@ -3590,6 +3600,19 @@ impl FederatedAgentChatTurnRunner {
 
 #[async_trait]
 impl AgentChatTurnRunner for FederatedAgentChatTurnRunner {
+    async fn rotate_pending_topic(
+        &self,
+        chat_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
+        crate::TopicRotator::rotate_pending_at(
+            &crate::TopicRotationCoordinator::new(self.db.clone(), self.embedded_agents.clone()),
+            chat_id,
+            now,
+        )
+        .await
+    }
+
     async fn validate_admission_authority(&self, job: &AgentChatTurnJob) -> Result<()> {
         if job.canonical_scope_type != "agent_chat" || job.canonical_scope_id != job.chat_id {
             return Err(ServiceError::invalid_operation(
@@ -3679,6 +3702,8 @@ pub struct AgentChatTurnWorker {
     runner: Arc<dyn AgentChatTurnRunner>,
     lease_owner: String,
     lease_renew_interval: Duration,
+    /// Held by the one in-flight topic rotation pass.
+    rotation_pass: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3720,6 +3745,7 @@ impl AgentChatTurnWorker {
             runner,
             lease_owner: format!("agent-chat-worker:{}", db::new_uuid_v4()),
             lease_renew_interval: LEASE_RENEW_INTERVAL,
+            rotation_pass: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -3839,6 +3865,9 @@ impl AgentChatTurnWorker {
     /// Select due work at an explicit clock instant; leases retain real time.
     pub async fn run_once_at(&self, now: chrono::DateTime<Utc>) -> Result<usize> {
         self.recover_expired().await?;
+        // Deterministic for callers: due rotations complete (or back off)
+        // before this pass claims. The polling loop runs them off-path.
+        crate::topic_rotation::run_topic_rotation_pass(&self.db, &self.runner, now).await?;
         let jobs: Vec<_> = self.claim_one_at(now).await?.into_iter().collect();
         let count = jobs.len();
         for job in jobs {
@@ -3850,6 +3879,7 @@ impl AgentChatTurnWorker {
     async fn claim_available(&self, capacity: usize) -> Result<Vec<AgentChatTurnJob>> {
         let mut jobs = Vec::with_capacity(capacity);
         self.recover_expired().await?;
+        self.spawn_topic_rotation_pass();
         for _ in 0..capacity {
             let Some(job) = self.claim_one().await? else {
                 break;
@@ -3863,6 +3893,25 @@ impl AgentChatTurnWorker {
         self.claim_one_at(Utc::now()).await
     }
 
+    /// Starts one topic rotation pass in the background unless one is
+    /// already running, so a rotation's provider summary call never delays
+    /// claiming any chat's turns.
+    fn spawn_topic_rotation_pass(&self) {
+        let Ok(guard) = Arc::clone(&self.rotation_pass).try_lock_owned() else {
+            return;
+        };
+        let db = Arc::clone(&self.db);
+        let runner = Arc::clone(&self.runner);
+        tokio::spawn(async move {
+            let _guard = guard;
+            if let Err(error) =
+                crate::topic_rotation::run_topic_rotation_pass(&db, &runner, Utc::now()).await
+            {
+                tracing::warn!(%error, "topic rotation pass failed");
+            }
+        });
+    }
+
     async fn claim_one_at(&self, now: chrono::DateTime<Utc>) -> Result<Option<AgentChatTurnJob>> {
         let now = now.to_rfc3339();
         let leased_until = lease_deadline();
@@ -3872,6 +3921,7 @@ impl AgentChatTurnWorker {
                  SELECT job.id
                  FROM agent_chat_turn_job AS job
                  WHERE job.status IN ('queued', 'retry_wait')
+                   AND NOT EXISTS (SELECT 1 FROM agent_chat_topic_rotation r WHERE r.chat_id = job.chat_id AND r.origin_turn_id IS NOT job.id)
                    AND job.attempt_count < job.max_attempts
                    AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ?)
                    -- A responder whose provider entry is backing off waits
