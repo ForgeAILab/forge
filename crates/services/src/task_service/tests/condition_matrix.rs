@@ -144,6 +144,7 @@ async fn condition_fixture(
                         to_state: reject_target.to_owned(),
                         trigger_name: Some("reject".to_owned()),
                         triggered_by: "user".to_owned(),
+                        bridge: Default::default(),
                         trigger_reason: "fixture rejection".to_owned(),
                         hook_results_json: None,
                         rejection: true,

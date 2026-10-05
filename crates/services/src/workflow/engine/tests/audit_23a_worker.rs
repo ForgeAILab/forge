@@ -29,11 +29,13 @@ async fn queued_ci_for_task(
         .unwrap();
     let input = fixture
         .engine
+        .workflow_execution()
         .cascade_step_input(
             &task,
             &fixture.workflow,
             "review".into(),
             "queued CI".into(),
+            Default::default(),
             false,
             false,
             Some(fixture.workflow_authority().await),
@@ -127,6 +129,7 @@ async fn audit_23a_real_target_moved_rebases_twice_without_ci_do_not_park() {
         .unwrap();
     fixture
         .engine
+        .workflow_execution()
         .transition(
             &task.id,
             "review",
@@ -135,6 +138,7 @@ async fn audit_23a_real_target_moved_rebases_twice_without_ci_do_not_park() {
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "completed",
             false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -183,7 +187,7 @@ async fn audit_23a_real_target_moved_rebases_twice_without_ci_do_not_park() {
             review_runner: None,
             merge_service: None,
             cleanup_scheduler: None,
-            task_service: fixture.engine.task_service.clone(),
+            task_service: fixture.engine.clone(),
             daemon_connections: None,
             workspace_exec_locks: None,
             terminal_activity: None,
@@ -195,7 +199,7 @@ async fn audit_23a_real_target_moved_rebases_twice_without_ci_do_not_park() {
             execution_id: None,
             state_config: json!({}),
         };
-        let crate::workflow::HookResult::Cascade { to, reason } =
+        let crate::workflow::HookResult::Cascade { to, reason, bridge } =
             crate::workflow::actions::target_moved_result(&ctx, &task, "target advanced", "main")
                 .await
         else {
@@ -211,11 +215,13 @@ async fn audit_23a_real_target_moved_rebases_twice_without_ci_do_not_park() {
             .unwrap();
         let input = fixture
             .engine
+            .workflow_execution()
             .cascade_step_input(
                 &task,
                 &fixture.workflow,
                 to,
                 reason,
+                bridge,
                 false,
                 false,
                 None,
@@ -279,6 +285,7 @@ async fn audit_23a_before_exit_cascade_does_not_suppress_target_hooks() {
         cancellation_state: None,
     };
     let result = engine(db.clone(), bus)
+        .workflow_execution()
         .transition(
             id,
             "target",
@@ -287,6 +294,7 @@ async fn audit_23a_before_exit_cascade_does_not_suppress_target_hooks() {
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "advance",
             false,
+            Default::default(),
         )
         .await;
     assert!(result.is_ok(), "the CAS returns before target hooks");
@@ -450,11 +458,13 @@ async fn audit_23a_fast_lane_progresses_while_four_real_ci_hooks_hold_long_lane(
         .unwrap();
     let input = fixture
         .engine
+        .workflow_execution()
         .cascade_step_input(
             &task,
             &workflow,
             "finished".into(),
             "fast cascade".into(),
+            Default::default(),
             false,
             false,
             None,
@@ -494,11 +504,13 @@ async fn reaudit_23a_default_cascades_in_other_projects_run_while_long_lane_is_f
         assert_ne!(other.project_id, fixture.task.project_id);
         let input = fixture
             .engine
+            .workflow_execution()
             .cascade_step_input(
                 &other,
                 &workflow,
                 to.into(),
                 "gate skipped: other Project".into(),
+                Default::default(),
                 from == "review",
                 false,
                 None,

@@ -64,7 +64,11 @@ impl HookAction for AutoCascadeOnUnassignedRole {
         match target {
             Some(to) => HookResult::Cascade {
                 to,
-                reason: format!("gate skipped: no {role_name} role assigned"),
+                reason: format!("No {role_name} role assigned; optional gate skipped"),
+
+                bridge: api_types::TransitionBridge::new(
+                    api_types::TransitionBridgeKind::GateSkipped,
+                ),
             },
             None => HookResult::Skipped {
                 reason: format!("no active transition for unassigned {role_name} role"),

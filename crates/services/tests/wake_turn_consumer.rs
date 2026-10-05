@@ -3096,16 +3096,13 @@ async fn audit39b_detection(fixture: &ChatTurnFixture, path: &str, count: i64) {
         let task_id = new_uuid_v4();
         let id = new_uuid_v4();
         let now = now_rfc3339();
-        let reason = format!(
-            "[conflict-handoff]; paths_json={}",
-            serde_json::json!([path])
-        );
+        let reason = format!("Conflict handed to worker: {path}");
         sqlx::query("INSERT INTO task (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, ?, 'merge_failed', ?, ?)")
             .bind(&task_id).bind(&fixture.project_id).bind(format!("audit39b:{number}"))
             .bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
         let mut tx = db::begin_immediate(fixture.db.pool()).await.unwrap();
-        sqlx::query("INSERT INTO transition_log (id, task_id, from_state, to_state, triggered_by, trigger_reason, created_at) VALUES (?, ?, 'merging', 'merge_failed', 'system:workflow', ?, ?)")
-            .bind(&id).bind(&task_id).bind(&reason).bind(&now).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO transition_log (id, task_id, from_state, to_state, triggered_by, trigger_reason, created_at, bridge_kind, bridge_payload) VALUES (?, ?, 'merging', 'merge_failed', 'system:workflow', ?, ?, 'conflict_handoff', ?)")
+            .bind(&id).bind(&task_id).bind(&reason).bind(&now).bind(serde_json::json!({"paths":[path]}).to_string()).execute(&mut *tx).await.unwrap();
         fixture
             .db
             .append_event_in_tx(

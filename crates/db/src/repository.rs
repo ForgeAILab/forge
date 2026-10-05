@@ -1398,15 +1398,15 @@ pub trait ExecutionRepo: Send + Sync {
     ) -> Result<Option<Execution>>;
     /// Count and test in-flight automatic recovery executions without loading
     /// the complete execution history into the service process.
-    async fn count_by_task_and_summary_prefix(
+    async fn count_by_task_and_purpose(
         &self,
         task_id: &str,
-        summary_prefix: &str,
+        purpose: api_types::ExecutionPurpose,
     ) -> Result<i64>;
-    async fn has_running_by_task_and_summary_prefix(
+    async fn has_running_by_task_and_purpose(
         &self,
         task_id: &str,
-        summary_prefix: &str,
+        purpose: api_types::ExecutionPurpose,
     ) -> Result<bool>;
     /// Duplicate-follow-up detection is an exact parent/status lookup, not a
     /// first-page history scan.
@@ -3047,6 +3047,8 @@ pub struct CreateExecution {
 /// between the dispatcher's final read and admission fails closed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionAdmission {
+    #[serde(default)]
+    pub purpose: Option<api_types::ExecutionPurpose>,
     /// Only the replay owning this exact intent may consume it at admission.
     pub expected_queued_recovery_id: Option<String>,
     /// Project revision selected with the Task/workflow snapshot. Project

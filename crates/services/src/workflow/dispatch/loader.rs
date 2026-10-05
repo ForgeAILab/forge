@@ -505,6 +505,7 @@ mod tests {
             to_state: "in_progress".to_owned(),
             trigger_name: Some("accept".to_owned()),
             triggered_by: triggered_by.to_owned(),
+            bridge: Default::default(),
             trigger_reason: reason.to_owned(),
             hook_results_json: None,
             rejection: false,

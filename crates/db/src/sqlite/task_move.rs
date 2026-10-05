@@ -230,6 +230,7 @@ impl TaskBoardRepo for SqliteDb {
             to_state: input.target_status.clone(),
             trigger_name: input.trigger_name.clone(),
             triggered_by: input.triggered_by.clone(),
+            bridge: input.bridge.clone(),
             trigger_reason: input.trigger_reason.clone(),
             hook_results_json: None,
             rejection: input.rejection,
@@ -290,6 +291,7 @@ impl TaskBoardRepo for SqliteDb {
                 to_state: transition_input.to_state,
                 trigger_name: transition_input.trigger_name,
                 triggered_by: transition_input.triggered_by,
+                bridge: transition_input.bridge,
                 trigger_reason: transition_input.trigger_reason,
                 hook_results_json: None,
                 rejection: transition_input.rejection,
@@ -514,7 +516,7 @@ async fn insert_transition_log(
 ) -> Result<()> {
     // Runs after the move's status update: record the epoch it entered.
     sqlx::query(
-        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, status_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))",
+        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload, status_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))",
     )
     .bind(&input.id)
     .bind(&input.task_id)
@@ -526,6 +528,8 @@ async fn insert_transition_log(
     .bind(input.hook_results_json.as_deref())
     .bind(if input.rejection { 1_i64 } else { 0_i64 })
     .bind(&input.created_at)
+    .bind(input.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+    .bind(input.bridge.bridge_payload.as_ref().map(ToString::to_string))
     .bind(&input.task_id)
     .execute(&mut **tx)
     .await?;

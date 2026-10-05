@@ -384,6 +384,7 @@ fn merge_fix_prompts_hand_a_committed_conflict_to_the_worker() {
         to_state: default_states::MERGE_FAILED.to_owned(),
         trigger_name: None,
         triggered_by: "system:workflow".to_owned(),
+        bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ConflictHandoff),
         trigger_reason: format!(
             "{} rebased onto main; conflicts were committed with markers in: src/pkg/__init__.py, uv.lock",
             crate::workflow::CONFLICT_HANDOFF_MARKER

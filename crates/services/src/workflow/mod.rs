@@ -53,9 +53,18 @@ pub struct HookContext {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum HookResult {
     Ok,
-    Skipped { reason: String },
-    Failed { reason: String },
-    Cascade { to: String, reason: String },
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        reason: String,
+    },
+    Cascade {
+        to: String,
+        reason: String,
+        #[serde(flatten)]
+        bridge: api_types::TransitionBridge,
+    },
 }
 
 pub mod actions;
@@ -71,23 +80,16 @@ pub mod template_service;
 pub mod transition_event;
 pub mod validation;
 
-/// Marks a mechanical integration-contention bounce whose only purpose is to
-/// obtain a fresh review. These transitions must never consume a merge-fix
-/// budget or dispatch an implementation agent.
+#[cfg(test)]
 pub(crate) const REVIEW_REFRESH_MARKER: &str = "[review-refresh]";
-
-/// Additional marker used to bound repeated automatic target rebases.
+#[cfg(test)]
 pub(crate) const TARGET_MOVED_MARKER: &str = "[target-moved-rebase]";
-
-/// Marks a rebase conflict Forge committed with its markers and handed back to
-/// the Worker to reconcile. Worker prompts key their merge-fix instructions on
-/// it, and it bounds how many conflicts one Task may be handed.
+#[cfg(test)]
 pub(crate) const CONFLICT_HANDOFF_MARKER: &str = "[conflict-handoff]";
+#[cfg(test)]
 pub(crate) const CONFLICT_HANDOFF_PATHS_PREFIX: &str = "; paths_json=";
 
-/// Only paths handed to the Worker in the current retry window require a
-/// conflict-marker check at integration. The transition reason is durable and
-/// carries a JSON path list so punctuation and non-ASCII names stay intact.
+/// Paths recorded in typed conflict handoffs in the current retry window.
 pub(crate) fn handed_off_conflict_paths(entries: &[db::TransitionLog]) -> Vec<String> {
     let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
     let mut paths = Vec::new();
@@ -95,17 +97,11 @@ pub(crate) fn handed_off_conflict_paths(entries: &[db::TransitionLog]) -> Vec<St
         if entry.from_state != default_states::MERGING
             || entry.to_state != default_states::MERGE_FAILED
             || entry.triggered_by != workflow_actor
-            || !entry.trigger_reason.contains(CONFLICT_HANDOFF_MARKER)
+            || entry.bridge.bridge_kind != Some(api_types::TransitionBridgeKind::ConflictHandoff)
         {
             continue;
         }
-        let Some((_, encoded)) = entry
-            .trigger_reason
-            .rsplit_once(CONFLICT_HANDOFF_PATHS_PREFIX)
-        else {
-            continue;
-        };
-        if let Ok(handoff_paths) = serde_json::from_str::<Vec<String>>(encoded) {
+        if let Some(handoff_paths) = entry.bridge.conflict_paths() {
             for path in handoff_paths {
                 if !paths.contains(&path) {
                     paths.push(path);
@@ -122,8 +118,8 @@ pub(crate) fn handed_off_conflict_paths(entries: &[db::TransitionLog]) -> Vec<St
 /// The transition log must end with `merging -> merge_failed` bridge followed
 /// directly by the current `merge_failed -> review` entry, so a failed check
 /// bounce, a user move, or any other intervening transition disqualifies the
-/// entry. Only Forge's own bridges qualify: a clean rebase carrying both the
-/// review-refresh and target-moved markers, or a conflict handoff.
+/// entry. Only Forge's own bridges qualify: a clean rebase classified as TargetMovedRebase followed by ReviewRefresh,
+/// or a ConflictHandoff.
 pub(crate) fn review_carry_entry_kind(
     entries: &[db::TransitionLog],
 ) -> Option<db::ReviewCarryKind> {
@@ -140,11 +136,10 @@ pub(crate) fn review_carry_entry_kind(
     {
         return None;
     }
-    if bridge.trigger_reason.contains(CONFLICT_HANDOFF_MARKER) {
+    if bridge.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff) {
         Some(db::ReviewCarryKind::ConflictRepair)
-    } else if bridge.trigger_reason.contains(REVIEW_REFRESH_MARKER)
-        && bridge.trigger_reason.contains(TARGET_MOVED_MARKER)
-        && current.trigger_reason.contains(REVIEW_REFRESH_MARKER)
+    } else if bridge.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::TargetMovedRebase)
+        && current.bridge.is_review_refresh()
     {
         Some(db::ReviewCarryKind::CleanRebase)
     } else {
@@ -157,8 +152,8 @@ pub(crate) async fn review_refresh_transition_pending(
     task_id: &str,
     current_state: &str,
 ) -> db::Result<bool> {
-    let latest = sqlx::query_as::<_, (String, String, String, String)>(
-        "SELECT from_state, to_state, trigger_reason, triggered_by
+    let latest = sqlx::query_as::<_, (String, String, Option<String>, String)>(
+        "SELECT from_state, to_state, bridge_kind, triggered_by
          FROM transition_log
          WHERE task_id = ?
          ORDER BY created_at DESC, rowid DESC
@@ -169,10 +164,13 @@ pub(crate) async fn review_refresh_transition_pending(
     .await?;
 
     Ok(
-        latest.is_some_and(|(from_state, to_state, reason, triggered_by)| {
+        latest.is_some_and(|(from_state, to_state, kind, triggered_by)| {
             from_state == default_states::MERGING
                 && to_state == current_state
-                && reason.contains(REVIEW_REFRESH_MARKER)
+                && kind
+                    .as_deref()
+                    .and_then(|kind| kind.parse::<api_types::TransitionBridgeKind>().ok())
+                    .is_some_and(api_types::TransitionBridgeKind::is_review_refresh)
                 && triggered_by
                     == api_types::Actor::system(api_types::SystemComponent::Workflow).display()
         }),
@@ -212,7 +210,10 @@ mod tests {
     use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind};
     use serde_json::json;
 
-    use super::effective_role;
+    use super::{
+        effective_role, handed_off_conflict_paths, review_carry_entry_kind,
+        review_refresh_transition_pending,
+    };
 
     fn state(kind: StateKind, role: Option<&str>) -> StateDefinition {
         StateDefinition {
@@ -256,6 +257,108 @@ mod tests {
         assert_eq!(
             effective_role(&state(StateKind::Gate, Some("coder"))),
             Some("coder")
+        );
+    }
+    fn bridge_log(from: &str, to: &str, bridge: api_types::TransitionBridge) -> db::TransitionLog {
+        db::TransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: "task".into(),
+            from_state: from.into(),
+            to_state: to.into(),
+            trigger_name: None,
+            triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            bridge,
+            trigger_reason: "Human text is independent of classification".into(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: db::now_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn bridge_readers_ignore_prose_and_use_only_typed_history() {
+        use api_types::{TransitionBridge as Bridge, TransitionBridgeKind as Kind};
+        let paths = vec!["src/a,b.rs".into(), "日本語.rs".into()];
+        let handoff = bridge_log("merging", "merge_failed", Bridge::conflict_handoff(&paths));
+        assert_eq!(
+            handed_off_conflict_paths(std::slice::from_ref(&handoff)),
+            paths
+        );
+        let current = bridge_log("merge_failed", "review", Bridge::new(Kind::ReviewRefresh));
+        assert_eq!(
+            review_carry_entry_kind(&[handoff.clone(), current.clone()]),
+            Some(db::ReviewCarryKind::ConflictRepair)
+        );
+        let rebase = bridge_log(
+            "merging",
+            "merge_failed",
+            Bridge::new(Kind::TargetMovedRebase),
+        );
+        assert_eq!(
+            review_carry_entry_kind(&[rebase.clone(), current.clone()]),
+            Some(db::ReviewCarryKind::CleanRebase)
+        );
+        let mut ordinary = handoff;
+        ordinary.bridge = Bridge::default();
+        ordinary.trigger_reason =
+            "[conflict-handoff] [review-refresh] [target-moved-rebase]; paths_json=[\"fake.rs\"]"
+                .into();
+        assert!(handed_off_conflict_paths(&[ordinary.clone()]).is_empty());
+        assert_eq!(review_carry_entry_kind(&[ordinary, current]), None);
+        let mut rejected = rebase;
+        rejected.rejection = true;
+        assert_eq!(
+            crate::task_diagnostics::count_gate_rejections_since_boundary(&[rejected], "merging"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_refresh_reads_typed_latest_row_even_with_unrelated_reason() {
+        use db::TransitionLogRepo;
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = db::SqliteDb::new(pool);
+        sqlx::query(
+            "INSERT INTO project(id,name,created_at,updated_at) VALUES('p','Project','now','now')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('task','p','Task','merge_failed','now','now')").execute(db.pool()).await.unwrap();
+        let log = bridge_log(
+            "merging",
+            "merge_failed",
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::TargetMovedRebase),
+        );
+        TransitionLogRepo::insert(
+            &db,
+            db::CreateTransitionLog {
+                id: log.id,
+                task_id: log.task_id,
+                from_state: log.from_state,
+                to_state: log.to_state,
+                trigger_name: log.trigger_name,
+                triggered_by: log.triggered_by,
+                bridge: log.bridge,
+                trigger_reason: log.trigger_reason,
+                hook_results_json: None,
+                rejection: false,
+                created_at: log.created_at,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            review_refresh_transition_pending(&db, "task", "merge_failed")
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE transition_log SET bridge_kind=NULL,trigger_reason='[review-refresh]' WHERE task_id='task'").execute(db.pool()).await.unwrap();
+        assert!(
+            !review_refresh_transition_pending(&db, "task", "merge_failed")
+                .await
+                .unwrap()
         );
     }
 }

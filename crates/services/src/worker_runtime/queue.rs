@@ -28,6 +28,8 @@ const LEASE_SECONDS: i64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CascadePayload {
+    #[serde(flatten)]
+    pub bridge: api_types::TransitionBridge,
     pub to: String,
     pub reason: String,
     pub rejection: bool,
@@ -71,7 +73,8 @@ pub(crate) fn cascade_lane(workflow: &api_types::WorkflowDefinition, to: &str) -
 }
 
 pub struct TaskStepWorker {
-    engine: WorkflowEngine,
+    engine: Arc<WorkflowEngine>,
+    task_service: crate::TaskService,
     db: Arc<db::SqliteDb>,
     pub(crate) renew_interval: Duration,
 }
@@ -79,7 +82,7 @@ pub struct TaskStepWorker {
 #[async_trait::async_trait]
 impl db::task_writer::TaskStepExecutor for TaskStepWorker {
     async fn drive_inline(&self, task_id: &str) -> db::Result<()> {
-        Arc::new(Self::new(self.engine.clone()))
+        Arc::new(Self::new(self.task_service.clone()))
             .start_inline_head(task_id)
             .await
             .map_err(|error| match error {
@@ -89,8 +92,10 @@ impl db::task_writer::TaskStepExecutor for TaskStepWorker {
     }
 }
 impl TaskStepWorker {
-    pub fn new(engine: WorkflowEngine) -> Self {
+    pub fn new(task_service: crate::TaskService) -> Self {
+        let engine = task_service.workflow_engine();
         Self {
+            task_service,
             db: Arc::clone(&engine.db),
             engine,
             renew_interval: Duration::from_secs(15),
@@ -180,8 +185,7 @@ impl TaskStepWorker {
         }
         let id = db::new_uuid_v4();
         let (reply, mut received) = tokio::sync::oneshot::channel();
-        self.engine
-            .task_service
+        self.task_service
             .task_step_replies
             .lock()
             .expect("Task step replies")
@@ -234,8 +238,7 @@ impl TaskStepWorker {
         }
         .await;
         if let Err(error) = enqueue {
-            self.engine
-                .task_service
+            self.task_service
                 .task_step_replies
                 .lock()
                 .expect("Task step replies")
@@ -289,8 +292,7 @@ impl TaskStepWorker {
                 _=tokio::time::sleep_until(deadline)=>break Err(db::DbError::TaskBusy {pending_steps:self.db.pending_steps(task_id).await?,retry_after_ms:250}.into()),
             }
         };
-        self.engine
-            .task_service
+        self.task_service
             .task_step_replies
             .lock()
             .expect("Task step replies")
@@ -439,7 +441,6 @@ impl TaskStepWorker {
         match self.execute_attempt(step).await {
             Err(error) => {
                 let reply = self
-                    .engine
                     .task_service
                     .task_step_replies
                     .lock()
@@ -564,7 +565,6 @@ impl TaskStepWorker {
             }
             if step.kind == "command" {
                 if let Some(reply) = self
-                    .engine
                     .task_service
                     .task_step_replies
                     .lock()
@@ -582,7 +582,7 @@ impl TaskStepWorker {
         let operations = self.db.running_remote_task_operations(&step.id).await?;
         let unconfirmed = crate::remote_cancel::cancel_operations(
             &self.db,
-            self.engine.daemon_connections.clone(),
+            self.task_service.daemon_connections.clone(),
             &operations,
         )
         .await?;
@@ -601,7 +601,6 @@ impl TaskStepWorker {
         )
         .await?;
         if let Some(reply) = self
-            .engine
             .task_service
             .task_step_replies
             .lock()
@@ -671,7 +670,6 @@ impl TaskStepWorker {
                 )
                 .await?;
                 if let Some(reply) = self
-                    .engine
                     .task_service
                     .task_step_replies
                     .lock()
@@ -699,7 +697,7 @@ impl TaskStepWorker {
                     .collect::<Vec<_>>();
                 let unconfirmed = crate::remote_cancel::cancel_operations(
                     &self.db,
-                    self.engine.daemon_connections.clone(),
+                    self.task_service.daemon_connections.clone(),
                     &operations,
                 )
                 .await?;
@@ -711,6 +709,8 @@ impl TaskStepWorker {
             let result = if command.operation == "engine_transition" {
                 #[derive(Deserialize)]
                 struct Input {
+                    #[serde(flatten)]
+                    pub bridge: api_types::TransitionBridge,
                     task_id: String,
                     target_state: String,
                     workflow: api_types::WorkflowDefinition,
@@ -729,6 +729,7 @@ impl TaskStepWorker {
                     .await?
                     .ok_or(db::DbError::NotFound)?;
                 self.engine
+                    .bind(&self.task_service)
                     .transition_inner(
                         input.task_id,
                         input.target_state,
@@ -743,6 +744,7 @@ impl TaskStepWorker {
                         None,
                         input.authority,
                         input.entry_retry,
+                        input.bridge,
                     )
                     .await
                     .and_then(|value| {
@@ -752,7 +754,7 @@ impl TaskStepWorker {
             } else {
                 crate::TaskService::with_recovery_command_context(
                     &step.payload_json,
-                    self.engine.task_service.execute_task_command(&command),
+                    self.task_service.execute_task_command(&command),
                 )
                 .await
             };
@@ -779,7 +781,6 @@ impl TaskStepWorker {
                 .await?;
             self.db.domain_event_notify().notify_waiters();
             if let Some(reply) = self
-                .engine
                 .task_service
                 .task_step_replies
                 .lock()
@@ -805,7 +806,11 @@ impl TaskStepWorker {
             let payload: crate::workflow::engine::durable::HookPayload =
                 serde_json::from_str(&step.payload_json)
                     .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
-            let result = self.engine.execute_hook_step(step, &payload).await?;
+            let result = self
+                .engine
+                .bind(&self.task_service)
+                .execute_hook_step(step, &payload)
+                .await?;
             if let Some(reason) = result.retry.as_deref() {
                 // A transient `run_merge` failure takes the cascade retry
                 // budget and back-off; once spent it settles as a merge failure.
@@ -889,7 +894,7 @@ impl TaskStepWorker {
             // Entry hooks fence dispatch while they run. A continuation the
             // dispatcher skipped meanwhile (a queued role retry) becomes
             // dispatchable only now, so wake the dispatcher.
-            self.engine.task_service.dispatch_wake.notify_one();
+            self.task_service.dispatch_wake.notify_one();
             return Ok(());
         }
         let payload: CascadePayload =
@@ -963,7 +968,7 @@ impl TaskStepWorker {
                     .gate_config
                     .as_ref()
                     .is_some_and(|gate| gate.reject_target.as_deref() == Some(payload.to.as_str()));
-            if !WorkflowEngine::cascade_allowed(source, &payload.reason, rejection_to_target) {
+            if !WorkflowEngine::cascade_allowed(source, &payload.bridge, rejection_to_target) {
                 return self
                     .settle(
                         step,
@@ -995,6 +1000,7 @@ impl TaskStepWorker {
         }
         let result = self
             .engine
+            .bind(&self.task_service)
             .transition_step(step, &payload, &workflow, authority)
             .await?;
         // These used to observe the final recursive result in TaskService's
@@ -1002,7 +1008,6 @@ impl TaskStepWorker {
         if workflow.state_kind(&result.task.status) == Some(api_types::StateKind::Terminal) {
             if workflow.cancellation_state.as_deref() != Some(result.task.status.as_str()) {
                 if let Err(error) = self
-                    .engine
                     .task_service
                     .wake_dependents_of_completed_task(&result.task)
                     .await
@@ -1010,14 +1015,12 @@ impl TaskStepWorker {
                     tracing::warn!(task_id=%result.task.id, %error, "failed to wake dependents after committed cascade");
                 }
             }
-            self.engine
-                .task_service
+            self.task_service
                 .reconcile_terminal_subtask(&result.task)
                 .await;
         }
         if workflow.state_kind(&result.task.status) == Some(api_types::StateKind::Initial) {
             if let Err(error) = self
-                .engine
                 .task_service
                 .finish_initial_unverified_refusal(&result.task)
                 .await

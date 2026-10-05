@@ -445,37 +445,35 @@ impl ExecutionRepo for SqliteDb {
         .transpose()
     }
 
-    async fn count_by_task_and_summary_prefix(
+    async fn count_by_task_and_purpose(
         &self,
         task_id: &str,
-        summary_prefix: &str,
+        purpose: api_types::ExecutionPurpose,
     ) -> Result<i64> {
-        let pattern = format!("{summary_prefix}%");
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM execution
-             WHERE task_id = ? AND summary LIKE ?",
+             WHERE task_id = ? AND purpose = ?",
         )
         .bind(task_id)
-        .bind(pattern)
+        .bind(purpose.as_str())
         .fetch_one(&self.pool)
         .await
         .map_err(Into::into)
     }
 
-    async fn has_running_by_task_and_summary_prefix(
+    async fn has_running_by_task_and_purpose(
         &self,
         task_id: &str,
-        summary_prefix: &str,
+        purpose: api_types::ExecutionPurpose,
     ) -> Result<bool> {
-        let pattern = format!("{summary_prefix}%");
         sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1 FROM execution
-                 WHERE task_id = ? AND status = 'running' AND summary LIKE ?
+                 WHERE task_id = ? AND status = 'running' AND purpose = ?
              )",
         )
         .bind(task_id)
-        .bind(pattern)
+        .bind(purpose.as_str())
         .fetch_one(&self.pool)
         .await
         .map_err(Into::into)

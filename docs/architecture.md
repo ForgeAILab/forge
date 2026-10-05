@@ -3688,7 +3688,7 @@ candidate without an agent review contract (human reviewer, or no reviewer)
 hits a plain merge conflict, which Forge then rebases the same way unless the
 `merge_fix` budget is 0 — Forge
 commits each text-content conflict step with its conflict markers, finishes the
-rebase, and sends the Task to `merge_failed` marked `[conflict-handoff]` with
+rebase, and sends the Task to `merge_failed` classified as `bridge_kind = conflict_handoff` with
 the affected paths. The worker reconciles those files by editing and committing them, and the
 result goes through fresh checks; it keeps the previous approval when the review
 authority carry described under review conformance applies, and otherwise gets
@@ -3703,7 +3703,7 @@ window) and parks unresolved files for manual Task-worktree repair. Modify/delet
 conflicts also require manual repair, as do more than five handoffs in one
 retry window and conflicts on coordination roots, whose aggregate branch stays
 on the manual path. There, the recovery action creates a
-marked review-refresh transition, clears the old approval, and runs the
+typed review-refresh transition, clears the old approval, and runs the
 repaired result through fresh checks and review before merge.
 
 The durable `conflict-hotspots` consumer observes workflow-authored
@@ -3864,7 +3864,15 @@ grace is handled by the orphan safety net as an actionable exception.
 `WorkflowEngine` in `crates/services/src/workflow/engine/mod.rs` is the
 data-driven Task transition path. `TaskService.transition()` supplies service
 pre-checks and delegates the transition to the engine; there is no parallel
-legacy `TaskStatus`/`transition_allowed` state machine.
+legacy `TaskStatus`/`transition_allowed` state machine. Each service constructs
+one `Arc<WorkflowEngine>` from its immutable database/event-bus dependencies;
+all service clones, transition/recovery/board/role entry points and queued
+workers share it. A borrowed `WorkflowExecution` binds that engine to the
+fully configured originating service for an operation. Hooks receive that
+service through `HookContext`; the engine never owns a service or snapshots
+mutable provider/executor/workspace configuration. Configuring a service does
+not construct another engine. The queued worker retains a service clone with
+its worker-cache ownership detached, so neither graph has an ownership cycle.
 
 Workflows are project-defined JSON in `project.workflow_definition`. Empty
 string or `"{}"` resolves at runtime to the built-in `DefaultWorkflow`.
@@ -4481,6 +4489,43 @@ to a nonexistent execution, or refers to an execution that is not in a stopped
 state awaiting user recovery. The sweep is idempotent and only ever clears
 annotations.
 
+### Typed transition bridges
+
+Transition history separates human `trigger_reason` prose from nullable
+`bridge_kind` and `bridge_payload`. The closed kinds are `review_refresh`,
+`target_moved_rebase`, `conflict_handoff`, `retry_window_reset`, `recovery`,
+`gate_skipped`, `gate_approved`, `gate_rejected`, `ci_only_review_passed` and
+`review_carry`. A target-moved rebase also has refresh semantics. Conflict
+handoffs store `{"paths":[...]}`; recovery/reset payloads store `{"verb":...}`.
+An ordinary/unclassified row has null metadata. Kinds do not replace actor,
+state, immediate-predecessor, rejection or current-window checks.
+
+Every transition reader uses typed evidence: refresh dispatch, carry entry,
+rebase/handoff limits, gate bypass/decisions, cascade admission/rejection,
+conflict-marker checks, conflict hotspots and the web CI-only badge. Memory
+failure indexing uses rejection, state and structured hook outcomes; audit
+words and hook error prose are not failure signals. Gate approval and send-back
+keep their typed decision kind even when the owner supplies custom guidance.
+Only `retry_window_reset` establishes a new retry window; granting one attempt
+is a `recovery` and does not erase prior attempts.
+
+Migration `V202610051343__typed_workflow_bridges` preserves all old reason text,
+backfills history and saved command/cascade/hook/repository-mutation and checkpoint metadata once, and leaves incidental
+marker words unclassified. The intentional refresh/rebase pair becomes one
+`target_moved_rebase`. A genuine conflict handoff takes priority over conflicting
+refresh tags. The last paths-JSON suffix is decoded only if it is an array of
+strings; malformed/missing paths retain handoff identity with null payload.
+Runtime never falls back to parsing prose, including when replaying queued work.
+Historical event prose may be bounded; the hotspot consumer reads the full
+kind/payload from the authoritative transition-log source row instead.
+
+Automatic review-recovery executions have typed `purpose =
+automatic_review_recovery`, set atomically during execution admission. Attempt
+counts cover the Task's entire execution history and the running check also
+filters execution status. Changing a summary cannot change the count, and a
+normal follow-up does not inherit its parent's purpose. Existing recovery
+summaries and counts are preserved by the migration.
+
 ### Failure classification
 
 Interruption kinds are a closed vocabulary: `FailureKind` in `api-types`
@@ -4971,7 +5016,7 @@ Acceptance rechecks source provenance inside the SQLite write transaction.
 Direct integration holds the authority write lock during the local git operation,
 compares source and target commits, fast-forwards only the immutable reviewed
 object, and checks the resulting head. Stale review authority and a clean target
-rebase enter a marked review-refresh route; they do not consume merge-fix budget
+rebase enter a typed review-refresh route; they do not consume merge-fix budget
 or dispatch a coder. Actual conflicts enter bounded merge repair. Changed content
 must receive a new semantic review, regardless of `review_passed_at`, except for
 the mechanical carry below. Explicit human and no-agent-review workflows remain
@@ -4982,9 +5027,9 @@ would otherwise pay a full reviewer run per lost race. The `review` state's
 `on_enter` hook `carry_review_authority` (ahead of `dispatch_role_agent`) keeps
 the previous approval when the Task re-enters `review` only because (a) Forge
 rebased it cleanly onto a moved target (the transition log ends with the
-`[review-refresh] [target-moved-rebase]` bridge followed directly by the move
+typed `target_moved_rebase` bridge followed directly by the move
 into `review`), or (b) its Worker completed the repair of a Forge-committed
-rebase conflict (the bridge carries `[conflict-handoff]`). Every condition must
+rebase conflict (the bridge has `bridge_kind = conflict_handoff`). Every condition must
 hold, and failing any one is a `Skipped` hook, so the reviewer is dispatched as
 usual:
 

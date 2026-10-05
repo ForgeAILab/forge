@@ -6,6 +6,7 @@ use db::{TaskStepRepo, TransitionLogRepo};
 
 fn system_options(version: i64, reason: &str) -> crate::task_service::TransitionOptions {
     crate::task_service::TransitionOptions {
+        bridge: Default::default(),
         version,
         reason: Some(reason.to_owned()),
         triggered_by: Actor::system(SystemComponent::General),
@@ -23,6 +24,7 @@ fn same_state_marker(task_id: &str, state: &str) -> db::CreateTransitionLog {
         to_state: state.to_owned(),
         trigger_name: Some("retry".to_owned()),
         triggered_by: Actor::user(api_types::UserActionSource::Test).display(),
+        bridge: Default::default(),
         trigger_reason: "retry window reset".to_owned(),
         hook_results_json: None,
         rejection: false,

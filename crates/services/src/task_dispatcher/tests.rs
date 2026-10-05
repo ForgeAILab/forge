@@ -1870,6 +1870,7 @@ async fn failed_review_fixture(failed_ago: chrono::Duration, budget: i32) -> Fai
             to_state: "review".to_owned(),
             trigger_name: None,
             triggered_by: Actor::system(SystemComponent::Workflow).display(),
+            bridge: Default::default(),
             trigger_reason: "user action".to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -2196,6 +2197,7 @@ async fn merge_gate_fixture(entered_ago: chrono::Duration) -> MergeGateFixture {
             to_state: "merging".to_owned(),
             trigger_name: Some("accept".to_owned()),
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            bridge: Default::default(),
             trigger_reason: "review passed".to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -2500,6 +2502,7 @@ async fn dispatcher_clears_plan_review_wait_from_an_older_planning_entry() {
             to_state: crate::workflow::default_states::PLANNING.to_owned(),
             trigger_name: Some("plan".to_owned()),
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            bridge: Default::default(),
             trigger_reason: "first planning entry".to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -2571,6 +2574,7 @@ async fn dispatcher_clears_plan_review_wait_from_an_older_planning_entry() {
             to_state: crate::workflow::default_states::PLANNING.to_owned(),
             trigger_name: Some("replan".to_owned()),
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            bridge: Default::default(),
             trigger_reason: "second planning entry".to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -4544,6 +4548,9 @@ async fn coordination_root_target_moved_rebase_returns_to_aggregate_review() {
             to_state: crate::workflow::default_states::MERGE_FAILED.to_owned(),
             trigger_name: Some("retry".to_owned()),
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            bridge: api_types::TransitionBridge::new(
+                api_types::TransitionBridgeKind::TargetMovedRebase,
+            ),
             trigger_reason: format!(
                 "{} {} target advanced; re-review required",
                 crate::workflow::REVIEW_REFRESH_MARKER,
@@ -7877,6 +7884,7 @@ async fn machine_capacity_active_waiter_is_parked_at_final_version() {
             queued.id.clone(),
             "in_progress".to_owned(),
             crate::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: queued.version,
                 reason: Some("manual start".to_owned()),
                 triggered_by: Actor::system(SystemComponent::TaskDispatcher),
@@ -8229,6 +8237,7 @@ async fn machine_capacity_stale_marker_clears_on_agent_skip() {
             queued.id.clone(),
             "in_progress".to_owned(),
             crate::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: queued.version,
                 reason: Some("manual start".to_owned()),
                 triggered_by: Actor::system(SystemComponent::TaskDispatcher),
@@ -8335,6 +8344,7 @@ async fn machine_capacity_review_recovery_is_quiet_and_resumes() {
             to_state: "review".to_owned(),
             trigger_name: None,
             triggered_by: Actor::system(SystemComponent::Workflow).display(),
+            bridge: Default::default(),
             trigger_reason: "coder completed".to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -8394,14 +8404,12 @@ async fn machine_capacity_review_recovery_is_quiet_and_resumes() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        execution
-            .summary
-            .as_deref()
-            .is_some_and(|summary| summary.starts_with("[Forge automatic review recovery]")),
-        "{:?}",
-        execution.summary
-    );
+    let purpose: Option<String> = sqlx::query_scalar("SELECT purpose FROM execution WHERE id=?")
+        .bind(&execution.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(purpose.as_deref(), Some("automatic_review_recovery"));
 }
 
 #[tokio::test]
@@ -8578,6 +8586,7 @@ async fn machine_capacity_title_edit_keeps_waiter_parked_until_recheck() {
             task.id.clone(),
             "in_progress".into(),
             crate::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 reason: None,
                 triggered_by: Actor::system(SystemComponent::TaskDispatcher),
@@ -9024,8 +9033,9 @@ async fn hook_restart_recognizes_merge_landed_before_checkpoint_even_after_sibli
         .unwrap()
         .unwrap();
     let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-    let engine = fixture.dispatcher.task_service.workflow_engine();
+    let engine = fixture.dispatcher.task_service.clone();
     engine
+        .workflow_execution()
         .manual_override_transition_with_authority(
             &fixture.task.id,
             "merging",
@@ -9103,7 +9113,7 @@ async fn hook_restart_recognizes_merge_landed_before_checkpoint_even_after_sibli
     );
     let target_tip = run_git(fixture._repo_dir.path(), &["rev-parse", "HEAD"]);
     assert_ne!(target_tip, intent.candidate_sha);
-    let settled = crate::worker_runtime::queue::TaskStepWorker::new(engine)
+    let settled = crate::worker_runtime::queue::TaskStepWorker::new(engine.as_ref().clone())
         .drain(&fixture.task.id)
         .await
         .unwrap();
@@ -9343,8 +9353,9 @@ async fn hook_restart_resumes_rebase_interrupted_mid_conflict_as_handoff() {
         .unwrap()
         .unwrap();
     let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-    let engine = fixture.dispatcher.task_service.workflow_engine();
+    let engine = fixture.dispatcher.task_service.clone();
     engine
+        .workflow_execution()
         .manual_override_transition_with_authority(
             &fixture.task.id,
             "merging",
@@ -9413,7 +9424,7 @@ async fn hook_restart_resumes_rebase_interrupted_mid_conflict_as_handoff() {
         .await
         .unwrap();
 
-    crate::worker_runtime::queue::TaskStepWorker::new(engine)
+    crate::worker_runtime::queue::TaskStepWorker::new(engine.as_ref().clone())
         .drain(&fixture.task.id)
         .await
         .unwrap();
@@ -9425,30 +9436,19 @@ async fn hook_restart_resumes_rebase_interrupted_mid_conflict_as_handoff() {
         .find(|entry| {
             entry.from_state == "merging"
                 && entry.to_state == "merge_failed"
-                && entry
-                    .trigger_reason
-                    .contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
+                && entry.bridge.bridge_kind
+                    == Some(api_types::TransitionBridgeKind::ConflictHandoff)
         })
         .expect("the resumed rebase hands its conflict to the coder");
     assert_eq!(
         handoff.triggered_by,
         api_types::Actor::system(api_types::SystemComponent::Workflow).display()
     );
-    assert!(
-        handoff.trigger_reason.contains(&format!(
-            "{}[\"feature.txt\"]",
-            crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX
-        )),
-        "{}",
-        handoff.trigger_reason
+    assert_eq!(
+        handoff.bridge.conflict_paths(),
+        Some(vec!["feature.txt".to_owned()])
     );
-    assert!(
-        !handoff
-            .trigger_reason
-            .contains(crate::workflow::REVIEW_REFRESH_MARKER),
-        "{}",
-        handoff.trigger_reason
-    );
+    assert!(!handoff.bridge.is_review_refresh());
     // The coder gets the branch on the new target, not a stopped rebase.
     assert!(!git::detect_rebase_in_progress(&worktree).await.unwrap());
     assert!(run_git(&worktree, &["status", "--porcelain"]).is_empty());
@@ -9483,7 +9483,7 @@ async fn workspace_reset_waits_for_in_flight_hook_steps() {
     fixture
         .dispatcher
         .task_service
-        .workflow_engine()
+        .workflow_execution()
         .manual_override_transition_with_authority(
             &fixture.task.id,
             "merging",

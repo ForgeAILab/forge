@@ -75,7 +75,7 @@ async fn transition_log_records_review_retry_and_completion_history() {
             (
                 "review".to_owned(),
                 "merging".to_owned(),
-                "gate approved".to_owned()
+                "Gate approved".to_owned()
             ),
             (
                 "merging".to_owned(),
@@ -84,6 +84,23 @@ async fn transition_log_records_review_retry_and_completion_history() {
             ),
         ]
     );
+    let approval = entries
+        .iter()
+        .find(|entry| entry["trigger_reason"] == "Gate approved")
+        .unwrap();
+    assert_eq!(approval["bridge_kind"], "gate_approved");
+    assert!(approval["bridge_payload"].is_null());
+    let rejection = entries
+        .iter()
+        .find(|entry| entry["trigger_reason"] == "missing tests")
+        .unwrap();
+    assert_eq!(rejection["bridge_kind"], "gate_rejected");
+    let ordinary = entries
+        .iter()
+        .find(|entry| entry["trigger_reason"] == "ready for review")
+        .unwrap();
+    assert!(ordinary["bridge_kind"].is_null());
+    assert!(ordinary["bridge_payload"].is_null());
     assert!(entries
         .iter()
         .all(|entry| entry["triggered_by"] == "user:api"

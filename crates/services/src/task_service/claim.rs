@@ -167,6 +167,7 @@ impl TaskService {
         };
         let mut execution_admission = agent.as_ref().map(|claiming_agent| {
             let mut admission = db::ExecutionAdmission {
+                purpose: None,
                 expected_queued_recovery_id: None,
                 expected_project_version: Some(project.version),
                 expected_task_version: task.version,

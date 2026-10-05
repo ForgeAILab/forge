@@ -986,7 +986,7 @@ async fn list_comment_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>
 async fn list_transition_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
     let rows = sqlx::query(
         "SELECT t.project_id, tl.id, tl.task_id, tl.from_state, tl.to_state, tl.trigger_name, tl.triggered_by, \
-                tl.trigger_reason, tl.hook_results_json, tl.rejection, tl.created_at \
+                tl.bridge_kind, tl.bridge_payload, tl.trigger_reason, tl.hook_results_json, tl.rejection, tl.created_at \
          FROM transition_log tl JOIN task t ON t.id = tl.task_id \
          ORDER BY tl.created_at ASC, tl.id ASC",
     )
@@ -1001,6 +1001,18 @@ async fn list_transition_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSour
             to_state: row.try_get("to_state")?,
             trigger_name: row.try_get("trigger_name")?,
             triggered_by: row.try_get("triggered_by")?,
+            bridge: api_types::TransitionBridge {
+                bridge_kind: row
+                    .try_get::<Option<String>, _>("bridge_kind")?
+                    .map(|kind| kind.parse())
+                    .transpose()
+                    .map_err(ServiceError::invalid_operation)?,
+                bridge_payload: row
+                    .try_get::<Option<String>, _>("bridge_payload")?
+                    .map(|payload| serde_json::from_str(&payload))
+                    .transpose()
+                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+            },
             trigger_reason: row.try_get("trigger_reason")?,
             hook_results_json: row.try_get("hook_results_json")?,
             rejection: row.try_get::<i64, _>("rejection")? != 0,
@@ -1418,15 +1430,11 @@ fn transition_body(transition: &TransitionLog, hook_results_json: Option<&str>) 
 fn transition_has_failure_signal(
     from_state: &str,
     to_state: &str,
-    trigger_reason: &str,
+    _trigger_reason: &str,
     hook_results_json: Option<&str>,
     rejection: bool,
 ) -> bool {
-    if rejection
-        || state_name_is_failure(from_state)
-        || state_name_is_failure(to_state)
-        || text_has_failure_signal(trigger_reason)
-    {
+    if rejection || state_name_is_failure(from_state) || state_name_is_failure(to_state) {
         return true;
     }
     let Some(hook_results_json) = hook_results_json else {
@@ -1447,23 +1455,11 @@ fn hook_result_is_failure(entry: &Value) -> bool {
             .get("status")
             .and_then(Value::as_str)
             .is_some_and(|status| matches!(status, "failure" | "hook_error"))
-        || entry
-            .get("error")
-            .and_then(Value::as_str)
-            .is_some_and(text_has_failure_signal)
 }
 
 fn state_name_is_failure(state: &str) -> bool {
     let lower = state.to_ascii_lowercase();
     lower.contains("fail") || lower.contains("error") || lower.contains("blocked")
-}
-
-fn text_has_failure_signal(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("failed")
-        || lower.contains("failure")
-        || lower.contains("error")
-        || lower.contains("hook_error")
 }
 
 fn agent_creator(agent_id: String) -> MemoryCreator {
@@ -1747,5 +1743,40 @@ mod tests {
         assert!(guard_evidence_json(r#"{"note":"Authorization: Bearer sk-secret"}"#).is_err());
         assert!(guard_memory_reason("private key material").is_err());
         assert_eq!(guard_evidence_json("{}").expect("valid evidence"), "{}");
+    }
+}
+
+#[cfg(test)]
+mod typed_transition_tests {
+    #[test]
+    fn failure_memory_uses_structured_evidence_not_reason_words() {
+        assert!(!super::transition_has_failure_signal(
+            "todo",
+            "in_progress",
+            "failed failure error hook_error [conflict-handoff]",
+            None,
+            false
+        ));
+        assert!(super::transition_has_failure_signal(
+            "todo",
+            "in_progress",
+            "unrelated prose",
+            None,
+            true
+        ));
+        assert!(super::transition_has_failure_signal(
+            "todo",
+            "in_progress",
+            "unrelated prose",
+            Some(r#"[{"outcome":"failed"}]"#),
+            false
+        ));
+        assert!(!super::transition_has_failure_signal(
+            "todo",
+            "in_progress",
+            "unrelated prose",
+            Some(r#"[{"outcome":"ok","error":"failed"}]"#),
+            false
+        ));
     }
 }

@@ -179,11 +179,9 @@ impl TaskDispatcher {
                             task.id.clone(),
                             target.clone(),
                             crate::task_service::TransitionOptions {
+            bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
                                 version: task.version,
-                                reason: Some(format!(
-                                    "{} recover interrupted review refresh",
-                                    crate::workflow::REVIEW_REFRESH_MARKER
-                                )),
+                                reason: Some("Recover interrupted review refresh".to_owned()),
                                 triggered_by: Actor::system(SystemComponent::TaskDispatcher),
                                 rejection: false,
                                 defer_dispatch_seconds: None,

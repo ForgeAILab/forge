@@ -31,6 +31,7 @@ async fn last_manual_bounce_reason_is_loaded_for_coder_dispatch() {
             task_id.clone(),
             default_states::REVIEW.to_owned(),
             TransitionOptions {
+                bridge: Default::default(),
                 version: 1,
                 reason: Some("ready for review".to_owned()),
                 triggered_by: Actor::agent("coder-agent"),

@@ -183,20 +183,7 @@ impl TaskService {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
-        };
+        let engine = self.workflow_execution();
         let engine_result = engine
             .move_task_with_authority(
                 &task_id,
@@ -344,6 +331,7 @@ impl TaskService {
                 workflow_snapshot,
                 trigger_name: None,
                 triggered_by: Actor::user(UserActionSource::BoardDrag).display(),
+                bridge: Default::default(),
                 trigger_reason: "board reorder".to_owned(),
                 rejection: false,
                 expected_project_version: Some(expected_project_version),

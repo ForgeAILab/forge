@@ -207,6 +207,7 @@ impl TaskService {
                 task_id,
                 "merging".to_owned(),
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: None,
                     triggered_by: actor,
@@ -302,6 +303,9 @@ impl TaskService {
             task_id.clone(),
             "in_progress".to_owned(),
             TransitionOptions {
+                bridge: api_types::TransitionBridge::new(
+                    api_types::TransitionBridgeKind::GateRejected,
+                ),
                 version: task.version,
                 reason: Some(reason.clone()),
                 triggered_by: actor,

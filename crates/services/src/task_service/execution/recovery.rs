@@ -1419,6 +1419,7 @@ impl TaskService {
             )),
             &reason,
         );
+        transition_log.bridge = api_types::TransitionBridge::recovery("retry", true);
         transition_log.hook_results_json = Some(
             serde_json::to_string(&vec![api_types::HookResultEntry {
                 action: "retry".to_owned(),
@@ -1575,6 +1576,7 @@ impl TaskService {
                 task.id.clone(),
                 target,
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: Some(transition_reason),
                     triggered_by: TaskService::task_action_actor(api_types::Actor::user(
@@ -1666,6 +1668,7 @@ impl TaskService {
                 &TaskService::task_action_actor(api_types::Actor::user(
                     api_types::UserActionSource::Action(api_types::TaskAction::retry()),
                 )),
+                api_types::TransitionBridge::recovery("retry", false),
             )
             .await?;
         // The workflow transition owns the Task version CAS. Persist this
@@ -1691,6 +1694,7 @@ impl TaskService {
         target_state: String,
         reason: String,
         actor: &api_types::Actor,
+        bridge: api_types::TransitionBridge,
     ) -> Result<Task> {
         super::ensure_plan_publication_transition_authority(task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
@@ -1703,34 +1707,27 @@ impl TaskService {
             .is_some_and(|trigger| trigger.system_only());
 
         if uses_system_only_trigger && !actor.is_system() {
-            let engine = WorkflowEngine {
-                db: Arc::clone(&self.db),
-                event_bus: Arc::clone(&self.event_bus),
-                review_runner: self.review_runner.clone(),
-                merge_service: self.merge_service.clone(),
-                cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_service: self.clone(),
-                daemon_connections: self.daemon_connections.clone(),
-                workspace_exec_locks: self.workspace_exec_locks.clone(),
-                terminal_activity: self.terminal_activity.clone(),
-                workspace_root: self.workspace_root.clone(),
-                repo_cache_locks: self.repo_cache_locks.clone(),
-                workspace_backend_router: Arc::clone(&self.workspace_backend_router),
-            };
+            let engine = self.workflow_execution();
             let recovered = engine
-                .manual_override_transition_with_authority(
-                    &task.id,
-                    &target_state,
+                .transition_inner(
+                    task.id.clone(),
+                    target_state,
                     task.version,
                     &workflow,
                     actor.clone(),
-                    &reason,
+                    reason,
                     true,
+                    true,
+                    None,
+                    None,
+                    None,
                     Some(crate::workflow::engine::WorkflowAuthority {
                         project_version: project.version,
                         workflow_definition: project.workflow_definition.clone(),
                         clear_review_passed_at_on_commit: false,
                     }),
+                    false,
+                    bridge,
                 )
                 .await?
                 .task;
@@ -1743,6 +1740,7 @@ impl TaskService {
                 task.id.clone(),
                 target_state,
                 TransitionOptions {
+                    bridge,
                     version: task.version,
                     reason: Some(reason),
                     triggered_by: actor.clone(),
@@ -2293,6 +2291,7 @@ impl TaskService {
                 task.id.clone(),
                 pass_target,
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: Some(reason),
                     triggered_by: TaskService::task_action_actor(api_types::Actor::user(
@@ -2326,20 +2325,7 @@ impl TaskService {
         };
         let workflow =
             WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
-        };
+        let engine = self.workflow_execution();
         let recovered = engine
             .retry_entry_barrier_with_authority(
                 &task.id,
@@ -2394,20 +2380,7 @@ impl TaskService {
                 api_types::UserActionSource::Action(api_types::TaskAction::retry()),
             )),
         );
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
-        };
+        let engine = self.workflow_execution();
         let recovered = engine
             .manual_override_transition_with_authority(
                 &cleared.id,
@@ -2508,12 +2481,9 @@ impl TaskService {
             .transition_recovery_rejection(
                 &task,
                 reject_target,
-                format!(
-                    "{} {}; fresh review required",
-                    crate::workflow::REVIEW_REFRESH_MARKER,
-                    recovery_reason
-                ),
+                format!("{recovery_reason}; fresh review required"),
                 &actor,
+                api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
             )
             .await?;
         // The command defers execution hooks, including the repair bridge's
@@ -2523,11 +2493,11 @@ impl TaskService {
                 recovered.id.clone(),
                 review_state,
                 TransitionOptions {
+                    bridge: api_types::TransitionBridge::new(
+                        api_types::TransitionBridgeKind::ReviewRefresh,
+                    ),
                     version: recovered.version,
-                    reason: Some(format!(
-                        "{} fresh review after manual repair",
-                        crate::workflow::REVIEW_REFRESH_MARKER
-                    )),
+                    reason: Some("Fresh review after manual repair".to_owned()),
                     triggered_by: actor.clone(),
                     rejection: false,
                     defer_dispatch_seconds: None,
@@ -2701,20 +2671,7 @@ impl TaskService {
                 )
                 .await?
             };
-            let engine = WorkflowEngine {
-                db: Arc::clone(&self.db),
-                event_bus: Arc::clone(&self.event_bus),
-                review_runner: self.review_runner.clone(),
-                merge_service: self.merge_service.clone(),
-                cleanup_scheduler: self.cleanup_scheduler.clone(),
-                task_service: self.clone(),
-                daemon_connections: self.daemon_connections.clone(),
-                workspace_exec_locks: self.workspace_exec_locks.clone(),
-                terminal_activity: self.terminal_activity.clone(),
-                workspace_root: self.workspace_root.clone(),
-                repo_cache_locks: self.repo_cache_locks.clone(),
-                workspace_backend_router: Arc::clone(&self.workspace_backend_router),
-            };
+            let engine = self.workflow_execution();
             let recovered = engine
                 .retry_entry_barrier_with_authority(
                     &updated.id,
@@ -2903,6 +2860,7 @@ fn recovery_marker(
         to_state: state.to_owned(),
         trigger_name: Some(action.to_owned()),
         triggered_by: actor.display(),
+        bridge: api_types::TransitionBridge::recovery(action, action == "restart"),
         trigger_reason: reason.to_owned(),
         hook_results_json: None,
         rejection: false,

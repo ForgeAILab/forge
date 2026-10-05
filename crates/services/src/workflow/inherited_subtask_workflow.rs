@@ -125,7 +125,6 @@ pub fn inherited_subtask_workflow() -> WorkflowDefinition {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use db::{
@@ -135,7 +134,7 @@ mod tests {
     use events::EventBus;
 
     use super::inherited_subtask_workflow;
-    use crate::workflow::{default_states, engine::WorkflowEngine};
+    use crate::workflow::default_states;
 
     #[test]
     fn inherited_subtask_workflow_has_no_review_state() {
@@ -276,22 +275,10 @@ mod tests {
         let workflow = inherited_subtask_workflow();
         let event_bus = Arc::new(EventBus::new(16));
         let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
-        let engine = WorkflowEngine {
-            workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
-            db,
-            event_bus,
-            review_runner: None,
-            merge_service: None,
-            cleanup_scheduler: None,
-            task_service,
-            daemon_connections: None,
-            workspace_exec_locks: None,
-            terminal_activity: None,
-            workspace_root: PathBuf::new(),
-            repo_cache_locks: None,
-        };
+        let engine = task_service;
 
         let result = engine
+            .workflow_execution()
             .transition(
                 &subtask.id,
                 default_states::REVIEW,
@@ -300,6 +287,7 @@ mod tests {
                 &api_types::Actor::user(api_types::UserActionSource::Test),
                 "attempt review",
                 false,
+                Default::default(),
             )
             .await;
 

@@ -2805,9 +2805,7 @@ async fn retry_hook_after_manual_merge_repair_returns_to_fresh_review_without_wo
     assert!(entries.iter().any(|entry| {
         entry.from_state == crate::workflow::default_states::MERGING
             && entry.to_state == crate::workflow::default_states::MERGE_FAILED
-            && entry
-                .trigger_reason
-                .contains(crate::workflow::REVIEW_REFRESH_MARKER)
+            && entry.bridge.is_review_refresh()
     }));
     let executions = ExecutionRepo::list_by_task(
         &*db,
@@ -4302,6 +4300,7 @@ async fn seed_previous_review_attempt(db: &SqliteDb, task_id: &str, status: Revi
                 to_state: crate::workflow::default_states::IN_PROGRESS.to_owned(),
                 trigger_name: Some("reject".to_owned()),
                 triggered_by: "system:workflow".to_owned(),
+                bridge: Default::default(),
                 trigger_reason: "previous review failed".to_owned(),
                 hook_results_json: None,
                 rejection: true,
@@ -6947,6 +6946,7 @@ async fn submit_does_not_reuse_a_completed_attempt_from_before_review_remediatio
             to_state: crate::workflow::default_states::IN_PROGRESS.to_owned(),
             trigger_name: Some("reject".to_owned()),
             triggered_by: "user:api".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "review remediation".to_owned(),
             hook_results_json: None,
             rejection: true,
@@ -7599,6 +7599,7 @@ async fn manual_stop_annotation_rejects_stale_state_entry_after_cycle() {
             to_state: "review".to_owned(),
             trigger_name: Some("test_cycle".to_owned()),
             triggered_by: "system:test".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "state-entry epoch regression".to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -7631,6 +7632,7 @@ async fn manual_stop_annotation_rejects_stale_state_entry_after_cycle() {
             to_state: "in_progress".to_owned(),
             trigger_name: Some("test_cycle".to_owned()),
             triggered_by: "system:test".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "state-entry epoch regression".to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -7713,6 +7715,7 @@ async fn state_entry_authority_breaks_timestamp_ties_by_insertion_order() {
                 to_state: "in_progress".to_owned(),
                 trigger_name: Some("test_tie".to_owned()),
                 triggered_by: "system:test".to_owned(),
+                bridge: Default::default(),
                 trigger_reason: "state-entry timestamp tie regression".to_owned(),
                 hook_results_json: None,
                 rejection: false,
@@ -8816,12 +8819,13 @@ async fn execution_completion_racing_queued_cascade_transitions_exactly_once() {
     seed_role_assignment(&db, &task.id, "coder", Some(&agent)).await;
     let execution = seed_completed_coder_execution(&db, &task, &agent, None).await;
     let cascade = service
-        .workflow_engine()
+        .workflow_execution()
         .cascade_step_input(
             &task,
             &workflow,
             "done".into(),
             "racing cascade".into(),
+            Default::default(),
             false,
             false,
             None,

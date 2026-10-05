@@ -2508,6 +2508,7 @@ async fn task_page_projection_batches_roles_and_retry_history() {
                     to_state: to_state.to_owned(),
                     trigger_name: Some("reject".to_owned()),
                     triggered_by: "system".to_owned(),
+                    bridge: Default::default(),
                     trigger_reason: "test".to_owned(),
                     hook_results_json: Some("{}".to_owned()),
                     rejection,
@@ -4075,6 +4076,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         make_execution(competing.clone()),
         make_lease(competing.clone()),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -4147,6 +4149,7 @@ async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() 
         make_execution(stale.clone()),
         make_lease(stale),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -4268,6 +4271,7 @@ async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
             to_state: "in_progress".to_owned(),
             trigger_name: Some("reject".to_owned()),
             triggered_by: "user:test".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "first entry".to_owned(),
             hook_results_json: None,
             rejection: true,
@@ -4336,6 +4340,7 @@ async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
         now: now.clone(),
     };
     let make_admission = || ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: Some(project.version),
         expected_task_version: task.version,
@@ -4382,6 +4387,7 @@ async fn execution_admission_ignores_plan_claim_from_prior_same_state_entry() {
             to_state: "in_progress".to_owned(),
             trigger_name: Some("reject".to_owned()),
             triggered_by: "user:test".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "later re-entry".to_owned(),
             hook_results_json: None,
             rejection: true,
@@ -4662,6 +4668,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
         .await
         .unwrap();
     let make_admission = |id: &str| ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: Some(id.to_owned()),
         expected_project_version: None,
         expected_task_version: queued.version,
@@ -4828,6 +4835,7 @@ async fn execution_admission_rejects_agent_profile_reassignment_without_capacity
             now: now.to_owned(),
         },
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -5058,6 +5066,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         root_execution_input,
         make_lease(root_execution_id, "embedded:custom-root"),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: root.version,
@@ -5093,6 +5102,7 @@ async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() 
         ),
         make_lease(child_execution_id, "embedded:inherited-child"),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: child.version,
@@ -5206,6 +5216,7 @@ async fn reviewer_execution_admission_binds_latest_review_candidate() {
     .await
     .expect("first review creates");
     let make_admission = |parent_execution_id: Option<String>| ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
@@ -6495,6 +6506,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         now: now.clone(),
     };
     let stale_admission = ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
@@ -6563,6 +6575,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         make_execution(dependency_id.clone()),
         make_lease(dependency_id),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -6594,6 +6607,7 @@ async fn execution_admission_rechecks_assignment_and_dependency_edges() {
         interactive_execution,
         make_lease(interactive_id),
         Some(ExecutionAdmission {
+            purpose: None,
             expected_queued_recovery_id: None,
             expected_project_version: None,
             expected_task_version: task.version,
@@ -6699,6 +6713,7 @@ async fn concurrent_execution_admission_has_one_winner_and_typed_loser() {
     let first_db = std::sync::Arc::clone(&db);
     let second_db = std::sync::Arc::clone(&db);
     let first_admission = ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: task.version,
@@ -6852,6 +6867,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
     let first_db = std::sync::Arc::clone(&db);
     let second_db = std::sync::Arc::clone(&db);
     let first_admission = ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: first_task.version,
@@ -6872,6 +6888,7 @@ async fn concurrent_execution_admission_respects_agent_capacity() {
         expected_workflow_definition: Some("{}".to_owned()),
     };
     let second_admission = ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: None,
         expected_task_version: second_task.version,
@@ -7575,6 +7592,7 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
         workflow_snapshot: serde_json::Value::Null,
         trigger_name: None,
         triggered_by: "user:board_drag".to_owned(),
+        bridge: Default::default(),
         trigger_reason: "board reorder".to_owned(),
         rejection: false,
         expected_project_version: None,
@@ -7684,6 +7702,7 @@ async fn compare_and_move_rejects_stale_project_workflow_authority_without_mutat
         workflow_snapshot: serde_json::Value::Null,
         trigger_name: None,
         triggered_by: "user:board_drag".to_owned(),
+        bridge: Default::default(),
         trigger_reason: "stale workflow authority".to_owned(),
         rejection: false,
         expected_project_version: Some(project.version),
@@ -7772,6 +7791,7 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
             triggered_by: "user:board_drag".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "resolve the block by moving the task".to_owned(),
             rejection: false,
             expected_project_version: None,
@@ -7853,6 +7873,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
             triggered_by: "user:board_drag".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "board reorder".to_owned(),
             rejection: false,
             expected_project_version: None,
@@ -7895,6 +7916,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
             triggered_by: "user:board_drag".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "board move".to_owned(),
             rejection: false,
             expected_project_version: None,
@@ -7932,6 +7954,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
             triggered_by: "user:board_drag".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "board move".to_owned(),
             rejection: false,
             expected_project_version: None,

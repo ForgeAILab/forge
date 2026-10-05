@@ -723,6 +723,7 @@ pub(super) async fn forge_transition_task(
             params.task_id,
             params.status.into(),
             services::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: params.version,
                 reason: None,
                 triggered_by: Actor::system(SystemComponent::Mcp),

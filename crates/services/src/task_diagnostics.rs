@@ -650,23 +650,7 @@ pub fn entries_since_retry_window_boundary<'a>(
     let boundary = entries.iter().rposition(|entry| {
         !entry.rejection
             && gate_state.is_none_or(|state| entry.from_state == state)
-            && (matches!(
-                entry.trigger_name.as_deref(),
-                Some("restart" | "reset_to_initial" | "reset_retry_window")
-            ) || (entry.trigger_name.as_deref() == Some("retry")
-                && entry
-                    .hook_results_json
-                    .as_deref()
-                    .and_then(|raw| {
-                        serde_json::from_str::<Vec<api_types::HookResultEntry>>(raw).ok()
-                    })
-                    .is_some_and(|results| {
-                        results.iter().any(|result| {
-                            result.action == "retry"
-                                && result.phase == "action"
-                                && result.outcome == "reset_budget"
-                        })
-                    })))
+            && entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::RetryWindowReset)
     });
     boundary
         .and_then(|index| entries.get(index + 1..))
@@ -695,12 +679,9 @@ pub fn count_gate_rejections_since_boundary(entries: &[TransitionLog], gate_stat
                 && entry.rejection
                 && !(gate_state == crate::workflow::default_states::MERGING
                     && entry.to_state == crate::workflow::default_states::MERGE_FAILED
-                    && (entry
-                        .trigger_reason
-                        .contains(crate::workflow::REVIEW_REFRESH_MARKER)
-                        || entry
-                            .trigger_reason
-                            .contains(crate::workflow::CONFLICT_HANDOFF_MARKER))
+                    && (entry.bridge.is_review_refresh()
+                        || entry.bridge.bridge_kind
+                            == Some(api_types::TransitionBridgeKind::ConflictHandoff))
                     && entry.triggered_by == workflow_actor)
         })
         .count() as i64
@@ -923,6 +904,14 @@ mod tests {
             to_state: to_state.to_owned(),
             trigger_name: trigger_name.map(str::to_owned),
             triggered_by: "system:test".to_owned(),
+            bridge: if matches!(
+                trigger_name,
+                Some("restart" | "reset_to_initial" | "reset_retry_window")
+            ) {
+                api_types::TransitionBridge::new(api_types::TransitionBridgeKind::RetryWindowReset)
+            } else {
+                Default::default()
+            },
             trigger_reason: "test".to_owned(),
             hook_results_json: None,
             rejection,
@@ -946,6 +935,8 @@ mod tests {
             api_types::Actor::system(api_types::SystemComponent::Workflow).display();
         let mut bridge = log("merging", "merge_failed", Some("retry"), true);
         bridge.triggered_by = workflow_actor;
+        bridge.bridge =
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh);
         bridge.trigger_reason =
             format!("{} target advanced", crate::workflow::REVIEW_REFRESH_MARKER);
         let entries = vec![log("merging", "merge_failed", Some("reject"), true), bridge];
@@ -959,6 +950,8 @@ mod tests {
             api_types::Actor::system(api_types::SystemComponent::Workflow).display();
         let mut handoff = log("merging", "merge_failed", Some("retry"), true);
         handoff.triggered_by = workflow_actor;
+        handoff.bridge =
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ConflictHandoff);
         handoff.trigger_reason = format!(
             "{} rebased onto main; paths_json=[\"exports.py\"]",
             crate::workflow::CONFLICT_HANDOFF_MARKER

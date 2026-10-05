@@ -1337,6 +1337,7 @@ pub struct CompareAndMoveTask {
     pub workflow_snapshot: serde_json::Value,
     pub trigger_name: Option<String>,
     pub triggered_by: String,
+    pub bridge: api_types::TransitionBridge,
     pub trigger_reason: String,
     pub rejection: bool,
     /// Exact Project workflow authority observed before resolving this move.
@@ -2777,6 +2778,8 @@ pub struct TransitionLog {
     pub to_state: String,
     pub trigger_name: Option<String>,
     pub triggered_by: String,
+    #[serde(flatten)]
+    pub bridge: api_types::TransitionBridge,
     pub trigger_reason: String,
     pub hook_results_json: Option<String>,
     pub rejection: bool,
@@ -2802,6 +2805,8 @@ pub struct CreateTransitionLog {
     pub to_state: String,
     pub trigger_name: Option<String>,
     pub triggered_by: String,
+    #[serde(flatten)]
+    pub bridge: api_types::TransitionBridge,
     pub trigger_reason: String,
     pub hook_results_json: Option<String>,
     pub rejection: bool,

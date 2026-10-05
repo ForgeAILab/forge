@@ -221,7 +221,7 @@ pub(super) fn log_hook_result(
                 "workflow hook failed"
             );
         }
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             tracing::info!(
                 task_id = %task_id,
                 from_state = %from_state,
@@ -272,7 +272,7 @@ pub(super) fn hook_result_entry(
         HookResult::Ok => ("ok".to_string(), None),
         HookResult::Skipped { reason } => ("skipped".to_string(), Some(reason.clone())),
         HookResult::Failed { reason } => ("failed".to_string(), Some(reason.clone())),
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             ("cascade".to_string(), Some(format!("{} -> {}", reason, to)))
         }
     };

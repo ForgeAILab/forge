@@ -171,6 +171,7 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
                 to_state: "in_progress".to_owned(),
                 trigger_name: Some("reject".to_owned()),
                 triggered_by: "test".to_owned(),
+                bridge: Default::default(),
                 trigger_reason: reason.to_owned(),
                 hook_results_json: None,
                 rejection: true,
@@ -246,6 +247,12 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
     harness
         .state
         .task_service
+        .drain(&task_id)
+        .await
+        .expect("entry hooks settle before the dispatcher consumes the action");
+    harness
+        .state
+        .task_service
         .test_dispatch_task_action(&task_id)
         .await
         .expect("the accepted human send-back dispatches its fresh follow-up");
@@ -254,7 +261,13 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
             .await
             .expect("coder execution count loads"),
         2,
-        "human rejection after reset must dispatch a fresh coder follow-up"
+        "human rejection after reset must dispatch a fresh coder follow-up; task={:?}; steps={:?}",
+        db::TaskRepo::get_by_id(&*harness.state.db, &task_id, false)
+            .await
+            .unwrap(),
+        db::TaskStepRepo::task_steps(&*harness.state.db, &task_id)
+            .await
+            .unwrap()
     );
 }
 

@@ -369,7 +369,7 @@ impl TaskService {
 
         let (workflow, workflow_authority) = self.workflow_and_authority_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;
-        self.workflow_engine()
+        self.workflow_execution()
             .restart_with_authority(
                 &task.id,
                 &initial_state,
@@ -492,7 +492,7 @@ impl TaskService {
 
         let (workflow, workflow_authority) = self.workflow_and_authority_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;
-        self.workflow_engine()
+        self.workflow_execution()
             .restart_with_authority(
                 &task.id,
                 &initial_state,
@@ -1110,21 +1110,12 @@ impl TaskService {
         Ok((false, false))
     }
 
-    pub(crate) fn workflow_engine(&self) -> WorkflowEngine {
-        WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
-        }
+    pub fn workflow_engine(&self) -> Arc<WorkflowEngine> {
+        Arc::clone(&self.workflow_engine)
+    }
+
+    pub fn workflow_execution(&self) -> crate::workflow::engine::WorkflowExecution<'_> {
+        self.workflow_engine.bind(self)
     }
 
     fn publish_role_reassigned(

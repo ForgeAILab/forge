@@ -197,22 +197,8 @@ fn initialize_git_repo(path: &std::path::Path) {
     run_git(path, &["commit", "-m", "initial commit"]);
 }
 
-fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> WorkflowEngine {
-    let task_service = crate::TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
-    WorkflowEngine {
-        workspace_backend_router: crate::diff::embedded_read_router_for_test(Arc::clone(&db)),
-        db,
-        event_bus,
-        review_runner: None,
-        merge_service: None,
-        cleanup_scheduler: None,
-        task_service,
-        daemon_connections: None,
-        workspace_exec_locks: None,
-        terminal_activity: None,
-        workspace_root: PathBuf::new(),
-        repo_cache_locks: None,
-    }
+fn engine(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> crate::TaskService {
+    crate::TaskService::new_for_test(db, event_bus)
 }
 
 fn hook(action: &str, on_failure: FailurePolicy) -> HookSpec {
@@ -422,7 +408,7 @@ fn cascade_chain_workflow(steps: usize) -> WorkflowDefinition {
     }
 }
 
-async fn drain(engine: WorkflowEngine, task_id: &str) -> db::Task {
+async fn drain(engine: crate::TaskService, task_id: &str) -> db::Task {
     crate::worker_runtime::queue::TaskStepWorker::new(engine)
         .drain(task_id)
         .await
@@ -430,7 +416,7 @@ async fn drain(engine: WorkflowEngine, task_id: &str) -> db::Task {
 }
 
 async fn drain_result(
-    driver: WorkflowEngine,
+    driver: crate::TaskService,
     mut result: super::TransitionResult,
 ) -> super::TransitionResult {
     result.task = drain(driver.clone(), &result.task.id).await;
@@ -453,6 +439,7 @@ async fn long_legitimate_cascade_returns_own_commit_then_drains_without_parking(
     // 40 distinct edges, over four times the hotfix's nine-hop carry chain.
     let workflow = cascade_chain_workflow(40);
     let result = engine(db.clone(), bus.clone())
+        .workflow_execution()
         .transition(
             id,
             "step_0",
@@ -461,6 +448,7 @@ async fn long_legitimate_cascade_returns_own_commit_then_drains_without_parking(
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "start",
             false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -503,6 +491,7 @@ async fn automatic_chain_bound_parks_and_publishes_loop_event() {
     seed_project_repo_and_task(&db, id, "start").await;
     let workflow = cascade_chain_workflow(66);
     engine(db.clone(), bus.clone())
+        .workflow_execution()
         .transition(
             id,
             "step_0",
@@ -511,6 +500,7 @@ async fn automatic_chain_bound_parks_and_publishes_loop_event() {
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "start",
             false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -613,11 +603,13 @@ async fn review_carry_two_refresh_rounds_complete_without_parking() {
         }
         let task = TaskRepo::get_by_id(&*db, id, false).await.unwrap().unwrap();
         let input = driver
+            .workflow_execution()
             .cascade_step_input(
                 &task,
                 &workflow,
                 (*target).into(),
                 "review carry fixture".into(),
+                Default::default(),
                 false,
                 false,
                 None,
@@ -669,6 +661,7 @@ async fn repeated_edge_parks_instead_of_transitioning_again() {
     workflow.states[2].hooks.on_enter =
         vec![hook("auto_cascade_on_unassigned_role", FailurePolicy::Log)];
     engine(db.clone(), bus.clone())
+        .workflow_execution()
         .transition(
             id,
             "step_0",
@@ -677,6 +670,7 @@ async fn repeated_edge_parks_instead_of_transitioning_again() {
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "start",
             false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -709,6 +703,7 @@ async fn moved_task_supersedes_pending_cascade() {
     seed_project_repo_and_task(&db, id, "start").await;
     let workflow = cascade_chain_workflow(2);
     engine(db.clone(), bus.clone())
+        .workflow_execution()
         .transition(
             id,
             "step_0",
@@ -717,6 +712,7 @@ async fn moved_task_supersedes_pending_cascade() {
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "start",
             false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -759,6 +755,7 @@ async fn lifecycle_ordering() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
         .transition(
             task_id,
             default_states::PLANNING,
@@ -767,6 +764,7 @@ async fn lifecycle_ordering() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
+            Default::default(),
         )
         .await
         .expect("transition succeeds");
@@ -812,6 +810,7 @@ async fn transition_rejects_stale_project_workflow_authority_without_mutation() 
     .expect("workflow update wins the race");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition_with_authority(
             task_id,
             default_states::IN_PROGRESS,
@@ -898,6 +897,7 @@ async fn retry_entry_barrier_rejects_stale_project_workflow_authority_without_mu
 
     let workflow = default_workflow::default_workflow();
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .retry_entry_barrier_with_authority(
             task_id,
             blocked.version,
@@ -950,6 +950,7 @@ async fn reset_to_initial_rejects_stale_project_workflow_authority_without_mutat
     .expect("workflow update wins the race");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .restart_with_authority(
             task_id,
             default_states::TODO,
@@ -997,6 +998,7 @@ async fn default_workflow_allows_user_to_leave_planning() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             task_id,
             default_states::IN_PROGRESS,
@@ -1005,6 +1007,7 @@ async fn default_workflow_allows_user_to_leave_planning() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work after planning",
             false,
+            Default::default(),
         )
         .await
         .expect("planning can be advanced by a user");
@@ -1025,6 +1028,7 @@ async fn default_workflow_allows_user_to_start_work_from_todo() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             task_id,
             default_states::IN_PROGRESS,
@@ -1033,6 +1037,7 @@ async fn default_workflow_allows_user_to_start_work_from_todo() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "start human work",
             false,
+            Default::default(),
         )
         .await
         .expect("todo can be moved directly into active work by a user");
@@ -1067,6 +1072,7 @@ async fn default_workflow_skips_planning_when_no_planner_is_assigned() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
         .transition(
             task_id,
             default_states::PLANNING,
@@ -1075,6 +1081,7 @@ async fn default_workflow_skips_planning_when_no_planner_is_assigned() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "enter planning",
             false,
+            Default::default(),
         )
         .await
         .expect("planning gate is skipped");
@@ -1088,7 +1095,7 @@ async fn default_workflow_skips_planning_when_no_planner_is_assigned() {
     assert!(transition_logs.iter().any(|log| {
         log.from_state == default_states::PLANNING
             && log.to_state == default_states::IN_PROGRESS
-            && log.trigger_reason == "gate skipped: no planner role assigned"
+            && log.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::GateSkipped)
             && !log.rejection
     }));
 }
@@ -1107,6 +1114,7 @@ async fn default_workflow_keeps_planning_when_planner_is_human() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             task_id,
             default_states::PLANNING,
@@ -1115,6 +1123,7 @@ async fn default_workflow_keeps_planning_when_planner_is_human() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "enter planning",
             false,
+            Default::default(),
         )
         .await
         .expect("human planning gate is entered");
@@ -1135,6 +1144,7 @@ async fn default_workflow_skips_system_review_when_no_checks_or_reviewer_are_ass
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
         .transition(
             task_id,
             default_states::REVIEW,
@@ -1143,6 +1153,7 @@ async fn default_workflow_skips_system_review_when_no_checks_or_reviewer_are_ass
             &api_types::Actor::system(api_types::SystemComponent::General),
             "request review after agent completion",
             false,
+            Default::default(),
         )
         .await
         .expect("system-entered unconfigured review skips to merge gate");
@@ -1173,6 +1184,7 @@ async fn default_workflow_keeps_user_requested_review_when_unassigned() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             task_id,
             default_states::REVIEW,
@@ -1181,6 +1193,7 @@ async fn default_workflow_keeps_user_requested_review_when_unassigned() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "request human review",
             false,
+            Default::default(),
         )
         .await
         .expect("user-requested review gate is entered");
@@ -1224,6 +1237,7 @@ async fn default_workflow_keeps_review_when_reviewer_is_human() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             task_id,
             default_states::REVIEW,
@@ -1232,6 +1246,7 @@ async fn default_workflow_keeps_review_when_reviewer_is_human() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "request review",
             false,
+            Default::default(),
         )
         .await
         .expect("human review gate is entered");
@@ -1293,6 +1308,7 @@ async fn guard_rejection_returns_412_error() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
         .transition(
             task_id,
             default_states::IN_PROGRESS,
@@ -1301,6 +1317,7 @@ async fn guard_rejection_returns_412_error() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
+            Default::default(),
         )
         .await;
 
@@ -1377,6 +1394,7 @@ async fn effect_failure_log_policy_continues() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             task_id,
             default_states::IN_PROGRESS,
@@ -1385,6 +1403,7 @@ async fn effect_failure_log_policy_continues() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
+            Default::default(),
         )
         .await
         .expect("transition succeeds despite logged effect failure");
@@ -1421,6 +1440,7 @@ async fn dispatch_failure_entering_active_state_rolls_task_back_to_initial() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
         .transition(
             task_id,
             default_states::PLANNING,
@@ -1429,6 +1449,7 @@ async fn dispatch_failure_entering_active_state_rolls_task_back_to_initial() {
             &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
             "scheduled by task dispatcher",
             false,
+            Default::default(),
         )
         .await
         .expect("transition succeeds");
@@ -1535,6 +1556,7 @@ async fn successful_dispatch_clears_stale_dispatch_failure_annotation() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             task_id,
             default_states::IN_PROGRESS,
@@ -1543,6 +1565,7 @@ async fn successful_dispatch_clears_stale_dispatch_failure_annotation() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "restart work after baseline approval",
             false,
+            Default::default(),
         )
         .await
         .expect("transition succeeds");
@@ -1616,6 +1639,7 @@ async fn cancellation_implicit_edge() {
         .expect("task exists");
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             task_id,
             default_states::CANCELLED,
@@ -1624,6 +1648,7 @@ async fn cancellation_implicit_edge() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "cancel",
             false,
+            Default::default(),
         )
         .await
         .expect("implicit cancellation transition succeeds");
@@ -1793,6 +1818,7 @@ async fn review_refresh_bridge_skips_merge_repair_entry_hooks() {
         .expect("project settings become invalid");
 
     let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
         .transition(
             &task_id,
             default_states::MERGE_FAILED,
@@ -1804,6 +1830,7 @@ async fn review_refresh_bridge_skips_merge_repair_entry_hooks() {
                 crate::workflow::REVIEW_REFRESH_MARKER
             ),
             true,
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
         )
         .await
         .expect("review refresh crosses the repair bridge");
@@ -1881,6 +1908,7 @@ async fn custom_workflow_renamed_states_lifecycle() {
     let eng = engine(Arc::clone(&db), Arc::clone(&event_bus));
 
     let r1 = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "working",
@@ -1889,12 +1917,14 @@ async fn custom_workflow_renamed_states_lifecycle() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "claim",
             false,
+            Default::default(),
         )
         .await
         .expect("pending → working");
     assert_eq!(r1.task.status, "working");
 
     let r2 = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "checking",
@@ -1903,12 +1933,14 @@ async fn custom_workflow_renamed_states_lifecycle() {
             &api_types::Actor::system(api_types::SystemComponent::General),
             "completed",
             false,
+            Default::default(),
         )
         .await
         .expect("working → checking");
     assert_eq!(r2.task.status, "checking");
 
     let r3 = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "shipped",
@@ -1917,6 +1949,7 @@ async fn custom_workflow_renamed_states_lifecycle() {
             &api_types::Actor::system(api_types::SystemComponent::General),
             "approved",
             false,
+            Default::default(),
         )
         .await
         .expect("checking → shipped");
@@ -1941,6 +1974,7 @@ async fn implicit_accept_transition_moves_to_next_declared_state() {
     seed_custom_workflow_task(&db, &task_id, "pending", &workflow).await;
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             &task_id,
             "working",
@@ -1949,6 +1983,7 @@ async fn implicit_accept_transition_moves_to_next_declared_state() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "accept",
             false,
+            Default::default(),
         )
         .await
         .expect("pending implicitly accepts to working");
@@ -2100,6 +2135,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_a_id,
             "coding",
@@ -2108,6 +2144,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
+            Default::default(),
         )
         .await
         .expect("start → coding");
@@ -2118,6 +2155,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_a_id,
             "qa",
@@ -2126,6 +2164,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "request qa",
             false,
+            Default::default(),
         )
         .await
         .expect("coding → qa");
@@ -2136,6 +2175,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_a_id,
             "released",
@@ -2144,6 +2184,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate approved",
             false,
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::GateApproved),
         )
         .await
         .expect("qa → released");
@@ -2154,6 +2195,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_b_id,
             "coding",
@@ -2162,6 +2204,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
+            Default::default(),
         )
         .await
         .expect("start → coding");
@@ -2172,6 +2215,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_b_id,
             "qa",
@@ -2180,6 +2224,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "request qa",
             false,
+            Default::default(),
         )
         .await
         .expect("coding → qa");
@@ -2190,6 +2235,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_b_id,
             "coding",
@@ -2198,6 +2244,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate rejected",
             true,
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::GateRejected),
         )
         .await
         .expect("qa → coding (reject)");
@@ -2220,6 +2267,7 @@ async fn user_approval_gate_failed_blocking_before_enter_cascades_to_reject_targ
         .expect("task review config updates");
 
     let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
         .transition(
             &task_id,
             "review",
@@ -2228,6 +2276,7 @@ async fn user_approval_gate_failed_blocking_before_enter_cascades_to_reject_targ
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "submit for validation",
             false,
+            Default::default(),
         )
         .await
         .expect("failed validation cascades back to working");
@@ -2249,7 +2298,7 @@ async fn user_approval_gate_failed_blocking_before_enter_cascades_to_reject_targ
 
 struct FailedCiFixture {
     db: Arc<SqliteDb>,
-    engine: WorkflowEngine,
+    engine: crate::TaskService,
     workflow: WorkflowDefinition,
     task: db::Task,
     workspace: db::Workspace,
@@ -2371,9 +2420,7 @@ async fn failed_ci_fixture(budget: i32, policy: FailurePolicy) -> FailedCiFixtur
     .unwrap();
     let mut eng = engine(Arc::clone(&db), Arc::new(EventBus::new(32)));
     eng.workspace_root = workspace_root.path().to_path_buf();
-    eng.task_service = eng
-        .task_service
-        .with_workspace_root(workspace_root.path().to_path_buf());
+    eng = eng.with_workspace_root(workspace_root.path().to_path_buf());
     FailedCiFixture {
         db,
         engine: eng,
@@ -2417,6 +2464,7 @@ async fn before_work_workspace_reset_required_keeps_typed_recovery_annotation() 
 
     let result = fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &fixture.task.id,
             "review",
@@ -2483,6 +2531,7 @@ async fn system_review_ci_failure_routes_to_coder_and_spends_review_budget() {
         std::fs::remove_dir_all(fixture.workspace.embedded_worktree_path_for_backend()).unwrap();
         let result = fixture
             .engine
+            .workflow_execution()
             .transition_with_authority(
                 &fixture.task.id,
                 "review",
@@ -2535,6 +2584,7 @@ async fn system_review_ci_failure_records_review_budget_exhausted_blocker() {
     let fixture = failed_ci_fixture(1, FailurePolicy::Block).await;
     let result = fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &fixture.task.id,
             "review",
@@ -2571,6 +2621,7 @@ async fn user_review_ci_success_still_waits_for_human() {
         .unwrap();
     let result = fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &fixture.task.id,
             "review",
@@ -2611,6 +2662,7 @@ async fn user_approval_gate_passing_hooks_pauses_forward_cascade_for_human() {
     seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
 
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             &task_id,
             "review",
@@ -2619,6 +2671,7 @@ async fn user_approval_gate_passing_hooks_pauses_forward_cascade_for_human() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "submit for validation",
             false,
+            Default::default(),
         )
         .await
         .expect("passing validation pauses for human approval");
@@ -2699,6 +2752,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "coding",
@@ -2707,6 +2761,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
+            Default::default(),
         )
         .await
         .expect("start → coding");
@@ -2717,6 +2772,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "review",
@@ -2725,6 +2781,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "request review",
             false,
+            Default::default(),
         )
         .await
         .expect("coding → review");
@@ -2749,6 +2806,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "coding",
@@ -2757,6 +2815,7 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate rejected",
             true,
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::GateRejected),
         )
         .await
         .expect("review → coding (reject)");
@@ -2766,17 +2825,19 @@ async fn review_gate_exhausted_budget_defers_blocking_until_review_failure() {
         .await
         .expect("task loads")
         .expect("task exists");
-    eng.transition(
-        &task_id,
-        "review",
-        current_task.version,
-        &workflow,
-        &api_types::Actor::user(api_types::UserActionSource::Test),
-        "request review again",
-        false,
-    )
-    .await
-    .expect("review budget resolves on re-entry");
+    eng.workflow_execution()
+        .transition(
+            &task_id,
+            "review",
+            current_task.version,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "request review again",
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("review budget resolves on re-entry");
 
     let current_task = TaskRepo::get_by_id(&*db, &task_id, false)
         .await
@@ -2887,6 +2948,7 @@ async fn planning_gate_reject_back_to_itself() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             default_states::PLANNING,
@@ -2895,6 +2957,7 @@ async fn planning_gate_reject_back_to_itself() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "enter planning",
             false,
+            Default::default(),
         )
         .await
         .expect("todo → planning");
@@ -2905,6 +2968,7 @@ async fn planning_gate_reject_back_to_itself() {
         .expect("task loads")
         .expect("task exists");
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             default_states::PLANNING,
@@ -2913,6 +2977,7 @@ async fn planning_gate_reject_back_to_itself() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate rejected",
             true,
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::GateRejected),
         )
         .await
         .expect("planning rejects back to itself");
@@ -2975,6 +3040,7 @@ async fn gate_reject_back_to_itself() {
     assert_eq!(reject_target, "planning");
 
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             reject_target,
@@ -2983,6 +3049,7 @@ async fn gate_reject_back_to_itself() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "gate rejected: needs more detail",
             true,
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::GateRejected),
         )
         .await
         .expect("planning → planning (reject)");
@@ -3103,6 +3170,7 @@ async fn user_override_succeeds_across_missing_edge() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "done",
@@ -3111,6 +3179,7 @@ async fn user_override_succeeds_across_missing_edge() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "override",
             false,
+            Default::default(),
         )
         .await
         .expect("user override across missing edge succeeds");
@@ -3129,6 +3198,7 @@ async fn user_override_does_not_reopen_terminal_state() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "working",
@@ -3137,6 +3207,7 @@ async fn user_override_does_not_reopen_terminal_state() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "override",
             false,
+            Default::default(),
         )
         .await;
 
@@ -3160,6 +3231,7 @@ async fn user_override_succeeds_along_system_only_edge() {
     let eng = engine(Arc::clone(&db), Arc::clone(&event_bus));
 
     let user_result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "failed",
@@ -3168,6 +3240,7 @@ async fn user_override_succeeds_along_system_only_edge() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "user override along fail edge",
             false,
+            Default::default(),
         )
         .await
         .expect("user override along system-only edge succeeds");
@@ -3176,6 +3249,7 @@ async fn user_override_succeeds_along_system_only_edge() {
     let task_id_system = new_uuid_v4();
     seed_custom_workflow_task(&db, &task_id_system, "working", &workflow).await;
     let system_result = eng
+        .workflow_execution()
         .transition(
             &task_id_system,
             "failed",
@@ -3184,6 +3258,7 @@ async fn user_override_succeeds_along_system_only_edge() {
             &api_types::Actor::system(api_types::SystemComponent::General),
             "system fail transition",
             false,
+            Default::default(),
         )
         .await
         .expect("system actor may use system-only edge");
@@ -3192,6 +3267,7 @@ async fn user_override_succeeds_along_system_only_edge() {
     let task_id_agent = new_uuid_v4();
     seed_custom_workflow_task(&db, &task_id_agent, "working", &workflow).await;
     let agent_result = eng
+        .workflow_execution()
         .transition(
             &task_id_agent,
             "failed",
@@ -3200,6 +3276,7 @@ async fn user_override_succeeds_along_system_only_edge() {
             &api_types::Actor::agent("unit"),
             "agent attempt",
             false,
+            Default::default(),
         )
         .await;
     match agent_result {
@@ -3226,6 +3303,7 @@ async fn agent_can_use_a_system_trigger_only_for_the_cancellation_target() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "failed",
@@ -3234,6 +3312,7 @@ async fn agent_can_use_a_system_trigger_only_for_the_cancellation_target() {
             &api_types::Actor::agent("project-agent"),
             "cancelled through the scoped Task command",
             false,
+            Default::default(),
         )
         .await
         .expect("an authorized Agent cancellation can reach the cancellation target");
@@ -3267,6 +3346,7 @@ async fn override_not_granted_to_agents_or_system() {
         let task_id = new_uuid_v4();
         seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
         let result = eng
+            .workflow_execution()
             .transition(
                 &task_id,
                 "done",
@@ -3275,6 +3355,7 @@ async fn override_not_granted_to_agents_or_system() {
                 &actor,
                 "should not override",
                 false,
+                Default::default(),
             )
             .await;
         assert!(
@@ -3298,6 +3379,7 @@ async fn override_to_undefined_target_rejected_with_enumerated_states() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "nonexistent",
@@ -3306,6 +3388,7 @@ async fn override_to_undefined_target_rejected_with_enumerated_states() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "invalid target",
             false,
+            Default::default(),
         )
         .await;
 
@@ -3340,6 +3423,7 @@ async fn custom_workflow_lacking_review_rejects_with_enumerated_states() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "review",
@@ -3348,6 +3432,7 @@ async fn custom_workflow_lacking_review_rejects_with_enumerated_states() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "request review",
             false,
+            Default::default(),
         )
         .await;
 
@@ -3423,6 +3508,7 @@ async fn content_guard_blocks_user_override() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "done",
@@ -3431,6 +3517,7 @@ async fn content_guard_blocks_user_override() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "override blocked by guard",
             false,
+            Default::default(),
         )
         .await;
 
@@ -3460,6 +3547,7 @@ async fn version_conflict_still_applies_to_override() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &task_id,
             "done",
@@ -3468,6 +3556,7 @@ async fn version_conflict_still_applies_to_override() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "stale version",
             false,
+            Default::default(),
         )
         .await;
 
@@ -3488,17 +3577,19 @@ async fn override_is_auditable() {
     let reason = "audit this override";
     let eng = engine(Arc::clone(&db), event_bus);
 
-    eng.transition(
-        &task_id,
-        "done",
-        1,
-        &workflow,
-        &api_types::Actor::user(api_types::UserActionSource::Test),
-        reason,
-        false,
-    )
-    .await
-    .expect("override transition succeeds");
+    eng.workflow_execution()
+        .transition(
+            &task_id,
+            "done",
+            1,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            reason,
+            false,
+            Default::default(),
+        )
+        .await
+        .expect("override transition succeeds");
 
     let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
         .await
@@ -3530,6 +3621,7 @@ async fn subtask_user_override_into_review_no_workspace_no_reviewer_completes() 
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &subtask_id,
             default_states::REVIEW,
@@ -3538,6 +3630,7 @@ async fn subtask_user_override_into_review_no_workspace_no_reviewer_completes() 
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "subtask into review",
             false,
+            Default::default(),
         )
         .await
         .expect("subtask user override into review completes without panic");
@@ -3564,6 +3657,7 @@ async fn subtask_user_override_into_review_with_ci_steps_completes_or_fails_grac
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &subtask_id,
             default_states::REVIEW,
@@ -3572,6 +3666,7 @@ async fn subtask_user_override_into_review_with_ci_steps_completes_or_fails_grac
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "subtask review with ci",
             false,
+            Default::default(),
         )
         .await;
 
@@ -3608,6 +3703,7 @@ async fn subtask_user_override_into_review_empty_ci_auto_passes() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &subtask_id,
             default_states::REVIEW,
@@ -3616,6 +3712,7 @@ async fn subtask_user_override_into_review_empty_ci_auto_passes() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "subtask review no ci",
             false,
+            Default::default(),
         )
         .await
         .expect("subtask user override into review with empty CI completes");
@@ -3642,6 +3739,7 @@ async fn subtask_user_override_into_merging_without_merge_service_completes() {
     let eng = engine(Arc::clone(&db), event_bus);
 
     let result = eng
+        .workflow_execution()
         .transition(
             &subtask_id,
             default_states::MERGING,
@@ -3650,6 +3748,7 @@ async fn subtask_user_override_into_merging_without_merge_service_completes() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "subtask into merging",
             false,
+            Default::default(),
         )
         .await;
 
@@ -3763,6 +3862,7 @@ async fn system_review_ci_placement_error_retries_without_review_rejection() {
     )));
     let result = fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &fixture.task.id,
             "review",
@@ -3794,6 +3894,7 @@ async fn system_review_ci_placement_error_retries_without_review_rejection() {
     );
     let retried = fixture
         .engine
+        .workflow_execution()
         .retry_entry_barrier_with_authority(
             &fixture.task.id,
             result.task.version,
@@ -3910,6 +4011,7 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
         })));
     let mut result = fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &fixture.task.id,
             "review",
@@ -3935,6 +4037,7 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
     for _ in 0..6 {
         result = fixture
             .engine
+            .workflow_execution()
             .retry_entry_barrier_with_authority(
                 &fixture.task.id,
                 result.task.version,
@@ -3983,6 +4086,7 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
         assert!(delay.num_milliseconds() > (5 * (1_i64 << (attempt - 1)) - 1) * 1000);
         result = fixture
             .engine
+            .workflow_execution()
             .retry_entry_barrier_with_authority(
                 &fixture.task.id,
                 result.task.version,
@@ -4128,6 +4232,7 @@ async fn system_review_ci_authority_loss_keeps_base_cancellation_routing() {
         })));
     let result = fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &fixture.task.id,
             "review",
@@ -4445,6 +4550,7 @@ async fn audit_23a_unconfigured_review_target_moved_round_keeps_running() {
 
     // Real producer: unconfigured review cascades review -> merging (step 1).
     let result = driver
+        .workflow_execution()
         .transition(
             id,
             default_states::REVIEW,
@@ -4453,6 +4559,7 @@ async fn audit_23a_unconfigured_review_target_moved_round_keeps_running() {
             &api_types::Actor::system(api_types::SystemComponent::General),
             "agent completed",
             false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -4471,11 +4578,13 @@ async fn audit_23a_unconfigured_review_target_moved_round_keeps_running() {
         crate::workflow::TARGET_MOVED_MARKER
     );
     let input = driver
+        .workflow_execution()
         .cascade_step_input(
             &merging,
             &workflow,
             default_states::MERGE_FAILED.into(),
             reason,
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::TargetMovedRebase),
             false,
             false,
             None,
@@ -4508,7 +4617,6 @@ async fn audit_23a_unconfigured_review_target_moved_round_keeps_running() {
     assert_eq!(steps.last().unwrap().status, "done");
     assert!(settled.blocked_json.is_none());
     let snapshot = driver
-        .task_service
         .task_action_snapshot(
             id,
             &api_types::Actor::user(api_types::UserActionSource::Test),
@@ -4636,4 +4744,27 @@ async fn removed_dispatch_annotation_retries_preserve_a_queued_manual_stop() {
             .iter()
             .all(|s| s.status == "done" && s.attempts == 1));
     }
+}
+
+#[test]
+fn optional_gate_cascade_uses_typed_skip_instead_of_reason_words() {
+    let mut source = state("approval", StateKind::Gate, None, StateHooks::default());
+    source.gate_config = Some(GateConfig {
+        requires_user_approval: Some(true),
+        optional_when_unassigned: Some(true),
+        reject_target: None,
+        max_rejections: None,
+        approve_label: None,
+        reject_label: None,
+    });
+    assert!(WorkflowEngine::cascade_allowed(
+        &source,
+        &api_types::TransitionBridge::new(api_types::TransitionBridgeKind::GateSkipped),
+        false
+    ));
+    assert!(!WorkflowEngine::cascade_allowed(
+        &source,
+        &api_types::TransitionBridge::default(),
+        false
+    ));
 }

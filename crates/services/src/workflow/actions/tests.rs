@@ -1614,7 +1614,7 @@ async fn run_ci_steps_without_reviewer_cascades_to_merging() {
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
     match AutoCascadeOnReviewPass.execute(&ctx).await {
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             assert_eq!(to, default_states::MERGING);
             assert_eq!(reason, "review passed");
         }
@@ -2128,8 +2128,8 @@ async fn review_refresh_bypasses_merge_fix_notification_and_dispatch() {
     sqlx::query(
         "INSERT INTO transition_log
          (id, task_id, from_state, to_state, trigger_name, triggered_by,
-          trigger_reason, hook_results_json, rejection, created_at)
-         VALUES (?, ?, ?, ?, 'retry', 'system:workflow', ?, NULL, 0, ?)",
+          trigger_reason, hook_results_json, rejection, created_at, bridge_kind)
+         VALUES (?, ?, ?, ?, 'retry', 'system:workflow', ?, NULL, 0, ?, 'review_refresh')",
     )
     .bind(new_uuid_v4())
     .bind(&harness.ctx.task_id)
@@ -2152,11 +2152,14 @@ async fn review_refresh_bypasses_merge_fix_notification_and_dispatch() {
 
     let dispatch = DispatchRoleAgent.execute(&harness.ctx).await;
     assert!(matches!(
-        dispatch,
-        HookResult::Cascade { to, reason }
-            if to == default_states::REVIEW
-                && reason.contains(crate::workflow::REVIEW_REFRESH_MARKER)
-    ));
+            dispatch,
+            HookResult::Cascade { to, bridge,
+
+    ..
+    }
+                if to == default_states::REVIEW
+                    && bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ReviewRefresh)
+        ));
     assert!(harness.rx.try_recv().is_err());
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(
@@ -2182,6 +2185,7 @@ fn review_refresh_bridge_does_not_reset_or_spend_merge_fix_window() {
         to_state: default_states::MERGE_FAILED.to_owned(),
         trigger_name: Some("retry".to_owned()),
         triggered_by: workflow_actor.clone(),
+        bridge: Default::default(),
         trigger_reason: reason.to_owned(),
         hook_results_json: None,
         rejection: true,
@@ -2194,6 +2198,7 @@ fn review_refresh_bridge_does_not_reset_or_spend_merge_fix_window() {
         to_state: default_states::MERGE_FAILED.to_owned(),
         trigger_name: Some("retry".to_owned()),
         triggered_by: workflow_actor.clone(),
+        bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
         trigger_reason: format!(
             "{} target advanced; re-review required",
             crate::workflow::REVIEW_REFRESH_MARKER
@@ -2474,16 +2479,16 @@ async fn rebase_conflict_is_handed_back_to_the_worker_with_committed_markers() {
 
     let result = target_moved_result(&ctx, &task, "main advanced", "main").await;
 
-    let HookResult::Cascade { to, reason } = result else {
+    let HookResult::Cascade { to, reason, bridge } = result else {
         panic!("a sibling conflict goes back to the Worker, got {result:?}");
     };
     assert_eq!(to, default_states::MERGE_FAILED);
     assert!(
-        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
         "{reason}"
     );
     assert!(
-        !reason.contains(crate::workflow::REVIEW_REFRESH_MARKER),
+        !bridge.is_review_refresh(),
         "a conflict needs the Worker, not a bare re-review: {reason}"
     );
     assert!(reason.contains("exports.py"), "{reason}");
@@ -2528,6 +2533,7 @@ async fn record_conflict_handoff(ctx: &HookContext, reason: String, rejection: b
             to_state: default_states::MERGE_FAILED.to_owned(),
             trigger_name: None,
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            bridge: api_types::TransitionBridge::conflict_handoff(&["exports.py".into()]),
             trigger_reason: reason,
             hook_results_json: None,
             rejection,
@@ -2743,12 +2749,12 @@ async fn plain_merge_conflict_is_handed_back_to_the_worker() {
 
     let result = RunMerge.execute(&ctx).await;
 
-    let HookResult::Cascade { to, reason } = result else {
+    let HookResult::Cascade { to, reason, bridge } = result else {
         panic!("a plain merge conflict goes back to the Worker, got {result:?}");
     };
     assert_eq!(to, default_states::MERGE_FAILED);
     assert!(
-        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
         "{reason}"
     );
     let exports = std::fs::read_to_string(worktree_path.join("exports.py")).expect("exports reads");
@@ -2782,6 +2788,9 @@ async fn repeated_conflict_handoffs_escalate_in_a_single_task_write() {
                 trigger_name: None,
                 triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow)
                     .display(),
+                bridge: api_types::TransitionBridge::new(
+                    api_types::TransitionBridgeKind::ConflictHandoff,
+                ),
                 trigger_reason: format!(
                     "{} rebased onto main; conflicts were committed with markers in: exports.py",
                     crate::workflow::CONFLICT_HANDOFF_MARKER
@@ -3512,7 +3521,7 @@ async fn ci_fails_reviewer_not_dispatched_cascade_handles_bounce() {
 
     let cascade_result = AutoCascadeOnReviewPass.execute(&ctx).await;
     match cascade_result {
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             assert_eq!(to, default_states::IN_PROGRESS);
             assert_eq!(reason, "review failed");
         }
@@ -3745,7 +3754,7 @@ async fn no_reviewer_assigned_auto_cascade_to_merging() {
 
     let cascade_result = super::AutoCascadeOnUnconfiguredReview.execute(&ctx).await;
     match cascade_result {
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             assert_eq!(to, default_states::MERGING);
             assert!(reason.contains("no checks or reviewer"));
         }
@@ -3773,7 +3782,7 @@ async fn read_only_task_without_reviewer_ignores_implementation_checks_and_casca
     let cascade = super::AutoCascadeOnUnconfiguredReview.execute(&ctx).await;
 
     match cascade {
-        HookResult::Cascade { to, reason } => {
+        HookResult::Cascade { to, reason, .. } => {
             assert_eq!(to, default_states::MERGING);
             assert!(reason.contains("no checks or reviewer"));
         }
@@ -4061,6 +4070,7 @@ async fn record_transition_entry(
     to: &str,
     actor: api_types::Actor,
     reason: &str,
+    bridge: api_types::TransitionBridge,
 ) {
     db::TransitionLogRepo::insert(
         &*ctx.db,
@@ -4071,6 +4081,7 @@ async fn record_transition_entry(
             to_state: to.to_owned(),
             trigger_name: None,
             triggered_by: actor.display(),
+            bridge,
             trigger_reason: reason.to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -4086,6 +4097,7 @@ async fn record_transition_entry(
 async fn enter_review_after_bridge(
     ctx: &mut HookContext,
     bridge_reason: &str,
+    bridge: &api_types::TransitionBridge,
     entry_actor: api_types::Actor,
     entry_reason: &str,
     ci_steps: serde_json::Value,
@@ -4097,6 +4109,7 @@ async fn enter_review_after_bridge(
         default_states::MERGE_FAILED,
         workflow_actor,
         bridge_reason,
+        bridge.clone(),
     )
     .await;
     record_transition_entry(
@@ -4105,6 +4118,7 @@ async fn enter_review_after_bridge(
         default_states::REVIEW,
         entry_actor.clone(),
         entry_reason,
+        api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
     )
     .await;
     ctx.from_state = default_states::MERGE_FAILED.to_owned();
@@ -4227,12 +4241,12 @@ async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
 
-    let HookResult::Cascade { to, reason } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { to, reason, bridge } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     assert_eq!(to, default_states::MERGE_FAILED);
     assert!(
-        reason.contains(crate::workflow::TARGET_MOVED_MARKER),
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::TargetMovedRebase),
         "{reason}"
     );
     let rebased_head = run_git(&scenario.worktree, &["rev-parse", "HEAD"]);
@@ -4241,6 +4255,7 @@ async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),
@@ -4250,11 +4265,14 @@ async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
     assert!(matches!(ci, HookResult::Ok), "{ci:?}");
 
     let carried = super::CarryReviewAuthority.execute(&ctx).await;
-    let HookResult::Cascade { to, reason } = carried else {
+    let HookResult::Cascade { to, reason, bridge } = carried else {
         panic!("a clean rebase with passing checks carries the review, got {carried:?}");
     };
     assert_eq!(to, default_states::MERGING);
-    assert!(reason.contains("[review-carry]"), "{reason}");
+    assert!(
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ReviewCarry),
+        "{reason}"
+    );
 
     assert_eq!(reviewer_execution_count(&ctx).await, reviewers_before);
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
@@ -4296,11 +4314,11 @@ async fn conflict_repair_by_the_worker_carries_review_authority() {
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
 
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the conflicting sibling should hand the conflict back");
     };
     assert!(
-        reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER),
+        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
         "{reason}"
     );
     // The Worker reconciles only the handed-off file and commits.
@@ -4316,6 +4334,7 @@ async fn conflict_repair_by_the_worker_carries_review_authority() {
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Test),
         "worker completed the merge repair",
         json!(["test -d ."]),
@@ -4352,7 +4371,7 @@ async fn repair_touching_a_new_path_gets_a_full_review() {
         build_carry_scenario("task-carry-scope", "agent-carry-scope", true).await;
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the conflicting sibling should hand the conflict back");
     };
     std::fs::write(
@@ -4368,6 +4387,7 @@ async fn repair_touching_a_new_path_gets_a_full_review() {
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Test),
         "worker completed the merge repair",
         json!(["test -d ."]),
@@ -4399,12 +4419,13 @@ async fn no_configured_checks_means_a_full_review() {
         build_carry_scenario("task-carry-no-ci", "agent-carry-no-ci", false).await;
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!([]),
@@ -4425,7 +4446,7 @@ async fn changed_governing_context_means_a_full_review() {
     let (harness, _scenario) =
         build_carry_scenario("task-carry-context", "agent-carry-context", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     sqlx::query("UPDATE task SET description = 'a different acceptance scope' WHERE id = ?")
@@ -4436,6 +4457,7 @@ async fn changed_governing_context_means_a_full_review() {
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),
@@ -4457,13 +4479,14 @@ async fn other_review_entries_never_carry() {
     let (harness, _scenario) =
         build_carry_scenario("task-carry-entry", "agent-carry-entry", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     // A user moving the Task is never mechanical.
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::user(api_types::UserActionSource::Api),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),
@@ -4488,13 +4511,14 @@ async fn carry_for_an_old_review_is_ignored_after_a_newer_real_review() {
     let (harness, scenario) =
         build_carry_scenario("task-carry-superseded", "agent-carry-superseded", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     let rebased_head = run_git(&scenario.worktree, &["rev-parse", "HEAD"]);
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),
@@ -4557,7 +4581,7 @@ async fn carries_are_bounded_per_review() {
     let (harness, scenario) =
         build_carry_scenario("task-carry-bound", "agent-carry-bound", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, .. } = RunMerge.execute(&ctx).await else {
+    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
         panic!("the moved target should bounce the merge through a rebase");
     };
     let contract_execution_id: String =
@@ -4586,6 +4610,7 @@ async fn carries_are_bounded_per_review() {
     enter_review_after_bridge(
         &mut ctx,
         &reason,
+        &bridge,
         api_types::Actor::system(api_types::SystemComponent::Workflow),
         CARRY_REFRESH_REASON,
         json!(["test -d ."]),

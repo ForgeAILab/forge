@@ -188,22 +188,10 @@ impl Fixture {
         let event_bus = Arc::new(events::EventBus::new(16));
         let task_service =
             services::TaskService::new_for_test(Arc::clone(&self.db), Arc::clone(&event_bus));
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus,
-            workspace_backend_router: task_service.workspace_backend_router(),
-            review_runner: None,
-            merge_service: None,
-            cleanup_scheduler: None,
-            task_service,
-            daemon_connections: None,
-            workspace_exec_locks: None,
-            terminal_activity: None,
-            workspace_root: std::path::PathBuf::new(),
-            repo_cache_locks: None,
-        };
+        let engine = task_service;
         let result = if board_move {
             engine
+                .workflow_execution()
                 .move_task(
                     &task.id,
                     target,
@@ -226,6 +214,7 @@ impl Fixture {
                 .unwrap()
         } else {
             engine
+                .workflow_execution()
                 .transition(
                     &task.id,
                     target,
@@ -234,6 +223,7 @@ impl Fixture {
                     &actor,
                     "snapshot test",
                     false,
+                    Default::default(),
                 )
                 .await
                 .unwrap()

@@ -1,7 +1,6 @@
 use super::*;
 
 const AUTOMATIC_REVIEW_RECOVERY_TRIGGER: &str = "automatic_review_recovery";
-const AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX: &str = "[Forge automatic review recovery]";
 
 tokio::task_local! {
     static AUTOMATIC_REVIEW_RECOVERY_TASK: String;
@@ -2567,19 +2566,19 @@ impl TaskService {
         };
 
         let max_attempts = recovery.max_attempts.max(1) as usize;
-        let recovery_attempts = ExecutionRepo::count_by_task_and_summary_prefix(
+        let recovery_attempts = ExecutionRepo::count_by_task_and_purpose(
             &*self.db,
             &task.id,
-            AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX,
+            api_types::ExecutionPurpose::AutomaticReviewRecovery,
         )
         .await? as usize;
         if recovery_attempts >= max_attempts {
             return Ok(None);
         }
-        if ExecutionRepo::has_running_by_task_and_summary_prefix(
+        if ExecutionRepo::has_running_by_task_and_purpose(
             &*self.db,
             &task.id,
-            AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX,
+            api_types::ExecutionPurpose::AutomaticReviewRecovery,
         )
         .await?
         {
@@ -2702,6 +2701,7 @@ impl TaskService {
                 task.id.clone(),
                 target.to_owned(),
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: Some(reason.to_owned()),
                     triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow),
@@ -2897,7 +2897,7 @@ fn render_automatic_review_recovery_prompt(
     max_attempts: usize,
 ) -> String {
     format!(
-        "{AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX}\n\n\
+        "Forge automatic review recovery\n\n\
          The normal review retry flow is about to block this task, so this is the final automatic recovery attempt.\n\n\
          Task: {title}\n\
          Current status: {status}\n\

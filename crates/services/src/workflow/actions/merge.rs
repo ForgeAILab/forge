@@ -5,10 +5,7 @@ use events::{event_timestamp, EventContext, ForgeEvent};
 use crate::{
     merge_service::MergeOutcome,
     task_service::config::{runtime_retry_budget, RetryBudgetKind},
-    workflow::{
-        default_states, HookAction, HookContext, HookResult, CONFLICT_HANDOFF_MARKER,
-        REVIEW_REFRESH_MARKER, TARGET_MOVED_MARKER,
-    },
+    workflow::{default_states, HookAction, HookContext, HookResult},
 };
 
 use super::common::{
@@ -117,8 +114,10 @@ impl HookAction for RunMerge {
                 }
                 HookResult::Cascade {
                     to: default_states::MERGE_FAILED.to_string(),
-                    reason: format!(
-                        "{REVIEW_REFRESH_MARKER} conformance review required: {reason}"
+                    reason: format!("conformance review required: {reason}"),
+
+                    bridge: api_types::TransitionBridge::new(
+                        api_types::TransitionBridgeKind::ReviewRefresh,
                     ),
                 }
             }
@@ -136,6 +135,8 @@ impl HookAction for RunMerge {
                 HookResult::Cascade {
                     to: default_states::DONE.to_string(),
                     reason: "merge succeeded".to_string(),
+
+                    bridge: Default::default(),
                 }
             }
             Ok(MergeOutcome::TargetMoved {
@@ -395,7 +396,7 @@ fn target_moved_rebases_since_boundary(entries: &[db::TransitionLog]) -> i64 {
     entries
         .iter()
         .filter(|entry| {
-            entry.trigger_reason.contains(TARGET_MOVED_MARKER)
+            entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::TargetMovedRebase)
                 && entry.triggered_by == workflow_actor
         })
         .count() as i64
@@ -627,8 +628,10 @@ pub(crate) async fn target_moved_result(
             }
             HookResult::Cascade {
                 to: default_states::MERGE_FAILED.to_string(),
-                reason: format!("{REVIEW_REFRESH_MARKER} {TARGET_MOVED_MARKER} {reason}; rebased onto {target_branch}, re-review required"),
-            }
+                reason: format!("{reason}; rebased onto {target_branch}, re-review required"),
+
+bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::TargetMovedRebase),
+}
         }
         Ok(api_types::WorkspaceOwnerOperationOutcome::Dirty { .. }) => merge_failure_result(ctx, task,
             format!("{reason}; worktree has uncommitted changes and cannot be rebased"), api_types::FailureKind::DirtyWorktree).await,
@@ -658,7 +661,7 @@ fn conflict_handoffs_since_boundary(entries: &[db::TransitionLog]) -> i64 {
     crate::task_diagnostics::entries_since_retry_window_boundary(entries, None)
         .iter()
         .filter(|entry| {
-            entry.trigger_reason.contains(CONFLICT_HANDOFF_MARKER)
+            entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff)
                 && entry.triggered_by == workflow_actor
         })
         .count() as i64
@@ -731,11 +734,9 @@ async fn conflict_handoff_result(
     });
     HookResult::Cascade {
         to: default_states::MERGE_FAILED.to_string(),
-        reason: format!(
-            "{CONFLICT_HANDOFF_MARKER} {details}{}{encoded}",
-            crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX,
-            encoded = serde_json::to_string(paths).expect("path list serializes"),
-        ),
+        reason: details,
+
+        bridge: api_types::TransitionBridge::conflict_handoff(paths),
     }
 }
 
@@ -857,6 +858,8 @@ pub(super) async fn merge_failure_result(
         HookResult::Cascade {
             to: default_states::MERGE_FAILED.to_string(),
             reason,
+
+            bridge: Default::default(),
         }
     }
 }

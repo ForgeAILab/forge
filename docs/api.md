@@ -827,7 +827,8 @@ direct stream so one approved execution cannot appear twice.
 Three distinct Tasks handing off conflicts on one non-lockfile path within seven
 days raise one `conflict_hotspot` Attention incident per Project/path (priority 60,
 recommended action `split_hotspot`). The window ends at the handoff's timestamp,
-and counting reads the full transition log after the installation timestamp.
+and counting reads typed conflict-handoff paths from the full transition log
+after the installation timestamp. Bounded event reason prose is not classified.
 The consumer starts at the installation event head, without historical backfill.
 Each episode emits one detection, causing one Attention upsert and at most one
 Project Agent wake. Later handoffs leave the first-crossing summary and wake
@@ -2855,6 +2856,19 @@ reject any other value with `400`, and a per-execution override replaces the
 agent default.
 
 ## Task transitions
+
+`GET /api/v1/tasks/{id}/transitions` returns `items` containing nullable
+`bridge_kind` and `bridge_payload` alongside the original human `trigger_reason`.
+Kinds are `review_refresh`, `target_moved_rebase`, `conflict_handoff`,
+`retry_window_reset`, `recovery`, `gate_skipped`, `gate_approved`, `gate_rejected`,
+`ci_only_review_passed` and `review_carry`. Conflict payloads contain a `paths`
+array; recovery/reset payloads contain the recorded `verb`. Ordinary history
+has null fields. Malformed legacy conflict paths retain the handoff kind with
+null payload. New reasons contain plain prose; historical reasons are preserved.
+Clients must use the typed fields rather than marker/prefix matching. These
+fields are server-derived and are not accepted classification overrides on
+transition requests. MCP and forge-ctl continue sending audit reasons normally.
+
 
 `POST /api/v1/tasks/{id}/transition` accepts `status`, `version`, optional
 `reason`, and optional `source`. When a user move would fail strict routing

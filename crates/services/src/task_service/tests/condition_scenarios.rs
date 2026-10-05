@@ -774,6 +774,14 @@ async fn condition_stored_data_scenarios() {
                 to_state: to.to_owned(),
                 trigger_name: Some(trigger.to_owned()),
                 triggered_by: "user".to_owned(),
+                bridge: if matches!(
+                    trigger,
+                    "reset_retry_window" | "reset_to_initial" | "restart"
+                ) {
+                    api_types::TransitionBridge::recovery(trigger, true)
+                } else {
+                    Default::default()
+                },
                 trigger_reason: "base row".to_owned(),
                 hook_results_json: None,
                 rejection,
@@ -1155,6 +1163,7 @@ async fn condition_send_back_prompt_scenarios() {
                             task.id.clone(),
                             target.to_owned(),
                             TransitionOptions {
+                                bridge: Default::default(),
                                 version: task.version,
                                 reason: Some("CONDITION-GUIDANCE add evidence".to_owned()),
                                 triggered_by: Actor::user(UserActionSource::Test),

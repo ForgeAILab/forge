@@ -840,11 +840,18 @@ impl TaskService {
                 task.id.clone(),
                 target,
                 TransitionOptions {
+                    bridge: api_types::TransitionBridge::new(
+                        if trigger == WorkflowTrigger::Accept {
+                            api_types::TransitionBridgeKind::GateApproved
+                        } else {
+                            api_types::TransitionBridgeKind::GateRejected
+                        },
+                    ),
                     version: task.version,
                     reason: Some(match trigger {
                         WorkflowTrigger::Accept => guidance
                             .clone()
-                            .unwrap_or_else(|| "gate approved".to_owned()),
+                            .unwrap_or_else(|| "Gate approved".to_owned()),
                         _ => guidance.unwrap_or_default(),
                     }),
                     triggered_by: actor,
