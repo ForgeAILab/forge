@@ -539,6 +539,16 @@ async fn remote_daemon_disconnect_suspends_server_workspace_until_expiry() {
             .status,
         DbExecutionStatus::Running
     );
+    let execution_spent = || async {
+        db::budget::spent(
+            fixture.harness.state.db.pool(),
+            &task_id,
+            db::budget::Kind::Execution.key(),
+        )
+        .await
+        .expect("execution budget spend loads")
+    };
+    let spent_before = execution_spent().await;
     let before = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
         .await
         .unwrap()
@@ -572,12 +582,7 @@ async fn remote_daemon_disconnect_suspends_server_workspace_until_expiry() {
         placement.failure_cause,
         Some(db::PlacementFailureCause::OwnerDisconnectedTimeout)
     );
-    let retry_count = |task: &db::Task| {
-        serde_json::from_str::<serde_json::Value>(task.metadata_json.as_deref().unwrap_or("{}"))
-            .unwrap()["execution_retry_count"]
-            .clone()
-    };
-    assert_eq!(retry_count(&task), retry_count(&before));
+    assert_eq!(execution_spent().await, spent_before);
     assert_eq!(task.status, before.status);
     let annotation: Value = serde_json::from_str(
         task.error_annotation
@@ -803,8 +808,15 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
             .and_then(|raw| serde_json::from_str(raw).ok())
             .unwrap_or_else(|| json!({}));
         if metadata.get("deferred_dispatch").is_some() {
+            let spent = db::budget::spent(
+                fixture.harness.state.db.pool(),
+                &task_id,
+                db::budget::Kind::Execution.key(),
+            )
+            .await
+            .expect("execution budget spend loads");
             assert_eq!(
-                metadata["execution_retry_count"], 1,
+                spent, 1,
                 "executor unavailability spends exactly one execution retry; metadata: {metadata}"
             );
             assert!(
