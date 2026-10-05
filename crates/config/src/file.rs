@@ -51,6 +51,11 @@ pub(crate) struct FileForgePaths {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileServerConfig {
+    pub main_working_set_target_tokens: Option<u32>,
+    pub main_working_set_hard_tokens: Option<u32>,
+    pub project_working_set_target_tokens: Option<u32>,
+    pub project_working_set_hard_tokens: Option<u32>,
+
     pub max_concurrent_runs: Option<u32>,
     pub build_jobs_per_run: Option<u32>,
     pub run_nice: Option<u32>,

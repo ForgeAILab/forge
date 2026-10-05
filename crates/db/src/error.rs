@@ -4,6 +4,11 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
+    #[error("LCM timeline ownership changed")]
+    LcmTimelineOwned {
+        owner: Option<String>,
+        generation: i64,
+    },
     #[cfg(feature = "test-template")]
     #[error("test database template failed: {0}")]
     TestTemplate(String),

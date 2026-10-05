@@ -273,6 +273,14 @@ impl AppState {
         self.embedded_agent_service
             .set_command_policy(&config.commands);
         self.embedded_agent_service
+            .native_backend()
+            .set_working_sets(
+                config.server.main_working_set_target_tokens,
+                config.server.main_working_set_hard_tokens,
+                config.server.project_working_set_target_tokens,
+                config.server.project_working_set_hard_tokens,
+            );
+        self.embedded_agent_service
             .set_media_root(config.forge.data_dir.join("media"));
         self.embedded_agent_service.set_workspace_root(
             config.workspace.root.clone(),

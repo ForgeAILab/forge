@@ -12,8 +12,8 @@ use db::{
     AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, SqliteDb, User, UserRepo,
 };
 use services::{
-    AgentChatService, MainChatTopicService, ProductGenesisService, SendAgentChatMessageInput,
-    ServiceError, SetMainAgentBindingInput, StartMainChatTopicInput,
+    AgentChatService, MainChatTopicService, SendAgentChatMessageInput, ServiceError,
+    SetMainAgentBindingInput, StartMainChatTopicInput,
 };
 
 const ACCOUNT_ID: &str = "topic-service-account";
@@ -68,6 +68,27 @@ async fn fixture() -> Fixture {
     .await
     .expect("other account creates");
 
+    let embedded = services::EmbeddedAgentService::new(db.clone(), b"topic-tests");
+    embedded
+        .protected_store()
+        .create_credential(
+            "topic-credential",
+            ACCOUNT_ID,
+            "openai",
+            "fake",
+            forge_agent_host::Secret::new("unused"),
+            &now,
+        )
+        .await
+        .unwrap();
+    let fake = Arc::new(agent_runtime::provider::fake::FakeProvider::new(
+        "test-model",
+        agent_runtime::core::provider::Capabilities::basic_streaming(),
+        Vec::new(),
+    ));
+    let backend = forge_agent_host::NativeAgentRuntimeBackend::new(embedded.protected_store())
+        .with_provider_override(fake);
+    let embedded = Arc::new(embedded.with_native_backend(Arc::new(backend)));
     AgentRepo::create_identity_with_profile(
         &*db,
         CreateAgentIdentity {
@@ -92,15 +113,15 @@ async fn fixture() -> Fixture {
             identity_id: IDENTITY_ID.to_owned(),
             backend_kind: "native".to_owned(),
             executor_type: "embedded".to_owned(),
-            provider: Some("test".to_owned()),
+            provider: Some("openai".to_owned()),
             model: Some("test-model".to_owned()),
             reasoning_effort: None,
             permission_policy: None,
             prompt_template: None,
             capabilities_json: "{}".to_owned(),
             tool_policy_json: "{}".to_owned(),
-            config_json: "{}".to_owned(),
-            credential_ref: None,
+            config_json: serde_json::json!({"base_url": "https://unused.invalid/v1"}).to_string(),
+            credential_ref: Some("topic-credential".to_owned()),
             daemon_id: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -127,11 +148,11 @@ async fn fixture() -> Fixture {
         .expect("main chat lookup")
         .expect("main chat exists");
 
-    let topics = MainChatTopicService::new(
-        Arc::clone(&db),
-        Arc::clone(&chat_service),
-        ProductGenesisService::for_sqlite(Arc::clone(&db)),
-    );
+    let topics = MainChatTopicService::new(Arc::clone(&db), Arc::clone(&chat_service))
+        .with_rotator(Arc::new(services::TopicRotationCoordinator::new(
+            db.clone(),
+            embedded,
+        )));
 
     Fixture {
         db,
@@ -176,7 +197,7 @@ async fn starting_a_topic_rotates_a_fresh_main_chat_past_its_first_topic() {
         })
         .await
         .expect("first topic starts");
-    assert_eq!(first.topic.sequence, 0);
+    assert_eq!(first.topic.as_ref().unwrap().sequence, 0);
 
     let second = fixture
         .topics
@@ -188,11 +209,17 @@ async fn starting_a_topic_rotates_a_fresh_main_chat_past_its_first_topic() {
         })
         .await
         .expect("second topic rotates");
-    assert_eq!(second.topic.sequence, 1);
-    assert_eq!(second.topic.label, "Planning the next release");
-    assert_eq!(second.divider_message.chat_id, fixture.chat_id);
+    assert_eq!(second.topic.as_ref().unwrap().sequence, 1);
     assert_eq!(
-        second.divider_message.content,
+        second.topic.as_ref().unwrap().label,
+        "Planning the next release"
+    );
+    assert_eq!(
+        second.divider_message.as_ref().unwrap().chat_id,
+        fixture.chat_id
+    );
+    assert_eq!(
+        second.divider_message.as_ref().unwrap().content,
         "New topic started: Planning the next release"
     );
 
@@ -202,8 +229,8 @@ async fn starting_a_topic_rotates_a_fresh_main_chat_past_its_first_topic() {
         .await
         .expect("topic list after two rotations");
     assert_eq!(after.len(), 2);
-    assert_eq!(after[0].id, first.topic.id);
-    assert_eq!(after[1].id, second.topic.id);
+    assert_eq!(after[0].id, first.topic.as_ref().unwrap().id);
+    assert_eq!(after[1].id, second.topic.as_ref().unwrap().id);
     let current_after = fixture
         .topics
         .current_topic(ACCOUNT_ID, &fixture.chat_id)
@@ -211,7 +238,8 @@ async fn starting_a_topic_rotates_a_fresh_main_chat_past_its_first_topic() {
         .expect("current topic lookup")
         .expect("a current topic exists");
     assert_eq!(
-        current_after.id, second.topic.id,
+        current_after.id,
+        second.topic.as_ref().unwrap().id,
         "the newest topic is current"
     );
 }
@@ -229,7 +257,7 @@ async fn starting_a_topic_with_no_label_gets_a_server_default() {
         })
         .await
         .expect("topic rotates with a default label");
-    assert_eq!(rotation.topic.label, "New topic");
+    assert_eq!(rotation.topic.as_ref().unwrap().label, "New topic");
 }
 
 #[tokio::test]
@@ -249,7 +277,7 @@ async fn starting_a_topic_denies_a_caller_who_does_not_own_the_chat() {
 }
 
 #[tokio::test]
-async fn starting_a_topic_is_denied_while_a_main_turn_is_live() {
+async fn starting_a_topic_is_deferred_while_a_main_turn_is_live() {
     let fixture = fixture().await;
     fixture
         .chat_service
@@ -262,17 +290,18 @@ async fn starting_a_topic_is_denied_while_a_main_turn_is_live() {
         .await
         .expect("sending a message admits a live (queued) turn");
 
-    let error = fixture
+    let result = fixture
         .topics
         .start_topic(StartMainChatTopicInput {
             actor_user_id: ACCOUNT_ID.to_owned(),
             chat_id: fixture.chat_id.clone(),
-            label: Some("Should be blocked".to_owned()),
+            label: Some("Deferred topic".into()),
             summary: None,
         })
         .await
-        .expect_err("a live Main turn denies the topic reset");
-    assert!(matches!(error, ServiceError::Conflict(message) if message.contains("Main turn")));
+        .expect("REST persists a pending rotation during a live turn");
+    assert!(result.rotation_pending);
+    assert!(result.topic.is_none());
 
     let turns = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*fixture.db, &fixture.chat_id)
         .await
@@ -281,7 +310,7 @@ async fn starting_a_topic_is_denied_while_a_main_turn_is_live() {
 }
 
 #[tokio::test]
-async fn starting_a_topic_is_denied_while_genesis_needs_a_decision() {
+async fn idle_genesis_intent_rotates_without_bypassing_a_live_turn() {
     let fixture = fixture().await;
     let now = now_rfc3339();
     sqlx::query(
@@ -299,15 +328,16 @@ async fn starting_a_topic_is_denied_while_genesis_needs_a_decision() {
     .await
     .expect("pending genesis session inserts");
 
-    let error = fixture
+    let result = fixture
         .topics
         .start_topic(StartMainChatTopicInput {
             actor_user_id: ACCOUNT_ID.to_owned(),
             chat_id: fixture.chat_id.clone(),
-            label: Some("Should be blocked".to_owned()),
+            label: Some("Genesis topic".into()),
             summary: None,
         })
         .await
-        .expect_err("a Genesis session awaiting finish/cancel denies the topic reset");
-    assert!(matches!(error, ServiceError::Conflict(message) if message.contains("Genesis")));
+        .expect("idle Genesis pending intent may rotate before its successor");
+    assert!(!result.rotation_pending);
+    assert!(result.topic.is_some());
 }

@@ -57,9 +57,9 @@ pub use interaction::{
     InteractionAnswer, InteractionAnswerValue, InteractionBrokerHandle, ProtectedInteractionSummary,
 };
 pub use lcm::{
-    DeterministicLcmSummaryModel, FORGE_LCM_POLICY_REVISION, FORGE_LCM_SIZER_REVISION,
-    FORGE_LCM_STORE_REVISION, FORGE_TASK_LCM_PROJECTION_REVISION, ForgeLcmSizer, SqliteLcmStore,
-    TaskLcmProjectionPolicy, TaskRuntimeLcmRecord,
+    DeterministicLcmSummaryModel, FORGE_LCM_POLICY_REVISION, FORGE_LCM_STORE_REVISION,
+    FORGE_TASK_LCM_PROJECTION_REVISION, SqliteLcmStore, TaskLcmProjectionPolicy,
+    TaskRuntimeLcmRecord,
 };
 pub use manifest::{
     RuntimeClassificationLink, RuntimeContextManifestLink, RuntimeContextSegmentLink,
@@ -387,6 +387,9 @@ pub struct AgentTurnOutput {
 #[async_trait]
 pub trait TurnEventSink: Send + Sync + fmt::Debug {
     async fn text_delta(&self, _text: &str) {}
+
+    /// Redaction-safe cache-prefix diagnostics from the authoritative planner.
+    async fn cache_plan_changed(&self, _first_changed_fragment: Option<&str>) {}
 
     /// A reasoning fragment. `redacted` fragments carry no readable text and
     /// exist only as liveness/progress signals.

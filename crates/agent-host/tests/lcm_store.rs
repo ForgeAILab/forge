@@ -875,7 +875,7 @@ async fn provisional_tail_truncation_removes_orphans_but_never_node_covered_entr
 }
 
 #[tokio::test]
-async fn replacement_runtime_session_retires_a_summarized_timeline() {
+async fn populated_timeline_requires_an_explicit_fenced_adoption() {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool");
@@ -995,36 +995,61 @@ async fn replacement_runtime_session_retires_a_summarized_timeline() {
         .expect("owner reopens");
     assert_eq!(same.timeline_id(), original);
 
-    // A replacement session cannot continue a summarized timeline it did not
-    // write: it gets a fresh one, and the old one keeps its rows.
-    let replacement = open("runtime-b", "2026-08-13T00:00:00Z")
+    // U7 replaces automatic retirement with explicit adoption and writer fences.
+    let replacement = open("runtime-b", "2026-08-13T00:00:00Z").await.unwrap();
+    assert_eq!(replacement.timeline_id(), original);
+    let replacement_view = replacement.view();
+    let owner = agent_runtime::core::ids::SessionId::new("runtime-b");
+    assert!(matches!(
+        replacement.claim(&replacement_view, &owner, 0).await,
+        Err(agent_runtime::lcm::LcmError::TimelineOwned { .. })
+    ));
+    replacement
+        .claim(&replacement_view, &owner, 1)
         .await
-        .expect("replacement opens");
-    assert_ne!(replacement.timeline_id(), original);
+        .unwrap();
+    let before = replacement
+        .current_revision(&replacement_view)
+        .await
+        .unwrap();
+    replacement
+        .claim(&replacement_view, &owner, 1)
+        .await
+        .unwrap();
     assert_eq!(
         replacement
-            .current_revision(&replacement.view())
+            .current_revision(&replacement_view)
             .await
-            .expect("revision")
-            .get(),
-        0
+            .unwrap(),
+        before,
+        "claim replay does not bump revision"
     );
-    let retired = AgentLcmRepo::get_lcm_timeline(&*db, &original)
-        .await
-        .expect("read retired")
-        .expect("retired timeline kept");
-    assert_eq!(retired.scope_id, format!("account-1#retired:{original}"));
+    let append = LcmAppendRequest::new(LcmOperationId::new("append-0"), vec![entry]);
+    assert!(matches!(
+        replacement.append(&replacement_view, append.clone()).await,
+        Err(agent_runtime::lcm::LcmError::TimelineOwned { .. })
+    ));
+    let fenced = replacement_view.with_owner(owner, 1);
+    assert!(
+        replacement
+            .append(&fenced, append)
+            .await
+            .unwrap()
+            .already_committed
+    );
+    assert_eq!(
+        AgentLcmRepo::get_lcm_timeline(&*db, &original)
+            .await
+            .unwrap()
+            .unwrap()
+            .scope_id,
+        "account-1"
+    );
     assert_eq!(
         AgentLcmRepo::list_lcm_entries(&*db, &original, 0, 0, 8)
             .await
-            .expect("retired entries")
+            .unwrap()
             .len(),
         1
     );
-
-    // The replacement then owns the scope; reopening does not retire again.
-    let reopened = open("runtime-b", "2026-08-13T00:00:00Z")
-        .await
-        .expect("replacement reopens");
-    assert_eq!(reopened.timeline_id(), replacement.timeline_id());
 }

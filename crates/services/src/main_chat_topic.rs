@@ -17,15 +17,14 @@ use std::sync::Arc;
 
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBindingRepo, AgentChat, AgentChatMessageRepo,
-    AgentChatRepo, AgentChatTopic, AgentChatTopicDenialReason, AgentChatTopicRepo,
-    AgentChatTopicTransactionRepo, AgentChatTransactionRepo, AgentChatTurnJobRepo,
-    AgentHandoffRepo, AgentRepo, CreateAgentChatTopic, ProjectAgentBindingRepo, ProjectMemberRepo,
-    RotateAgentChatTopic,
+    AgentChatRepo, AgentChatTopic, AgentChatTopicRepo, AgentChatTopicTransactionRepo,
+    AgentChatTransactionRepo, AgentChatTurnJobRepo, AgentHandoffRepo, AgentRepo,
+    CreateAgentChatTopic, ProjectAgentBindingRepo, ProjectMemberRepo, RotateAgentChatTopic,
 };
 
 use crate::{
-    agent_chat_service::AgentChatService, agent_turn_admission::AgentResponderStore,
-    product_genesis::ProductGenesisService, Result, ServiceError,
+    agent_chat_service::AgentChatService, agent_turn_admission::AgentResponderStore, Result,
+    ServiceError,
 };
 
 const MAIN_CHAT_KIND: &str = "account_main";
@@ -44,15 +43,16 @@ pub struct StartMainChatTopicInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainChatTopicRotation {
-    pub topic: AgentChatTopic,
-    pub divider_message: db::AgentChatMessage,
+    pub topic: Option<AgentChatTopic>,
+    pub divider_message: Option<db::AgentChatMessage>,
+    pub rotation_pending: bool,
 }
 
 #[derive(Clone)]
 pub struct MainChatTopicService<D> {
     db: Arc<D>,
     chat_service: Arc<AgentChatService<D>>,
-    genesis: ProductGenesisService,
+    rotator: Option<Arc<dyn crate::TopicRotator>>,
 }
 
 impl<D> std::fmt::Debug for MainChatTopicService<D> {
@@ -78,16 +78,17 @@ where
         + AgentChatTopicRepo
         + AgentChatTopicTransactionRepo,
 {
-    pub fn new(
-        db: Arc<D>,
-        chat_service: Arc<AgentChatService<D>>,
-        genesis: ProductGenesisService,
-    ) -> Self {
+    pub fn new(db: Arc<D>, chat_service: Arc<AgentChatService<D>>) -> Self {
         Self {
             db,
             chat_service,
-            genesis,
+            rotator: None,
         }
+    }
+
+    pub fn with_rotator(mut self, rotator: Arc<dyn crate::TopicRotator>) -> Self {
+        self.rotator = Some(rotator);
+        self
     }
 
     /// List every topic for the caller's own Main Chat, oldest first.
@@ -127,17 +128,6 @@ where
             .authorized_main_chat(&input.actor_user_id, &input.chat_id)
             .await?;
 
-        // Best-effort early exit with a specific, safe reason. The DB
-        // transaction below re-checks both conditions atomically and is the
-        // actual authority; this cannot race a request into succeeding when
-        // it should have been denied.
-        if let Some(reason) = self
-            .precondition_denial(&chat, &input.actor_user_id)
-            .await?
-        {
-            return Err(denial_error(reason));
-        }
-
         let label = normalize_label(input.label.as_deref())?;
         let summary = normalize_summary(input.summary.as_deref())?;
         let now = now_rfc3339();
@@ -150,12 +140,14 @@ where
             now.clone(),
         );
 
-        let outcome = AgentChatTopicTransactionRepo::rotate_agent_chat_topic(
+        let intent = AgentChatTopicTransactionRepo::request_agent_chat_topic(
             &*self.db,
             RotateAgentChatTopic {
+                runtime_session_id: None,
+                rotation_owner: None,
                 topic: CreateAgentChatTopic {
                     id: topic_id,
-                    chat_id: chat.id,
+                    chat_id: chat.id.clone(),
                     label,
                     summary,
                     principal_type: USER_PRINCIPAL.to_owned(),
@@ -167,13 +159,37 @@ where
         )
         .await?;
 
-        match outcome {
-            Ok(rotated) => Ok(MainChatTopicRotation {
-                topic: rotated.topic,
-                divider_message: rotated.divider_message,
-            }),
-            Err(reason) => Err(denial_error(reason)),
+        let live = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*self.db, &chat.id)
+            .await?
+            .iter()
+            .any(|turn| {
+                matches!(
+                    turn.status,
+                    db::AgentChatTurnState::Queued
+                        | db::AgentChatTurnState::Leased
+                        | db::AgentChatTurnState::RetryWait
+                        | db::AgentChatTurnState::AwaitingInput
+                )
+            });
+        if !live {
+            if let Some(rotator) = &self.rotator {
+                rotator.rotate_pending(&chat.id).await?;
+            }
         }
+
+        let topic = AgentChatTopicRepo::get_agent_chat_topic(&*self.db, &intent).await?;
+        let divider_message = match topic
+            .as_ref()
+            .and_then(|topic| topic.starting_message_id.as_deref())
+        {
+            Some(id) => AgentChatMessageRepo::get_agent_chat_message(&*self.db, id).await?,
+            None => None,
+        };
+        Ok(MainChatTopicRotation {
+            rotation_pending: topic.is_none(),
+            topic,
+            divider_message,
+        })
     }
 
     async fn authorized_main_chat(&self, actor_user_id: &str, chat_id: &str) -> Result<AgentChat> {
@@ -188,41 +204,6 @@ where
         }
         Ok(chat)
     }
-
-    async fn precondition_denial(
-        &self,
-        chat: &AgentChat,
-        actor_user_id: &str,
-    ) -> Result<Option<AgentChatTopicDenialReason>> {
-        let turns = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*self.db, &chat.id).await?;
-        let main_turn_live = turns.iter().any(|turn| {
-            matches!(
-                turn.status,
-                db::AgentChatTurnState::Queued
-                    | db::AgentChatTurnState::Leased
-                    | db::AgentChatTurnState::RetryWait
-            )
-        });
-        if main_turn_live {
-            return Ok(Some(AgentChatTopicDenialReason::MainTurnLive));
-        }
-        if self.genesis.active(actor_user_id).await?.is_some() {
-            return Ok(Some(AgentChatTopicDenialReason::GenesisDecisionPending));
-        }
-        Ok(None)
-    }
-}
-
-fn denial_error(reason: AgentChatTopicDenialReason) -> ServiceError {
-    let message = match reason {
-        AgentChatTopicDenialReason::MainTurnLive => {
-            "A Main turn is in progress; wait for it to finish or cancel it before starting a new topic."
-        }
-        AgentChatTopicDenialReason::GenesisDecisionPending => {
-            "A Product Genesis session needs an explicit finish or cancel decision before starting a new topic."
-        }
-    };
-    ServiceError::Conflict(message.to_owned())
 }
 
 fn normalize_label(label: Option<&str>) -> Result<String> {

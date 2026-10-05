@@ -58,6 +58,19 @@ impl ForgeConfig {
         }
 
         if let Some(server) = file.server {
+            if let Some(value) = server.main_working_set_target_tokens {
+                self.server.main_working_set_target_tokens = value;
+            }
+            if let Some(value) = server.main_working_set_hard_tokens {
+                self.server.main_working_set_hard_tokens = value;
+            }
+            if let Some(value) = server.project_working_set_target_tokens {
+                self.server.project_working_set_target_tokens = value;
+            }
+            if let Some(value) = server.project_working_set_hard_tokens {
+                self.server.project_working_set_hard_tokens = value;
+            }
+
             self.server.max_concurrent_runs = server.max_concurrent_runs;
             self.server.build_jobs_per_run = server.build_jobs_per_run;
             if let Some(nice) = server.run_nice {
@@ -207,6 +220,22 @@ impl ForgeConfig {
     }
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(value) = env_value("FORGE_SERVER_MAIN_WORKING_SET_TARGET_TOKENS") {
+            self.server.main_working_set_target_tokens =
+                parse_env_u32("FORGE_SERVER_MAIN_WORKING_SET_TARGET_TOKENS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS") {
+            self.server.main_working_set_hard_tokens =
+                parse_env_u32("FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_PROJECT_WORKING_SET_TARGET_TOKENS") {
+            self.server.project_working_set_target_tokens =
+                parse_env_u32("FORGE_SERVER_PROJECT_WORKING_SET_TARGET_TOKENS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SERVER_PROJECT_WORKING_SET_HARD_TOKENS") {
+            self.server.project_working_set_hard_tokens =
+                parse_env_u32("FORGE_SERVER_PROJECT_WORKING_SET_HARD_TOKENS", &value)?;
+        }
         if let Some(value) = env_value("FORGE_SERVER_BUILD_JOBS_PER_RUN") {
             self.server.build_jobs_per_run =
                 Some(parse_env_u32("FORGE_SERVER_BUILD_JOBS_PER_RUN", &value)?);

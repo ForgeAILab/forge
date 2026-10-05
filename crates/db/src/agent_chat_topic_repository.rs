@@ -68,6 +68,8 @@ pub struct CreateAgentChatTopic {
 /// the insert, so nothing can race between the check and the write.
 #[derive(Debug, Clone)]
 pub struct RotateAgentChatTopic {
+    pub runtime_session_id: Option<String>,
+    pub rotation_owner: Option<String>,
     pub topic: CreateAgentChatTopic,
     /// The visible timeline divider. `sequence` is only a hint -- the store
     /// allocates the real value exactly like every other Agent Chat message
@@ -102,6 +104,9 @@ pub trait AgentChatTopicRepo: Send + Sync {
 
 #[async_trait]
 pub trait AgentChatTopicTransactionRepo: Send + Sync {
+    /// Persist one coalesced rotation intent; its id survives retries and crashes.
+    async fn request_agent_chat_topic(&self, input: RotateAgentChatTopic) -> Result<String>;
+
     /// Rotate to a new topic, or refuse per [`AgentChatTopicDenialReason`].
     async fn rotate_agent_chat_topic(
         &self,

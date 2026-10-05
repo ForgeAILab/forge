@@ -1106,25 +1106,31 @@ Documents/Decisions/Tasks/checks/milestones/releases, and records a visible
 canonical conflict plus `reconciliation_required` reason when authoritative
 records disagree. It blocks only the affected execution or readiness path.
 
-#### Main Chat topic epochs
+#### Agent Chat topic epochs
 
-Forge has exactly one account Main Chat. A *topic* is a durable, user-owned
-context epoch inside that chat, not a second chat: `agent_chat_topic`
-(migration `V103`) records an immutable sequence, label/summary, principal,
-timestamp, and the `starting_message_sequence` its epoch begins at. Topic
-membership is derived from `sequence >= starting_message_sequence`, so no
-message row is ever rewritten and every historical message/turn ID and its
-provenance survive the backfill unchanged. Rotation inserts one topic row plus
-one ordinary system message that the timeline renders as a divider.
+A native Main or Project Chat topic owns one runtime session and one LCM timeline.
+The first native turn records the initial topic; rotation records the successor
+runtime session ID on a new immutable `agent_chat_topic` row. Transcript IDs,
+message provenance and earlier topics remain inspectable.
 
-`FederatedAgentChatTurnRunner` bounds a new Main turn's episodic history to the
-current topic's floor. A chat with no topic — every Project Chat, and any Main
-Chat before its first topic — has floor `0`, so the behavior is unchanged for
-them. Canonical portfolio state and unresolved durable obligations are supplied
-independently of the epoch, and earlier topics stay inspectable rather than
-being injected wholesale. Starting a topic is denied while a Main turn is live
-or while a Genesis session/approval needs an explicit finish-or-cancel
-decision.
+Genesis start, Project creation/handoff and the first user message after eight
+hours idle mark `rotation_pending` in `agent_chat_topic_rotation`, in the trigger's
+transaction. REST topic requests use the same intent. REST rotates immediately
+when no turn is live, and otherwise returns a pending result. The turn worker
+processes intents before claiming a successor; a leased turn or an active native
+driver prevents rotation. Queued successor jobs wait behind the intent.
+
+The intent reserves its successor Forge/runtime IDs and a renewable lease.
+A provider summary is sealed before calling runtime `fork_session` with
+`ForkSeed::Summary` and `ForkLcm::NewTimeline`. The runtime protects the seed and
+supersedes the parent. Forge then commits the topic, divider, session replacement
+and intent removal together. A crash leaves the same intent and IDs to replay;
+a crash after the fork reuses its protected seed and completed successor. An
+expired lease can be reclaimed. Rotation never grants additional authority.
+
+The request layout is `[system][tools][topic summary][history][state card + input]`.
+The summary is stable within its topic. State cards stay in a transient user-role
+fragment, outside durable history. CLI chat retains its existing transcript path.
 
 #### Adaptive authority is a closed vocabulary
 
@@ -1459,15 +1465,15 @@ conversation only; a state change replaces the one card. The card is rendered
 when the turn starts and is the same for every request of that turn; the
 agent reads state it changed during the turn through its tools.
 
-The runtime renders a contributed fragment on the system role. The OpenAI
-Chat Completions and Responses adapters send it in place, as the last message
-of the request, so the system prompt, tool schemas and the whole history stay
-a byte-identical prefix across a state change. The Gemini Interactions
-adapter folds every system-role message into `system_instruction`; there the
-card follows the protocol text, and a state change alters the wire-level
-system instruction while the Forge system prompt itself is unchanged. Keeping
-the card after the conversation on every provider needs a runtime trailing
-lane that is not rendered on the system role.
+The pinned runtime admits only text in its transient contributor lane. Forge
+plans that required card there, then its provider serialization boundary narrows
+the identified trailing card message from System to User. Vendor adapters retain
+that role, so the stable system instruction,
+tools, topic summary and prior history precede the changing card. The card is
+planned and sized on every tool-loop step without becoming durable history.
+`CachePlanChanged.first_changed_fragment` is recorded in native debug diagnostics;
+changes in the history suffix or state card must not invalidate the stable
+system/tools/topic-summary prefix.
 
 Text in a conversation message that resembles a card is quoted data or a
 superseded card, never current state, and its counts or versions must not be
@@ -2036,41 +2042,43 @@ operation, immutable admitted entries, transactional DAG compare-and-swap,
 operation fingerprints, and restart recovery. Histories from different
 canonical scopes cannot be opened or merged by possessing a timeline/node ID.
 
-A timeline records the runtime session that writes it. A restart suspends
-every native session, and the next turn opens a fresh runtime session (as does
-a session rotation) whose canonical history is rebuilt from the chat
-transcript. That history cannot continue another session's timeline: once the
-old timeline holds summary nodes the runtime cannot truncate the diverged
-tail, and every turn failed with "LCM source range overlaps an active node".
-So when a different runtime session binds a timeline that already has
-entries, the store retires it — the row keeps its entries and nodes, its
-`scope_id` gains a `#retired:<timeline id>` suffix, and `canonical_scope_id`
-keeps the original scope so Project deletion still removes it — and creates a
-fresh timeline for the new session.
+Runtime-to-timeline bindings are durable and authorized by canonical identity
+and scope. U7 ownership claims atomically record owner/generation, increment the
+DAG revision and fence every mutation, including replay and truncation. A session
+created before U7 resumes once with `Adopt`; subsequent resumes are plain.
+Populated history is never silently adopted or retired. Explicit topic forks use
+an independently authorized empty timeline. Historical V149 retired rows remain
+readable and keep their canonical scope for deletion; new bindings do not rename
+or retire old timelines.
 
-Pressure sizing is host-supplied. `ForgeLcmSizer` charges an entry for its
-serialized canonical form, because the runtime's default sizer scans an
-entry's plain text plus one token per tool part and a tool call's arguments
-and a tool result's body sit inside their content part, invisible to that
-scan. A Project Agent timeline is mostly `[assistant tool call, tool result]`
-pairs, so the default read ~41% under
-what the context planner charges: pressure stayed Soft, which never compacts,
-while the planner refused the turn with `budget_exceeded` — and because
-canonical history is durable, every retry replayed it.
+U6 supplies one request sizer for the planner and LCM, including tool arguments,
+results and measured fixed overhead. Main defaults to a 48,000-token target and
+64,000-token hard cap; Project defaults to 96,000/128,000. Server config and env can
+set each value. Smaller provider windows clamp both values. The planner enforces
+the hard cap, and runtime-derived pressure/leaf/round defaults govern compaction.
+Forge's serialized-entry sizer, chars/4 overhead calculation and pressure overrides
+are removed.
 
-The runtime folds Forge's sizer, pressure policy, and summary policy into one
-LCM component revision and refuses to decode component state written under a
-different one, so changing any of them would fail every turn of every live
-session. `protected_agent_session_state.lcm_policy_revision` records the
-`FORGE_LCM_POLICY_REVISION` that last wrote a session, and the protected store
-drops superseded LCM component state on load — from the session snapshot and
-from the checkpoint's copy, which the resume overlay would otherwise reinstate
-— leaving the coordinator to rebuild it from `agent_lcm_entry` /
-`agent_lcm_node`. Bump that constant with any change to those three policies.
+`ProviderLcmSummaryModel` uses the agent's configured provider/model with bounded
+host instructions and its lowest declared reasoning setting (minimal for Gemini,
+low for controllable models; fixed/unsupported reasoning is left unconfigured). The deterministic model remains a fallback.
+Every summary provider call is planner-admitted under the surface hard cap.
+Leaf summary usage is reported from the runtime semantic-summary ledger. Topic
+summary usage is stored durably under `topic_summary` and submitted through the
+next topic turn's usage reports; stable report IDs are retried until acknowledged
+by the canonical usage ledger. Summary seeds are sealed in the protected store.
+U6 rebuilds tuning-derived state without deleting its LCM namespace or requiring
+a Forge policy-revision bump. Strict binding and authorization mismatches still
+fail closed.
+
+Within a topic, unchanged `project.current_state` and `project.charter` results
+return `{ "unchanged_since_call": "<original call id>" }`. A changed digest returns
+the full body; a new topic starts with an empty read cache. This changes context
+representation only, never the authority of the underlying read.
 
 The runtime's process-local history/LCM accounting cache still reads authorized
 inclusive ranges in pages of at most 1,024 entries and checks the DAG revision
-before and after pressure accounting. Forge's store and sizer satisfy those
+before and after pressure accounting. Forge's store and the runtime sizer satisfy those
 contracts without changing `FORGE_LCM_POLICY_REVISION` or dropping session LCM
 state.
 

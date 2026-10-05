@@ -109,6 +109,14 @@ pub struct ForgePaths {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default = "default_main_working_set_target_tokens")]
+    pub main_working_set_target_tokens: u32,
+    #[serde(default = "default_main_working_set_hard_tokens")]
+    pub main_working_set_hard_tokens: u32,
+    #[serde(default = "default_project_working_set_target_tokens")]
+    pub project_working_set_target_tokens: u32,
+    #[serde(default = "default_project_working_set_hard_tokens")]
+    pub project_working_set_hard_tokens: u32,
     #[serde(default)]
     pub max_concurrent_runs: Option<u32>,
     #[serde(default)]
@@ -356,6 +364,25 @@ impl ForgeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        for (name, target, hard) in [
+            (
+                "main",
+                self.server.main_working_set_target_tokens,
+                self.server.main_working_set_hard_tokens,
+            ),
+            (
+                "project",
+                self.server.project_working_set_target_tokens,
+                self.server.project_working_set_hard_tokens,
+            ),
+        ] {
+            if target == 0 || target > hard {
+                return Err(ConfigError::InvalidConfig {
+                    message: format!("server.{name}_working_set requires 0 < target <= hard"),
+                });
+            }
+        }
+
         if self.server.run_nice > 19 {
             return Err(ConfigError::InvalidConfig {
                 message: "server.run_nice must be between 0 and 19".to_owned(),
@@ -395,6 +422,10 @@ impl ForgeConfig {
         Self {
             forge: ForgePaths { data_dir },
             server: ServerConfig {
+                main_working_set_target_tokens: 48000,
+                main_working_set_hard_tokens: 64000,
+                project_working_set_target_tokens: 96000,
+                project_working_set_hard_tokens: 128000,
                 max_concurrent_runs: None,
                 build_jobs_per_run: None,
                 run_nice: crate::default_run_nice(),
@@ -607,4 +638,17 @@ fn parse_trusted_origin(value: &str) -> Option<String> {
 
 fn default_event_consumer_stall_seconds() -> u32 {
     crate::DEFAULT_EVENT_CONSUMER_STALL_SECONDS
+}
+
+fn default_main_working_set_target_tokens() -> u32 {
+    48000
+}
+fn default_main_working_set_hard_tokens() -> u32 {
+    64000
+}
+fn default_project_working_set_target_tokens() -> u32 {
+    96000
+}
+fn default_project_working_set_hard_tokens() -> u32 {
+    128000
 }

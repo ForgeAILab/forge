@@ -26,14 +26,14 @@ use agent_runtime::{
     },
     harness::{
         ComponentDescriptor, ContextContributor, ContextPatch, ContextView, LcmCoordinator,
-        LcmCoordinatorPolicy, StaticLcmTimelineResolver,
+        LcmCoordinatorPolicy,
     },
     provider::{
         gemini::{GeminiInteractionsConfig, GeminiInteractionsProvider},
         openai::{OpenAiConfig, OpenAiProvider},
         responses::{ResponsesConfig, ResponsesProvider},
     },
-    runtime::{RuntimeBuilder, SessionHandle, StartSession},
+    runtime::{RuntimeBuilder, SessionHandle, StartSession, WorkingSetPolicy},
 };
 use api_types::{OrchestrationOutcome, ToolResultSummary};
 use async_trait::async_trait;
@@ -42,10 +42,10 @@ use futures_util::StreamExt;
 use crate::{
     AgentHostError, AgentSessionBackend, AgentTurnLimit, AgentTurnOutput, AgentTurnRequest,
     AgentTurnTelemetryState, AgentTurnUsageReport, BackendCapabilities, CanonicalScope,
-    CanonicalScopeType, DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION, ForgeLcmSizer,
-    ForgeToolProvider, InteractionBrokerHandle, ProjectChatToolContext, RuntimeContextManifestLink,
-    ScopeToolComposition, ScopeToolRuntime, TurnEventSink, WorkspaceAccess,
-    protected_store::SqliteProtectedRuntimeStore, transport::ReqwestTransport,
+    CanonicalScopeType, FORGE_LCM_STORE_REVISION, ForgeToolProvider, InteractionBrokerHandle,
+    ProjectChatToolContext, RuntimeContextManifestLink, ScopeToolComposition, ScopeToolRuntime,
+    TurnEventSink, WorkspaceAccess, protected_store::SqliteProtectedRuntimeStore,
+    transport::ReqwestTransport,
 };
 
 #[derive(Clone)]
@@ -59,6 +59,7 @@ pub struct NativeAgentRuntimeBackend {
     /// freshly resolved address per request.
     fetch_transport: Arc<dyn agent_runtime::harness::FetchTransport>,
     provider_override: Option<Arc<dyn Provider>>,
+    working_sets: Arc<std::sync::RwLock<(WorkingSetPolicy, WorkingSetPolicy)>>,
 }
 
 struct ActiveNativeSession {
@@ -126,7 +127,39 @@ impl NativeAgentRuntimeBackend {
             forge_tool_provider: None,
             fetch_transport: Arc::new(crate::ForgeFetchTransport::new()),
             provider_override: None,
+            working_sets: Arc::new(std::sync::RwLock::new((
+                WorkingSetPolicy {
+                    target_tokens: 48_000,
+                    hard_tokens: 64_000,
+                },
+                WorkingSetPolicy {
+                    target_tokens: 96_000,
+                    hard_tokens: 128_000,
+                },
+            ))),
         }
+    }
+
+    pub fn set_working_sets(
+        &self,
+        main_target: u32,
+        main_hard: u32,
+        project_target: u32,
+        project_hard: u32,
+    ) {
+        *self
+            .working_sets
+            .write()
+            .expect("working set lock poisoned") = (
+            WorkingSetPolicy {
+                target_tokens: main_target,
+                hard_tokens: main_hard,
+            },
+            WorkingSetPolicy {
+                target_tokens: project_target,
+                hard_tokens: project_hard,
+            },
+        );
     }
 
     /// Replaces outbound provider construction with an in-process runtime
@@ -224,93 +257,394 @@ impl NativeAgentRuntimeBackend {
     }
 }
 
-/// Sizing constants mirroring the LCM `CharRatioSizer` default so the
-/// host-side overhead estimate and the coordinator's timeline accounting
-/// stay on one scale.
-const LCM_CHARS_PER_TOKEN: u64 = 4;
-/// Absorbs framing, cache-control, and estimator drift the host cannot
-/// measure exactly at composition time.
-const LCM_PLANNER_MARGIN_TOKENS: u64 = 1024;
-/// Keeps the pressure policy valid (a zero budget is rejected) when the
-/// non-conversation content alone exceeds the provider window; the turn then
-/// fails with the planner's precise required-content diagnostic instead of a
-/// policy configuration error.
-const LCM_MIN_CONVERSATION_BUDGET_TOKENS: u64 = 1024;
-
-/// Direct Task turns use the runtime's deterministic structural compactor,
-/// not the durable LCM summary DAG. Keep enough headroom that the next tool
-/// exchange does not immediately force another compaction pass.
-const TASK_COMPACTION_HIGH_PERCENT: u64 = 85;
-const TASK_COMPACTION_LOW_PERCENT: u64 = 70;
-const TASK_COMPACTION_POLICY_REVISION: &str = "forge-task-structural-compaction-1";
-
-/// The LCM pressure model counts only timeline (conversation) tokens, while
-/// the context planner must fit the system prompt, activated tool schemas,
-/// and the new user input inside the same provider window. Handing the
-/// coordinator the full `max_input_tokens` leaves a dead zone: history alone
-/// stays below hard pressure while the planned total already exceeds the
-/// budget, so the turn fails planner-side (`budget_exceeded`) without LCM
-/// ever compacting. Deduct the measurable non-conversation content so
-/// pressure trips while compaction can still help.
-fn conversation_budget_tokens(
-    request: &AgentTurnRequest,
-    composition: &ScopeToolComposition,
-) -> u64 {
-    let mut chars = request.system_prompt.as_deref().map_or(0, str::len) as u64;
-    chars += request.input.len() as u64;
-    chars += request
-        .server_state_card
-        .as_ref()
-        .map_or(0, |card| card.len() as u64);
-    for tool in composition.tools() {
-        let spec = tool.spec();
-        chars += (spec.name.len() + spec.description.len()) as u64;
-        chars += serde_json::to_string(&spec.input_schema).map_or(0, |schema| schema.len() as u64);
+#[derive(Debug)]
+struct TopicReadFilter {
+    db: Arc<db::SqliteDb>,
+    runtime_session_id: String,
+}
+#[async_trait]
+impl crate::typed_tools::ToolResultFilter for TopicReadFilter {
+    async fn filter(
+        &self,
+        call_id: &ToolCallId,
+        arguments: &serde_json::Value,
+        mut outcome: ToolOutcome,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        let operation = arguments
+            .get("operation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if outcome.is_error || !matches!(operation, "project.current_state" | "project.charter") {
+            return Ok(outcome);
+        }
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(
+            serde_json::to_vec(&outcome.value)
+                .map_err(|_| RuntimeError::internal("topic read digest failed"))?,
+        ));
+        let mut tx = db::begin_immediate(self.db.pool())
+            .await
+            .map_err(|_| RuntimeError::internal("topic read cache unavailable"))?;
+        let previous: Option<(String, String)> = sqlx::query_as("SELECT digest, call_ref FROM agent_topic_read_digest WHERE runtime_session_id = ? AND operation = ?")
+            .bind(&self.runtime_session_id).bind(operation).fetch_optional(&mut *tx).await.map_err(|_| RuntimeError::internal("topic read cache unavailable"))?;
+        if let Some((old_digest, reference)) = previous.filter(|(old, _)| old == &digest) {
+            let _ = old_digest;
+            outcome.value = serde_json::json!({"unchanged_since_call": reference});
+            outcome.content = Default::default();
+        } else {
+            sqlx::query("INSERT INTO agent_topic_read_digest (runtime_session_id, operation, digest, call_ref) VALUES (?, ?, ?, ?) ON CONFLICT(runtime_session_id, operation) DO UPDATE SET digest = excluded.digest, call_ref = excluded.call_ref")
+                .bind(&self.runtime_session_id).bind(operation).bind(digest).bind(call_id.as_str()).execute(&mut *tx).await.map_err(|_| RuntimeError::internal("topic read cache unavailable"))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| RuntimeError::internal("topic read cache unavailable"))?;
+        Ok(outcome)
     }
-    let overhead = chars.div_ceil(LCM_CHARS_PER_TOKEN) + LCM_PLANNER_MARGIN_TOKENS;
-    u64::from(request.provider.max_input_tokens)
-        .saturating_sub(overhead)
-        .max(LCM_MIN_CONVERSATION_BUDGET_TOKENS)
 }
 
-/// Forge's pressure policy, adjusted on three axes the stock defaults get
-/// wrong for real chats:
-///
-/// - `leaf_target_tokens` must exceed one full canonical turn. Leaf planning
-///   only commits a span ending at a user boundary; when a single
-///   `[user, assistant]` pair outgrows the target (assistant replies are
-///   bounded by `max_output_tokens`, far above the stock 2048), selection
-///   stops mid-turn, the planner backs up to the previous user boundary —
-///   eventually index zero — and returns no plan, so every attempt ends in
-///   "LCM context cannot fit after bounded hard compaction" with the
-///   frontier permanently stuck in front of the oversized turn. Scale the
-///   target with the profile's output cap so one leaf can always swallow a
-///   full turn pair. An agentic turn is not bounded by one reply — its tool
-///   loop can outgrow any target — so the runtime also takes an oversized
-///   oldest turn whole as one leaf rather than returning no plan.
-/// - `max_rounds`: 3 rounds cannot walk a chat back under budget once it has
-///   drifted deep past hard pressure. Sixteen rounds cover a full
-///   provider-window overrun in one attempt; each round is a cheap local
-///   deterministic summary, so the widened bound costs nothing when pressure
-///   is caught early.
-/// - `hard_threshold_percent`: the stock 95% assumes the pressure estimate
-///   tracks the planner's accounting. It does not: the `CharRatioSizer`
-///   counts only each entry's joined text, so assistant reasoning payloads
-///   and per-message JSON framing are invisible to it — on a real chat the
-///   estimate runs 10–15% under what the planner charges for the same
-///   history. Five percent of headroom is smaller than that error, so a chat
-///   sails past the planner budget (`budget_exceeded`, no turn possible)
-///   while pressure still reads Soft — and Soft never compacts, because the
-///   host does not drive the idle admission phase. Hard at 85% trips
-///   before the estimator error can eat the whole margin.
-fn forge_lcm_pressure_policy(request: &AgentTurnRequest) -> agent_runtime::lcm::LcmPressurePolicy {
-    agent_runtime::lcm::LcmPressurePolicy {
-        revision: agent_runtime::registry::RegistryRevision::from_content("forge-lcm-pressure-3"),
-        leaf_target_tokens: u64::from(request.provider.max_output_tokens).saturating_add(4096),
-        max_rounds: 16,
-        soft_threshold_percent: 70,
-        hard_threshold_percent: 85,
-        ..agent_runtime::lcm::LcmPressurePolicy::default()
+/// Serialization of the host's identified data card. The pinned runtime admits
+/// a transient TailContext text fragment on System; this adapter narrows that
+/// exact required message to User before the vendor adapter serializes it.
+struct ServerStateCardProvider {
+    inner: Arc<dyn Provider>,
+    card: String,
+}
+impl fmt::Debug for ServerStateCardProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerStateCardProvider")
+            .field("inner", &self.inner)
+            .field("card", &"[redacted]")
+            .finish()
+    }
+}
+#[async_trait]
+impl Provider for ServerStateCardProvider {
+    fn describe(&self) -> Vec<agent_runtime::core::provider::ModelDescriptor> {
+        self.inner.describe()
+    }
+    fn capabilities(&self, model: &ModelId) -> Option<agent_runtime::core::provider::Capabilities> {
+        self.inner.capabilities(model)
+    }
+    fn cache_resource_provider(
+        &self,
+    ) -> Option<&dyn agent_runtime::core::provider::CacheResourceProvider> {
+        self.inner.cache_resource_provider()
+    }
+    async fn stream(
+        &self,
+        mut request: agent_runtime::core::provider::ProviderRequest,
+        ctx: agent_runtime::core::provider::ProviderCallContext,
+    ) -> Result<
+        agent_runtime::core::provider::ProviderStream,
+        agent_runtime::core::provider::ProviderError,
+    > {
+        let tail = request.messages.last_mut().ok_or_else(|| {
+            agent_runtime::core::provider::ProviderError::new(
+                agent_runtime::core::provider::ProviderErrorKind::BadRequest,
+                "planned state card is missing",
+            )
+        })?;
+        if tail.role != Role::System || tail.joined_text() != self.card {
+            return Err(agent_runtime::core::provider::ProviderError::new(
+                agent_runtime::core::provider::ProviderErrorKind::BadRequest,
+                "planned state card does not match the host card",
+            ));
+        }
+        tail.role = Role::User;
+        self.inner.stream(request, ctx).await
+    }
+}
+
+type SealedTopicSeed = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+struct PreparedNativeRuntime {
+    runtime: agent_runtime::runtime::Runtime,
+    context_mode: TurnContextMode,
+    lcm_link: Option<(String, String)>,
+    tool_result_summaries: Arc<Mutex<HashMap<String, ToolResultSummary>>>,
+    needs_adoption: bool,
+    summary_cap: u32,
+}
+
+#[derive(Debug)]
+struct TopicTimelineResolver {
+    source: agent_runtime::harness::LcmTimelineBinding,
+    successor: Option<agent_runtime::harness::LcmTimelineBinding>,
+}
+impl agent_runtime::harness::LcmTimelineResolver for TopicTimelineResolver {
+    fn resolve(
+        &self,
+        session: &SessionId,
+    ) -> Result<agent_runtime::harness::LcmTimelineBinding, RuntimeError> {
+        let binding = if self.source.session == *session {
+            &self.source
+        } else {
+            self.successor
+                .as_ref()
+                .ok_or_else(|| RuntimeError::not_found("topic timeline binding unavailable"))?
+        };
+        if binding.session != *session {
+            return Err(RuntimeError::conflict("topic session binding differs"));
+        }
+        Ok(binding.clone())
+    }
+    fn new_timeline(
+        &self,
+        session: &SessionId,
+        previous: &agent_runtime::harness::LcmTimelineBinding,
+    ) -> Result<agent_runtime::harness::LcmTimelineBinding, RuntimeError> {
+        if previous != &self.source {
+            return Err(RuntimeError::conflict("topic fork source binding differs"));
+        }
+        let binding = self
+            .successor
+            .as_ref()
+            .ok_or_else(|| RuntimeError::conflict("topic successor was not durably reserved"))?;
+        if binding.session != *session {
+            return Err(RuntimeError::conflict("topic session binding differs"));
+        }
+        Ok(binding.clone())
+    }
+}
+
+impl NativeAgentRuntimeBackend {
+    async fn prepare_runtime(
+        &self,
+        request: &AgentTurnRequest,
+        successor: Option<&str>,
+    ) -> Result<PreparedNativeRuntime, AgentHostError> {
+        request.scope.validate()?;
+        let binding = self
+            .protected_store
+            .runtime_scope_binding(
+                &request.forge_session_id,
+                &request.runtime_session_id,
+                request.workspace_path.as_deref(),
+            )
+            .await?;
+        if binding.scope != request.scope {
+            return Err(AgentHostError::Authority(
+                "native turn scope does not match the server-issued session binding".to_owned(),
+            ));
+        }
+        if binding.workspace_path.as_deref() != request.workspace_path.as_deref() {
+            return Err(AgentHostError::Authority(
+                "native turn workspace does not match the server-issued Task workspace".to_owned(),
+            ));
+        }
+        if successor.is_none() && request.scope.scope_type == CanonicalScopeType::AgentChat {
+            let db = self.protected_store.database();
+            sqlx::query("INSERT INTO agent_chat_topic (id, chat_id, sequence, label, summary, starting_message_id, starting_message_sequence, principal_type, principal_id, created_at, runtime_session_id) SELECT ?, ?, 0, 'Original conversation', NULL, NULL, 0, 'system', NULL, ?, ? WHERE NOT EXISTS (SELECT 1 FROM agent_chat_topic WHERE chat_id = ?)")
+                .bind(db::new_uuid_v4()).bind(&request.scope.scope_id).bind(db::now_rfc3339()).bind(&request.runtime_session_id).bind(&request.scope.scope_id)
+                .execute(db.pool()).await.map_err(|_| AgentHostError::ProtectedPersistence)?;
+        }
+        let summary_cap = if binding.scope.scope_type == CanonicalScopeType::AgentChat {
+            let budgets = *self.working_sets.read().expect("working set lock poisoned");
+            if binding.agent_chat_project_id.is_some() {
+                budgets.1.hard_tokens
+            } else {
+                budgets.0.hard_tokens
+            }
+        } else {
+            request.provider.max_input_tokens
+        }
+        .min(request.provider.max_input_tokens);
+        let workspace = workspace_for_scope(&binding.scope, binding.workspace_path.as_deref())?;
+        // A Task session and a Project Agent verification session both compose
+        // against a real root; every other scope composes against none.
+        let composed_workspace_root = match binding.scope.scope_type {
+            CanonicalScopeType::Task => Some(workspace.root().to_owned()),
+            CanonicalScopeType::AgentChat
+                if binding.scope.workspace_access == WorkspaceAccess::ProjectVerify =>
+            {
+                Some(workspace.root().to_owned())
+            }
+            // The Main Agent and the ephemeral inquiry sub-agents it
+            // dispatches compose against an account scratch directory. No
+            // repository is present in it, so there is nothing to write back.
+            CanonicalScopeType::Account | CanonicalScopeType::AgentChat
+                if binding.scope.workspace_access == WorkspaceAccess::AccountScratch =>
+            {
+                Some(workspace.root().to_owned())
+            }
+            CanonicalScopeType::Account
+            | CanonicalScopeType::Project
+            | CanonicalScopeType::AgentChat => None,
+        };
+        let composition = ScopeToolComposition::for_scope_with_permissions_and_project_context(
+            binding.identity_id.clone(),
+            binding.scope.clone(),
+            binding.task_role.as_deref(),
+            composed_workspace_root.as_deref(),
+            &binding.allowed_permissions,
+            ProjectChatToolContext {
+                is_project_agent_chat: binding.agent_chat_project_id.is_some(),
+                charter_setup_required: binding.project_charter_setup_required,
+            },
+            self.forge_tool_provider.clone(),
+            ScopeToolRuntime {
+                command_allowlist: request.command_allowlist.clone(),
+                environment: request.environment.clone(),
+                fetch_transport: Some(Arc::clone(&self.fetch_transport)),
+            },
+        )?;
+        let composition = if binding.scope.scope_type == CanonicalScopeType::AgentChat {
+            composition.filter_results(Arc::new(TopicReadFilter {
+                db: self.protected_store.database(),
+                runtime_session_id: request.runtime_session_id.clone(),
+            }))
+        } else {
+            composition
+        };
+        // `RuntimeEvent::ToolCallCompleted` only carries `is_error`; observe
+        // each tool's exact result here, keyed by call id, so the bounded
+        // `ToolResultSummary` a structured Forge command already produced
+        // survives to `TurnEventSink::tool_call_finished` instead of being
+        // discarded at that boundary (F14/D18).
+        let tool_result_summaries: Arc<Mutex<HashMap<String, ToolResultSummary>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let observed_summaries = Arc::clone(&tool_result_summaries);
+        let composition = composition.observe_results(Arc::new(
+            move |call_id: &ToolCallId, result: &Result<ToolOutcome, RuntimeError>| {
+                let summary = tool_result_summary(call_id.as_str(), result);
+                if let Ok(mut summaries) = observed_summaries.lock() {
+                    summaries.insert(call_id.as_str().to_owned(), summary);
+                }
+            },
+        ));
+        let provider = self.provider(request)?;
+        let model_id = ModelId::new(&request.provider.model);
+        let context_mode = turn_context_mode(&binding.scope, binding.task_role.as_deref());
+        let mut lcm_link = None;
+        let mut needs_adoption = false;
+        let lcm = if context_mode.lcm {
+            let lcm_store = self
+                .protected_store
+                .lcm_store_for_runtime_session(
+                    &request.runtime_session_id,
+                    scope_type_name(request.scope.scope_type),
+                    &request.scope.scope_id,
+                )
+                .await?;
+            lcm_link = Some((
+                lcm_store.timeline_id().to_owned(),
+                lcm_store.authorization_revision().to_owned(),
+            ));
+            needs_adoption = lcm_store.needs_adoption().await?;
+            let lcm_binding =
+                lcm_store.runtime_binding(SessionId::new(&request.runtime_session_id))?;
+            let mut resolver = TopicTimelineResolver {
+                source: lcm_binding,
+                successor: None,
+            };
+            let mut lcm_store = lcm_store;
+            if let Some(successor) = successor {
+                let next = self
+                    .protected_store
+                    .lcm_store_for_runtime_session(
+                        successor,
+                        scope_type_name(request.scope.scope_type),
+                        &request.scope.scope_id,
+                    )
+                    .await?;
+                resolver.successor = Some(next.runtime_binding(SessionId::new(successor))?);
+                lcm_store = lcm_store.with_alternate(next);
+            }
+            let lcm = LcmCoordinator::new(
+                Arc::new(lcm_store),
+                Arc::new(self.summary_model(request, summary_cap)?),
+                Arc::new(resolver),
+                LcmCoordinatorPolicy {
+                    input_budget_tokens: u64::from(request.provider.max_input_tokens),
+                    ..LcmCoordinatorPolicy::default()
+                },
+            )
+            .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+            Some(lcm)
+        } else {
+            None
+        };
+        let mut builder = RuntimeBuilder::new(model_id.clone())
+            .provider_name(request.provider.provider.clone())
+            .provider(if let Some(card) = request.server_state_card.clone() {
+                Arc::new(ServerStateCardProvider {
+                    inner: provider,
+                    card,
+                }) as Arc<dyn Provider>
+            } else {
+                provider
+            })
+            .model_profile(ResolvedModelProfile::explicit(
+                request.provider.provider.clone(),
+                model_id,
+                ModelLimits::new(
+                    request.provider.context_tokens,
+                    request.provider.max_input_tokens,
+                    request.provider.max_output_tokens,
+                ),
+            ))
+            .workspace(workspace)
+            .interaction_broker(Arc::new(self.interaction_broker.clone()))
+            .security_subject(SecuritySubject::new(binding.identity_id))
+            // Forge reduces raw arguments to a bounded, credential-masked
+            // preview (`tool_preview::build_tool_argument_preview`) before
+            // they are ever persisted or rendered; without this opt-in the
+            // runtime withholds argument values by default.
+            .emit_raw_tool_arguments(true);
+        if context_mode.persistent_session {
+            builder = builder
+                .session_store(self.protected_store.clone())
+                .checkpoint_store(self.protected_store.clone());
+        }
+        if let Some(lcm) = lcm {
+            builder = builder.lcm(Arc::new(lcm));
+            if binding.scope.scope_type == CanonicalScopeType::AgentChat {
+                let budgets = *self.working_sets.read().expect("working set lock poisoned");
+                let policy = if binding.agent_chat_project_id.is_some() {
+                    budgets.1
+                } else {
+                    budgets.0
+                };
+                let window = request.provider.max_input_tokens.min(
+                    request
+                        .provider
+                        .context_tokens
+                        .saturating_sub(request.provider.max_output_tokens),
+                );
+                builder = builder.working_set_policy(WorkingSetPolicy {
+                    target_tokens: policy.target_tokens.min(window),
+                    hard_tokens: policy.hard_tokens.min(window),
+                });
+            }
+        }
+        if context_mode.structural_compaction {
+            builder =
+                builder.compactor(task_structural_compactor(request.provider.max_input_tokens));
+        }
+        builder = composition.apply(builder);
+        if let Some(prompt) = request.system_prompt.as_deref() {
+            builder = builder.system_prompt(prompt);
+        }
+        if let Some(card) = request.server_state_card.clone() {
+            builder = builder.context_contributor(Arc::new(ServerStateCard { card }));
+        }
+        if let Some(effort) = request.provider.reasoning_effort.as_deref() {
+            builder = builder.reasoning(ReasoningConfig {
+                effort: Some(effort.to_owned()),
+                max_tokens: None,
+            });
+        }
+        let runtime = builder
+            .build()
+            .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+        Ok(PreparedNativeRuntime {
+            runtime,
+            context_mode,
+            lcm_link,
+            tool_result_summaries,
+            needs_adoption,
+            summary_cap,
+        })
     }
 }
 
@@ -360,7 +694,7 @@ fn retry_aware_input(history: &[Message], input: String) -> String {
 
 /// Harness component id of [`ServerStateCard`]. It owns no session state.
 const STATE_CARD_COMPONENT_ID: &str = "forge.server_state_card";
-const STATE_CARD_COMPONENT_REVISION: &str = "1";
+const STATE_CARD_COMPONENT_REVISION: &str = "2";
 const STATE_CARD_FRAGMENT_ID: &str = "forge:server-state-card";
 /// Sorts the card after every other trailing fragment, so it is the last
 /// block of the request.
@@ -412,6 +746,10 @@ impl ContextContributor for ServerStateCard {
         ]))
     }
 }
+
+const TASK_COMPACTION_HIGH_PERCENT: u64 = 85;
+const TASK_COMPACTION_LOW_PERCENT: u64 = 70;
+const TASK_COMPACTION_POLICY_REVISION: &str = "forge-task-structural-compaction-1";
 
 fn task_structural_compactor(max_input_tokens: u32) -> StructuralCompactor {
     let max_input_tokens = u64::from(max_input_tokens).max(1);
@@ -497,177 +835,45 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         if request.cancellation.is_cancelled() {
             return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
         }
-        request.scope.validate()?;
-        let binding = self
+        let PreparedNativeRuntime {
+            runtime,
+            context_mode,
+            lcm_link,
+            tool_result_summaries,
+            needs_adoption,
+            summary_cap: _,
+        } = self.prepare_runtime(&request, None).await?;
+        use agent_runtime::core::store::SessionStore;
+        use agent_runtime::prelude::CheckpointStore;
+        let id = SessionId::new(&request.runtime_session_id);
+        let saved = self
             .protected_store
-            .runtime_scope_binding(
-                &request.forge_session_id,
-                &request.runtime_session_id,
-                request.workspace_path.as_deref(),
-            )
-            .await?;
-        if binding.scope != request.scope {
-            return Err(AgentHostError::Authority(
-                "native turn scope does not match the server-issued session binding".to_owned(),
-            ));
-        }
-        if binding.workspace_path.as_deref() != request.workspace_path.as_deref() {
-            return Err(AgentHostError::Authority(
-                "native turn workspace does not match the server-issued Task workspace".to_owned(),
-            ));
-        }
-        let workspace = workspace_for_scope(&binding.scope, binding.workspace_path.as_deref())?;
-        // A Task session and a Project Agent verification session both compose
-        // against a real root; every other scope composes against none.
-        let composed_workspace_root = match binding.scope.scope_type {
-            CanonicalScopeType::Task => Some(workspace.root().to_owned()),
-            CanonicalScopeType::AgentChat
-                if binding.scope.workspace_access == WorkspaceAccess::ProjectVerify =>
-            {
-                Some(workspace.root().to_owned())
-            }
-            // The Main Agent and the ephemeral inquiry sub-agents it
-            // dispatches compose against an account scratch directory. No
-            // repository is present in it, so there is nothing to write back.
-            CanonicalScopeType::Account | CanonicalScopeType::AgentChat
-                if binding.scope.workspace_access == WorkspaceAccess::AccountScratch =>
-            {
-                Some(workspace.root().to_owned())
-            }
-            CanonicalScopeType::Account
-            | CanonicalScopeType::Project
-            | CanonicalScopeType::AgentChat => None,
-        };
-        let composition = ScopeToolComposition::for_scope_with_permissions_and_project_context(
-            binding.identity_id.clone(),
-            binding.scope.clone(),
-            binding.task_role.as_deref(),
-            composed_workspace_root.as_deref(),
-            &binding.allowed_permissions,
-            ProjectChatToolContext {
-                is_project_agent_chat: binding.agent_chat_project_id.is_some(),
-                charter_setup_required: binding.project_charter_setup_required,
-            },
-            self.forge_tool_provider.clone(),
-            ScopeToolRuntime {
-                command_allowlist: request.command_allowlist.clone(),
-                environment: request.environment.clone(),
-                fetch_transport: Some(Arc::clone(&self.fetch_transport)),
-            },
-        )?;
-        // `RuntimeEvent::ToolCallCompleted` only carries `is_error`; observe
-        // each tool's exact result here, keyed by call id, so the bounded
-        // `ToolResultSummary` a structured Forge command already produced
-        // survives to `TurnEventSink::tool_call_finished` instead of being
-        // discarded at that boundary (F14/D18).
-        let tool_result_summaries: Arc<Mutex<HashMap<String, ToolResultSummary>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let observed_summaries = Arc::clone(&tool_result_summaries);
-        let composition = composition.observe_results(Arc::new(
-            move |call_id: &ToolCallId, result: &Result<ToolOutcome, RuntimeError>| {
-                let summary = tool_result_summary(call_id.as_str(), result);
-                if let Ok(mut summaries) = observed_summaries.lock() {
-                    summaries.insert(call_id.as_str().to_owned(), summary);
-                }
-            },
-        ));
-        let provider = self.provider(&request)?;
-        let model_id = ModelId::new(&request.provider.model);
-        let context_mode = turn_context_mode(&binding.scope, binding.task_role.as_deref());
-        let mut lcm_link = None;
-        let lcm = if context_mode.lcm {
-            let lcm_store = self
+            .load(&id)
+            .await
+            .map_err(host_runtime_error)?
+            .is_some()
+            || self
                 .protected_store
-                .lcm_store_for_runtime_session(
-                    &request.runtime_session_id,
-                    scope_type_name(request.scope.scope_type),
-                    &request.scope.scope_id,
-                )
-                .await?;
-            lcm_link = Some((
-                lcm_store.timeline_id().to_owned(),
-                lcm_store.authorization_revision().to_owned(),
-            ));
-            let lcm_binding =
-                lcm_store.runtime_binding(SessionId::new(&request.runtime_session_id))?;
-            let lcm = LcmCoordinator::new(
-                Arc::new(lcm_store),
-                Arc::new(DeterministicLcmSummaryModel::default()),
-                Arc::new(StaticLcmTimelineResolver::new(lcm_binding)),
-                LcmCoordinatorPolicy {
-                    input_budget_tokens: conversation_budget_tokens(&request, &composition),
-                    pressure: forge_lcm_pressure_policy(&request),
-                    // The stock sizer cannot see a tool call's arguments or a
-                    // tool result's body, so a tool-exchange timeline read
-                    // Soft — which never compacts — right up to the planner's
-                    // `budget_exceeded` wall. See `ForgeLcmSizer`.
-                    sizer: Arc::new(ForgeLcmSizer::new()),
-                    ..LcmCoordinatorPolicy::default()
-                },
-            )
-            .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
-            Some(lcm)
+                .load_latest(&id)
+                .await
+                .map_err(host_runtime_error)?
+                .is_some();
+        let start = if !context_mode.persistent_session {
+            let mut start = StartSession::ephemeral(Vec::new());
+            start.session_id = Some(id);
+            start
+        } else if saved {
+            let start = StartSession::resume(id);
+            if needs_adoption {
+                start.with_lcm_policy(agent_runtime::harness::LcmRecoveryPolicy::Adopt)
+            } else {
+                start
+            }
         } else {
-            None
+            StartSession::create(id, request.history)
         };
-        let mut builder = RuntimeBuilder::new(model_id.clone())
-            .provider_name(request.provider.provider.clone())
-            .provider(provider)
-            .model_profile(ResolvedModelProfile::explicit(
-                request.provider.provider.clone(),
-                model_id,
-                ModelLimits::new(
-                    request.provider.context_tokens,
-                    request.provider.max_input_tokens,
-                    request.provider.max_output_tokens,
-                ),
-            ))
-            .workspace(workspace)
-            .interaction_broker(Arc::new(self.interaction_broker.clone()))
-            .security_subject(SecuritySubject::new(binding.identity_id))
-            // Forge reduces raw arguments to a bounded, credential-masked
-            // preview (`tool_preview::build_tool_argument_preview`) before
-            // they are ever persisted or rendered; without this opt-in the
-            // runtime withholds argument values by default.
-            .emit_raw_tool_arguments(true);
-        if context_mode.persistent_session {
-            builder = builder
-                .session_store(self.protected_store.clone())
-                .checkpoint_store(self.protected_store.clone());
-        }
-        if let Some(lcm) = lcm {
-            builder = builder.lcm(Arc::new(lcm));
-        }
-        if context_mode.structural_compaction {
-            builder =
-                builder.compactor(task_structural_compactor(request.provider.max_input_tokens));
-        }
-        builder = composition.apply(builder);
-        if let Some(prompt) = request.system_prompt.as_deref() {
-            builder = builder.system_prompt(prompt);
-        }
-        if let Some(card) = request.server_state_card {
-            builder = builder.context_contributor(Arc::new(ServerStateCard { card }));
-        }
-        if let Some(effort) = request.provider.reasoning_effort.as_deref() {
-            builder = builder.reasoning(ReasoningConfig {
-                effort: Some(effort.to_owned()),
-                max_tokens: None,
-            });
-        }
-        let runtime = builder
-            .build()
-            .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
         let session = runtime
-            .start_session(
-                StartSession::new()
-                    .with_id(SessionId::new(&request.runtime_session_id))
-                    .with_history(if context_mode.persistent_session {
-                        request.history
-                    } else {
-                        Vec::new()
-                    }),
-            )
+            .start_session(start)
             .await
             .map_err(host_runtime_error)?;
         // A persistent session restores its accumulated usage ledger, so
@@ -730,6 +936,10 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                         continue;
                     }
                     match &event.payload {
+                        RuntimeEvent::CachePlanChanged { first_changed_fragment, .. } => {
+                            tracing::debug!(runtime_session_id = %request.runtime_session_id, ?first_changed_fragment, "native topic cache prefix change");
+                            sink.cache_plan_changed(first_changed_fragment.as_deref()).await;
+                        }
                         RuntimeEvent::TextDelta { text, .. } => sink.text_delta(text).await,
                         RuntimeEvent::ReasoningDelta { text, redacted, .. } => {
                             sink.reasoning_delta(text, *redacted).await;
@@ -831,10 +1041,15 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .get(CounterKind::Output)
             .checked_add(usage.get(CounterKind::Reasoning))
             .ok_or_else(|| AgentHostError::Runtime("usage counter overflow".to_owned()))?;
-        let usage_reports = turn_records
+        let mut usage_reports = turn_records
             .iter()
             .enumerate()
-            .filter(|(_, record)| record.source == UsageSource::ProviderAttempt)
+            .filter(|(_, record)| {
+                matches!(
+                    record.source,
+                    UsageSource::ProviderAttempt | UsageSource::SemanticSummary
+                )
+            })
             .map(|(offset, record)| {
                 let counters = record_counters(&record.delta)?;
                 let request_id = record.provenance.request.as_ref().map(ToString::to_string);
@@ -842,8 +1057,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 // The record's position in the session ledger, which never
                 // changes, keeps the id unique across the session's turns.
                 let report_id = format!(
-                    "native:{}:{}:{}",
+                    "native:{}:{}:{}:{}",
                     request.runtime_session_id,
+                    record.provenance.purpose.as_deref().unwrap_or("turn"),
                     request_id
                         .as_deref()
                         .or(attempt_id.as_deref())
@@ -869,6 +1085,25 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 })
             })
             .collect::<Result<Vec<_>, AgentHostError>>()?;
+        let db = self.protected_store.database();
+        let summary_rows = sqlx::query("SELECT s.* FROM agent_topic_summary_usage s WHERE runtime_session_id = ? AND NOT EXISTS (SELECT 1 FROM usage_event e WHERE e.source_report_id = s.id)")
+            .bind(&request.runtime_session_id).fetch_all(db.pool()).await.map_err(|_| AgentHostError::ProtectedPersistence)?;
+        use sqlx::Row;
+        for row in summary_rows {
+            usage_reports.push(AgentTurnUsageReport {
+                report_id: row.get("id"),
+                request_id: Some(format!("topic_summary:{}", row.get::<String, _>("id"))),
+                attempt_id: None,
+                provider_id: Some(row.get("provider")),
+                model_id: Some(row.get("model")),
+                input_tokens: Some(row.get::<i64, _>("input_tokens") as u64),
+                output_tokens: Some(row.get::<i64, _>("output_tokens") as u64),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                telemetry_state: AgentTurnTelemetryState::Metered,
+                failed: row.get("failed"),
+            });
+        }
         let output = AgentTurnOutput {
             runtime_session_id: request.runtime_session_id,
             text,
@@ -972,6 +1207,213 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .steer_current_turn(None, UserInput::text(content))
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         Ok(())
+    }
+}
+
+impl NativeAgentRuntimeBackend {
+    /// Complete the durable intent using its pre-reserved successor identity.
+    pub async fn fork_topic(
+        &self,
+        request: AgentTurnRequest,
+        intent_id: &str,
+        successor: &str,
+    ) -> Result<(), AgentHostError> {
+        use agent_runtime::{
+            core::store::SessionStore, lcm::LcmSummaryModel, prelude::CheckpointStore,
+        };
+        let db = self.protected_store.database();
+        if self
+            .active
+            .lock()
+            .map_err(|_| AgentHostError::ProtectedPersistence)?
+            .contains_key(&request.runtime_session_id)
+        {
+            return Err(AgentHostError::VersionConflict);
+        }
+        let prepared = self.prepare_runtime(&request, Some(successor)).await?;
+        let saved_seed: Option<SealedTopicSeed> = sqlx::query_as(
+            "SELECT summary_ciphertext, summary_nonce FROM agent_chat_topic_rotation WHERE id = ?",
+        )
+        .bind(intent_id)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+        let seed = if let Some((Some(bytes), Some(nonce))) = saved_seed {
+            String::from_utf8(
+                self.protected_store
+                    .open_protected(&bytes, &nonce)
+                    .map_err(host_runtime_error)?,
+            )
+            .map_err(|_| AgentHostError::ProtectedPersistence)?
+        } else {
+            let id = SessionId::new(&request.runtime_session_id);
+            let saved = self
+                .protected_store
+                .load(&id)
+                .await
+                .map_err(host_runtime_error)?
+                .is_some()
+                || self
+                    .protected_store
+                    .load_latest(&id)
+                    .await
+                    .map_err(host_runtime_error)?
+                    .is_some();
+            let start = if saved {
+                let start = StartSession::resume(id);
+                if prepared.needs_adoption {
+                    start.with_lcm_policy(agent_runtime::harness::LcmRecoveryPolicy::Adopt)
+                } else {
+                    start
+                }
+            } else {
+                StartSession::create(id, request.history.clone())
+            };
+            let parent = prepared
+                .runtime
+                .start_session(start)
+                .await
+                .map_err(host_runtime_error)?;
+            parent.persist().await.map_err(host_runtime_error)?;
+            let messages = parent.history();
+            let source = agent_runtime::lcm::Fingerprint::of(
+                serde_json::to_vec(&messages).map_err(|_| AgentHostError::ProtectedPersistence)?,
+            );
+            let summary_request = agent_runtime::lcm::LcmSummaryModelRequest {
+                purpose: "topic_summary".to_owned(),
+                level: agent_runtime::lcm::EscalationLevel::PreserveDetails,
+                target_tokens: 1024,
+                source_range: agent_runtime::lcm::LcmRange::new(
+                    agent_runtime::lcm::LcmSequence::new(0),
+                    agent_runtime::lcm::LcmSequence::new(messages.len().saturating_sub(1) as u64),
+                )
+                .map_err(|e| AgentHostError::Configuration(e.to_string()))?,
+                source_fingerprint: source,
+                messages,
+                operation_fingerprint: agent_runtime::lcm::LcmOperationFingerprint::new(
+                    agent_runtime::lcm::Fingerprint::of(intent_id.as_bytes()),
+                ),
+                policy_revision: agent_runtime::registry::RegistryRevision::new(
+                    "forge-topic-summary-1",
+                ),
+                sizer_revision: agent_runtime::context::RequestSizer::revision(
+                    &agent_runtime::context::CharRatioSizer::default(),
+                )
+                .revision,
+            };
+            let model = self.summary_model(&request, prepared.summary_cap)?;
+            let result = if summary_request.messages.is_empty() {
+                None
+            } else {
+                Some(model.summarize(&summary_request).await)
+            };
+            let (text, input, output, failed) = match result {
+                Some(Ok(response)) => (
+                    response.text,
+                    response.input_tokens,
+                    response.output_tokens,
+                    false,
+                ),
+                Some(Err(error)) => {
+                    let (input, output) = error.reported_usage().unwrap_or((0, 0));
+                    let fallback = crate::DeterministicLcmSummaryModel::default()
+                        .summarize(&summary_request)
+                        .await
+                        .map_err(|e| AgentHostError::Runtime(e.to_string()))?;
+                    (fallback.text, input, output, true)
+                }
+                None => ("No earlier conversation.".to_owned(), 0, 0, false),
+            };
+            let (ciphertext, nonce) = self
+                .protected_store
+                .seal_protected(text.as_bytes())
+                .map_err(host_runtime_error)?;
+            let mut tx = db::begin_immediate(db.pool())
+                .await
+                .map_err(|_| AgentHostError::ProtectedPersistence)?;
+            sqlx::query("UPDATE agent_chat_topic_rotation SET summary_ciphertext = ?, summary_nonce = ? WHERE id = ? AND summary_ciphertext IS NULL")
+                .bind(ciphertext).bind(nonce).bind(intent_id).execute(&mut *tx).await.map_err(|_| AgentHostError::ProtectedPersistence)?;
+            if input != 0 || output != 0 {
+                sqlx::query("INSERT INTO agent_topic_summary_usage (id, runtime_session_id, provider, model, input_tokens, output_tokens, failed, purpose) VALUES (?, ?, ?, ?, ?, ?, ?, 'topic_summary')")
+                    .bind(format!("topic-summary:{intent_id}")).bind(successor).bind(&request.provider.provider).bind(&request.provider.model)
+                    .bind(input as i64).bind(output as i64).bind(failed).execute(&mut *tx).await.map_err(|_| AgentHostError::ProtectedPersistence)?;
+            }
+            tx.commit()
+                .await
+                .map_err(|_| AgentHostError::ProtectedPersistence)?;
+            text
+        };
+        let child = prepared
+            .runtime
+            .fork_session(agent_runtime::runtime::ForkSession {
+                from: SessionId::new(&request.runtime_session_id),
+                new_id: SessionId::new(successor),
+                seed: agent_runtime::runtime::ForkSeed::Summary(seed),
+                lcm: agent_runtime::runtime::ForkLcm::NewTimeline,
+            })
+            .await
+            .map_err(host_runtime_error)?;
+        child.persist().await.map_err(host_runtime_error)?;
+        Ok(())
+    }
+
+    fn summary_model(
+        &self,
+        request: &AgentTurnRequest,
+        summary_cap: u32,
+    ) -> Result<agent_runtime::lcm::ProviderLcmSummaryModel<dyn Provider>, AgentHostError> {
+        agent_runtime::lcm::ProviderLcmSummaryModel::new(
+            Arc::new(LowReasoningProvider(
+                self.provider(request)?,
+                if request.provider.provider == "gemini" {
+                    "minimal"
+                } else {
+                    "low"
+                },
+            )) as Arc<dyn Provider>,
+            ResolvedModelProfile::explicit(
+                request.provider.provider.clone(),
+                ModelId::new(&request.provider.model),
+                ModelLimits::new(
+                    request.provider.context_tokens,
+                    summary_cap,
+                    request.provider.max_output_tokens,
+                ),
+            ),
+            crate::lcm::SUMMARY_INSTRUCTIONS,
+            Arc::new(agent_runtime::context::CharRatioSizer::default()),
+        )
+        .map_err(|e| AgentHostError::Configuration(e.to_string()))
+    }
+}
+
+#[derive(Debug)]
+struct LowReasoningProvider(Arc<dyn Provider>, &'static str);
+#[async_trait]
+impl Provider for LowReasoningProvider {
+    fn describe(&self) -> Vec<agent_runtime::core::provider::ModelDescriptor> {
+        self.0.describe()
+    }
+    fn capabilities(&self, model: &ModelId) -> Option<agent_runtime::core::provider::Capabilities> {
+        self.0.capabilities(model)
+    }
+    async fn stream(
+        &self,
+        mut request: agent_runtime::core::provider::ProviderRequest,
+        ctx: agent_runtime::core::provider::ProviderCallContext,
+    ) -> Result<
+        agent_runtime::core::provider::ProviderStream,
+        agent_runtime::core::provider::ProviderError,
+    > {
+        request.reasoning = self.0.capabilities(&request.model).and_then(|caps| {
+            (caps.reasoning == agent_runtime::core::provider::ReasoningSupport::Controllable).then(
+                || ReasoningConfig {
+                    effort: Some(self.1.to_owned()),
+                    max_tokens: None,
+                },
+            )
+        });
+        self.0.stream(request, ctx).await
     }
 }
 
@@ -1979,5 +2421,57 @@ mod turn_failure_tests {
         for (error, expected) in cases {
             assert_eq!(provider_turn_failure(&error), expected);
         }
+    }
+    #[tokio::test]
+    async fn unchanged_reads_are_scoped_to_one_topic_and_changed_bodies_are_full() {
+        use crate::typed_tools::ToolResultFilter;
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let database = Arc::new(db::SqliteDb::new(pool));
+        let filter = TopicReadFilter {
+            db: database.clone(),
+            runtime_session_id: "topic-one".into(),
+        };
+        let args = serde_json::json!({"operation": "project.current_state"});
+        let outcome = |version| ToolOutcome {
+            value: serde_json::json!({"version": version, "body": "current authoritative state"}),
+            content: Default::default(),
+            is_error: false,
+        };
+        assert_eq!(
+            filter
+                .filter(&ToolCallId::new("call-1"), &args, outcome(1))
+                .await
+                .unwrap()
+                .value["version"],
+            1
+        );
+        assert_eq!(
+            filter
+                .filter(&ToolCallId::new("call-2"), &args, outcome(1))
+                .await
+                .unwrap()
+                .value,
+            serde_json::json!({"unchanged_since_call": "call-1"})
+        );
+        assert_eq!(
+            filter
+                .filter(&ToolCallId::new("call-3"), &args, outcome(2))
+                .await
+                .unwrap()
+                .value["version"],
+            2
+        );
+        let next = TopicReadFilter {
+            db: database,
+            runtime_session_id: "topic-two".into(),
+        };
+        assert_eq!(
+            next.filter(&ToolCallId::new("call-4"), &args, outcome(2))
+                .await
+                .unwrap()
+                .value["version"],
+            2
+        );
     }
 }

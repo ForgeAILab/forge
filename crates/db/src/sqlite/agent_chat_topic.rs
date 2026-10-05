@@ -49,6 +49,19 @@ impl AgentChatTopicRepo for SqliteDb {
 
 #[async_trait]
 impl AgentChatTopicTransactionRepo for SqliteDb {
+    async fn request_agent_chat_topic(&self, input: RotateAgentChatTopic) -> Result<String> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        sqlx::query("INSERT OR IGNORE INTO agent_chat_topic_rotation (chat_id, id, label, requested_summary, cause, created_at) VALUES (?, ?, ?, ?, 'rest', ?)")
+            .bind(&input.topic.chat_id).bind(&input.topic.id).bind(&input.topic.label).bind(&input.topic.summary).bind(&input.topic.created_at)
+            .execute(&mut *tx).await?;
+        let id = sqlx::query_scalar("SELECT id FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&input.topic.chat_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     async fn rotate_agent_chat_topic(
         &self,
         input: RotateAgentChatTopic,
@@ -91,7 +104,10 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
         .bind(&input.topic.chat_id)
         .fetch_one(&mut *transaction)
         .await?;
-        if live_turn_count > 0 {
+        let system_rotation = input.rotation_owner.is_some();
+        let leased: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_chat_turn_job WHERE chat_id = ? AND status = 'leased')")
+            .bind(&input.topic.chat_id).fetch_one(&mut *transaction).await?;
+        if leased || (!system_rotation && live_turn_count > 0) {
             transaction.rollback().await?;
             return Ok(Err(AgentChatTopicDenialReason::MainTurnLive));
         }
@@ -106,7 +122,7 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
             .await?
             .ok_or(DbError::NotFound)?;
         let account_id: Option<String> = chat_row.try_get("account_id")?;
-        if let Some(account_id) = account_id {
+        if let Some(account_id) = account_id.filter(|_| !system_rotation) {
             let pending_genesis = sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM product_genesis_session
                  WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')",
@@ -120,6 +136,13 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
             }
         }
 
+        if let Some(owner) = &input.rotation_owner {
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_chat_topic_rotation WHERE chat_id = ? AND id = ? AND owner_token = ?)")
+                .bind(&input.topic.chat_id).bind(&input.topic.id).bind(owner).fetch_one(&mut *transaction).await?;
+            if !valid {
+                return Err(DbError::VersionConflict);
+            }
+        }
         let next_sequence: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence), -1) + 1 FROM agent_chat_topic WHERE chat_id = ?",
         )
@@ -216,8 +239,8 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
         sqlx::query(
             "INSERT INTO agent_chat_topic (
                 id, chat_id, sequence, label, summary, starting_message_id,
-                starting_message_sequence, principal_type, principal_id, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                starting_message_sequence, principal_type, principal_id, created_at, runtime_session_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.topic.id)
         .bind(&input.topic.chat_id)
@@ -229,9 +252,37 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
         .bind(&input.topic.principal_type)
         .bind(input.topic.principal_id.as_deref())
         .bind(&input.topic.created_at)
+        .bind(&input.runtime_session_id)
         .execute(&mut *transaction)
         .await?;
 
+        if let Some(runtime_id) = &input.runtime_session_id {
+            let successor: (String, Option<String>) = sqlx::query_as(
+                "SELECT id, predecessor_session_id FROM agent_session WHERE runtime_session_id = ?",
+            )
+            .bind(runtime_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if let Some(parent) = &successor.1 {
+                let version: i64 =
+                    sqlx::query_scalar("SELECT version FROM agent_session WHERE id = ?")
+                        .bind(parent)
+                        .fetch_one(&mut *transaction)
+                        .await?;
+                sqlx::query("UPDATE agent_session SET status = 'replaced', replaced_by_session_id = ?, version = version + 1 WHERE id = ? AND version = ?")
+                    .bind(&successor.0).bind(parent).bind(version).execute(&mut *transaction).await?;
+            }
+            let version: i64 = sqlx::query_scalar("SELECT version FROM agent_session WHERE id = ?")
+                .bind(&successor.0)
+                .fetch_one(&mut *transaction)
+                .await?;
+            sqlx::query("UPDATE agent_session SET status = 'ready', version = version + 1 WHERE id = ? AND version = ? AND status = 'suspended'")
+                .bind(&successor.0).bind(version).execute(&mut *transaction).await?;
+        }
+        if let Some(owner) = &input.rotation_owner {
+            sqlx::query("DELETE FROM agent_chat_topic_rotation WHERE chat_id = ? AND id = ? AND owner_token = ?")
+                .bind(&input.topic.chat_id).bind(&input.topic.id).bind(owner).execute(&mut *transaction).await?;
+        }
         let topic_row = sqlx::query("SELECT * FROM agent_chat_topic WHERE id = ?")
             .bind(&input.topic.id)
             .fetch_one(&mut *transaction)

@@ -638,3 +638,6 @@ mod execution_admission_error_tests {
 #[cfg(test)]
 #[path = "pricing_auto_tests.rs"]
 mod pricing_auto_tests;
+
+mod topic_rotation;
+pub use topic_rotation::{TopicRotationCoordinator, TopicRotator};

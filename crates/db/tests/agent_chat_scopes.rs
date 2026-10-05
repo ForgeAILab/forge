@@ -173,6 +173,7 @@ async fn agent_chat_scope_flows_through_session_lcm_memory_manifest_and_action_r
     AgentLcmRepo::append_lcm_entries(
         &db,
         db::AppendAgentLcmEntries {
+            claim: None,
             timeline_id: timeline.id.clone(),
             expected_revision: 0,
             operation_id: "agent-chat-lcm-append".to_owned(),
@@ -752,6 +753,7 @@ async fn identity_profile_session_replacement_preserves_per_identity_chat_contin
         AgentLcmRepo::append_lcm_entries(
             &db,
             db::AppendAgentLcmEntries {
+                claim: None,
                 timeline_id: timeline.id.clone(),
                 expected_revision: 0,
                 operation_id: format!("continuity-operation-{index}"),

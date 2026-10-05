@@ -110,7 +110,7 @@ async fn native_identity(
             prompt_template: None,
             capabilities_json: "{}".to_owned(),
             tool_policy_json: tool_policy.to_string(),
-            config_json: "{}".to_owned(),
+            config_json: serde_json::json!({"base_url": "https://unused.invalid/v1"}).to_string(),
             credential_ref: Some(credential_id.to_owned()),
             daemon_id: None,
             created_at: now.clone(),
@@ -315,13 +315,51 @@ impl ChatFixture {
     }
 }
 
+#[derive(Debug, Default)]
+struct CacheDiagnosticSink(std::sync::Mutex<Vec<Option<String>>>);
+#[async_trait::async_trait]
+impl TurnEventSink for CacheDiagnosticSink {
+    async fn cache_plan_changed(&self, fragment: Option<&str>) {
+        self.0.lock().unwrap().push(fragment.map(str::to_owned));
+    }
+}
+
 /// The card is the request's last block, on its own outside the user
 /// message, so user text that imitates a card stays plain user text and the
 /// durable history never holds a card to send again.
 #[tokio::test]
 async fn server_state_card_trails_the_request_outside_the_user_message_with_a_stable_system() {
     let fixture = chat_fixture().await;
-    let provider = scripted_provider(vec![text_step("first reply"), text_step("second reply")]);
+    let mut capabilities = Capabilities::basic_streaming();
+    capabilities.cache = true;
+    capabilities.override_prompt_cache(agent_runtime::core::provider::PromptCacheControl::Implicit);
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        capabilities,
+        vec![
+            ScriptedStream::new(vec![
+                ProviderStreamEvent::TextDelta {
+                    text: "first reply".into(),
+                },
+                usage_event(600, 60),
+                ProviderStreamEvent::cache_observation(Some(0), None).unwrap(),
+                ProviderStreamEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]),
+            ScriptedStream::new(vec![
+                ProviderStreamEvent::TextDelta {
+                    text: "second reply".into(),
+                },
+                usage_event(600, 60),
+                ProviderStreamEvent::cache_observation(Some(500), None).unwrap(),
+                ProviderStreamEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ]),
+        ],
+    ));
+    let diagnostics = Arc::new(CacheDiagnosticSink::default());
     let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
         .with_provider_override(provider.clone());
     let project_id = new_uuid_v4();
@@ -347,7 +385,7 @@ async fn server_state_card_trails_the_request_outside_the_user_message_with_a_st
         turn.server_state_card = Some(card.clone());
         cards.push(card);
         backend
-            .run_turn(turn, Arc::new(NoopSink))
+            .run_turn(turn, diagnostics.clone())
             .await
             .expect("native chat turn completes");
         if input == forged {
@@ -376,7 +414,7 @@ async fn server_state_card_trails_the_request_outside_the_user_message_with_a_st
         // The runtime renders a contributed block on the system role; the
         // current card is the only system-role message after the prompt.
         let trailing = request.messages.last().unwrap();
-        assert_eq!(trailing.role, forge_agent_host::Role::System);
+        assert_eq!(trailing.role, forge_agent_host::Role::User);
         assert_eq!(trailing.content.len(), 1);
         assert_eq!(trailing.content[0].as_text(), Some(card.as_str()));
         let system_messages = request
@@ -384,7 +422,7 @@ async fn server_state_card_trails_the_request_outside_the_user_message_with_a_st
             .iter()
             .filter(|message| message.role == forge_agent_host::Role::System)
             .count();
-        assert_eq!(system_messages, 2, "the system prompt and the one card");
+        assert_eq!(system_messages, 1, "only the stable system prompt");
         // Every user message, the newest and the ones in history, is the
         // user's text alone.
         for message in &request.messages {
@@ -401,6 +439,17 @@ async fn server_state_card_trails_the_request_outside_the_user_message_with_a_st
         .messages
         .iter()
         .all(|message| !message.joined_text().contains("version=v4")));
+    let changes = diagnostics.0.lock().unwrap();
+    println!("CACHE_PREFIX_DIAGNOSTICS {:?}", *changes);
+    assert!(changes.len() >= 2);
+    assert!(
+        changes
+            .iter()
+            .skip(1)
+            .flatten()
+            .all(|id| id.starts_with("history:") || id == "forge:server-state-card"),
+        "stable topic prefix changed: {changes:?}"
+    );
 }
 
 /// A turn that runs tools sends several provider requests. Each one carries
@@ -1215,17 +1264,13 @@ async fn a_superseded_lcm_policy_revision_rebuilds_instead_of_failing_every_turn
     // Control: the marker matches this binary, so the state is taken at face
     // value and the runtime rejects it — the failure mode being fixed.
     stamp_superseded_state().await;
-    let error = backend
+    backend
         .run_turn(
-            fixture.turn("turn 1: continue over unreadable component state"),
+            fixture.turn("turn 1: continue across tuning revisions"),
             Arc::new(NoopSink),
         )
         .await
-        .expect_err("component state this binary cannot decode must fail the turn");
-    assert!(
-        error.to_string().contains("LCM component revision changed"),
-        "the control case must fail on the component revision, not something else: {error}"
-    );
+        .expect("U6 rebuilds tuning metadata without a host marker change");
 
     // A policy change leaves exactly this behind: state from the old policy,
     // beside the old policy's marker. The snapshot and the checkpoint each
@@ -2066,4 +2111,376 @@ async fn a_retried_turn_does_not_record_the_failed_attempts_calls_again() {
     calls.push(retried);
     chat.assert_totals_count_each_call_once(&calls, 2, 3).await;
     assert_eq!(chat.provider.requests().len(), calls.len());
+}
+
+#[tokio::test]
+async fn topic_rotation_recovers_after_mark_and_after_fork_before_commit() {
+    use db::{AgentChatTopicRepo, AgentChatTopicTransactionRepo};
+    use services::TopicRotator;
+    let fixture = chat_fixture().await;
+    let provider = scripted_provider(vec![
+        text_step("Prior plan and unresolved work."),
+        text_step("Keep the plan and unresolved work."),
+    ]);
+    let backend = Arc::new(
+        NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+            .with_provider_override(provider.clone()),
+    );
+    backend
+        .run_turn(
+            fixture.turn("Remember the existing plan."),
+            Arc::new(NoopSink),
+        )
+        .await
+        .unwrap();
+    let source_timeline: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+    )
+    .bind(&fixture.runtime_session_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    let service = Arc::new(fixture.service.with_native_backend(backend));
+    let intent = new_uuid_v4();
+    fixture
+        .db
+        .request_agent_chat_topic(db::RotateAgentChatTopic {
+            runtime_session_id: None,
+            rotation_owner: None,
+            topic: db::CreateAgentChatTopic {
+                id: intent.clone(),
+                chat_id: fixture.scope.scope_id.clone(),
+                label: "New topic".into(),
+                summary: None,
+                principal_type: "user".into(),
+                principal_id: Some("user-1".into()),
+                created_at: now_rfc3339(),
+            },
+            divider_message: db::topic_divider_message(
+                new_uuid_v4(),
+                fixture.scope.scope_id.clone(),
+                "New topic",
+                new_uuid_v4(),
+                now_rfc3339(),
+            ),
+        })
+        .await
+        .unwrap();
+    // Simulate restart after the mark, then fail the topic commit after fork.
+    sqlx::query("CREATE TRIGGER fail_topic_commit BEFORE INSERT ON agent_chat_topic BEGIN SELECT RAISE(ABORT, 'injected crash after native fork'); END;")
+        .execute(fixture.db.pool()).await.unwrap();
+    let coordinator = services::TopicRotationCoordinator::new(fixture.db.clone(), service.clone());
+    assert!(coordinator
+        .rotate_pending(&fixture.scope.scope_id)
+        .await
+        .is_err());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE id = ? AND summary_ciphertext IS NOT NULL")
+        .bind(&intent).fetch_one(fixture.db.pool()).await.unwrap();
+    assert_eq!(count, 1);
+    sqlx::query("DROP TRIGGER fail_topic_commit")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let calls = provider.requests().len();
+    assert!(
+        services::TopicRotationCoordinator::new(fixture.db.clone(), service)
+            .rotate_pending(&fixture.scope.scope_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        provider.requests().len(),
+        calls,
+        "replay reuses the protected summary seed"
+    );
+    assert_eq!(
+        fixture
+            .db
+            .list_agent_chat_topics(&fixture.scope.scope_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let successor: String =
+        sqlx::query_scalar("SELECT runtime_session_id FROM agent_chat_topic WHERE id = ?")
+            .bind(&intent)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    let next_timeline: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+    )
+    .bind(&successor)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_ne!(source_timeline, next_timeline);
+    let store = fixture
+        .db
+        .get_current_agent_chat_topic(&fixture.scope.scope_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.id, intent);
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&fixture.scope.scope_id)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(pending, 0);
+}
+
+#[tokio::test]
+async fn pre_u7_resume_adopts_once_and_retired_timeline_still_loads() {
+    let fixture = chat_fixture().await;
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(text_only_provider(3));
+    backend
+        .run_turn(fixture.turn("First turn"), Arc::new(NoopSink))
+        .await
+        .unwrap();
+    let timeline: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+    )
+    .bind(&fixture.runtime_session_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE agent_lcm_timeline SET claim_owner = NULL, claim_generation = 0, scope_id = canonical_scope_id || '#retired:' || id, retired_at = ? WHERE id = ?")
+        .bind(now_rfc3339()).bind(&timeline).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("DELETE FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?")
+        .bind(&fixture.runtime_session_id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    backend
+        .run_turn(fixture.turn("Resume after upgrade"), Arc::new(NoopSink))
+        .await
+        .unwrap();
+    backend
+        .run_turn(fixture.turn("Resume again"), Arc::new(NoopSink))
+        .await
+        .unwrap();
+    let (owner, generation, retired): (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT claim_owner, claim_generation, retired_at FROM agent_lcm_timeline WHERE id = ?",
+    )
+    .bind(timeline)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(owner, fixture.runtime_session_id);
+    assert_eq!(generation, 1, "only the first upgraded resume adopts");
+    assert!(retired.is_some(), "historical V149 data is preserved");
+}
+
+#[derive(Debug, Default)]
+struct WorkingSetMeasurementProvider {
+    requests: std::sync::Mutex<Vec<(u32, agent_runtime::core::provider::ProviderRequest)>>,
+    ordinary: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl agent_runtime::core::provider::Provider for WorkingSetMeasurementProvider {
+    fn describe(&self) -> Vec<agent_runtime::core::provider::ModelDescriptor> {
+        Vec::new()
+    }
+    fn capabilities(&self, _: &agent_runtime::core::provider::ModelId) -> Option<Capabilities> {
+        Some(Capabilities::basic_streaming())
+    }
+    async fn stream(
+        &self,
+        request: agent_runtime::core::provider::ProviderRequest,
+        ctx: agent_runtime::core::provider::ProviderCallContext,
+    ) -> Result<
+        agent_runtime::core::provider::ProviderStream,
+        agent_runtime::core::provider::ProviderError,
+    > {
+        use agent_runtime::context::RequestSizer;
+        let sizer = agent_runtime::context::CharRatioSizer::default();
+        let tokens = request
+            .messages
+            .iter()
+            .map(|m| sizer.size_message(m))
+            .sum::<u32>()
+            + request
+                .tools
+                .iter()
+                .map(|t| sizer.size_tool_schema(t))
+                .sum::<u32>();
+        let summary = request.messages.first().is_some_and(|m| {
+            m.joined_text()
+                .starts_with("Summarize the supplied conversation")
+        });
+        self.requests
+            .lock()
+            .unwrap()
+            .push((tokens, request.clone()));
+        let events = if summary {
+            vec![ProviderStreamEvent::TextDelta { text: "The user is planning a Project. Preserve the constraints, prior decisions, and next actions; consult current state for authority.".into() }, usage_event(u64::from(tokens), 32), ProviderStreamEvent::Finish { reason: FinishReason::Stop }]
+        } else {
+            let call = self
+                .ordinary
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call & 1 == 0 {
+                vec![
+                    ProviderStreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: Some(format!("measurement-{call}")),
+                        name: Some("forge_scope_read".into()),
+                        arguments_fragment: serde_json::json!({"operation": "agent_chat.summary"})
+                            .to_string(),
+                    },
+                    usage_event(u64::from(tokens), 40),
+                    ProviderStreamEvent::Finish {
+                        reason: FinishReason::ToolCalls,
+                    },
+                ]
+            } else {
+                vec![
+                    ProviderStreamEvent::TextDelta {
+                        text: "Documented Project planning detail. ".repeat(480),
+                    },
+                    usage_event(u64::from(tokens), 4_000),
+                    ProviderStreamEvent::Finish {
+                        reason: FinishReason::Stop,
+                    },
+                ]
+            }
+        };
+        agent_runtime::core::provider::Provider::stream(
+            &*scripted_provider(vec![ScriptedStream::new(events)]),
+            request,
+            ctx,
+        )
+        .await
+    }
+}
+#[derive(Debug)]
+struct WorkingSetMeasurementReads {
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl forge_agent_host::ForgeToolProvider for WorkingSetMeasurementReads {
+    async fn read(
+        &self,
+        _: &str,
+        _: &CanonicalScope,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, forge_agent_host::AgentHostError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(
+            serde_json::json!({"charter": "Approved requirements and acceptance detail. ".repeat(760)}),
+        )
+    }
+    async fn propose(
+        &self,
+        _: &str,
+        _: &CanonicalScope,
+        _: &str,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, forge_agent_host::AgentHostError> {
+        unreachable!()
+    }
+}
+
+/// Forty native Project turns; records the actual planner-sized requests, including tool schemas.
+#[tokio::test]
+async fn forty_turn_project_working_set_measurement() {
+    let mut fixture = chat_fixture_with_policy(
+        serde_json::json!({"permissions": ["read_project", "read_agent_chat", "read_memory"]}),
+        serde_json::json!({"allowed": ["read_project", "read_agent_chat", "read_memory"]}),
+    )
+    .await;
+    let project = new_uuid_v4();
+    let now = now_rfc3339();
+    sqlx::query("INSERT INTO project (id, name, owner_id, version, created_at, updated_at) VALUES (?, 'Measurement Project', 'user-1', 1, ?, ?)")
+        .bind(&project).bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    let project_chat: String = sqlx::query_scalar("SELECT id FROM agent_chat WHERE project_id = ?")
+        .bind(&project)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    let original = db::AgentSessionRepo::get_agent_session(&*fixture.db, &fixture.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE project_agent_binding SET identity_id = ?, profile_id = ?, state = 'active', permission_ceiling_json = ? WHERE project_id = ?")
+        .bind(&original.identity_id).bind(&original.profile_id)
+        .bind(serde_json::json!({"allowed": ["read_project", "read_agent_chat", "read_memory"]}).to_string())
+        .bind(&project).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("INSERT OR IGNORE INTO project_member (id, project_id, user_id, role, created_at, updated_at) VALUES (?, ?, 'user-1', 'owner', ?, ?)")
+        .bind(new_uuid_v4()).bind(&project).bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    let session = fixture
+        .service
+        .create_or_resume_session(CreateScopedSession {
+            actor_user_id: "user-1".into(),
+            identity_id: original.identity_id,
+            profile_id: Some(original.profile_id),
+            scope: RequestedCanonicalScope::AgentChat {
+                chat_id: project_chat.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    fixture.session_id = session.id;
+    fixture.runtime_session_id = session.runtime_session_id.unwrap();
+    fixture.scope.scope_id = project_chat;
+    fixture.provider_config.context_tokens = 1_000_000;
+    fixture.provider_config.max_input_tokens = 800_000;
+    fixture.provider_config.max_output_tokens = 8_192;
+    let provider = Arc::new(WorkingSetMeasurementProvider::default());
+    let reads = Arc::new(WorkingSetMeasurementReads {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
+        .with_provider_override(provider.clone())
+        .with_forge_tool_provider(reads.clone());
+    let mut turn_maxima = Vec::new();
+    for turn in 0..40 {
+        let before = provider.requests.lock().unwrap().len();
+        let mut request = fixture.turn(&format!(
+            "Project planning turn {turn}: {}",
+            "Constraints and unresolved delivery questions. ".repeat(400)
+        ));
+        request.server_state_card = Some(format!(
+            "Project state card: turn {turn}; review current records before acting."
+        ));
+        backend
+            .run_turn(request, Arc::new(NoopSink))
+            .await
+            .unwrap_or_else(|error| panic!("measurement turn {turn}: {error}"));
+        let records = provider.requests.lock().unwrap();
+        let largest = records[before..]
+            .iter()
+            .filter(|(_, r)| {
+                !r.messages.first().is_some_and(|m| {
+                    m.joined_text()
+                        .starts_with("Summarize the supplied conversation")
+                })
+            })
+            .map(|(tokens, _)| *tokens)
+            .max()
+            .unwrap();
+        turn_maxima.push(largest);
+    }
+    assert_eq!(
+        reads.calls.load(std::sync::atomic::Ordering::SeqCst),
+        40,
+        "every turn must execute a real scoped tool read"
+    );
+    let mut sorted = turn_maxima.clone();
+    sorted.sort_unstable();
+    println!(
+        "WORKING_SET_MEASUREMENT turns=40 p50={} max={} per_turn={:?}",
+        sorted[19], sorted[39], turn_maxima
+    );
+    if std::env::var("FORGE_MEASUREMENT_EXPECT_CAP").as_deref() == Ok("1") {
+        assert!(
+            sorted[39] <= 128_000,
+            "Project's planner hard cap must apply to every request"
+        );
+    }
 }

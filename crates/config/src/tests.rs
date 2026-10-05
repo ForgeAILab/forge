@@ -901,3 +901,18 @@ fn run_budget_file_env_flag_precedence_and_validation() {
     assert_eq!(cfg.server.build_jobs_per_run, Some(0));
     assert_eq!(cfg.server.run_nice, 0);
 }
+
+#[test]
+fn working_set_file_and_env_settings_are_validated() {
+    let _guard = env_lock().lock().unwrap();
+    clear_forge_env();
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("forge.yaml");
+    fs::write(&path, "server:\n  main_working_set_target_tokens: 32000\n  main_working_set_hard_tokens: 48000\n  project_working_set_target_tokens: 64000\n  project_working_set_hard_tokens: 96000\n").unwrap();
+    let config = ForgeConfig::load(Some(&path), test_overrides(directory.path())).unwrap();
+    assert_eq!(config.server.main_working_set_target_tokens, 32000);
+    assert_eq!(config.server.project_working_set_hard_tokens, 96000);
+    env::set_var("FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS", "16000");
+    assert!(ForgeConfig::load(Some(&path), test_overrides(directory.path())).is_err());
+    env::remove_var("FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS");
+}

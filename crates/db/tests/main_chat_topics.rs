@@ -227,6 +227,8 @@ async fn database_with_ready_main_chat(name: &str) -> (SqliteDb, String) {
 fn rotate_input(chat_id: &str, topic_id: &str, label: &str) -> RotateAgentChatTopic {
     let now = now_rfc3339();
     RotateAgentChatTopic {
+        runtime_session_id: None,
+        rotation_owner: None,
         topic: CreateAgentChatTopic {
             id: topic_id.to_owned(),
             chat_id: chat_id.to_owned(),
@@ -434,4 +436,73 @@ async fn rotate_is_denied_while_a_genesis_session_needs_a_decision() {
         .await
         .expect("topics list");
     assert_eq!(topics.len(), 1, "only the backfilled topic exists");
+}
+
+#[tokio::test]
+async fn genesis_mark_is_atomic_and_idle_user_message_marks_one_durable_intent() {
+    let (db, chat_id) = database_with_ready_main_chat("durable-rotation").await;
+    let account: String = sqlx::query_scalar("SELECT account_id FROM agent_chat WHERE id = ?")
+        .bind(&chat_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO product_genesis_session (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity, lifecycle, version, created_at, updated_at) VALUES ('atomic-genesis', ?, ?, 'test', 'idea', 'mvp', 'discovering', 1, ?, ?)")
+        .bind(&account).bind(&chat_id).bind(&now).bind(&now).execute(&mut *tx).await.unwrap();
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(pending, 1);
+    tx.rollback().await.unwrap();
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        pending, 0,
+        "rolled-back Genesis must not leave a rotation mark"
+    );
+    for (id, time) in [
+        ("before-idle", "2026-08-10T00:00:00Z"),
+        ("after-idle", "2026-08-10T08:00:00Z"),
+    ] {
+        let mut message = db::topic_divider_message(
+            id.into(),
+            chat_id.clone(),
+            "user message",
+            id.into(),
+            time.into(),
+        );
+        message.author_type = AgentChatMessageAuthorType::User;
+        message.author_id = Some(account.clone());
+        AgentChatMessageRepo::append_agent_chat_message(&db, message)
+            .await
+            .unwrap();
+    }
+    let (id, cause, successor): (String, String, String) = sqlx::query_as(
+        "SELECT id, cause, successor_runtime_id FROM agent_chat_topic_rotation WHERE chat_id = ?",
+    )
+    .bind(&chat_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(cause, "idle");
+    assert!(!id.is_empty());
+    assert!(!successor.is_empty());
+    let replay = AgentChatTopicTransactionRepo::request_agent_chat_topic(
+        &db,
+        rotate_input(&chat_id, "another-request", "coalesced"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        replay, id,
+        "pending request keeps its crash-recovery identity"
+    );
 }

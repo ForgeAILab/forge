@@ -600,12 +600,20 @@ impl ForgeRuntimeBuilder {
         embedded_agent_service
             .set_public_search_config(Some(effective_config.public_search.clone()));
         embedded_agent_service.set_command_policy(&effective_config.commands);
+        embedded_agent_service.native_backend().set_working_sets(
+            effective_config.server.main_working_set_target_tokens,
+            effective_config.server.main_working_set_hard_tokens,
+            effective_config.server.project_working_set_target_tokens,
+            effective_config.server.project_working_set_hard_tokens,
+        );
         let agent_chat_service = Arc::new(crate::AgentChatService::new(Arc::clone(&self.db)));
-        let main_chat_topic_service = Arc::new(MainChatTopicService::new(
-            Arc::clone(&self.db),
-            Arc::clone(&agent_chat_service),
-            crate::ProductGenesisService::for_sqlite(Arc::clone(&self.db)),
-        ));
+        let main_chat_topic_service = Arc::new(
+            MainChatTopicService::new(Arc::clone(&self.db), Arc::clone(&agent_chat_service))
+                .with_rotator(Arc::new(crate::TopicRotationCoordinator::new(
+                    self.db.clone(),
+                    embedded_agent_service.clone(),
+                ))),
+        );
         let agent_chat_turn_logs =
             AgentChatTurnLogRoot::new(agent_chat_turn_log_root(&effective_config));
         let agent_inquiry_service =

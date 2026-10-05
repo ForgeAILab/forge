@@ -19,72 +19,12 @@ impl AgentLcmRepo for SqliteDb {
         input: CreateAgentLcmTimeline,
     ) -> Result<AgentLcmTimeline> {
         let mut transaction = crate::begin_immediate(self.pool()).await?;
-        let existing = sqlx::query(
-            "SELECT id, runtime_session_id, updated_at, authorization_revision,
-                    EXISTS(SELECT 1 FROM agent_lcm_entry e WHERE e.timeline_id = l.id)
-                        AS has_entries
-             FROM agent_lcm_timeline l
-             WHERE identity_id = ? AND scope_type = ? AND scope_id = ?",
-        )
-        .bind(&input.identity_id)
-        .bind(&input.scope_type)
-        .bind(&input.scope_id)
-        .fetch_optional(&mut *transaction)
-        .await?;
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM agent_lcm_timeline WHERE identity_id = ? AND scope_type = ? AND scope_id = ? AND authorization_revision = ?",
+        ).bind(&input.identity_id).bind(&input.scope_type).bind(&input.scope_id).bind(&input.authorization_revision)
+            .fetch_optional(&mut *transaction).await?;
+        let insert = existing.is_none();
         let claim = input.runtime_session.as_ref();
-        let insert = match existing {
-            None => true,
-            Some(row) => {
-                let id: String = row.try_get("id")?;
-                let authorization_revision: String = row.try_get("authorization_revision")?;
-                if authorization_revision != input.authorization_revision {
-                    return Err(DbError::Check(
-                        "LCM binding already exists with a different authorization revision"
-                            .to_owned(),
-                    ));
-                }
-                match claim {
-                    None => false,
-                    Some(claim) => {
-                        let owner: Option<String> = row.try_get("runtime_session_id")?;
-                        let updated_at: String = row.try_get("updated_at")?;
-                        let has_entries: bool = row.try_get("has_entries")?;
-                        let written_by_other_session = match owner.as_deref() {
-                            Some(owner) => owner != claim.runtime_session_id,
-                            None => rfc3339_before(&updated_at, &claim.session_created_at),
-                        };
-                        if written_by_other_session && has_entries {
-                            // The new session's canonical history is rebuilt
-                            // from the chat transcript and cannot continue
-                            // this timeline. Keep it, but free the scope.
-                            sqlx::query(
-                                "UPDATE agent_lcm_timeline
-                                 SET scope_id = scope_id || '#retired:' || id,
-                                     retired_at = ?
-                                 WHERE id = ?",
-                            )
-                            .bind(&input.updated_at)
-                            .bind(&id)
-                            .execute(&mut *transaction)
-                            .await?;
-                            true
-                        } else {
-                            if owner.as_deref() != Some(claim.runtime_session_id.as_str()) {
-                                sqlx::query(
-                                    "UPDATE agent_lcm_timeline SET runtime_session_id = ?
-                                     WHERE id = ?",
-                                )
-                                .bind(&claim.runtime_session_id)
-                                .bind(&id)
-                                .execute(&mut *transaction)
-                                .await?;
-                            }
-                            false
-                        }
-                    }
-                }
-            }
-        };
         if insert {
             sqlx::query(
                 "INSERT INTO agent_lcm_timeline (
@@ -232,6 +172,7 @@ impl AgentLcmRepo for SqliteDb {
         input: AppendAgentLcmEntries,
     ) -> Result<AgentLcmMutationResult> {
         let mut transaction = crate::begin_immediate(self.pool()).await?;
+        check_lcm_claim(&mut transaction, &input.timeline_id, input.claim.as_ref()).await?;
         if let Some(existing) = existing_operation(
             &mut transaction,
             &input.timeline_id,
@@ -350,8 +291,10 @@ impl AgentLcmRepo for SqliteDb {
         timeline_id: &str,
         from_sequence: i64,
         updated_at: &str,
+        claim: Option<&crate::AgentLcmClaimFence>,
     ) -> Result<AgentLcmTruncation> {
         let mut transaction = crate::begin_immediate(self.pool()).await?;
+        check_lcm_claim(&mut transaction, timeline_id, claim).await?;
         let current = timeline_revision(&mut transaction, timeline_id).await?;
         let node_reaches_span: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -394,6 +337,7 @@ impl AgentLcmRepo for SqliteDb {
 
     async fn commit_lcm_leaf(&self, input: CommitAgentLcmLeaf) -> Result<AgentLcmMutationResult> {
         let mut transaction = crate::begin_immediate(self.pool()).await?;
+        check_lcm_claim(&mut transaction, &input.timeline_id, input.claim.as_ref()).await?;
         if let Some(existing) = existing_operation(
             &mut transaction,
             &input.timeline_id,
@@ -496,6 +440,7 @@ impl AgentLcmRepo for SqliteDb {
         input: CommitAgentLcmCondensation,
     ) -> Result<AgentLcmMutationResult> {
         let mut transaction = crate::begin_immediate(self.pool()).await?;
+        check_lcm_claim(&mut transaction, &input.timeline_id, input.claim.as_ref()).await?;
         if let Some(existing) = existing_operation(
             &mut transaction,
             &input.timeline_id,
@@ -764,16 +709,6 @@ fn operation_result(
     }
 }
 
-fn rfc3339_before(left: &str, right: &str) -> bool {
-    match (
-        chrono::DateTime::parse_from_rfc3339(left),
-        chrono::DateTime::parse_from_rfc3339(right),
-    ) {
-        (Ok(left), Ok(right)) => left < right,
-        _ => false,
-    }
-}
-
 fn map_timeline(row: SqliteRow) -> Result<AgentLcmTimeline> {
     Ok(AgentLcmTimeline {
         id: row.try_get("id")?,
@@ -836,4 +771,25 @@ fn map_operation(row: SqliteRow) -> Result<AgentLcmOperation> {
         result_node_id: row.try_get("result_node_id")?,
         created_at: row.try_get("created_at")?,
     })
+}
+
+async fn check_lcm_claim(
+    transaction: &mut Transaction<'_, Sqlite>,
+    timeline_id: &str,
+    fence: Option<&crate::AgentLcmClaimFence>,
+) -> Result<()> {
+    let (owner, generation): (Option<String>, i64) =
+        sqlx::query_as("SELECT claim_owner, claim_generation FROM agent_lcm_timeline WHERE id = ?")
+            .bind(timeline_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+    let valid = match (&owner, fence) {
+        (None, None) => true,
+        (Some(owner), Some(fence)) => owner == &fence.owner && generation == fence.generation,
+        _ => false,
+    };
+    if !valid {
+        return Err(DbError::LcmTimelineOwned { owner, generation });
+    }
+    Ok(())
 }

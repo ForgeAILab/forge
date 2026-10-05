@@ -999,6 +999,20 @@ impl ScopeToolComposition {
         Ok(outcome.value)
     }
 
+    pub(crate) fn filter_results(mut self, filter: Arc<dyn ToolResultFilter>) -> Self {
+        self.tools = self
+            .tools
+            .into_iter()
+            .map(|inner| {
+                Arc::new(FilteredTool {
+                    inner,
+                    filter: filter.clone(),
+                }) as Arc<dyn Tool>
+            })
+            .collect();
+        self
+    }
+
     /// Wraps every composed tool so `observer` sees the exact call id and
     /// result immediately before it returns to the runtime.
     ///
@@ -1134,6 +1148,62 @@ impl Tool for TerminalDenialTool {
             }
         }
         Ok(result)
+    }
+}
+
+#[async_trait]
+pub(crate) trait ToolResultFilter: Send + Sync + fmt::Debug {
+    async fn filter(
+        &self,
+        call_id: &ToolCallId,
+        arguments: &Value,
+        outcome: ToolOutcome,
+    ) -> Result<ToolOutcome, RuntimeError>;
+}
+
+#[derive(Debug)]
+struct FilteredTool {
+    inner: Arc<dyn Tool>,
+    filter: Arc<dyn ToolResultFilter>,
+}
+#[async_trait]
+impl Tool for FilteredTool {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+    async fn prepare(
+        &self,
+        arguments: Value,
+        ctx: &PreparationContext,
+    ) -> Result<PreparedToolCall, RuntimeError> {
+        self.inner.prepare(arguments, ctx).await
+    }
+    fn supports_interaction(&self) -> bool {
+        self.inner.supports_interaction()
+    }
+    fn interaction_request(
+        &self,
+        prepared: &PreparedToolCall,
+        origin: InteractionOrigin,
+        deadline: Deadline,
+    ) -> Result<Option<InteractionRequest>, RuntimeError> {
+        self.inner.interaction_request(prepared, origin, deadline)
+    }
+    fn resolve_interaction(
+        &self,
+        prepared: &PreparedToolCall,
+        response: &InteractionResponse,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        self.inner.resolve_interaction(prepared, response)
+    }
+    async fn invoke(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        let arguments = prepared.arguments().clone();
+        let outcome = self.inner.invoke(prepared, ctx).await?;
+        self.filter.filter(&ctx.call_id, &arguments, outcome).await
     }
 }
 

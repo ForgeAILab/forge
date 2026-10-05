@@ -277,7 +277,7 @@ succeeds. The connection test itself updates the health row.
 | POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/retry` | Admit a new turn for a failed or cancelled turn’s triggering message using current authority; requires `expected_version` and `idempotency_key` |
 | GET    | `/api/v1/analytics/usage` | Read account-scoped typed usage/cost analytics across Task, Project/Main/Genesis Chat, and Main inquiry surfaces |
 | GET    | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — List the chat's immutable topic epochs, newest first, with the current one marked |
-| POST   | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — Start a new topic epoch in the same chat; denied while a turn is live or a Genesis session/approval needs an explicit decision |
+| POST   | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — Request a topic rotation in the same chat; completed immediately when idle, durably deferred while a turn is live |
 | GET    | `/api/v1/agent-chats/{chat_id}/inquiries` | `V130+` — List the chat's Main Agent inquiry runs with opaque keyset pagination |
 | GET    | `/api/v1/inquiries/{id}` | `V130+` — Read one Main Agent inquiry run |
 | GET    | `/api/v1/inquiries/{id}/logs` | `V130+` — One page of a sub-agent's durable activity log |
@@ -5020,3 +5020,10 @@ The web renders Task controls from live offers, including placement waits (`hold
 Solo's review card derives decisions from offers. Request changes collects nonblank guidance before submitting send-back; a required approval reason is collected before approval.
 
 Project doctrine @19 names `forge_scope_read` operation `work.read` for live Task offers and versions, and the `task.action` contract and required inputs. Migration V202610030100 adds it without changing @17/@18 bodies or digests, and advances current Project bindings. Frozen historical admissions remain immutable.
+
+Native topic rotation responses contain `rotation_pending`, nullable `topic`, and
+nullable `divider_message_id`. When pending, both nullable fields are `null`; the
+worker completes the durable request before admitting the next turn. When complete,
+`rotation_pending` is false and both topic/divider fields identify the new epoch.
+Repeated unchanged native `project.current_state`/`project.charter` tool reads within
+one topic return `{ "unchanged_since_call": "<call id>" }`.

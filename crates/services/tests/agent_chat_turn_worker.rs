@@ -951,7 +951,6 @@ async fn newer_message_turn_supersedes_retry_and_resolves_snoozed_incident() {
             services::MainChatTopicService::new(
                 db.clone(),
                 Arc::new(AgentChatService::new(db.clone())),
-                services::ProductGenesisService::for_sqlite(db.clone()),
             )
             .start_topic(services::StartMainChatTopicInput {
                 actor_user_id: ACCOUNT_ID.into(),
@@ -960,6 +959,43 @@ async fn newer_message_turn_supersedes_retry_and_resolves_snoozed_incident() {
                 summary: None,
             })
             .await
+            .unwrap();
+            // This fixture has a fake turn runner. Complete its durable intent
+            // through the topic transaction before checking attention supersession.
+            let intent: (String, String, String) = sqlx::query_as(
+                "SELECT id, label, created_at FROM agent_chat_topic_rotation WHERE chat_id = ?",
+            )
+            .bind(&job.chat_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            sqlx::query("UPDATE agent_chat_topic_rotation SET owner_token = 'attention-fixture' WHERE chat_id = ?")
+                .bind(&job.chat_id).execute(db.pool()).await.unwrap();
+            db::AgentChatTopicTransactionRepo::rotate_agent_chat_topic(
+                &*db,
+                db::RotateAgentChatTopic {
+                    runtime_session_id: None,
+                    rotation_owner: Some("attention-fixture".into()),
+                    topic: db::CreateAgentChatTopic {
+                        id: intent.0.clone(),
+                        chat_id: job.chat_id.clone(),
+                        label: intent.1.clone(),
+                        summary: None,
+                        principal_type: "system".into(),
+                        principal_id: None,
+                        created_at: intent.2.clone(),
+                    },
+                    divider_message: db::topic_divider_message(
+                        format!("divider:{}", intent.0),
+                        job.chat_id.clone(),
+                        &intent.1,
+                        "attention-fixture".into(),
+                        intent.2,
+                    ),
+                },
+            )
+            .await
+            .unwrap()
             .unwrap();
         } else {
             AgentChatService::new(db.clone())

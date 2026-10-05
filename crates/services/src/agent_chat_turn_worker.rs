@@ -565,6 +565,10 @@ impl AgentChatTurnLogRoot {
 
 #[async_trait]
 pub trait AgentChatTurnRunner: Send + Sync {
+    async fn rotate_pending_topic(&self, _chat_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     async fn run_turn(
         &self,
         job: &AgentChatTurnJob,
@@ -3588,6 +3592,14 @@ impl FederatedAgentChatTurnRunner {
 
 #[async_trait]
 impl AgentChatTurnRunner for FederatedAgentChatTurnRunner {
+    async fn rotate_pending_topic(&self, chat_id: &str) -> Result<bool> {
+        crate::TopicRotator::rotate_pending(
+            &crate::TopicRotationCoordinator::new(self.db.clone(), self.embedded_agents.clone()),
+            chat_id,
+        )
+        .await
+    }
+
     async fn validate_admission_authority(&self, job: &AgentChatTurnJob) -> Result<()> {
         if job.canonical_scope_type != "agent_chat" || job.canonical_scope_id != job.chat_id {
             return Err(ServiceError::invalid_operation(
@@ -3862,6 +3874,13 @@ impl AgentChatTurnWorker {
     }
 
     async fn claim_one_at(&self, now: chrono::DateTime<Utc>) -> Result<Option<AgentChatTurnJob>> {
+        let pending: Vec<String> = sqlx::query_scalar("SELECT chat_id FROM agent_chat_topic_rotation WHERE owner_token IS NULL OR julianday(lease_until) <= julianday(?) ORDER BY created_at ASC LIMIT 8")
+            .bind(now.to_rfc3339()).fetch_all(self.db.pool()).await?;
+        for chat_id in pending {
+            if let Err(error) = self.runner.rotate_pending_topic(&chat_id).await {
+                tracing::warn!(%chat_id, %error, "topic rotation deferred before turn admission");
+            }
+        }
         let now = now.to_rfc3339();
         let leased_until = lease_deadline();
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
@@ -3870,6 +3889,7 @@ impl AgentChatTurnWorker {
                  SELECT job.id
                  FROM agent_chat_turn_job AS job
                  WHERE job.status IN ('queued', 'retry_wait')
+                   AND NOT EXISTS (SELECT 1 FROM agent_chat_topic_rotation r WHERE r.chat_id = job.chat_id AND r.origin_turn_id IS NOT job.id)
                    AND job.attempt_count < job.max_attempts
                    AND (job.next_attempt_at IS NULL OR job.next_attempt_at <= ?)
                    -- A responder whose provider entry is backing off waits
