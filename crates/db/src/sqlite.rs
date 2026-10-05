@@ -142,6 +142,13 @@ mod workspace_placement;
 
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
+    pub(crate) task_step_controls: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Arc<crate::task_writer::TaskStepControl>>,
+        >,
+    >,
+    pub(crate) task_step_executor:
+        Arc<std::sync::Mutex<Option<std::sync::Weak<dyn crate::task_writer::TaskStepExecutor>>>>,
     pub server_run_cap: Arc<crate::machine_capacity::MachineRunCap>,
     pool: SqlitePool,
     pub(crate) task_step_activity:
@@ -160,6 +167,8 @@ impl SqliteDb {
         let domain_event_hooks = crate::connection::domain_event_hooks(&pool);
         Self {
             pool,
+            task_step_controls: Default::default(),
+            task_step_executor: Default::default(),
             task_step_activity: Default::default(),
             readiness_decode_warnings: Default::default(),
             domain_event_hooks,
@@ -246,11 +255,13 @@ const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow
 /// `version`, forming a generation boundary that rejects an in-flight stale
 /// disposition writer after the Project authority changes.
 pub(crate) async fn wake_dispatch_for_project_in_tx(
+    db: &SqliteDb,
     transaction: &mut Transaction<'_, Sqlite>,
     project_id: &str,
     updated_at: &str,
 ) -> Result<u64> {
-    let result = sqlx::query(
+    let result = crate::task_writer::BulkTaskQuery::new(
+        db,
         "UPDATE task
          SET metadata_json = NULLIF(
                  json_remove(metadata_json, '$.dispatch_disposition', '$.deferred_dispatch'),
@@ -268,9 +279,9 @@ pub(crate) async fn wake_dispatch_for_project_in_tx(
     )
     .bind(updated_at)
     .bind(project_id)
-    .execute(&mut **transaction)
+    .execute_in_tx(transaction)
     .await?;
-    Ok(result.rows_affected())
+    Ok(result.tasks())
 }
 
 fn limit(page: &PageRequest) -> i64 {
@@ -755,6 +766,29 @@ impl SqliteDb {
         admission: Option<&ExecutionAdmission>,
     ) -> Result<Execution> {
         if input.status == ExecutionStatus::Running {
+            if !crate::task_writer::owns_task(&input.task_id) {
+                return Err(DbError::Check(
+                    "execution admission requires the Task step".to_owned(),
+                ));
+            }
+            self.fence_current_step_in_tx(transaction).await?;
+        }
+        if input.status == ExecutionStatus::Running {
+            if let Some(workspace_id) = &input.workspace_id {
+                let pending: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pending_remote_cancel WHERE workspace_id=?)",
+                )
+                .bind(workspace_id)
+                .fetch_one(&mut **transaction)
+                .await?;
+                if pending {
+                    return Err(DbError::Check(
+                        "workspace has an unconfirmed remote cancellation".to_owned(),
+                    ));
+                }
+            }
+        }
+        if input.status == ExecutionStatus::Running {
             if let Some(admission) = admission {
                 Self::ensure_task_execution_admission_in_tx(transaction, input, admission).await?;
             }
@@ -1087,7 +1121,8 @@ impl SqliteDb {
         .ok_or(DbError::NotFound)?;
         let actual_version: i64 = row.try_get("version")?;
         let actual_status: String = row.try_get("status")?;
-        if actual_version != admission.expected_task_version
+        if (!crate::task_writer::owns_task(task_id)
+            && actual_version != admission.expected_task_version)
             || actual_status != admission.expected_task_status
         {
             return Err(DbError::VersionConflict);

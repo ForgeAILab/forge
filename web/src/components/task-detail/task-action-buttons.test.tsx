@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { toast } from 'sonner'
 import { ApiError } from '@/api/client'
 import type { Offer } from '@/types/generated'
 import { TaskActionButtons } from './task-action-buttons'
@@ -122,6 +123,30 @@ describe('descriptor action forms', () => {
       expect(mutate.mock.calls[1][0].version).toBe(6)
     },
   )
+  it('treats task_busy as accepted and queued, not as changed actions', async () => {
+    const info = vi.spyOn(toast, 'info').mockImplementation(() => '')
+    const error = vi.spyOn(toast, 'error').mockImplementation(() => '')
+    mutate.mockImplementation((_request, callbacks) =>
+      callbacks.onError(
+        new ApiError('busy', 409, '', {
+          code: 'task_busy',
+          message: 'Task has pending steps; accepted work remains queued',
+          request_id: '',
+          details: { pending_steps: 1, retry_after_ms: 250, retry_hint: 'Refetch' },
+        }),
+      ),
+    )
+    mount(offer({ verb: 'start' }))
+    fireEvent.click(screen.getByRole('button', { name: 'start' }))
+    await waitFor(() =>
+      expect(info).toHaveBeenCalledWith('Queued; it will apply after the current step'),
+    )
+    expect(error).not.toHaveBeenCalled()
+    expect(apiFetch).not.toHaveBeenCalled()
+    expect(screen.queryByRole('status')).toBeNull()
+    info.mockRestore()
+    error.mockRestore()
+  })
   it('requires a reason for a one-shot retry when reset_budget is false', () => {
     mount(
       offer({ verb: 'retry', reset_budget: true }, [

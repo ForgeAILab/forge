@@ -29,7 +29,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
 import { getAvailableTaskTransitions } from '@/components/task-controls'
-import { getApiErrorMessage, isTransientApiError } from '@/lib/api-error'
+import { getApiErrorMessage, isTransientApiError, notifyTaskBusy } from '@/lib/api-error'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
 import type { Review } from '@/types/generated'
@@ -226,6 +226,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
             toast.error(msg)
             return
           }
+          if (notifyTaskBusy(error)) return
           toast.error(getApiErrorMessage(error, 'Transition failed'))
         },
       },

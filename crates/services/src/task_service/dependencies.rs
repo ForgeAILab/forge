@@ -11,6 +11,16 @@ pub enum TaskDependencyAction {
 
 impl TaskService {
     pub async fn add_task_dependency(&self, task_id: &str, depends_on_id: &str) -> Result<()> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "add_task_dependency",
+                    serde_json::json!([task_id, depends_on_id]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", task_id)?;
         validate_required("depends_on_id", depends_on_id)?;
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
@@ -40,6 +50,16 @@ impl TaskService {
     }
 
     pub async fn remove_task_dependency(&self, task_id: &str, depends_on_id: &str) -> Result<()> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "remove_task_dependency",
+                    serde_json::json!([task_id, depends_on_id]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", task_id)?;
         validate_required("depends_on_id", depends_on_id)?;
         TaskDependencyRepo::remove_dependency(&*self.db, task_id, depends_on_id).await?;
@@ -137,6 +157,32 @@ impl TaskService {
         task: &Task,
         cancelled_dependency_ids: &[String],
     ) -> Result<Task> {
+        if !db::task_writer::owns_task(&task.id) {
+            if db::task_writer::current_task_step().is_some() {
+                // Identity-fenced (TaskCommand::fence): a dependency block is
+                // never lost to a status change or a preempting Hold.
+                self.enqueue_task_command(
+                    &task.id,
+                    "block_cancelled_dependencies",
+                    serde_json::json!([task.id, cancelled_dependency_ids]),
+                    false,
+                )
+                .await?;
+                return Ok(task.clone());
+            }
+            return self
+                .request_task_command(
+                    &task.id,
+                    "block_cancelled_dependencies",
+                    serde_json::json!([task.id, cancelled_dependency_ids]),
+                    false,
+                )
+                .await;
+        }
+        let current_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        let task = &current_task;
         if cancelled_dependency_ids.is_empty() {
             return Ok(task.clone());
         }
@@ -187,8 +233,8 @@ impl TaskService {
         })
         .to_string();
 
-        let mut current = task.clone();
-        for attempt in 0..3 {
+        let current = task.clone();
+        {
             match TaskRepo::update(
                 &*self.db,
                 db::UpdateTask {
@@ -222,20 +268,11 @@ impl TaskService {
                             execution_id: None,
                         },
                     });
-                    return Ok(updated);
+                    Ok(updated)
                 }
-                Err(db::DbError::VersionConflict) if attempt < 2 => {
-                    current = TaskRepo::get_by_id(&*self.db, &current.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", current.id.clone()))?;
-                    if current.blocked_json.is_some() || current.failed_json.is_some() {
-                        return Ok(current);
-                    }
-                }
-                Err(error) => return Err(error.into()),
+                Err(error) => Err(error.into()),
             }
         }
-        Ok(current)
     }
 
     pub(super) async fn block_dependents_of_cancelled_task(&self, task: &Task) -> Result<()> {

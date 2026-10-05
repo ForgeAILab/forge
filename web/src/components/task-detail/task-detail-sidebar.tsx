@@ -267,7 +267,7 @@ export function TaskDetailSidebar({
 
             {(task.placement ?? task.workspace?.placement) ? (
               <div className="pb-4">
-                <TaskWorkspacePlacement placement={task.placement ?? task.workspace?.placement} />
+                <TaskWorkspacePlacement placement={task.placement ?? task.workspace?.placement} pendingRemoteCancelCount={task.workspace?.pending_remote_cancel.length ?? 0} />
                 <TaskPlacementDiagnostics diagnostics={task.placement_diagnostics ?? []} />
               </div>
             ) : null}

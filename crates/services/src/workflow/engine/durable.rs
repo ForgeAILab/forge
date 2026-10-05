@@ -206,9 +206,6 @@ impl WorkflowEngine {
         let mut task = TaskRepo::get_by_id(&*self.db, &step.task_id, false)
             .await?
             .ok_or(db::DbError::NotFound)?;
-        if task.status != step.expected_status || !self.db.step_entry_matches(step).await? {
-            return Err(db::DbError::VersionConflict.into());
-        }
         let task_id = task.id.clone();
         let current_status = payload.from.clone();
         let target_state = payload.to.clone();

@@ -223,6 +223,16 @@ impl TaskService {
         let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
+        if !db::task_writer::owns_task(&execution.task_id) {
+            return self
+                .request_task_command(
+                    &execution.task_id,
+                    "start_execution",
+                    serde_json::json!([execution_id]),
+                    false,
+                )
+                .await;
+        }
         if execution.status != ExecutionStatus::Running {
             return Err(ServiceError::invalid_operation(
                 "only running executions can be started",

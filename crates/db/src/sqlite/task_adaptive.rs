@@ -145,7 +145,13 @@ pub(super) async fn apply_adaptive_task_command(
     db: &SqliteDb,
     input: ApplyAdaptiveTaskCommand,
 ) -> Result<AppliedAdaptiveTaskCommand> {
+    if !crate::task_writer::owns_task(&input.source_task_id) {
+        return Err(DbError::Check(
+            "adaptive command requires the Task step".to_owned(),
+        ));
+    }
     let mut tx = crate::begin_immediate(db.pool()).await?;
+    db.fence_current_step_in_tx(&mut tx).await?;
     let receipt_input = input
         .command_receipt
         .clone()

@@ -1176,6 +1176,7 @@ export interface WorkspacePlacementResponse {
 }
 
 export interface Workspace {
+  pending_remote_cancel: import("./bindings/PendingRemoteCancel").PendingRemoteCancel[]
   id: string
   task_id: string
   repo_id: string
@@ -1596,6 +1597,7 @@ export interface PeriodicWorkerStatus {
 }
 
 export interface OperatorStatusResponse {
+  pending_remote_cancels: number
   usage_index: UsageIndexStatus
   event_relay: EventRelayStatus
   event_consumers: EventConsumerStatus[]

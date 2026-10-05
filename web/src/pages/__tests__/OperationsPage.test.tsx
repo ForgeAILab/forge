@@ -81,6 +81,7 @@ const usageSummary: UsageAggregate = {
 }
 
 const degradedStatus: OperatorStatusResponse = {
+  pending_remote_cancels: 0,
   periodic_workers: [],
   task_steps: {
     worker_name: 'task_steps',

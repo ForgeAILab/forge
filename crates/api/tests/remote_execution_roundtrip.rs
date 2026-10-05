@@ -553,6 +553,13 @@ async fn remote_daemon_disconnect_suspends_server_workspace_until_expiry() {
     assert_eq!(execution.status, DbExecutionStatus::Failed);
     assert_eq!(execution.stop_reason, Some(StopReason::DaemonDisconnected));
 
+    fixture
+        .harness
+        .state
+        .task_service
+        .drain(&task_id)
+        .await
+        .expect("owner recovery annotation step settles");
     let task = TaskRepo::get_by_id(&*fixture.harness.state.db, &task_id, false)
         .await
         .expect("task loads")

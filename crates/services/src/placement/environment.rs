@@ -228,8 +228,8 @@ async fn record_probe_error(
         .expect("machine")
         .to_string();
     // Only matching Task waits receive diagnostics; readiness facts are unchanged.
-    sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.environment_wait.last_error',?,'$.deferred_dispatch.reason',COALESCE(json_extract(metadata_json,'$.deferred_dispatch.reason'),'environment_probe_pending') || '; last failure: ' || ?) WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND json_extract(metadata_json,'$.environment_wait.kind')='environment_probe_pending'")
-        .bind(&error).bind(&error).bind(&row.project_id).bind(machine).execute(&mut *tx).await?;
+    db::task_writer::BulkTaskQuery::new(db,"UPDATE task SET metadata_json=json_set(metadata_json,'$.environment_wait.last_error',?,'$.deferred_dispatch.reason',COALESCE(json_extract(metadata_json,'$.deferred_dispatch.reason'),'environment_probe_pending') || '; last failure: ' || ?) WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND json_extract(metadata_json,'$.environment_wait.kind')='environment_probe_pending'")
+        .bind(&error).bind(&error).bind(&row.project_id).bind(machine).execute_in_tx(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -967,9 +967,13 @@ pub(crate) async fn defer_refusal(
     }) {
         return Ok(Some(true));
     }
-    let changed = sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?), '$.environment_wait', json(?)) WHERE id = ? AND version = ?")
-        .bind(marker.to_string()).bind(wait.to_string()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
-    if changed.rows_affected() != 1 {
+    // The dispatcher refuses outside the Task lease, where this wait is
+    // queued: identity-fenced to the status it was computed for, so it lands
+    // unless the Task has moved on (then it is moot).
+    let changed = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?), '$.environment_wait', json(?)) WHERE id = ? AND version = ? AND status = ?")
+        .bind(marker.to_string()).bind(wait.to_string()).bind(&task.id).bind(task.version).bind(&task.status)
+        .identity_fenced().execute_in_tx(&mut tx).await?;
+    if changed.applied().is_some_and(|rows| rows != 1) {
         return Err(db::DbError::VersionConflict.into());
     }
     tx.commit().await?;
@@ -1093,8 +1097,15 @@ pub(crate) async fn persist_machine_wait(
         .get("environment_wait")
         == Some(&marker);
     let deferral = serde_json::json!({"kind":"environment_not_ready","reason":format!("environment_not_ready: {} ({})",label,checks.join(", ")),"target_state":task.status,"not_before":(chrono::Utc::now()+chrono::Duration::seconds(30)).to_rfc3339()});
-    sqlx::query("UPDATE task SET metadata_json = json_set(json_remove(COALESCE(metadata_json, '{}'), '$.owner_wait'), '$.environment_wait', json(?), '$.deferred_dispatch', json(?)) WHERE id = ? AND version = ?")
-        .bind(marker.to_string()).bind(deferral.to_string()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
+    // Queued outside the lease (dispatcher admission): identity-fenced to the
+    // status this wait belongs to, so the event below never describes a wait
+    // that a status change silently dropped.
+    let written = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json = json_set(json_remove(COALESCE(metadata_json, '{}'), '$.owner_wait'), '$.environment_wait', json(?), '$.deferred_dispatch', json(?)) WHERE id = ? AND version = ? AND status = ?")
+        .bind(marker.to_string()).bind(deferral.to_string()).bind(&task.id).bind(task.version).bind(&task.status)
+        .identity_fenced().execute_in_tx(&mut tx).await?;
+    if written.applied().is_some_and(|rows| rows != 1) {
+        return Err(db::DbError::VersionConflict.into());
+    }
     if !unchanged {
         let now = db::now_rfc3339();
         let event_id = db::new_uuid_v4();
@@ -1272,6 +1283,7 @@ mod tests {
         record_probe_error(&db, &row, "daemon offline: hidden-value")
             .await
             .unwrap();
+        crate::test_support::drain_task_steps(&db, "probe-wait").await;
         let metadata: String =
             sqlx::query_scalar("SELECT metadata_json FROM task WHERE id='probe-wait'")
                 .fetch_one(db.pool())

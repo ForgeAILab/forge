@@ -290,19 +290,23 @@ impl TaskService {
             .to_string()
         });
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let result = sqlx::query("UPDATE task SET metadata_json = CASE WHEN ? IS NULL THEN
+        let result = db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET metadata_json = CASE WHEN ? IS NULL THEN
             json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
             json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
             error_annotation = COALESCE(?, error_annotation),
-            blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + ? WHERE id = ? AND version = ?")
+            blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + ? WHERE id = ? AND version = ? AND status = ?")
             .bind(&deferral).bind(&deferral).bind(&annotation).bind(&blocked).bind(now.to_rfc3339()).bind(i64::from(!unchanged_reason))
-            .bind(&task.id).bind(task.version).execute(&mut *tx).await?;
-        if result.rows_affected() != 1 {
+            .bind(&task.id).bind(task.version).bind(&task.status).identity_fenced().execute_in_tx(&mut tx).await?;
+        // The dispatcher records refusals outside the Task lease, where this
+        // blocking deferral is queued. It is identity-fenced to the status it
+        // was computed for: it lands unless the Task moved on (then moot), so
+        // the attention recorded below is not based on a dropped write.
+        if result.applied().is_some_and(|rows| rows != 1) {
             return Err(DbError::VersionConflict.into());
         }
         if let Some(owner_wait) = owner_wait.filter(|_| !unchanged_reason) {
-            sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ?")
-                .bind(owner_wait).bind(&task.id).execute(&mut *tx).await?;
+            let _queued_or_applied = db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ? AND status = ?")
+                .bind(owner_wait).bind(&task.id).bind(&task.status).identity_fenced().execute_in_tx(&mut tx).await?;
         }
         if daemon_id.is_some() && !unchanged_reason {
             crate::placement::admission::record_wait_attention_in_tx(
@@ -341,6 +345,16 @@ impl TaskService {
         if !expired || task.blocked_json.is_some() {
             return Ok(false);
         }
+        if !db::task_writer::owns_task(&task.id) {
+            return self
+                .request_task_command(
+                    &task.id,
+                    "expire_owner_wait",
+                    serde_json::json!([task.id]),
+                    false,
+                )
+                .await;
+        }
         let error = ServiceError::DaemonUnavailable {
             daemon_id: daemon_id.into(),
         };
@@ -359,8 +373,8 @@ impl TaskService {
             return Ok(true);
         }
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?")
-            .bind(&task.id).bind(current.version).execute(&mut *tx).await?;
+        db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?")
+            .bind(&task.id).bind(current.version).execute_in_tx(&mut tx).await?.require_applied()?;
         sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
             .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id))
             .bind(format!("task-environment-wait:{}", task.id)).execute(&mut *tx).await?;
@@ -1170,14 +1184,15 @@ impl TaskService {
             context.environment_admission = admission.environment_admission;
             crate::placement::select_placement(&context).into_result()?;
         }
-        sqlx::query(
+        db::task_writer::TaskQuery::new(&self.db,&task.id,
             "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.environment_wait', '$.deferred_dispatch')
             WHERE id = ? AND (json_type(metadata_json, '$.owner_wait') IS NOT NULL
             OR json_type(metadata_json, '$.environment_wait') IS NOT NULL)",
         )
         .bind(&task.id)
-        .execute(&mut **transaction)
-        .await?;
+        .execute_in_tx(transaction)
+        .await?
+        .require_applied()?;
         sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
             WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
             .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id))
@@ -2327,6 +2342,7 @@ pub(super) async fn reset_daemon_workspace(
         .bind(prepared.base_sha).bind(prepared.branch).bind(now_rfc3339()).bind(&workspace.id)
         .execute(&mut *transaction).await?;
     crate::placement::admission::resolve_workspace_attention_in_tx(
+        db,
         &mut transaction,
         &placement.task_id,
     )
@@ -3233,12 +3249,15 @@ mod tests {
             Some(daemon.id.as_str())
         );
         let admission = service.prepare_claim_workspace(admission).await.unwrap();
+        // Claim checks placement inside the Task's claim step.
+        let lease = crate::test_support::TestTaskLease::claim(&db, &task.id).await;
         let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
-        service
-            .check_claim_placement_in_tx(&mut transaction, &task, &admission)
+        lease
+            .run(service.check_claim_placement_in_tx(&mut transaction, &task, &admission))
             .await
             .unwrap();
         transaction.rollback().await.unwrap();
+        lease.release().await;
         assert_eq!(execution_count(&db, &task.id).await, 0);
     }
 
@@ -3898,17 +3917,21 @@ mod tests {
             second.placement.workspace_handle
         );
         assert_eq!(first.placement.generation, second.placement.generation);
+        // Claim checks placement inside the Task's claim step.
+        let lease = crate::test_support::TestTaskLease::claim(&db, &task.id).await;
         let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
         assert!(matches!(
-            service
-                .check_claim_placement_in_tx(&mut transaction, &task, &first)
+            lease
+                .run(service.check_claim_placement_in_tx(&mut transaction, &task, &first))
                 .await,
             Err(ServiceError::Db(DbError::VersionConflict))
         ));
-        assert!(service
-            .check_claim_placement_in_tx(&mut transaction, &task, &second)
+        assert!(lease
+            .run(service.check_claim_placement_in_tx(&mut transaction, &task, &second))
             .await
             .is_ok());
+        transaction.rollback().await.unwrap();
+        lease.release().await;
     }
 
     #[tokio::test]
@@ -4932,6 +4955,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attention, 1);
+        service.drain(&task.id).await.unwrap();
         let waiting = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -4946,6 +4970,7 @@ mod tests {
             .defer_placement_refusal(&waiting, &refusal)
             .await
             .unwrap());
+        service.drain(&task.id).await.unwrap();
         let again = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -4960,12 +4985,14 @@ mod tests {
         assert_eq!(unchanged, attention_version);
         sqlx::query("UPDATE task SET metadata_json = json_set(metadata_json, '$.owner_wait.started_at', ?) WHERE id = ?")
             .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339()).bind(&task.id).execute(db.pool()).await.unwrap();
+        let service = Arc::new(service);
         let dispatcher = crate::task_dispatcher::TaskDispatcher::new(
             db.clone(),
             Arc::new(EventBus::default()),
-            Arc::new(service),
+            service.clone(),
         );
         dispatcher.check_once().await.unwrap();
+        service.drain(&task.id).await.unwrap();
         let task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -5159,12 +5186,15 @@ mod tests {
                 .reserve_claim_workspace(&task, Some(&agent), "interactive")
                 .await
                 .unwrap();
+            // Claim checks placement inside the Task's claim step.
+            let lease = crate::test_support::TestTaskLease::claim(&db, &task.id).await;
             let mut tx = db::begin_immediate(db.pool()).await.unwrap();
-            service
-                .check_claim_placement_in_tx(&mut tx, &task, &admission)
+            lease
+                .run(service.check_claim_placement_in_tx(&mut tx, &task, &admission))
                 .await
                 .unwrap();
             tx.rollback().await.unwrap();
+            lease.release().await;
             assert!(
                 outbound.try_recv().is_err(),
                 "{state}: daemon admission never proactively probes or runs another workspace"

@@ -1693,3 +1693,87 @@ async fn workspace_run_applies_machine_build_environment_and_niceness() {
         assert_eq!(nice, expected);
     }
 }
+
+#[tokio::test]
+async fn cancel_running_workspace_command_kills_group_and_blocks_delayed_start() {
+    let fixture = Arc::new(Fixture::new().await);
+    let pid_file = fixture.dir.path().join("cancel-pid");
+    let mut params = fixture.run(
+        "cancel-ci",
+        WorkspaceRunPurpose::CiStep,
+        &format!(
+            "printf '%s' $$ > '{}'; sleep 120; touch never",
+            pid_file.display()
+        ),
+    );
+    params.timeout_secs = 0;
+    let running = fixture.clone();
+    let handler = tokio::spawn(async move {
+        running
+            .backend
+            .handle(
+                METHOD_WORKSPACE_RUN,
+                serde_json::to_value(params).unwrap(),
+                Vec::new,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !pid_file.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let ack: WorkspaceCancelResult = serde_json::from_value(
+        fixture
+            .backend
+            .handle(
+                METHOD_WORKSPACE_CANCEL,
+                serde_json::json!({"operation_id":"cancel-ci"}),
+                Vec::new,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ack.state, WorkspaceCancelState::Killed);
+    assert!(handler.await.unwrap().is_err());
+    assert!(!fixture.path().join("never").exists());
+    let unknown: WorkspaceCancelResult = serde_json::from_value(
+        fixture
+            .backend
+            .handle(
+                METHOD_WORKSPACE_CANCEL,
+                serde_json::json!({"operation_id":"delayed-ci"}),
+                Vec::new,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unknown.state, WorkspaceCancelState::Unknown);
+    let delayed = fixture.run("delayed-ci", WorkspaceRunPurpose::CiStep, "touch delayed");
+    assert!(fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_RUN,
+            serde_json::to_value(delayed).unwrap(),
+            Vec::new
+        )
+        .await
+        .is_err());
+    assert!(!fixture.path().join("delayed").exists());
+}
+
+#[test]
+fn cancel_tombstones_are_pruned_seven_days_after_acknowledgment() {
+    let mut registry = WorkspaceRegistry::default();
+    registry.record_cancel_tombstone("old", 1_000);
+    registry.record_cancel_tombstone("recent", 1_000 + CANCEL_TOMBSTONE_RETENTION_SECS - 1);
+    assert!(registry.cancel_tombstones.contains_key("old"));
+    registry.record_cancel_tombstone("new", 1_000 + CANCEL_TOMBSTONE_RETENTION_SECS);
+    assert!(!registry.cancel_tombstones.contains_key("old"));
+    assert!(registry.cancel_tombstones.contains_key("recent"));
+    assert!(registry.cancel_tombstones.contains_key("new"));
+}

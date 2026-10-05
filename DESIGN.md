@@ -650,3 +650,11 @@ Task action buttons render server labels and meaningful parameters. Use the exis
 ### Task action forms
 
 Use existing outline buttons, Dialog, Label and Textarea primitives. Offers supply labels and fields; required text is labelled and blocks Apply while blank. Boolean selects show only offered choices. Cancellation copy states subtask propagation. Changed-action notices use a polite status region. Dialog content scrolls within the viewport, keeping all inputs reachable.
+
+### Pending remote workspace cleanup
+
+Reuse the Workspace placement status section and its warning notice tokens.
+Show “Remote cleanup pending” with a plain explanation that the owner must confirm
+remote work stopped before workspace reuse. The existing status region announces
+the state; no extra control is added. Operations reuses StatCard for the pending
+remote cleanup count. Existing wrapping, loading, error and responsive rules apply.

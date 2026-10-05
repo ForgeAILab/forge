@@ -66,6 +66,17 @@ impl TaskService {
         prompt: String,
         trigger: &str,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_role_follow_up",
+                    serde_json::json!([task_id, role, parent_execution_id, prompt, trigger]),
+                    false,
+                )
+                .await;
+        }
+
         dispatch_role_follow_up_impl(
             self.clone(),
             task_id.to_owned(),
@@ -92,6 +103,23 @@ impl TaskService {
         trigger: &str,
         admission: db::ExecutionAdmission,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_role_follow_up_with_admission",
+                    serde_json::json!([
+                        task_id,
+                        role,
+                        parent_execution_id,
+                        prompt,
+                        trigger,
+                        admission
+                    ]),
+                    false,
+                )
+                .await;
+        }
         dispatch_role_follow_up_impl(
             self.clone(),
             task_id.to_owned(),
@@ -114,6 +142,23 @@ impl TaskService {
         prompt: String,
         trigger: &str,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_role_follow_up_with_agent",
+                    serde_json::json!([
+                        task_id,
+                        role,
+                        parent_execution_id,
+                        agent_id,
+                        prompt,
+                        trigger
+                    ]),
+                    false,
+                )
+                .await;
+        }
         dispatch_role_follow_up_impl(
             self.clone(),
             task_id.to_owned(),

@@ -275,7 +275,7 @@ pub trait TaskRepo: Send + Sync {
 /// Metadata is a shared extension point.  A whole-document read/modify/write
 /// is not safe when independent dispatcher, recovery, and workflow paths each
 /// own a different key, so those paths use this operation instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LatestExecutionAuthority {
     pub execution_id: String,
     pub role: String,
@@ -284,7 +284,7 @@ pub struct LatestExecutionAuthority {
     pub expected_project_version: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LatestExecutionMetadataClaim {
     pub task_id: String,
     pub expected_task_version: i64,
@@ -294,7 +294,7 @@ pub struct LatestExecutionMetadataClaim {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TaskMetadataMutation {
     Set {
         key: String,
@@ -1808,7 +1808,7 @@ pub trait ScopedMemoryRepository: Send + Sync {
 
 /// Producer of a terminal review mutation; human decisions never impersonate
 /// the runner's completion notification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReviewEventOrigin {
     Runner,
     User,
@@ -2929,19 +2929,27 @@ pub struct CreateTask {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateTask {
     pub id: String,
     pub expected_version: i64,
     pub title: Option<String>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub description: Option<Option<String>>,
     pub priority: Option<i64>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub merge_config: Option<Option<String>>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub plan: Option<Option<String>>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub error_annotation: Option<Option<String>>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub blocked_json: Option<Option<String>>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub failed_json: Option<Option<String>>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub task_state_config: Option<Option<String>>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub parent_task_id: Option<Option<String>>,
     pub updated_at: String,
 }
@@ -2986,25 +2994,29 @@ pub struct ClaimTask {
     pub claimed_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClaimedTask {
     pub task: Task,
     pub execution: Execution,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateTaskStatus {
     pub id: String,
     pub expected_version: i64,
     pub status: String,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub assignee_id: Option<Option<String>>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub error_annotation: Option<Option<String>>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub blocked_json: Option<Option<String>>,
+    #[serde(with = "crate::task_writer::nested_option")]
     pub failed_json: Option<Option<String>>,
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateExecution {
     pub id: String,
     pub task_id: String,
@@ -3033,7 +3045,7 @@ pub struct CreateExecution {
 /// The Task facts used to choose a role execution.  These are checked again
 /// in the same SQLite transaction as the execution INSERT so a transition
 /// between the dispatcher's final read and admission fails closed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionAdmission {
     /// Only the replay owning this exact intent may consume it at admission.
     pub expected_queued_recovery_id: Option<String>,
@@ -3088,7 +3100,7 @@ pub struct ExecutionAdmission {
     pub expected_workflow_definition: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RestoreQueuedRecovery {
     pub task_id: String,
     pub expected_version: i64,
@@ -3467,7 +3479,7 @@ pub struct AdmittedAgentHandoff {
     pub turn: AgentChatTurnJob,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateReview {
     pub id: String,
     pub task_id: String,
@@ -3494,7 +3506,7 @@ pub struct SettleCarriedReview {
     pub occurred_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateManualReviewPass {
     pub id: String,
     pub source_review_id: String,

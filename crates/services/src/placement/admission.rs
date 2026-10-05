@@ -165,14 +165,17 @@ pub(crate) async fn record_fence_rejection(
 }
 
 pub(crate) async fn resolve_workspace_attention_in_tx(
+    db: &SqliteDb,
     tx: &mut Transaction<'_, Sqlite>,
     task_id: &str,
 ) -> Result<()> {
     let now = db::now_rfc3339();
     // Existing successful admission and move-on paths already call this resolver.
     // Clear only the machine wait's own deferral, preserving unrelated blockers.
-    sqlx::query("UPDATE task SET metadata_json = json_remove(CASE WHEN json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' THEN json_remove(metadata_json, '$.deferred_dispatch') ELSE metadata_json END, '$.environment_wait') WHERE id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.environment_wait') IS NOT NULL")
-        .bind(task_id).execute(&mut **tx).await?;
+    // Clears only its own marker, so a queued clear is identity-fenced and
+    // applies even if the Task changes status first.
+    let _queued_or_applied = db::task_writer::TaskQuery::new(db,task_id,"UPDATE task SET metadata_json = json_remove(CASE WHEN json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' THEN json_remove(metadata_json, '$.deferred_dispatch') ELSE metadata_json END, '$.environment_wait') WHERE id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.environment_wait') IS NOT NULL")
+        .bind(task_id).identity_fenced().execute_in_tx(tx).await?;
     sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
         WHERE status <> 'resolved' AND (dedupe_key IN (?, ?, ?) OR (dedupe_key LIKE 'workspace-fence:%' AND json_extract(details_json, '$.task.id') = ?))")
         .bind(&now).bind(&now).bind(format!("review-ci:{task_id}")).bind(format!("task-owner-wait:{task_id}")).bind(format!("task-environment-wait:{task_id}")).bind(task_id)
@@ -182,7 +185,7 @@ pub(crate) async fn resolve_workspace_attention_in_tx(
 
 pub(crate) async fn resolve_workspace_attention(db: &SqliteDb, task_id: &str) -> Result<()> {
     let mut tx = db::begin_immediate(db.pool()).await?;
-    resolve_workspace_attention_in_tx(&mut tx, task_id).await?;
+    resolve_workspace_attention_in_tx(db, &mut tx, task_id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -352,6 +355,7 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::test_support::drain_task_steps(&db, &task.id).await;
         let current = db::TaskRepo::get_by_id(&db, &task.id, false)
             .await
             .unwrap()
@@ -385,6 +389,7 @@ mod tests {
         let failed:i64=sqlx::query_scalar("SELECT count(*) FROM domain_event WHERE entity_id=? AND event_type='task.execution_failed'").bind(&task.id).fetch_one(db.pool()).await.unwrap();
         assert_eq!(failed, 0);
         resolve_workspace_attention(&db, &task.id).await.unwrap();
+        crate::test_support::drain_task_steps(&db, &task.id).await;
         let metadata: Option<String> =
             sqlx::query_scalar("SELECT metadata_json FROM task WHERE id=?")
                 .bind(&task.id)

@@ -18,7 +18,23 @@ impl TaskService {
         task_id: impl Into<String>,
         request: MoveTaskRequest,
     ) -> Result<MoveTaskResult> {
-        let task_id = task_id.into();
+        let task_id: String = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+            if task.status != request.target_status {
+                return self
+                    .request_task_command(
+                        &task_id,
+                        "move_task",
+                        serde_json::json!([task_id, request]),
+                        false,
+                    )
+                    .await;
+            }
+        }
+
         validate_required("task_id", &task_id)?;
         validate_required("operation_id", &request.operation_id)?;
         Uuid::parse_str(&request.operation_id)
@@ -34,9 +50,7 @@ impl TaskService {
             )
         };
         let guard = operation_lock.lock().await;
-        let result = crate::worker_runtime::queue::PRODUCER_TASK
-            .scope(task_id.clone(), self.move_task_locked(task_id, request))
-            .await;
+        let result = self.move_task_locked(task_id, request).await;
         drop(guard);
         let mut locks = self.move_operation_locks.lock().await;
         if Arc::strong_count(&operation_lock) == 2 {
@@ -71,7 +85,10 @@ impl TaskService {
 
         super::execution::ensure_plan_publication_transition_authority(&source_task, None)?;
 
-        if source_task.version != request.task_version {
+        let accepted_version = db::task_writer::current_task_step().is_some_and(|step| {
+            step.task_id == source_task.id && step.expected_version == request.task_version
+        });
+        if source_task.version != request.task_version && !accepted_version {
             return Err(DbError::TaskVersionConflict {
                 expected: request.task_version,
                 actual: source_task.version,
@@ -203,10 +220,6 @@ impl TaskService {
                 }),
             )
             .await?;
-        let _step_reservation = crate::worker_runtime::queue::ProducerReservation::hold(
-            Arc::clone(&self.db),
-            engine_result.queued_step_id.as_deref(),
-        );
         let direct_result = match engine_result.board_move {
             Some(BoardMoveOutcome::Replayed(result)) => return Ok(result),
             Some(BoardMoveOutcome::Committed(result)) => result,
@@ -270,11 +283,6 @@ impl TaskService {
             .await
             {
                 Ok(updated) => task = updated,
-                Err(DbError::VersionConflict) => {
-                    task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                }
                 Err(error) => return Err(error.into()),
             }
         }

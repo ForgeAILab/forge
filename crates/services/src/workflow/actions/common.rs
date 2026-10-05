@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use db::{
-    new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, DbError, Execution,
-    ExecutionRepo, ProjectRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo,
-    TaskRoleAssignment, TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, Execution, ExecutionRepo,
+    ProjectRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo, TaskRoleAssignment,
+    TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
@@ -415,8 +415,8 @@ pub(super) async fn block_task_with_annotation(
         "source": source,
         "execution_id": ctx.execution_id.clone(),
     });
-    let mut current = task.clone();
-    for attempt in 0..3 {
+    let current = task.clone();
+    {
         match TaskRepo::update(
             &*ctx.db,
             UpdateTask {
@@ -447,12 +447,6 @@ pub(super) async fn block_task_with_annotation(
                     execution_id = ?ctx.execution_id,
                     "task blocked"
                 );
-                break;
-            }
-            Err(DbError::VersionConflict) if attempt < 2 => {
-                current = TaskRepo::get_by_id(&*ctx.db, &task.id, false)
-                    .await?
-                    .ok_or(DbError::NotFound)?;
             }
             Err(error) => return Err(error),
         }

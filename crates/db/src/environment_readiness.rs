@@ -133,6 +133,31 @@ pub trait ProjectMachineReadinessRepo: Send + Sync {
 mod tests {
     use super::*;
     use crate::{ProjectRepo, SqliteDb};
+    async fn settle_task_writes(db: &SqliteDb) {
+        use crate::TaskStepRepo;
+        let tasks: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT task_id FROM task_step WHERE status='pending'")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        for task in tasks {
+            while let Some(step) = db
+                .claim_step(
+                    "test-writer",
+                    Some(&task),
+                    &crate::task_writer::lease_deadline(),
+                )
+                .await
+                .unwrap()
+            {
+                assert_eq!(step.kind, "mutation");
+                crate::task_writer::in_task_step(step.clone(), db.execute_task_mutation(&step))
+                    .await
+                    .unwrap();
+                db.release_step(&step.id, "test-writer").await.unwrap();
+            }
+        }
+    }
     async fn fixture() -> (SqliteDb, String, api_types::ProjectEnvironment) {
         let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
         crate::run_migrations(&pool).await.unwrap();
@@ -239,6 +264,7 @@ mod tests {
         let mut full = saved.clone();
         full.scope_covered = "full".into();
         db.put_readiness(full, Some(saved.version)).await.unwrap();
+        settle_task_writes(&db).await;
         let wait: Option<String> = sqlx::query_scalar("SELECT json_extract(metadata_json,'$.environment_wait.kind') FROM task WHERE id='provision-wait'").fetch_one(db.pool()).await.unwrap();
         assert!(wait.is_none());
     }
@@ -536,6 +562,7 @@ mod tests {
         db.put_readiness(row(&id, &environment), None)
             .await
             .unwrap();
+        settle_task_writes(&db).await;
         for (task, cleared) in [
             ("probe", true),
             ("wait", true),
@@ -556,6 +583,7 @@ mod tests {
         let mut ready = row(&id, &environment);
         ready.machine = machine;
         db.put_readiness(ready, None).await.unwrap();
+        settle_task_writes(&db).await;
         let pending:Option<String>=sqlx::query_scalar("SELECT json_extract(metadata_json,'$.deferred_dispatch.kind') FROM task WHERE id='daemon-wait'").fetch_one(db.pool()).await.unwrap();
         assert!(
             pending.is_none(),

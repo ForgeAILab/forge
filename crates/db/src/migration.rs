@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202610050233 (topic working sets, protected fork seeds, timeline claims, bounded native-only rotation intents and a summary-usage outbox); previous V202610042145 (level-triggered wakes, category budgets, owner escalation, per-Attention wake decisions, capped lease refunds and Project doctrine @21); previous V202610040225 (durable post-commit hook steps and hook/script checkpoints); previous V202610032100 (conflict hot-spot episodes, indexed transition-log windows and UTC installation time); previous V202610031934 (Task status epochs and step epoch fences, fast/long step lanes, retained workflow references and prune indexes; V202610031431 merge-friendly layout guidance; V202610030400 Task cascade outbox; dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
+// Embedded migration bundle revision: V202610051045 (data-preserving single Task writer commands, replies, preemption and remote cancellation fences); previous V202610050233 (topic working sets, protected fork seeds, timeline claims, bounded native-only rotation intents and a summary-usage outbox); previous V202610042145 (level-triggered wakes, category budgets, owner escalation, per-Attention wake decisions, capped lease refunds and Project doctrine @21); previous V202610040225 (durable post-commit hook steps and hook/script checkpoints); previous V202610032100 (conflict hot-spot episodes, indexed transition-log windows and UTC installation time); previous V202610031934 (Task status epochs and step epoch fences, fast/long step lanes, retained workflow references and prune indexes; V202610031431 merge-friendly layout guidance; V202610030400 Task cascade outbox; dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later
@@ -506,6 +506,86 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn single_writer_upgrade_preserves_claims_causation_and_hook_script_checkpoints() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        ensure_migration_table(&pool).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE task(id TEXT PRIMARY KEY); CREATE TABLE workspace(id TEXT PRIMARY KEY); CREATE TABLE workspace_placement(id TEXT PRIMARY KEY); CREATE TABLE execution(id TEXT PRIMARY KEY); INSERT INTO task VALUES('t');").execute(&pool).await.unwrap();
+        let old = include_str!("../migrations/V202610040225__durable_hook_steps.sql");
+        let schema = old
+            .split("INSERT INTO task_step_new")
+            .next()
+            .unwrap()
+            .replace("task_step_new", "task_step");
+        sqlx::raw_sql(&schema).execute(&pool).await.unwrap();
+        let checkpoints = format!(
+            "CREATE TABLE task_hook_checkpoint{}",
+            old.split("CREATE TABLE task_hook_checkpoint")
+                .nth(1)
+                .unwrap()
+                .split("-- Legacy running")
+                .next()
+                .unwrap()
+        );
+        sqlx::raw_sql(&checkpoints).execute(&pool).await.unwrap();
+        sqlx::raw_sql("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,claimed_by,lease_until,available_at,attempts,created_at,updated_at,expected_epoch,lane) VALUES('hooks','t',1,'hooks','{}','entry','chain',1,'review',7,'claimed','owner','2099-01-01','2000-01-01',2,'2000-01-01','2000-01-01',5,'long'); INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,created_at,updated_at,expected_epoch,lane) VALUES('cascade','t',2,'cascade','{}','hooks','next','chain',2,'review',7,'pending','2000-01-01','2000-01-01','2000-01-01',5,'fast'); INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,result_json,effects_json) VALUES('hooks',0,'2000-01-01','{\"Ok\":null}','{\"effect\":\"kept\"}'); INSERT INTO task_hook_script(step_id,hook_index,script_index,started_at,result_json) VALUES('hooks',0,0,'2000-01-01','{\"status\":\"passed\"}');").execute(&pool).await.unwrap();
+        apply_migration_sql(
+            &pool,
+            &Migration {
+                version: 202610051045,
+                name: "task_single_writer".into(),
+                path: PathBuf::new(),
+            },
+            include_str!("../migrations/V202610051045__task_single_writer.sql"),
+        )
+        .await
+        .unwrap();
+        let claim: (String,String,String,i64,i64) = sqlx::query_as("SELECT status,claimed_by,lease_until,attempts,expected_epoch FROM task_step WHERE id='hooks'").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            claim,
+            ("claimed".into(), "owner".into(), "2099-01-01".into(), 2, 5)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT causation_step_id FROM task_step WHERE id='cascade'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "hooks"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT effects_json FROM task_hook_checkpoint WHERE step_id='hooks'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "{\"effect\":\"kept\"}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT result_json FROM task_hook_script WHERE step_id='hooks'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "{\"status\":\"passed\"}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn task_list_revision_triggers_exist_after_bundled_migrations() {

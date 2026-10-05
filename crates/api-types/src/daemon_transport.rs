@@ -19,6 +19,7 @@ pub const METHOD_REPO_LOCATION_PROVISION: &str = "repo_location.provision";
 pub const METHOD_WORKSPACE_PREPARE: &str = "workspace.prepare";
 pub const METHOD_WORKSPACE_DESCRIBE: &str = "workspace.describe";
 pub const METHOD_WORKSPACE_RUN: &str = "workspace.run";
+pub const METHOD_WORKSPACE_CANCEL: &str = "workspace.cancel";
 pub const METHOD_WORKSPACE_DIFF: &str = "workspace.diff";
 pub const METHOD_WORKSPACE_READ: &str = "workspace.read";
 pub const METHOD_WORKSPACE_MERGE: &str = "workspace.merge";
@@ -322,6 +323,28 @@ pub struct WorkspaceRunParams {
     pub timeout_secs: u64,
     /// u64::MAX accepts bounded CI output tails; other values are strict per-stream budgets.
     pub max_output_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceCancelParams {
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceCancelState {
+    Killed,
+    AlreadyFinished,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceCancelResult {
+    pub operation_id: String,
+    pub state: WorkspaceCancelState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

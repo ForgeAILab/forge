@@ -1,6 +1,13 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import { toast } from 'sonner'
 import { ApiError } from '@/api/client'
-import { getApiErrorMessage } from './api-error'
+import {
+  getApiErrorMessage,
+  isTaskBusy,
+  TASK_BUSY_QUEUED_MESSAGE,
+  taskBusyRetryAfterMs,
+  toastApiError,
+} from './api-error'
 
 describe('placement admission errors', () => {
   it('includes candidate reasons for daemon upgrade refusals', () => {
@@ -147,5 +154,29 @@ describe('placement admission errors', () => {
     expect(getApiErrorMessage(error)).toBe(
       'Placement refused Server: No rejection reason provided.',
     )
+  })
+})
+
+describe('task_busy', () => {
+  const busy = () =>
+    new ApiError('Task has pending steps; accepted work remains queued', 409, undefined, {
+      code: 'task_busy',
+      message: 'Task has pending steps; accepted work remains queued',
+      request_id: '',
+      details: { pending_steps: 2, retry_after_ms: 250, retry_hint: 'Refetch the Task' },
+    })
+  it('is an accepted, queued request with a retry hint', () => {
+    expect(isTaskBusy(busy())).toBe(true)
+    expect(taskBusyRetryAfterMs(busy())).toBe(250)
+    expect(isTaskBusy(new ApiError('changed', 409, undefined))).toBe(false)
+  })
+  it('shows the queued notice instead of an error toast', () => {
+    const info = vi.spyOn(toast, 'info').mockImplementation(() => '')
+    const error = vi.spyOn(toast, 'error').mockImplementation(() => '')
+    toastApiError(busy(), 'Transition failed')
+    expect(info).toHaveBeenCalledWith(TASK_BUSY_QUEUED_MESSAGE)
+    expect(error).not.toHaveBeenCalled()
+    info.mockRestore()
+    error.mockRestore()
   })
 })

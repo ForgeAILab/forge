@@ -10,12 +10,20 @@ impl TaskService {
         new_status: TaskStatus,
         options: impl Into<TransitionOptions>,
     ) -> Result<TransitionResult> {
-        let task_id = task_id.into();
-        crate::worker_runtime::queue::PRODUCER_TASK
-            .scope(
-                task_id.clone(),
-                self.transition_inner(task_id, new_status, options.into(), None),
-            )
+        let task_id: String = task_id.into();
+        let options: TransitionOptions = options.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "transition",
+                    serde_json::json!([task_id, new_status, options]),
+                    new_status == "cancelled",
+                )
+                .await;
+        }
+
+        self.transition_inner(task_id, new_status, options, None)
             .await
     }
 
@@ -26,12 +34,20 @@ impl TaskService {
         options: impl Into<TransitionOptions>,
         execution_id: &str,
     ) -> Result<TransitionResult> {
-        let task_id = task_id.into();
-        crate::worker_runtime::queue::PRODUCER_TASK
-            .scope(
-                task_id.clone(),
-                self.transition_inner(task_id, new_status, options.into(), Some(execution_id)),
-            )
+        let task_id: String = task_id.into();
+        let options: TransitionOptions = options.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "transition_with_plan_publication",
+                    serde_json::json!([task_id, new_status, options, execution_id]),
+                    new_status == "cancelled",
+                )
+                .await;
+        }
+
+        self.transition_inner(task_id, new_status, options, Some(execution_id))
             .await
     }
 
@@ -164,10 +180,6 @@ impl TaskService {
                 }),
             )
             .await?;
-        let _step_reservation = crate::worker_runtime::queue::ProducerReservation::hold(
-            Arc::clone(&self.db),
-            result.queued_step_id.as_deref(),
-        );
         // The engine returns the requested transition's committed CAS
         // snapshot. A concurrent writer cannot replace it in this response.
         let mut task = result.task;
@@ -240,13 +252,6 @@ impl TaskService {
             .await
             {
                 Ok(updated) => task = updated,
-                Err(DbError::VersionConflict) => {
-                    // An on_enter hook (e.g. dispatch_role_follow_up) may have already
-                    // cleared the annotation and incremented the version; re-fetch.
-                    task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -735,13 +740,23 @@ impl TaskService {
             .await
     }
 
-    async fn cancel_task_with_options(
+    pub(crate) async fn cancel_task_with_options(
         &self,
         task_id: String,
         expected_version: Option<i64>,
         reason: String,
         actor: Actor,
     ) -> Result<Task> {
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "cancel_task_with_options",
+                    serde_json::json!([task_id, expected_version, reason, actor]),
+                    true,
+                )
+                .await;
+        }
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -840,8 +855,24 @@ impl TaskService {
         for child in children {
             self.cancel_running_executions_for_task(&child, reason, actor.clone())
                 .await?;
-            if !crate::task_hierarchy::subtask_is_terminal(&child, workflow) {
-                Box::pin(self.cancel_task_as(child.id, actor.clone())).await?;
+            if crate::task_hierarchy::subtask_is_terminal(&child, workflow) {
+                continue;
+            }
+            // The root's cancel has committed under the root lease. Each
+            // child's cancel is its own preempting step on the child's queue;
+            // the root never waits on a child's lease, so a busy child cannot
+            // turn the committed root cancel into an error or skip a sibling.
+            // A repeat root Cancel re-enqueues any child still not terminal.
+            if let Err(error) = self
+                .enqueue_task_command(
+                    &child.id,
+                    "cancel_task_with_options",
+                    serde_json::json!([child.id, Option::<i64>::None, "cancel task", actor]),
+                    true,
+                )
+                .await
+            {
+                tracing::warn!(root_id = %root.id, child_id = %child.id, %error, "failed to enqueue coordination child cancel");
             }
         }
         Ok(())
@@ -855,6 +886,16 @@ impl TaskService {
         reason: String,
         actor: Actor,
     ) -> Result<Task> {
+        if !db::task_writer::owns_task(&task.id) {
+            return self
+                .request_task_command(
+                    &task.id,
+                    "advance_task_condition",
+                    serde_json::json!([task.id, workflow, target, reason, actor]),
+                    false,
+                )
+                .await;
+        }
         super::execution::ensure_plan_publication_transition_authority(task, None)?;
         crate::task_hierarchy::ensure_coordination_root_target_ready(
             &self.db, task, workflow, &target,
@@ -863,23 +904,8 @@ impl TaskService {
         if workflow.state_kind(&target) != Some(api_types::StateKind::Terminal) {
             crate::task_hierarchy::ensure_subtask_dispatch_order(&self.db, task).await?;
         }
-        let claimed = TaskRepo::mutate_metadata_and_bump_version(
-            &*self.db,
-            &task.id,
-            task.version,
-            Vec::new(),
-            &now_rfc3339(),
-        )
-        .await?;
-        self.cancel_running_executions_for_task(
-            &claimed,
-            "cancelled by manual advance",
-            actor.clone(),
-        )
-        .await?;
-        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        self.cancel_running_executions_for_task(task, "cancelled by manual advance", actor.clone())
+            .await?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -901,7 +927,7 @@ impl TaskService {
             .manual_override_transition_with_authority(
                 &task.id,
                 &target,
-                current.version,
+                task.version,
                 workflow,
                 actor,
                 &reason,
@@ -1166,9 +1192,9 @@ async fn clear_manual_advance_error_annotation(
     // may already have moved the Task. A replaced annotation is a no-op,
     // never a post-commit 409. The event shares the clear's transaction.
     let mut tx = db::begin_immediate(db.pool()).await?;
-    let cleared = sqlx::query("UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL")
+    let cleared = db::task_writer::TaskQuery::new(db,&advanced_task.id,"UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL")
         .bind(now_rfc3339()).bind(&advanced_task.id).bind(&source_task.error_annotation)
-        .execute(&mut *tx).await?.rows_affected();
+        .execute_in_tx(&mut tx).await?.require_applied()?;
     let current = db
         .get_task_in_tx(&mut tx, &advanced_task.id)
         .await?
@@ -1492,9 +1518,40 @@ mod audit_tests {
                     .await
                     .unwrap();
             }
-            let result = clear_manual_advance_error_annotation(&db, &source, advanced)
+            use db::TaskStepRepo;
+            let current = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+            db.enqueue_task_mutation(
+                "t",
+                db::TaskMutation::TaskSetEntryBarrier {
+                    id: "t".into(),
+                    expected_version: current.version,
+                    entry_barrier_json: None,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+            let lease = db
+                .claim_step(
+                    "advance-clear",
+                    Some("t"),
+                    &db::task_writer::lease_deadline(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let result = db::task_writer::in_task_step(
+                lease.clone(),
+                clear_manual_advance_error_annotation(&db, &source, advanced),
+            )
+            .await
+            .unwrap();
+            let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+            db.finish_step_in_tx(&mut tx, &lease, "done", None)
                 .await
                 .unwrap();
+            tx.commit().await.unwrap();
+            db.release_step(&lease.id, "advance-clear").await.unwrap();
             assert!(result.error_annotation.is_none());
             if !step_wins {
                 sqlx::query("UPDATE task SET status='in_progress',version=version+1 WHERE id='t'")

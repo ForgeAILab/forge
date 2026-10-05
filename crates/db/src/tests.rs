@@ -250,6 +250,91 @@ fn pending_claim_lease(execution_id: &str, now: &str) -> ClaimExecutionLease {
     }
 }
 
+// Transaction-kernel tests own a real Task step, as production claim does.
+async fn claim_in_test_step(
+    db: &SqliteDb,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    input: ClaimTask,
+) -> crate::Result<crate::ClaimedTask> {
+    use crate::TaskStepRepo;
+    let task = TaskRepo::get_by_id_in_tx(db, transaction, &input.task_id, false)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    if task.version != input.expected_version {
+        return Err(DbError::VersionConflict);
+    }
+    let id = new_uuid_v4();
+    let now = now_rfc3339();
+    let until = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+    db.enqueue_step_in_tx(
+        transaction,
+        &crate::EnqueueTaskStep {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            kind: "command".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: id.clone(),
+            chain_id: id.clone(),
+            chain_position: 1,
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "fast".into(),
+            available_at: now.clone(),
+        },
+    )
+    .await?;
+    let epoch: i64 = sqlx::query_scalar("SELECT expected_epoch FROM task_step WHERE id=?")
+        .bind(&id)
+        .fetch_one(&mut **transaction)
+        .await?;
+    let changed = sqlx::query("UPDATE task_step SET status='claimed',claimed_by='claim-test',lease_until=?,attempts=1 WHERE id=? AND NOT EXISTS(SELECT 1 FROM task_step held WHERE held.task_id=? AND held.id<>? AND held.lease_until>?)")
+        .bind(&until).bind(&id).bind(&task.id).bind(&id).bind(&now).execute(&mut **transaction).await?.rows_affected();
+    assert_eq!(changed, 1, "one writer for the fixture Task");
+    let step = crate::TaskStep {
+        id: id.clone(),
+        task_id: task.id,
+        seq: 0,
+        kind: "command".into(),
+        payload_json: "{}".into(),
+        causation_step_id: None,
+        causation_key: id.clone(),
+        chain_id: id.clone(),
+        chain_position: 1,
+        expected_status: task.status,
+        expected_version: task.version,
+        expected_epoch: epoch,
+        lane: "fast".into(),
+        status: "claimed".into(),
+        claimed_by: Some("claim-test".into()),
+        lease_until: Some(until),
+        available_at: now.clone(),
+        attempts: 1,
+        last_error: None,
+        created_at: now.clone(),
+        updated_at: now,
+        completed_at: None,
+        result_json: None,
+        entry_fenced: true,
+    };
+    let result =
+        crate::task_writer::in_task_step(step.clone(), TaskRepo::claim(db, transaction, input))
+            .await;
+    db.finish_step_in_tx(
+        transaction,
+        &step,
+        if result.is_ok() { "done" } else { "failed" },
+        None,
+    )
+    .await?;
+    sqlx::query("UPDATE task_step SET claimed_by=NULL,lease_until=NULL WHERE id=?")
+        .bind(&id)
+        .execute(&mut **transaction)
+        .await?;
+    result
+}
+
 #[tokio::test]
 async fn profile_publication_and_selection_are_atomic_on_version_conflict() {
     let db = sqlite_db().await;
@@ -9088,7 +9173,7 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
         .await
         .expect("transaction starts");
     let execution_id = new_uuid_v4();
-    let claimed = TaskRepo::claim(
+    let claimed = claim_in_test_step(
         &db,
         &mut tx,
         ClaimTask {
@@ -9186,7 +9271,7 @@ async fn claim_capacity_ignores_assigned_but_not_running_tasks() {
     let mut transaction = crate::begin_immediate(db.pool())
         .await
         .expect("claim transaction starts");
-    let claimed = TaskRepo::claim(
+    let claimed = claim_in_test_step(
         &db,
         &mut transaction,
         ClaimTask {
@@ -9286,7 +9371,7 @@ async fn claim_rejects_stale_project_workflow_authority_without_mutation() {
     let mut tx = crate::begin_immediate(db.pool())
         .await
         .expect("claim transaction starts");
-    let result = TaskRepo::claim(
+    let result = claim_in_test_step(
         &db,
         &mut tx,
         ClaimTask {
@@ -9689,7 +9774,7 @@ async fn task_claim_rejects_active_entry_barrier() {
         .await
         .expect("transaction starts");
     let execution_id = new_uuid_v4();
-    let result = TaskRepo::claim(
+    let result = claim_in_test_step(
         &db,
         &mut tx,
         ClaimTask {
@@ -9874,7 +9959,7 @@ async fn test_dependency_gate_blocks_non_context_holder() {
         .await
         .expect("transaction starts");
     let execution_id = new_uuid_v4();
-    let result = TaskRepo::claim(
+    let result = claim_in_test_step(
         &db,
         &mut tx,
         ClaimTask {
@@ -10006,7 +10091,7 @@ async fn dependency_gate_finds_context_holder_behind_100_newer_attempts() {
         .await
         .expect("transaction starts");
     let execution_id = "dependent-context-holder-000".to_owned();
-    let result = TaskRepo::claim(
+    let result = claim_in_test_step(
         &db,
         &mut transaction,
         ClaimTask {
@@ -10739,7 +10824,7 @@ async fn legacy_non_runnable_governance_flag_does_not_block_current_charter_exec
         .await
         .expect("claim transaction begins");
     let execution_id = new_uuid_v4();
-    let _claim = TaskRepo::claim(
+    let _claim = claim_in_test_step(
         &db,
         &mut claim_transaction,
         ClaimTask {

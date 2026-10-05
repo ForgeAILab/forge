@@ -609,6 +609,7 @@ async fn condition_queue_scenarios() {
                 .await;
             let mut rounds = Vec::new();
             for _ in 0..2 {
+                service.drain(&task.id).await.unwrap();
                 let current = reload(&db, &task.id).await;
                 if !has_marker(&current) {
                     break;
@@ -1128,6 +1129,7 @@ async fn condition_send_back_prompt_scenarios() {
                         .map(|result| result.task.status)
                         .map_err(|error| error.to_string());
                     for _ in 0..2 {
+                        service.drain(&task.id).await.unwrap();
                         let current = reload(&db, &task.id).await;
                         if !has_marker(&current) {
                             break;

@@ -255,7 +255,24 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
+        let initial_defaults = if is_root {
+            let covered = validated_assignments
+                .as_ref()
+                .map(|rows| rows.iter().map(|(role, _, _)| role.clone()).collect())
+                .unwrap_or_default();
+            self.project_default_role_assignments_for_ids(&create_task.id, &project_id, covered)
+                .await?
+        } else {
+            Vec::new()
+        };
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id=?")
+            .bind(&project_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        if project_version != project.version {
+            return Err(db::DbError::VersionConflict.into());
+        }
         for dependency_id in &dependency_ids {
             let dependency =
                 TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, dependency_id, false)
@@ -300,12 +317,17 @@ impl TaskService {
             let mut removed_parent_role = false;
             for role_name in parent_roles {
                 if !root_role_policy.allows_assignment(&role_name) {
-                    sqlx::query(
+                    // Effects on an existing parent are its own queued
+                    // steps, identity-fenced so they are never dropped.
+                    let _queued_or_applied = db::task_writer::TaskQuery::new(
+                        &self.db,
+                        parent_task_id,
                         "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
                     )
                     .bind(parent_task_id)
                     .bind(role_name)
-                    .execute(&mut *transaction)
+                    .identity_fenced()
+                    .execute_in_tx(&mut transaction)
                     .await?;
                     removed_parent_role = true;
                 }
@@ -314,7 +336,7 @@ impl TaskService {
                 // Converting a Task into a coordination root changes its
                 // authority surface. Invalidate review authority and wake
                 // parked dispatch in the same transaction as role pruning.
-                sqlx::query(
+                let _queued_or_applied = db::task_writer::TaskQuery::new(&self.db,parent_task_id,
                     "UPDATE task
                      SET review_passed_at = NULL,
                          version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
@@ -337,7 +359,8 @@ impl TaskService {
                 )
                 .bind(&now)
                 .bind(parent_task_id)
-                .execute(&mut *transaction)
+                .identity_fenced()
+                .execute_in_tx(&mut transaction)
                 .await?;
             }
         }
@@ -351,32 +374,22 @@ impl TaskService {
             )
             .await?;
         }
-        transaction.commit().await?;
-
         if let Some(assignments) = validated_assignments {
             for (role_name, assignee_type, assignee_id) in assignments {
-                TaskRoleAssignmentRepo::assign_if_unchanged(
-                    &*self.db,
-                    CreateTaskRoleAssignment {
-                        id: new_uuid_v4(),
-                        task_id: task.id.clone(),
-                        role_name,
-                        assignee_type: Some(assignee_type),
-                        assignee_id: Some(assignee_id),
-                        created_at: now.clone(),
-                        updated_at: now.clone(),
-                    },
-                    None,
-                )
-                .await?;
+                // Initial assignment is part of the unpublished Task's
+                // birth transaction, before another writer can see it.
+                sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+                    .bind(new_uuid_v4()).bind(&task.id).bind(role_name).bind(assignee_type.to_string())
+                    .bind(assignee_id).bind(&now).bind(&now).execute(&mut *transaction).await?;
             }
         }
-
-        let task = if is_root {
-            self.assign_project_default_roles(&task).await?
-        } else {
-            task
-        };
+        for assignment in initial_defaults {
+            sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+                .bind(assignment.id).bind(&task.id).bind(assignment.role_name)
+                .bind(assignment.assignee_type.map(|kind|kind.to_string())).bind(assignment.assignee_id)
+                .bind(assignment.created_at).bind(assignment.updated_at).execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
 
         self.publish(ForgeEvent {
             event_type: "task.created".to_owned(),

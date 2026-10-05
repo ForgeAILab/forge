@@ -2,7 +2,7 @@ import { useId, useState } from 'react'
 import { toast } from 'sonner'
 import { useTaskAction } from '@/api/hooks'
 import { ApiError, apiFetch } from '@/api/client'
-import { getApiErrorMessage } from '@/lib/api-error'
+import { getApiErrorMessage, notifyTaskBusy } from '@/lib/api-error'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -169,6 +169,14 @@ export function TaskActionButtons({
           setNotice('')
         },
         onError: (error) => {
+          // Accepted and queued behind the current step: not a failure, and
+          // the offers did not change. The hook refetches the Task.
+          if (notifyTaskBusy(error)) {
+            setSelected(null)
+            setAction(null)
+            setNotice('')
+            return
+          }
           if (error instanceof ApiError && error.status === 409) {
             setSelected(null)
             setAction(null)

@@ -4599,3 +4599,79 @@ async fn carries_are_bounded_per_review() {
     };
     assert!(reason.contains("already carried"), "{reason}");
 }
+
+#[tokio::test]
+async fn hook_block_rebases_a_content_edit_under_its_lease_without_cas_retry() {
+    use db::TaskStepRepo;
+    let ctx = build_test_ctx("block-content-race", "in_progress", "in_progress", None).await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let id = new_uuid_v4();
+    ctx.db
+        .enqueue_step(&db::EnqueueTaskStep {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            kind: "hooks".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: id.clone(),
+            chain_id: id,
+            chain_position: 1,
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "fast".into(),
+            available_at: now_rfc3339(),
+        })
+        .await
+        .unwrap();
+    let step = ctx
+        .db
+        .claim_step(
+            "hook",
+            Some(&task.id),
+            &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE task SET title='owner edit',version=version+1 WHERE id=?")
+        .bind(&task.id)
+        .execute(ctx.db.pool())
+        .await
+        .unwrap();
+    db::task_writer::in_task_step(
+        step.clone(),
+        super::common::block_task_with_annotation(
+            &ctx,
+            &task,
+            "CI failed",
+            api_types::FailureKind::CiFailed,
+            Some("CI"),
+            Some(json!({"type":"ci_failed"}).to_string()),
+        ),
+    )
+    .await
+    .unwrap();
+    let result = TaskRepo::get_by_id(&*ctx.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.title, "owner edit");
+    assert!(result
+        .blocked_json
+        .as_deref()
+        .unwrap()
+        .contains("CI failed"));
+    assert_eq!(result.version, task.version + 2);
+    let mut tx = db::begin_immediate(ctx.db.pool()).await.unwrap();
+    ctx.db
+        .finish_step_in_tx(&mut tx, &step, "done", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    ctx.db.release_step(&step.id, "hook").await.unwrap();
+    assert_eq!(ctx.db.task_steps(&task.id).await.unwrap()[0].attempts, 1);
+}

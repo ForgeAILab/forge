@@ -214,10 +214,20 @@ async fn exact_old_notification_set_excludes_hold_ci_restore_and_human_review_wr
             &ci,
             service.clone(),
         );
-        service
-            .annotate_review_ci_interruption(&ci, &ctx, "CI owner unavailable", retry, reset)
-            .await
-            .unwrap();
+        // Production calls this from the Task's review hook step.
+        crate::test_support::with_task_lease(
+            &db,
+            &ci.id,
+            service.annotate_review_ci_interruption(
+                &ci,
+                &ctx,
+                "CI owner unavailable",
+                retry,
+                reset,
+            ),
+        )
+        .await
+        .unwrap();
     }
     // Failed queued action restoration may restore ANY prior kind, including
     // a kind that otherwise legitimately produces task.failed/task.blocked.

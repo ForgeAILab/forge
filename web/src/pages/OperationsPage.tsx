@@ -770,6 +770,7 @@ export function OperationsPage() {
         <StatCard label="Blocked" value={status.blocked_tasks.length} />
         <StatCard label={productTerm('runtime', 0)} value={status.daemon_issues.length} />
         <StatCard label="Cleanup" value={status.workspace_cleanup.length} />
+        <StatCard label="Remote cleanup" value={status.pending_remote_cancels} />
         <StatCard label="Retries" value={status.retry_pressure.length} />
         <StatCard label="Errors" value={status.recent_errors.length} />
       </div>

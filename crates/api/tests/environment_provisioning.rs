@@ -164,6 +164,7 @@ impl Owner {
 }
 
 struct Harness {
+    _step_worker: Option<common::StepWorkerGuard>,
     app: axum::Router,
     state: Arc<api::AppState>,
 }
@@ -216,7 +217,11 @@ async fn harness(root: &std::path::Path) -> Harness {
     std::fs::create_dir_all(&web).unwrap();
     std::fs::write(web.join("index.html"), "<html></html>").unwrap();
     let app = api::build_router((*state).clone(), web);
-    Harness { app, state }
+    Harness {
+        _step_worker: None,
+        app,
+        state,
+    }
 }
 
 struct Fixture {
@@ -249,7 +254,7 @@ impl Fixture {
             root.path().to_owned()
         };
         let source = common::setup_git_repo(server_root.path());
-        let harness = harness(server_root.path()).await;
+        let mut harness = harness(server_root.path()).await;
         let registration =
             register_daemon(&harness.app, &db::new_uuid_v4(), "environment-provision").await;
         report_remote_daemon_shell(
@@ -395,6 +400,9 @@ impl Fixture {
             .with_daemon_connections(harness.state.daemon_connections.clone())
             .with_placement_adapter_registry(Arc::new(executors::AdapterRegistry::new())),
         );
+        let mut worker_state = (*harness.state).clone();
+        worker_state.task_service = service.clone();
+        harness._step_worker = Some(common::StepWorkerGuard::start(&worker_state));
         Self {
             harness,
             service,
@@ -427,6 +435,25 @@ impl Fixture {
                     Ok(claimed) => break claimed,
                     Err(services::ServiceError::PlacementUnavailable(refusal)) => {
                         last = format!("{refusal:?}");
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(services::ServiceError::TaskBusy { .. }) => {
+                        let task = self
+                            .service
+                            .drain(&self.task)
+                            .await
+                            .expect("accepted claim settles");
+                        if let Some(execution) = db::ExecutionRepo::list_running_by_task(
+                            &*self.harness.state.db,
+                            &self.task,
+                        )
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .find(|e| e.agent_id.as_deref() == Some(self.agent.as_str()))
+                        {
+                            break db::ClaimedTask { task, execution };
+                        }
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) => panic!("claim failed: {error:?}"),
@@ -695,6 +722,9 @@ async fn daemon_offline_mid_probe_retains_facts_and_retry_can_restart() {
         .join("repos")
         .join(&fixture.repo)
         .exists());
+    let mut worker_state = (*fixture.harness.state).clone();
+    worker_state.task_service = fixture.service.clone();
+    fixture.harness._step_worker = Some(common::StepWorkerGuard::start(&worker_state));
     fixture.owner = Some(
         Owner::connect(
             &fixture.server,
@@ -786,6 +816,7 @@ async fn server_restart_after_clone_lost_reply_reuses_one_location_and_wakes_pla
     // The daemon has cloned, but the server has not received the provisioning
     // result. Replace the listening server and reconstruct its admission service.
     fixture.owner.take();
+    fixture.harness._step_worker.take();
     // Reopen the durable SQLite file through a fresh service graph and command registry.
     let pool = db::create_sqlite_pool(&format!(
         "sqlite:{}",
@@ -1156,7 +1187,7 @@ async fn incompatible_provisioning_candidate_keeps_deterministic_refusal() {
 
 #[tokio::test]
 async fn dispatcher_provisions_without_manual_retry_deadlines_and_keeps_server_location() {
-    let fixture = Fixture::new(
+    let mut fixture = Fixture::new(
         json!([{ "name":"toolchain", "command":"true", "scope":"machine" }]),
         "coder",
     )
@@ -1249,6 +1280,9 @@ async fn dispatcher_provisions_without_manual_retry_deadlines_and_keeps_server_l
         StatusCode::OK,
     )
     .await;
+    // The second phase deliberately exercises the host-capable graph.
+    // Stop the daemon-only worker before its independent inline claim.
+    fixture.harness._step_worker.take();
     let host = services::TaskService::new_for_test(
         fixture.harness.state.db.clone(),
         fixture.harness.state.event_bus.clone(),

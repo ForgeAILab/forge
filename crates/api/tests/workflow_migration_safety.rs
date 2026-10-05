@@ -121,6 +121,12 @@ async fn workflow_update_wakes_parked_dispatch_disposition() {
     )
     .await;
 
+    harness
+        ._state
+        .task_service
+        .drain(&task.id)
+        .await
+        .expect("workflow wake step settles");
     let metadata: Option<String> =
         sqlx::query_scalar("SELECT metadata_json FROM task WHERE id = ?")
             .bind(&task.id)

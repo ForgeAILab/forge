@@ -9,8 +9,8 @@ use sqlx::{Row, Sqlite, Transaction};
 pub const STEP_FENCE: &str = "SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND status=? AND status_epoch=? AND deleted_at IS NULL)";
 // Both use task_step_settled(status, completed_at); binds: cutoff, now,
 // active Task ids (JSON), batch limit.
-const PRUNE_SETTLED: &str = "DELETE FROM task_step WHERE id IN (SELECT id FROM task_step WHERE status IN ('done','superseded') AND completed_at<? AND (lease_until IS NULL OR lease_until<?) AND task_id NOT IN (SELECT value FROM json_each(?)) AND NOT EXISTS(SELECT 1 FROM task_step live WHERE live.chain_id=task_step.chain_id AND live.status IN ('pending','claimed')) ORDER BY completed_at LIMIT ?)";
-const PRUNE_UNRESOLVED: &str = "DELETE FROM task_step WHERE id IN (SELECT id FROM task_step WHERE status IN ('failed','parked') AND completed_at<? AND (lease_until IS NULL OR lease_until<?) AND task_id NOT IN (SELECT value FROM json_each(?)) AND NOT EXISTS(SELECT 1 FROM task_step live WHERE live.chain_id=task_step.chain_id AND live.status IN ('pending','claimed')) ORDER BY completed_at LIMIT ?)";
+const PRUNE_SETTLED: &str = "DELETE FROM task_step WHERE id IN (SELECT id FROM task_step WHERE status IN ('done','superseded') AND completed_at<? AND (lease_until IS NULL OR lease_until<?) AND task_id NOT IN (SELECT value FROM json_each(?)) AND NOT EXISTS(SELECT 1 FROM task_remote_operation r WHERE r.step_id=task_step.id AND r.state='running') AND NOT EXISTS(SELECT 1 FROM pending_remote_cancel r WHERE r.step_id=task_step.id) AND NOT EXISTS(SELECT 1 FROM task_step live WHERE live.chain_id=task_step.chain_id AND live.status IN ('pending','claimed')) ORDER BY completed_at LIMIT ?)";
+const PRUNE_UNRESOLVED: &str = "DELETE FROM task_step WHERE id IN (SELECT id FROM task_step WHERE status IN ('failed','parked') AND completed_at<? AND (lease_until IS NULL OR lease_until<?) AND task_id NOT IN (SELECT value FROM json_each(?)) AND NOT EXISTS(SELECT 1 FROM task_remote_operation r WHERE r.step_id=task_step.id AND r.state='running') AND NOT EXISTS(SELECT 1 FROM pending_remote_cancel r WHERE r.step_id=task_step.id) AND NOT EXISTS(SELECT 1 FROM task_step live WHERE live.chain_id=task_step.chain_id AND live.status IN ('pending','claimed')) ORDER BY completed_at LIMIT ?)";
 // task_step_workflow_ref(workflow_ref_id) answers the reference probe.
 const PRUNE_WORKFLOWS: &str = "DELETE FROM task_step_workflow WHERE id IN (SELECT w.id FROM task_step_workflow w WHERE w.last_used_at<? AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.workflow_ref_id=w.id) LIMIT ?)";
 
@@ -40,6 +40,10 @@ pub struct TaskStep {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+    pub result_json: Option<String>,
+    /// False for a queued effect fenced by its own identity: it applies after
+    /// a status change and survives a preempting Cancel/Hold.
+    pub entry_fenced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,8 +63,7 @@ pub struct EnqueueTaskStep {
     /// transaction. Post-commit producers pass their entry's epoch.
     pub expected_epoch: Option<i64>,
     pub lane: String,
-    /// Producer reservation. Release after inline hooks and wrapper writes;
-    /// a lost producer becomes eligible after this deadline on restart.
+    /// Earliest attempt time, including durable retry backoff.
     pub available_at: String,
 }
 
@@ -109,7 +112,6 @@ pub trait TaskStepRepo: Send + Sync {
     async fn release_step(&self, id: &str, owner: &str) -> Result<()>;
     async fn retry_step(&self, step: &TaskStep, error: &str, available_at: &str) -> Result<()>;
     async fn ready_step(&self, id: &str) -> Result<()>;
-    async fn renew_step_reservation(&self, id: &str, until: &str) -> Result<bool>;
 }
 
 fn row_step(row: sqlx::sqlite::SqliteRow) -> TaskStep {
@@ -136,6 +138,8 @@ fn row_step(row: sqlx::sqlite::SqliteRow) -> TaskStep {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         completed_at: row.get("completed_at"),
+        result_json: row.get("result_json"),
+        entry_fenced: row.get::<i64, _>("entry_fenced") != 0,
     }
 }
 
@@ -151,6 +155,17 @@ impl TaskStepRepo for SqliteDb {
             .bind(&i.id).bind(&i.task_id).bind(&i.kind).bind(&i.payload_json).bind(&i.causation_step_id).bind(&i.causation_key)
             .bind(&i.chain_id).bind(i.chain_position).bind(&i.expected_status).bind(i.expected_version)
             .bind(i.expected_epoch).bind(&i.task_id).bind(&i.lane).bind(&i.available_at).bind(&now).bind(&now).bind(&i.task_id).execute(&mut **tx).await?;
+        if serde_json::from_str::<serde_json::Value>(&i.payload_json)
+            .ok()
+            .is_some_and(|p| p["preempt"] == true)
+        {
+            sqlx::query("UPDATE task_step SET priority=1 WHERE id=?")
+                .bind(&i.id)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("UPDATE task_step SET status='superseded',last_error='preempted by owner command',completed_at=?,updated_at=? WHERE task_id=? AND seq<(SELECT seq FROM task_step WHERE id=?) AND priority=0 AND integration_started_at IS NULL AND entry_fenced=1 AND status='pending' AND kind IN ('hooks','cascade','command','mutation')")
+                .bind(&now).bind(&now).bind(&i.task_id).bind(&i.id).execute(&mut **tx).await?;
+        }
         Ok(
             sqlx::query_scalar("SELECT id FROM task_step WHERE task_id = ? AND causation_key = ?")
                 .bind(&i.task_id)
@@ -261,18 +276,26 @@ impl TaskStepRepo for SqliteDb {
             .await?)
     }
     async fn pending_steps(&self, task_id: &str) -> Result<i64> {
+        let own = crate::task_writer::current_task_step()
+            .filter(|step| step.task_id == task_id)
+            .map(|step| step.id);
         Ok(sqlx::query_scalar(
-            "SELECT COUNT(*) FROM task_step WHERE task_id = ? AND status IN ('pending','claimed')",
+            "SELECT COUNT(*) FROM task_step WHERE task_id = ? AND status IN ('pending','claimed') AND (? IS NULL OR id<>?)",
         )
         .bind(task_id)
+        .bind(&own).bind(&own)
         .fetch_one(self.pool())
         .await?)
     }
     async fn entry_hooks_pending(&self, task_id: &str) -> Result<bool> {
+        let own = crate::task_writer::current_task_step()
+            .filter(|step| step.task_id == task_id)
+            .map(|step| step.id);
         Ok(sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id = s.task_id WHERE s.task_id = ? AND s.kind = 'hooks' AND s.status IN ('pending','claimed') AND s.expected_status = t.status AND s.expected_epoch = t.status_epoch)",
+            "SELECT EXISTS(SELECT 1 FROM task_step s JOIN task t ON t.id = s.task_id WHERE s.task_id = ? AND (s.kind='hooks' OR (s.kind='command' AND s.lane='long')) AND s.status IN ('pending','claimed') AND (? IS NULL OR s.id<>?) AND s.expected_status = t.status AND s.expected_epoch = t.status_epoch)",
         )
         .bind(task_id)
+        .bind(&own).bind(&own)
         .fetch_one(self.pool())
         .await?)
     }
@@ -316,6 +339,10 @@ impl TaskStepRepo for SqliteDb {
     async fn release_step(&self, id: &str, owner: &str) -> Result<()> {
         sqlx::query("UPDATE task_step SET lease_until=NULL,claimed_by=NULL WHERE id=? AND claimed_by=? AND status NOT IN ('pending','claimed')")
             .bind(id).bind(owner).execute(self.pool()).await?;
+        self.task_step_activity
+            .lock()
+            .expect("step activity")
+            .retain(|step_id, (_, token)| step_id != id || token != owner);
         self.domain_event_notify().notify_waiters();
         Ok(())
     }
@@ -328,17 +355,6 @@ impl TaskStepRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         Ok(())
-    }
-    async fn renew_step_reservation(&self, id: &str, until: &str) -> Result<bool> {
-        Ok(
-            sqlx::query("UPDATE task_step SET available_at=? WHERE id=? AND status='pending'")
-                .bind(until)
-                .bind(id)
-                .execute(self.pool())
-                .await?
-                .rows_affected()
-                == 1,
-        )
     }
     async fn ready_step(&self, id: &str) -> Result<()> {
         sqlx::query(
@@ -359,10 +375,19 @@ impl TaskStepRepo for SqliteDb {
 pub struct TaskStepActivity {
     state: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
     id: String,
+    controls: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<crate::task_writer::TaskStepControl>>,
+        >,
+    >,
 }
 impl Drop for TaskStepActivity {
     fn drop(&mut self) {
         self.state.lock().expect("step activity").remove(&self.id);
+        self.controls
+            .lock()
+            .expect("step controls")
+            .remove(&self.id);
     }
 }
 impl SqliteDb {
@@ -373,15 +398,9 @@ impl SqliteDb {
         tx: &mut Transaction<'_, Sqlite>,
         step: &TaskStep,
     ) -> Result<()> {
-        let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE id=? AND status='claimed' AND claimed_by=? AND (lease_until>? OR ?))")
-            .bind(&step.id).bind(&step.claimed_by).bind(now_rfc3339()).bind(self.step_is_active(step)).fetch_one(&mut **tx).await?;
-        let entry: bool = sqlx::query_scalar(STEP_FENCE)
-            .bind(&step.task_id)
-            .bind(&step.expected_status)
-            .bind(step.expected_epoch)
-            .fetch_one(&mut **tx)
-            .await?;
-        if !owned || !entry {
+        let owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE id=? AND (status='claimed' OR (? AND status='done')) AND claimed_by=? AND (lease_until>? OR ?))")
+            .bind(&step.id).bind(step.kind != "hooks").bind(&step.claimed_by).bind(now_rfc3339()).bind(self.step_is_active(step)).fetch_one(&mut **tx).await?;
+        if !owned {
             return Err(DbError::VersionConflict);
         }
         Ok(())
@@ -490,6 +509,7 @@ impl SqliteDb {
         TaskStepActivity {
             state: self.task_step_activity.clone(),
             id: step.id.clone(),
+            controls: self.task_step_controls.clone(),
         }
     }
     pub fn step_is_active(&self, step: &TaskStep) -> bool {
@@ -532,7 +552,7 @@ impl SqliteDb {
     /// excluding `excluding_task`. Counts a Task's available fast-lane head
     /// step or a claimed fast-lane hook while dispatch is imminent. Completed
     /// status steps and recorded dispatch outcomes reserve nothing. Rows behind another
-    /// step, in back-off, under a producer reservation, or waiting for or
+    /// step, in back-off, or waiting for or
     /// inside a long-lane merge/CI hook hold no capacity; the dispatcher
     /// re-drives a refused entry.
     pub async fn queued_admissions(
@@ -563,6 +583,23 @@ impl SqliteDb {
     pub fn active_step_count(&self) -> usize {
         self.task_step_activity.lock().expect("step activity").len()
     }
+    pub fn register_step_control(
+        &self,
+        step: &TaskStep,
+    ) -> std::sync::Arc<crate::task_writer::TaskStepControl> {
+        let control = crate::task_writer::TaskStepControl::new();
+        self.task_step_controls
+            .lock()
+            .expect("step controls")
+            .insert(step.id.clone(), control.clone());
+        control
+    }
+    pub fn release_step_control(&self, step: &TaskStep) {
+        self.task_step_controls
+            .lock()
+            .expect("step controls")
+            .remove(&step.id);
+    }
     pub async fn claim_step_lane(
         &self,
         owner: &str,
@@ -580,7 +617,14 @@ impl SqliteDb {
         let active = serde_json::to_string(&active)
             .map_err(|e| DbError::from(sqlx::Error::Decode(Box::new(e))))?;
         let now = now_rfc3339();
-        let candidate = "SELECT s.* FROM task_step s WHERE s.status IN ('pending','claimed') AND (? IS NULL OR s.lane=?) AND s.task_id NOT IN (SELECT value FROM json_each(?)) AND (? IS NULL OR s.task_id = ?) AND ((s.status = 'pending' AND s.available_at <= ?) OR (s.status = 'claimed' AND s.lease_until <= ?)) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND p.seq < s.seq AND p.status IN ('pending','claimed')) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND p.id != s.id AND p.lease_until > ?) ORDER BY s.created_at,s.seq LIMIT 1";
+        if let Some(lane) = lane {
+            let live:i64=sqlx::query_scalar("SELECT COUNT(*) FROM task_step WHERE status='claimed' AND lane=? AND lease_until>?")
+                .bind(lane).bind(&now).fetch_one(self.pool()).await?;
+            if live >= if lane == "long" { 4 } else { 8 } {
+                return Ok(None);
+            }
+        }
+        let candidate = "SELECT s.* FROM task_step s WHERE s.status IN ('pending','claimed') AND (? IS NULL OR s.lane=?) AND s.task_id NOT IN (SELECT value FROM json_each(?)) AND (? IS NULL OR s.task_id = ?) AND ((s.status = 'pending' AND s.available_at <= ?) OR (s.status = 'claimed' AND s.lease_until <= ?)) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND ((p.integration_started_at IS NOT NULL AND p.seq<s.seq) OR (s.integration_started_at IS NULL AND p.priority>s.priority) OR (p.priority=s.priority AND p.seq<s.seq)) AND p.status IN ('pending','claimed')) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND p.id != s.id AND p.lease_until > ?) ORDER BY s.priority DESC,s.created_at,s.seq LIMIT 1";
         if sqlx::query(candidate)
             .bind(lane)
             .bind(lane)
@@ -597,6 +641,14 @@ impl SqliteDb {
             return Ok(None);
         }
         let mut tx = begin_immediate(self.pool()).await?;
+        if let Some(lane) = lane {
+            let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_step WHERE status='claimed' AND lane=? AND lease_until>?")
+                .bind(lane).bind(&now).fetch_one(&mut *tx).await?;
+            if live >= if lane == "long" { 4 } else { 8 } {
+                tx.commit().await?;
+                return Ok(None);
+            }
+        }
         let row = sqlx::query(candidate)
             .bind(lane)
             .bind(lane)
@@ -627,6 +679,7 @@ impl SqliteDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TaskRepo;
     async fn fixture() -> SqliteDb {
         let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
         crate::run_migrations(&pool).await.unwrap();
@@ -663,6 +716,19 @@ mod tests {
     }
     fn later() -> String {
         (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
+    }
+    #[tokio::test]
+    async fn fast_commands_do_not_hide_owner_actions_but_long_commands_do() {
+        let db = fixture().await;
+        let mut fast = input("a", "fast-command");
+        fast.kind = "command".into();
+        db.enqueue_step(&fast).await.unwrap();
+        assert!(!db.entry_hooks_pending("a").await.unwrap());
+        let mut long = input("a", "long-command");
+        long.kind = "command".into();
+        long.lane = "long".into();
+        db.enqueue_step(&long).await.unwrap();
+        assert!(db.entry_hooks_pending("a").await.unwrap());
     }
     #[tokio::test]
     async fn enqueue_rolls_back_with_producing_cas_and_deduplicates() {
@@ -1126,7 +1192,7 @@ mod tests {
         assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (2, 2));
     }
     #[tokio::test]
-    async fn hook_and_script_checkpoints_reject_stale_owners_and_entries() {
+    async fn hook_and_script_checkpoints_reject_stale_owners_and_serialize_writers() {
         let db = fixture().await;
         let mut input = input("a", "hook");
         input.kind = "hooks".into();
@@ -1174,14 +1240,51 @@ mod tests {
             db.finish_hook(&step, 0, "old").await,
             Err(DbError::VersionConflict)
         ));
-        sqlx::query("UPDATE task SET status='other' WHERE id='a'")
-            .execute(db.pool())
+        db.enqueue_task_mutation(
+            "a",
+            crate::TaskMutation::Sql {
+                task_id: "a".into(),
+                query: "UPDATE task SET status='other',version=version+1 WHERE id=?".into(),
+                arguments: vec![serde_json::json!("a")],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            TaskRepo::get_by_id(&db, "a", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "todo"
+        );
+        db.finish_hook_script(&replacement, 0, 0, "current")
             .await
             .unwrap();
-        assert!(matches!(
-            db.finish_hook_script(&replacement, 0, 0, "late").await,
-            Err(DbError::VersionConflict)
-        ));
+        let mut tx = begin_immediate(db.pool()).await.unwrap();
+        db.finish_step_in_tx(&mut tx, &replacement, "done", None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        db.release_step(&replacement.id, "replacement")
+            .await
+            .unwrap();
+        let next = db
+            .claim_step("writer", Some("a"), &later())
+            .await
+            .unwrap()
+            .unwrap();
+        crate::task_writer::in_task_step(next.clone(), db.execute_task_mutation(&next))
+            .await
+            .unwrap();
+        assert_eq!(
+            TaskRepo::get_by_id(&db, "a", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "other"
+        );
     }
     #[tokio::test]
     async fn durable_hook_upgrade_unblocks_legacy_running_barrier_without_moving_epoch() {

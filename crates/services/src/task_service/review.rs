@@ -54,7 +54,7 @@ impl TaskService {
             "target_state": task.status, "reason": reason,
             "not_before": (Utc::now() + chrono::Duration::seconds(5 * (1_i64 << attempts.saturating_sub(1).min(4)))).to_rfc3339(),
         }).to_string());
-        let changed = sqlx::query("UPDATE task SET entry_barrier_json = ?, error_annotation = ?,
+        let changed = db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET entry_barrier_json = ?, error_annotation = ?,
             blocked_json = ?, metadata_json = CASE WHEN ? IS NULL THEN
             json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
             json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
@@ -63,8 +63,10 @@ impl TaskService {
             .bind(barrier.to_string()).bind(annotation.to_string())
             .bind((!retry).then(|| json!({"kind": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed }, "reason": reason, "created_at": now, "execution_id": null}).to_string()))
             .bind(&deferral).bind(&deferral).bind(&now).bind(&task.id).bind(task.version).bind(&task.status)
-            .execute(&mut *tx).await?;
-        if changed.rows_affected() != 1 {
+            .execute_in_tx(&mut tx).await?;
+        // Runs in the Task's review hook step; a queued write would make the
+        // attention and returned Task below untruthful.
+        if changed.require_applied()? != 1 {
             return Err(DbError::VersionConflict.into());
         }
         if !retry {
@@ -100,6 +102,16 @@ impl TaskService {
 
     pub async fn rerun_review(&self, task_id: Uuid) -> Result<(Task, Review)> {
         let task_id = task_id.to_string();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "rerun_review",
+                    serde_json::json!([task_id]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -126,6 +138,16 @@ impl TaskService {
         actor: Actor,
     ) -> Result<(Task, Review)> {
         let task_id = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "approve_review_as",
+                    serde_json::json!([task_id, actor]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -203,6 +225,16 @@ impl TaskService {
         actor: Actor,
     ) -> Result<(Task, Review)> {
         let task_id = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "reject_review_as",
+                    serde_json::json!([task_id, reason, actor]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?

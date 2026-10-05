@@ -64,6 +64,19 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         &self,
         input: CreateTaskRoleAssignment,
     ) -> std::result::Result<TaskRoleAssignment, DbError> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskRoleAssignmentAssign {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        self.fence_current_step_in_tx(&mut tx).await?;
         sqlx::query(
             "INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(task_id, role_name) DO UPDATE SET assignee_type = excluded.assignee_type, assignee_id = excluded.assignee_id, updated_at = excluded.updated_at",
         )
@@ -74,7 +87,7 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         .bind(input.assignee_id.as_deref())
         .bind(&input.created_at)
         .bind(&input.updated_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
@@ -83,11 +96,15 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         )
         .bind(&input.task_id)
         .bind(&input.role_name)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
-        map_task_role_assignment_row(row)
+        let assignment = map_task_role_assignment_row(row)?;
+        self.record_mutation_reply_in_tx(&mut tx, &assignment)
+            .await?;
+        tx.commit().await?;
+        Ok(assignment)
     }
 
     async fn assign_if_unchanged(
@@ -95,7 +112,20 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         input: CreateTaskRoleAssignment,
         expected_previous: Option<&TaskRoleAssignment>,
     ) -> std::result::Result<TaskRoleAssignment, DbError> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskRoleAssignmentAssignIfUnchanged {
+                        input: input.clone(),
+                        expected_previous: expected_previous.cloned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let current_row = sqlx::query(
             "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
              FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
@@ -207,12 +237,28 @@ impl TaskRoleAssignmentRepo for SqliteDb {
     }
 
     async fn remove(&self, task_id: &str, role_name: &str) -> std::result::Result<(), DbError> {
+        if !crate::task_writer::owns_task(task_id) {
+            return self
+                .run_task_mutation(
+                    task_id,
+                    crate::TaskMutation::TaskRoleAssignmentRemove {
+                        task_id: task_id.to_owned(),
+                        role_name: role_name.to_owned(),
+                    },
+                )
+                .await;
+        }
+
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        self.fence_current_step_in_tx(&mut tx).await?;
         sqlx::query("DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?")
             .bind(task_id)
             .bind(role_name)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(map_workflow_sqlx_error)?;
+        self.record_mutation_reply_in_tx(&mut tx, &()).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -223,7 +269,22 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         expected_task_version: i64,
         updated_at: &str,
     ) -> std::result::Result<(TaskRoleAssignment, Task), DbError> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskRoleAssignmentAssignAndClearReviewAuthority {
+                        input: input.clone(),
+                        expected_previous: expected_previous.cloned(),
+                        expected_task_version,
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let current_row = sqlx::query(
             "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
              FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
@@ -314,7 +375,21 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         expected_task_version: i64,
         updated_at: &str,
     ) -> std::result::Result<Task, DbError> {
+        if !crate::task_writer::owns_task(&expected_assignment.task_id) {
+            return self
+                .run_task_mutation(
+                    &expected_assignment.task_id,
+                    crate::TaskMutation::TaskRoleAssignmentRemoveAndClearReviewAuthority {
+                        expected_assignment: expected_assignment.clone(),
+                        expected_task_version,
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let current_row = sqlx::query(
             "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
              FROM task_role_assignment WHERE task_id = ? AND role_name = ?",

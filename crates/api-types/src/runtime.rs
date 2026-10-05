@@ -84,12 +84,26 @@ pub struct WorkspaceResponse {
     /// A host path for server placements; empty for daemon placements.
     pub worktree_path: String,
     pub placement: WorkspacePlacementResponse,
+    pub pending_remote_cancel: Vec<PendingRemoteCancel>,
     pub branch: String,
     pub status: String,
     pub before_sha: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PendingRemoteCancel {
+    pub operation_id: String,
+    pub placement_id: String,
+    pub daemon_id: String,
+    pub runtime_id: String,
+    #[ts(type = "number")]
+    pub generation: i64,
+    pub step_id: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

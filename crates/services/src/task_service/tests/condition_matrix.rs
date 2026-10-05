@@ -568,6 +568,7 @@ async fn condition_offer_apply_dispatch_matrix() {
                         };
                         let mut dispatch_results = Vec::new();
                         for _ in 0..3 {
+                            service.drain(&copy.id).await.unwrap();
                             let current = TaskRepo::get_by_id(&*db, &copy.id, false)
                                 .await
                                 .unwrap()
@@ -664,7 +665,7 @@ async fn condition_offer_apply_dispatch_matrix() {
                                     current.error_annotation.is_some()
                                         || current.blocked_json.is_some()
                                         || current.failed_json.is_some(),
-                                    "{label} {tag}: refusal lost its condition"
+                                    "{label} {tag}: refusal lost its condition; dispatch={dispatch_results:?}; current={current:?}"
                                 );
                                 restored += 1;
                             } else {
@@ -710,4 +711,84 @@ async fn condition_offer_apply_dispatch_matrix() {
         applied + restored,
         "each accepted action must settle; see db-matrix.txt"
     );
+}
+
+#[tokio::test]
+async fn queued_role_retry_preserves_a_condition_when_dispatch_refuses() {
+    let db = Arc::new(sqlite_db().await);
+    let (project, _, repo) = seed_project_repo(&db).await;
+    initialize_primary_repository(&repo);
+    let agent = seed_agent(&db).await;
+    let row = AgentRepo::get_by_id(&*db, &agent).await.unwrap().unwrap();
+    AgentRepo::update(
+        &*db,
+        db::UpdateAgent {
+            id: row.id,
+            expected_version: row.version,
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            config_json: None,
+            daemon_id: Some(None),
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+        .with_workspace_root(repo.path().join("workspaces"))
+        .with_task_executor(Arc::new(ConditionPendingExecutor));
+    let task = condition_fixture(
+        &db,
+        &project,
+        &agent,
+        "std",
+        "planning",
+        Some(FailureKind::ExecutorUnavailable),
+        "bare",
+    )
+    .await;
+    let action = service
+        .task_action_offers(&task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap()
+        .available_actions
+        .into_iter()
+        .find(|offer| offer.action.verb() == "retry" && offer.reason == "role_retry")
+        .unwrap()
+        .action;
+    service
+        .perform_task_action(&task.id, action, task.version)
+        .await
+        .unwrap();
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let outcome = service.dispatch_queued_recovery(&task).await;
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    if outcome.is_err() {
+        assert!(
+            condition_marker_present(&current)
+                || current.error_annotation.is_some()
+                || current.blocked_json.is_some()
+                || current.failed_json.is_some(),
+            "refusal lost condition: {outcome:?}, original={:?}, current={current:?}",
+            task.metadata_json
+        );
+    }
 }

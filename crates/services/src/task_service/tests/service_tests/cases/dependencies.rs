@@ -289,6 +289,7 @@ async fn done_prerequisite_wakes_dependent_with_stale_dispatch_disposition() {
         .await
         .expect("prerequisite completes");
     assert_eq!(done.task.status, "done");
+    service.drain(&dependent.id).await.unwrap();
 
     // Completing the prerequisite wakes the dependent and advances its own
     // version, fencing any in-flight stale disposition writer (F6).
@@ -590,6 +591,7 @@ async fn cancelled_prerequisite_durably_blocks_dependents_until_link_is_removed(
         .cancel_task(prerequisite.id.clone())
         .await
         .expect("prerequisite cancels");
+    service.drain(&dependent.id).await.unwrap();
 
     let blocked = TaskRepo::get_by_id(&*db, &dependent.id, false)
         .await
@@ -665,4 +667,39 @@ async fn test_user_claim_bypasses_capacity_check() {
         .expect("coder assignment loads")
         .is_none());
     assert_eq!(claimed.execution.agent_id, None);
+}
+
+#[tokio::test]
+async fn dependency_block_serializes_a_content_edit_without_cas_retry() {
+    use db::TaskStepRepo;
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(16)));
+    let (project, _, _repo) = seed_project_repo(&db).await;
+    let stale = seed_task_with_status(&db, &project, "todo".to_owned()).await;
+    sqlx::query("UPDATE task SET title='owner edit',version=version+1 WHERE id=?")
+        .bind(&stale.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = service
+        .block_cancelled_dependencies(&stale, &["prerequisite".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(task.title, "owner edit");
+    assert!(task
+        .blocked_json
+        .as_deref()
+        .unwrap()
+        .contains("prerequisite"));
+    assert!(task
+        .error_annotation
+        .as_deref()
+        .unwrap()
+        .contains("dependency_cancelled"));
+    assert!(db
+        .task_steps(&task.id)
+        .await
+        .unwrap()
+        .iter()
+        .all(|s| s.status == "done" && s.attempts == 1));
 }

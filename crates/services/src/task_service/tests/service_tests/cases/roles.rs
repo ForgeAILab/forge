@@ -374,6 +374,7 @@ async fn reassign_role_same_assignee_does_not_emit_event() {
     )
     .await
     .expect("dispatch disposition records");
+    while rx.try_recv().is_ok() {}
 
     service
         .reassign_role(
@@ -837,6 +838,10 @@ async fn on_agent_deleted_clears_coder_assignee_id_and_preserves_agent_type() {
         .on_agent_deleted(&agent_id)
         .await
         .expect("agent deletion sweep succeeds");
+    service
+        .drain(&task.id)
+        .await
+        .expect("queued deletion assignment sweep settles");
 
     let row = sqlx::query(
         "SELECT assignee_type, assignee_id FROM task_role_assignment WHERE task_id = ? AND role_name = 'coder'",
@@ -1129,6 +1134,7 @@ async fn reassign_same_coder_noop_preserves_review_passed_at() {
     )
     .await
     .expect("review_passed_at seeds");
+    while rx.try_recv().is_ok() {}
 
     service
         .reassign_role(

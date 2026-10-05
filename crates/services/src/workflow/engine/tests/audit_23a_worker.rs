@@ -292,7 +292,13 @@ async fn audit_23a_before_exit_cascade_does_not_suppress_target_hooks() {
     assert!(result.is_ok(), "the CAS returns before target hooks");
     let settled = drain(engine(db.clone(), Arc::new(EventBus::new(32))), id).await;
     assert_eq!(settled.status, "target");
-    let rows = db.task_steps(id).await.unwrap();
+    let rows: Vec<_> = db
+        .task_steps(id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|step| step.kind == "hooks")
+        .collect();
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].status, "failed",

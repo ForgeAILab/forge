@@ -14,10 +14,8 @@ pub async fn claim_task(
     });
     let claimed = state
         .task_service
-        .claim_task(id, assignee, overrides)
+        .claim_and_start_task(id, assignee, overrides)
         .await?;
-    let execution_id = claimed.execution.id.clone();
-    state.task_service.start_execution(execution_id).await?;
     Ok(Json(
         task_response(&state.db, &state.workspace_backend_router, claimed.task).await?,
     ))

@@ -113,8 +113,8 @@ PY"# }
     .await;
     let task_id = created_task.id;
     assert_eq!(created_task.status, "todo".to_owned());
-    // Creation applies the Project's default role assignments, so the created
-    // Task is past version 1 by the time it is returned. What matters is that
+    // Creation applies the Project's default role assignments in the Task's
+    // birth transaction, so they spend no extra version. What matters is that
     // the response is not a pre-assignment snapshot: a client's next optimistic
     // write must succeed against the version it was handed.
     let persisted_task: TaskResponse = empty_request(
@@ -135,11 +135,12 @@ PY"# }
     )
     .await;
     assert_eq!(claimed.status, "in_progress".to_owned());
-    // Claiming is several authority writes, not one: the coder assignment,
-    // the transition itself, and the entry barrier its blocking before-work
-    // hook opens and closes. The exact count is asserted so a change to what
-    // a claim commits shows up here rather than silently.
-    assert_eq!(claimed.version, 5);
+    // The Task is born at version 1 with its default roles, and the claim
+    // (coder assignment plus transition) commits as one versioned write. The
+    // exact count is asserted so a change to what a claim commits shows up
+    // here rather than silently.
+    assert_eq!(created_task.version, 1);
+    assert_eq!(claimed.version, 2);
 
     let execution = single_execution_for_task(&harness.app, &task_id).await;
     let execution_id = execution.id.clone();

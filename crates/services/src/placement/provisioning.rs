@@ -224,8 +224,8 @@ pub(crate) async fn start(job: Job) -> Result<()> {
                 let reason = format!("environment_probe_pending: {name}; provisioning elapsed {elapsed}s; last failure: {error}{}", if attempts >= MAX_PROVISION_ATTEMPTS { "; provisioning retry limit reached" } else { "" });
                 if let Ok(mut tx)=db::begin_immediate(job.db.pool()).await {
                     if fence_job_inputs(&mut tx,&job.project.id,&digest).await.is_ok() {
-                for (id,version) in tasks { let _ = sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.reason',?) WHERE id=? AND version=? AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
-                    .bind(&reason).bind(id).bind(version).bind(&machine_json).bind(&job.project.id).bind(&job.candidate.location.daemon_id).bind(&job.candidate.location.runtime_id).bind(readiness_witness.as_ref().map(|row|row.version).unwrap_or(-1)).execute(&mut *tx).await; }
+                for (id,version) in tasks { let _ = db::task_writer::TaskQuery::new(&job.db,&id,"UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.reason',?) WHERE id=? AND version=? AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
+                    .bind(&reason).bind(&id).bind(version).bind(&machine_json).bind(&job.project.id).bind(&job.candidate.location.daemon_id).bind(&job.candidate.location.runtime_id).bind(readiness_witness.as_ref().map(|row|row.version).unwrap_or(-1)).identity_fenced().execute_in_tx(&mut tx).await; }
                         let _=tx.commit().await;
                     }
                 }

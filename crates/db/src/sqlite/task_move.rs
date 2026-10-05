@@ -52,11 +52,12 @@ impl TaskBoardRepo for SqliteDb {
 
     async fn compare_and_move_task(
         &self,
-        input: CompareAndMoveTask,
+        mut input: CompareAndMoveTask,
     ) -> Result<MoveTaskPersistence> {
         validate_move_input(&input)?;
         let request_hash = normalized_request(&input)?;
         let mut tx = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut tx).await?;
 
         let reserved = sqlx::query(
             "INSERT INTO task_move_operation (operation_id, project_id, task_id, request_hash, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'processing', ?, ?) ON CONFLICT(operation_id) DO NOTHING",
@@ -138,6 +139,9 @@ impl TaskBoardRepo for SqliteDb {
             return Err(DbError::InvalidTaskMove(
                 "task belongs to a different project".to_owned(),
             ));
+        }
+        if crate::task_writer::owns_task(&input.task_id) {
+            input.task_version = task.version;
         }
         if task.version != input.task_version {
             return Err(DbError::TaskVersionConflict {

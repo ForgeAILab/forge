@@ -86,6 +86,7 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     std::env::set_current_dir(out_dir).expect("switch to types output directory");
 
     TaskType::export().expect("export TaskType");
+    TaskBusyDetails::export().expect("export TaskBusyDetails");
     ProductMaturity::export().expect("export ProductMaturity");
     ProductGenesisLifecycle::export().expect("export ProductGenesisLifecycle");
     ProductGenesisSession::export().expect("export ProductGenesisSession");
@@ -108,6 +109,10 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     VerifyRepoLocationRequest::export().expect("export VerifyRepoLocationRequest");
     WorkspacePlacementResponse::export().expect("export WorkspacePlacementResponse");
     WorkspaceResponse::export().expect("export WorkspaceResponse");
+    PendingRemoteCancel::export().expect("export PendingRemoteCancel");
+    WorkspaceCancelParams::export().expect("export WorkspaceCancelParams");
+    WorkspaceCancelResult::export().expect("export WorkspaceCancelResult");
+    WorkspaceCancelState::export().expect("export WorkspaceCancelState");
     FsEntry::export().expect("export FsEntry");
     FsListResponse::export().expect("export FsListResponse");
     BranchListResponse::export().expect("export BranchListResponse");

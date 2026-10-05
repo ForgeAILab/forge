@@ -100,6 +100,18 @@ impl DaemonWorkspaceBackend {
 
     async fn workspace(&self, placement: &WorkspacePlacement) -> Result<Workspace> {
         self.owner(placement)?;
+        if !self
+            .db
+            .pending_remote_cancels(None, Some(&placement.workspace_id))
+            .await?
+            .is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "pending_remote_cancel: workspace is fenced until owner acknowledgement",
+            )
+            .into());
+        }
+
         WorkspaceRepo::get_by_id(&*self.db, &placement.workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", &placement.workspace_id).into())
@@ -335,6 +347,17 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
     }
 
     async fn run(&self, placement: &WorkspacePlacement, spec: &RunSpec) -> Result<RunResult> {
+        if !self
+            .db
+            .pending_remote_cancels(None, Some(&placement.workspace_id))
+            .await?
+            .is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "pending_remote_cancel: workspace is fenced until owner acknowledgement",
+            )
+            .into());
+        }
         if spec.max_output_bytes == 0
             || (spec.timeout_secs == 0 && spec.purpose != WorkspaceRunPurpose::CiStep)
         {
@@ -358,6 +381,14 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
                 error => error,
             })?;
         let operation_id = db::new_uuid_v4();
+        let attempt = crate::workflow::engine::durable::current_hook(&placement.task_id)
+            .map(|attempt| attempt.step)
+            .or_else(db::task_writer::current_task_step);
+        if let Some(attempt) = &attempt {
+            self.db
+                .register_remote_task_operation(attempt, placement, &operation_id)
+                .await?;
+        }
         let result = self
             .client
             .run(
@@ -382,6 +413,11 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             )
             .await
             .map_err(|error| Self::error(placement, Some(spec.purpose), error))?;
+        if let Some(attempt) = &attempt {
+            self.db
+                .finish_remote_task_operation(attempt, &operation_id)
+                .await?;
+        }
         if result.timed_out {
             return Err(ServiceError::invalid_operation("review command timed out").into());
         }
@@ -516,6 +552,7 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             );
         }
         let expected = self.current_expected(placement).await?;
+        self.db.protect_step_integration().await?;
         let guard = match self.db.lock_review_integration(&placement.task_id).await {
             Ok(guard) => guard,
             Err(db::DbError::Check(reason)) => return Ok(MergeOutcome::ReviewRequired { reason }),
@@ -560,6 +597,7 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
                 .map(|contract| contract.commit_sha.clone()),
         };
         let daemon_id = self.owner(placement)?.0;
+
         let request = serde_json::to_value(&params).expect("merge serializes");
         let retained = self
             .client
@@ -585,6 +623,7 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             .map_err(|error| {
                 ServiceError::invalid_operation(format!("invalid retained merge: {error}"))
             })?;
+        self.db.protect_step_integration().await?;
         let guard = match self.db.lock_review_integration(&placement.task_id).await {
             Ok(guard) => guard,
             Err(db::DbError::Check(reason)) => return Ok(MergeOutcome::ReviewRequired { reason }),
@@ -599,6 +638,12 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
         // Keep the frozen authority check outside the transport exchange so
         // its SQLite write lock cannot block the reply behind a heartbeat.
         guard.release().await?;
+        let attempt = db::task_writer::current_task_step();
+        if let Some(step) = &attempt {
+            self.db
+                .register_remote_task_operation(step, placement, &params.merge.fence.operation_id)
+                .await?;
+        }
         let result = match retained_result {
             Some(result) => Ok(result),
             None => self.client.merge(daemon_id, params.clone()).await,
@@ -630,6 +675,11 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             .retain_merge_result(daemon_id, &request, &value, &execution.id)
             .await
             .map_err(|error| Self::error(placement, None, error))?;
+        if let Some(step) = &attempt {
+            self.db
+                .finish_remote_task_operation(step, &params.merge.fence.operation_id)
+                .await?;
+        }
         self.client.acknowledge_recorded(daemon_id, &value).await;
         Ok(match result.outcome {
             WorkspaceMergeOutcome::ReviewRequired { reason } => {
@@ -824,6 +874,9 @@ mod tests {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("pool creates");
+        db::run_migrations(&pool)
+            .await
+            .expect("workspace cancellation tables exist");
         DaemonWorkspaceBackend {
             db: Arc::new(SqliteDb::new(pool)),
             client: DaemonWorkspaceClient::new(Arc::clone(&daemon.registry)),

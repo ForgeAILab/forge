@@ -32,6 +32,11 @@ pub enum DbError {
 
     #[error("version conflict")]
     VersionConflict,
+    #[error("task_busy: {pending_steps} pending steps; retry after {retry_after_ms} ms")]
+    TaskBusy {
+        pending_steps: i64,
+        retry_after_ms: u64,
+    },
 
     #[error("idempotency key conflicts with a different mutation")]
     IdempotencyConflict,
@@ -77,6 +82,9 @@ pub enum DbError {
         running_executions: i64,
         active_leases: i64,
     },
+
+    #[error("{resource} is in use: {reason}")]
+    ResourceInUse { resource: String, reason: String },
 
     #[error("dependency gate")]
     DependencyGate,
@@ -133,10 +141,22 @@ pub enum DbError {
 }
 
 impl DbError {
+    /// A delete or update was refused because another row still references
+    /// the target. Callers surface this as a typed conflict, never a 500.
+    pub fn is_foreign_key_violation(&self) -> bool {
+        // SQLite reports an immediate `ON DELETE RESTRICT` refusal as
+        // SQLITE_CONSTRAINT_TRIGGER (1811), not SQLITE_CONSTRAINT_FOREIGNKEY
+        // (787), with the same message.
+        matches!(self, Self::Sqlx(sqlx::Error::Database(error))
+            if error.kind() == sqlx::error::ErrorKind::ForeignKeyViolation
+                || error.message().contains("FOREIGN KEY constraint failed"))
+    }
+
     /// Worker retry classification, deliberately narrower than "any DB error".
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::VersionConflict
+            Self::TaskBusy { .. }
+            | Self::VersionConflict
             | Self::TaskVersionConflict { .. }
             | Self::BoardRevisionConflict { .. } => true,
             Self::Sqlx(

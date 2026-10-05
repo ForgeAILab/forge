@@ -749,3 +749,118 @@ async fn default_workflow_assigns_declared_roles_not_assignee() {
     );
     assert!(!roles.iter().any(|role| role == default_roles::ASSIGNEE));
 }
+
+#[tokio::test]
+async fn queued_dispatcher_claim_racing_owner_cancel_cannot_start_cancelled_task() {
+    use db::TaskStepRepo;
+    let db = Arc::new(sqlite_db().await);
+    let root = TempDir::new().unwrap();
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(32)))
+        .with_workspace_root(root.path().to_path_buf());
+    let (project_id, _, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "claim cancel race",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let id = new_uuid_v4();
+    db.enqueue_step(&db::EnqueueTaskStep {
+        id: id.clone(),
+        task_id: task.id.clone(),
+        kind: "mutation".into(),
+        payload_json: serde_json::to_string(&db::TaskMutation::Sql {
+            task_id: task.id.clone(),
+            query: "UPDATE task SET updated_at=updated_at WHERE id=?".into(),
+            arguments: vec![json!(task.id)],
+        })
+        .unwrap(),
+        causation_step_id: None,
+        causation_key: id.clone(),
+        chain_id: id,
+        chain_position: 1,
+        expected_status: task.status.clone(),
+        expected_version: task.version,
+        expected_epoch: None,
+        lane: "fast".into(),
+        available_at: now_rfc3339(),
+    })
+    .await
+    .unwrap();
+    let head = db
+        .claim_step(
+            "fast-predecessor",
+            Some(&task.id),
+            &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let claim = {
+        let svc = service.clone();
+        let id = task.id.clone();
+        tokio::spawn(async move { svc.claim_task(id, Assignee::Agent(agent_id), None).await })
+    };
+    let cancel = {
+        let svc = service.clone();
+        let id = task.id.clone();
+        let version = task.version;
+        tokio::spawn(async move {
+            svc.perform_task_action(
+                id,
+                api_types::TaskAction::Cancel {
+                    reason: Some("owner cancel".into()),
+                },
+                version,
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if db
+                .task_steps(&task.id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|s| s.kind == "command")
+                .count()
+                >= 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    db.finish_step_in_tx(&mut tx, &head, "done", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    db.release_step(&head.id, "fast-predecessor").await.unwrap();
+    assert_eq!(cancel.await.unwrap().unwrap().task.status, "cancelled");
+    assert!(claim.await.unwrap().is_err());
+    assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+}

@@ -58,8 +58,17 @@ async fn crash_after_cas_keeps_hooks_and_checkpointed_cascade_durable() {
     assert_eq!(settled.status, "done");
     let rows = db.task_steps("crash-cas").await.unwrap();
     assert!(rows.iter().all(|row| row.status == "done"));
-    assert_eq!(rows.iter().filter(|row| row.kind == "cascade").count(), 2);
-    assert_eq!(rows[0].attempts, 2);
+    let targets: Vec<String> = sqlx::query_scalar(
+        "SELECT to_state FROM transition_log WHERE task_id='crash-cas' ORDER BY created_at,rowid",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(targets, vec!["step_0", "step_1", "done"]);
+    assert_eq!(
+        rows.iter().find(|row| row.id == step.id).unwrap().attempts,
+        2
+    );
 }
 
 #[tokio::test]
@@ -126,11 +135,12 @@ async fn hooks_enqueue_failure_rolls_back_status_cas() {
 }
 
 #[tokio::test]
-async fn direct_writer_during_hooks_supersedes_even_after_return_to_same_status() {
+async fn workflow_writer_waits_for_hook_lease_and_old_owner_stays_fenced() {
     let db = Arc::new(sqlite_db().await);
     let bus = Arc::new(EventBus::new(8));
     seed_project_repo_and_task(&db, "hook-fence", "start").await;
-    engine(db.clone(), bus.clone())
+    let engine = engine(db.clone(), bus.clone());
+    engine
         .transition(
             "hook-fence",
             "step_0",
@@ -152,42 +162,46 @@ async fn direct_writer_during_hooks_supersedes_even_after_return_to_same_status(
         .unwrap()
         .unwrap();
     db.start_hook(&step, 0).await.unwrap();
-    // Direct writers remain allowed until C, and leaving/returning changes epoch.
-    let mut observed = TaskRepo::get_by_id(&*db, "hook-fence", false)
-        .await
-        .unwrap()
-        .unwrap();
-    sqlx::query("UPDATE task SET status='start',version=version+1 WHERE id='hook-fence'")
-        .execute(db.pool())
-        .await
-        .unwrap();
-    sqlx::query("UPDATE task SET status='step_0',version=version+1 WHERE id='hook-fence'")
-        .execute(db.pool())
-        .await
-        .unwrap();
-    assert!(db.finish_hook(&step, 0, "\"Ok\"").await.is_err());
-    // A completed hook must not refresh into a new entry before compensation.
-    assert!(matches!(
-        engine(db.clone(), bus.clone())
-            .refresh_task_after_hook(&mut observed, "step_0", Some(&step))
-            .await,
-        Err(ServiceError::Db(db::DbError::VersionConflict))
-    ));
+    db.enqueue_task_mutation(
+        "hook-fence",
+        db::TaskMutation::Sql {
+            task_id: "hook-fence".into(),
+            query: "UPDATE task SET status='start',version=version+1 WHERE id=?".into(),
+            arguments: vec![json!("hook-fence")],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, "hook-fence", false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "step_0"
+    );
+    db.finish_hook(&step, 0, "\"Ok\"").await.unwrap();
     sqlx::query("UPDATE task_step SET lease_until='2000-01-01T00:00:00Z' WHERE id=?")
         .bind(&step.id)
         .execute(db.pool())
         .await
         .unwrap();
-    TaskStepWorker::new(engine(db.clone(), bus))
+    TaskStepWorker::new(engine)
         .drain("hook-fence")
         .await
         .unwrap();
+    assert!(matches!(
+        db.finish_hook(&step, 0, "late").await,
+        Err(db::DbError::VersionConflict)
+    ));
     assert_eq!(
-        db.task_steps("hook-fence").await.unwrap()[0].status,
-        "superseded"
+        TaskRepo::get_by_id(&*db, "hook-fence", false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "start"
     );
-    let events:i64=sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type='transition.step_superseded' AND entity_id='hook-fence'").fetch_one(db.pool()).await.unwrap();
-    assert_eq!(events, 1);
 }
 
 #[tokio::test]
@@ -352,13 +366,13 @@ async fn resumed_dispatch_reuses_a_terminal_execution_for_its_hook() {
 }
 
 #[tokio::test]
-async fn concurrent_transition_attempts_during_ci_leave_one_winner_and_supersede_hooks() {
+async fn cancel_preempts_long_ci_step_and_cancels_the_task() {
     let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
     let control = TempDir::new().unwrap();
     let started = control.path().join("started");
-    let release = control.path().join("release");
+    let completed = control.path().join("completed");
     let quote = |p: &std::path::Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\"'\"'"));
-    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?").bind(json!({"review":{"ci_steps":[format!("touch {}; while [ ! -f {} ]; do sleep 0.01; done",quote(&started),quote(&release))]}}).to_string()).bind(&fixture.task.id).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?").bind(json!({"review":{"ci_steps":[format!("touch {}; sleep 120; touch {}",quote(&started),quote(&completed))]}}).to_string()).bind(&fixture.task.id).execute(fixture.db.pool()).await.unwrap();
     let result = fixture
         .engine
         .transition_with_authority(
@@ -378,7 +392,7 @@ async fn concurrent_transition_attempts_during_ci_leave_one_winner_and_supersede
     let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !started.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
         }
     })
     .await
@@ -387,56 +401,39 @@ async fn concurrent_transition_attempts_during_ci_leave_one_winner_and_supersede
         .await
         .unwrap()
         .unwrap();
-    let authority = fixture.workflow_authority().await;
-    let actor = api_types::Actor::system(api_types::SystemComponent::TaskDispatcher);
-    let a = fixture.engine.manual_override_transition_with_authority(
-        &current.id,
-        "todo",
-        current.version,
-        &fixture.workflow,
-        actor.clone(),
-        "move during CI A",
-        false,
-        Some(authority.clone()),
-    );
-    let b = fixture.engine.manual_override_transition_with_authority(
-        &current.id,
-        "todo",
-        current.version,
-        &fixture.workflow,
-        actor,
-        "move during CI B",
-        false,
-        Some(authority),
-    );
-    let (a, b) = tokio::join!(a, b);
-    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
-    std::fs::write(&release, "continue").unwrap();
+    let result = fixture
+        .engine
+        .transition_with_authority(
+            &current.id,
+            "cancelled",
+            current.version,
+            &fixture.workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "Cancel during CI",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.task.status, "cancelled");
+    assert!(!completed.exists());
     fixture
         .engine
         .task_service
         .drain(&current.id)
         .await
         .unwrap();
-    stop.send(true).unwrap();
-    worker.await.unwrap();
-    let task = TaskRepo::get_by_id(&*fixture.db, &current.id, false)
+    assert!(fixture
+        .db
+        .task_steps(&current.id)
         .await
         .unwrap()
-        .unwrap();
-    assert_eq!(task.status, "todo");
-    assert!(task.error_annotation.is_none());
-    let rows = fixture.db.task_steps(&current.id).await.unwrap();
-    assert_eq!(rows[0].status, "superseded");
-    assert_eq!(
-        TransitionLogRepo::list_by_task(&*fixture.db, &current.id)
-            .await
-            .unwrap()
-            .iter()
-            .filter(|log| log.to_state == "todo")
-            .count(),
-        1
-    );
+        .iter()
+        .any(|step| step.kind == "hooks"
+            && step.expected_status == "review"
+            && step.status == "superseded"));
+    stop.send(true).unwrap();
+    worker.await.unwrap();
 }
 
 // A Log-policy effect failure settles its step `failed` and is logged; it
@@ -491,7 +488,13 @@ async fn log_policy_effect_failure_settles_step_failed_without_blocking_task() {
         .await
         .unwrap();
     let result = drain_result(engine(db.clone(), Arc::new(EventBus::new(32))), result).await;
-    let steps = db.task_steps(task_id).await.unwrap();
+    let steps: Vec<_> = db
+        .task_steps(task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|step| step.kind == "hooks")
+        .collect();
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].status, "failed");
     assert!(steps[0]

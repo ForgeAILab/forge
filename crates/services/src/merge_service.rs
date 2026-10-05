@@ -618,6 +618,7 @@ impl MergeService {
         )
         .await?;
 
+        self.db.protect_step_integration().await?;
         let review_guard = match self.db.lock_review_integration(&task_id).await {
             Ok(guard) => guard,
             Err(db::DbError::Check(reason)) => {
@@ -674,6 +675,9 @@ impl MergeService {
             }
         }
         let task_branch = workspace::task_branch_name(&task_id);
+        // Keep this step through integration and its durable merge outcome.
+        // A pending Cancel observes the terminal cascade when Git has landed.
+
         if !already_merged {
             git::checkout_branch(repo_path, &target_branch).await?;
         }

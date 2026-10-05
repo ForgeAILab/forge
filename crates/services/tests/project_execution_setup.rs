@@ -190,6 +190,10 @@ async fn attach_primary_repository_wakes_parked_tasks_at_the_command_boundary() 
         .expect("repository attachment commits");
     assert_eq!(response.execution_setup_state, ExecutionSetupState::Ready);
 
+    TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::new(16)))
+        .drain(&task_id)
+        .await
+        .expect("queued repository wake settles");
     let metadata: Option<String> =
         sqlx::query_scalar("SELECT metadata_json FROM task WHERE id = ?")
             .bind(&task_id)

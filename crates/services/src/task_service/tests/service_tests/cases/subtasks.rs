@@ -203,3 +203,94 @@ async fn reorder_subtasks_updates_order() {
     assert_eq!(reordered[1].title, "C");
     assert_eq!(reordered[2].title, "B");
 }
+
+/// Root Cancel commits the root's own cancel under the root lease and
+/// enqueues each child's cancel as the child's own preempting step. A child
+/// whose CI hook holds its lease neither delays the root response nor turns
+/// it into `task_busy`, and no sibling is skipped.
+#[tokio::test]
+async fn root_cancel_enqueues_child_cancels_without_waiting_on_a_busy_child() {
+    use db::TaskStepRepo;
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(64)));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
+    let mut children = Vec::new();
+    for (order, title) in ["first", "second", "third"].into_iter().enumerate() {
+        children.push(
+            seed_subtask_with_status(&db, &root, title, "in_progress".to_owned(), order as i64)
+                .await,
+        );
+    }
+    // The second child is mid-CI: another worker holds its long hook step.
+    let busy = &children[1];
+    db.enqueue_step(&db::EnqueueTaskStep {
+        id: new_uuid_v4(),
+        task_id: busy.id.clone(),
+        kind: "hooks".into(),
+        payload_json: "{}".into(),
+        causation_step_id: None,
+        causation_key: "ci".into(),
+        chain_id: "ci".into(),
+        chain_position: 1,
+        expected_status: busy.status.clone(),
+        expected_version: busy.version,
+        expected_epoch: None,
+        lane: "long".into(),
+        available_at: now_rfc3339(),
+    })
+    .await
+    .unwrap();
+    let ci = db
+        .claim_step(
+            "ci-worker",
+            Some(&busy.id),
+            &db::task_writer::lease_deadline(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let root = TaskRepo::get_by_id(&*db, &root.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let cancelled = service
+        .cancel_task_as(root.id.clone(), Actor::user(UserActionSource::Test))
+        .await
+        .expect("a busy child never turns the root cancel into task_busy");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "root cancel waited on a child lease: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(cancelled.status, "cancelled");
+    for child in &children {
+        assert!(
+            db.task_steps(&child.id).await.unwrap().iter().any(|step| {
+                step.kind == "command"
+                    && step.status == "pending"
+                    && step.payload_json.contains("cancel_task_with_options")
+            }),
+            "child {} has its own queued cancel",
+            child.title
+        );
+    }
+
+    // CI stops at its safe point; then every child's queued cancel applies.
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    db.finish_step_in_tx(
+        &mut tx,
+        &ci,
+        "superseded",
+        Some("preempted by owner command"),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    db.release_step(&ci.id, "ci-worker").await.unwrap();
+    for child in &children {
+        assert_eq!(service.drain(&child.id).await.unwrap().status, "cancelled");
+    }
+}

@@ -11,6 +11,7 @@ use ts_rs::TS;
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum OutcomeCode {
+    TaskBusy,
     Ok,
     ApprovalRequired,
     SetupRequired,
@@ -30,6 +31,7 @@ impl OutcomeCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::TaskBusy => "task_busy",
             Self::Ok => "ok",
             Self::ApprovalRequired => "approval_required",
             Self::SetupRequired => "setup_required",
@@ -611,7 +613,8 @@ impl OrchestrationOutcome {
             OutcomeCode::Ok => OutcomeStatus::Succeeded,
             OutcomeCode::ApprovalRequired => OutcomeStatus::ApprovalRequired,
             OutcomeCode::SetupRequired => OutcomeStatus::SetupRequired,
-            OutcomeCode::VersionConflict
+            OutcomeCode::TaskBusy
+            | OutcomeCode::VersionConflict
             | OutcomeCode::ActiveSessionConflict
             | OutcomeCode::DigestConflict
             | OutcomeCode::IdempotencyConflict
