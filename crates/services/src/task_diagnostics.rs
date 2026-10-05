@@ -937,8 +937,7 @@ mod tests {
         bridge.triggered_by = workflow_actor;
         bridge.bridge =
             api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh);
-        bridge.trigger_reason =
-            format!("{} target advanced", crate::workflow::REVIEW_REFRESH_MARKER);
+        bridge.trigger_reason = "Target advanced".to_owned();
         let entries = vec![log("merging", "merge_failed", Some("reject"), true), bridge];
 
         assert_eq!(count_gate_rejections_since_boundary(&entries, "merging"), 1);
@@ -952,10 +951,8 @@ mod tests {
         handoff.triggered_by = workflow_actor;
         handoff.bridge =
             api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ConflictHandoff);
-        handoff.trigger_reason = format!(
-            "{} rebased onto main; paths_json=[\"exports.py\"]",
-            crate::workflow::CONFLICT_HANDOFF_MARKER
-        );
+        handoff.trigger_reason =
+            "rebased onto main; conflicts were committed with markers in: exports.py".to_owned();
         assert_eq!(
             count_gate_rejections_since_boundary(&[handoff], "merging"),
             0

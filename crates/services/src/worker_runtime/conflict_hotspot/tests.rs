@@ -231,15 +231,11 @@ async fn lockfiles_are_excluded_by_basename() {
 }
 
 #[tokio::test]
-async fn punctuation_and_unicode_paths_preserve_json_and_last_prefix() {
+async fn punctuation_and_unicode_paths_preserve_json() {
     let db = database().await;
     let path = "src/日本語 ; punctuation, \"quoted\".rs";
     for task in ["one", "two", "three"] {
-        let mut event = input("project-1", task, &[path], &timestamp(10));
-        let mut payload: Value = serde_json::from_str(&event.payload_json).unwrap();
-        payload["trigger_reason"] = json!(format!("{CONFLICT_HANDOFF_MARKER} earlier{CONFLICT_HANDOFF_PATHS_PREFIX}discarded{CONFLICT_HANDOFF_PATHS_PREFIX}{}", json!([path])));
-        event.payload_json = payload.to_string();
-        append_input(&db, event).await;
+        append_input(&db, input("project-1", task, &[path], &timestamp(10))).await;
     }
     run(&db).await;
     assert_eq!(detections(&db).await[0]["path"], path);

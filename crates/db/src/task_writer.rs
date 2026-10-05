@@ -109,6 +109,12 @@ impl TaskMutationReply {
                     DbError::ReviewDetailsCorrupt { review_id, reason } => {
                         serde_json::json!({"code":"review_details_corrupt","review_id":review_id,"reason":reason})
                     }
+                    DbError::TransitionBridgeCorrupt {
+                        transition_log_id,
+                        reason,
+                    } => {
+                        serde_json::json!({"code":"transition_bridge_corrupt","transition_log_id":transition_log_id,"reason":reason})
+                    }
                     DbError::RepoInUse { repo_id } => {
                         serde_json::json!({"code":"repo_in_use","repo_id":repo_id})
                     }
@@ -188,6 +194,10 @@ impl TaskMutationReply {
                 Some("invalid_soft_delete") => DbError::InvalidSoftDelete,
                 Some("review_details_corrupt") => DbError::ReviewDetailsCorrupt {
                     review_id: value("review_id"),
+                    reason: value("reason"),
+                },
+                Some("transition_bridge_corrupt") => DbError::TransitionBridgeCorrupt {
+                    transition_log_id: value("transition_log_id"),
                     reason: value("reason"),
                 },
                 Some("repo_in_use") => DbError::RepoInUse {

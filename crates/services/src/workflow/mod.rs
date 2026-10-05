@@ -80,15 +80,6 @@ pub mod template_service;
 pub mod transition_event;
 pub mod validation;
 
-#[cfg(test)]
-pub(crate) const REVIEW_REFRESH_MARKER: &str = "[review-refresh]";
-#[cfg(test)]
-pub(crate) const TARGET_MOVED_MARKER: &str = "[target-moved-rebase]";
-#[cfg(test)]
-pub(crate) const CONFLICT_HANDOFF_MARKER: &str = "[conflict-handoff]";
-#[cfg(test)]
-pub(crate) const CONFLICT_HANDOFF_PATHS_PREFIX: &str = "; paths_json=";
-
 /// Paths recorded in typed conflict handoffs in the current retry window.
 pub(crate) fn handed_off_conflict_paths(entries: &[db::TransitionLog]) -> Vec<String> {
     let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
@@ -152,8 +143,18 @@ pub(crate) async fn review_refresh_transition_pending(
     task_id: &str,
     current_state: &str,
 ) -> db::Result<bool> {
-    let latest = sqlx::query_as::<_, (String, String, Option<String>, String)>(
-        "SELECT from_state, to_state, bridge_kind, triggered_by
+    let latest = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        ),
+    >(
+        "SELECT id, from_state, to_state, bridge_kind, bridge_payload, triggered_by
          FROM transition_log
          WHERE task_id = ?
          ORDER BY created_at DESC, rowid DESC
@@ -162,19 +163,14 @@ pub(crate) async fn review_refresh_transition_pending(
     .bind(task_id)
     .fetch_optional(db.pool())
     .await?;
-
-    Ok(
-        latest.is_some_and(|(from_state, to_state, kind, triggered_by)| {
-            from_state == default_states::MERGING
-                && to_state == current_state
-                && kind
-                    .as_deref()
-                    .and_then(|kind| kind.parse::<api_types::TransitionBridgeKind>().ok())
-                    .is_some_and(api_types::TransitionBridgeKind::is_review_refresh)
-                && triggered_by
-                    == api_types::Actor::system(api_types::SystemComponent::Workflow).display()
-        }),
-    )
+    let Some((id, from_state, to_state, kind, payload, triggered_by)) = latest else {
+        return Ok(false);
+    };
+    let bridge = db::decode_transition_bridge(&id, kind.as_deref(), payload.as_deref())?;
+    Ok(from_state == default_states::MERGING
+        && to_state == current_state
+        && bridge.is_review_refresh()
+        && triggered_by == api_types::Actor::system(api_types::SystemComponent::Workflow).display())
 }
 
 pub(crate) fn review_refresh_target(
@@ -360,5 +356,15 @@ mod tests {
                 .await
                 .unwrap()
         );
+        // The column is open; a kind this build does not know is a typed
+        // error, never "not a refresh" and never a panic.
+        sqlx::query("UPDATE transition_log SET bridge_kind='future_kind' WHERE task_id='task'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            review_refresh_transition_pending(&db, "task", "merge_failed").await,
+            Err(db::DbError::TransitionBridgeCorrupt { .. })
+        ));
     }
 }

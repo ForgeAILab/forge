@@ -2135,10 +2135,7 @@ async fn review_refresh_bypasses_merge_fix_notification_and_dispatch() {
     .bind(&harness.ctx.task_id)
     .bind(default_states::MERGING)
     .bind(default_states::MERGE_FAILED)
-    .bind(format!(
-        "{} reviewed commit changed; fresh review required",
-        crate::workflow::REVIEW_REFRESH_MARKER
-    ))
+    .bind("Reviewed commit changed; fresh review required")
     .bind(now_rfc3339())
     .execute(harness.ctx.db.pool())
     .await
@@ -2199,10 +2196,7 @@ fn review_refresh_bridge_does_not_reset_or_spend_merge_fix_window() {
         trigger_name: Some("retry".to_owned()),
         triggered_by: workflow_actor.clone(),
         bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
-        trigger_reason: format!(
-            "{} target advanced; re-review required",
-            crate::workflow::REVIEW_REFRESH_MARKER
-        ),
+        trigger_reason: "Target advanced; re-review required".to_owned(),
         hook_results_json: None,
         // A direct caller may supply rejection=true; the engine normalizes the
         // durable row, and the counter remains defensive for pre-existing rows.
@@ -2555,11 +2549,7 @@ async fn conflict_handoff_preserves_later_merge_fix_follow_up() {
     .await;
     record_conflict_handoff(
         &ctx,
-        format!(
-            "{} rebased onto main{}[\"exports.py\"]",
-            crate::workflow::CONFLICT_HANDOFF_MARKER,
-            crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX,
-        ),
+        "rebased onto main; conflicts were committed with markers in: exports.py".to_owned(),
         true,
     )
     .await;
@@ -2791,10 +2781,9 @@ async fn repeated_conflict_handoffs_escalate_in_a_single_task_write() {
                 bridge: api_types::TransitionBridge::new(
                     api_types::TransitionBridgeKind::ConflictHandoff,
                 ),
-                trigger_reason: format!(
-                    "{} rebased onto main; conflicts were committed with markers in: exports.py",
-                    crate::workflow::CONFLICT_HANDOFF_MARKER
-                ),
+                trigger_reason:
+                    "rebased onto main; conflicts were committed with markers in: exports.py"
+                        .to_owned(),
                 hook_results_json: None,
                 rejection: true,
                 created_at: now_rfc3339(),

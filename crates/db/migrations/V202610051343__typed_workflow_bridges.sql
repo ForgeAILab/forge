@@ -1,12 +1,10 @@
 -- Audit prose is preserved. Only this migration recognizes the former protocol.
-ALTER TABLE transition_log ADD COLUMN bridge_kind TEXT
-    CHECK (bridge_kind IS NULL OR bridge_kind IN (
-      'review_refresh','target_moved_rebase','conflict_handoff','retry_window_reset',
-      'recovery','gate_skipped','gate_approved','gate_rejected','ci_only_review_passed','review_carry'));
+-- Kind and purpose are open TEXT: Rust validates them on write and decodes an
+-- unknown value as a typed error, so adding a kind never rebuilds these tables.
+ALTER TABLE transition_log ADD COLUMN bridge_kind TEXT;
 ALTER TABLE transition_log ADD COLUMN bridge_payload TEXT
     CHECK (bridge_payload IS NULL OR json_valid(bridge_payload));
-ALTER TABLE execution ADD COLUMN purpose TEXT
-    CHECK (purpose IS NULL OR purpose = 'automatic_review_recovery');
+ALTER TABLE execution ADD COLUMN purpose TEXT;
 UPDATE execution SET purpose = 'automatic_review_recovery'
     WHERE summary LIKE '[Forge automatic review recovery]%';
 
@@ -83,14 +81,16 @@ UPDATE bridge_backfill SET kind=CASE
       (ltrim(reason) LIKE '[review-refresh] [target-moved-rebase]%'
        OR ltrim(reason) LIKE '[target-moved-rebase]%') THEN 'target_moved_rebase'
     WHEN ltrim(reason) LIKE '[review-refresh]%' AND actor LIKE 'system:%' THEN 'review_refresh'
-    WHEN reason LIKE 'gate skipped:%' AND actor LIKE 'system:%' THEN 'gate_skipped'
-    WHEN reason LIKE 'gate approved%' AND actor LIKE 'user%' THEN 'gate_approved'
-    WHEN reason LIKE 'gate rejected%' AND actor LIKE 'user%' THEN 'gate_rejected'
-    WHEN actor LIKE 'user:action:approve%' THEN 'gate_approved'
-    WHEN actor LIKE 'user:action:send_back%' THEN 'gate_rejected'
+    WHEN reason GLOB 'gate skipped:*' AND actor LIKE 'system:%' THEN 'gate_skipped'
+    -- Exactly the rows base read as gate decisions: a case-sensitive prefix,
+    -- any actor. Custom approval guidance and send-backs were not decisions.
+    WHEN reason GLOB 'gate approved*' THEN 'gate_approved'
+    WHEN reason GLOB 'gate rejected*' THEN 'gate_rejected'
     WHEN reason='CI-only re-review passed' AND actor='system:workflow' THEN 'ci_only_review_passed'
     WHEN ltrim(reason) LIKE '[review-carry]%' AND actor='system:workflow' THEN 'review_carry'
-    WHEN trigger_name='retry' AND from_state=to_state AND actor LIKE 'user%' THEN 'recovery'
+    -- The same-state retry marker, whoever applied the action. The gate->target
+    -- move that follows it is an ordinary rejection.
+    WHEN trigger_name='retry' AND from_state=to_state THEN 'recovery'
     ELSE NULL END;
 UPDATE bridge_backfill SET payload=json_object('verb',trigger_name)
 WHERE kind IN ('retry_window_reset','recovery');

@@ -688,13 +688,14 @@ where
         project_id: &str,
         transition: &TransitionLog,
         hook_results_json: Option<&str>,
+        evidence: TransitionFailureEvidence,
     ) -> Result<Option<Uuid>> {
         if !transition_has_failure_signal(
             &transition.from_state,
             &transition.to_state,
-            &transition.trigger_reason,
             hook_results_json.or(transition.hook_results_json.as_deref()),
             transition.rejection,
+            evidence,
         ) {
             return Ok(None);
         }
@@ -1001,29 +1002,24 @@ async fn list_transition_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSour
             to_state: row.try_get("to_state")?,
             trigger_name: row.try_get("trigger_name")?,
             triggered_by: row.try_get("triggered_by")?,
-            bridge: api_types::TransitionBridge {
-                bridge_kind: row
-                    .try_get::<Option<String>, _>("bridge_kind")?
-                    .map(|kind| kind.parse())
-                    .transpose()
-                    .map_err(ServiceError::invalid_operation)?,
-                bridge_payload: row
-                    .try_get::<Option<String>, _>("bridge_payload")?
-                    .map(|payload| serde_json::from_str(&payload))
-                    .transpose()
-                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
-            },
+            bridge: db::decode_transition_bridge(
+                row.try_get::<&str, _>("id")?,
+                row.try_get::<Option<&str>, _>("bridge_kind")?,
+                row.try_get::<Option<&str>, _>("bridge_payload")?,
+            )?,
             trigger_reason: row.try_get("trigger_reason")?,
             hook_results_json: row.try_get("hook_results_json")?,
             rejection: row.try_get::<i64, _>("rejection")? != 0,
             created_at: row.try_get("created_at")?,
         };
+        // History keeps only the row's own typed evidence: the Task's
+        // annotation and Review verdict at that moment were not recorded.
         if !transition_has_failure_signal(
             &transition.from_state,
             &transition.to_state,
-            &transition.trigger_reason,
             transition.hook_results_json.as_deref(),
             transition.rejection,
+            TransitionFailureEvidence::default(),
         ) {
             continue;
         }
@@ -1427,14 +1423,42 @@ fn transition_body(transition: &TransitionLog, hook_results_json: Option<&str>) 
     .to_string()
 }
 
+/// Typed failure evidence observed when a transition's hooks settle. Reason
+/// prose and hook messages are never failure signals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TransitionFailureEvidence {
+    /// The Task carries an interruption of this kind once the hooks ran, for
+    /// example the dispatch-failure rollback or a blocked review gate.
+    pub failure_kind: Option<api_types::FailureKind>,
+    /// A hook of this transition acted on a failed Review verdict.
+    pub review_failed: bool,
+}
+
+impl TransitionFailureEvidence {
+    /// The interruption kind of a stored `error_annotation`, if any.
+    pub(crate) fn annotation_kind(raw: Option<&str>) -> Option<api_types::FailureKind> {
+        match serde_json::from_str::<api_types::TaskAnnotation>(raw?).ok()? {
+            api_types::TaskAnnotation::Blocking(annotation) => Some(annotation.annotation_type),
+            api_types::TaskAnnotation::Legacy(value) => {
+                serde_json::from_value(value.get("type")?.clone()).ok()
+            }
+        }
+    }
+}
+
 fn transition_has_failure_signal(
     from_state: &str,
     to_state: &str,
-    _trigger_reason: &str,
     hook_results_json: Option<&str>,
     rejection: bool,
+    evidence: TransitionFailureEvidence,
 ) -> bool {
-    if rejection || state_name_is_failure(from_state) || state_name_is_failure(to_state) {
+    if rejection
+        || state_name_is_failure(from_state)
+        || state_name_is_failure(to_state)
+        || evidence.failure_kind.is_some()
+        || evidence.review_failed
+    {
         return true;
     }
     let Some(hook_results_json) = hook_results_json else {
@@ -1748,35 +1772,56 @@ mod tests {
 
 #[cfg(test)]
 mod typed_transition_tests {
+    use super::{transition_has_failure_signal as signal, TransitionFailureEvidence};
+
     #[test]
-    fn failure_memory_uses_structured_evidence_not_reason_words() {
-        assert!(!super::transition_has_failure_signal(
+    fn failure_memory_uses_typed_evidence_not_prose() {
+        let none = TransitionFailureEvidence::default();
+        // Rejection, failure-named states and failed hooks are row evidence.
+        assert!(!signal("todo", "in_progress", None, false, none));
+        assert!(signal("todo", "in_progress", None, true, none));
+        assert!(signal("merging", "merge_failed", None, false, none));
+        assert!(signal(
             "todo",
             "in_progress",
-            "failed failure error hook_error [conflict-handoff]",
-            None,
-            false
+            Some(r#"[{"action":"run_ci_steps","outcome":"failed","error":"boom"}]"#),
+            false,
+            none
         ));
-        assert!(super::transition_has_failure_signal(
+        // A hook message is prose: "failed" in a skipped/ok entry is no signal.
+        assert!(!signal(
             "todo",
             "in_progress",
-            "unrelated prose",
-            None,
-            true
+            Some(r#"[{"outcome":"ok","error":"failed"},{"outcome":"skipped","error":"error"}]"#),
+            false,
+            none
         ));
-        assert!(super::transition_has_failure_signal(
-            "todo",
-            "in_progress",
-            "unrelated prose",
-            Some(r#"[{"outcome":"failed"}]"#),
-            false
-        ));
-        assert!(!super::transition_has_failure_signal(
-            "todo",
-            "in_progress",
-            "unrelated prose",
-            Some(r#"[{"outcome":"ok","error":"failed"}]"#),
-            false
-        ));
+        // The dispatch-failure rollback and the failed-review cascade carry
+        // only typed evidence from the hooks that produced them.
+        let dispatch_failed = TransitionFailureEvidence {
+            failure_kind: Some(api_types::FailureKind::DispatchFailed),
+            review_failed: false,
+        };
+        assert!(signal("in_progress", "todo", None, false, dispatch_failed));
+        let review_failed = TransitionFailureEvidence {
+            failure_kind: None,
+            review_failed: true,
+        };
+        assert!(signal("in_progress", "review", None, false, review_failed));
+    }
+
+    #[test]
+    fn annotation_kind_reads_blocking_and_legacy_annotations() {
+        assert_eq!(
+            TransitionFailureEvidence::annotation_kind(Some(
+                r#"{"type":"dispatch_failed","message":"no agent","state":"in_progress"}"#
+            )),
+            Some(api_types::FailureKind::DispatchFailed)
+        );
+        assert_eq!(
+            TransitionFailureEvidence::annotation_kind(Some(r#"{"note":"no type"}"#)),
+            None
+        );
+        assert_eq!(TransitionFailureEvidence::annotation_kind(None), None);
     }
 }

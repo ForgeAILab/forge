@@ -4492,26 +4492,39 @@ annotations.
 ### Typed transition bridges
 
 Transition history separates human `trigger_reason` prose from nullable
-`bridge_kind` and `bridge_payload`. The closed kinds are `review_refresh`,
+`bridge_kind` and `bridge_payload`. The kinds are `review_refresh`,
 `target_moved_rebase`, `conflict_handoff`, `retry_window_reset`, `recovery`,
 `gate_skipped`, `gate_approved`, `gate_rejected`, `ci_only_review_passed` and
 `review_carry`. A target-moved rebase also has refresh semantics. Conflict
 handoffs store `{"paths":[...]}`; recovery/reset payloads store `{"verb":...}`.
 An ordinary/unclassified row has null metadata. Kinds do not replace actor,
-state, immediate-predecessor, rejection or current-window checks.
+state, immediate-predecessor, rejection or current-window checks. The columns
+carry no enumerated `CHECK` (the payload keeps `json_valid`), so a new kind
+needs no table rebuild: Rust writes only typed values and decodes a stored kind
+it does not know as a typed `TransitionBridgeCorrupt` error, never as an
+unclassified row.
 
 Every transition reader uses typed evidence: refresh dispatch, carry entry,
 rebase/handoff limits, gate bypass/decisions, cascade admission/rejection,
 conflict-marker checks, conflict hotspots and the web CI-only badge. Memory
-failure indexing uses rejection, state and structured hook outcomes; audit
-words and hook error prose are not failure signals. Gate approval and send-back
-keep their typed decision kind even when the owner supplies custom guidance.
-Only `retry_window_reset` establishes a new retry window; granting one attempt
-is a `recovery` and does not erase prior attempts.
+failure indexing uses typed evidence only: rejection, failure-named states,
+a hook that returned `failed`, a `FailureKind` interruption on the Task once
+the transition's hooks settled (for example the dispatch-failure rollback),
+or a review-verdict hook that acted on a failed Review. Reason words and hook
+messages are not failure signals; history backfill has only the row's own
+evidence. `gate_approved` marks exactly the plain approval (reason
+`gate approved`), as the gate reader always treated it; an approval with owner
+guidance, a send-back and a human-review approve or reject carry no gate kind.
+Only `retry_window_reset` establishes a new retry window. `recovery` marks the
+same-state `retry` marker of whoever applied the action; the gate-to-target move
+it allows is an ordinary rejection with no kind.
 
 Migration `V202610051343__typed_workflow_bridges` preserves all old reason text,
 backfills history and saved command/cascade/hook/repository-mutation and checkpoint metadata once, and leaves incidental
-marker words unclassified. The intentional refresh/rebase pair becomes one
+marker words unclassified. Gate decisions are backfilled from the
+case-sensitive `gate approved` / `gate rejected` prefix of any actor, exactly
+the rows the old reader counted; Workflow-authored `[review-refresh]` rows
+(including manual merge repair) become `review_refresh`. The intentional refresh/rebase pair becomes one
 `target_moved_rebase`. A genuine conflict handoff takes priority over conflicting
 refresh tags. The last paths-JSON suffix is decoded only if it is an array of
 strings; malformed/missing paths retain handoff identity with null payload.
@@ -4520,11 +4533,13 @@ Historical event prose may be bounded; the hotspot consumer reads the full
 kind/payload from the authoritative transition-log source row instead.
 
 Automatic review-recovery executions have typed `purpose =
-automatic_review_recovery`, set atomically during execution admission. Attempt
-counts cover the Task's entire execution history and the running check also
-filters execution status. Changing a summary cannot change the count, and a
-normal follow-up does not inherit its parent's purpose. Existing recovery
-summaries and counts are preserved by the migration.
+automatic_review_recovery`, set atomically during execution admission. The
+attempt count covers only running attempts, which is what the former
+summary-prefix count effectively measured (terminalization replaced the prompt
+summary). Attempts stay serialized and a Task may receive one per retry
+exhaustion, as before; `automatic_recovery.max_attempts` is not a lifetime cap. Changing a summary cannot
+change the count, and a normal follow-up does not inherit its parent's purpose.
+Existing recovery summaries are preserved by the migration.
 
 ### Failure classification
 

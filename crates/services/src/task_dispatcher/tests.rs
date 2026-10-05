@@ -4551,11 +4551,7 @@ async fn coordination_root_target_moved_rebase_returns_to_aggregate_review() {
             bridge: api_types::TransitionBridge::new(
                 api_types::TransitionBridgeKind::TargetMovedRebase,
             ),
-            trigger_reason: format!(
-                "{} {} target advanced; re-review required",
-                crate::workflow::REVIEW_REFRESH_MARKER,
-                crate::workflow::TARGET_MOVED_MARKER
-            ),
+            trigger_reason: "Target advanced; re-review required".to_owned(),
             hook_results_json: None,
             rejection: false,
             created_at: now_rfc3339(),

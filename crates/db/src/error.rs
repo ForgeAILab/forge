@@ -101,6 +101,14 @@ pub enum DbError {
     #[error("review {review_id} has corrupt persisted step_results_json: {reason}")]
     ReviewDetailsCorrupt { review_id: String, reason: String },
 
+    /// A stored transition bridge this build cannot decode, for example a kind
+    /// written by a newer binary. Never interpreted as an unclassified row.
+    #[error("transition {transition_log_id} has an unreadable bridge: {reason}")]
+    TransitionBridgeCorrupt {
+        transition_log_id: String,
+        reason: String,
+    },
+
     #[error("{scope} execution already running: {execution_id}")]
     ExecutionAlreadyRunning { scope: String, execution_id: String },
 

@@ -185,6 +185,28 @@ impl WorkflowExecution<'_> {
         Ok(DurableHook::Done(result))
     }
 
+    /// Typed failure evidence for failure memory once this transition's
+    /// hooks settled: the Task's interruption kind, and whether the
+    /// review-verdict hook acted on a failed Review.
+    async fn transition_failure_evidence(
+        &self,
+        task: &db::Task,
+        hook_results: &[api_types::HookResultEntry],
+    ) -> crate::Result<crate::memory::TransitionFailureEvidence> {
+        let review_failed = hook_results
+            .iter()
+            .any(|entry| entry.action == "auto_cascade_on_review_pass")
+            && latest_review(&self.db, &task.id)
+                .await?
+                .is_some_and(|review| review.status == db::ReviewStatus::Failed);
+        Ok(crate::memory::TransitionFailureEvidence {
+            failure_kind: crate::memory::TransitionFailureEvidence::annotation_kind(
+                task.error_annotation.as_deref(),
+            ),
+            review_failed,
+        })
+    }
+
     pub(crate) async fn execute_hook_step(
         &self,
         step: &db::TaskStep,
@@ -993,10 +1015,20 @@ impl WorkflowExecution<'_> {
                 );
             } else {
                 let memory_service = crate::MemoryService::new(Arc::clone(&self.db));
-                if let Err(error) = memory_service
-                    .record_transition_if_failure(&task.project_id, &transition_log, Some(&payload))
-                    .await
-                {
+                let recorded = match self.transition_failure_evidence(&task, &hook_results).await {
+                    Ok(evidence) => {
+                        memory_service
+                            .record_transition_if_failure(
+                                &task.project_id,
+                                &transition_log,
+                                Some(&payload),
+                                evidence,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = recorded {
                     tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
                 }
             }

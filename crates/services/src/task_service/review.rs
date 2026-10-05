@@ -303,9 +303,7 @@ impl TaskService {
             task_id.clone(),
             "in_progress".to_owned(),
             TransitionOptions {
-                bridge: api_types::TransitionBridge::new(
-                    api_types::TransitionBridgeKind::GateRejected,
-                ),
+                bridge: Default::default(),
                 version: task.version,
                 reason: Some(reason.clone()),
                 triggered_by: actor,

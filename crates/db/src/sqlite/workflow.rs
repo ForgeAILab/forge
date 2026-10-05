@@ -36,20 +36,26 @@ fn assignment_snapshot_matches(
         && current.updated_at == expected.updated_at
 }
 
-fn map_transition_log_row(row: SqliteRow) -> TransitionLog {
-    TransitionLog {
-        id: row.get(0),
+fn map_transition_log_row(row: SqliteRow) -> Result<TransitionLog> {
+    let id: String = row.get(0);
+    let bridge = crate::decode_transition_bridge(
+        &id,
+        row.get::<Option<String>, _>("bridge_kind").as_deref(),
+        row.get::<Option<String>, _>("bridge_payload").as_deref(),
+    )?;
+    Ok(TransitionLog {
+        id,
         task_id: row.get(1),
         from_state: row.get(2),
         to_state: row.get(3),
         trigger_name: row.get(4),
         triggered_by: row.get(5),
-        bridge: map_transition_bridge(&row),
+        bridge,
         trigger_reason: row.get(6),
         hook_results_json: row.get(7),
         rejection: row.get::<i64, _>(8) != 0,
         created_at: row.get(9),
-    }
+    })
 }
 
 fn map_workflow_sqlx_error(error: sqlx::Error) -> DbError {
@@ -478,8 +484,8 @@ impl TransitionLogRepo for SqliteDb {
         .bind(input.hook_results_json.as_deref())
         .bind(if input.rejection { 1_i64 } else { 0_i64 })
         .bind(&input.created_at)
-    .bind(input.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
-    .bind(input.bridge.bridge_payload.as_ref().map(ToString::to_string))
+        .bind(input.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+        .bind(input.bridge.bridge_payload.as_ref().map(ToString::to_string))
         .execute(&self.pool)
         .await
         .map_err(map_workflow_sqlx_error)?;
@@ -492,7 +498,7 @@ impl TransitionLogRepo for SqliteDb {
         .await
         .map_err(map_workflow_sqlx_error)?;
 
-        Ok(map_transition_log_row(row))
+        map_transition_log_row(row)
     }
 
     async fn insert_recovery_marker(
@@ -537,7 +543,7 @@ impl TransitionLogRepo for SqliteDb {
         .await
         .map_err(map_workflow_sqlx_error)?;
 
-        Ok(rows.into_iter().map(map_transition_log_row).collect())
+        rows.into_iter().map(map_transition_log_row).collect()
     }
 
     async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TransitionLog>> {
@@ -556,9 +562,6 @@ impl TransitionLogRepo for SqliteDb {
              WHERE rejection.task_id = ?
                AND rejection.from_state = ?
                AND rejection.rejection = 1
-               AND NOT (rejection.from_state = 'merging' AND rejection.to_state = 'merge_failed'
-                   AND rejection.triggered_by = 'system:workflow'
-                   AND COALESCE(rejection.bridge_kind IN ('review_refresh','target_moved_rebase','conflict_handoff'),0))
                AND NOT EXISTS (
                    SELECT 1
                    FROM transition_log AS boundary
@@ -662,18 +665,5 @@ pub(super) async fn transitions_for_tasks(
     }
     ids.push_unseparated(") ORDER BY task_id, created_at, rowid");
     let rows = query.build().fetch_all(&mut *connection).await?;
-    Ok(rows.into_iter().map(map_transition_log_row).collect())
-}
-
-fn map_transition_bridge(row: &SqliteRow) -> api_types::TransitionBridge {
-    api_types::TransitionBridge {
-        bridge_kind: row
-            .get::<Option<String>, _>("bridge_kind")
-            .map(|kind| kind.parse().expect("bridge kind constrained by schema")),
-        bridge_payload: row
-            .get::<Option<String>, _>("bridge_payload")
-            .map(|payload| {
-                serde_json::from_str(&payload).expect("bridge payload constrained by schema")
-            }),
-    }
+    rows.into_iter().map(map_transition_log_row).collect()
 }

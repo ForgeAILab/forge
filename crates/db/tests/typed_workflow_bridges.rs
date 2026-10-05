@@ -231,6 +231,7 @@ async fn populated_upgrade_backfills_bridges_queue_checkpoints_and_execution_pur
             None,
         ),
         (
+            // Base read only the "gate approved" prefix as a decision.
             "custom-approve",
             "Looks good".into(),
             "review",
@@ -238,7 +239,41 @@ async fn populated_upgrade_backfills_bridges_queue_checkpoints_and_execution_pur
             "user:action:approve",
             None,
             None,
-            Some(Kind::GateApproved),
+            None,
+            None,
+        ),
+        (
+            "send-back",
+            "add tests".into(),
+            "review",
+            "in_progress",
+            "user:action:send_back",
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            "agent-recovery",
+            "agent grants one attempt".into(),
+            "review",
+            "review",
+            "agent:project-agent",
+            Some("retry"),
+            None,
+            Some(Kind::Recovery),
+            Some(json!({"verb":"retry"})),
+        ),
+        (
+            // The gate->target move after a recovery marker is a rejection.
+            "recovery-target",
+            "one attempt".into(),
+            "review",
+            "in_progress",
+            "user:action:retry",
+            Some("reject"),
+            None,
+            None,
             None,
         ),
         (
@@ -442,16 +477,29 @@ async fn populated_upgrade_backfills_bridges_queue_checkpoints_and_execution_pur
         checkpoint["Cascade"]["reason"],
         "[review-carry] resumed authority"
     );
+    // Base counted only attempts whose prompt summary survived, i.e. the
+    // unfinished ones: the running attempt, not the completed one.
+    let purposes: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT id, purpose FROM execution ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(
+        purposes,
+        vec![
+            ("e1".into(), Some("automatic_review_recovery".into())),
+            ("e2".into(), Some("automatic_review_recovery".into())),
+            ("e3".into(), None),
+        ]
+    );
+    let count = || {
         ExecutionRepo::count_by_task_and_purpose(
             &db,
             "t",
-            ExecutionPurpose::AutomaticReviewRecovery
+            ExecutionPurpose::AutomaticReviewRecovery,
         )
-        .await
-        .unwrap(),
-        2
-    );
+    };
+    assert_eq!(count().await.unwrap(), 1);
     assert!(ExecutionRepo::has_running_by_task_and_purpose(
         &db,
         "t",
@@ -463,15 +511,15 @@ async fn populated_upgrade_backfills_bridges_queue_checkpoints_and_execution_pur
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        ExecutionRepo::count_by_task_and_purpose(
-            &db,
-            "t",
-            ExecutionPurpose::AutomaticReviewRecovery
-        )
+    assert_eq!(count().await.unwrap(), 1, "summary text never counts");
+    sqlx::query("UPDATE execution SET status='completed' WHERE id='e2'")
+        .execute(&pool)
         .await
-        .unwrap(),
-        2
+        .unwrap();
+    assert_eq!(
+        count().await.unwrap(),
+        0,
+        "a finished attempt stops counting"
     );
     run_migrations(&pool).await.unwrap();
     assert_eq!(
@@ -481,4 +529,266 @@ async fn populated_upgrade_backfills_bridges_queue_checkpoints_and_execution_pur
             .len(),
         cases.len()
     );
+}
+
+async fn pre_bridge_pool(name: &str) -> (tempfile::TempDir, String, sqlx::SqlitePool) {
+    let temp = tempfile::tempdir().unwrap();
+    let old = temp.path().join("old");
+    std::fs::create_dir(&old).unwrap();
+    let migrations = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&migrations).unwrap() {
+        let entry = entry.unwrap();
+        let file = entry.file_name().to_string_lossy().to_string();
+        if file.ends_with(".sql") && !file.ends_with("__typed_workflow_bridges.sql") {
+            std::fs::copy(entry.path(), old.join(&file)).unwrap();
+        }
+    }
+    let url = format!(
+        "sqlite://{}",
+        temp.path().join(format!("{name}.db")).display()
+    );
+    let pool = create_sqlite_pool(&url).await.unwrap();
+    run_migrations_from(&pool, &old).await.unwrap();
+    sqlx::query(
+        "INSERT INTO project(id,name,created_at,updated_at) VALUES('p','Project','now','now')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('t','p','Task','review','now','now')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    (temp, url, pool)
+}
+
+async fn log(pool: &sqlx::SqlitePool, id: &str, from: &str, to: &str, actor: &str, reason: &str) {
+    sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,rejection,created_at) VALUES(?,'t',?,?,?,?,0,'now')")
+        .bind(id).bind(from).bind(to).bind(actor).bind(reason)
+        .execute(pool).await.unwrap();
+}
+
+/// Base `gate_decision_since_entry` was `starts_with("gate approved")` /
+/// `starts_with("gate rejected")` (case-sensitive, any actor). History that
+/// base did not treat as a gate decision must not become one after backfill.
+#[tokio::test]
+async fn backfill_gate_decisions_match_base_reader() {
+    let (_temp, url, pool) = pre_bridge_pool("gate").await;
+    // Base: not a decision (capitalised; SQLite LIKE is ASCII case-insensitive).
+    log(
+        &pool,
+        "capital",
+        "review",
+        "merging",
+        "user:api",
+        "Gate approved by owner",
+    )
+    .await;
+    // Base: not a decision (approve with custom guidance).
+    log(
+        &pool,
+        "guided",
+        "review",
+        "merging",
+        "user:action:approve",
+        "LGTM, ship it",
+    )
+    .await;
+    // Base: not a decision (send_back guidance).
+    log(
+        &pool,
+        "sendback",
+        "review",
+        "in_progress",
+        "user:action:send_back",
+        "add tests",
+    )
+    .await;
+    pool.close().await;
+    let pool = create_sqlite_pool(&url).await.unwrap();
+    run_migrations(&pool).await.unwrap();
+    let db = SqliteDb::new(pool);
+    let rows = TransitionLogRepo::list_by_task(&db, "t").await.unwrap();
+    let kinds: Vec<_> = rows
+        .iter()
+        .map(|row| (row.id.clone(), row.bridge.bridge_kind))
+        .collect();
+    assert!(
+        rows.iter().all(|row| row.bridge.bridge_kind.is_none()),
+        "rows base did not classify as gate decisions were backfilled as decisions: {kinds:?}"
+    );
+}
+
+/// Huge reasons and many path delimiters: the backfill must stay bounded.
+#[tokio::test]
+async fn backfill_huge_reasons_stays_bounded() {
+    let (_temp, url, pool) = pre_bridge_pool("huge").await;
+    sqlx::query("UPDATE task SET status='merge_failed' WHERE id='t'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let paths: Vec<String> = (0..20_000)
+        .map(|i| format!("src/module_{i}/file_{i}.rs"))
+        .collect();
+    let one = format!(
+        "[conflict-handoff] rebased onto main; conflicts were committed with markers in: {}; paths_json={}",
+        paths.join(", "),
+        serde_json::to_string(&paths).unwrap()
+    );
+    log(
+        &pool,
+        "one-delimiter",
+        "merging",
+        "merge_failed",
+        "system:workflow",
+        &one,
+    )
+    .await;
+    let many = format!(
+        "[conflict-handoff] x{}; paths_json=[\"last.rs\"]",
+        "; paths_json=junk-padding-padding-padding-padding".repeat(2_000)
+    );
+    log(
+        &pool,
+        "many-delimiters",
+        "merging",
+        "merge_failed",
+        "system:workflow",
+        &many,
+    )
+    .await;
+    pool.close().await;
+    let pool = create_sqlite_pool(&url).await.unwrap();
+    let started = std::time::Instant::now();
+    run_migrations(&pool).await.unwrap();
+    let elapsed = started.elapsed();
+    eprintln!(
+        "bytes one={} many={} migration={elapsed:?}",
+        one.len(),
+        many.len()
+    );
+    let db = SqliteDb::new(pool);
+    let rows = TransitionLogRepo::list_by_task(&db, "t").await.unwrap();
+    let one_row = rows.iter().find(|row| row.id == "one-delimiter").unwrap();
+    assert_eq!(one_row.trigger_reason, one);
+    assert_eq!(one_row.bridge.conflict_paths().unwrap().len(), paths.len());
+    let many_row = rows.iter().find(|row| row.id == "many-delimiters").unwrap();
+    assert_eq!(
+        many_row.bridge.conflict_paths().unwrap(),
+        vec!["last.rs".to_owned()]
+    );
+    assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+}
+
+/// Base counted automatic review-recovery attempts with
+/// `summary LIKE '[Forge automatic review recovery]%'`. The runner's
+/// terminalization (`runner.rs` `summary: Some(result.summary)`) replaces the
+/// prompt with the agent's summary, so base stopped counting a finished
+/// attempt. The typed purpose count must agree with base for the same rows.
+#[tokio::test]
+async fn recovery_attempt_count_matches_base_after_terminal_summary() {
+    let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+    run_migrations(&pool).await.unwrap();
+    let db = SqliteDb::new(pool.clone());
+    sqlx::query(
+        "INSERT INTO project(id,name,created_at,updated_at) VALUES('p','Project','now','now')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('t','p','Task','review','now','now')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A new attempt as 2.4 admits it: purpose set, prompt summary without the
+    // old bracket prefix.
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,summary,purpose,created_at,updated_at) VALUES('r1','t','coder','running','[Forge automatic review recovery]\n\n...','automatic_review_recovery','now','now')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Terminalization replaces the summary with the agent's own text.
+    sqlx::query(
+        "UPDATE execution SET status='completed', summary='Fixed the failing check' WHERE id='r1'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let base_equivalent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id='t' AND summary LIKE '[Forge automatic review recovery]%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let typed = db::ExecutionRepo::count_by_task_and_purpose(
+        &db,
+        "t",
+        api_types::ExecutionPurpose::AutomaticReviewRecovery,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        typed, base_equivalent,
+        "typed recovery count diverges from base once the attempt finishes"
+    );
+}
+
+/// Kind and purpose columns are open TEXT. A value this build does not know
+/// (for example from a newer binary) is stored, and reading it back is a
+/// typed error rather than a panic or a silently unclassified row.
+#[tokio::test]
+async fn unknown_stored_kind_and_purpose_are_typed_not_panics() {
+    let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+    run_migrations(&pool).await.unwrap();
+    let db = SqliteDb::new(pool.clone());
+    sqlx::query(
+        "INSERT INTO project(id,name,created_at,updated_at) VALUES('p','Project','now','now')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('t','p','Task','review','now','now')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,rejection,created_at,bridge_kind) VALUES('future','t','review','merging','system:workflow','later kind',0,'now','owner_fixable_fail')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    match TransitionLogRepo::list_by_task(&db, "t").await {
+        Err(db::DbError::TransitionBridgeCorrupt {
+            transition_log_id,
+            reason,
+        }) => {
+            assert_eq!(transition_log_id, "future");
+            assert!(reason.contains("owner_fixable_fail"), "{reason}");
+        }
+        other => panic!("expected a typed bridge error, got {other:?}"),
+    }
+    assert!(matches!(
+        db::TransitionLogRepo::list_by_tasks(&db, &["t"]).await,
+        Err(db::DbError::TransitionBridgeCorrupt { .. })
+    ));
+    // The payload keeps its JSON check.
+    assert!(sqlx::query(
+        "UPDATE transition_log SET bridge_kind=NULL, bridge_payload='not json' WHERE id='future'"
+    )
+    .execute(&pool)
+    .await
+    .is_err());
+    // A purpose this build does not know is stored and never counted.
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,purpose,created_at,updated_at) VALUES('x','t','coder','running','later_purpose','now','now')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_purpose(
+            &db,
+            "t",
+            ExecutionPurpose::AutomaticReviewRecovery
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    assert!("later_purpose".parse::<ExecutionPurpose>().is_err());
 }

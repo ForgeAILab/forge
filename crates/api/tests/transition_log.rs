@@ -75,7 +75,7 @@ async fn transition_log_records_review_retry_and_completion_history() {
             (
                 "review".to_owned(),
                 "merging".to_owned(),
-                "Gate approved".to_owned()
+                "gate approved".to_owned()
             ),
             (
                 "merging".to_owned(),
@@ -86,15 +86,16 @@ async fn transition_log_records_review_retry_and_completion_history() {
     );
     let approval = entries
         .iter()
-        .find(|entry| entry["trigger_reason"] == "Gate approved")
+        .find(|entry| entry["trigger_reason"] == "gate approved")
         .unwrap();
     assert_eq!(approval["bridge_kind"], "gate_approved");
     assert!(approval["bridge_payload"].is_null());
+    // A send-back with guidance is an ordinary rejection, as base read it.
     let rejection = entries
         .iter()
         .find(|entry| entry["trigger_reason"] == "missing tests")
         .unwrap();
-    assert_eq!(rejection["bridge_kind"], "gate_rejected");
+    assert!(rejection["bridge_kind"].is_null());
     let ordinary = entries
         .iter()
         .find(|entry| entry["trigger_reason"] == "ready for review")

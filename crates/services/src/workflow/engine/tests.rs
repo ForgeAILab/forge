@@ -1825,10 +1825,7 @@ async fn review_refresh_bridge_skips_merge_repair_entry_hooks() {
             1,
             &workflow,
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
-            &format!(
-                "{} reviewed commit changed; fresh review required",
-                crate::workflow::REVIEW_REFRESH_MARKER
-            ),
+            "Reviewed commit changed; fresh review required",
             true,
             api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewRefresh),
         )
@@ -4572,11 +4569,7 @@ async fn audit_23a_unconfigured_review_target_moved_round_keeps_running() {
     // RunMerge's TargetMoved outcome (target_moved_result) returns exactly
     // this cascade from the step-1 execution; enqueue it the way the engine
     // does, with step 1 as parent.
-    let reason = format!(
-        "{} {} main advanced; rebased onto main, re-review required",
-        crate::workflow::REVIEW_REFRESH_MARKER,
-        crate::workflow::TARGET_MOVED_MARKER
-    );
+    let reason = "main advanced; rebased onto main, re-review required".to_owned();
     let input = driver
         .workflow_execution()
         .cascade_step_input(
@@ -4767,4 +4760,144 @@ fn optional_gate_cascade_uses_typed_skip_instead_of_reason_words() {
         &api_types::TransitionBridge::default(),
         false
     ));
+}
+
+async fn transition_memory_count(db: &SqliteDb, transition_log_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memory_item WHERE source_type = 'transition'
+         AND json_extract(metadata_json, '$.source_ref') = ?",
+    )
+    .bind(transition_log_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("memory items count")
+}
+
+/// Failure memory keeps its coverage from typed signals once reason and hook
+/// message words stopped counting: a failed hook on an ordinary move, and the
+/// dispatch-failure rollback whose only base signal was the word "failed".
+#[tokio::test]
+async fn failure_memory_records_failed_hook_and_dispatch_rollback_from_typed_evidence() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+
+    // A Log-policy hook failure leaves the Task in an ordinary state.
+    let task_id = "task-memory-failed-hook";
+    seed_project_repo_and_task(&db, task_id, default_states::TODO).await;
+    assign_agent_role_without_agent(&db, task_id, default_roles::CODER).await;
+    let workflow = WorkflowDefinition {
+        roles: Vec::new(),
+        states: vec![
+            with_trigger(
+                state(
+                    default_states::TODO,
+                    StateKind::Initial,
+                    None,
+                    StateHooks::default(),
+                ),
+                WorkflowTrigger::Accept,
+                default_states::IN_PROGRESS,
+            ),
+            state(
+                default_states::IN_PROGRESS,
+                StateKind::Active,
+                Some(default_roles::CODER),
+                StateHooks {
+                    on_enter: vec![hook("notify_role_holder", FailurePolicy::Log)],
+                    ..StateHooks::default()
+                },
+            ),
+        ],
+        configuration: Vec::new(),
+        cancellation_state: None,
+    };
+    let task = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
+        .transition(
+            task_id,
+            default_states::IN_PROGRESS,
+            task.version,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "start work",
+            false,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
+    let logs = TransitionLogRepo::list_by_task(&*db, task_id)
+        .await
+        .unwrap();
+    let entered = logs
+        .iter()
+        .find(|entry| entry.to_state == default_states::IN_PROGRESS)
+        .unwrap();
+    assert!(!entered.rejection);
+    assert!(hook_results(&db, task_id)
+        .await
+        .iter()
+        .any(|entry| entry.action == "notify_role_holder" && entry.outcome == "failed"));
+    assert_eq!(transition_memory_count(&db, &entered.id).await, 1);
+
+    // The rollback cascade's reason is the only base signal; its typed signal
+    // is the DispatchFailed interruption the failed dispatch recorded.
+    let task_id = "task-memory-dispatch-rollback";
+    seed_project_repo_and_task(&db, task_id, default_states::TODO).await;
+    assign_agent_role_without_agent(&db, task_id, default_roles::CODER).await;
+    // A benign entry hook on the initial state gives the rollback its own
+    // hooks step, which is where failure memory is recorded.
+    let mut workflow = default_workflow::default_workflow();
+    workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == default_states::TODO)
+        .unwrap()
+        .hooks
+        .on_enter = vec![hook("satisfy_dependents", FailurePolicy::Log)];
+    let task = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+        .workflow_execution()
+        .transition(
+            task_id,
+            default_states::PLANNING,
+            task.version,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+            "scheduled by task dispatcher",
+            false,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let settled = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
+    assert_eq!(settled.task.status, default_states::TODO);
+    let logs = TransitionLogRepo::list_by_task(&*db, task_id)
+        .await
+        .unwrap();
+    let rollback = logs
+        .iter()
+        .find(|entry| {
+            entry.from_state == default_states::IN_PROGRESS
+                && entry.to_state == default_states::TODO
+        })
+        .unwrap();
+    assert!(!rollback.rejection);
+    let rollback_hooks: Vec<HookResultEntry> =
+        serde_json::from_str(rollback.hook_results_json.as_deref().unwrap()).unwrap();
+    assert!(!rollback_hooks.is_empty());
+    assert!(rollback_hooks.iter().all(|entry| entry.outcome != "failed"));
+    assert!(settled
+        .task
+        .error_annotation
+        .as_deref()
+        .is_some_and(|annotation| annotation.contains("dispatch_failed")));
+    assert_eq!(transition_memory_count(&db, &rollback.id).await, 1);
 }

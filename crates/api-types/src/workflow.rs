@@ -118,7 +118,19 @@ pub enum ExecutionPurpose {
 }
 impl ExecutionPurpose {
     pub const fn as_str(self) -> &'static str {
-        "automatic_review_recovery"
+        match self {
+            Self::AutomaticReviewRecovery => "automatic_review_recovery",
+        }
+    }
+}
+
+impl std::str::FromStr for ExecutionPurpose {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "automatic_review_recovery" => Ok(Self::AutomaticReviewRecovery),
+            _ => Err(format!("unknown execution purpose: {value}")),
+        }
     }
 }
 

@@ -13,8 +13,6 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 
 use super::{consumer_error, Outcome, Subscription, Worker, WorkerError};
-#[cfg(test)]
-use crate::workflow::{CONFLICT_HANDOFF_MARKER, CONFLICT_HANDOFF_PATHS_PREFIX};
 
 pub(crate) const CONSUMER_NAME: &str = "conflict-hotspots";
 pub(crate) const DETECTED_EVENT: &str = "project.conflict_hotspot.detected";
@@ -39,7 +37,8 @@ const UNSPLITTABLE_LOCKFILES: &[&str] = &[
 
 // Existing Project and Task/state/time indexes bound the seek before parsing.
 // One query supplies every eligible path; UTC RFC3339 bounds match DB writers.
-const HANDOFF_QUERY: &str = "SELECT tl.task_id, tl.bridge_kind, tl.bridge_payload, tl.created_at
+const HANDOFF_QUERY: &str =
+    "SELECT tl.id, tl.task_id, tl.bridge_kind, tl.bridge_payload, tl.created_at
     FROM task t JOIN transition_log tl ON tl.task_id = t.id
     WHERE t.project_id = ? AND tl.from_state = 'merging' AND tl.to_state = 'merge_failed'
       AND tl.triggered_by = ? AND tl.created_at > ? AND tl.created_at <= ?
@@ -78,16 +77,21 @@ pub(crate) fn incident_key(project_id: &str, path: &str) -> String {
     )
 }
 
-fn handoff_paths(kind: Option<&str>, payload: Option<&str>) -> Option<Vec<String>> {
-    if kind != Some(api_types::TransitionBridgeKind::ConflictHandoff.as_str()) {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(payload?).ok()?;
-    let mut paths: Vec<String> = serde_json::from_value(value.get("paths")?.clone()).ok()?;
+/// Splittable paths of a typed conflict handoff. An unknown stored kind is a
+/// typed error; a handoff whose payload has no path array yields no paths.
+fn handoff_paths(
+    transition_log_id: &str,
+    kind: Option<&str>,
+    payload: Option<&str>,
+) -> crate::Result<Option<Vec<String>>> {
+    let bridge = db::decode_transition_bridge(transition_log_id, kind, payload)?;
+    let Some(mut paths) = bridge.conflict_paths() else {
+        return Ok(None);
+    };
     paths.retain(|path| !UNSPLITTABLE_LOCKFILES.contains(&path.rsplit('/').next().unwrap_or(path)));
     paths.sort();
     paths.dedup();
-    Some(paths)
+    Ok(Some(paths))
 }
 
 fn timestamp(value: &str) -> crate::Result<DateTime<Utc>> {
@@ -119,7 +123,7 @@ impl ConflictHotspotConsumer {
         // Event prose is bounded. Read the authoritative typed kind, full paths
         // and timestamp; refuse a removed or mismatched source Task/log.
         let source = sqlx::query(
-            "SELECT tl.from_state, tl.to_state, tl.triggered_by, tl.bridge_kind, tl.bridge_payload, tl.created_at
+            "SELECT tl.id, tl.from_state, tl.to_state, tl.triggered_by, tl.bridge_kind, tl.bridge_payload, tl.created_at
             FROM transition_log tl JOIN task t ON t.id = tl.task_id
             WHERE tl.id = ? AND t.id = ? AND t.project_id = ?",
         )
@@ -139,13 +143,15 @@ impl ConflictHotspotConsumer {
             return Ok(None);
         }
         let Some(paths) = handoff_paths(
+            &source.try_get::<String, _>("id")?,
             source
                 .try_get::<Option<String>, _>("bridge_kind")?
                 .as_deref(),
             source
                 .try_get::<Option<String>, _>("bridge_payload")?
                 .as_deref(),
-        ) else {
+        )?
+        else {
             return Ok(None);
         };
         Ok((!paths.is_empty()).then(|| Handoff {
@@ -238,10 +244,12 @@ impl ConflictHotspotConsumer {
         for row in rows {
             let at = timestamp(&row.try_get::<String, _>("created_at")?)?;
             let Some(paths) = handoff_paths(
+                &row.try_get::<String, _>("id")?,
                 row.try_get::<Option<String>, _>("bridge_kind")?.as_deref(),
                 row.try_get::<Option<String>, _>("bridge_payload")?
                     .as_deref(),
-            ) else {
+            )?
+            else {
                 continue;
             };
             let task_id: String = row.try_get("task_id")?;

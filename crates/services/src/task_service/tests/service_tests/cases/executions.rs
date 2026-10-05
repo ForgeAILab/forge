@@ -2807,6 +2807,27 @@ async fn retry_hook_after_manual_merge_repair_returns_to_fresh_review_without_wo
             && entry.to_state == crate::workflow::default_states::MERGE_FAILED
             && entry.bridge.is_review_refresh()
     }));
+    // Both repair rows are Workflow-authored, so the backfill rule
+    // (`[review-refresh]` from a system actor) classifies history the same.
+    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
+    let repair_rows: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.bridge.is_review_refresh())
+        .map(|entry| {
+            (
+                entry.from_state.as_str(),
+                entry.to_state.as_str(),
+                entry.triggered_by.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        repair_rows,
+        vec![
+            ("merging", "merge_failed", workflow_actor.as_str()),
+            ("merge_failed", "review", workflow_actor.as_str()),
+        ]
+    );
     let executions = ExecutionRepo::list_by_task(
         &*db,
         &task.id,
@@ -9058,4 +9079,271 @@ async fn hold_before_a_queued_completion_cascade_never_loses_the_completion() {
         "an accepted Hold before the queued completion stranded the Task"
     );
     assert_eq!(db.pending_steps(&task.id).await.unwrap(), 0);
+}
+
+/// The one-time 2.4 backfill exactly as shipped: everything after the
+/// column/purpose DDL.
+async fn run_shipped_bridge_backfill(db: &SqliteDb) {
+    let migration =
+        include_str!("../../../../../../db/migrations/V202610051343__typed_workflow_bridges.sql");
+    let start = migration.find("CREATE TEMP TABLE bridge_backfill").unwrap();
+    sqlx::raw_sql(&migration[start..])
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
+async fn pre_upgrade_cascade(
+    base_reason: &str,
+    expected_kind: Option<api_types::TransitionBridgeKind>,
+    expected_payload: Option<serde_json::Value>,
+) {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::default()));
+    let (project_id, _, _repo) = seed_project_repo(&db).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    for state in &mut workflow.states {
+        state.hooks = api_types::StateHooks::default();
+    }
+    sqlx::query("UPDATE project SET workflow_definition=?,version=version+1 WHERE id=?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = seed_task_with_status(&db, &project_id, "merging".into()).await;
+    // A real producer shape, then reduced to the pre-2.4 payload: no typed
+    // fields, marker prose in `reason`.
+    let mut cascade = service
+        .workflow_execution()
+        .cascade_step_input(
+            &task,
+            &workflow,
+            "merge_failed".into(),
+            "placeholder".into(),
+            Default::default(),
+            false,
+            false,
+            None,
+            None,
+            db::new_uuid_v4(),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut payload: serde_json::Value = serde_json::from_str(&cascade.payload_json).unwrap();
+    let object = payload.as_object_mut().unwrap();
+    object.remove("bridge_kind");
+    object.remove("bridge_payload");
+    object.insert("reason".into(), serde_json::json!(base_reason));
+    cascade.payload_json = payload.to_string();
+    db::TaskStepRepo::enqueue_step(&*db, &cascade)
+        .await
+        .unwrap();
+    run_shipped_bridge_backfill(&db).await;
+    let migrated: String = sqlx::query_scalar("SELECT payload_json FROM task_step WHERE id=?")
+        .bind(&cascade.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let migrated: serde_json::Value = serde_json::from_str(&migrated).unwrap();
+    assert_eq!(migrated["reason"], base_reason, "prose preserved");
+    let task = service.drain(&task.id).await.unwrap();
+    assert_eq!(task.status, "merge_failed");
+    let entries = db::TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    let committed = entries
+        .iter()
+        .rev()
+        .find(|e| e.from_state == "merging" && e.to_state == "merge_failed")
+        .expect("queued cascade committed after upgrade");
+    assert_eq!(committed.trigger_reason, base_reason);
+    assert_eq!(committed.bridge.bridge_kind, expected_kind, "{base_reason}");
+    assert_eq!(
+        committed.bridge.bridge_payload, expected_payload,
+        "{base_reason}"
+    );
+    assert!(!committed.rejection);
+}
+
+#[tokio::test]
+async fn pre_upgrade_conflict_handoff_cascade_executes_typed() {
+    pre_upgrade_cascade(
+        "[conflict-handoff] rebased onto main; conflicts were committed with markers in: a.rs, b c.rs; paths_json=[\"a.rs\",\"b c.rs\"]",
+        Some(api_types::TransitionBridgeKind::ConflictHandoff),
+        Some(serde_json::json!({"paths":["a.rs","b c.rs"]})),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pre_upgrade_target_moved_cascade_executes_typed() {
+    pre_upgrade_cascade(
+        "[review-refresh] [target-moved-rebase] main advanced; rebased onto main, re-review required",
+        Some(api_types::TransitionBridgeKind::TargetMovedRebase),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pre_upgrade_conformance_refresh_cascade_executes_typed() {
+    pre_upgrade_cascade(
+        "[review-refresh] conformance review required: scope drift",
+        Some(api_types::TransitionBridgeKind::ReviewRefresh),
+        None,
+    )
+    .await;
+}
+
+/// A pre-2.4 binary committed `merging -> merge_failed` for a clean target
+/// rebase (marker prose, no typed columns) and queued its hooks step, and,
+/// with `checkpoint`, had already saved the dispatch hook's Cascade result in
+/// the pre-2.4 shape. After the shipped backfill the replay must do what base
+/// did: route to a fresh review without a merge-fix Worker, commit the refresh
+/// as a non-rejection, and let review carry see a clean rebase.
+async fn pre_upgrade_hooks_step_replays(checkpoint: Option<&str>) -> db::TransitionLog {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::default()));
+    let (project_id, _, _repo) = seed_project_repo(&db).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    // Only merge_failed's dispatch hook remains, at checkpoint index 0.
+    for state in &mut workflow.states {
+        let dispatch = state
+            .hooks
+            .on_enter
+            .iter()
+            .filter(|hook| {
+                state.name == crate::workflow::default_states::MERGE_FAILED
+                    && hook.action == "dispatch_role_agent"
+            })
+            .cloned()
+            .collect();
+        state.hooks = api_types::StateHooks {
+            on_enter: dispatch,
+            ..Default::default()
+        };
+    }
+    sqlx::query("UPDATE project SET workflow_definition=?,version=version+1 WHERE id=?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = seed_task_with_status(&db, &project_id, "merging".into()).await;
+    let base_reason =
+        "[review-refresh] [target-moved-rebase] main advanced; rebased onto main, re-review required";
+    // Produce the real committed row and queued hooks step, then reduce both
+    // to what the pre-2.4 binary stored: no typed columns or payload fields.
+    let committed = service
+        .workflow_execution()
+        .transition(
+            &task.id,
+            crate::workflow::default_states::MERGE_FAILED,
+            task.version,
+            &workflow,
+            &crate::worker_runtime::queue::cascade_actor(),
+            base_reason,
+            false,
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::TargetMovedRebase),
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed.pending_steps, 1);
+    sqlx::query("UPDATE transition_log SET bridge_kind=NULL, bridge_payload=NULL WHERE task_id=?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE task_step SET payload_json=json_remove(payload_json,'$.bridge_kind','$.bridge_payload')
+         WHERE task_id=? AND kind='hooks'",
+    )
+    .bind(&task.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let step_id: String =
+        sqlx::query_scalar("SELECT id FROM task_step WHERE task_id=? AND kind='hooks'")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    if let Some(reason) = checkpoint {
+        sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,result_json) VALUES(?,0,'now',?)")
+            .bind(&step_id)
+            .bind(serde_json::json!({"Cascade":{"to":"review","reason":reason}}).to_string())
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    run_shipped_bridge_backfill(&db).await;
+    let payload: String = sqlx::query_scalar("SELECT payload_json FROM task_step WHERE id=?")
+        .bind(&step_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["reason"], base_reason, "queued prose preserved");
+    assert_eq!(payload["bridge_kind"], "target_moved_rebase");
+
+    let settled = service.drain(&task.id).await.unwrap();
+    assert_eq!(settled.status, crate::workflow::default_states::REVIEW);
+    let executions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id=?")
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        executions, 0,
+        "a review refresh never dispatches a merge-fix Worker"
+    );
+    let entries = db::TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap();
+    let [.., bridge, refresh] = entries.as_slice() else {
+        panic!("bridge and refresh rows: {entries:?}");
+    };
+    assert_eq!(bridge.trigger_reason, base_reason);
+    assert_eq!(
+        bridge.bridge.bridge_kind,
+        Some(api_types::TransitionBridgeKind::TargetMovedRebase)
+    );
+    assert_eq!(
+        (refresh.from_state.as_str(), refresh.to_state.as_str()),
+        ("merge_failed", "review")
+    );
+    assert_eq!(
+        refresh.triggered_by,
+        crate::worker_runtime::queue::cascade_actor().display()
+    );
+    assert!(!refresh.rejection);
+    assert_eq!(
+        refresh.bridge.bridge_kind,
+        Some(api_types::TransitionBridgeKind::ReviewRefresh)
+    );
+    assert_eq!(
+        crate::workflow::review_carry_entry_kind(&entries),
+        Some(db::ReviewCarryKind::CleanRebase)
+    );
+    refresh.clone()
+}
+
+#[tokio::test]
+async fn pre_upgrade_hooks_step_replays_with_backfilled_bridge() {
+    let refresh = pre_upgrade_hooks_step_replays(None).await;
+    // The dispatch hook ran live on the backfilled committed row.
+    assert_eq!(
+        refresh.trigger_reason,
+        "Mechanical merge contention resolved; fresh review required"
+    );
+}
+
+#[tokio::test]
+async fn pre_upgrade_hook_checkpoint_replays_with_backfilled_bridge() {
+    let saved = "[review-refresh] mechanical merge contention resolved; fresh review required";
+    let refresh = pre_upgrade_hooks_step_replays(Some(saved)).await;
+    // The saved result replayed instead of re-running the hook.
+    assert_eq!(refresh.trigger_reason, saved);
 }

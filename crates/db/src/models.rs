@@ -2786,6 +2786,30 @@ pub struct TransitionLog {
     pub created_at: String,
 }
 
+/// Decode the stored `bridge_kind` / `bridge_payload` columns. The schema keeps
+/// both open; an unknown kind or a payload that is not JSON is a typed
+/// [`crate::DbError::TransitionBridgeCorrupt`], never a panic or a silent NULL.
+pub fn decode_transition_bridge(
+    transition_log_id: &str,
+    kind: Option<&str>,
+    payload: Option<&str>,
+) -> crate::Result<api_types::TransitionBridge> {
+    let corrupt = |reason: String| crate::DbError::TransitionBridgeCorrupt {
+        transition_log_id: transition_log_id.to_owned(),
+        reason,
+    };
+    Ok(api_types::TransitionBridge {
+        bridge_kind: kind
+            .map(str::parse::<api_types::TransitionBridgeKind>)
+            .transpose()
+            .map_err(corrupt)?,
+        bridge_payload: payload
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(|error| corrupt(format!("bridge_payload is not JSON: {error}")))?,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateTaskRoleAssignment {
     pub id: String,

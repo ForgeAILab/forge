@@ -1668,7 +1668,9 @@ impl TaskService {
                 &TaskService::task_action_actor(api_types::Actor::user(
                     api_types::UserActionSource::Action(api_types::TaskAction::retry()),
                 )),
-                api_types::TransitionBridge::recovery("retry", false),
+                // The same-state marker below is the recovery record; this
+                // gate->target move is an ordinary rejection, as in history.
+                Default::default(),
             )
             .await?;
         // The workflow transition owns the Task version CAS. Persist this
@@ -2860,7 +2862,13 @@ fn recovery_marker(
         to_state: state.to_owned(),
         trigger_name: Some(action.to_owned()),
         triggered_by: actor.display(),
-        bridge: api_types::TransitionBridge::recovery(action, action == "restart"),
+        bridge: api_types::TransitionBridge::recovery(
+            action,
+            matches!(
+                action,
+                "restart" | "reset_to_initial" | "reset_retry_window"
+            ),
+        ),
         trigger_reason: reason.to_owned(),
         hook_results_json: None,
         rejection: false,
