@@ -77,11 +77,20 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     assert_eq!(created_task.status, "todo".to_owned());
-    // Creation commits the Project's default role assignments too, and the
-    // response carries the Task as those writes left it -- a client's next
-    // optimistic write uses this version.
-    assert_eq!(created_task.version, 4);
+    // Creation writes the Project's default role assignments in the Task's
+    // birth transaction, so they spend no extra version. The response is the
+    // stored Task, not a pre-assignment snapshot: a client's next optimistic
+    // write uses this version (the second Task below cancels with it).
+    assert_eq!(created_task.version, 1);
     let task_id = created_task.id;
+    let persisted_task: TaskResponse = empty_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(persisted_task.version, created_task.version);
 
     let tasks: PaginatedResponse<api_types::TaskListItemResponse> = empty_request(
         &app,
@@ -101,9 +110,9 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     assert_eq!(claimed_task.status, "in_progress".to_owned());
-    // The claim is the coder assignment, the transition, and the entry
-    // barrier its blocking before-work hook opens and closes.
-    assert_eq!(claimed_task.version, 5);
+    // The claim (coder assignment plus transition) commits as one versioned
+    // write.
+    assert_eq!(claimed_task.version, 2);
 
     let cancelled_task: TaskResponse = json_request(
         &app,
@@ -114,7 +123,7 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     assert_eq!(cancelled_task.status, "cancelled".to_owned());
-    assert_eq!(cancelled_task.version, 7);
+    assert_eq!(cancelled_task.version, 4);
 
     let terminal_error = raw_json_request(
         &app,
@@ -150,6 +159,9 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     let second_task_id = second_task.id.clone();
+    // A client's next optimistic write against the creation response's
+    // version applies.
+    assert_eq!(second_task.version, 1);
 
     let cancelled_task: TaskResponse = json_request(
         &app,

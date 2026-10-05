@@ -243,19 +243,27 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
         1,
         "the rejection after an explicit reset consumes only the fresh window"
     );
-    // Task actions commit dispatch intent; this fixture has no background dispatcher.
+    // The send-back commits the coder follow-up as queued dispatch intent and
+    // leaves the in_progress entry's hooks step pending; that step fences
+    // dispatch until it settles. This fixture has no background step worker
+    // or dispatcher, so do what production does: the worker drains the
+    // Task's step queue (the entry hooks step), then the dispatcher, woken
+    // when that step settles, dispatches the queued follow-up.
     harness
         .state
         .task_service
         .drain(&task_id)
         .await
-        .expect("entry hooks settle before the dispatcher consumes the action");
-    harness
-        .state
-        .task_service
-        .test_dispatch_task_action(&task_id)
-        .await
-        .expect("the accepted human send-back dispatches its fresh follow-up");
+        .expect("the send-back's entry hooks step settles");
+    assert!(
+        harness
+            .state
+            .task_service
+            .test_dispatch_task_action(&task_id)
+            .await
+            .expect("the accepted human send-back dispatches its fresh follow-up"),
+        "the queued follow-up dispatches once the entry hooks settle"
+    );
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*harness.state.db, &task_id, "coder")
             .await
