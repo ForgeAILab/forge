@@ -8,6 +8,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Native chat topic responses can be pending (plan 3.6).**
+  `POST /api/v1/agent-chats/{chat_id}/topics` now returns nullable `topic` and
+  `divider_message_id` plus `rotation_pending`. On a native chat, a request
+  during a live turn is recorded and completed after that turn (previously
+  409). A newer request while one is pending applies its label and summary to
+  it, and a request whose own rotation is abandoned returns 409. CLI chats and
+  the Genesis-pending 409 are unchanged.
+- **Native Project Agent state reads can return a reference (plan 3.6).** Full
+  `project.current_state` and `project.charter` results carry a `read_ref`. An
+  unchanged repeat in the same topic returns
+  `{"unchanged_since_call": "<read_ref>"}` while that result is still visible
+  to the model.
+
 - **Task actions are now eight verbs served from server offers.** Every Task
   mutation that recovers, pauses, resumes, approves or cancels work goes
   through `GET /api/v1/tasks/{id}/actions`, which returns
@@ -348,6 +361,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Native chats use topic-scoped, budgeted working sets (plan 3.6).** Each
+  topic is one runtime session and one LCM timeline. Main runs at 48k/64k
+  tokens and Project at 96k/128k (`server.*_working_set_*_tokens`,
+  `FORGE_SERVER_*`), with runtime sizing and provider LCM and topic summaries
+  at low reasoning, a deterministic fallback and a 30 s summary timeout. On a
+  scripted 40-turn chat, p50 input per turn fell from 349k tokens to 42k
+  (Main) and 86k (Project).
+  - Native chats rotate topics automatically at Genesis start, at Project
+    creation or handoff, and after 8 h idle; CLI chats never rotate
+    automatically. Rotations run off the turn-claim path with at most 3
+    attempts and back-off, then are abandoned with a visible notice and an
+    `agent_chat.topic.rotation_failed` event.
+  - The agent-runtime pin moves to `5ee41e4`. LCM tuning changes keep
+    session state and historical retired timelines.
 
 - **Project blockers are level-triggered (plan 3.5).** A supervised sweep
   (at most every 60 s) reconsiders open Attention and batches each Project's
@@ -851,6 +879,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Pre-V149 LCM timelines are adopted once by their own session, a failed
+  snapshot save after adoption no longer wedges the chat, and topic-summary
+  usage is charged exactly once, even if the new topic never runs a turn
+  (plan 3.6).
 - Dropdown menus near the bottom of the window open upwards instead of
   off-screen, and their height is capped to the space available.
 - An event that a consumer can never apply no longer blocks every later event
