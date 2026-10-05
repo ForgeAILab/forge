@@ -64,7 +64,9 @@ impl TaskService {
             .bind((!retry).then(|| json!({"kind": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed }, "reason": reason, "created_at": now, "execution_id": null}).to_string()))
             .bind(&deferral).bind(&deferral).bind(&now).bind(&task.id).bind(task.version).bind(&task.status)
             .execute_in_tx(&mut tx).await?;
-        if changed.rows_affected() != 1 {
+        // Runs in the Task's review hook step; a queued write would make the
+        // attention and returned Task below untruthful.
+        if changed.require_applied()? != 1 {
             return Err(DbError::VersionConflict.into());
         }
         if !retry {

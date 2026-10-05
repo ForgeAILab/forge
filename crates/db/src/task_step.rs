@@ -41,6 +41,9 @@ pub struct TaskStep {
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub result_json: Option<String>,
+    /// False for a queued effect fenced by its own identity: it applies after
+    /// a status change and survives a preempting Cancel/Hold.
+    pub entry_fenced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +139,7 @@ fn row_step(row: sqlx::sqlite::SqliteRow) -> TaskStep {
         updated_at: row.get("updated_at"),
         completed_at: row.get("completed_at"),
         result_json: row.get("result_json"),
+        entry_fenced: row.get::<i64, _>("entry_fenced") != 0,
     }
 }
 
@@ -159,7 +163,7 @@ impl TaskStepRepo for SqliteDb {
                 .bind(&i.id)
                 .execute(&mut **tx)
                 .await?;
-            sqlx::query("UPDATE task_step SET status='superseded',last_error='preempted by owner command',completed_at=?,updated_at=? WHERE task_id=? AND seq<(SELECT seq FROM task_step WHERE id=?) AND priority=0 AND integration_started_at IS NULL AND status='pending' AND kind IN ('hooks','cascade','command','mutation')")
+            sqlx::query("UPDATE task_step SET status='superseded',last_error='preempted by owner command',completed_at=?,updated_at=? WHERE task_id=? AND seq<(SELECT seq FROM task_step WHERE id=?) AND priority=0 AND integration_started_at IS NULL AND entry_fenced=1 AND status='pending' AND kind IN ('hooks','cascade','command','mutation')")
                 .bind(&now).bind(&now).bind(&i.task_id).bind(&i.id).execute(&mut **tx).await?;
         }
         Ok(

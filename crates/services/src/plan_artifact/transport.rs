@@ -150,8 +150,12 @@ pub(crate) async fn record_retry(
         error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation, '$.type')='plan_settlement_wait' THEN ? ELSE error_annotation END,
         version=version+1, updated_at=? WHERE id=? AND version=?")
         .bind(marker.to_string()).bind(serde_json::json!({"target_state":task.status,"reason":message,"not_before":retry_at}).to_string())
-        .bind(annotation.to_string()).bind(now.to_rfc3339()).bind(&task.id).bind(task.version).execute_in_tx(&mut tx).await?;
-    if changed.rows_affected() != 1 {
+        .bind(annotation.to_string()).bind(now.to_rfc3339()).bind(&task.id).bind(task.version)
+        .identity_fenced().execute_in_tx(&mut tx).await?;
+    // A blocking wait must never be lost: outside the Task lease it is
+    // queued identity-fenced, so it applies even after a status change and
+    // the attention recorded below stays truthful.
+    if changed.applied().is_some_and(|rows| rows != 1) {
         return Err(db::DbError::VersionConflict.into());
     }
     if offline {
@@ -165,8 +169,9 @@ pub(crate) async fn record_retry(
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| now.to_rfc3339());
-        db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json=json_set(metadata_json, '$.owner_wait', json(?)) WHERE id=?")
-            .bind(serde_json::json!({"daemon_id":daemon_id,"started_at":started_at,"plan_execution_id":execution_id}).to_string()).bind(&task.id).execute_in_tx(&mut tx).await?;
+        let _queued_or_applied = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json=json_set(metadata_json, '$.owner_wait', json(?)) WHERE id=?")
+            .bind(serde_json::json!({"daemon_id":daemon_id,"started_at":started_at,"plan_execution_id":execution_id}).to_string()).bind(&task.id)
+            .identity_fenced().execute_in_tx(&mut tx).await?;
     }
     crate::placement::admission::record_wait_attention_in_tx(
         db,

@@ -172,8 +172,10 @@ pub(crate) async fn resolve_workspace_attention_in_tx(
     let now = db::now_rfc3339();
     // Existing successful admission and move-on paths already call this resolver.
     // Clear only the machine wait's own deferral, preserving unrelated blockers.
-    db::task_writer::TaskQuery::new(db,task_id,"UPDATE task SET metadata_json = json_remove(CASE WHEN json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' THEN json_remove(metadata_json, '$.deferred_dispatch') ELSE metadata_json END, '$.environment_wait') WHERE id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.environment_wait') IS NOT NULL")
-        .bind(task_id).execute_in_tx(tx).await?;
+    // Clears only its own marker, so a queued clear is identity-fenced and
+    // applies even if the Task changes status first.
+    let _queued_or_applied = db::task_writer::TaskQuery::new(db,task_id,"UPDATE task SET metadata_json = json_remove(CASE WHEN json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' THEN json_remove(metadata_json, '$.deferred_dispatch') ELSE metadata_json END, '$.environment_wait') WHERE id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.environment_wait') IS NOT NULL")
+        .bind(task_id).identity_fenced().execute_in_tx(tx).await?;
     sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
         WHERE status <> 'resolved' AND (dedupe_key IN (?, ?, ?) OR (dedupe_key LIKE 'workspace-fence:%' AND json_extract(details_json, '$.task.id') = ?))")
         .bind(&now).bind(&now).bind(format!("review-ci:{task_id}")).bind(format!("task-owner-wait:{task_id}")).bind(format!("task-environment-wait:{task_id}")).bind(task_id)

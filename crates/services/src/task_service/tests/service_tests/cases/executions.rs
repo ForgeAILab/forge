@@ -8921,3 +8921,137 @@ async fn busy_claim_still_starts_its_execution_after_the_fast_head_releases() {
         1
     );
 }
+
+/// A finished execution's completion cascade is queued behind busy Task work
+/// when a Hold arrives. The Hold must not lose the completion: once released,
+/// the Task ends exactly where it would have ended without the Hold.
+#[tokio::test]
+async fn hold_before_a_queued_completion_cascade_never_loses_the_completion() {
+    use db::TaskStepRepo;
+    async fn fixture() -> (Arc<SqliteDb>, TaskService, Task, Execution) {
+        let db = Arc::new(sqlite_db().await);
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()));
+        let (project_id, _, _repo) = seed_project_repo(&db).await;
+        let agent = seed_agent(&db).await;
+        let task = seed_task_with_status(&db, &project_id, "in_progress".into()).await;
+        seed_role_assignment(&db, &task.id, "coder", Some(&agent)).await;
+        let execution = seed_completed_coder_execution(&db, &task, &agent, None).await;
+        (db, service, task, execution)
+    }
+
+    // Without a Hold, the completion moves the Task on.
+    let (_db, service, task, execution) = fixture().await;
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .unwrap();
+    let expected = service.drain(&task.id).await.unwrap().status;
+    assert_ne!(expected, "in_progress", "the completion moves the Task on");
+
+    // The completion is queued (as a busy completion request leaves it), and
+    // a Hold arrives before it runs.
+    let (db, service, task, execution) = fixture().await;
+    service
+        .enqueue_task_command(
+            &task.id,
+            "maybe_cascade_executor_completion",
+            serde_json::json!([execution.id]),
+            false,
+        )
+        .await
+        .unwrap();
+    let hold = service
+        .perform_task_action(
+            &task.id,
+            api_types::TaskAction::Hold { reason: None },
+            task.version,
+        )
+        .await;
+    assert!(
+        matches!(
+            hold,
+            Ok(_)
+                | Err(ServiceError::TaskActionUnavailable { .. })
+                | Err(ServiceError::Db(db::DbError::TaskVersionConflict { .. }))
+        ),
+        "{hold:?}"
+    );
+    let held = service.drain(&task.id).await.unwrap();
+    let release = service
+        .task_action_offers(&task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap()
+        .available_actions
+        .into_iter()
+        .find(|offer| offer.action.verb() == "release");
+    if let Some(release) = release {
+        service
+            .perform_task_action(&task.id, release.action, held.version)
+            .await
+            .unwrap();
+    }
+    let after = service.drain(&task.id).await.unwrap();
+    assert_eq!(
+        after.status, expected,
+        "a refused Hold before the queued completion stranded the Task (hold={hold:?})"
+    );
+    assert_eq!(db.pending_steps(&task.id).await.unwrap(), 0);
+
+    // An accepted Hold: entry hooks are still queued, so the owner's Hold
+    // applies; the queued completion is then released with the Task.
+    let (db, service, task, execution) = fixture().await;
+    db.enqueue_step(&db::EnqueueTaskStep {
+        id: new_uuid_v4(),
+        task_id: task.id.clone(),
+        kind: "hooks".into(),
+        payload_json: "{}".into(),
+        causation_step_id: None,
+        causation_key: "entry-hooks".into(),
+        chain_id: "entry-hooks".into(),
+        chain_position: 1,
+        expected_status: task.status.clone(),
+        expected_version: task.version,
+        expected_epoch: None,
+        lane: "fast".into(),
+        available_at: now_rfc3339(),
+    })
+    .await
+    .unwrap();
+    service
+        .enqueue_task_command(
+            &task.id,
+            "maybe_cascade_executor_completion",
+            serde_json::json!([execution.id]),
+            false,
+        )
+        .await
+        .unwrap();
+    let held = service
+        .perform_task_action(
+            &task.id,
+            api_types::TaskAction::Hold { reason: None },
+            task.version,
+        )
+        .await
+        .expect("Hold applies while entry hooks are queued");
+    let held = service.drain(&held.task.id).await.unwrap();
+    if let Some(release) = service
+        .task_action_offers(&task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap()
+        .available_actions
+        .into_iter()
+        .find(|offer| offer.action.verb() == "release")
+    {
+        service
+            .perform_task_action(&task.id, release.action, held.version)
+            .await
+            .unwrap();
+    }
+    let after = service.drain(&task.id).await.unwrap();
+    assert_eq!(
+        after.status, expected,
+        "an accepted Hold before the queued completion stranded the Task"
+    );
+    assert_eq!(db.pending_steps(&task.id).await.unwrap(), 0);
+}

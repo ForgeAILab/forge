@@ -2209,7 +2209,7 @@ impl TaskService {
             .bind(follow_up.version)
             .execute_in_tx(&mut transaction)
             .await?;
-            if linked.rows_affected() != 1 {
+            if linked.require_applied()? != 1 {
                 return Err(db::DbError::VersionConflict.into());
             }
             let (review, task) = ReviewRepo::create_manual_pass_with_task_authority_in_tx(
@@ -2229,7 +2229,7 @@ impl TaskService {
             .bind(task.version)
             .execute_in_tx(&mut transaction)
             .await?;
-            if cleared.rows_affected() != 1 {
+            if cleared.require_applied()? != 1 {
                 return Err(db::DbError::VersionConflict.into());
             }
             let task = TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, &task.id, false)

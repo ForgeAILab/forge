@@ -211,7 +211,7 @@ impl TaskService {
         let result=db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation,'$.type')='dispatch_failed' THEN ? ELSE error_annotation END,
             metadata_json=CASE WHEN ? THEN json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?),'$.environment_wait',json(?)) ELSE json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?)) END,version=version+1,updated_at=? WHERE id=? AND version=?")
             .bind(annotation.to_string()).bind(unverified || failed).bind(marker.to_string()).bind(serde_json::to_string(&wait).expect("wait")).bind(marker.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version).execute(self.db.pool()).await?;
-        if result.rows_affected() != 1 {
+        if result != 1 {
             return Err(DbError::VersionConflict.into());
         }
         let current = TaskRepo::get_by_id(&*self.db, &task.id, false)

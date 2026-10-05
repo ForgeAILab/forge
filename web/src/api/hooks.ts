@@ -56,7 +56,12 @@ import {
 } from '@/api/agent-inquiries'
 import { qk } from '@/api/query-keys'
 import { invalidateProjectTaskDetails } from '@/api/task-detail-invalidation'
-import { getApiErrorCode, isTransientApiError } from '@/lib/api-error'
+import {
+  getApiErrorCode,
+  isTaskBusy,
+  isTransientApiError,
+  taskBusyRetryAfterMs,
+} from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import type {
   Agent,
@@ -676,7 +681,24 @@ export function useTransitionTask() {
       void queryClient.invalidateQueries({ queryKey: qk.projectTasks(result.task.project_id) })
       void queryClient.invalidateQueries({ queryKey: qk.reviews(result.task.id) })
     },
+    onError: (error, { taskId }) => refetchAfterTaskBusy(queryClient, error, taskId),
   })
+}
+
+/** A `task_busy` request stays queued; refetch the Task once its retry hint elapses. */
+export function refetchAfterTaskBusy(
+  queryClient: ReturnType<typeof useQueryClient>,
+  error: unknown,
+  taskId: string,
+) {
+  if (!isTaskBusy(error)) return
+  const refetch = () => {
+    for (const queryKey of [qk.task(taskId), qk.taskDetail(taskId)]) {
+      void queryClient.invalidateQueries({ queryKey })
+    }
+  }
+  refetch()
+  setTimeout(refetch, taskBusyRetryAfterMs(error))
 }
 
 export function useTaskAction() {
@@ -688,9 +710,10 @@ export function useTaskAction() {
         void queryClient.invalidateQueries({ queryKey })
       }
     },
-    onError: (_, variables) => {
+    onError: (error, variables) => {
       void queryClient.invalidateQueries({ queryKey: qk.task(variables.taskId) })
       void queryClient.invalidateQueries({ queryKey: qk.taskDetail(variables.taskId) })
+      refetchAfterTaskBusy(queryClient, error, variables.taskId)
     },
   })
 }

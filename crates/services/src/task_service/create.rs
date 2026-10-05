@@ -317,13 +317,16 @@ impl TaskService {
             let mut removed_parent_role = false;
             for role_name in parent_roles {
                 if !root_role_policy.allows_assignment(&role_name) {
-                    db::task_writer::TaskQuery::new(
+                    // Effects on an existing parent are its own queued
+                    // steps, identity-fenced so they are never dropped.
+                    let _queued_or_applied = db::task_writer::TaskQuery::new(
                         &self.db,
                         parent_task_id,
                         "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
                     )
                     .bind(parent_task_id)
                     .bind(role_name)
+                    .identity_fenced()
                     .execute_in_tx(&mut transaction)
                     .await?;
                     removed_parent_role = true;
@@ -333,7 +336,7 @@ impl TaskService {
                 // Converting a Task into a coordination root changes its
                 // authority surface. Invalidate review authority and wake
                 // parked dispatch in the same transaction as role pruning.
-                db::task_writer::TaskQuery::new(&self.db,parent_task_id,
+                let _queued_or_applied = db::task_writer::TaskQuery::new(&self.db,parent_task_id,
                     "UPDATE task
                      SET review_passed_at = NULL,
                          version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
@@ -356,6 +359,7 @@ impl TaskService {
                 )
                 .bind(&now)
                 .bind(parent_task_id)
+                .identity_fenced()
                 .execute_in_tx(&mut transaction)
                 .await?;
             }

@@ -855,8 +855,24 @@ impl TaskService {
         for child in children {
             self.cancel_running_executions_for_task(&child, reason, actor.clone())
                 .await?;
-            if !crate::task_hierarchy::subtask_is_terminal(&child, workflow) {
-                Box::pin(self.cancel_task_as(child.id, actor.clone())).await?;
+            if crate::task_hierarchy::subtask_is_terminal(&child, workflow) {
+                continue;
+            }
+            // The root's cancel has committed under the root lease. Each
+            // child's cancel is its own preempting step on the child's queue;
+            // the root never waits on a child's lease, so a busy child cannot
+            // turn the committed root cancel into an error or skip a sibling.
+            // A repeat root Cancel re-enqueues any child still not terminal.
+            if let Err(error) = self
+                .enqueue_task_command(
+                    &child.id,
+                    "cancel_task_with_options",
+                    serde_json::json!([child.id, Option::<i64>::None, "cancel task", actor]),
+                    true,
+                )
+                .await
+            {
+                tracing::warn!(root_id = %root.id, child_id = %child.id, %error, "failed to enqueue coordination child cancel");
             }
         }
         Ok(())
@@ -1178,7 +1194,7 @@ async fn clear_manual_advance_error_annotation(
     let mut tx = db::begin_immediate(db.pool()).await?;
     let cleared = db::task_writer::TaskQuery::new(db,&advanced_task.id,"UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL")
         .bind(now_rfc3339()).bind(&advanced_task.id).bind(&source_task.error_annotation)
-        .execute_in_tx(&mut tx).await?.rows_affected();
+        .execute_in_tx(&mut tx).await?.require_applied()?;
     let current = db
         .get_task_in_tx(&mut tx, &advanced_task.id)
         .await?

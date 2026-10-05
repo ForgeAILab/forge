@@ -421,23 +421,6 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         }
     };
     if state.kind == StateKind::Terminal || task.archived_at.is_some() {
-        if task.archived_at.is_none()
-            && state.kind == StateKind::Terminal
-            && (workflow.cancellation_state.as_deref() == Some(task.status.as_str())
-                || task.status == "cancelled")
-            && workflow
-                .states
-                .iter()
-                .any(|state| state.kind == StateKind::Initial)
-        {
-            offer(
-                TaskAction::Restart { reason: None },
-                &[],
-                &[Owner, ProjectAgent],
-                "cancelled_restart",
-                "Restart Task",
-            );
-        }
         return offers;
     }
     if workflow.cancellation_state.is_some()
@@ -2039,15 +2022,6 @@ mod tests {
                 "{kind:?}"
             );
         }
-    }
-
-    #[test]
-    fn cancelled_task_offers_restart_while_done_task_remains_terminal() {
-        let cancelled = available_actions(&snapshot("cancelled", None));
-        assert_eq!(cancelled.len(), 1);
-        assert_eq!(cancelled[0].action.verb(), "restart");
-        assert_eq!(cancelled[0].reason, "cancelled_restart");
-        assert!(available_actions(&snapshot("done", None)).is_empty());
     }
 
     #[test]

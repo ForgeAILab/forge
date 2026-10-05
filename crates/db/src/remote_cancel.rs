@@ -91,6 +91,13 @@ impl SqliteDb {
             .bind(task_id).bind(task_id).fetch_one(self.pool()).await?)
     }
 
+    /// Machines whose unconfirmed cancellation still fences this Task's
+    /// workspace: the hostname, or the daemon id if the registration is gone.
+    pub async fn task_pending_remote_cancel_machines(&self, task_id: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT DISTINCT COALESCE(d.hostname,r.daemon_id) FROM pending_remote_cancel r JOIN workspace w ON w.id=r.workspace_id LEFT JOIN daemon d ON d.id=r.daemon_id WHERE w.task_id=? OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=? AND e.workspace_id=w.id) ORDER BY 1")
+            .bind(task_id).bind(task_id).fetch_all(self.pool()).await?)
+    }
+
     pub async fn mark_pending_remote_cancel(&self, operation: &RemoteTaskOperation) -> Result<()> {
         sqlx::query("INSERT INTO pending_remote_cancel(operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at) SELECT operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at FROM task_remote_operation WHERE operation_id=? AND step_id=? AND state='running' ON CONFLICT DO NOTHING")
             .bind(&operation.operation_id).bind(&operation.step_id).execute(self.pool()).await?;
@@ -119,11 +126,12 @@ impl SqliteDb {
             .fetch_one(&mut *tx)
             .await?
             {
-                self.enqueue_task_mutation_in_tx(&mut tx,&task_id,crate::TaskMutation::Sql {
+                // Clears only its own marker: identity-fenced, never dropped.
+                self.enqueue_fenced_task_mutation_in_tx(&mut tx,&task_id,crate::TaskMutation::Sql {
                     task_id:task_id.clone(),
                     query:"UPDATE task SET error_annotation=CASE WHEN json_valid(error_annotation) AND json_extract(error_annotation,'$.blocking_reason')='pending_remote_cancel' THEN NULL ELSE error_annotation END, metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.dispatch_disposition','$.deferred_dispatch') ELSE metadata_json END,version=version+1,updated_at=? WHERE id=? AND deleted_at IS NULL".to_owned(),
                     arguments:vec![serde_json::json!(now_rfc3339()),serde_json::json!(task_id)],
-                }).await?;
+                },crate::task_writer::EffectFence::Identity).await?;
             }
         }
         tx.commit().await?;
@@ -136,7 +144,7 @@ impl SqliteDb {
         workspace_id: &str,
         task_id: &str,
     ) -> Result<Vec<RemoteTaskOperation>> {
-        Ok(sqlx::query("SELECT r.* FROM pending_remote_cancel r JOIN task_step s ON s.id=r.step_id WHERE r.workspace_id=? OR s.task_id=? ORDER BY r.created_at,r.operation_id")
+        Ok(sqlx::query("SELECT r.* FROM pending_remote_cancel r LEFT JOIN task_step s ON s.id=r.step_id WHERE r.workspace_id=? OR s.task_id=? ORDER BY r.created_at,r.operation_id")
             .bind(workspace_id).bind(task_id).fetch_all(self.pool()).await?.into_iter().map(row_operation).collect())
     }
     pub async fn pending_remote_cancels(

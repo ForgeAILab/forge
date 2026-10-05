@@ -28,6 +28,10 @@ CREATE TABLE task_step_new (
     integration_started_at TEXT,
     expected_epoch INTEGER NOT NULL DEFAULT 0,
     lane TEXT NOT NULL DEFAULT 'fast' CHECK (lane IN ('fast','long')),
+    -- 1: the step applies only in its producing status entry and a preempting
+    -- Cancel/Hold supersedes it. 0: a queued effect fenced by its own
+    -- identity (wakes, clears, dependency blocks); it survives both.
+    entry_fenced INTEGER NOT NULL DEFAULT 1 CHECK (entry_fenced IN (0,1)),
     workflow_ref_id TEXT GENERATED ALWAYS AS (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json,'$.workflow_ref.id') END) VIRTUAL,
     UNIQUE(task_id, seq),
     UNIQUE(task_id, causation_key)
@@ -45,8 +49,8 @@ CREATE INDEX task_step_workflow_ref ON task_step(workflow_ref_id) WHERE workflow
 CREATE TABLE task_remote_operation (
     operation_id TEXT PRIMARY KEY,
     step_id TEXT NOT NULL REFERENCES task_step(id) ON DELETE CASCADE,
-    workspace_id TEXT NOT NULL REFERENCES workspace(id) ON DELETE RESTRICT,
-    placement_id TEXT NOT NULL REFERENCES workspace_placement(id) ON DELETE RESTRICT,
+    workspace_id TEXT NOT NULL REFERENCES workspace(id) ON DELETE CASCADE,
+    placement_id TEXT NOT NULL REFERENCES workspace_placement(id) ON DELETE CASCADE,
     daemon_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
     generation INTEGER NOT NULL,
@@ -55,11 +59,14 @@ CREATE TABLE task_remote_operation (
     created_at TEXT NOT NULL
 );
 CREATE INDEX task_remote_operation_step ON task_remote_operation(step_id,state);
+-- Daemon-scoped cleanup record. It deliberately has no foreign key to the
+-- Task, its step, workspace or placement: deleting any of them leaves the
+-- record, so owner reconnect still sends workspace.cancel for it.
 CREATE TABLE pending_remote_cancel (
     operation_id TEXT PRIMARY KEY,
-    step_id TEXT NOT NULL REFERENCES task_step(id) ON DELETE RESTRICT,
-    workspace_id TEXT NOT NULL REFERENCES workspace(id) ON DELETE RESTRICT,
-    placement_id TEXT NOT NULL REFERENCES workspace_placement(id) ON DELETE RESTRICT,
+    step_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    placement_id TEXT NOT NULL,
     daemon_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
     generation INTEGER NOT NULL,

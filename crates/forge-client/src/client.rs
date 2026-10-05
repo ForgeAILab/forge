@@ -218,10 +218,21 @@ impl std::error::Error for ActionUnavailable {}
 fn request_error(status: StatusCode, body: String) -> anyhow::Error {
     if status == StatusCode::CONFLICT {
         if let Ok(response) = serde_json::from_str::<serde_json::Value>(&body) {
-            if response.get("code").and_then(serde_json::Value::as_str)
-                == Some("action_unavailable")
-            {
+            let code = response.get("code").and_then(serde_json::Value::as_str);
+            if code == Some("action_unavailable") {
                 return ActionUnavailable { response }.into();
+            }
+            if code == Some(api_types::TASK_BUSY) {
+                if let Ok(busy) = serde_json::from_value::<api_types::TaskBusyDetails>(
+                    response["details"].clone(),
+                ) {
+                    return anyhow!(
+                        "Task is busy: the request was accepted and stays queued behind {} pending step(s). {}; retry after {} ms.",
+                        busy.pending_steps,
+                        busy.retry_hint,
+                        busy.retry_after_ms
+                    );
+                }
             }
         }
     }
@@ -247,5 +258,22 @@ mod tests {
             r#"{"code":"version_conflict"}"#.into()
         )
         .is::<ActionUnavailable>());
+    }
+    #[test]
+    fn task_busy_prints_the_queued_steps_and_retry_hint() {
+        let message = request_error(
+            StatusCode::CONFLICT,
+            r#"{"code":"task_busy","message":"Task has pending steps; accepted work remains queued","details":{"pending_steps":2,"retry_after_ms":250,"retry_hint":"Refetch the Task after pending steps settle"},"request_id":"r"}"#.into(),
+        )
+        .to_string();
+        assert!(
+            message.contains("accepted and stays queued behind 2 pending step(s)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Refetch the Task after pending steps settle"),
+            "{message}"
+        );
+        assert!(message.contains("retry after 250 ms"), "{message}");
     }
 }

@@ -416,7 +416,7 @@ async fn clear_upgrade_dispatch_refusal(db: &db::SqliteDb, task: &db::Task) -> c
     .bind(&task.error_annotation)
     .bind(api_types::DAEMON_UPGRADE_REQUIRED)
     .execute(db.pool()).await?;
-    let changed = result.rows_affected() != 0;
+    let changed = result != 0;
     if changed {
         tracing::info!(task_id = %task.id, "task dispatch woken after daemon upgrade");
     }

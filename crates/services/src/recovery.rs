@@ -137,6 +137,25 @@ impl CrashRecovery {
         let mut recovered = 0;
 
         for task in tasks {
+            // One live recovery command per Task and running-execution set:
+            // repeated restarts before the queue drains do not stack copies.
+            let mut running = ExecutionRepo::list_running_by_task(&*self.db, &task.id)
+                .await?
+                .into_iter()
+                .map(|execution| execution.id)
+                .collect::<Vec<_>>();
+            running.sort();
+            let key = format!("recover_task_after_restart:{}", running.join(","));
+            let prefix = format!("{key}:");
+            let queued: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND kind='command' AND status IN ('pending','claimed') AND substr(causation_key,1,length(?))=?)")
+                .bind(&task.id)
+                .bind(&prefix)
+                .bind(&prefix)
+                .fetch_one(self.db.pool())
+                .await?;
+            if queued {
+                continue;
+            }
             let id = db::new_uuid_v4();
             db::TaskStepRepo::enqueue_step(
                 &*self.db,
@@ -151,7 +170,7 @@ impl CrashRecovery {
                     }
                     .payload_json()?,
                     causation_step_id: None,
-                    causation_key: id.clone(),
+                    causation_key: format!("{key}:{id}"),
                     chain_id: id,
                     chain_position: 1,
                     expected_status: task.status,
@@ -1100,6 +1119,8 @@ pub(crate) struct CancelledExecution {
 pub(crate) struct RecoverTaskOutcome {
     pub task: Task,
     pub annotated: bool,
+    /// Running executions this recovery settled.
+    pub settled_executions: usize,
 }
 
 async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result<Vec<Task>> {
@@ -1193,6 +1214,7 @@ pub(crate) async fn recover_task(
         return Ok(RecoverTaskOutcome {
             task,
             annotated: false,
+            settled_executions: 0,
         });
     }
 
@@ -1205,6 +1227,7 @@ pub(crate) async fn recover_task(
         return Ok(RecoverTaskOutcome {
             task,
             annotated: false,
+            settled_executions: cancelled.len(),
         });
     }
 
@@ -1220,6 +1243,7 @@ pub(crate) async fn recover_task(
         return Ok(RecoverTaskOutcome {
             task,
             annotated: false,
+            settled_executions: cancelled.len(),
         });
     }
 
@@ -1248,26 +1272,42 @@ pub(crate) async fn recover_task(
         "message": message,
     })
     .to_string();
-    db.enqueue_task_mutation(
-        &task.id,
-        db::TaskMutation::TaskUpdateStatus {
-            input: UpdateTaskStatus {
-                id: task.id.clone(),
-                expected_version: task.version,
-                status: task.status.clone(),
-                assignee_id: None,
-                error_annotation: Some(Some(annotation)),
-                blocked_json: None,
-                failed_json: None,
-                updated_at: now_rfc3339(),
-            },
+    // Applied under the recovery step's lease, or synchronously as the
+    // Task's own step (bounded) from the heartbeat monitor. The outcome
+    // reports a committed annotation only, never a queued one.
+    let task = match TaskRepo::update_status(
+        db,
+        UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: task.status.clone(),
+            assignee_id: None,
+            error_annotation: Some(Some(annotation)),
+            blocked_json: None,
+            failed_json: None,
+            updated_at: now_rfc3339(),
         },
     )
-    .await?;
+    .await
+    {
+        Ok(task) => task,
+        Err(db::DbError::TaskBusy { pending_steps, .. }) => {
+            // Outside the lease only: the accepted annotation stays queued
+            // behind running work and publishes task.updated when it lands.
+            tracing::info!(task_id = %task.id, pending_steps, "recovery annotation queued behind running Task work");
+            return Ok(RecoverTaskOutcome {
+                task,
+                annotated: false,
+                settled_executions: cancelled.len(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     Ok(RecoverTaskOutcome {
         task,
         annotated: true,
+        settled_executions: cancelled.len(),
     })
 }
 
@@ -2374,10 +2414,25 @@ async fn annotate_owner_recovery(
             "message": format!("Workspace owner recovery required: {cause}"),
     });
     if can_annotate {
-        let updated = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET error_annotation = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?")
+        // The heartbeat runs outside the Task lease, so this blocking
+        // annotation is usually queued. It must never be dropped by a status
+        // change, so it is identity-fenced and its predicate re-derives
+        // `can_annotate` when it runs: no failure, a non-terminal status and
+        // no newer foreign annotation.
+        let terminal = workflow
+            .states
+            .iter()
+            .filter(|state| state.kind == api_types::StateKind::Terminal)
+            .map(|state| state.name.clone())
+            .collect::<Vec<_>>();
+        let updated = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET error_annotation = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?
+            AND deleted_at IS NULL AND failed_json IS NULL AND status NOT IN (SELECT value FROM json_each(?))
+            AND (error_annotation IS NULL OR (json_valid(error_annotation) AND json_extract(error_annotation, '$.blocking_reason') IN ('owner_disconnected_timeout', 'owner_lost_execution')))")
             .bind(annotation.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version)
+            .bind(serde_json::to_string(&terminal).expect("terminal states serialize"))
+            .identity_fenced()
             .execute_in_tx(&mut transaction).await?;
-        if updated.rows_affected() != 1 {
+        if updated.applied().is_some_and(|rows| rows != 1) {
             return Err(db::DbError::VersionConflict.into());
         }
     }
@@ -4547,6 +4602,65 @@ pub(crate) mod tests {
             assert_eq!(updated.status, ExecutionStatus::Cancelled);
             assert!(updated.error.as_deref().unwrap().contains("Recovered"));
             assert_eq!(updated.resume_policy, Some(ResumePolicy::Auto));
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_restart_queues_one_recovery_and_publishes_task_recovered_when_it_settles() {
+        use db::TaskStepRepo;
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
+        let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            "in_progress".to_owned(),
+            Some(agent.id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent.id, None).await;
+        let recovery = CrashRecovery::new(Arc::clone(&db), event_bus);
+        // Two restarts before the queue drains: one recovery command for the
+        // Task and its dead execution.
+        recovery.run_recovery().await.expect("first restart");
+        recovery.run_recovery().await.expect("second restart");
+        let commands = db
+            .task_steps(&task.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|step| {
+                step.kind == "command" && step.payload_json.contains("recover_task_after_restart")
+            })
+            .count();
+        assert_eq!(commands, 1);
+
+        let bus = Arc::new(EventBus::new(64));
+        let mut rx = bus.subscribe();
+        crate::TaskService::new(Arc::clone(&db), Arc::clone(&bus))
+            .drain(&task.id)
+            .await
+            .expect("recovery step settles");
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Cancelled
+        );
+        let mut recovered = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event.event_type == "task.recovered" {
+                recovered.push(event);
+            }
+        }
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].entity_id, task.id);
+        match &recovered[0].context {
+            EventContext::TaskRecovered { reason, .. } => assert_eq!(reason, "crash_recovery"),
+            other => panic!("unexpected task.recovered context: {other:?}"),
         }
     }
 

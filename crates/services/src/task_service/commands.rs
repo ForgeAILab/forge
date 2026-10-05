@@ -12,6 +12,19 @@ pub(crate) struct TaskCommand {
     pub preempt: bool,
 }
 impl TaskCommand {
+    /// Commands that re-derive their work from current state when they run
+    /// are must-not-lose effects: queued, they apply after a status change
+    /// and a preempting Cancel/Hold does not supersede them. An execution's
+    /// completion cascade re-checks the current state, role attempt and
+    /// settlement receipt, so it is moot (a no-op) once the Task moved on.
+    pub(crate) fn fence(operation: &str) -> db::task_writer::EffectFence {
+        match operation {
+            "maybe_cascade_executor_completion"
+            | "block_cancelled_dependencies"
+            | "advance_coordination_root" => db::task_writer::EffectFence::Identity,
+            _ => db::task_writer::EffectFence::Entry,
+        }
+    }
     pub(crate) fn payload_json(&self) -> Result<String> {
         let mut payload = serde_json::to_value(self)
             .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
@@ -77,6 +90,7 @@ impl TaskService {
             )
             .await
     }
+    /// Enqueue a command without waiting, fenced per [`TaskCommand::fence`].
     pub(crate) async fn enqueue_task_command(
         &self,
         id: &str,
@@ -84,31 +98,43 @@ impl TaskService {
         arguments: Value,
         preempt: bool,
     ) -> Result<String> {
+        let fence = TaskCommand::fence(operation);
         let task = self.command_task(id).await?;
         let step_id = db::new_uuid_v4();
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
         let queued = self
             .db
-            .enqueue_step(&db::EnqueueTaskStep {
-                id: step_id.clone(),
-                task_id: id.to_owned(),
-                kind: "command".to_owned(),
-                payload_json: TaskCommand {
-                    operation: operation.to_owned(),
-                    arguments,
-                    preempt,
-                }
-                .payload_json()?,
-                causation_step_id: db::task_writer::current_task_step().map(|step| step.id),
-                causation_key: step_id.clone(),
-                chain_id: step_id,
-                chain_position: 1,
-                expected_status: task.status,
-                expected_version: task.version,
-                expected_epoch: None,
-                lane: "fast".to_owned(),
-                available_at: db::now_rfc3339(),
-            })
+            .enqueue_step_in_tx(
+                &mut tx,
+                &db::EnqueueTaskStep {
+                    id: step_id.clone(),
+                    task_id: id.to_owned(),
+                    kind: "command".to_owned(),
+                    payload_json: TaskCommand {
+                        operation: operation.to_owned(),
+                        arguments,
+                        preempt,
+                    }
+                    .payload_json()?,
+                    causation_step_id: db::task_writer::current_task_step().map(|step| step.id),
+                    causation_key: step_id.clone(),
+                    chain_id: step_id,
+                    chain_position: 1,
+                    expected_status: task.status,
+                    expected_version: task.version,
+                    expected_epoch: None,
+                    lane: "fast".to_owned(),
+                    available_at: db::now_rfc3339(),
+                },
+            )
             .await?;
+        if fence == db::task_writer::EffectFence::Identity {
+            self.db
+                .mark_step_identity_fenced_in_tx(&mut tx, &queued)
+                .await?;
+        }
+        tx.commit().await?;
+        self.db.domain_event_notify().notify_waiters();
         if preempt {
             self.db.request_task_preemption(id).await?;
         }
@@ -561,13 +587,26 @@ impl TaskService {
                     let (id,): (String,) = serde_json::from_value(command.arguments.clone())
                         .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
                     let task = self.command_task(&id).await?;
-                    let _ = crate::recovery::recover_task(
+                    let outcome = crate::recovery::recover_task(
                         &self.db,
                         task,
                         db::StopReason::CrashRecovery,
                         &Actor::system(api_types::SystemComponent::CrashRecovery),
                     )
                     .await?;
+                    // Published once this recovery step has settled the
+                    // Task's dead executions (or annotated it).
+                    if outcome.annotated || outcome.settled_executions > 0 {
+                        self.publish(ForgeEvent {
+                            event_type: "task.recovered".to_owned(),
+                            entity_id: outcome.task.id.clone(),
+                            timestamp: event_timestamp(),
+                            context: EventContext::TaskRecovered {
+                                project_id: outcome.task.project_id,
+                                reason: "crash_recovery".to_owned(),
+                            },
+                        });
+                    }
                     encode(())
                 }
                 "block_cancelled_dependencies" => {

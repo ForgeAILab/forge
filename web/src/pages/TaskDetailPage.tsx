@@ -19,7 +19,7 @@ import type { AssigneeSelection } from '@/components/task-controls'
 import { TaskCommentsPanel } from '@/components/task-detail/task-comments-panel'
 import { TaskHistoryPanel } from '@/components/task-detail/task-history-panel'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
-import { getApiErrorMessage, isTransientApiError } from '@/lib/api-error'
+import { getApiErrorMessage, isTransientApiError, notifyTaskBusy } from '@/lib/api-error'
 import { productTerm } from '@/lib/i18n'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
@@ -281,6 +281,7 @@ export function TaskDetailPage({
           }
         },
         onError: (error) => {
+          if (notifyTaskBusy(error)) return
           toast.error(getTaskDetailApiErrorMessage(error, 'Transition failed'))
         },
       },

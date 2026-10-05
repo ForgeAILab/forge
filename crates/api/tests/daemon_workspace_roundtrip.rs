@@ -2371,7 +2371,7 @@ async fn connected_cancel_kills_remote_ci_and_supersedes_its_hook_step() {
 }
 
 #[tokio::test]
-async fn disconnected_cancel_parks_restart_until_real_owner_reconnect_cleanup() {
+async fn disconnected_cancel_fences_workspace_until_real_owner_reconnect_cleanup() {
     let mut fixture = Fixture::new("forge-disconnected-ci-cancel").await;
     let db = fixture.harness.state.db.clone();
     let task_id = fixture.resolved.placement.task_id.clone();
@@ -2438,36 +2438,18 @@ async fn disconnected_cancel_parks_restart_until_real_owner_reconnect_cleanup() 
         .unwrap()
         .is_empty());
     service.drain(&task_id).await.unwrap();
-    let now = db::now_rfc3339();
-    TaskRoleAssignmentRepo::assign(
-        &*db,
-        CreateTaskRoleAssignment {
-            id: db::new_uuid_v4(),
-            task_id: task_id.clone(),
-            role_name: "coder".into(),
-            assignee_type: Some(AssigneeKind::User),
-            assignee_id: Some(common::fake_daemon::FAKE_DAEMON_USER_ID.into()),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .unwrap();
+    // A cancelled Task offers nothing; its workspace stays fenced for reuse.
     let task = TaskRepo::get_by_id(&*db, &task_id, false)
         .await
         .unwrap()
         .unwrap();
-    let parked = service
-        .perform_task_action(&task_id, TaskAction::Restart { reason: None }, task.version)
+    assert!(service
+        .task_action_offers(&task_id, &Actor::user(UserActionSource::Api))
         .await
-        .unwrap();
-    assert_eq!(parked.task.status, "cancelled");
-    assert!(parked
-        .task
-        .error_annotation
-        .as_deref()
         .unwrap()
-        .contains("pending_remote_cancel"));
+        .available_actions
+        .is_empty());
+    assert_eq!(task.status, "cancelled");
     fixture.link = Some(
         DaemonLink::connect(
             &fixture.server,
@@ -2492,15 +2474,166 @@ async fn disconnected_cancel_parks_restart_until_real_owner_reconnect_cleanup() 
         .unwrap()
         .requests(METHOD_WORKSPACE_CANCEL)
         .is_empty());
+    assert!(db
+        .workspace_remote_cancels(&fixture.resolved.placement.workspace_id, &task_id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Hold with the owner disconnected parks the follow-up action on the
+/// unconfirmed remote cleanup, naming the machine, until the owner reconnects.
+#[tokio::test]
+async fn disconnected_hold_parks_follow_up_on_the_named_machine_until_reconnect() {
+    let mut fixture = Fixture::new("forge-disconnected-ci-hold").await;
+    let db = fixture.harness.state.db.clone();
+    let task_id = fixture.resolved.placement.task_id.clone();
+    sqlx::query("UPDATE workspace SET before_sha=? WHERE id=?")
+        .bind(&fixture.base_sha)
+        .bind(&fixture.resolved.placement.workspace_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let started = fixture
+        ._daemon_root
+        .path()
+        .join("disconnected-hold-started");
+    let completed = fixture
+        ._daemon_root
+        .path()
+        .join("disconnected-hold-completed");
+    sqlx::query("UPDATE task SET task_state_config=?,status='merge_failed' WHERE id=?").bind(json!({"review":{"ci_steps":[format!("touch {}; sleep 120; touch {}",quote(&started.to_string_lossy()),quote(&completed.to_string_lossy()))]}}).to_string()).bind(&task_id).execute(db.pool()).await.unwrap();
+    let service = fixture.harness.state.task_service.clone();
     let task = TaskRepo::get_by_id(&*db, &task_id, false)
         .await
         .unwrap()
         .unwrap();
-    let restarted = service
-        .perform_task_action(&task_id, TaskAction::Restart { reason: None }, task.version)
+    service
+        .transition(
+            &task_id,
+            "review".to_owned(),
+            services::task_service::TransitionOptions {
+                version: task.version,
+                triggered_by: Actor::system(SystemComponent::Workflow),
+                reason: Some("remote CI".into()),
+                rejection: false,
+                defer_dispatch_seconds: None,
+            },
+        )
         .await
         .unwrap();
-    assert_ne!(restarted.task.status, "cancelled");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.link.take();
+    fixture
+        .harness
+        .state
+        .daemon_connections
+        .unregister(&fixture.daemon_id);
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let held = service
+        .perform_task_action(&task_id, TaskAction::Hold { reason: None }, task.version)
+        .await
+        .unwrap();
+    assert_ne!(held.task.status, "cancelled");
+    assert!(db.task_has_pending_remote_cancel(&task_id).await.unwrap());
+    service.drain(&task_id).await.unwrap();
+    let now = db::now_rfc3339();
+    TaskRoleAssignmentRepo::assign(
+        &*db,
+        CreateTaskRoleAssignment {
+            id: db::new_uuid_v4(),
+            task_id: task_id.clone(),
+            role_name: "coder".into(),
+            assignee_type: Some(AssigneeKind::User),
+            assignee_id: Some(common::fake_daemon::FAKE_DAEMON_USER_ID.into()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let follow_up = |offers: &TaskActionsResponse| {
+        offers
+            .available_actions
+            .iter()
+            .find(|offer| matches!(offer.action.verb(), "release" | "restart" | "retry"))
+            .map(|offer| offer.action.clone())
+            .unwrap_or_else(|| panic!("held Task offers a follow-up: {offers:?}"))
+    };
+    let offers = service
+        .task_action_offers(&task_id, &Actor::user(UserActionSource::Api))
+        .await
+        .unwrap();
+    let parked = service
+        .perform_task_action(&task_id, follow_up(&offers), offers.version)
+        .await
+        .unwrap();
+    let annotation: Value =
+        serde_json::from_str(parked.task.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["blocking_reason"], "pending_remote_cancel");
+    let hostname = db::DaemonRepo::get_by_id(&*db, &fixture.daemon_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .hostname;
+    assert!(
+        annotation["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("machine {hostname}")),
+        "parked annotation names the machine: {annotation}"
+    );
+    fixture.link = Some(
+        DaemonLink::connect(
+            &fixture.server,
+            &fixture.daemon_id,
+            &fixture.token,
+            fixture.runtime.clone(),
+        )
+        .await,
+    );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while db.task_has_pending_remote_cancel(&task_id).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    service.drain(&task_id).await.unwrap();
+    assert!(!completed.exists());
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!task
+        .error_annotation
+        .as_deref()
+        .unwrap_or_default()
+        .contains("pending_remote_cancel"));
+    // With cleanup confirmed, the follow-up proceeds instead of parking.
+    let offers = service
+        .task_action_offers(&task_id, &Actor::user(UserActionSource::Api))
+        .await
+        .unwrap();
+    let proceeded = service
+        .perform_task_action(&task_id, follow_up(&offers), offers.version)
+        .await
+        .unwrap();
+    assert!(!proceeded
+        .task
+        .error_annotation
+        .as_deref()
+        .unwrap_or_default()
+        .contains("pending_remote_cancel"));
 }
 
 #[cfg(unix)]
@@ -2612,6 +2745,172 @@ async fn cancel_during_remote_merge_push_finishes_integration_and_reports_done()
         .unwrap()
         .unwrap()
         .unwrap();
+    assert_eq!(cancelled.task.status, "done");
+    // The queued Cancel ran after the merge landed and records that it was moot.
+    let moot: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_comment WHERE task_id=? AND content LIKE 'Cancel had no effect%'",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(moot, 1);
+    drain.await.unwrap().unwrap();
+    let output = tokio::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&remote)
+        .args(["rev-parse", "refs/heads/main"])
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), candidate);
+    assert!(db
+        .pending_remote_cancels(None, None)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_during_slow_remote_merge_push_reports_done() {
+    use db::TaskStepRepo;
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("forge-merge-push-cancel-slow").await;
+    let candidate = fixture.candidate().await;
+    fixture.approve_candidate().await;
+    let root = fixture._daemon_root.path();
+    let remote = root.join("push-target.git");
+    let started = root.join("push-started");
+    let release = root.join("push-release");
+    let output = tokio::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&remote)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    let hook = remote.join("hooks/pre-receive");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ntouch {}\nwhile [ ! -f {} ]; do sleep 0.02; done\n",
+            quote(&started.to_string_lossy()),
+            quote(&release.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let post_merge = fixture.checkout.join(".git/hooks/post-merge");
+    std::fs::write(
+        &post_merge,
+        format!(
+            "#!/bin/sh\ngit push {} HEAD:refs/heads/main\n",
+            quote(&remote.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&post_merge, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let db = fixture.harness.state.db.clone();
+    let service = fixture.harness.state.task_service.clone();
+    let task_id = fixture.resolved.placement.task_id.clone();
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    service
+        .transition(
+            &task_id,
+            "merging".into(),
+            services::task_service::TransitionOptions {
+                version: task.version,
+                triggered_by: Actor::system(SystemComponent::Workflow),
+                reason: Some("approved remote merge".into()),
+                rejection: false,
+                defer_dispatch_seconds: None,
+            },
+        )
+        .await
+        .unwrap();
+    let drain = {
+        let service = service.clone();
+        let task_id = task_id.clone();
+        tokio::spawn(async move { service.drain(&task_id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("merge reaches the push process");
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut cancel = {
+        let service = service.clone();
+        let task_id = task_id.clone();
+        tokio::spawn(async move {
+            service
+                .perform_task_action(&task_id, TaskAction::Cancel { reason: None }, task.version)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !db.task_steps(&task_id).await.unwrap().iter().any(|s| {
+            s.kind == "command"
+                && s.status == "pending"
+                && serde_json::from_str::<Value>(&s.payload_json).unwrap()["preempt"] == true
+        }) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut cancel)
+            .await
+            .is_err(),
+        "Cancel waits for the protected push"
+    );
+    // The push is still running after the 10 s acknowledgement window.
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    std::fs::write(&release, "release").unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_secs(15), cancel)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let pushed = {
+        let mut sha = String::new();
+        for _ in 0..200 {
+            let output = tokio::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&remote)
+                .args(["rev-parse", "refs/heads/main"])
+                .output()
+                .await
+                .unwrap();
+            sha = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+            if sha == candidate {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        sha
+    };
+    let now = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (cancelled.task.status.as_str(), now.status.as_str()),
+        ("done", "done"),
+        "integration landed on the target (pushed={}, candidate={candidate}) but Cancel reported {} and the Task is now {}",
+        pushed, cancelled.task.status, now.status
+    );
     assert_eq!(cancelled.task.status, "done");
     drain.await.unwrap().unwrap();
     let output = tokio::process::Command::new("git")

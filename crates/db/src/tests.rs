@@ -316,6 +316,7 @@ async fn claim_in_test_step(
         updated_at: now,
         completed_at: None,
         result_json: None,
+        entry_fenced: true,
     };
     let result =
         crate::task_writer::in_task_step(step.clone(), TaskRepo::claim(db, transaction, input))

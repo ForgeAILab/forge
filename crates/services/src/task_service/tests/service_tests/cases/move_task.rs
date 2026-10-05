@@ -258,3 +258,65 @@ async fn board_move_conflicts_and_guard_rejection_write_nothing() {
         0
     );
 }
+
+/// An accepted board move must be fenced to the status entry the
+/// client saw, exactly like `transition`. A workflow write queued ahead of the
+/// move (here todo -> backlog) changes status and epoch before the move runs.
+#[tokio::test]
+async fn queued_board_move_is_fenced_like_transition() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(64)));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let queued_ahead = |task_id: String| {
+        let db = Arc::clone(&db);
+        async move {
+            db.enqueue_task_mutation(
+                &task_id,
+                db::TaskMutation::Sql {
+                    task_id: task_id.clone(),
+                    query: "UPDATE task SET status='backlog',version=version+1 WHERE id=?".into(),
+                    arguments: vec![serde_json::json!(task_id)],
+                },
+            )
+            .await
+            .unwrap();
+        }
+    };
+
+    // Control: transition with the version the client saw is superseded.
+    let control = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
+    queued_ahead(control.id.clone()).await;
+    let transition = service
+        .transition(
+            control.id.clone(),
+            default_states::PLANNING.to_owned(),
+            control.version,
+        )
+        .await;
+    assert!(transition.is_err(), "control transition applied");
+    let control_after = TaskRepo::get_by_id(&*db, &control.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(control_after.status, "backlog");
+
+    // Board move with the same accepted version and status.
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
+    let revision = TaskBoardRepo::board_revision(&*db, &project_id)
+        .await
+        .unwrap();
+    let request = move_request(&task, revision, default_states::PLANNING, None, None);
+    queued_ahead(task.id.clone()).await;
+    let moved = service.move_task(task.id.clone(), request).await;
+    let after = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        moved.is_err() && after.status == "backlog",
+        "stale board move applied from {:?}: result={:?} status_now={}",
+        moved.as_ref().ok().map(|m| m.old_status.clone()),
+        moved.as_ref().map(|m| m.task.status.clone()),
+        after.status
+    );
+}

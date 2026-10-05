@@ -4074,31 +4074,75 @@ Task step. Owner commands, claims, execution settlement, dispatcher effects,
 recovery, assignment and coordination use the same worker path. Content-only
 updates and same-column board order retain their version CAS. Creation initializes
 unpublished rows in its writer transaction; effects on an existing parent are
-queued separately. The entry status/epoch fence runs at step claim. Checkpoints
-and effects retain the lease-owner fence; the former per-hook epoch rereads and
-Task-state CAS retry loops are removed.
+queued separately. The entry status/epoch fence runs when a step executes.
+Checkpoints and effects retain the lease-owner fence; the former per-hook epoch
+rereads and Task-state CAS retry loops are removed. In-transaction helpers that
+write status, blocking annotations or recovery metadata fence through
+`fence_task_lease_in_tx`, which debug-asserts that the caller runs in that Task's
+step.
+
+In-lease version override: a Task SQL effect applied under the lease
+(`apply_task_sql`) keeps every predicate but rebinds `AND version = ?` to the
+version read in its own transaction, because the lease already makes the step the
+only workflow writer and a content edit may have bumped the version. The version
+guard is therefore off inside the lease: an in-lease read-modify-write that spans
+an `.await` must not rely on it to detect another writer.
+
+Queued effects carry a fence. `Entry` (the default) applies only while the Task is
+still in the status entry it was queued in, and a preempting Cancel/Hold supersedes
+it while pending; it is for effects that are moot once the Task has moved on
+(status writes, entry barriers, deferrals for one entry, transition-class commands
+and the startup stale-annotation sweep). `Identity`
+effects are fenced by their own SQL predicate or re-derive their work when they
+run; they apply after a status change and survive a preempting Cancel/Hold. They
+are the must-not-lose effects: dispatch wakes (per Task, Project, Repository and
+readiness), clears of a Task's own wait markers, the `pending_remote_cancel`
+clear, plan-settlement and owner-recovery blocking annotations (the latter
+re-derives its admission conditions in SQL), agent-deletion and
+coordination-root role clears, `block_cancelled_dependencies`,
+`advance_coordination_root`, the coordination-review flag and an execution's
+completion cascade (`maybe_cascade_executor_completion`, which re-checks the
+current state, role attempt and settlement receipt). A completion that runs while
+the Task is held is a no-op; releasing that hold settles the completed attempt
+instead of re-running the role.
+`TaskQuery::execute_in_tx` returns `Applied(rows)` or `Queued { step_id }`; a
+lease-holding writer requires `Applied`, and no caller treats `Queued` as applied.
 
 Callers that need a result enqueue a command and drive the same worker inline.
-A registered notification, checked before waiting, bounds predecessor wait to five
-seconds without polling. Once that command claims the lease, its result describes
-its own committed Task. A timeout returns HTTP 409 `task_busy` with `pending_steps`,
-`retry_after_ms` and a retry hint; the accepted command remains durable. Hooks and
-cascades remain asynchronous, and responses retain `pending_steps`. Claim and its
-execution startup share one command; dispatch continues if the HTTP waiter expires.
-Cross-Task wakes enqueue without waiting for another Task lane, and explicit initial
-role assignments publish in the new Task's birth transaction.
+A registered notification, checked before waiting, bounds the predecessor wait
+without polling: one deadline of five seconds, or fifteen for Cancel/Hold (five
+plus the ten-second remote acknowledgment). Once that command claims the lease,
+its result describes its own committed Task; running its own step is not counted
+as waiting (claim with environment checks and `rerun_review` are bounded only by
+their checks' timeouts). A timeout returns HTTP 409 `task_busy` with
+`pending_steps`, `retry_after_ms` and a retry hint; the accepted command remains
+durable. Hooks and cascades remain asynchronous, and responses retain
+`pending_steps`. Claim and its execution startup share one command; dispatch
+continues if the HTTP waiter expires. Cross-Task wakes enqueue without waiting for
+another Task lane, and explicit initial role assignments publish in the new Task's
+birth transaction. A root Cancel commits under the root lease and enqueues each
+child's cancel as the child's own preempting step; it never waits on a child lease.
 
 Cancel/Hold preempts scripts, CI and startup at a safe point. Integration is
-protected through its result and terminal cascade; a landed merge wins and Cancel
-returns the done Task. Remote commands receive `workspace.cancel`; acknowledgment
-wait is at most ten seconds. Without confirmation the hook is superseded with
-`remote_operation_unconfirmed`, while `pending_remote_cancel` durably excludes
-that workspace from new steps and executions. Owner reconnect retries cancellation
-and clears the exclusion on `killed`, `already_finished` or `unknown`. Restart/Retry
-uses the existing queued recovery and blocking annotation until cleanup confirms.
-Late results cannot write through a superseded step's owner token. Transport
-loss alone does not abort a daemon command. Operations reports the pending count,
-and Task workspace detail names the exclusion.
+protected from its start (`integration_started_at`) through its result and
+terminal cascade: a preempt request never interrupts it and no acknowledgment
+timeout settles it. A Cancel/Hold waiting behind it returns `task_busy` at its
+bound and stays queued; when it runs after a landed merge it returns the done Task
+and records a moot-Cancel system comment. A daemon disconnect mid-merge settles
+through workspace containment and reconnect. Remote non-integration commands
+receive `workspace.cancel`; acknowledgment wait is at most ten seconds. Without
+confirmation the hook is superseded with `remote_operation_unconfirmed`, while
+`pending_remote_cancel` durably excludes that workspace from new steps and
+executions. The record is daemon-scoped (no foreign key to the Task, step,
+workspace or placement), so deleting any of them proceeds and reconnect still
+cancels it. Owner reconnect retries cancellation and clears the exclusion on
+`killed`, `already_finished` or `unknown`. Restart/Retry/Release uses the existing
+queued recovery and a blocking annotation naming the machine until cleanup
+confirms. Late results cannot write through a superseded step's owner token.
+Transport loss alone does not abort a daemon command. Operations reports the
+pending count, and Task workspace detail names the exclusion. Crash recovery
+enqueues at most one live recovery command per Task and running-execution set,
+and publishes `task.recovered` when that step settles dead executions.
 
 The step table replaces the in-memory exclusions. While the current entry's
 `hooks` row (matched on status and status_epoch) is pending or claimed, its entry

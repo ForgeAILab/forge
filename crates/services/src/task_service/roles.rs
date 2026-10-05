@@ -50,10 +50,12 @@ impl TaskService {
         let task_ids:Vec<String> = sqlx::query_scalar("SELECT id FROM task WHERE deleted_at IS NULL AND (assignee_id=? OR id IN (SELECT task_id FROM task_role_assignment WHERE assignee_id=?))")
             .bind(agent_id).bind(agent_id).fetch_all(&mut **transaction).await?;
         for task_id in task_ids {
-            db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?")
-                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).execute_in_tx(transaction).await?;
-            db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task SET assignee_id=NULL,updated_at=? WHERE id=? AND assignee_type='agent' AND assignee_id=?")
-                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).execute_in_tx(transaction).await?;
+            // Role clears for a deleted Agent must never be lost: each is
+            // identity-fenced by its own predicate when queued.
+            let _queued_or_applied = db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?")
+                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).identity_fenced().execute_in_tx(transaction).await?;
+            let _queued_or_applied = db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task SET assignee_id=NULL,updated_at=? WHERE id=? AND assignee_type='agent' AND assignee_id=?")
+                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).identity_fenced().execute_in_tx(transaction).await?;
         }
 
         // Agent archival changes the effective authority of every affected
@@ -63,7 +65,7 @@ impl TaskService {
         let affected_task_ids: HashSet<&str> =
             events.iter().map(|event| event.task_id.as_str()).collect();
         for task_id in affected_task_ids {
-            db::task_writer::TaskQuery::new(db,task_id,
+            let _queued_or_applied = db::task_writer::TaskQuery::new(db,task_id,
                 "UPDATE task
                  SET review_passed_at = NULL,
                      version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
@@ -86,6 +88,7 @@ impl TaskService {
             )
             .bind(now_rfc3339())
             .bind(task_id)
+            .identity_fenced()
             .execute_in_tx(transaction)
             .await?;
         }

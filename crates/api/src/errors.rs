@@ -567,6 +567,16 @@ impl From<DbError> for ApiError {
                     "active_leases": active_leases,
                 }),
             ),
+            DbError::ResourceInUse { resource, reason } => Self::conflict_with_code_and_details(
+                "resource_in_use",
+                format!("{resource} is in use: {reason}"),
+                json!({ "resource": resource, "reason": reason }),
+            ),
+            error if error.is_foreign_key_violation() => Self::conflict_with_code_and_details(
+                "resource_in_use",
+                "the resource is still referenced by other records".to_owned(),
+                json!({ "resource": null, "reason": "foreign_key" }),
+            ),
             DbError::CycleDetected => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "cycle_detected",
@@ -693,6 +703,28 @@ mod placement_tests {
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(error.code, "prepare_failed");
         assert_eq!(error.details.unwrap()["failure_cause"], "prepare_failed");
+    }
+    #[tokio::test]
+    async fn foreign_key_refusal_is_a_typed_conflict_not_a_500() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql("CREATE TABLE parent(id TEXT PRIMARY KEY); CREATE TABLE child(id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parent(id) ON DELETE RESTRICT); INSERT INTO parent VALUES('p'); INSERT INTO child VALUES('c','p');")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let refused = sqlx::query("DELETE FROM parent WHERE id='p'")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        let error = ApiError::from(ServiceError::from(DbError::from(refused)));
+        assert_eq!(error.status, StatusCode::CONFLICT, "{}", error.message);
+        assert_eq!(error.code, "resource_in_use");
+        let typed = ApiError::from(DbError::ResourceInUse {
+            resource: "workspace w".into(),
+            reason: "a remote workspace operation is still running".into(),
+        });
+        assert_eq!(typed.status, StatusCode::CONFLICT);
+        assert_eq!(typed.code, "resource_in_use");
+        assert_eq!(typed.details.unwrap()["resource"], "workspace w");
     }
     #[test]
     fn task_busy_preserves_retry_details_across_error_boundaries() {

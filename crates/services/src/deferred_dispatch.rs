@@ -516,12 +516,14 @@ pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) 
         if TaskRepo::get_by_id(db, task_id, false).await?.is_none() {
             return Ok(());
         }
-        db.enqueue_task_mutation(
+        // A wake must never be dropped because the Task changed status first.
+        db.enqueue_fenced_task_mutation(
             task_id,
             db::TaskMutation::TaskWakeDispatchForTask {
                 id: task_id.to_owned(),
                 updated_at: now_rfc3339(),
             },
+            db::task_writer::EffectFence::Identity,
         )
         .await?;
         tracing::info!(task_id = %task_id, %reason, "task dispatch wake queued");

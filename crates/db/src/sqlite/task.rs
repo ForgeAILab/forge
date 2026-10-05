@@ -579,7 +579,12 @@ async fn set_error_annotation_if_no_running_execution_inner(
     overlapping_roles: Vec<String>,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
-    db.fence_current_step_in_tx(&mut transaction).await?;
+    db.fence_task_lease_in_tx(
+        &mut transaction,
+        id,
+        "set_error_annotation_if_no_running_execution",
+    )
+    .await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -742,7 +747,8 @@ async fn update_recovery_metadata_inner(
     expected_queued_recovery_id: Option<&str>,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
-    db.fence_current_step_in_tx(&mut transaction).await?;
+    db.fence_task_lease_in_tx(&mut transaction, id, "update_recovery_metadata")
+        .await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -2510,7 +2516,8 @@ async fn update_task_status_inner(
         return Err(DbError::InvalidTransition);
     }
     let mut transaction = crate::begin_immediate(&db.pool).await?;
-    db.fence_current_step_in_tx(&mut transaction).await?;
+    db.fence_task_lease_in_tx(&mut transaction, &input.id, "update_task_status")
+        .await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(&input.id)
         .fetch_optional(&mut *transaction)

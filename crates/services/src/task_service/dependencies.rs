@@ -159,6 +159,8 @@ impl TaskService {
     ) -> Result<Task> {
         if !db::task_writer::owns_task(&task.id) {
             if db::task_writer::current_task_step().is_some() {
+                // Identity-fenced (TaskCommand::fence): a dependency block is
+                // never lost to a status change or a preempting Hold.
                 self.enqueue_task_command(
                     &task.id,
                     "block_cancelled_dependencies",

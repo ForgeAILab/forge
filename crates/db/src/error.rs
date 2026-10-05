@@ -83,6 +83,9 @@ pub enum DbError {
         active_leases: i64,
     },
 
+    #[error("{resource} is in use: {reason}")]
+    ResourceInUse { resource: String, reason: String },
+
     #[error("dependency gate")]
     DependencyGate,
 
@@ -138,6 +141,17 @@ pub enum DbError {
 }
 
 impl DbError {
+    /// A delete or update was refused because another row still references
+    /// the target. Callers surface this as a typed conflict, never a 500.
+    pub fn is_foreign_key_violation(&self) -> bool {
+        // SQLite reports an immediate `ON DELETE RESTRICT` refusal as
+        // SQLITE_CONSTRAINT_TRIGGER (1811), not SQLITE_CONSTRAINT_FOREIGNKEY
+        // (787), with the same message.
+        matches!(self, Self::Sqlx(sqlx::Error::Database(error))
+            if error.kind() == sqlx::error::ErrorKind::ForeignKeyViolation
+                || error.message().contains("FOREIGN KEY constraint failed"))
+    }
+
     /// Worker retry classification, deliberately narrower than "any DB error".
     pub fn is_transient(&self) -> bool {
         match self {

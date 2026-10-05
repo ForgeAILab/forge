@@ -186,34 +186,53 @@ impl TaskStepWorker {
             .lock()
             .expect("Task step replies")
             .insert(id.clone(), reply);
-        let enqueue = self
-            .db
-            .enqueue_step(&db::EnqueueTaskStep {
-                id: id.clone(),
-                task_id: task_id.to_owned(),
-                kind: "command".to_owned(),
-                payload_json: payload.to_string(),
-                causation_step_id: db::task_writer::current_task_step().map(|step| step.id),
-                causation_key: id.clone(),
-                chain_id: id.clone(),
-                chain_position: 1,
-                expected_status: task.status.clone(),
-                expected_version: task.version,
-                expected_epoch: None,
-                lane: if startup_checks
-                    || command.operation == "rerun_review"
-                    || (command.operation == "dispatch_queued_recovery"
-                        && crate::deferred_dispatch::queued_recovery(&task)
-                            .is_some_and(|q| q.request.offer.reason == "review_checks_retry"))
-                {
-                    "long"
-                } else {
-                    "fast"
-                }
-                .to_owned(),
-                available_at: db::now_rfc3339(),
-            })
-            .await;
+        let fence = crate::task_service::commands::TaskCommand::fence(&command.operation);
+        let enqueue = async {
+            let mut tx = db::begin_immediate(self.db.pool()).await?;
+            let queued = self
+                .db
+                .enqueue_step_in_tx(
+                    &mut tx,
+                    &db::EnqueueTaskStep {
+                        id: id.clone(),
+                        task_id: task_id.to_owned(),
+                        kind: "command".to_owned(),
+                        payload_json: payload.to_string(),
+                        causation_step_id: db::task_writer::current_task_step().map(|step| step.id),
+                        causation_key: id.clone(),
+                        chain_id: id.clone(),
+                        chain_position: 1,
+                        expected_status: task.status.clone(),
+                        expected_version: task.version,
+                        expected_epoch: None,
+                        lane: if startup_checks
+                            || command.operation == "rerun_review"
+                            || (command.operation == "dispatch_queued_recovery"
+                                && crate::deferred_dispatch::queued_recovery(&task).is_some_and(
+                                    |q| q.request.offer.reason == "review_checks_retry",
+                                ))
+                        {
+                            "long"
+                        } else {
+                            "fast"
+                        }
+                        .to_owned(),
+                        available_at: db::now_rfc3339(),
+                    },
+                )
+                .await?;
+            // A command left queued by a busy wait must not be lost to a
+            // later preempting Cancel/Hold when it is identity-fenced.
+            if fence == db::task_writer::EffectFence::Identity {
+                self.db
+                    .mark_step_identity_fenced_in_tx(&mut tx, &queued)
+                    .await?;
+            }
+            tx.commit().await?;
+            self.db.domain_event_notify().notify_waiters();
+            Ok::<_, db::DbError>(queued)
+        }
+        .await;
         if let Err(error) = enqueue {
             self.engine
                 .task_service
@@ -259,14 +278,15 @@ impl TaskStepWorker {
                     });
             }
             self.start_inline_head(task_id).await?;
-            let protected_merge: bool = command.preempt && sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND integration_started_at IS NOT NULL AND status IN ('pending','claimed'))")
-                .bind(task_id).fetch_one(self.db.pool()).await?;
+            // One deadline bounds the whole predecessor wait, including a
+            // protected merge ahead of a Cancel/Hold. The accepted command
+            // stays queued and runs after the predecessor settles.
             tokio::select! {
                 biased;
                 reply=&mut received=>break reply.map_err(|_|ServiceError::invalid_operation("Task step reply was interrupted"))?
                     .and_then(|value|serde_json::from_value(value).map_err(|e|ServiceError::invalid_operation(e.to_string()))),
                 _=changed=>{},
-                _=tokio::time::sleep_until(deadline), if !protected_merge =>break Err(db::DbError::TaskBusy {pending_steps:self.db.pending_steps(task_id).await?,retry_after_ms:250}.into()),
+                _=tokio::time::sleep_until(deadline)=>break Err(db::DbError::TaskBusy {pending_steps:self.db.pending_steps(task_id).await?,retry_after_ms:250}.into()),
             }
         };
         self.engine
@@ -485,57 +505,28 @@ impl TaskStepWorker {
             step.clone(),
             self.execute_inner(&step),
         ));
-        let notify = self.db.domain_event_notify();
-        let mut remote_cancel: Option<
-            std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>>,
-        > = None;
-        let mut remote_cancel_started = false;
-        let mut unconfirmed = false;
-        let mut result = loop {
-            if *preempt.borrow_and_update() {
-                if !control.critical.load(std::sync::atomic::Ordering::SeqCst) {
-                    break None;
-                }
-                // Local integration finishes first. For remote integration,
-                // poll its result while requesting cleanup: an acknowledged
-                // merge finishes normally, but ten seconds without an ACK
-                // leaves a workspace fence and lets Cancel/Hold apply.
-                if !remote_cancel_started {
-                    let operations = self.db.running_remote_task_operations(&step.id).await?;
-                    if !operations.is_empty() {
-                        remote_cancel_started = true;
-                        let db = self.db.clone();
-                        let registry = self.engine.daemon_connections.clone();
-                        remote_cancel = Some(Box::pin(async move {
-                            crate::remote_cancel::cancel_operations(&db, registry, &operations)
-                                .await
-                        }));
-                    }
-                }
+        let result = loop {
+            // Integration, local or remote, is protected once it starts: it
+            // runs to its own result, which settles normally. A remote merge
+            // is never settled because a cancel acknowledgment is late; a
+            // daemon disconnect settles it through workspace containment and
+            // reconnect, never through a timeout. The waiting Cancel/Hold
+            // stays queued behind it.
+            if *preempt.borrow_and_update()
+                && !control.critical.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break None;
             }
             tokio::select! {
                 result=&mut work=>break Some(result),
                 _=preempt.changed()=>{},
-                _=notify.notified(), if *preempt.borrow() => {},
-                cancelled=async { remote_cancel.as_mut().expect("active remote cancellation").await }, if remote_cancel.is_some() => {
-                    remote_cancel = None;
-                    unconfirmed = cancelled?;
-                    if unconfirmed { break None; }
-                },
             }
         };
         // Drop the hook future before cancellation/lease settlement;
         // embedded CI, scripts and startup children are kill_on_drop.
         drop(work);
-        if let Some(cancel) = remote_cancel {
-            unconfirmed = cancel.await?;
-        }
-        if matches!(&result, Some(Err(_))) && *preempt.borrow() && remote_cancel_started {
-            result = None;
-        }
         let result = match result {
             Some(result) => result,
-            None if remote_cancel_started => self.settle_preempted_step(&step, unconfirmed).await,
             None => self.preempt_step(&step).await,
         };
         self.db.release_step_control(&step);
@@ -895,6 +886,10 @@ impl TaskStepWorker {
             }
             tx.commit().await?;
             self.db.domain_event_notify().notify_waiters();
+            // Entry hooks fence dispatch while they run. A continuation the
+            // dispatcher skipped meanwhile (a queued role retry) becomes
+            // dispatchable only now, so wake the dispatcher.
+            self.engine.task_service.dispatch_wake.notify_one();
             return Ok(());
         }
         let payload: CascadePayload =

@@ -1765,3 +1765,15 @@ async fn cancel_running_workspace_command_kills_group_and_blocks_delayed_start()
         .is_err());
     assert!(!fixture.path().join("delayed").exists());
 }
+
+#[test]
+fn cancel_tombstones_are_pruned_seven_days_after_acknowledgment() {
+    let mut registry = WorkspaceRegistry::default();
+    registry.record_cancel_tombstone("old", 1_000);
+    registry.record_cancel_tombstone("recent", 1_000 + CANCEL_TOMBSTONE_RETENTION_SECS - 1);
+    assert!(registry.cancel_tombstones.contains_key("old"));
+    registry.record_cancel_tombstone("new", 1_000 + CANCEL_TOMBSTONE_RETENTION_SECS);
+    assert!(!registry.cancel_tombstones.contains_key("old"));
+    assert!(registry.cancel_tombstones.contains_key("recent"));
+    assert!(registry.cancel_tombstones.contains_key("new"));
+}

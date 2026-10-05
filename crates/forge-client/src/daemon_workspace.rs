@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -42,9 +42,31 @@ struct WorkspaceRegistry {
     locations: HashMap<String, VerifiedLocation>,
     handles: HashMap<String, OwnedWorkspace>,
     /// Cancellation tombstones prevent a delayed request from starting after
-    /// an `unknown` acknowledgment, including after an owner restart.
+    /// an `unknown` acknowledgment, including after an owner restart. Each
+    /// maps the operation id to its acknowledgment time (Unix seconds) and is
+    /// pruned [`CANCEL_TOMBSTONE_RETENTION_SECS`] after it.
     #[serde(default)]
-    cancelled_operations: HashSet<String>,
+    cancel_tombstones: HashMap<String, u64>,
+}
+
+/// A delayed request for a cancelled operation cannot arrive a week later:
+/// server RPCs and their retries are bounded far below this.
+const CANCEL_TOMBSTONE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+impl WorkspaceRegistry {
+    /// Record an acknowledged cancellation and drop tombstones past retention.
+    fn record_cancel_tombstone(&mut self, operation_id: &str, now: u64) {
+        self.cancel_tombstones
+            .retain(|_, acked_at| now.saturating_sub(*acked_at) < CANCEL_TOMBSTONE_RETENTION_SECS);
+        self.cancel_tombstones.insert(operation_id.to_owned(), now);
+    }
 }
 
 #[derive(Clone)]
@@ -203,7 +225,7 @@ impl DaemonWorkspaceBackend {
             // Register before waiting for the workspace mutation lock. Cancel
             // must also stop a command that has not yet spawned its child.
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            if state.cancelled_operations.contains(&id) {
+            if state.cancel_tombstones.contains_key(&id) {
                 return Err(error(WORKSPACE_ERROR, "workspace operation was cancelled"));
             }
             let mut running = self
@@ -257,9 +279,7 @@ impl DaemonWorkspaceBackend {
         let running = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let mut updated = state.clone();
-            updated
-                .cancelled_operations
-                .insert(request.operation_id.clone());
+            updated.record_cancel_tombstone(&request.operation_id, unix_now());
             self.journal
                 .save_workspace_state(&updated)
                 .map_err(storage_error)?;

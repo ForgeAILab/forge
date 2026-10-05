@@ -281,7 +281,7 @@ pub(crate) async fn wake_dispatch_for_project_in_tx(
     .bind(project_id)
     .execute_in_tx(transaction)
     .await?;
-    Ok(result.rows_affected())
+    Ok(result.tasks())
 }
 
 fn limit(page: &PageRequest) -> i64 {

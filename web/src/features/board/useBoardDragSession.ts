@@ -2,7 +2,13 @@ import { useCallback, useEffect, useReducer, useRef } from 'react'
 import type { DragStart, DragUpdate, DropResult } from '@hello-pangea/dnd'
 import { toast } from 'sonner'
 import { ApiError } from '@/api/client'
-import { getApiErrorCode, toastApiError } from '@/lib/api-error'
+import {
+  getApiErrorCode,
+  isTaskBusy,
+  notifyTaskBusy,
+  TASK_BUSY_QUEUED_MESSAGE,
+  toastApiError,
+} from '@/lib/api-error'
 import { useMoveTask } from './board-api'
 import { planBoardMove, type BoardSnapshot } from './board-ordering'
 import { boardReducer, createBoardState, type BoardState } from './board-reducer'
@@ -91,6 +97,14 @@ export function useBoardDragSession({
         dispatch({ type: 'commit_succeeded', response })
         await reconcile()
       } catch (error) {
+        if (isTaskBusy(error)) {
+          // Accepted and queued behind the current step; the board refreshes
+          // now and again when the queued move applies.
+          dispatch({ type: 'commit_failed', announcement: TASK_BUSY_QUEUED_MESSAGE })
+          notifyTaskBusy(error)
+          await reconcile()
+          return
+        }
         const code = error instanceof ApiError ? getApiErrorCode(error) : undefined
         const stale =
           error instanceof ApiError &&

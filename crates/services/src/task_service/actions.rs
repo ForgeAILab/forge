@@ -135,6 +135,21 @@ impl TaskService {
                     != Some(snapshot.task.status.as_str())
                 && (preempting_hooks || integrated)
             {
+                // The protected merge landed before this queued command ran.
+                // Record that the request had no effect on the done Task.
+                self.create_system_comment(
+                    &task_id,
+                    format!(
+                        "{} had no effect: the merge landed first and the Task is {}.",
+                        if matches!(&action, TaskAction::Cancel { .. }) {
+                            "Cancel"
+                        } else {
+                            "Hold"
+                        },
+                        snapshot.task.status
+                    ),
+                )
+                .await?;
                 return Ok(TaskActionResult {
                     task: snapshot.task,
                     action,
@@ -190,17 +205,28 @@ impl TaskService {
                 .flatten(),
             })?;
         let action = apply_offered_parameters(&offer, action);
-        if matches!(
+        let fencing_machines = if matches!(
             &action,
             TaskAction::Restart { .. } | TaskAction::Retry { .. } | TaskAction::Release { .. }
-        ) && self.db.task_has_pending_remote_cancel(&task_id).await?
-        {
+        ) {
+            self.db
+                .task_pending_remote_cancel_machines(&task_id)
+                .await?
+        } else {
+            Vec::new()
+        };
+        if !fencing_machines.is_empty() {
             let queued = self
                 .queue_task_action(&snapshot, offer, action.clone(), actor)
                 .await?;
+            // Name the machine so the owner knows which one to bring back.
+            let machines = fencing_machines.join(", ");
+            let message = format!(
+                "Waiting for machine {machines} to confirm its remote work has stopped. Reconnect that machine to finish cleanup."
+            );
             let parked=TaskRepo::update(&*self.db,db::UpdateTask {
                 id:queued.id.clone(),expected_version:queued.version,title:None,description:None,priority:None,merge_config:None,plan:None,
-                error_annotation:Some(Some(json!({"type":api_types::FailureKind::WorkspaceResetRequired,"blocking_reason":"pending_remote_cancel","message":"Waiting for the workspace owner to confirm remote work has stopped"}).to_string())),
+                error_annotation:Some(Some(json!({"type":api_types::FailureKind::WorkspaceResetRequired,"blocking_reason":"pending_remote_cancel","blocked_by":format!("machine:{machines}"),"message":message}).to_string())),
                 blocked_json:None,failed_json:None,task_state_config:None,parent_task_id:None,updated_at:now_rfc3339(),
             }).await?;
             return Ok(TaskActionResult {
@@ -257,6 +283,16 @@ impl TaskService {
             actor => actor,
         };
         let task = snapshot.task.clone();
+        // A completion that settled while the Task was held was a no-op
+        // (a held Task does not advance). Release settles it instead of
+        // re-running the role, so the completion is never lost.
+        let held_completion =
+            if matches!(&action, TaskAction::Release { .. }) && offer.reason == "manually_held" {
+                self.held_completion_pending(&task, offer.target_execution_id.as_deref())
+                    .await?
+            } else {
+                None
+            };
         let updated = TASK_ACTION_ACTOR
             .scope(
                 actor.clone(),
@@ -302,6 +338,15 @@ impl TaskService {
                         TaskAction::Release { reason } if offer.reason == "held_waiting" => {
                             self.release_to_dispatch_queue(&snapshot, reason.as_deref())
                                 .await?
+                        }
+                        TaskAction::Release { reason } if held_completion.is_some() => {
+                            let execution_id = held_completion.as_deref().expect("held completion");
+                            self.release_to_dispatch_queue(&snapshot, reason.as_deref())
+                                .await?;
+                            Box::pin(self.maybe_cascade_executor_completion(execution_id)).await?;
+                            TaskRepo::get_by_id(&*self.db, &task.id, false)
+                                .await?
+                                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?
                         }
                         TaskAction::Hold { reason } => {
                             TaskRepo::mutate_metadata_and_bump_version(
@@ -670,6 +715,31 @@ impl TaskService {
 
     /// Clear an owner's hold on a Task that no Agent can take yet. The Task
     /// goes back to waiting for dispatch; nothing is launched here.
+    /// The released role attempt already completed but its completion has
+    /// not settled for the current status entry (the Hold made it a no-op).
+    async fn held_completion_pending(
+        &self,
+        task: &Task,
+        execution_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(execution_id) = execution_id else {
+            return Ok(None);
+        };
+        let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
+            return Ok(None);
+        };
+        if execution.task_id != task.id
+            || execution.status != ExecutionStatus::Completed
+            || super::execution::execution_completion_settled_for_current_state_entry(
+                &self.db, task, &execution,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(execution.id))
+    }
+
     async fn release_to_dispatch_queue(
         &self,
         snapshot: &TaskSnapshot,

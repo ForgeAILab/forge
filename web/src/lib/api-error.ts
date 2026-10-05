@@ -114,7 +114,31 @@ function getPlacementRejectionMessage(error: ApiError): string | undefined {
     .join(' ')
 }
 
+export const TASK_BUSY_QUEUED_MESSAGE = 'Queued; it will apply after the current step'
+
+/**
+ * `task_busy` (409) means the server accepted the request and keeps it queued
+ * behind the Task's running step. It is not a failure and not a changed offer.
+ */
+export function isTaskBusy(error: unknown): boolean {
+  return getApiErrorCode(error) === 'task_busy'
+}
+
+/** The server's retry hint for a `task_busy` response, in milliseconds. */
+export function taskBusyRetryAfterMs(error: unknown): number {
+  const retry = getApiConflictDetails(error)?.retry_after_ms
+  return typeof retry === 'number' && retry > 0 ? retry : 0
+}
+
+/** Show the queued notice for `task_busy`; returns whether it handled the error. */
+export function notifyTaskBusy(error: unknown): boolean {
+  if (!isTaskBusy(error)) return false
+  toast.info(TASK_BUSY_QUEUED_MESSAGE)
+  return true
+}
+
 export function toastApiError(error: unknown, fallback?: string): void {
+  if (notifyTaskBusy(error)) return
   toast.error(getApiErrorMessage(error, fallback))
 }
 
