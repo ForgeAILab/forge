@@ -1514,6 +1514,35 @@ impl EmbeddedAgentService {
             },
         )
         .await?;
+        // A native topic retains its runtime identity across server suspension.
+        if profile.backend_kind == "native" && canonical.scope_type == CanonicalScopeType::AgentChat
+        {
+            let dormant: Option<String> = sqlx::query_scalar(
+                "SELECT s.id FROM agent_session s WHERE s.identity_id = ? AND s.context_scope_id = ? AND s.profile_id = ? AND s.backend_kind = 'native' AND s.status = 'suspended' AND s.replaced_by_session_id IS NULL ORDER BY s.created_at DESC LIMIT 1")
+                .bind(&identity.id).bind(&scope.id).bind(&profile.id).fetch_optional(self.db.pool()).await?;
+            if let Some(id) = dormant {
+                let previous = AgentSessionRepo::get_agent_session(&*self.db, &id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("agent_session", &id))?;
+                let pending_successor: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_chat_topic_rotation WHERE successor_session_id = ?)")
+                    .bind(&id).fetch_one(self.db.pool()).await?;
+                if !pending_successor {
+                    AgentSessionRepo::update_agent_session(
+                        &*self.db,
+                        UpdateAgentSession {
+                            id,
+                            expected_version: previous.version,
+                            runtime_session_id: None,
+                            status: Some("ready".to_owned()),
+                            connection_status: None,
+                            last_activity_at: None,
+                            updated_at: now.clone(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
         if let Some(active) =
             AgentSessionRepo::get_active_agent_session(&*self.db, &identity.id, &scope.id).await?
         {

@@ -231,39 +231,6 @@ impl SqliteProtectedRuntimeStore {
         Ok(hex::encode(mac.sign().as_ref()))
     }
 
-    /// Drops LCM component state this binary can no longer decode.
-    ///
-    /// The runtime folds Forge's sizer, pressure policy, and summary policy
-    /// into one LCM component revision, and `decode_state` rejects state
-    /// written under a different one — a conflict that fails the turn and is
-    /// replayed on every attempt, so a Forge-side LCM policy change would
-    /// otherwise wedge every existing session permanently. The component's
-    /// state is a cache over the durable timeline (`agent_lcm_entry` /
-    /// `agent_lcm_node`), so dropping it loses nothing: the coordinator
-    /// synchronizes it back from the timeline on the next turn. Canonical
-    /// history, usage, and manifests in the snapshot are untouched.
-    ///
-    /// `None` is state written before the marker column existed, and is
-    /// treated as stale once.
-    fn drop_stale_lcm_state(snapshot: &mut SessionSnapshot, stored_revision: Option<&str>) {
-        if stored_revision == Some(crate::FORGE_LCM_POLICY_REVISION) {
-            return;
-        }
-        if snapshot
-            .extension_state
-            .remove(agent_runtime::harness::LCM_COMPONENT_ID)
-            .is_some()
-        {
-            tracing::info!(
-                session_id = %snapshot.id.as_str(),
-                stored_revision = stored_revision.unwrap_or("none"),
-                current_revision = crate::FORGE_LCM_POLICY_REVISION,
-                "dropped LCM component state written under a superseded Forge LCM policy; \
-                 it will be rebuilt from the durable timeline"
-            );
-        }
-    }
-
     /// Internal protected-payload seam used by the interaction broker.  The
     /// bytes never cross into public profile/session/domain projections.
     pub(crate) fn seal_protected(
@@ -620,14 +587,72 @@ impl SqliteProtectedRuntimeStore {
     /// LCM timeline. The runtime id and canonical scope must both match the
     /// persisted Forge session; a timeline id alone cannot be used to open
     /// the store.
+    ///
+    /// A session first resolves to its own durable binding. Without one it
+    /// may continue a timeline it already owns (stamped with its runtime id),
+    /// or adopt the one pre-V149 owner-less timeline its *own* persisted LCM
+    /// state references; that adoption stamps the owner in the same
+    /// transaction, so no other runtime session can resolve to it afterwards.
+    /// Anything else gets a fresh timeline.
     pub async fn lcm_store_for_runtime_session(
         &self,
         runtime_id: &str,
         scope_type: &str,
         scope_id: &str,
     ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+        self.resolve_lcm_store(runtime_id, scope_type, scope_id, false)
+            .await
+    }
+
+    /// Resolves a topic-rotation successor. A successor never adopts or
+    /// shares an existing timeline: it is always bound to a fresh, empty one
+    /// (replays reuse that same binding).
+    pub async fn lcm_store_for_successor_runtime_session(
+        &self,
+        runtime_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+        self.resolve_lcm_store(runtime_id, scope_type, scope_id, true)
+            .await
+    }
+
+    /// The LCM timeline the runtime session's own persisted state is bound
+    /// to, if it has any. Only this timeline may be adopted while owner-less.
+    async fn referenced_lcm_timeline(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<String>, crate::AgentHostError> {
+        let id = SessionId::new(runtime_id);
+        let snapshot = match SessionStore::load(self, &id)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+        {
+            Some(snapshot) => Some(snapshot),
+            None => CheckpointStore::load_latest(self, &id)
+                .await
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+                .map(|checkpoint| checkpoint.snapshot),
+        };
+        Ok(snapshot.and_then(|snapshot| {
+            snapshot
+                .extension_state
+                .get(agent_runtime::harness::LCM_COMPONENT_ID)
+                .and_then(|state| state.value.get("timeline_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }))
+    }
+
+    async fn resolve_lcm_store(
+        &self,
+        runtime_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        successor: bool,
+    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
         let row = sqlx::query(
-            "SELECT session.identity_id, session.created_at, scope.scope_type, scope.scope_id
+            "SELECT session.identity_id, scope.scope_type, scope.scope_id
              FROM agent_session AS session
              JOIN agent_context_scope AS scope
                ON scope.id = session.context_scope_id
@@ -645,9 +670,6 @@ impl SqliteProtectedRuntimeStore {
         let identity_id: String = row
             .try_get("identity_id")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let session_created_at: String = row
-            .try_get("created_at")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let stored_scope_type: String = row
             .try_get("scope_type")
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
@@ -658,19 +680,115 @@ impl SqliteProtectedRuntimeStore {
             agent_runtime::registry::RegistryRevision::from_content(format!(
                 "forge-lcm-authorization-v1\n{identity_id}\n{stored_scope_type}\n{stored_scope_id}"
             ));
-        crate::SqliteLcmStore::open_for_binding(
-            Arc::clone(&self.db),
-            &identity_id,
-            &stored_scope_type,
-            &stored_scope_id,
-            authorization_revision.as_str(),
-            Some(db::AgentLcmSessionClaim {
-                runtime_session_id: runtime_id.to_owned(),
-                session_created_at,
-            }),
-            &db::now_rfc3339(),
+        let has_binding: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?)",
         )
+        .bind(runtime_id)
+        .fetch_one(self.db.pool())
         .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        // Decrypting the snapshot happens outside the write transaction.
+        let referenced = if successor || has_binding {
+            None
+        } else {
+            self.referenced_lcm_timeline(runtime_id).await?
+        };
+        let mut tx = db::begin_immediate(self.db.pool())
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+        )
+        .bind(runtime_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let timeline_id = if let Some(id) = existing {
+            id
+        } else {
+            let candidate: Option<String> = if successor {
+                None
+            } else {
+                sqlx::query_scalar(
+                    "SELECT id FROM agent_lcm_timeline
+                     WHERE identity_id = ?1 AND scope_type = ?2 AND canonical_scope_id = ?3
+                       AND (runtime_session_id = ?4
+                            OR (runtime_session_id IS NULL AND retired_at IS NULL AND id = ?5)
+                            OR (scope_type <> 'agent_chat' AND claim_owner IS NULL
+                                AND retired_at IS NULL
+                                AND NOT EXISTS(SELECT 1 FROM agent_lcm_entry e
+                                               WHERE e.timeline_id = agent_lcm_timeline.id)))
+                     ORDER BY runtime_session_id IS NULL ASC LIMIT 1",
+                )
+                .bind(&identity_id)
+                .bind(&stored_scope_type)
+                .bind(&stored_scope_id)
+                .bind(runtime_id)
+                .bind(referenced.as_deref())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+            };
+            let id = match candidate {
+                Some(id) => {
+                    // Adopting a legacy owner-less row stamps its owner, so
+                    // the lookup above can never hand it to another session
+                    // (a rotation successor in particular).
+                    sqlx::query(
+                        "UPDATE agent_lcm_timeline SET runtime_session_id = ?
+                         WHERE id = ? AND runtime_session_id IS NULL",
+                    )
+                    .bind(runtime_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                    id
+                }
+                None => {
+                    let id = db::new_uuid_v4();
+                    let now = db::now_rfc3339();
+                    sqlx::query(
+                        "INSERT INTO agent_lcm_timeline (
+                            id, identity_id, scope_type, scope_id, canonical_scope_id,
+                            runtime_session_id, authorization_revision, revision,
+                            created_at, updated_at
+                         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    )
+                    .bind(&id)
+                    .bind(&identity_id)
+                    .bind(&stored_scope_type)
+                    .bind(format!("{stored_scope_id}#topic:{runtime_id}"))
+                    .bind(&stored_scope_id)
+                    .bind(runtime_id)
+                    .bind(authorization_revision.as_str())
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                    id
+                }
+            };
+            sqlx::query(
+                "INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id)
+                 VALUES (?, ?)",
+            )
+            .bind(runtime_id)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            id
+        };
+        tx.commit()
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let timeline = db::AgentLcmRepo::get_lcm_timeline(&*self.db, &timeline_id)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+            .ok_or(crate::AgentHostError::ProtectedPersistence)?;
+        Ok(crate::SqliteLcmStore::new(self.db.clone(), timeline))
     }
 
     pub async fn create_credential(
@@ -1715,14 +1833,10 @@ impl SessionStore for SqliteProtectedRuntimeStore {
         let nonce: Option<Vec<u8>> = row
             .try_get("snapshot_nonce")
             .map_err(|_| RuntimeError::internal("protected session row is invalid"))?;
-        let lcm_policy_revision: Option<String> = row
-            .try_get("lcm_policy_revision")
-            .map_err(|_| RuntimeError::internal("protected session row is invalid"))?;
         match (ciphertext, nonce) {
             (Some(ciphertext), Some(nonce)) => {
                 let bytes = self.open_session_state(ciphertext, nonce).await?;
-                let mut snapshot: SessionSnapshot = serde_json::from_slice(&bytes)?;
-                Self::drop_stale_lcm_state(&mut snapshot, lcm_policy_revision.as_deref());
+                let snapshot: SessionSnapshot = serde_json::from_slice(&bytes)?;
                 Ok(Some(snapshot))
             }
             // A checkpoint already owns the exact canonical snapshot. NULL
@@ -1845,9 +1959,6 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
         let nonce: Option<Vec<u8>> = row
             .try_get("checkpoint_nonce")
             .map_err(|_| RuntimeError::internal("protected checkpoint row is invalid"))?;
-        let lcm_policy_revision: Option<String> = row
-            .try_get("lcm_policy_revision")
-            .map_err(|_| RuntimeError::internal("protected checkpoint row is invalid"))?;
         match (ciphertext, nonce) {
             (Some(ciphertext), Some(nonce)) => {
                 let bytes = self
@@ -1863,19 +1974,15 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
                             ),
                         )
                     })?;
-                let mut checkpoint: TurnCheckpoint = serde_json::from_slice(&bytes).map_err(|_| {
-                    RuntimeError::new(ErrorKind::Serialization, format!(
-                        "protected checkpoint for session {} contains invalid checkpoint JSON",
-                        session.as_str()))
+                let checkpoint: TurnCheckpoint = serde_json::from_slice(&bytes).map_err(|_| {
+                    RuntimeError::new(
+                        ErrorKind::Serialization,
+                        format!(
+                            "protected checkpoint for session {} contains invalid checkpoint JSON",
+                            session.as_str()
+                        ),
+                    )
                 })?;
-                // The checkpoint carries its own copy of every extension
-                // namespace, and the resume overlay reinstates a namespace the
-                // session snapshot no longer has. Stale LCM state has to leave
-                // by both doors or it comes straight back.
-                Self::drop_stale_lcm_state(
-                    &mut checkpoint.snapshot,
-                    lcm_policy_revision.as_deref(),
-                );
                 Ok(Some(checkpoint))
             }
             (None, None) => Ok(None),
@@ -2620,13 +2727,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(loaded.extension_state.is_empty());
+        assert_eq!(loaded.extension_state, snapshot.extension_state);
         SessionStore::save(&store, &loaded).await.unwrap();
         let checkpoint = CheckpointStore::load_latest(&store, &snapshot.id)
             .await
             .unwrap()
             .unwrap();
-        assert!(checkpoint.snapshot.extension_state.is_empty());
+        assert_eq!(
+            checkpoint.snapshot.extension_state,
+            snapshot.extension_state
+        );
         let row = sqlx::query("SELECT lcm_policy_revision, checkpoint_lcm_policy_revision FROM protected_agent_session_state")
             .fetch_one(db.pool()).await.unwrap();
         assert_eq!(

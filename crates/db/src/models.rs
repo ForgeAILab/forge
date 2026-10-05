@@ -932,20 +932,56 @@ pub fn canonical_attention_incident_digest(attention: &AttentionProjection) -> S
         .take(8_192)
         .collect::<String>();
     let canonical_details = serde_json::from_str::<serde_json::Value>(&bounded_details)
-        .map(|value| value.to_string())
+        .map(|mut value| {
+            fn strip_delivery_metadata(value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::Object(object) => {
+                        for key in [
+                            "source_event_id",
+                            "source_event_type",
+                            "source_sequence",
+                            "task_version",
+                            "created_at",
+                            "updated_at",
+                            "detected_at",
+                            "last_checked_at",
+                            "next_check_at",
+                            "execution_id",
+                        ] {
+                            object.remove(key);
+                        }
+                        for child in object.values_mut() {
+                            strip_delivery_metadata(child);
+                        }
+                    }
+                    serde_json::Value::Array(array) => {
+                        for child in array {
+                            strip_delivery_metadata(child);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            strip_delivery_metadata(&mut value);
+            // A renamed Task or a changed action offer is not a new blocker.
+            if let Some(task) = value.get_mut("task").and_then(|v| v.as_object_mut()) {
+                task.remove("task_title");
+            }
+            if let Some(recovery) = value.get_mut("recovery").and_then(|v| v.as_object_mut()) {
+                recovery.remove("actions");
+            }
+            value.to_string()
+        })
         .unwrap_or(bounded_details);
     let details_digest = wake_incident_digest(&canonical_details);
     let canonical = format!(
-        "type={};scope_type={};scope_id={};status={};source_event_id={};source_sequence={:?};details_digest={};recommended_action={};version={}",
+        "type={};scope_type={};scope_id={};status={};details_digest={};recommended_action={}",
         bounded_wake_ref(&attention.attention_type),
         bounded_wake_ref(&attention.scope_type),
         bounded_wake_ref(&attention.scope_id),
         bounded_wake_ref(&attention.status),
-        bounded_wake_ref(&attention.source_event_id),
-        attention.source_sequence,
         details_digest,
         bounded_wake_ref(&attention.recommended_action),
-        attention.version,
     );
     wake_incident_digest(&canonical)
 }

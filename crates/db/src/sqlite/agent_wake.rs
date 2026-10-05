@@ -599,6 +599,15 @@ fn map_wake_write_error(error: sqlx::Error) -> DbError {
 }
 
 impl SqliteDb {
+    pub async fn get_agent_wake_disposition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        consumer: &str,
+        event_id: &str,
+    ) -> Result<Option<AgentWakeDisposition>> {
+        current_disposition_in_tx(tx, consumer, event_id).await
+    }
+
     pub async fn retry_agent_wake_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,

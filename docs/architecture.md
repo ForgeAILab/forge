@@ -408,21 +408,7 @@ The typed `TurnFailure` crosses the Agent Runtime host boundary before any
 human-readable error formatting. `ProviderAttemptFinished.error` retains the
 provider kind, retryability, delay, and usage reset hint; `BudgetFailure(Input)`
 identifies context overflow. The turn policy owns all automatic retry decisions.
-Deterministic configuration, authority, and request rejection fail immediately;
-context overflow also fails because the host exposes no forced compaction.
-A provider's prompt-too-long HTTP 400 is reported as `provider_rejected` because
-no typed evidence distinguishes it from other request rejections; a retry fails
-the same way until the context shrinks.
-Transient/retryable request rejection, empty response, turn limits, unclassified
-and postcondition failures use the existing three-attempt budget.
-Postcondition retries keep the existing instruction overlay. Usage limits refund
-the claim's attempt and defer with a separately counted floor (1, 5, 15, 30, then
-60 minutes),
-a fifteen-minute missing/past reset fallback, and a six-hour per-wait ceiling.
-The 24th deferral or 24 hours from the first deferral terminalizes the turn with
-`usage_limit`; no scheduled time exceeds that deadline. Chat provider health
-uses the typed failure and the turn's resume time, with no message classifier.
-Task and connection-test health retain message parsing and their 24-hour ceiling.
+Deterministic configuration, authority, provider schema rejection and authentication fail immediately; context overflow also fails because the host exposes no forced compaction. Provider schema/auth failures carry `provider_schema`/`provider_auth`; a provider rejection the provider marks retryable stays `provider_rejected` with its delay. Quota exhaustion carries `usage_limit`: an autonomous wake turn fails on attempt one (the sweep owns its re-admission), while a user-authored turn defers until the window resets (refunded attempt, escalating floor, six-hour per-wait and 24-hour total ceilings). Transient failures, empty responses, turn limits, unclassified and postcondition failures retain the three-attempt budget. Postcondition retries keep the existing instruction overlay.
 Pre-provider admission failures refund the attempt and stop at a separate cap of
 three. A monotonic invocation counter keeps accounting identities distinct when
 a charged attempt is refunded. Leases continue to fence every failure settlement.
@@ -1106,25 +1092,58 @@ Documents/Decisions/Tasks/checks/milestones/releases, and records a visible
 canonical conflict plus `reconciliation_required` reason when authoritative
 records disagree. It blocks only the affected execution or readiness path.
 
-#### Main Chat topic epochs
+#### Agent Chat topic epochs
 
-Forge has exactly one account Main Chat. A *topic* is a durable, user-owned
-context epoch inside that chat, not a second chat: `agent_chat_topic`
-(migration `V103`) records an immutable sequence, label/summary, principal,
-timestamp, and the `starting_message_sequence` its epoch begins at. Topic
-membership is derived from `sequence >= starting_message_sequence`, so no
-message row is ever rewritten and every historical message/turn ID and its
-provenance survive the backfill unchanged. Rotation inserts one topic row plus
-one ordinary system message that the timeline renders as a divider.
+A native Main or Project Chat topic owns one runtime session and one LCM timeline.
+The first native turn records the initial topic; rotation records the successor
+runtime session ID on a new immutable `agent_chat_topic` row. Transcript IDs,
+message provenance and earlier topics remain inspectable.
 
-`FederatedAgentChatTurnRunner` bounds a new Main turn's episodic history to the
-current topic's floor. A chat with no topic — every Project Chat, and any Main
-Chat before its first topic — has floor `0`, so the behavior is unchanged for
-them. Canonical portfolio state and unresolved durable obligations are supplied
-independently of the epoch, and earlier topics stay inspectable rather than
-being injected wholesale. Starting a topic is denied while a Main turn is live
-or while a Genesis session/approval needs an explicit finish-or-cancel
-decision.
+For a chat whose responder (the active Main or Project binding's identity and
+its selected Profile) is native, Genesis start, Project creation/handoff and the
+first user message after eight hours idle mark `rotation_pending` in
+`agent_chat_topic_rotation`, in the trigger's transaction. A CLI chat raises no
+automatic intent and keeps its pre-topic-working-set behaviour: its REST topic
+request rotates directly and is denied while a turn is live. A native REST request
+uses the same intent: it is denied while a Genesis session needs a decision
+(checked in the intent's own transaction), and a request that meets a pending
+intent applies its label and summary to it. REST runs the rotation immediately
+when no turn is live (bounded by the summary timeout) and otherwise returns a
+pending result.
+
+Rotations never run on the turn-claim path. The Agent Chat worker starts one
+background rotation pass per poll (`run_once` runs it before claiming); it attempts
+every due intent concurrently, fresh intents first, skipping chats with a leased or
+originating live turn. Queued successor jobs, including wake turns, wait behind the
+intent. Each attempt is leased and counted; a failure records `last_error_kind` and
+backs off (`next_attempt_at`: 5 s, then 30 s). The third failure abandons the
+intent in one transaction: `rotation_pending` clears, a visible system notice
+(`outcome = topic_rotation_failed`) and an `agent_chat.topic.rotation_failed`
+event (`error_kind`, `attempts`, `session_handed_over`) are recorded, and queued
+turns are admitted again on the current topic. If the runtime fork never saved its
+successor, the source session is kept (a pending fork intent is aborted) and the
+reserved successor is marked `failed`. If the fork completed, the runtime has
+superseded the source, so the successor takes over the chat and only the topic
+record is missing.
+
+The intent reserves its successor Forge/runtime IDs and a renewable lease.
+A provider summary, bounded by a 30 s timeout, is sealed before calling runtime
+`fork_session` with `ForkSeed::Summary` and `ForkLcm::NewTimeline`; a summary
+timeout or failure falls back to the deterministic seed and never fails the
+rotation. The runtime protects the seed and supersedes the parent. Forge then
+commits the topic, divider, session replacement and intent removal together. A
+crash leaves the same intent and IDs to replay; a crash after the fork reuses its
+protected seed and completed successor. An expired lease can be reclaimed. A
+successor is always bound to a fresh, empty timeline. Rotation never grants
+additional authority.
+
+The request layout is `[system][tools][topic summary][history][state card + input]`.
+The summary is stable within its topic. State cards stay in a transient user-role
+fragment, outside durable history. The runtime renders a contributed text fragment
+on the system role, so the card carries a random per-backend marker line and a
+provider adapter rewrites exactly that marked message to the user role (marker
+removed) until the runtime admits user-role transient contributors. CLI chat
+retains its existing transcript path.
 
 #### Adaptive authority is a closed vocabulary
 
@@ -1459,15 +1478,15 @@ conversation only; a state change replaces the one card. The card is rendered
 when the turn starts and is the same for every request of that turn; the
 agent reads state it changed during the turn through its tools.
 
-The runtime renders a contributed fragment on the system role. The OpenAI
-Chat Completions and Responses adapters send it in place, as the last message
-of the request, so the system prompt, tool schemas and the whole history stay
-a byte-identical prefix across a state change. The Gemini Interactions
-adapter folds every system-role message into `system_instruction`; there the
-card follows the protocol text, and a state change alters the wire-level
-system instruction while the Forge system prompt itself is unchanged. Keeping
-the card after the conversation on every provider needs a runtime trailing
-lane that is not rendered on the system role.
+The pinned runtime admits only text in its transient contributor lane. Forge
+plans that required card there, then its provider serialization boundary narrows
+the identified trailing card message from System to User. Vendor adapters retain
+that role, so the stable system instruction,
+tools, topic summary and prior history precede the changing card. The card is
+planned and sized on every tool-loop step without becoming durable history.
+`CachePlanChanged.first_changed_fragment` is recorded in native debug diagnostics;
+changes in the history suffix or state card must not invalidate the stable
+system/tools/topic-summary prefix.
 
 Text in a conversation message that resembles a card is quoted data or a
 superseded card, never current state, and its counts or versions must not be
@@ -2036,41 +2055,73 @@ operation, immutable admitted entries, transactional DAG compare-and-swap,
 operation fingerprints, and restart recovery. Histories from different
 canonical scopes cannot be opened or merged by possessing a timeline/node ID.
 
-A timeline records the runtime session that writes it. A restart suspends
-every native session, and the next turn opens a fresh runtime session (as does
-a session rotation) whose canonical history is rebuilt from the chat
-transcript. That history cannot continue another session's timeline: once the
-old timeline holds summary nodes the runtime cannot truncate the diverged
-tail, and every turn failed with "LCM source range overlaps an active node".
-So when a different runtime session binds a timeline that already has
-entries, the store retires it — the row keeps its entries and nodes, its
-`scope_id` gains a `#retired:<timeline id>` suffix, and `canonical_scope_id`
-keeps the original scope so Project deletion still removes it — and creates a
-fresh timeline for the new session.
+Runtime-to-timeline bindings are durable and authorized by canonical identity
+and scope. U7 ownership claims atomically record owner/generation, increment the
+DAG revision and fence every mutation, including replay and truncation. A session
+created before U7 resumes once with `Adopt`; subsequent resumes are plain. A
+pre-V149 timeline with no recorded runtime session is adopted only by the session
+whose own persisted LCM state references it, and adoption stamps that session as
+the timeline's runtime owner in the binding transaction, so no other session (in
+particular a rotation successor) can resolve to it. Adopt's claim and the snapshot
+save are separate writes; if the save fails after the claim, the same session
+re-adopts idempotently on its next resume (the store reports the timeline as
+unclaimed at the snapshot's generation to its own owner, and the repeated claim
+is a no-op). Populated history is never silently adopted or retired. Explicit topic forks use
+an independently authorized empty timeline. Historical V149 retired rows remain
+readable and keep their canonical scope for deletion; new bindings do not rename
+or retire old timelines.
 
-Pressure sizing is host-supplied. `ForgeLcmSizer` charges an entry for its
-serialized canonical form, because the runtime's default sizer scans an
-entry's plain text plus one token per tool part and a tool call's arguments
-and a tool result's body sit inside their content part, invisible to that
-scan. A Project Agent timeline is mostly `[assistant tool call, tool result]`
-pairs, so the default read ~41% under
-what the context planner charges: pressure stayed Soft, which never compacts,
-while the planner refused the turn with `budget_exceeded` — and because
-canonical history is durable, every retry replayed it.
+U6 supplies one request sizer for the planner and LCM, including tool arguments,
+results and measured fixed overhead. Main defaults to a 48,000-token target and
+64,000-token hard cap; Project defaults to 96,000/128,000. Server config and env can
+set each value. Smaller provider windows clamp both values. The planner enforces
+the hard cap, and runtime-derived pressure/leaf/round defaults govern compaction.
+Forge's serialized-entry sizer, chars/4 overhead calculation and pressure overrides
+are removed.
 
-The runtime folds Forge's sizer, pressure policy, and summary policy into one
-LCM component revision and refuses to decode component state written under a
-different one, so changing any of them would fail every turn of every live
-session. `protected_agent_session_state.lcm_policy_revision` records the
-`FORGE_LCM_POLICY_REVISION` that last wrote a session, and the protected store
-drops superseded LCM component state on load — from the session snapshot and
-from the checkpoint's copy, which the resume overlay would otherwise reinstate
-— leaving the coordinator to rebuild it from `agent_lcm_entry` /
-`agent_lcm_node`. Bump that constant with any change to those three policies.
+The runtime measures fixed overhead only after a successful plan, so a cold
+session (new, adopted, or with no successful plan yet) would budget history
+against the whole target. On such a turn Forge sizes the system prompt, state card
+and tool schemas with the runtime's default request sizer and lowers the target to
+`min(target, hard - estimate)` (never below a quarter of the target). With the
+default gaps this is a no-op; it matters when a small model window clamps target and
+hard cap to the same value. Once the session persists a measured overhead, turns use
+the configured target unchanged.
+
+`ProviderLcmSummaryModel` uses the agent's configured provider/model with bounded
+host instructions and a low reasoning setting (minimal for Gemini, low for other
+controllable models; fixed/unsupported reasoning is left unconfigured). The runtime
+capabilities expose no effort levels, so the value is fixed in Forge. The
+deterministic model remains a fallback.
+Every summary provider call is planner-admitted under the surface hard cap.
+Leaf summary usage is reported from the runtime semantic-summary ledger with the
+turn that made the call. A topic summary call is written to the
+`agent_topic_summary_usage` outbox with its sealed seed and settled into the usage
+ledger exactly once, keyed by the outbox row id, as its own invocation (candidate
+`topic_summary`) on the chat's surface: right after the rotation commits, or by
+the worker's rotation pass after a crash or an abandoned rotation. It is charged
+even if the new topic never runs a turn, and never through later turns. Summary
+seeds are sealed in the protected store.
+U6 rebuilds tuning-derived state without deleting its LCM namespace or requiring
+a Forge policy-revision bump. Strict binding and authorization mismatches still
+fail closed.
+
+Within a topic, a full `project.current_state` or `project.charter` result carries
+a unique `read_ref`, and an unchanged repeat returns
+`{ "unchanged_since_call": "<read_ref>" }` only while that full result is in the
+model-visible history of the topic. References from the running turn are held in
+memory and become durable, with the result's canonical history index, only when
+the turn completes; a failed, cancelled or retried turn leaves none and clears the
+session's references before its next turn. A durable reference is honoured only
+while no LCM summary node covers its history index (the LCM entry sequence equals
+the history index), and a same-turn reference only while no node reaches into the
+running turn. A changed digest returns the full body; a new topic starts with an
+empty read cache, and rotation deletes the predecessor's references. This changes
+context representation only, never the authority of the underlying read.
 
 The runtime's process-local history/LCM accounting cache still reads authorized
 inclusive ranges in pages of at most 1,024 entries and checks the DAG revision
-before and after pressure accounting. Forge's store and sizer satisfy those
+before and after pressure accounting. Forge's store and the runtime sizer satisfy those
 contracts without changing `FORGE_LCM_POLICY_REVISION` or dropping session LCM
 state.
 
@@ -2336,8 +2387,8 @@ rows are recreated. The consumer placements are:
 | --- | --- | --- | --- | --- |
 | `scoped-memory-agent-chat-indexer` | Exact `agent_chat.message.admitted`, `agent_chat.response.completed`, `agent_chat.message.completed` | Prepare semantic memory / insert source-idempotent memory | None | None |
 | `agent-coordination-outcomes` | Exact `task.transitioned`, `task.done`, `task.completed`, `task.blocked`, `task.failed`, `task.cancelled` | Read Task, scope-validated commitments and action origins / acknowledge proposal inbox, reconcile commitments and deliver outcomes | None | None |
-| `attention_projection` | All (case-insensitive and substring classification) | Prepare incident, resolution and wake policy / write incident, resolutions, wake decision and budget | Resolve superseded turn incidents | Publish zero configured-budget notification with the resolved budget scope |
-| `agent-wake-turns` | Literal prefix `agent.wake.` | Plan admission/disposition / persist disposition and optional message/turn admission | Reconsider due deferred or changed setup dispositions, isolating and bounding failures per row | None; decision resolution shares admission/cursor commit |
+| `attention_projection` | All (case-insensitive and substring classification) | Prepare incident and shared responder / write incident, resolutions, audit decision, disposition, message/turn and category budget | Every 60 seconds: reconcile open blocker batches, setup changes, and one-time owner escalations | Publish zero configured-budget notification with the resolved budget scope |
+| `agent-wake-turns` | Literal prefix `agent.wake.` | Checkpoint audit records only | None | None |
 | `project-hooks` | Exact `task.transitioned`, `task.status_changed`, `project_hook.task_created`, `project_hook.task_archived` | Evaluate existing completion/epoch rules and prepare action content / claim run and write notification, comment or Task (including dispatch automation Task) with cursor | Settle stale started runs from execution evidence | Publish live hints and comment-memory indexing; launch external Agent execution only for the admitted started run |
 | `notifications` | Exact `task.transitioned`, `task.status_changed`, `review.status_changed`, `notification.requested` | Prepare the existing human notification / insert notification row with cursor | None | Publish `notification.created` live hint |
 | `conflict-hotspots` | Exact `task.transitioned` | Validate workflow handoff and read its full transition reason / seek Project Tasks then merge-failed log rows, count every path once, and commit episode/detection/cursor atomically | None | None |
@@ -2575,31 +2626,79 @@ scope-validated originating commitment, one delivery evidence/lifecycle
 projection.  Its event-derived dedupe keys make a crash between projection
 and cursor checkpoint safe to replay.
 
-The `agent-wake-turns` consumer (also started by `forge-cli`) closes the wake
-loop. Migration `V088` records an install-time cutover cursor, so events that
-commit after installation are evaluated even when the process has not polled
-yet; startup never derives a cursor from the runtime event maximum. Each
-`agent.wake.*` candidate receives one durable current disposition:
-`turn_admitted`, `deterministically_suppressed`, `deferred`, or
-`setup_required`. The disposition, cursor advancement and optional Agent Chat message/turn
-admission commit in one transaction. Deferred and setup-required incidents retain bounded retry or
-authoritative-state reconsideration lineage instead of disappearing as
-completed delivery. Checkpointed candidates are ordered by ascending subscribed
-`domain_event.sequence`; the cursor cannot skip an undisposed wake sequence. A disposition replay is
-idempotent and advances the cursor at most once, only after its disposition
-and any admitted turn/message commit.
+Attention owns autonomous wake admission. It prepares the shared responder snapshot
+outside the write transaction, then revalidates Attention and binding authority
+inside the transaction that writes the audit event, disposition, message, turn job
+and category budget charge. `agent-wake-turns` only checkpoints audit events; it
+never treats them as work. Suppressed/setup-required incidents spend no budget.
 
-Immediately before an admitted wake commits, the consumer revalidates the
-durable Attention version, status, digest, source, dedupe identity, and
-canonical scope. It then uses the same `AgentTurnAdmissionService` as user
-messages and handoffs. That service resolves the current owning binding,
-identity, selected Profile, operating-skill revision, permission/tool policy,
-and canonical scope, and freezes their exact versions/digests on the queued
-turn. Explicit retries and the turn runner continue from that persisted
-snapshot rather than substituting later binding or Profile state. A worker
-retry of a `retry_wait` job is not a new admission: it reclaims that same turn
-job and invokes the runner with the same frozen provenance, changing only
-lease/attempt metadata.
+The default Project budget remains 10/h, divided into blocker 4/h, delivery 4/h
+and decision 2/h. Totals of 5 or more split 40/40/20 (blockers rounded up,
+delivery down, decisions the remainder) with at least one wake per bucket.
+Totals of 1–4 are one shared pool, so no category is starved; the sweep serves
+blockers, then decisions, then delivery. A zero total stops autonomy and raises
+the budget-stall notice once per binding. An owner's escalation answer is
+owner-initiated and never charged. Migration keeps only charges still inside
+their hour, in delivery, starting at the oldest live window. One five-minute
+Project blocker window admits a single combined directive carrying all eligible
+open blockers. The material-state digest excludes event delivery IDs,
+sequences, projection versions, the Task title and the action-offer list, so
+refreshing or renaming an unchanged incident cannot create new work.
+
+The sweep runs at most every 60 seconds on Attention's WorkerRuntime tick
+(superseded turn incidents still resolve every loop). It reads open Attention
+with one keyed row per item in `agent_wake_attention_latest` (the latest
+decision and its digest for every batch member) and isolates each scope: a
+failing Project is logged and skipped. For a Project blocker it reads the turns
+linked through `agent_wake_blocker`:
+
+- any linked turn queued or running, whatever digest it carried: no wake and no
+  escalation (no member gets a second turn or charge while the batch turn is
+  pending);
+- a succeeded turn for the current digest: the digest has had its turn; the
+  owner is escalated once per completed turn, unless the turn recorded a
+  recovery outcome and the blocker has not recurred since that turn ended;
+- a failed or cancelled turn: infrastructure failures (transient, lease loss,
+  cancellation) do not consume the digest, so the sweep re-admits after the
+  Project cooldown; deterministic provider failures (`provider_auth`,
+  `provider_schema`, `usage_limit`, `configuration_invalid`) never escalate,
+  raise "Project Agent can't run" once per responder Profile version, and hold
+  the blocker until the responder's Profile changes or, for a usage limit, the
+  window resets (one hour when the provider gave no reset);
+- otherwise the blocker is admitted unless its latest decision is a policy
+  suppression (`ineligible_scope`, `self_event`, `reaction_depth_exceeded`,
+  `resolved_incident`, `repeated_failure`, `retry_exhausted_same_chat`) for the
+  same digest and responder.
+
+A digest change, or a resolve followed by a reopen, re-arms the blocker.
+Rows imported from before the upgrade never count as a completed turn: each
+open imported blocker gets one normal, budgeted re-admission batched per
+Project, and escalation applies only after a post-upgrade turn for the same
+digest. Decision wakes suppressed by their bucket, cooldown or a duplicate are
+also reconsidered: an unanswered decision is level state.
+
+Recorded outcomes are `agent_wake_blocker.recorded_outcome`, set by the native
+and MCP `task.action` verbs `retry`, `release`, `restart`, `cancel`,
+`send_back` and `approve` during the responder's live blocker turn, and the
+persisted `task.transitioned` events that responder authored on a blocker Task
+after the turn started. The owner escalation `need` is one bounded line per
+blocker: its summary plus the Task title, status, role, failure kind and reason.
+Escalation records, owner Notification and owner Attention commit together. An
+owner answer (the answer endpoint, `forge-ctl project escalations answer`, the
+Mission Control Answer box, or a generic Resolve of the escalation item, which
+records "Resolved by the owner.") resolves that Attention and commits the
+decision continuation event; the continuation turn becomes the escalated
+blockers' turn, so a blocker still unchanged after it escalates again rather
+than going silent. These paths read Tasks but never mutate Task state.
+
+Frozen responder, Profile, operating-skill and policy provenance are reused on
+ordinary turn retries. Deterministic provider schema/auth failures, and usage
+limits on autonomous wakes, stop on attempt one. A lease expiry refunds its
+attempt charge at most three times per turn (`lease_refund_count`); later
+expiries count against `max_attempts`, so a turn that keeps killing its process
+ends. The invocation ordinal and usage coverage gap are kept either way.
+Server-owned Project doctrine revision @21 adds two short recovery/escalation
+sentences and retains @20 and older immutable bodies for already-admitted turns.
 
 Execution terminal outcomes are written by the winning execution terminal CAS:
 the terminal row, active `WorkspaceLease` disposition, and one durable
@@ -2814,15 +2913,11 @@ removed. Error kind (`failure`, `transient`, `terminal`) and bounded message com
 from worker health or recent quarantine records. The same health result supplies
 Mission Control's capacity status.
 
-Wake semantic retry errors are isolated by disposition ID. A failing row cannot
-abort later rows. Transient failures back off without strikes; waiting rows are
-filtered before the SQL limit and waiting is not a tick error. Unexpected failures
-have an independent eight-strike cap in `worker_item_failure`; a terminal storage
-rejection or cap exhaustion commits a terminal `wake_retry_failed` disposition
-and a dead letter together. Evaluation/admission rejections that have a typed wake
-outcome retain `wake_evaluation_invalid` / `turn_admission_rejected`; commit-time
-missing authority defers as before. Initial and retry
-admission, disposition and decision-incident resolution commit together. Consumer
+Wake decisions have no semantic retry rows, strike counts or dead letters:
+Attention admits the turn, its audit event, disposition and budget charge in one
+transaction, and the level-triggered sweep reconsiders whatever is still open.
+A failing scope is logged and retried on the next sweep. Initial admission,
+disposition and decision-incident resolution commit together. Consumer
 `after_commit` hooks hold no durable effect; Attention only emits its budget-stall
 bus notification for the zero configured-budget branch, using the budget scope.
 

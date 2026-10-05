@@ -163,7 +163,6 @@ async fn agent_chat_scope_flows_through_session_lcm_memory_manifest_and_action_r
             scope_type: "agent_chat".to_owned(),
             scope_id: chat.id.clone(),
             authorization_revision: "auth-1".to_owned(),
-            runtime_session: None,
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
         },
@@ -173,6 +172,7 @@ async fn agent_chat_scope_flows_through_session_lcm_memory_manifest_and_action_r
     AgentLcmRepo::append_lcm_entries(
         &db,
         db::AppendAgentLcmEntries {
+            claim: None,
             timeline_id: timeline.id.clone(),
             expected_revision: 0,
             operation_id: "agent-chat-lcm-append".to_owned(),
@@ -742,7 +742,6 @@ async fn identity_profile_session_replacement_preserves_per_identity_chat_contin
                 scope_type: "agent_chat".to_owned(),
                 scope_id: chat.id.clone(),
                 authorization_revision: format!("auth-{index}"),
-                runtime_session: None,
                 created_at: now.to_owned(),
                 updated_at: now.to_owned(),
             },
@@ -752,6 +751,7 @@ async fn identity_profile_session_replacement_preserves_per_identity_chat_contin
         AgentLcmRepo::append_lcm_entries(
             &db,
             db::AppendAgentLcmEntries {
+                claim: None,
                 timeline_id: timeline.id.clone(),
                 expected_revision: 0,
                 operation_id: format!("continuity-operation-{index}"),

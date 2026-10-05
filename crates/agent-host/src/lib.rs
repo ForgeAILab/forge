@@ -57,15 +57,15 @@ pub use interaction::{
     InteractionAnswer, InteractionAnswerValue, InteractionBrokerHandle, ProtectedInteractionSummary,
 };
 pub use lcm::{
-    DeterministicLcmSummaryModel, FORGE_LCM_POLICY_REVISION, FORGE_LCM_SIZER_REVISION,
-    FORGE_LCM_STORE_REVISION, FORGE_TASK_LCM_PROJECTION_REVISION, ForgeLcmSizer, SqliteLcmStore,
-    TaskLcmProjectionPolicy, TaskRuntimeLcmRecord,
+    DeterministicLcmSummaryModel, FORGE_LCM_POLICY_REVISION, FORGE_LCM_STORE_REVISION,
+    FORGE_TASK_LCM_PROJECTION_REVISION, SqliteLcmStore, TaskLcmProjectionPolicy,
+    TaskRuntimeLcmRecord,
 };
 pub use manifest::{
     RuntimeClassificationLink, RuntimeContextManifestLink, RuntimeContextSegmentLink,
     RuntimeLosslessSummaryLink, RuntimeSummaryCoverageLink,
 };
-pub use native::NativeAgentRuntimeBackend;
+pub use native::{NativeAgentRuntimeBackend, TOPIC_SUMMARY_TIMEOUT, topic_summary_usage_id};
 pub use operation_catalog::{
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
@@ -75,13 +75,13 @@ pub use operation_catalog::{
     OperationExposure, OperationInputContract, OperationOutputContract, OperationPermission,
     OperationSetupExposure, OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION,
     PROJECT_CHARTER_READ_OPERATION, PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION,
-    PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION,
-    PROJECT_VALIDATION_OPERATION, SHARED_ORCHESTRATION_OUTCOME, TASK_ACTION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
-    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION, classify_operation,
-    contains_adaptive_authority_override, contains_authority_override,
+    PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION,
+    PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION,
+    PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_SKILL_SECTION_NAMES,
+    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, SHARED_ORCHESTRATION_OUTCOME,
+    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    classify_operation, contains_adaptive_authority_override, contains_authority_override,
     descriptor as operation_descriptor, is_allowed_project_direct_payload,
     is_approval_required_operation, is_coordination_direct_command,
     is_coordination_generic_proposal, is_denied_operation, is_project_orchestration_operation,
@@ -387,6 +387,9 @@ pub struct AgentTurnOutput {
 #[async_trait]
 pub trait TurnEventSink: Send + Sync + fmt::Debug {
     async fn text_delta(&self, _text: &str) {}
+
+    /// Redaction-safe cache-prefix diagnostics from the authoritative planner.
+    async fn cache_plan_changed(&self, _first_changed_fragment: Option<&str>) {}
 
     /// A reasoning fragment. `redacted` fragments carry no readable text and
     /// exist only as liveness/progress signals.

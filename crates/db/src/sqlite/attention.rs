@@ -198,6 +198,19 @@ fn map_attention_projection(row: SqliteRow) -> Result<AttentionProjection> {
 }
 
 impl SqliteDb {
+    pub async fn get_attention_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+    ) -> Result<Option<AttentionProjection>> {
+        sqlx::query("SELECT * FROM attention_projection WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(map_attention_projection)
+            .transpose()
+    }
+
     pub async fn insert_attention_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,

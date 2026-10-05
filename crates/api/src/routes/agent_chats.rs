@@ -372,11 +372,13 @@ pub async fn start_agent_chat_topic(
             summary: request.summary,
         })
         .await?;
-    let divider_message_id = rotation.divider_message.id;
-    let topic_id = rotation.topic.id.clone();
     Ok(Json(StartAgentChatTopicResponse {
-        topic: topic_response(Some(topic_id.as_str()), rotation.topic),
-        divider_message_id,
+        rotation_pending: rotation.rotation_pending,
+        divider_message_id: rotation.divider_message.map(|message| message.id),
+        topic: rotation.topic.map(|topic| {
+            let id = topic.id.clone();
+            topic_response(Some(&id), topic)
+        }),
     }))
 }
 

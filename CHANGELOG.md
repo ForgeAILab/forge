@@ -8,6 +8,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Native chat topic responses can be pending (plan 3.6).**
+  `POST /api/v1/agent-chats/{chat_id}/topics` now returns nullable `topic` and
+  `divider_message_id` plus `rotation_pending`. On a native chat, a request
+  during a live turn is recorded and completed after that turn (previously
+  409). A newer request while one is pending applies its label and summary to
+  it, and a request whose own rotation is abandoned returns 409. CLI chats and
+  the Genesis-pending 409 are unchanged.
+- **Native Project Agent state reads can return a reference (plan 3.6).** Full
+  `project.current_state` and `project.charter` results carry a `read_ref`. An
+  unchanged repeat in the same topic returns
+  `{"unchanged_since_call": "<read_ref>"}` while that result is still visible
+  to the model.
+
 - **Task actions are now eight verbs served from server offers.** Every Task
   mutation that recovers, pauses, resumes, approves or cancels work goes
   through `GET /api/v1/tasks/{id}/actions`, which returns
@@ -315,7 +328,77 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     blocked entry with a `before_work_hook_failed` annotation; use **Retry
     Entry Checks**. Queued and in-flight steps are kept.
 
+- **Autonomous wakes have one admission stage; `agent.wake.*` events are audit
+  records only (plan 3.5).** Attention commits the audit event, disposition,
+  queued turn and budget charge in one transaction. `agent.wake.admitted`
+  carries `reason=turn_admitted`, `admission_phase=turn` and `turn_job_id`;
+  the `pre_admitted` value and the unused `action` field are removed.
+  - The delivery-stage reasons are removed: `wake_evaluation_unavailable`,
+    `wake_evaluation_invalid`, `wake_retry_failed`, `turn_admission_rejected`,
+    `attention_policy_suppressed`, `malformed_wake_decision`,
+    `wake_retry_exhausted`, `malformed_wake_payload`,
+    `recursive_agent_response`, `attention_reference_missing`,
+    `attention_missing`, `attention_unavailable`,
+    `attention_scope_unavailable`, `cross_scope_incident`,
+    `attention_changed`, `chat_unavailable`,
+    `responder_resolution_unavailable`, `responder_unavailable`,
+    `delivery_state_unavailable`, `turn_admission_unavailable`,
+    `scope_type_missing`, `scope_id_missing`, `cross_scope_event`,
+    `incident_key_missing`, `incident_digest_missing` and
+    `reaction_depth_missing`. Policy reasons stay. Stored events remain
+    readable. Wake retry rows, their strike cap and dead letters are gone.
+  - The per-Project `wake_budget` (default 10/h) is split per category:
+    budgets of 5 or more split 40/40/20 (blocker, delivery, decision; at
+    least 1 each); smaller budgets are one shared pool served blockers
+    first. Only an admitted turn is charged; owner escalation answers are
+    never charged. On upgrade only charges still inside their hour carry
+    over.
+  - Owner escalation endpoints return 403 to a Project member who is not the
+    owner and 404 to anyone else (previously 400). MCP
+    `forge_project_escalate` records the authenticated owner as the actor.
+  - An autonomous wake turn that hits a usage limit fails on attempt one with
+    `usage_limit`; user-authored turns keep the usage deferral. Provider
+    schema and authentication failures fail on attempt one.
+
 ### Changed
+
+- **Native chats use topic-scoped, budgeted working sets (plan 3.6).** Each
+  topic is one runtime session and one LCM timeline. Main runs at 48k/64k
+  tokens and Project at 96k/128k (`server.*_working_set_*_tokens`,
+  `FORGE_SERVER_*`), with runtime sizing and provider LCM and topic summaries
+  at low reasoning, a deterministic fallback and a 30 s summary timeout. On a
+  scripted 40-turn chat, p50 input per turn fell from 349k tokens to 42k
+  (Main) and 86k (Project).
+  - Native chats rotate topics automatically at Genesis start, at Project
+    creation or handoff, and after 8 h idle; CLI chats never rotate
+    automatically. Rotations run off the turn-claim path with at most 3
+    attempts and back-off, then are abandoned with a visible notice and an
+    `agent_chat.topic.rotation_failed` event.
+  - The agent-runtime pin moves to `5ee41e4`. LCM tuning changes keep
+    session state and historical retired timelines.
+
+- **Project blockers are level-triggered (plan 3.5).** A supervised sweep
+  (at most every 60 s) reconsiders open Attention and batches each Project's
+  eligible blockers into one wake per five-minute window.
+  - Only a completed turn consumes a blocker's current digest; a digest
+    change, a resolve followed by a reopen, or an owner answer re-arms it.
+    Infrastructure failures are re-admitted after the cooldown;
+    deterministic provider failures raise the "Project Agent can't run"
+    notice once instead.
+  - A completed turn that leaves its blocker unchanged escalates to the owner
+    once, unless the turn recorded a recovery action and the blocker has not
+    recurred.
+  - Blockers imported from before the upgrade get one batched re-admission
+    per Project. The digest ignores Task renames and action-offer changes.
+  - Lease-expiry refunds are capped at three per turn.
+- **Owner escalation.** The Project Agent can escalate an exact need with
+  native `project.escalate` / MCP `forge_project_escalate` (one Notification
+  and one Attention item). New `GET /api/v1/projects/{project_id}/escalations`
+  lists them; Mission Control shows the need with an **Answer** box, and
+  Resolve counts as the answer "Resolved by the owner."; `forge-ctl project
+  escalations list|answer` wraps the same endpoints. An answer wakes the
+  Project Agent. Project doctrine @21 adds: verify recovery took effect,
+  never retry an unchanged blocker, escalate the exact need.
 
 - Workflow cascades are durable `task_step` rows run by a leased per-Task
   worker instead of recursive calls inside the request (refactor 2.3a).
@@ -796,6 +879,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Pre-V149 LCM timelines are adopted once by their own session, a failed
+  snapshot save after adoption no longer wedges the chat, and topic-summary
+  usage is charged exactly once, even if the new topic never runs a turn
+  (plan 3.6).
 - Dropdown menus near the bottom of the window open upwards instead of
   off-screen, and their height is capped to the space available.
 - An event that a consumer can never apply no longer blocks every later event

@@ -738,6 +738,7 @@ pub trait AgentLcmRepo: Send + Sync {
         timeline_id: &str,
         from_sequence: i64,
         updated_at: &str,
+        claim: Option<&AgentLcmClaimFence>,
     ) -> Result<AgentLcmTruncation>;
     async fn commit_lcm_leaf(&self, input: CommitAgentLcmLeaf) -> Result<AgentLcmMutationResult>;
     async fn commit_lcm_condensation(
@@ -753,25 +754,19 @@ pub struct CreateAgentLcmTimeline {
     pub scope_type: String,
     pub scope_id: String,
     pub authorization_revision: String,
-    /// The native runtime session binding the timeline. A timeline written
-    /// by another runtime session is retired and replaced; see
-    /// `V149__lcm_timeline_session_owner.sql`.
-    pub runtime_session: Option<AgentLcmSessionClaim>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentLcmSessionClaim {
-    pub runtime_session_id: String,
-    /// When the runtime session was created. A timeline with no recorded
-    /// owner that was last written before this instant belongs to an earlier
-    /// session.
-    pub session_created_at: String,
+pub struct AgentLcmClaimFence {
+    pub owner: String,
+    pub generation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendAgentLcmEntries {
+    pub claim: Option<AgentLcmClaimFence>,
     pub timeline_id: String,
     pub expected_revision: i64,
     pub operation_id: String,
@@ -783,6 +778,7 @@ pub struct AppendAgentLcmEntries {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitAgentLcmLeaf {
+    pub claim: Option<AgentLcmClaimFence>,
     pub timeline_id: String,
     pub expected_revision: i64,
     pub operation_id: String,
@@ -794,6 +790,7 @@ pub struct CommitAgentLcmLeaf {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitAgentLcmCondensation {
+    pub claim: Option<AgentLcmClaimFence>,
     pub timeline_id: String,
     pub expected_revision: i64,
     pub operation_id: String,

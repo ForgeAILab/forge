@@ -847,6 +847,7 @@ where
                     .as_deref()
                     .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
                     .map(|at| at.with_timezone(&chrono::Utc)),
+                fail_fast: crate::agent_chat_turn_policy::is_autonomous_wake_turn(job),
             },
             now,
             error_message,
@@ -908,6 +909,7 @@ where
                     .as_deref()
                     .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
                     .map(|at| at.with_timezone(&chrono::Utc)),
+                fail_fast: crate::agent_chat_turn_policy::is_autonomous_wake_turn(job),
             },
             now,
             error_message,
