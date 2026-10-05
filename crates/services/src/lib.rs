@@ -240,6 +240,7 @@ pub use operating_skills::{
     PROJECT_OPERATING_SKILL_SCHEMA_VERSION, PROJECT_OPERATING_SKILL_VERSION,
 };
 pub use operator_status::OperatorStatusService;
+pub(crate) mod remote_cancel;
 pub use operator_status_emitter::OperatorStatusEmitter;
 pub use orchestration_authorization::OrchestrationAuthorizationService;
 pub use product_genesis::{
@@ -343,6 +344,11 @@ pub type Result<T> = std::result::Result<T, ServiceError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
+    #[error("task_busy: {pending_steps} pending steps; retry after {retry_after_ms} ms")]
+    TaskBusy {
+        pending_steps: i64,
+        retry_after_ms: u64,
+    },
     #[error(transparent)]
     PlacementUnavailable(#[from] placement::PlacementUnavailable),
 
@@ -486,6 +492,13 @@ pub enum ServiceError {
 impl From<db::DbError> for ServiceError {
     fn from(error: db::DbError) -> Self {
         match error {
+            db::DbError::TaskBusy {
+                pending_steps,
+                retry_after_ms,
+            } => Self::TaskBusy {
+                pending_steps,
+                retry_after_ms,
+            },
             db::DbError::DependencyGate => Self::DependencyGate,
             db::DbError::AgentPaused { agent_id } => Self::AgentPaused { agent_id },
             db::DbError::ProjectPaused { project_id } => Self::ProjectPaused { project_id },

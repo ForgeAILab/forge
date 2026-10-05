@@ -3,13 +3,49 @@ use crate::workflow::{actions::DispatchRoleAgent, HookAction, HookContext};
 use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
 
 impl TaskService {
-    pub async fn claim_task(
+    /// The accepted claim owns startup even when its HTTP waiter times out.
+    pub async fn claim_and_start_task(
         &self,
         task_id: impl Into<String>,
         assignee: Assignee,
         overrides: Option<ExecutionOverrides>,
     ) -> Result<ClaimedTask> {
         let task_id = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "claim_and_start_task",
+                    serde_json::json!([task_id, assignee, overrides]),
+                    false,
+                )
+                .await;
+        }
+        let mut claimed = self.claim_task(&task_id, assignee, overrides).await?;
+        self.start_execution(&claimed.execution.id).await?;
+        claimed.task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id))?;
+        Ok(claimed)
+    }
+    pub async fn claim_task(
+        &self,
+        task_id: impl Into<String>,
+        assignee: Assignee,
+        overrides: Option<ExecutionOverrides>,
+    ) -> Result<ClaimedTask> {
+        let task_id: String = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "claim_task",
+                    serde_json::json!([task_id, assignee, overrides]),
+                    false,
+                )
+                .await;
+        }
+
         validate_required("task_id", &task_id)?;
 
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
@@ -319,8 +355,12 @@ impl TaskService {
                 return Err(error);
             }
         }
-        crate::placement::admission::resolve_workspace_attention_in_tx(&mut transaction, &task_id)
-            .await?;
+        crate::placement::admission::resolve_workspace_attention_in_tx(
+            &self.db,
+            &mut transaction,
+            &task_id,
+        )
+        .await?;
         if let Err(error) = transaction.commit().await.map_err(DbError::from) {
             // The commit may have succeeded at SQLite despite a transport
             // error; revoke the lease idempotently so a crashed claimant can

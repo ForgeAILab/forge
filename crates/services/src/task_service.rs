@@ -52,6 +52,7 @@ mod actions;
 pub use actions::task_review_requires_user_decision;
 mod adaptive;
 mod claim;
+pub(crate) mod commands;
 mod common;
 pub(crate) mod config;
 mod create;
@@ -410,6 +411,11 @@ pub(super) fn is_transient_error_annotation(raw_annotation: &str) -> bool {
 
 #[derive(Clone)]
 pub struct TaskService {
+    task_step_driver:
+        Arc<std::sync::Mutex<Option<Arc<crate::worker_runtime::queue::TaskStepWorker>>>>,
+    pub(crate) task_step_replies: Arc<
+        std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
+    >,
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     merge_service: Option<Arc<MergeService>>,
@@ -434,13 +440,14 @@ pub struct TaskService {
     pub(crate) dispatch_wake: Arc<tokio::sync::Notify>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct TransitionResult {
     pub task: Task,
     pub review: Option<Review>,
     pub pending_steps: i64,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct TransitionOptions {
     pub version: i64,
     pub reason: Option<String>,
@@ -485,6 +492,7 @@ impl From<(i64, Option<String>, bool)> for TransitionOptions {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct LaunchExecutionResult {
     pub task: Task,
     pub execution: Execution,
@@ -504,6 +512,8 @@ impl TaskService {
         let workspace_root = default_workspace_root();
         Self {
             db,
+            task_step_driver: Arc::default(),
+            task_step_replies: Arc::default(),
             event_bus,
             merge_service: None,
             cleanup_scheduler: None,
@@ -550,6 +560,7 @@ impl TaskService {
     pub fn with_merge_service(mut self, merge_service: Arc<MergeService>) -> Self {
         self.merge_service = Some(merge_service);
         self.configure_workspace_backend();
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -557,6 +568,7 @@ impl TaskService {
     pub fn with_workspace_backend_router(mut self, router: Arc<WorkspaceBackendRouter>) -> Self {
         self.workspace_backend_router = router;
         self.test_workspace_backend = false;
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -588,6 +600,7 @@ impl TaskService {
 
     pub fn with_review_runner(mut self, review_runner: Arc<ReviewRunner>) -> Self {
         self.review_runner = Some(review_runner);
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -597,6 +610,7 @@ impl TaskService {
 
     pub fn with_task_executor(mut self, task_executor: Arc<dyn TaskExecutor>) -> Self {
         self.task_executor = Some(task_executor);
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -606,6 +620,7 @@ impl TaskService {
         registry: Arc<executors::AdapterRegistry>,
     ) -> Self {
         self.placement_adapter_registry = Some(registry);
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -614,11 +629,13 @@ impl TaskService {
         daemon_connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
     ) -> Self {
         self.daemon_connections = Some(daemon_connections);
+        self.task_step_driver = Arc::default();
         self
     }
 
     pub fn with_workspace_exec_locks(mut self, locks: Arc<WorkspaceExecutionLockManager>) -> Self {
         self.workspace_exec_locks = Some(locks);
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -627,6 +644,7 @@ impl TaskService {
         terminal_activity: Arc<TerminalActivityTracker>,
     ) -> Self {
         self.terminal_activity = Some(terminal_activity);
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -636,6 +654,7 @@ impl TaskService {
         }
         self.repo_cache_locks = Some(locks);
         self.configure_workspace_backend();
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -647,22 +666,26 @@ impl TaskService {
             cleanup_scheduler.set_repo_cache_locks(Arc::clone(locks));
         }
         self.cleanup_scheduler = Some(cleanup_scheduler);
+        self.task_step_driver = Arc::default();
         self
     }
 
     pub fn with_workspace_max_disconnect(mut self, timeout: Duration) -> Self {
         self.workspace_max_disconnect = timeout;
+        self.task_step_driver = Arc::default();
         self
     }
 
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
         self.workspace_root = workspace_root;
         self.configure_workspace_backend();
+        self.task_step_driver = Arc::default();
         self
     }
 
     pub fn with_memory_service(mut self, memory_service: Arc<MemoryService>) -> Self {
         self.memory_service = memory_service;
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -674,6 +697,7 @@ impl TaskService {
         embedded: Arc<crate::embedded_agent_service::EmbeddedAgentService>,
     ) -> Self {
         self.credential_env = Some(embedded);
+        self.task_step_driver = Arc::default();
         self
     }
 
@@ -825,6 +849,16 @@ impl TaskService {
         mut input: CreateExecution,
         workspace_created_by_attempt: bool,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(&input.task_id) {
+            return self
+                .request_task_command(
+                    &input.task_id,
+                    "create_running_execution",
+                    serde_json::json!([input, workspace_created_by_attempt]),
+                    false,
+                )
+                .await;
+        }
         let repository_context = if let Some(workspace_id) = input.workspace_id.as_deref() {
             let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
                 .await?
@@ -2047,9 +2081,20 @@ mod tests;
 
 impl TaskService {
     pub fn task_step_worker(&self) -> Arc<crate::worker_runtime::queue::TaskStepWorker> {
-        Arc::new(crate::worker_runtime::queue::TaskStepWorker::new(
-            self.workflow_engine(),
-        ))
+        let mut cached = self.task_step_driver.lock().expect("Task step driver");
+        if let Some(worker) = cached.as_ref() {
+            return Arc::clone(worker);
+        }
+        let mut service = self.clone();
+        // The worker's service must not retain the cache that owns it.
+        service.task_step_driver = Arc::default();
+        let worker = Arc::new(crate::worker_runtime::queue::TaskStepWorker::new(
+            service.workflow_engine(),
+        ));
+        let executor: Arc<dyn db::task_writer::TaskStepExecutor> = worker.clone();
+        self.db.set_task_step_executor(Arc::downgrade(&executor));
+        *cached = Some(worker.clone());
+        worker
     }
     pub async fn drain(&self, task_id: &str) -> Result<Task> {
         self.task_step_worker().drain(task_id).await

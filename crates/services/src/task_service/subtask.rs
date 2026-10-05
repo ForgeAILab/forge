@@ -79,6 +79,27 @@ impl TaskService {
     }
 
     pub(crate) async fn advance_coordination_root(&self, parent_task_id: &str) -> Result<()> {
+        if db::task_writer::current_task_step().is_some_and(|step| step.task_id != parent_task_id) {
+            self.enqueue_task_command(
+                parent_task_id,
+                "advance_coordination_root",
+                serde_json::json!([parent_task_id]),
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
+        if !db::task_writer::owns_task(parent_task_id) {
+            return self
+                .request_task_command(
+                    parent_task_id,
+                    "advance_coordination_root",
+                    serde_json::json!([parent_task_id]),
+                    false,
+                )
+                .await;
+        }
+
         let mut parent = TaskRepo::get_by_id(&*self.db, parent_task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
@@ -265,6 +286,28 @@ async fn update_coordination_review_pending(
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", parent.id))
     })?;
     if pending {
+        if !db::task_writer::owns_task(parent_task_id) {
+            db.enqueue_task_mutation(
+                parent_task_id,
+                db::TaskMutation::TaskMutateMetadata {
+                    id: parent_task_id.to_owned(),
+                    expected_version: None,
+                    updated_at: now_rfc3339(),
+                    mutations: vec![
+                        db::TaskMetadataMutation::Set {
+                            key: COORDINATION_REVIEW_PENDING_KEY.into(),
+                            value: Value::Bool(true),
+                        },
+                        db::TaskMetadataMutation::Set {
+                            key: "coordination_review_pending_id".into(),
+                            value: Value::String(new_uuid_v4()),
+                        },
+                    ],
+                },
+            )
+            .await?;
+            return Ok(());
+        }
         TaskRepo::mutate_metadata(
             db,
             parent_task_id,

@@ -146,11 +146,11 @@ pub(crate) async fn record_retry(
             if matches!(error.as_ref(), ServiceError::DaemonUnavailable { .. } | ServiceError::DaemonTimeout { .. }));
     let marker = serde_json::json!({"execution_id":execution_id,"operation":operation,"daemon_id":daemon_id,"message":message,"retry_at":retry_at});
     let annotation = serde_json::json!({"type":"plan_settlement_wait","code":if offline {"runtime_offline"} else {"plan_owner_error"}, "message":message,"daemon_id":daemon_id,"execution_id":execution_id,"retry_at":retry_at});
-    let changed = sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json, '{}'), '$.plan_settlement_wait', json(?), '$.deferred_dispatch', json(?)),
+    let changed = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json=json_set(COALESCE(metadata_json, '{}'), '$.plan_settlement_wait', json(?), '$.deferred_dispatch', json(?)),
         error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation, '$.type')='plan_settlement_wait' THEN ? ELSE error_annotation END,
         version=version+1, updated_at=? WHERE id=? AND version=?")
         .bind(marker.to_string()).bind(serde_json::json!({"target_state":task.status,"reason":message,"not_before":retry_at}).to_string())
-        .bind(annotation.to_string()).bind(now.to_rfc3339()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
+        .bind(annotation.to_string()).bind(now.to_rfc3339()).bind(&task.id).bind(task.version).execute_in_tx(&mut tx).await?;
     if changed.rows_affected() != 1 {
         return Err(db::DbError::VersionConflict.into());
     }
@@ -165,8 +165,8 @@ pub(crate) async fn record_retry(
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| now.to_rfc3339());
-        sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json, '$.owner_wait', json(?)) WHERE id=?")
-            .bind(serde_json::json!({"daemon_id":daemon_id,"started_at":started_at,"plan_execution_id":execution_id}).to_string()).bind(&task.id).execute(&mut *tx).await?;
+        db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json=json_set(metadata_json, '$.owner_wait', json(?)) WHERE id=?")
+            .bind(serde_json::json!({"daemon_id":daemon_id,"started_at":started_at,"plan_execution_id":execution_id}).to_string()).bind(&task.id).execute_in_tx(&mut tx).await?;
     }
     crate::placement::admission::record_wait_attention_in_tx(
         db,
@@ -186,11 +186,15 @@ pub(crate) async fn record_retry(
 }
 
 pub(crate) async fn clear_retry(db: &db::SqliteDb, execution_id: &str) -> Result<()> {
+    let task_id: String = sqlx::query_scalar("SELECT task_id FROM execution WHERE id=?")
+        .bind(execution_id)
+        .fetch_one(db.pool())
+        .await?;
     sqlx::query("UPDATE execution_plan_transport SET retry_operation=NULL,retry_count=0,retry_at=NULL,retry_error=NULL WHERE execution_id=?")
         .bind(execution_id).execute(db.pool()).await?;
     let task_version: Option<i64> = sqlx::query_scalar("SELECT version FROM task WHERE json_extract(metadata_json, '$.plan_settlement_wait.execution_id')=?")
         .bind(execution_id).fetch_optional(db.pool()).await?;
-    sqlx::query("UPDATE task SET error_annotation=CASE WHEN json_extract(error_annotation, '$.type')='plan_settlement_wait' AND json_extract(error_annotation, '$.execution_id')=? THEN NULL ELSE error_annotation END,
+    db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task SET error_annotation=CASE WHEN json_extract(error_annotation, '$.type')='plan_settlement_wait' AND json_extract(error_annotation, '$.execution_id')=? THEN NULL ELSE error_annotation END,
         metadata_json=CASE WHEN json_extract(metadata_json, '$.owner_wait.plan_execution_id')=?
           THEN json_remove(metadata_json, '$.plan_settlement_wait', '$.deferred_dispatch', '$.owner_wait')
           ELSE json_remove(metadata_json, '$.plan_settlement_wait', '$.deferred_dispatch') END,
@@ -227,6 +231,7 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::test_support::drain_task_steps(&db, &task.id).await;
         let waiting = TaskRepo::get_by_id(&db, &task.id, false)
             .await
             .unwrap()
@@ -242,6 +247,7 @@ mod tests {
             .contains("runtime_offline"));
         assert!(retry_due(&db, &execution.id, "publish").await.is_err());
         clear_retry(&db, &execution.id).await.unwrap();
+        crate::test_support::drain_task_steps(&db, &task.id).await;
         let current = TaskRepo::get_by_id(&db, &task.id, false)
             .await
             .unwrap()

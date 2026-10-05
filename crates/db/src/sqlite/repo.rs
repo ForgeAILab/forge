@@ -69,8 +69,13 @@ impl RepoRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
-        wake_dispatch_for_project_in_tx(&mut transaction, &input.project_id, &project_updated_at)
-            .await?;
+        wake_dispatch_for_project_in_tx(
+            self,
+            &mut transaction,
+            &input.project_id,
+            &project_updated_at,
+        )
+        .await?;
         let repo_row = sqlx::query("SELECT * FROM repo WHERE id = ?")
             .bind(&input.id)
             .fetch_one(&mut *transaction)
@@ -148,7 +153,7 @@ impl RepoRepo for SqliteDb {
         .execute(&mut *transaction)
         .await
         .map_err(check_error)?;
-        wake_dispatch_for_project_in_tx(&mut transaction, &repo.project_id, &repo.updated_at)
+        wake_dispatch_for_project_in_tx(self, &mut transaction, &repo.project_id, &repo.updated_at)
             .await?;
         transaction.commit().await?;
         Ok(repo)
@@ -205,7 +210,8 @@ impl RepoRepo for SqliteDb {
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
-        wake_dispatch_for_project_in_tx(&mut transaction, &project_id, &project_updated_at).await?;
+        wake_dispatch_for_project_in_tx(self, &mut transaction, &project_id, &project_updated_at)
+            .await?;
         transaction.commit().await?;
         Ok(())
     }

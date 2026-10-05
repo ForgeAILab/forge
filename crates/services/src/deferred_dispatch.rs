@@ -512,6 +512,21 @@ fn bounded_safe_message(message: &str) -> String {
 /// commits one of those must call this afterward, or the previously observed
 /// denial keeps the Task quiesced forever.
 pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) -> Result<()> {
+    if !db::task_writer::owns_task(task_id) {
+        if TaskRepo::get_by_id(db, task_id, false).await?.is_none() {
+            return Ok(());
+        }
+        db.enqueue_task_mutation(
+            task_id,
+            db::TaskMutation::TaskWakeDispatchForTask {
+                id: task_id.to_owned(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        tracing::info!(task_id = %task_id, %reason, "task dispatch wake queued");
+        return Ok(());
+    }
     let result = TaskRepo::wake_dispatch_for_task(db, task_id, &now_rfc3339()).await;
     if let Err(db::DbError::NotFound) = &result {
         return Ok(());

@@ -318,6 +318,17 @@ impl WorkspaceBackendRouter {
     /// The entry point for reaching a workspace: use its persisted placement,
     /// never the Agent's daemon pin or `Workspace.worktree_path`.
     pub async fn resolve(&self, db: &SqliteDb, workspace: &Workspace) -> Result<ResolvedWorkspace> {
+        if !db
+            .pending_remote_cancels(None, Some(&workspace.id))
+            .await?
+            .is_empty()
+        {
+            return Err(ServiceError::WorkspaceResetRequired {
+                task_id: workspace.task_id.clone(),
+                reason: "waiting for remote workspace cancellation acknowledgment".to_owned(),
+            }
+            .into());
+        }
         let placement = Self::placement(db, workspace).await?;
         let backend = self.for_placement(&placement)?;
         Ok(ResolvedWorkspace { placement, backend })
@@ -326,6 +337,17 @@ impl WorkspaceBackendRouter {
     /// For operations that must run on the Forge host, such as an embedded
     /// executor. A daemon handle is never interpreted as a local path.
     pub async fn embedded_path(&self, db: &SqliteDb, workspace: &Workspace) -> Result<PathBuf> {
+        if !db
+            .pending_remote_cancels(None, Some(&workspace.id))
+            .await?
+            .is_empty()
+        {
+            return Err(ServiceError::WorkspaceResetRequired {
+                task_id: workspace.task_id.clone(),
+                reason: "waiting for remote workspace cancellation acknowledgment".to_owned(),
+            }
+            .into());
+        }
         embedded_path(&Self::placement(db, workspace).await?)
     }
 

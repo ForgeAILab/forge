@@ -7,13 +7,14 @@ impl TaskService {
     pub async fn on_agent_deleted(&self, agent_id: &str) -> Result<()> {
         validate_required("agent_id", agent_id)?;
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let events = Self::on_agent_deleted_in_tx(&mut transaction, agent_id).await?;
+        let events = Self::on_agent_deleted_in_tx(&self.db, &mut transaction, agent_id).await?;
         transaction.commit().await?;
         Self::publish_role_sweep_events(&self.event_bus, events);
         Ok(())
     }
 
     pub(crate) async fn on_agent_deleted_in_tx(
+        db: &SqliteDb,
         transaction: &mut Transaction<'_, Sqlite>,
         agent_id: &str,
     ) -> Result<Vec<RoleSweepEvent>> {
@@ -46,20 +47,14 @@ impl TaskService {
             });
         }
 
-        sqlx::query(
-            "UPDATE task_role_assignment SET assignee_id = NULL, updated_at = ? WHERE assignee_type = 'agent' AND assignee_id = ?",
-        )
-        .bind(now_rfc3339())
-        .bind(agent_id)
-        .execute(&mut **transaction)
-        .await?;
-        sqlx::query(
-            "UPDATE task SET assignee_id = NULL, updated_at = ? WHERE assignee_type = 'agent' AND assignee_id = ?",
-        )
-        .bind(now_rfc3339())
-        .bind(agent_id)
-        .execute(&mut **transaction)
-        .await?;
+        let task_ids:Vec<String> = sqlx::query_scalar("SELECT id FROM task WHERE deleted_at IS NULL AND (assignee_id=? OR id IN (SELECT task_id FROM task_role_assignment WHERE assignee_id=?))")
+            .bind(agent_id).bind(agent_id).fetch_all(&mut **transaction).await?;
+        for task_id in task_ids {
+            db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?")
+                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).execute_in_tx(transaction).await?;
+            db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task SET assignee_id=NULL,updated_at=? WHERE id=? AND assignee_type='agent' AND assignee_id=?")
+                .bind(now_rfc3339()).bind(&task_id).bind(agent_id).execute_in_tx(transaction).await?;
+        }
 
         // Agent archival changes the effective authority of every affected
         // Task.  Keep that invalidation and dispatch wake in the same write
@@ -68,7 +63,7 @@ impl TaskService {
         let affected_task_ids: HashSet<&str> =
             events.iter().map(|event| event.task_id.as_str()).collect();
         for task_id in affected_task_ids {
-            sqlx::query(
+            db::task_writer::TaskQuery::new(db,task_id,
                 "UPDATE task
                  SET review_passed_at = NULL,
                      version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
@@ -91,7 +86,7 @@ impl TaskService {
             )
             .bind(now_rfc3339())
             .bind(task_id)
-            .execute(&mut **transaction)
+            .execute_in_tx(transaction)
             .await?;
         }
 
@@ -139,6 +134,16 @@ impl TaskService {
         task_id: &str,
         agent_id: &str,
     ) -> Result<TaskRoleAssignment> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "assign_agent_to_task",
+                    serde_json::json!([task_id, agent_id]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", task_id)?;
         validate_required("agent_id", agent_id)?;
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
@@ -174,6 +179,17 @@ impl TaskService {
         reset_workspace: bool,
         reset_worktree: bool,
     ) -> Result<TaskRoleAssignment> {
+        if !db::task_writer::owns_task(&input.task_id) {
+            return self
+                .request_task_command(
+                    &input.task_id,
+                    "reassign_role",
+                    serde_json::json!([input, reset_workspace, reset_worktree]),
+                    false,
+                )
+                .await;
+        }
+
         self.reassign_role_with_active_execution_policy(
             input,
             reset_workspace,
@@ -394,6 +410,17 @@ impl TaskService {
         reset_workspace: bool,
         reset_worktree: bool,
     ) -> Result<()> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "remove_role",
+                    serde_json::json!([task_id, role_name, reset_workspace, reset_worktree]),
+                    false,
+                )
+                .await;
+        }
+
         let mut task = self.validate_reassignable_task(task_id).await?;
         super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let previous =

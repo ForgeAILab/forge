@@ -208,7 +208,7 @@ impl TaskService {
         };
         let wait=refusal.rejected_candidates.iter().find(|candidate|candidate.filter_codes.contains(&wait_code))
             .map(|candidate|serde_json::json!({"kind":if failed {"provision_failed"} else {"environment_unverified"},"machine":{"owner_kind":"daemon","daemon_id":candidate.daemon_id,"runtime_id":candidate.runtime_id},"checks":[]}));
-        let result=sqlx::query("UPDATE task SET error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation,'$.type')='dispatch_failed' THEN ? ELSE error_annotation END,
+        let result=db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation,'$.type')='dispatch_failed' THEN ? ELSE error_annotation END,
             metadata_json=CASE WHEN ? THEN json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?),'$.environment_wait',json(?)) ELSE json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?)) END,version=version+1,updated_at=? WHERE id=? AND version=?")
             .bind(annotation.to_string()).bind(unverified || failed).bind(marker.to_string()).bind(serde_json::to_string(&wait).expect("wait")).bind(marker.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version).execute(self.db.pool()).await?;
         if result.rows_affected() != 1 {
@@ -315,7 +315,7 @@ impl TaskService {
             return Ok(task);
         }
         sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1 WHERE dedupe_key IN (?,?) AND status<>'resolved'").bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-environment-unverified:{}",task.id)).bind(format!("task-provision-failed:{}",task.id)).execute(self.db.pool()).await?;
-        sqlx::query("UPDATE task SET error_annotation=CASE WHEN error_annotation=? THEN NULL ELSE error_annotation END,
+        db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET error_annotation=CASE WHEN error_annotation=? THEN NULL ELSE error_annotation END,
             metadata_json=CASE WHEN json_extract(metadata_json,'$.environment_wait.kind') IN ('environment_unverified','provision_failed') THEN json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition','$.environment_wait') ELSE json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition') END,version=version+1,updated_at=? WHERE id=? AND version=? AND metadata_json IS ?")
             .bind(marker["annotation"].to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version).bind(&task.metadata_json).execute(self.db.pool()).await?;
         TaskRepo::get_by_id(&*self.db, &task.id, false)

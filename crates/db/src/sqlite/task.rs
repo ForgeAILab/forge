@@ -171,6 +171,7 @@ async fn set_review_passed_at_inner(
     updated_at: &str,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -180,7 +181,18 @@ async fn set_review_passed_at_inner(
     if task.deleted_at.is_some() {
         return Err(DbError::NotFound);
     }
+    let expected_version = if crate::task_writer::owns_task(&task.id) && expected_version.is_some()
+    {
+        Some(task.version)
+    } else {
+        expected_version
+    };
     if let Some(expected_version) = expected_version {
+        let expected_version = if crate::task_writer::owns_task(&task.id) {
+            task.version
+        } else {
+            expected_version
+        };
         if task.version != expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -354,7 +366,7 @@ async fn insert_recovery_marker_in_tx(
 
 async fn update_task_inner(
     db: &SqliteDb,
-    input: UpdateTask,
+    mut input: UpdateTask,
     recovery_marker: Option<&CreateTransitionLog>,
     workflow_authority: Option<(i64, String)>,
 ) -> Result<Task> {
@@ -362,6 +374,7 @@ async fn update_task_inner(
         return Err(DbError::InvalidTransition);
     }
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(&input.id)
         .fetch_optional(&mut *transaction)
@@ -381,6 +394,9 @@ async fn update_task_inner(
             expected_workflow_definition,
         )
         .await?;
+    }
+    if crate::task_writer::owns_task(&input.id) {
+        input.expected_version = task.version;
     }
     if task.version != input.expected_version {
         return Err(DbError::VersionConflict);
@@ -482,6 +498,9 @@ async fn update_task_inner(
     if let Some(marker) = recovery_marker {
         insert_recovery_marker_in_tx(&mut transaction, marker).await?;
     }
+    db.record_mutation_reply_in_tx(&mut transaction, &task)
+        .await?;
+
     transaction.commit().await?;
     Ok(task)
 }
@@ -560,6 +579,7 @@ async fn set_error_annotation_if_no_running_execution_inner(
     overlapping_roles: Vec<String>,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -569,6 +589,11 @@ async fn set_error_annotation_if_no_running_execution_inner(
     if task.deleted_at.is_some() {
         return Err(DbError::InvalidSoftDelete);
     }
+    let expected_version = if crate::task_writer::owns_task(&task.id) {
+        task.version
+    } else {
+        expected_version
+    };
     if task.version != expected_version {
         return Err(DbError::VersionConflict);
     }
@@ -695,6 +720,9 @@ async fn set_error_annotation_if_no_running_execution_inner(
     if previous_error_annotation != task.error_annotation {
         append_task_interruption_event(db, &mut transaction, &task).await?;
     }
+    db.record_mutation_reply_in_tx(&mut transaction, &task)
+        .await?;
+
     transaction.commit().await?;
     Ok(task)
 }
@@ -714,6 +742,7 @@ async fn update_recovery_metadata_inner(
     expected_queued_recovery_id: Option<&str>,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -723,6 +752,11 @@ async fn update_recovery_metadata_inner(
     if task.deleted_at.is_some() {
         return Err(DbError::InvalidSoftDelete);
     }
+    let expected_version = if crate::task_writer::owns_task(&task.id) {
+        task.version
+    } else {
+        expected_version
+    };
     if task.version != expected_version {
         return Err(DbError::VersionConflict);
     }
@@ -792,6 +826,9 @@ async fn update_recovery_metadata_inner(
     ) {
         append_task_interruption_event(db, &mut transaction, &task).await?;
     }
+    db.record_mutation_reply_in_tx(&mut transaction, &task)
+        .await?;
+
     transaction.commit().await?;
     Ok(task)
 }
@@ -932,7 +969,11 @@ impl TaskRepo for SqliteDb {
 
     async fn create(&self, input: CreateTask) -> Result<Task> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task = TaskRepo::create_in_tx(self, &mut transaction, input).await?;
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
@@ -1077,6 +1118,7 @@ impl TaskRepo for SqliteDb {
         updated_at: &str,
     ) -> Result<()> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         if ordered_ids.iter().collect::<HashSet<_>>().len() != ordered_ids.len() {
             return Err(DbError::InvalidTransition);
         }
@@ -1122,6 +1164,22 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn update(&self, input: UpdateTask) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id)
+            && (input.error_annotation.is_some()
+                || input.blocked_json.is_some()
+                || input.failed_json.is_some()
+                || input.parent_task_id.is_some())
+        {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdate {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_inner(self, input, None, None).await
     }
 
@@ -1130,6 +1188,18 @@ impl TaskRepo for SqliteDb {
         input: UpdateTask,
         marker: CreateTransitionLog,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateWithRecoveryMarker {
+                        input: input.clone(),
+                        marker: marker.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_inner(self, input, Some(&marker), None).await
     }
 
@@ -1139,6 +1209,19 @@ impl TaskRepo for SqliteDb {
         expected_project_version: i64,
         expected_workflow_definition: String,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateWithWorkflowAuthority {
+                        input: input.clone(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_inner(
             self,
             input,
@@ -1155,6 +1238,20 @@ impl TaskRepo for SqliteDb {
         expected_project_version: i64,
         expected_workflow_definition: String,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateWithWorkflowAuthorityAndRecoveryMarker {
+                        input: input.clone(),
+                        marker: marker.clone(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_inner(
             self,
             input,
@@ -1179,6 +1276,28 @@ impl TaskRepo for SqliteDb {
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetErrorAnnotationIfNoRunningExecution {
+                        id: id.to_owned(),
+                        expected_version,
+                        expected_status: expected_status.to_owned(),
+                        expected_state_entry_token: expected_state_entry_token.map(str::to_owned),
+                        expected_workflow_definition: expected_workflow_definition.to_owned(),
+                        expected_assignment_role: expected_assignment_role.map(str::to_owned),
+                        expected_assignment: expected_assignment.clone(),
+                        annotation: annotation.to_owned(),
+                        updated_at: updated_at.to_owned(),
+                        stopped_execution_id: stopped_execution_id.to_owned(),
+                        workspace_id: workspace_id.map(str::to_owned),
+                        overlapping_roles: overlapping_roles.clone(),
+                    },
+                )
+                .await;
+        }
+
         set_error_annotation_if_no_running_execution_inner(
             self,
             id,
@@ -1209,6 +1328,25 @@ impl TaskRepo for SqliteDb {
         overlapping_roles: Vec<String>,
         metadata_mutations: Vec<TaskMetadataMutation>,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskUpdateRecoveryMetadataIfNoRunningExecution {
+                        id: id.to_owned(),
+                        expected_version,
+                        error_annotation: error_annotation.clone(),
+                        blocked_json: blocked_json.clone(),
+                        failed_json: failed_json.clone(),
+                        updated_at: updated_at.to_owned(),
+                        workspace_id: workspace_id.map(str::to_owned),
+                        overlapping_roles: overlapping_roles.clone(),
+                        metadata_mutations: metadata_mutations.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_recovery_metadata_inner(
             self,
             id,
@@ -1226,6 +1364,17 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn restore_queued_recovery(&self, input: RestoreQueuedRecovery) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskRestoreQueuedRecovery {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_recovery_metadata_inner(
             self,
             &input.task_id,
@@ -1255,6 +1404,19 @@ impl TaskRepo for SqliteDb {
         review_passed_at: Option<String>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetReviewPassedAt {
+                        id: id.to_owned(),
+                        review_passed_at: review_passed_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         set_review_passed_at_inner(self, id, None, review_passed_at, None, updated_at).await
     }
 
@@ -1265,6 +1427,20 @@ impl TaskRepo for SqliteDb {
         review_passed_at: Option<String>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetReviewPassedAtCas {
+                        id: id.to_owned(),
+                        expected_version,
+                        review_passed_at: review_passed_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let expected_review_updated_at = review_passed_at.as_ref().map(|_| updated_at);
         set_review_passed_at_inner(
             self,
@@ -1285,6 +1461,21 @@ impl TaskRepo for SqliteDb {
         expected_review_updated_at: &str,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetReviewPassedAtCasForReview {
+                        id: id.to_owned(),
+                        expected_version,
+                        review_passed_at: review_passed_at.clone(),
+                        expected_review_updated_at: expected_review_updated_at.to_owned(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         set_review_passed_at_inner(
             self,
             id,
@@ -1303,6 +1494,20 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadata {
+                        id: id.to_owned(),
+                        expected_version,
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let (task, _) = self
             .mutate_metadata_with_change(id, expected_version, mutations, updated_at)
             .await?;
@@ -1316,7 +1521,22 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<(Task, bool)> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadataWithChange {
+                        id: id.to_owned(),
+                        expected_version,
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1326,7 +1546,9 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
-        if expected_version.is_some_and(|expected| task.version != expected) {
+        if !crate::task_writer::owns_task(id)
+            && expected_version.is_some_and(|expected| task.version != expected)
+        {
             return Err(DbError::VersionConflict);
         }
 
@@ -1353,6 +1575,9 @@ impl TaskRepo for SqliteDb {
         .await?;
         task.metadata_json = metadata_json;
         task.updated_at = updated_at.to_owned();
+        self.record_mutation_reply_in_tx(&mut transaction, &(&task, true))
+            .await?;
+
         transaction.commit().await?;
         Ok((task, true))
     }
@@ -1364,7 +1589,22 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadataAndBumpVersion {
+                        id: id.to_owned(),
+                        expected_version,
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1374,6 +1614,11 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
+        let expected_version = if crate::task_writer::owns_task(&task.id) {
+            task.version
+        } else {
+            expected_version
+        };
         if task.version != expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -1407,6 +1652,9 @@ impl TaskRepo for SqliteDb {
         task.metadata_json = metadata_json;
         task.version += 1;
         task.updated_at = updated_at.to_owned();
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
@@ -1419,7 +1667,23 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadataAndBumpVersionWithProjectAuthority {
+                        id: id.to_owned(),
+                        expected_version,
+                        expected_project_version,
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1429,6 +1693,11 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
+        let expected_version = if crate::task_writer::owns_task(&task.id) {
+            task.version
+        } else {
+            expected_version
+        };
         if task.version != expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -1471,6 +1740,9 @@ impl TaskRepo for SqliteDb {
         task.metadata_json = metadata_json;
         task.version += 1;
         task.updated_at = updated_at.to_owned();
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
@@ -1483,7 +1755,23 @@ impl TaskRepo for SqliteDb {
         mutations: Vec<TaskMetadataMutation>,
         updated_at: &str,
     ) -> Result<Option<Task>> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskMutateMetadataAndBumpVersionForLatestExecution {
+                        id: id.to_owned(),
+                        expected_version,
+                        authority: authority.clone(),
+                        mutations: mutations.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1493,6 +1781,11 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
+        let expected_version = if crate::task_writer::owns_task(&task.id) {
+            task.version
+        } else {
+            expected_version
+        };
         if task.version != expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -1535,9 +1828,21 @@ impl TaskRepo for SqliteDb {
 
     async fn claim_metadata_for_latest_execution(
         &self,
-        input: LatestExecutionMetadataClaim,
+        mut input: LatestExecutionMetadataClaim,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::TaskClaimMetadataForLatestExecution {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.task_id)
             .fetch_optional(&mut *transaction)
@@ -1547,6 +1852,7 @@ impl TaskRepo for SqliteDb {
         if task.deleted_at.is_some() {
             return Err(DbError::NotFound);
         }
+        input.expected_task_version = task.version;
         if task.version != input.expected_task_version {
             return Err(DbError::VersionConflict);
         }
@@ -1580,12 +1886,28 @@ impl TaskRepo for SqliteDb {
         task.metadata_json = metadata_json;
         task.version += 1;
         task.updated_at = input.updated_at;
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
 
     async fn wake_dispatch_for_task(&self, id: &str, updated_at: &str) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskWakeDispatchForTask {
+                        id: id.to_owned(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut *transaction)
@@ -1641,8 +1963,9 @@ impl TaskRepo for SqliteDb {
 
     async fn wake_dispatch_for_project(&self, project_id: &str, updated_at: &str) -> Result<u64> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         let changed =
-            wake_dispatch_for_project_in_tx(&mut transaction, project_id, updated_at).await?;
+            wake_dispatch_for_project_in_tx(self, &mut transaction, project_id, updated_at).await?;
         transaction.commit().await?;
         Ok(changed)
     }
@@ -1678,6 +2001,20 @@ impl TaskRepo for SqliteDb {
         entry_barrier_json: Option<String>,
         updated_at: &str,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetEntryBarrier {
+                        id: id.to_owned(),
+                        expected_version,
+                        entry_barrier_json: entry_barrier_json.clone(),
+                        updated_at: updated_at.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let result = sqlx::query(
             "UPDATE task SET entry_barrier_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
@@ -1704,7 +2041,24 @@ impl TaskRepo for SqliteDb {
         expected_project_version: i64,
         expected_workflow_definition: String,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(id) {
+            return self
+                .run_task_mutation(
+                    id,
+                    crate::TaskMutation::TaskSetEntryBarrierWithWorkflowAuthority {
+                        id: id.to_owned(),
+                        expected_version,
+                        entry_barrier_json: entry_barrier_json.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition.clone(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
         check_project_workflow_authority_in_tx(
             &mut transaction,
             id,
@@ -1729,6 +2083,9 @@ impl TaskRepo for SqliteDb {
             .fetch_one(&mut *transaction)
             .await?;
         let task = map_task(row)?;
+        self.record_mutation_reply_in_tx(&mut transaction, &task)
+            .await?;
+
         transaction.commit().await?;
         Ok(task)
     }
@@ -1764,6 +2121,12 @@ impl TaskRepo for SqliteDb {
         transaction: &mut Transaction<'_, Sqlite>,
         mut input: ClaimTask,
     ) -> Result<ClaimedTask> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return Err(DbError::Check(
+                "Task claim requires its claimed step".to_owned(),
+            ));
+        }
+        self.fence_current_step_in_tx(transaction).await?;
         let sql = format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ? AND deleted_at IS NULL");
         let row = sqlx::query(&sql)
             .bind(&input.task_id)
@@ -1771,6 +2134,9 @@ impl TaskRepo for SqliteDb {
             .await?
             .ok_or(DbError::NotFound)?;
         let mut task = map_task(row)?;
+        if crate::task_writer::owns_task(&input.task_id) {
+            input.expected_version = task.version;
+        }
         if task.version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -2075,6 +2441,17 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateStatus {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_status_inner(self, input, None, None)
             .await?
             .ok_or(DbError::VersionConflict)
@@ -2085,6 +2462,18 @@ impl TaskRepo for SqliteDb {
         input: UpdateTaskStatus,
         authority: LatestExecutionAuthority,
     ) -> Result<Option<Task>> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateStatusForLatestExecution {
+                        input: input.clone(),
+                        authority: authority.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_status_inner(self, input, None, Some(&authority)).await
     }
 
@@ -2093,6 +2482,18 @@ impl TaskRepo for SqliteDb {
         input: UpdateTaskStatus,
         marker: CreateTransitionLog,
     ) -> Result<Task> {
+        if !crate::task_writer::owns_task(&input.id) {
+            return self
+                .run_task_mutation(
+                    &input.id,
+                    crate::TaskMutation::TaskUpdateStatusWithRecoveryMarker {
+                        input: input.clone(),
+                        marker: marker.clone(),
+                    },
+                )
+                .await;
+        }
+
         update_task_status_inner(self, input, Some(&marker), None)
             .await?
             .ok_or(DbError::VersionConflict)
@@ -2101,7 +2502,7 @@ impl TaskRepo for SqliteDb {
 
 async fn update_task_status_inner(
     db: &SqliteDb,
-    input: UpdateTaskStatus,
+    mut input: UpdateTaskStatus,
     recovery_marker: Option<&CreateTransitionLog>,
     latest_execution_authority: Option<&LatestExecutionAuthority>,
 ) -> Result<Option<Task>> {
@@ -2109,6 +2510,7 @@ async fn update_task_status_inner(
         return Err(DbError::InvalidTransition);
     }
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
         .bind(&input.id)
         .fetch_optional(&mut *transaction)
@@ -2117,6 +2519,9 @@ async fn update_task_status_inner(
     let mut task = map_task(task_row)?;
     if task.deleted_at.is_some() {
         return Err(DbError::InvalidSoftDelete);
+    }
+    if crate::task_writer::owns_task(&input.id) {
+        input.expected_version = task.version;
     }
     if task.version != input.expected_version {
         return Err(DbError::VersionConflict);

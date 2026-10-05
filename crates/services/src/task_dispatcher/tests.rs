@@ -1518,6 +1518,7 @@ async fn changing_root_default_wakes_and_dispatches_unstarted_subtask() {
         )
         .await
         .expect("root default worker changes");
+    dispatcher.task_service.drain(&child.id).await.unwrap();
 
     let woken_child = TaskRepo::get_by_id(&*db, &child.id, false)
         .await
@@ -2276,15 +2277,22 @@ async fn pull_request_merge_wait_requires_human_retry_before_direct_merge() {
     let merged = fixture
         .dispatcher
         .task_service
-        .test_apply_action(
+        .perform_task_action(
             &parked.id,
-            api_types::TaskAction::retry(),
-            Some("operator approved direct merge".to_owned()),
-            None,
+            api_types::TaskAction::Retry {
+                reason: Some("operator approved direct merge".to_owned()),
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: None,
+                guidance: None,
+            },
+            parked.version,
         )
         .await
-        .expect("human merge retry integrates the reviewed candidate");
+        .expect("human merge retry integrates the reviewed candidate")
+        .task;
     assert_eq!(merged.status, "merging");
+    fixture.dispatcher.check_once_and_drain().await.unwrap();
     let merged = fixture
         .dispatcher
         .task_service
@@ -3485,6 +3493,7 @@ async fn recovery_on_full_agent_resume_fallback_queues_and_replays() {
         ProjectRepo::set_paused_at(&*db, &project_id, Some(now_rfc3339()))
             .await
             .unwrap();
+        dispatcher.task_service.drain(&task.id).await.unwrap();
         let paused_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -9101,7 +9110,15 @@ async fn hook_restart_recognizes_merge_landed_before_checkpoint_even_after_sibli
     assert_eq!(settled.status, "done");
     assert!(settled.error_annotation.is_none());
     assert_eq!(
-        fixture.db.task_steps(&fixture.task.id).await.unwrap()[0].attempts,
+        fixture
+            .db
+            .task_steps(&fixture.task.id)
+            .await
+            .unwrap()
+            .iter()
+            .find(|row| row.id == step.id)
+            .unwrap()
+            .attempts,
         2
     );
     // The recorded merge result is the candidate, never the target's tip.
@@ -9139,7 +9156,8 @@ async fn legacy_merging_task_without_hook_step_is_merged_after_one_startup() {
         .task_steps(&fixture.task.id)
         .await
         .unwrap()
-        .is_empty());
+        .iter()
+        .all(|step| !matches!(step.kind.as_str(), "hooks" | "cascade") && step.status == "done"));
     // The dispatcher loop alone does not re-drive it.
     fixture.dispatcher.check_once_and_drain().await.unwrap();
     assert!(fixture
@@ -9147,7 +9165,8 @@ async fn legacy_merging_task_without_hook_step_is_merged_after_one_startup() {
         .task_steps(&fixture.task.id)
         .await
         .unwrap()
-        .is_empty());
+        .iter()
+        .all(|step| !matches!(step.kind.as_str(), "hooks" | "cascade") && step.status == "done"));
 
     assert_eq!(
         fixture
@@ -9166,7 +9185,14 @@ async fn legacy_merging_task_without_hook_step_is_merged_after_one_startup() {
             .unwrap(),
         0
     );
-    let steps = fixture.db.task_steps(&fixture.task.id).await.unwrap();
+    let steps = fixture
+        .db
+        .task_steps(&fixture.task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|step| step.kind == "hooks")
+        .collect::<Vec<_>>();
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].kind, "hooks");
     assert!(steps[0].causation_key.ends_with(":recovered"));

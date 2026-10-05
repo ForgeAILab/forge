@@ -5020,3 +5020,32 @@ The web renders Task controls from live offers, including placement waits (`hold
 Solo's review card derives decisions from offers. Request changes collects nonblank guidance before submitting send-back; a required approval reason is collected before approval.
 
 Project doctrine @19 names `forge_scope_read` operation `work.read` for live Task offers and versions, and the `task.action` contract and required inputs. Migration V202610030100 adds it without changing @17/@18 bodies or digests, and advances current Project bindings. Frozen historical admissions remain immutable.
+
+### Task command contention and remote cleanup
+
+Task workflow writes are serialized through the leased per-Task queue. Synchronous
+owner commands and claim return their own updated Task; `pending_steps` continues
+to describe asynchronous hooks and cascades. If predecessor work does not yield
+within five seconds, the response is HTTP 409 with code `task_busy` and details
+`{pending_steps, retry_after_ms, retry_hint}`. Accepted intent remains queued;
+refetch the Task after pending steps settle before retrying. An accepted claim owns
+execution startup in its step, so a busy HTTP response cannot leave a reserved
+execution without dispatch. MCP exposes the same
+code and retry details as a tool error. Cancel/Hold applies to the current Task,
+including when entry work has advanced its version.
+
+Daemon command `workspace.cancel` accepts `{operation_id}` and acknowledges
+`{operation_id, state}` where state is `killed`, `already_finished`, or `unknown`.
+The daemon kills the command's process group before acknowledging `killed` and
+persists a cancellation tombstone so delayed requests cannot start afterward.
+Command handlers survive a command-stream disconnect. A daemon rejecting the new
+method is unavailable for cancellation; upgrade it to complete cleanup.
+
+Cancel/Hold waits up to ten seconds for the remote acknowledgment and then applies
+under the Task lease. Without confirmation, the workspace response exposes
+`pending_remote_cancel` records (operation, placement/owner, generation, step and
+creation time). Those records block workspace reuse until reconnect confirms
+cleanup. Operations status exposes `pending_remote_cancels`. Cancelled Tasks offer
+Restart; the request parks while cleanup is pending. Restart and Retry park
+through queued recovery while the workspace is fenced. A merge already inside
+integration finishes first; if it lands, Cancel reports the done Task.

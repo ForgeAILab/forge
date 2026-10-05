@@ -3974,17 +3974,36 @@ adds no new requirement. A resumed script's hook log includes
 rerun_after_interruption: true and its step_id; resumed CI command entries carry
 the same evidence. CI may restart the entire check sequence after a crash.
 
-Every hook start/checkpoint and final settlement checks Task status plus
-status_epoch, and the step owner token. The status trigger covers direct writers;
-real workflow self-transitions also increment the epoch. Title edits, annotation
-clears and board reorders do not. A direct writer may move the Task while a hook
-is executing; before the next hook, the old phase settles superseded with
-transition.step_superseded and runs no further hooks. Direct dispatcher, recovery,
-claim and completion writers remain direct until C and are not locked by the
-queue. The running-entry soft lock, completion/merge in-memory slots and two-minute
-merge re-drive are removed. Blocked entry failure metadata remains recoverable.
-Upgrading converts a legacy `running` entry barrier into a blocked entry with a
-`before_work_hook_failed` annotation; the owner's Retry Entry Checks re-runs it.
+All runtime writes to an existing Task's workflow state execute through a claimed
+Task step. Owner commands, claims, execution settlement, dispatcher effects,
+recovery, assignment and coordination use the same worker path. Content-only
+updates and same-column board order retain their version CAS. Creation initializes
+unpublished rows in its writer transaction; effects on an existing parent are
+queued separately. The entry status/epoch fence runs at step claim. Checkpoints
+and effects retain the lease-owner fence; the former per-hook epoch rereads and
+Task-state CAS retry loops are removed.
+
+Callers that need a result enqueue a command and drive the same worker inline.
+A registered notification, checked before waiting, bounds predecessor wait to five
+seconds without polling. Once that command claims the lease, its result describes
+its own committed Task. A timeout returns HTTP 409 `task_busy` with `pending_steps`,
+`retry_after_ms` and a retry hint; the accepted command remains durable. Hooks and
+cascades remain asynchronous, and responses retain `pending_steps`. Claim and its
+execution startup share one command; dispatch continues if the HTTP waiter expires.
+Cross-Task wakes enqueue without waiting for another Task lane, and explicit initial
+role assignments publish in the new Task's birth transaction.
+
+Cancel/Hold preempts scripts, CI and startup at a safe point. Integration is
+protected through its result and terminal cascade; a landed merge wins and Cancel
+returns the done Task. Remote commands receive `workspace.cancel`; acknowledgment
+wait is at most ten seconds. Without confirmation the hook is superseded with
+`remote_operation_unconfirmed`, while `pending_remote_cancel` durably excludes
+that workspace from new steps and executions. Owner reconnect retries cancellation
+and clears the exclusion on `killed`, `already_finished` or `unknown`. Restart/Retry
+uses the existing queued recovery and blocking annotation until cleanup confirms.
+Late results cannot write through a superseded step's owner token. Transport
+loss alone does not abort a daemon command. Operations reports the pending count,
+and Task workspace detail names the exclusion.
 
 The step table replaces the in-memory exclusions. While the current entry's
 `hooks` row (matched on status and status_epoch) is pending or claimed, its entry
@@ -4020,9 +4039,7 @@ nothing; its hook row owns the dispatch reservation. Completed/deferred dispatch
 checkpoints, superseded entries, backoff, rows behind another step and long CI/merge
 hooks reserve no agent or server capacity. Paused integration retries enqueue and
 keep their marker until durable hook success, rather than interpreting a CAS
-response as completed integration. Producer reservations protect the short
-service-wrapper bookkeeping window and expire after a crash without rebinding
-Task versions.
+response as completed integration. The service wrapper bookkeeping runs inside the command step lease. There is no separate producer reservation.
 
 When `run_ci_steps` finalizes a failed Review during a non-user entry (including
 an entry-barrier retry), the engine clears the barrier and settles the verdict
@@ -4894,4 +4911,4 @@ column `task_step.workflow_ref_id`, not a JSON scan.
 
 Initial dispatcher admission only commits/enqueues and kicks the worker. A queued rollback to the initial state finalizes the existing placement-refusal bookkeeping; the dispatcher does not drain chains inline.
 
-Board reorders and recovery markers remain audit rows only; neither changes the status epoch. expected_version remains a diagnostic stamp and is never rebound. Replay-marker cleanup stays with its original recovery writer. Queued role-entry agent references reserve admission capacity only for the short window before the entry takes its slot: a Task's available fast-lane head step, a claimed fast cascade or hook step whose dispatch has no recorded result. Steps behind another step, in retry back-off, under a producer reservation, or waiting for or inside a long-lane merge/CI hook hold no agent or server capacity; if their later dispatch finds the agent full it is skipped and the dispatcher's active-task recovery re-drives it. The dispatcher kicks and continues rather than running the queue. Lane classification is checked again against the resolved workflow at execution and requeues a changed lane before any transition starts.
+Board reorders and recovery markers remain audit rows only; neither changes the status epoch. expected_version remains a diagnostic stamp and is never rebound. Replay-marker cleanup is a queued Task mutation. Queued role-entry agent references reserve admission capacity only for the short window before the entry takes its slot: a Task's available fast-lane head step, a claimed fast cascade or hook step whose dispatch has no recorded result. Steps behind another step, in retry back-off, or waiting for or inside a long-lane merge/CI hook hold no agent or server capacity; if their later dispatch finds the agent full it is skipped and the dispatcher's active-task recovery re-drives it. The dispatcher kicks and continues rather than running the queue. Lane classification is checked again against the resolved workflow at execution and requeues a changed lane before any transition starts.

@@ -171,6 +171,41 @@ impl DaemonWorkspaceClient {
             .await
     }
 
+    pub async fn cancel_workspace_operation(
+        &self,
+        daemon_id: &str,
+        operation_id: &str,
+    ) -> Result<api_types::WorkspaceCancelResult> {
+        let result: api_types::WorkspaceCancelResult = self
+            .request(
+                daemon_id,
+                api_types::METHOD_WORKSPACE_CANCEL,
+                &api_types::WorkspaceCancelParams {
+                    operation_id: operation_id.to_owned(),
+                },
+                Duration::from_secs(10),
+                false,
+            )
+            .await
+            .map_err(|error| match error {
+                WorkspaceClientError::Daemon(error)
+                    if error.code == api_types::UNSUPPORTED_METHOD =>
+                {
+                    WorkspaceClientError::Transport(ServiceError::DaemonUnavailable {
+                        daemon_id: daemon_id.to_owned(),
+                    })
+                }
+                error => error,
+            })?;
+        if result.operation_id != operation_id {
+            return Err(ServiceError::invalid_operation(
+                "workspace.cancel acknowledged another operation",
+            )
+            .into());
+        }
+        Ok(result)
+    }
+
     pub async fn inspect(
         &self,
         daemon_id: &str,
@@ -346,7 +381,9 @@ impl DaemonWorkspaceClient {
         let mut params = serde_json::to_value(params).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid daemon request params: {error}"))
         })?;
-        if params.get("operation_id").is_some() && method != METHOD_WORKSPACE_MERGE {
+        if params.get("operation_id").is_some()
+            && !matches!(method, METHOD_WORKSPACE_MERGE | METHOD_WORKSPACE_CANCEL)
+        {
             params = self
                 .remember_mutation(daemon_id, method, params, None)
                 .await?;
@@ -389,7 +426,10 @@ impl DaemonWorkspaceClient {
                 "invalid daemon response payload: {error}"
             )))
         })?;
-        if let Some(operation_id) = params["operation_id"].as_str() {
+        if let Some(operation_id) = params["operation_id"]
+            .as_str()
+            .filter(|_| method != METHOD_WORKSPACE_CANCEL)
+        {
             if value["operation_id"].as_str() != Some(operation_id)
                 || value["entry_id"].as_str().is_none_or(str::is_empty)
             {
@@ -399,7 +439,7 @@ impl DaemonWorkspaceClient {
                 .into());
             }
         }
-        if method != METHOD_WORKSPACE_MERGE {
+        if !matches!(method, METHOD_WORKSPACE_MERGE | METHOD_WORKSPACE_CANCEL) {
             self.retain_result(daemon_id, method, &params, &value)
                 .await?;
             if method != METHOD_WORKSPACE_CLEANUP {
@@ -1039,6 +1079,34 @@ impl DaemonWorkspaceClient {
         {
             return Err(unavailable().into());
         }
+        let tracked = if matches!(
+            method,
+            METHOD_WORKSPACE_PREPARE
+                | METHOD_WORKSPACE_RUN
+                | METHOD_WORKSPACE_MERGE
+                | METHOD_WORKSPACE_RESET
+                | METHOD_WORKSPACE_CLEANUP
+        ) {
+            if let (Some(db), Some(step), Some(placement_id), Some(operation_id)) = (
+                &self.db,
+                db::task_writer::current_task_step(),
+                params["placement_id"].as_str(),
+                params["operation_id"].as_str(),
+            ) {
+                let placement = WorkspacePlacementRepo::get_by_id(&**db, placement_id)
+                    .await
+                    .map_err(ServiceError::from)?
+                    .ok_or_else(|| ServiceError::not_found("workspace placement", placement_id))?;
+                db.register_remote_task_operation(&step, &placement, operation_id)
+                    .await
+                    .map_err(ServiceError::from)?;
+                Some((step, operation_id.to_owned()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let frame = DaemonFrame::Request {
             id: request_id,
             method: method.to_owned(),
@@ -1070,6 +1138,9 @@ impl DaemonWorkspaceClient {
                 let value = result?;
                 if !self.registry.is_current(daemon_id, connection.id()) {
                     return Err(unavailable().into());
+                }
+                if let (Some(db),Some((step,operation_id)))=(&self.db,&tracked) {
+                    db.finish_remote_task_operation(step,operation_id).await.map_err(ServiceError::from)?;
                 }
                 Ok(value)
             }
@@ -1761,6 +1832,27 @@ pub(crate) mod tests {
         assert_eq!(
             requests[0].params["operation_id"],
             requests[1].params["operation_id"]
+        );
+        daemon.finish().await;
+    }
+    #[tokio::test]
+    async fn older_daemon_cancel_rejection_is_unreachable_and_has_no_retry() {
+        let daemon = ScriptedDaemon::new(vec![rejection(
+            api_types::UNSUPPORTED_METHOD,
+            "unknown workspace.cancel",
+            None,
+        )]);
+        let client = DaemonWorkspaceClient::new(daemon.registry.clone());
+        assert!(matches!(
+            client.cancel_workspace_operation(DAEMON_ID, "old-op").await,
+            Err(WorkspaceClientError::Transport(
+                ServiceError::DaemonUnavailable { .. }
+            ))
+        ));
+        assert_eq!(daemon.requests().len(), 1);
+        assert_eq!(
+            daemon.requests()[0].method,
+            api_types::METHOD_WORKSPACE_CANCEL
         );
         daemon.finish().await;
     }

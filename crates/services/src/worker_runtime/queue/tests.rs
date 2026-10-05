@@ -386,13 +386,11 @@ async fn committed_hook_failure_after_sleep_is_recorded_for_live_owner() {
 }
 
 #[tokio::test]
-async fn crashed_producer_reservation_expires_and_version_edit_does_not_drop_cascade() {
+async fn delayed_head_and_metadata_edit_preserve_the_cascade() {
     let (db, worker) = fixture().await;
     let mut input = step("done");
     input.available_at = lease_deadline();
     db.enqueue_step(&input).await.unwrap();
-    let producer = ProducerReservation::hold(db.clone(), Some(&input.id));
-    drop(producer);
     sqlx::query("UPDATE task SET title='edited',version=version+1 WHERE id='t'")
         .execute(db.pool())
         .await
@@ -553,4 +551,357 @@ async fn loop_event_is_broadcast_once_with_durable_audit_envelope() {
         offer.action,
         api_types::TaskAction::Restart { .. } | api_types::TaskAction::Approve { .. }
     )));
+}
+
+#[tokio::test]
+async fn owner_command_drives_fast_predecessors_before_returning_its_task() {
+    let (db, worker) = fixture().await;
+    let mutation = db::TaskMutation::TaskSetEntryBarrier {
+        id: "t".into(),
+        expected_version: 1,
+        entry_barrier_json: None,
+        updated_at: db::now_rfc3339(),
+    };
+    db.enqueue_task_mutation("t", mutation).await.unwrap();
+    let command = crate::task_service::commands::TaskCommand {
+        operation: "engine_transition".into(),
+        preempt: false,
+        arguments: serde_json::json!({"task_id":"t","target_state":"done","version":1,"workflow":workflow(),"actor":cascade_actor(),"reason":"owner queued behind fast work","rejection":false,"skip_before_exit":false,"defer_dispatch_until":null,"board_move":null,"authority":null,"entry_retry":false}),
+    };
+    let result: crate::workflow::engine::TransitionResult = Arc::new(worker)
+        .request_command("t", command)
+        .await
+        .unwrap();
+    assert_eq!(result.task.status, "done");
+    let rows = db.task_steps("t").await.unwrap();
+    assert_eq!(rows[0].kind, "mutation");
+    assert_eq!(rows[0].status, "done");
+    assert_eq!(rows[1].kind, "command");
+    assert_eq!(rows[1].status, "done");
+}
+
+async fn remote_hook_fixture() -> (
+    Arc<db::SqliteDb>,
+    TaskStepWorker,
+    db::Task,
+    db::WorkspacePlacement,
+    db::TaskStep,
+) {
+    let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    let db = Arc::new(db::SqliteDb::new(pool));
+    let (task, placement, _) = crate::recovery::tests::daemon_owned_fixture(&db).await;
+    let mut input = step("done");
+    input.task_id = task.id.clone();
+    input.expected_status = task.status.clone();
+    input.expected_version = task.version;
+    input.kind = "hooks".into();
+    input.lane = "long".into();
+    db.enqueue_step(&input).await.unwrap();
+    let claimed = db
+        .claim_step("remote-ci", Some(&task.id), &lease_deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    db.register_remote_task_operation(&claimed, &placement, "remote-ci-operation")
+        .await
+        .unwrap();
+    let service = crate::TaskService::new(db.clone(), Arc::new(events::EventBus::new(32)));
+    let worker = TaskStepWorker::new(service.workflow_engine());
+    (db, worker, task, placement, claimed)
+}
+
+async fn cancel_remote_task(worker: &TaskStepWorker, task: &db::Task) -> db::Task {
+    let mut definition = workflow();
+    definition.states[0].name = task.status.clone();
+    definition.states[0].kind = StateKind::Active;
+    definition.states[1].name = "cancelled".into();
+    definition.cancellation_state = Some("cancelled".into());
+    let current = TaskRepo::get_by_id(&*worker.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    worker
+        .engine
+        .transition(
+            &task.id,
+            "cancelled",
+            current.version,
+            &definition,
+            &Actor::user(api_types::UserActionSource::Test),
+            "Cancel remote CI",
+            false,
+        )
+        .await
+        .unwrap()
+        .task
+}
+
+#[tokio::test]
+async fn connected_remote_cancel_ack_supersedes_hook_then_cancels_task() {
+    let (db, mut worker, task, placement, claimed) = remote_hook_fixture().await;
+    let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let daemon_id = placement.daemon_id.clone().unwrap();
+    let (connection, mut outbound) =
+        crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+    worker.engine.daemon_connections = Some(registry.clone());
+    let responder = tokio::spawn(async move {
+        let api_types::DaemonFrame::Request { id, method, params } = outbound.recv().await.unwrap()
+        else {
+            panic!("cancel request")
+        };
+        assert_eq!(method, api_types::METHOD_WORKSPACE_CANCEL);
+        assert_eq!(params["operation_id"], "remote-ci-operation");
+        registry.dispatch_incoming_for_connection(
+            &daemon_id,
+            connection,
+            api_types::DaemonFrame::Response {
+                id,
+                result: serde_json::json!({"operation_id":params["operation_id"],"state":"killed"}),
+            },
+        );
+    });
+    worker.preempt_step(&claimed).await.unwrap();
+    db.release_step(&claimed.id, "remote-ci").await.unwrap();
+    responder.await.unwrap();
+    assert_eq!(cancel_remote_task(&worker, &task).await.status, "cancelled");
+    assert!(db
+        .pending_remote_cancels(None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        db.task_steps(&task.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == claimed.id)
+            .unwrap()
+            .status,
+        "superseded"
+    );
+    assert!(matches!(
+        db.finish_remote_task_operation(&claimed, "remote-ci-operation")
+            .await,
+        Err(db::DbError::VersionConflict)
+    ));
+}
+
+#[tokio::test]
+async fn disconnected_remote_cancel_fences_workspace_until_reconnect_ack() {
+    let (db, worker, task, placement, claimed) = remote_hook_fixture().await;
+    worker.preempt_step(&claimed).await.unwrap();
+    db.release_step(&claimed.id, "remote-ci").await.unwrap();
+    assert_eq!(cancel_remote_task(&worker, &task).await.status, "cancelled");
+    assert!(db.task_has_pending_remote_cancel(&task.id).await.unwrap());
+    let rows = db.task_steps(&task.id).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|s| s.id == claimed.id)
+            .unwrap()
+            .last_error
+            .as_deref(),
+        Some("remote_operation_unconfirmed")
+    );
+    let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let backend =
+        crate::workspace_backend::DaemonWorkspaceBackend::new(db.clone(), registry.clone());
+    use crate::workspace_backend::WorkspaceBackend;
+    let spec = crate::workspace_backend::RunSpec {
+        purpose: crate::workspace_backend::WorkspaceRunPurpose::CiStep,
+        command: "restart CI".into(),
+        env: Default::default(),
+        timeout_secs: 0,
+        max_output_bytes: 4096,
+    };
+    assert!(backend
+        .run(&placement, &spec)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("pending_remote_cancel"));
+    let daemon_id = placement.daemon_id.clone().unwrap();
+    let (connection, mut outbound) =
+        crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+    let responses = registry.clone();
+    let responder = tokio::spawn(async move {
+        let api_types::DaemonFrame::Request { id, method, params } = outbound.recv().await.unwrap()
+        else {
+            panic!("reconnect cancel")
+        };
+        assert_eq!(method, api_types::METHOD_WORKSPACE_CANCEL);
+        responses.dispatch_incoming_for_connection(&daemon_id,connection,api_types::DaemonFrame::Response{id,result:serde_json::json!({"operation_id":params["operation_id"],"state":"unknown"})});
+    });
+    crate::remote_cancel::reconcile(&db, registry, &placement.daemon_id.clone().unwrap())
+        .await
+        .unwrap();
+    responder.await.unwrap();
+    assert!(!db.task_has_pending_remote_cancel(&task.id).await.unwrap());
+    assert!(db
+        .task_steps(&task.id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.kind == "mutation" && s.status == "pending"));
+    assert!(matches!(
+        db.finish_remote_task_operation(&claimed, "remote-ci-operation")
+            .await,
+        Err(db::DbError::VersionConflict)
+    ));
+}
+
+#[tokio::test]
+async fn protected_merge_finishes_before_preempting_cancel_can_claim() {
+    let (db, worker) = fixture().await;
+    let mut input = step("done");
+    input.kind = "hooks".into();
+    db.enqueue_step(&input).await.unwrap();
+    let merge = db
+        .claim_step("push", Some("t"), &lease_deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    db::task_writer::in_task_step(merge.clone(), db.protect_step_integration())
+        .await
+        .unwrap();
+    let mut cancel = step("done");
+    cancel.kind = "command".into();
+    cancel.causation_key = "cancel".into();
+    cancel.payload_json =
+        serde_json::json!({"operation":"perform_task_action_as","arguments":[],"preempt":true})
+            .to_string();
+    db.enqueue_step(&cancel).await.unwrap();
+    db.request_task_preemption("t").await.unwrap();
+    assert!(db
+        .claim_step("cancel", Some("t"), &lease_deadline())
+        .await
+        .unwrap()
+        .is_none());
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET status='done',version=version+1 WHERE id='t'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    db.finish_step_in_tx(&mut tx, &merge, "done", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    db.release_step(&merge.id, "push").await.unwrap();
+    let cancel = db
+        .claim_step("cancel", Some("t"), &lease_deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancel.kind, "command");
+    assert_eq!(
+        TaskRepo::get_by_id(&*worker.db, "t", false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "done"
+    );
+}
+
+#[tokio::test]
+async fn older_daemon_rejection_still_cancels_task_and_fences_workspace() {
+    let (db, mut worker, task, placement, claimed) = remote_hook_fixture().await;
+    let registry = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let daemon_id = placement.daemon_id.clone().unwrap();
+    let (connection, mut outbound) =
+        crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
+    worker.engine.daemon_connections = Some(registry.clone());
+    let responder = tokio::spawn(async move {
+        let api_types::DaemonFrame::Request { id, method, .. } = outbound.recv().await.unwrap()
+        else {
+            panic!("cancel request")
+        };
+        assert_eq!(method, api_types::METHOD_WORKSPACE_CANCEL);
+        registry.dispatch_incoming_for_connection(
+            &daemon_id,
+            connection,
+            api_types::DaemonFrame::Error {
+                id: Some(id),
+                error: api_types::DaemonErrorPayload {
+                    code: api_types::UNSUPPORTED_METHOD.into(),
+                    message: "older daemon".into(),
+                    details: None,
+                },
+            },
+        );
+    });
+    worker.preempt_step(&claimed).await.unwrap();
+    db.release_step(&claimed.id, "remote-ci").await.unwrap();
+    responder.await.unwrap();
+    assert_eq!(cancel_remote_task(&worker, &task).await.status, "cancelled");
+    assert!(db.task_has_pending_remote_cancel(&task.id).await.unwrap());
+    assert_eq!(
+        db.task_steps(&task.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == claimed.id)
+            .unwrap()
+            .last_error
+            .as_deref(),
+        Some("remote_operation_unconfirmed")
+    );
+}
+
+#[tokio::test]
+async fn owner_command_busy_retains_its_write_until_predecessor_releases() {
+    let (db, worker) = fixture().await;
+    let predecessor = db
+        .enqueue_task_mutation(
+            "t",
+            db::TaskMutation::TaskSetEntryBarrier {
+                id: "t".into(),
+                expected_version: 1,
+                entry_barrier_json: None,
+                updated_at: db::now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+    let claimed = db
+        .claim_step("other-worker", Some("t"), &lease_deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, predecessor);
+    let worker = Arc::new(worker);
+    let command = crate::task_service::commands::TaskCommand {
+        operation: "engine_transition".into(),
+        preempt: false,
+        arguments: serde_json::json!({"task_id":"t","target_state":"done","version":1,"workflow":workflow(),"actor":cascade_actor(),"reason":"busy owner write","rejection":false,"skip_before_exit":false,"defer_dispatch_until":null,"board_move":null,"authority":null,"entry_retry":false}),
+    };
+    let result = worker
+        .request_command::<crate::workflow::engine::TransitionResult>("t", command)
+        .await;
+    assert!(matches!(
+        result,
+        Err(ServiceError::TaskBusy {
+            pending_steps: 2,
+            ..
+        })
+    ));
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, "t", false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "todo"
+    );
+    db::task_writer::in_task_step(claimed.clone(), db.execute_task_mutation(&claimed))
+        .await
+        .unwrap();
+    db.release_step(&claimed.id, "other-worker").await.unwrap();
+    assert_eq!(worker.drain("t").await.unwrap().status, "done");
+    assert!(db
+        .task_steps("t")
+        .await
+        .unwrap()
+        .iter()
+        .all(|s| s.status == "done"));
 }

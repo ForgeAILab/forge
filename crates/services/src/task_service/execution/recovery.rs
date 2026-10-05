@@ -6,6 +6,42 @@ tokio::task_local! {
 }
 
 impl TaskService {
+    pub(crate) fn recovery_context() -> Option<(String, String)> {
+        REPLAYING_RECOVERY.try_with(Clone::clone).ok()
+    }
+    pub(crate) async fn with_recovery_command_context<T>(
+        payload: &str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        let payload = serde_json::from_str::<Value>(payload).unwrap_or(Value::Null);
+        let replay =
+            serde_json::from_value::<(String, String)>(payload["replaying_recovery"].clone()).ok();
+        let actor = serde_json::from_value::<Actor>(payload["action_actor"].clone()).ok();
+        let action_command = payload["action_command"] == true;
+        let replayed = async move {
+            match replay {
+                Some(replay) => REPLAYING_RECOVERY.scope(replay, future).await,
+                None => future.await,
+            }
+        };
+        let acted = async move {
+            match actor {
+                Some(actor) => {
+                    crate::task_service::actions::TASK_ACTION_ACTOR
+                        .scope(actor, replayed)
+                        .await
+                }
+                None => replayed.await,
+            }
+        };
+        if action_command {
+            crate::task_service::actions::TASK_ACTION_COMMAND
+                .scope((), acted)
+                .await
+        } else {
+            acted.await
+        }
+    }
     pub(crate) fn is_replaying_recovery(task_id: &str) -> bool {
         REPLAYING_RECOVERY
             .try_with(|(id, _)| id == task_id)
@@ -393,6 +429,29 @@ impl TaskService {
     /// Dispatcher-only consumption of an accepted Task action. This never
     /// calls a command handler or restores the old condition to authorize it.
     pub(crate) async fn dispatch_queued_recovery(&self, task: &Task) -> Result<bool> {
+        if db::TaskStepRepo::entry_hooks_pending(&*self.db, &task.id).await? {
+            return Ok(false);
+        }
+        if self.db.task_has_pending_remote_cancel(&task.id).await? {
+            return Ok(false);
+        }
+        if !db::task_writer::owns_task(&task.id) {
+            let queued = TaskMetadata::parse(task.metadata_json.as_deref())
+                .map_err(|e| ServiceError::invalid_operation(e.to_string()))?
+                .extra
+                .contains_key(crate::deferred_dispatch::QUEUED_RECOVERY_KEY);
+            if !queued {
+                return Ok(false);
+            }
+            return self
+                .request_task_command(
+                    &task.id,
+                    "dispatch_queued_recovery",
+                    serde_json::json!([task.id]),
+                    false,
+                )
+                .await;
+        }
         let result = Box::pin(self.dispatch_queued_task_action_inner(task)).await;
         if let Err(error) = &result {
             if self.settle_queued_task_action_refusal(task, error).await? {
@@ -1182,11 +1241,22 @@ impl TaskService {
         kind: Option<api_types::FailureKind>,
         execution_id: Option<String>,
     ) -> Result<Task> {
-        let task_id = task_id.into();
+        let task_id: String = task_id.into();
+        let reason: String = reason.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "fail_task",
+                    serde_json::json!([task_id, reason, kind, execution_id]),
+                    false,
+                )
+                .await;
+        }
+
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        let reason = reason.into();
         let failed_meta = json!({
             "reason": reason,
             "created_at": now_rfc3339(),
@@ -2128,14 +2198,16 @@ impl TaskService {
             let follow_up = self
                 .insert_created_task_in_tx(&mut transaction, follow_up, follow_up_governance)
                 .await?;
-            let linked = sqlx::query(
+            let linked = db::task_writer::TaskQuery::new(
+                &self.db,
+                &task.id,
                 "UPDATE task SET metadata_json = ?, version = version + 1
                  WHERE id = ? AND version = ?",
             )
             .bind(json!({ "follow_up_of": task.id }).to_string())
             .bind(&follow_up.id)
             .bind(follow_up.version)
-            .execute(&mut *transaction)
+            .execute_in_tx(&mut transaction)
             .await?;
             if linked.rows_affected() != 1 {
                 return Err(db::DbError::VersionConflict.into());
@@ -2146,14 +2218,16 @@ impl TaskService {
                 manual_pass,
             )
             .await?;
-            let cleared = sqlx::query(
+            let cleared = db::task_writer::TaskQuery::new(
+                &self.db,
+                &task.id,
                 "UPDATE task SET error_annotation = NULL, blocked_json = NULL,
                  updated_at = ?, version = version + 1 WHERE id = ? AND version = ?",
             )
             .bind(&finished_at)
             .bind(&task.id)
             .bind(task.version)
-            .execute(&mut *transaction)
+            .execute_in_tx(&mut transaction)
             .await?;
             if cleared.rows_affected() != 1 {
                 return Err(db::DbError::VersionConflict.into());

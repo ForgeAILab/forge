@@ -290,19 +290,19 @@ impl TaskService {
             .to_string()
         });
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let result = sqlx::query("UPDATE task SET metadata_json = CASE WHEN ? IS NULL THEN
+        let result = db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET metadata_json = CASE WHEN ? IS NULL THEN
             json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
             json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
             error_annotation = COALESCE(?, error_annotation),
             blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + ? WHERE id = ? AND version = ?")
             .bind(&deferral).bind(&deferral).bind(&annotation).bind(&blocked).bind(now.to_rfc3339()).bind(i64::from(!unchanged_reason))
-            .bind(&task.id).bind(task.version).execute(&mut *tx).await?;
+            .bind(&task.id).bind(task.version).execute_in_tx(&mut tx).await?;
         if result.rows_affected() != 1 {
             return Err(DbError::VersionConflict.into());
         }
         if let Some(owner_wait) = owner_wait.filter(|_| !unchanged_reason) {
-            sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ?")
-                .bind(owner_wait).bind(&task.id).execute(&mut *tx).await?;
+            db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ?")
+                .bind(owner_wait).bind(&task.id).execute_in_tx(&mut tx).await?;
         }
         if daemon_id.is_some() && !unchanged_reason {
             crate::placement::admission::record_wait_attention_in_tx(
@@ -341,6 +341,16 @@ impl TaskService {
         if !expired || task.blocked_json.is_some() {
             return Ok(false);
         }
+        if !db::task_writer::owns_task(&task.id) {
+            return self
+                .request_task_command(
+                    &task.id,
+                    "expire_owner_wait",
+                    serde_json::json!([task.id]),
+                    false,
+                )
+                .await;
+        }
         let error = ServiceError::DaemonUnavailable {
             daemon_id: daemon_id.into(),
         };
@@ -359,8 +369,8 @@ impl TaskService {
             return Ok(true);
         }
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?")
-            .bind(&task.id).bind(current.version).execute(&mut *tx).await?;
+        db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?")
+            .bind(&task.id).bind(current.version).execute_in_tx(&mut tx).await?;
         sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
             .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-owner-wait:{}", task.id))
             .bind(format!("task-environment-wait:{}", task.id)).execute(&mut *tx).await?;
@@ -1170,13 +1180,13 @@ impl TaskService {
             context.environment_admission = admission.environment_admission;
             crate::placement::select_placement(&context).into_result()?;
         }
-        sqlx::query(
+        db::task_writer::TaskQuery::new(&self.db,&task.id,
             "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.environment_wait', '$.deferred_dispatch')
             WHERE id = ? AND (json_type(metadata_json, '$.owner_wait') IS NOT NULL
             OR json_type(metadata_json, '$.environment_wait') IS NOT NULL)",
         )
         .bind(&task.id)
-        .execute(&mut **transaction)
+        .execute_in_tx(transaction)
         .await?;
         sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
             WHERE dedupe_key IN (?, ?) AND status <> 'resolved'")
@@ -2327,6 +2337,7 @@ pub(super) async fn reset_daemon_workspace(
         .bind(prepared.base_sha).bind(prepared.branch).bind(now_rfc3339()).bind(&workspace.id)
         .execute(&mut *transaction).await?;
     crate::placement::admission::resolve_workspace_attention_in_tx(
+        db,
         &mut transaction,
         &placement.task_id,
     )
@@ -4932,6 +4943,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attention, 1);
+        service.drain(&task.id).await.unwrap();
         let waiting = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -4946,6 +4958,7 @@ mod tests {
             .defer_placement_refusal(&waiting, &refusal)
             .await
             .unwrap());
+        service.drain(&task.id).await.unwrap();
         let again = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -4960,12 +4973,14 @@ mod tests {
         assert_eq!(unchanged, attention_version);
         sqlx::query("UPDATE task SET metadata_json = json_set(metadata_json, '$.owner_wait.started_at', ?) WHERE id = ?")
             .bind((Utc::now() - chrono::Duration::seconds(2)).to_rfc3339()).bind(&task.id).execute(db.pool()).await.unwrap();
+        let service = Arc::new(service);
         let dispatcher = crate::task_dispatcher::TaskDispatcher::new(
             db.clone(),
             Arc::new(EventBus::default()),
-            Arc::new(service),
+            service.clone(),
         );
         dispatcher.check_once().await.unwrap();
+        service.drain(&task.id).await.unwrap();
         let task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()

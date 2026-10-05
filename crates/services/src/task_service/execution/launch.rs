@@ -12,6 +12,17 @@ impl TaskService {
         role: &str,
         action: &api_types::TaskAction,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(&task.id) {
+            return self
+                .request_task_command(
+                    &task.id,
+                    "dispatch_recovery_role",
+                    serde_json::json!([task, project, workflow, agent_id, role, action]),
+                    false,
+                )
+                .await;
+        }
+
         if role == crate::workflow::default_roles::REVIEWER {
             self.ensure_review_attempt_for_recovery(task, project)
                 .await?;
@@ -161,6 +172,24 @@ impl TaskService {
         dispatch_metadata: Option<Value>,
         admission: db::ExecutionAdmission,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_initial_role_execution_with_metadata_and_admission",
+                    serde_json::json!([
+                        task_id,
+                        agent_id,
+                        role,
+                        prompt,
+                        dispatch_metadata,
+                        admission
+                    ]),
+                    false,
+                )
+                .await;
+        }
+
         self.dispatch_initial_role_execution_with_optional_admission(
             task_id,
             agent_id,
@@ -172,7 +201,7 @@ impl TaskService {
         .await
     }
 
-    async fn dispatch_initial_role_execution_with_optional_admission(
+    pub(crate) async fn dispatch_initial_role_execution_with_optional_admission(
         &self,
         task_id: &str,
         agent_id: &str,
@@ -181,6 +210,23 @@ impl TaskService {
         dispatch_metadata: Option<Value>,
         admission: Option<db::ExecutionAdmission>,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_initial_role_execution_with_optional_admission",
+                    serde_json::json!([
+                        task_id,
+                        agent_id,
+                        role,
+                        prompt,
+                        dispatch_metadata,
+                        admission
+                    ]),
+                    false,
+                )
+                .await;
+        }
         validate_required("task_id", task_id)?;
         validate_required("agent_id", agent_id)?;
         validate_required("role", role)?;
@@ -304,8 +350,19 @@ impl TaskService {
         summary: Option<String>,
         overrides: Option<ExecutionOverrides>,
     ) -> Result<LaunchExecutionResult> {
-        let task_id = task_id.into();
-        let agent_id = agent_id.into();
+        let task_id: String = task_id.into();
+        let agent_id: String = agent_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "launch_execution",
+                    serde_json::json!([task_id, agent_id, summary, overrides]),
+                    false,
+                )
+                .await;
+        }
+
         validate_required("task_id", &task_id)?;
         validate_required("agent_id", &agent_id)?;
 
@@ -442,6 +499,20 @@ impl TaskService {
         agent_id: Option<String>,
         overrides: Option<ExecutionOverrides>,
     ) -> Result<LaunchExecutionResult> {
+        let parent_execution_id: String = parent_execution_id.into();
+        let parent = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.clone()))?;
+        if !db::task_writer::owns_task(&parent.task_id) {
+            return self
+                .request_task_command(
+                    &parent.task_id,
+                    "follow_up_execution",
+                    serde_json::json!([parent_execution_id, message, agent_id, overrides]),
+                    false,
+                )
+                .await;
+        }
         self.follow_up_execution_with_role(parent_execution_id, message, agent_id, overrides, None)
             .await
     }
@@ -456,6 +527,22 @@ impl TaskService {
         agent_id: Option<String>,
         overrides: Option<ExecutionOverrides>,
     ) -> Result<LaunchExecutionResult> {
+        let parent_execution_id: String = parent_execution_id.into();
+        let _command_task_id = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.to_owned()))?
+            .task_id;
+        if !db::task_writer::owns_task(&_command_task_id) {
+            return self
+                .request_task_command(
+                    &_command_task_id,
+                    "follow_up_interactive_execution",
+                    serde_json::json!([parent_execution_id, message, agent_id, overrides]),
+                    false,
+                )
+                .await;
+        }
+
         self.follow_up_execution_with_role(
             parent_execution_id,
             message,
@@ -474,7 +561,7 @@ impl TaskService {
         overrides: Option<ExecutionOverrides>,
         requested_role: Option<&str>,
     ) -> Result<LaunchExecutionResult> {
-        let parent_execution_id = parent_execution_id.into();
+        let parent_execution_id: String = parent_execution_id.into();
         validate_required("parent_execution_id", &parent_execution_id)?;
 
         let parent_execution = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
@@ -747,6 +834,7 @@ impl TaskService {
         &self,
         parent_execution_id: impl Into<String>,
     ) -> Result<LaunchExecutionResult> {
+        let parent_execution_id: String = parent_execution_id.into();
         self.re_execute_execution_with_context(parent_execution_id, None)
             .await
     }
@@ -756,6 +844,22 @@ impl TaskService {
         parent_execution_id: impl Into<String>,
         context: Option<String>,
     ) -> Result<LaunchExecutionResult> {
+        let parent_execution_id: String = parent_execution_id.into();
+        let _command_task_id = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", parent_execution_id.to_owned()))?
+            .task_id;
+        if !db::task_writer::owns_task(&_command_task_id) {
+            return self
+                .request_task_command(
+                    &_command_task_id,
+                    "re_execute_execution_with_context",
+                    serde_json::json!([parent_execution_id, context]),
+                    false,
+                )
+                .await;
+        }
+
         Box::pin(self.re_execute_execution_with_context_inner(parent_execution_id, context, false))
             .await
     }
@@ -766,7 +870,7 @@ impl TaskService {
         context: Option<String>,
         clear_recovery_metadata: bool,
     ) -> Result<LaunchExecutionResult> {
-        let parent_execution_id = parent_execution_id.into();
+        let parent_execution_id: String = parent_execution_id.into();
         validate_required("parent_execution_id", &parent_execution_id)?;
 
         let parent_execution = ExecutionRepo::get_by_id(&*self.db, &parent_execution_id)
@@ -1142,6 +1246,22 @@ impl TaskService {
         execution_id: impl Into<String>,
         reason: String,
     ) -> Result<Execution> {
+        let execution_id: String = execution_id.into();
+        let _command_task_id = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?
+            .task_id;
+        if !db::task_writer::owns_task(&_command_task_id) {
+            return self
+                .request_task_command(
+                    &_command_task_id,
+                    "stop_execution",
+                    serde_json::json!([execution_id, reason]),
+                    false,
+                )
+                .await;
+        }
+
         self.stop_execution_with_actor(
             execution_id,
             reason,
@@ -1157,6 +1277,22 @@ impl TaskService {
         execution_id: impl Into<String>,
         reason: String,
     ) -> Result<Execution> {
+        let execution_id: String = execution_id.into();
+        let _command_task_id = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?
+            .task_id;
+        if !db::task_writer::owns_task(&_command_task_id) {
+            return self
+                .request_task_command(
+                    &_command_task_id,
+                    "pause_execution",
+                    serde_json::json!([execution_id, reason]),
+                    false,
+                )
+                .await;
+        }
+
         self.stop_execution_with_actor(
             execution_id,
             reason,
@@ -1175,7 +1311,7 @@ impl TaskService {
         blocking_reason: &str,
         annotation_message: &str,
     ) -> Result<Execution> {
-        let execution_id = execution_id.into();
+        let execution_id: String = execution_id.into();
         let execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
@@ -1341,10 +1477,30 @@ impl TaskService {
         annotation: String,
         initial_updated_at: String,
     ) -> Result<()> {
+        if !db::task_writer::owns_task(&initial_task.id) {
+            return self
+                .request_task_command(
+                    &initial_task.id,
+                    "persist_manual_stop_annotation",
+                    serde_json::json!([
+                        execution,
+                        initial_task,
+                        expected_status,
+                        expected_state_entry_token,
+                        expected_role,
+                        expected_workflow_definition,
+                        expected_assignment,
+                        annotation,
+                        initial_updated_at
+                    ]),
+                    false,
+                )
+                .await;
+        }
         let initial_error_annotation = initial_task.error_annotation.clone();
-        let mut candidate = initial_task.clone();
-        let mut updated_at = initial_updated_at;
-        for _ in 0..4 {
+        let candidate = initial_task.clone();
+        let updated_at = initial_updated_at;
+        {
             if candidate.status != expected_status {
                 tracing::debug!(
                     task_id = %candidate.id,
@@ -1420,18 +1576,11 @@ impl TaskService {
             )
             .await
             {
-                Ok(_) => return Ok(()),
-                Err(db::DbError::ExecutionAlreadyRunning { .. }) => return Ok(()),
-                Err(db::DbError::VersionConflict) => {
-                    candidate = TaskRepo::get_by_id(&*self.db, &candidate.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", candidate.id.clone()))?;
-                    updated_at = now_rfc3339();
-                }
-                Err(error) => return Err(ServiceError::Db(error)),
+                Ok(_) => Ok(()),
+                Err(db::DbError::ExecutionAlreadyRunning { .. }) => Ok(()),
+                Err(error) => Err(ServiceError::Db(error)),
             }
         }
-        Err(ServiceError::Db(db::DbError::VersionConflict))
     }
 }
 

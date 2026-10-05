@@ -31,6 +31,21 @@ impl TaskService {
     /// retries against current authority. This keeps duplicate delivery
     /// idempotent without dropping a successor role's terminal completion.
     pub async fn maybe_cascade_executor_completion(&self, execution_id: &str) -> Result<()> {
+        let _command_task_id = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?
+            .task_id;
+        if !db::task_writer::owns_task(&_command_task_id) {
+            return self
+                .request_task_command(
+                    &_command_task_id,
+                    "maybe_cascade_executor_completion",
+                    serde_json::json!([execution_id]),
+                    false,
+                )
+                .await;
+        }
+
         self.cascade_executor_completion(execution_id).await
     }
 
@@ -39,28 +54,15 @@ impl TaskService {
         let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
             return Ok(true);
         };
-        let service = self.clone();
-        let execution_id = execution_id.to_owned();
-        tokio::spawn(async move {
-            let result = service.cascade_executor_completion(&execution_id).await;
-            if let Err(error) = result {
-                tracing::warn!(%execution_id, %error, "detached completion cascade remains pending");
-                return;
-            }
-            if let Some(registry) = &service.daemon_connections {
-                if let Ok(Some(placement)) =
-                    db::WorkspacePlacementRepo::get_for_task(&*service.db, &execution.task_id).await
-                {
-                    if let Some(daemon_id) =
-                        crate::recovery::placement_execution_daemon_id(&placement)
-                    {
-                        if let Err(error) = registry.retry_retained_terminals(daemon_id).await {
-                            tracing::warn!(%daemon_id, %error, "cascade acknowledgement remains pending");
-                        }
-                    }
-                }
-            }
-        });
+        self.enqueue_task_command(
+            &execution.task_id,
+            "maybe_cascade_executor_completion",
+            serde_json::json!([execution_id]),
+            false,
+        )
+        .await?;
+        let worker = self.task_step_worker();
+        db::task_writer::TaskStepExecutor::drive_inline(&*worker, &execution.task_id).await?;
         Ok(true)
     }
 
@@ -70,6 +72,14 @@ impl TaskService {
             None => return Ok(()),
         };
         let task_snapshot = TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await?;
+        if task_snapshot.as_ref().is_some_and(|task| {
+            task.error_annotation
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .is_some_and(|a| a["type"] == "manual_stop")
+        }) {
+            return Ok(());
+        }
         if execution.role == crate::workflow::default_roles::REVIEWER {
             if execution.status == ExecutionStatus::Running {
                 return Ok(());

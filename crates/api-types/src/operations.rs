@@ -82,6 +82,8 @@ pub struct OperatorStatusResponse {
     pub event_consumers: Vec<EventConsumerStatus>,
     pub periodic_workers: Vec<PeriodicWorkerStatus>,
     pub task_steps: TaskStepQueueStatus,
+    #[ts(type = "number")]
+    pub pending_remote_cancels: i64,
     pub event_relay: EventRelayStatus,
     pub database: DatabaseStorageStatus,
     pub computed_at: String,

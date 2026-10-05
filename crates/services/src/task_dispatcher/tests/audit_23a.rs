@@ -221,24 +221,30 @@ async fn audit_23a_annotation_clear_and_board_reorder_preserve_review_entry() {
                 .await
                 .unwrap();
         } else {
-            let annotated = TaskRepo::update(
-                &*db,
-                UpdateTask {
-                    title: None,
-                    error_annotation: Some(Some(
-                        r#"{"type":"executor_failed","message":"old"}"#.into(),
-                    )),
-                    ..title_edit(&result.task)
+            // Workflow annotations queue behind the entry hooks; they cannot
+            // mutate the Task while those hooks hold its lease.
+            db.enqueue_task_mutation(
+                &task.id,
+                db::TaskMutation::TaskUpdate {
+                    input: UpdateTask {
+                        title: None,
+                        error_annotation: Some(Some(
+                            r#"{"type":"executor_failed","message":"old"}"#.into(),
+                        )),
+                        ..title_edit(&result.task)
+                    },
                 },
             )
             .await
             .unwrap();
-            TaskRepo::update(
-                &*db,
-                UpdateTask {
-                    title: None,
-                    error_annotation: Some(None),
-                    ..title_edit(&annotated)
+            db.enqueue_task_mutation(
+                &task.id,
+                db::TaskMutation::TaskUpdate {
+                    input: UpdateTask {
+                        title: None,
+                        error_annotation: Some(None),
+                        ..title_edit(&result.task)
+                    },
                 },
             )
             .await

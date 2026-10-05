@@ -77,3 +77,9 @@ describe('Task workspace placement', () => {
     expect(useDaemonsQuery).toHaveBeenCalledWith(false)
   })
 })
+
+it('shows the workspace exclusion while remote cancellation is unconfirmed', () => {
+  render(<TaskWorkspacePlacement placement={serverPlacement({ state: 'ready' })} pendingRemoteCancelCount={1} />)
+  expect(screen.getByText('Remote cleanup pending')).toBeTruthy()
+  expect(screen.getByText('Restart and Retry wait for that confirmation.')).toBeTruthy()
+})

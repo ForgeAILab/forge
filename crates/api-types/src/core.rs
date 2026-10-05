@@ -4,6 +4,17 @@ use serde_json::Value;
 use ts_rs::TS;
 
 pub type TaskStatus = String;
+pub const TASK_BUSY: &str = "task_busy";
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskBusyDetails {
+    #[ts(type = "number")]
+    pub pending_steps: i64,
+    #[ts(type = "number")]
+    pub retry_after_ms: u64,
+    pub retry_hint: String,
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]

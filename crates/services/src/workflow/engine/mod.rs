@@ -98,8 +98,8 @@ fn preserve_dispatch_annotation(raw_annotation: Option<&str>) -> bool {
         })
 }
 
-/// Persist a `dispatch_failed` error annotation on the task, retrying version
-/// conflicts. Shared by the engine's dispatch-failure fallback and the task
+/// Persist a `dispatch_failed` error annotation through the Task writer.
+/// Shared by the engine's dispatch-failure fallback and the task
 /// dispatcher's governance parking.
 pub(crate) async fn annotate_dispatch_failure(
     db: &db::SqliteDb,
@@ -192,10 +192,10 @@ async fn annotate_dispatch_failure_details(
             .extend(details.as_object().unwrap().clone());
     }
     let annotation = annotation.to_string();
-    let mut current = TaskRepo::get_by_id(db, task_id, false)
+    let current = TaskRepo::get_by_id(db, task_id, false)
         .await?
         .ok_or(db::DbError::NotFound)?;
-    for attempt in 0..3 {
+    {
         if let Some(raw) = current.error_annotation.as_deref() {
             if preserve_dispatch_annotation(Some(raw)) {
                 return Ok(());
@@ -229,6 +229,20 @@ async fn annotate_dispatch_failure_details(
             parent_task_id: None,
             updated_at: now_rfc3339(),
         };
+        if !db::task_writer::owns_task(task_id) {
+            return db
+                .run_task_mutation(
+                    task_id,
+                    db::TaskMutation::TaskUpdateIfAnnotation {
+                        input: update,
+                        expected_annotation: current.error_annotation.clone(),
+                        expected_project_version: authority.map(|a| a.project_version),
+                        expected_workflow_definition: authority
+                            .map(|a| a.workflow_definition.clone()),
+                    },
+                )
+                .await;
+        }
         let result = match authority {
             Some(authority) => {
                 TaskRepo::update_with_workflow_authority(
@@ -242,16 +256,10 @@ async fn annotate_dispatch_failure_details(
             None => TaskRepo::update(db, update).await,
         };
         match result {
-            Ok(_) => return Ok(()),
-            Err(db::DbError::VersionConflict) if attempt < 2 => {
-                current = TaskRepo::get_by_id(db, task_id, false)
-                    .await?
-                    .ok_or(db::DbError::NotFound)?;
-            }
-            Err(error) => return Err(error),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
         }
     }
-    Ok(())
 }
 
 /// Clear a `dispatch_failed` error annotation (and only that annotation type)
@@ -271,10 +279,10 @@ async fn clear_dispatch_failure_matching(
     authority: Option<&WorkflowAuthority>,
     matches: impl Fn(&serde_json::Value) -> bool,
 ) -> db::Result<()> {
-    let mut current = TaskRepo::get_by_id(db, task_id, false)
+    let current = TaskRepo::get_by_id(db, task_id, false)
         .await?
         .ok_or(db::DbError::NotFound)?;
-    for attempt in 0..3 {
+    {
         if !is_dispatch_failed_annotation(current.error_annotation.as_deref()) {
             return Ok(());
         }
@@ -299,6 +307,20 @@ async fn clear_dispatch_failure_matching(
             parent_task_id: None,
             updated_at: now_rfc3339(),
         };
+        if !db::task_writer::owns_task(task_id) {
+            return db
+                .run_task_mutation(
+                    task_id,
+                    db::TaskMutation::TaskUpdateIfAnnotation {
+                        input: update,
+                        expected_annotation: current.error_annotation.clone(),
+                        expected_project_version: authority.map(|a| a.project_version),
+                        expected_workflow_definition: authority
+                            .map(|a| a.workflow_definition.clone()),
+                    },
+                )
+                .await;
+        }
         let result = match authority {
             Some(authority) => {
                 TaskRepo::update_with_workflow_authority(
@@ -312,16 +334,10 @@ async fn clear_dispatch_failure_matching(
             None => TaskRepo::update(db, update).await,
         };
         match result {
-            Ok(_) => return Ok(()),
-            Err(db::DbError::VersionConflict) if attempt < 2 => {
-                current = TaskRepo::get_by_id(db, task_id, false)
-                    .await?
-                    .ok_or(db::DbError::NotFound)?;
-            }
-            Err(error) => return Err(error),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
         }
     }
-    Ok(())
 }
 
 pub(crate) async fn wake_upgraded_daemon_tasks(
@@ -383,7 +399,7 @@ async fn clear_upgrade_dispatch_refusal(db: &db::SqliteDb, task: &db::Task) -> c
     }
     let clear_annotation = annotation["type"] == DISPATCH_FAILED_ANNOTATION
         && annotation["code"] == api_types::DAEMON_UPGRADE_REQUIRED;
-    let result = sqlx::query(
+    let result = db::task_writer::TaskQuery::new(db,&task.id,
         "UPDATE task SET
             error_annotation = CASE WHEN ? THEN NULL ELSE error_annotation END,
             metadata_json = NULLIF(json_remove(metadata_json, '$.daemon_upgrade_refusal', '$.dispatch_disposition', '$.deferred_dispatch'), '{}'),
@@ -426,6 +442,7 @@ pub struct WorkflowEngine {
     pub workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct TransitionResult {
     pub task: db::Task,
     pub review: Option<db::Review>,
@@ -434,7 +451,7 @@ pub struct TransitionResult {
     pub board_move: Option<BoardMoveOutcome>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BoardMoveRequest {
     pub operation_id: String,
     pub project_id: String,
@@ -458,7 +475,7 @@ pub struct WorkflowAuthority {
     pub clear_review_passed_at_on_commit: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BoardMoveOutcome {
     Committed(MoveTaskResult),
     Replayed(MoveTaskResult),
@@ -473,19 +490,12 @@ impl WorkflowEngine {
     async fn refresh_task_after_hook(
         &self,
         task: &mut db::Task,
-        expected_status: &str,
-        step: Option<&db::TaskStep>,
+        _expected_status: &str,
+        _step: Option<&db::TaskStep>,
     ) -> crate::Result<()> {
         let latest = TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-        let entry_matches = match step {
-            Some(step) => self.db.step_entry_matches(step).await?,
-            None => true,
-        };
-        if latest.status != expected_status || !entry_matches {
-            return Err(db::DbError::VersionConflict.into());
-        }
         *task = latest;
         Ok(())
     }
@@ -1003,7 +1013,7 @@ impl WorkflowEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn transition_inner<'a>(
+    pub(crate) fn transition_inner<'a>(
         &'a self,
         task_id: String,
         target_state: String,
@@ -1033,11 +1043,25 @@ impl WorkflowEngine {
         );
 
         Box::pin(async move {
+            if !db::task_writer::owns_task(&task_id) {
+                let preempt = Self::is_cancellation_target(workflow, &target_state);
+                let command=crate::task_service::commands::TaskCommand {
+                    operation:"engine_transition".to_owned(),preempt,
+                    arguments:serde_json::json!({"task_id":task_id,"target_state":target_state,"version":version,"workflow":workflow,"actor":actor,"reason":reason,"rejection":rejection,"skip_before_exit":skip_before_exit,"defer_dispatch_until":defer_dispatch_until,"board_move":board_move,"authority":authority,"entry_retry":entry_retry}),
+                };
+                if db::task_writer::current_task_step().is_some_and(|step|step.task_id!=task_id) && reason=="root subtask cascade" {
+                    self.task_service.enqueue_task_command(&task_id,&command.operation,command.arguments,preempt).await?;
+                    let task=TaskRepo::get_by_id(&*self.db,&task_id,false).await?.ok_or(db::DbError::NotFound)?;
+                    return Ok(TransitionResult {task,review:None,queued_step_id:None,pending_steps:self.db.pending_steps(&task_id).await?,board_move:None});
+                }
+                return Arc::new(crate::worker_runtime::queue::TaskStepWorker::new(self.clone()))
+                    .request_command(&task_id,command).await;
+            }
             let mut task = TaskRepo::get_by_id(&*self.db, &task_id, false)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
 
-            if step.is_none() && task.version != version {
+            if step.is_none() && !db::task_writer::owns_task(&task_id) && task.version != version {
                 tracing::warn!(
                     task_id = %task.id,
                     expected_version = version,
@@ -1058,7 +1082,7 @@ impl WorkflowEngine {
                 });
             }
 
-            let version = if step.is_some() { task.version } else { version };
+            let version = task.version;
             let current_status = task.status.to_string();
             tracing::debug!(
                 task_id = %task.id,
@@ -1491,6 +1515,9 @@ impl WorkflowEngine {
                     }
                 } else {
                     let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        self.db.fence_current_step_in_tx(&mut transaction).await?;
+                    let version: i64 = sqlx::query_scalar("SELECT version FROM task WHERE id=?")
+                        .bind(&task_id).fetch_one(&mut *transaction).await?;
                     if let Some(authority) = authority.as_ref() {
                         let project_authority = query(
                             "SELECT version, workflow_definition FROM project WHERE id = ?",
@@ -1627,8 +1654,6 @@ impl WorkflowEngine {
                     (task, transition_log, None)
                 };
             drop(cleanup_guard);
-            let _step_reservation = crate::worker_runtime::queue::ProducerReservation::hold(
-                Arc::clone(&self.db), initial_hook_step.as_ref().map(|s| s.id.as_str()));
 
             tracing::info!(
                 task_id = %task.id,
@@ -1679,9 +1704,7 @@ impl WorkflowEngine {
                 }
             }
             let pending_steps = self.db.pending_steps(&task_id).await?;
-            if !crate::worker_runtime::queue::producer_deferred(&task_id) {
-                if let Some(id) = &queued_step_id { self.db.ready_step(id).await?; }
-            }
+            if let Some(id) = &queued_step_id { self.db.ready_step(id).await?; }
             let review = latest_review(&self.db, &task.id).await?;
 
             Ok(TransitionResult {
@@ -1702,20 +1725,23 @@ impl WorkflowEngine {
         workflow: &WorkflowDefinition,
         authority: Option<WorkflowAuthority>,
     ) -> crate::Result<TransitionResult> {
-        self.transition_inner(
-            step.task_id.clone(),
-            payload.to.clone(),
-            step.expected_version,
-            workflow,
-            crate::worker_runtime::queue::cascade_actor(),
-            payload.reason.clone(),
-            payload.rejection,
-            payload.skip_before_exit,
-            None,
-            None,
-            Some(step.clone()),
-            authority,
-            false,
+        db::task_writer::in_task_step(
+            step.clone(),
+            self.transition_inner(
+                step.task_id.clone(),
+                payload.to.clone(),
+                step.expected_version,
+                workflow,
+                crate::worker_runtime::queue::cascade_actor(),
+                payload.reason.clone(),
+                payload.rejection,
+                payload.skip_before_exit,
+                None,
+                None,
+                Some(step.clone()),
+                authority,
+                false,
+            ),
         )
         .await
     }
@@ -1840,7 +1866,7 @@ impl WorkflowEngine {
             expected_version: task.version,
             expected_epoch,
             lane: crate::worker_runtime::queue::cascade_lane(workflow, &payload.to).into(),
-            available_at: (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+            available_at: now_rfc3339(),
         })
     }
 

@@ -11,7 +11,7 @@ use sqlx::{sqlite::SqliteRow, Row};
 /// use this default unless the user explicitly configured a budget.
 pub const DEFAULT_PROJECT_AGENT_WAKE_BUDGET: i64 = 10;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -1022,7 +1022,7 @@ pub struct EventConsumerCutover {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Workspace {
     pub id: String,
     pub task_id: String,
@@ -1047,7 +1047,7 @@ impl Workspace {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WorkspaceStatus {
     Creating,
     Ready,
@@ -1344,7 +1344,7 @@ pub enum MoveTaskPersistence {
     Replayed(Box<MoveTaskResult>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Execution {
     pub id: String,
     pub task_id: String,
@@ -1892,7 +1892,7 @@ pub struct ContextManifestSource {
     pub fragment_fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExecutionStatus {
     Running,
     Completed,
@@ -1900,7 +1900,7 @@ pub enum ExecutionStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StopReason {
     UserCancelled,
     TaskCancelled,
@@ -1915,7 +1915,7 @@ pub enum StopReason {
     LegacyUnknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResumePolicy {
     Auto,
     Manual,
@@ -1927,7 +1927,7 @@ pub enum ResumePolicy {
 /// a hard deadline, the first claim establishes that immutable deadline for
 /// the attempt; `None` leaves the execution bounded only by its renewable
 /// owner lease and explicit cancellation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClaimExecutionLease {
     pub execution_id: String,
     pub expected_version: i64,
@@ -2130,7 +2130,7 @@ pub enum ExecutionTerminalOutcome {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Review {
     pub id: String,
     pub task_id: String,
@@ -2148,7 +2148,7 @@ pub struct Review {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReviewStatus {
     Running,
     AwaitingHuman,
@@ -3097,7 +3097,7 @@ pub struct AgentActionExecution {
 /// immutable in both the Rust repository surface and the SQLite schema so an
 /// identical retry can return the original result without rerunning a domain
 /// mutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandReceipt {
     pub id: String,
     pub principal_type: String,

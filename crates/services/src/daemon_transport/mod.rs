@@ -73,6 +73,9 @@ pub enum DaemonTerminalDisposition {
 
 #[async_trait]
 pub trait DaemonExecutionEventHandler: Send + Sync {
+    async fn handle_connected(&self, _daemon_id: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
     async fn handle_disconnected(&self, _daemon_id: &str) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -1123,6 +1126,14 @@ impl DaemonConnectionRegistry {
                     connection.set_protocol_compatibility(compatible);
                 }
                 if compatible {
+                    if let Some(handler) = lock(&self.inner.execution_events).clone() {
+                        let daemon_id = daemon_id.to_owned();
+                        tokio::spawn(async move {
+                            if let Err(error) = handler.handle_connected(&daemon_id).await {
+                                tracing::warn!(%daemon_id,%error,"pending remote cancellations remain fenced");
+                            }
+                        });
+                    }
                     tracing::debug!(
                         daemon_id,
                         connection_id,

@@ -577,6 +577,18 @@ impl ServerExecutionEventSink {
 
 #[async_trait]
 impl DaemonExecutionEventHandler for ServerExecutionEventSink {
+    async fn handle_connected(&self, daemon_id: &str) -> Result<()> {
+        let registry = self
+            .connection_registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(registry) = registry {
+            crate::remote_cancel::reconcile(&self.db, registry, daemon_id).await?;
+        }
+        Ok(())
+    }
     async fn handle_disconnected(&self, daemon_id: &str) -> Result<()> {
         crate::recovery::disconnect_daemon_placements(&self.db, &self.event_bus, daemon_id).await?;
         Ok(())
@@ -1698,7 +1710,12 @@ mod cancellation_tests {
                 .await
             })
         };
-        describe_started.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            describe_started.notified(),
+        )
+        .await
+        .expect("placement reconciliation sends describe");
         cancelled.abort();
         assert!(cancelled.await.unwrap_err().is_cancelled());
         assert!(lock(&registry.get(&daemon_id).unwrap().pending).is_empty());
@@ -1709,7 +1726,15 @@ mod cancellation_tests {
         monitor.check_once().await.unwrap();
         // A second tick must not start another describe for this placement.
         monitor.check_once().await.unwrap();
-        acked.notified().await;
+        if tokio::time::timeout(std::time::Duration::from_secs(30), acked.notified())
+            .await
+            .is_err()
+        {
+            panic!("terminal report is acknowledged after reconciliation: placement={:?}, steps={:?}, reports={:?}, retained={:?}, describes={}",
+                WorkspacePlacementRepo::get_by_id(&*db,&placement.id).await.unwrap().map(|p|p.state),
+                db::TaskStepRepo::task_steps(&*db,&placement.task_id).await.unwrap().iter().map(|s|(&s.kind,&s.status,&s.last_error,&s.claimed_by)).collect::<Vec<_>>(),
+                lock(&sink.terminal_reports), registry.retained_terminal_execution_ids(), describes.load(std::sync::atomic::Ordering::SeqCst));
+        }
         responder.await.unwrap();
         monitor.finish_placement_workers().await;
         assert_eq!(

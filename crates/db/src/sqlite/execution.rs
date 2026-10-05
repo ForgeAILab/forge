@@ -7,6 +7,19 @@ use std::collections::HashSet;
 #[async_trait]
 impl ExecutionRepo for SqliteDb {
     async fn create(&self, input: CreateExecution) -> Result<Execution> {
+        if input.status == ExecutionStatus::Running
+            && !crate::task_writer::owns_task(&input.task_id)
+        {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::ExecutionCreate {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let execution = self
             .create_execution_in_tx(&mut transaction, &input, None)
@@ -30,6 +43,21 @@ impl ExecutionRepo for SqliteDb {
         lease: ClaimExecutionLease,
         admission: Option<ExecutionAdmission>,
     ) -> Result<Execution> {
+        if input.status == ExecutionStatus::Running
+            && !crate::task_writer::owns_task(&input.task_id)
+        {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::ExecutionCreateWithLeaseAndAdmission {
+                        input: Box::new(input.clone()),
+                        lease: lease.clone(),
+                        admission: admission.clone(),
+                    },
+                )
+                .await;
+        }
+
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let execution = self
             .create_with_lease_and_admission_in_tx(&mut transaction, input, lease, admission)

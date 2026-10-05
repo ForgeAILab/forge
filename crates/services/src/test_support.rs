@@ -216,3 +216,15 @@ pub(crate) async fn drain_transition(
     result.pending_steps = 0;
     result
 }
+
+/// Enqueue-only producers return before their Task projection changes.
+pub(crate) async fn drain_task_steps(db: &SqliteDb, task_id: &str) {
+    let service = crate::TaskService::new(
+        std::sync::Arc::new(db.clone()),
+        std::sync::Arc::new(events::EventBus::default()),
+    );
+    service
+        .drain(task_id)
+        .await
+        .expect("queued Task effects settle");
+}

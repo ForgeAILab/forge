@@ -11,6 +11,20 @@ async fn database() -> SqliteDb {
     SqliteDb::new(pool)
 }
 
+async fn settle_queued_wake(db: &SqliteDb, task_id: &str) {
+    db.run_task_mutation::<db::Task>(
+        task_id,
+        db::TaskMutation::TaskMutateMetadata {
+            id: task_id.to_owned(),
+            expected_version: None,
+            mutations: Vec::new(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("published per-Task wake settles under its lease");
+}
+
 async fn task(db: &SqliteDb, project_id: &str, task_id: &str, updated_at: &str) {
     TaskRepo::create(
         db,
@@ -218,6 +232,7 @@ async fn project_wake_clears_dispatch_markers_atomically_but_keeps_pause_marker(
     let changed = TaskRepo::wake_dispatch_for_project(&db, &project_id, &now_rfc3339())
         .await
         .expect("project wake commits");
+    settle_queued_wake(&db, &task_id).await;
     assert_eq!(changed, 1);
     let current = TaskRepo::get_by_id(&db, &task_id, false)
         .await
@@ -386,6 +401,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     )
     .await
     .expect("settings update and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_settings = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads")
@@ -440,6 +456,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     )
     .await
     .expect("workflow update and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_workflow = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after workflow")
@@ -458,6 +475,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     ProjectRepo::set_paused_at(&db, &project_id, Some("2026-09-12T00:04:00Z".to_owned()))
         .await
         .expect("pause and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_pause = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after pause")
@@ -472,6 +490,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     ProjectRepo::set_paused_at(&db, &project_id, None)
         .await
         .expect("resume and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_resume = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after resume")
@@ -541,6 +560,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     )
     .await
     .expect("primary repo and link commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_repo_create = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after repo create")
@@ -565,6 +585,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     )
     .await
     .expect("repo update and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let task_after_repo_update = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task reloads after repo update")
@@ -583,6 +604,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
     RepoRepo::delete(&db, &repo.id)
         .await
         .expect("repo delete and wake commit");
+    settle_queued_wake(&db, &task_id).await;
     let project_after_repo_delete = ProjectRepo::get_by_id(&db, &project_id)
         .await
         .expect("project reloads after repo delete")

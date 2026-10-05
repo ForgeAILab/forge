@@ -530,8 +530,8 @@ impl ProjectRepo for SqliteDb {
                     .await?;
                 sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key IN (SELECT 'task-environment-wait:' || id FROM task WHERE project_id = ?)")
                     .bind(&project.updated_at).bind(&project.updated_at).bind(&project.id).execute(&mut *transaction).await?;
-                sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.environment_wait') WHERE project_id = ? AND json_valid(metadata_json)")
-                    .bind(&project.id).execute(&mut *transaction).await?;
+                crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json = json_remove(metadata_json, '$.environment_wait') WHERE project_id = ? AND json_valid(metadata_json)")
+                    .bind(&project.id).execute_in_tx(&mut transaction).await?;
             } else if digest_changed || after.is_none() {
                 sqlx::query("UPDATE project_machine_readiness SET status = 'unknown', checks_digest = ?, failing_checks_json = '[]', check_results_json = '[]', output_tail = '', checked_at = NULL, next_check_at = NULL, version = version + 1 WHERE project_id = ?")
                     .bind(after.as_ref().map(crate::environment_checks_digest).unwrap_or_else(|| "invalid_settings".into())).bind(&project.id)
@@ -539,12 +539,21 @@ impl ProjectRepo for SqliteDb {
             }
         }
         if original_paused_at.is_some() && project.paused_at.is_none() {
-            super::environment_readiness::reset_readiness_in_tx(&mut transaction, &project.id)
-                .await?;
+            super::environment_readiness::reset_readiness_in_tx(
+                self,
+                &mut transaction,
+                &project.id,
+            )
+            .await?;
         }
         if project_authority_changed {
-            wake_dispatch_for_project_in_tx(&mut transaction, &project.id, &project.updated_at)
-                .await?;
+            wake_dispatch_for_project_in_tx(
+                self,
+                &mut transaction,
+                &project.id,
+                &project.updated_at,
+            )
+            .await?;
         }
         let updated_row = sqlx::query(&format!(
             "SELECT {PROJECT_COLUMNS} FROM project WHERE id = ?"
@@ -590,7 +599,7 @@ impl ProjectRepo for SqliteDb {
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
-        wake_dispatch_for_project_in_tx(&mut transaction, id, updated_at).await?;
+        wake_dispatch_for_project_in_tx(self, &mut transaction, id, updated_at).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -652,9 +661,9 @@ impl ProjectRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
         if paused_at.is_none() {
-            super::environment_readiness::reset_readiness_in_tx(&mut transaction, id).await?;
+            super::environment_readiness::reset_readiness_in_tx(self, &mut transaction, id).await?;
         }
-        wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+        wake_dispatch_for_project_in_tx(self, &mut transaction, id, &updated_at).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -702,7 +711,7 @@ impl ProjectRepo for SqliteDb {
         .await?;
         let paused = result.rows_affected() > 0;
         if paused {
-            wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+            wake_dispatch_for_project_in_tx(self, &mut transaction, id, &updated_at).await?;
         }
         transaction.commit().await?;
         Ok(paused)
@@ -760,9 +769,9 @@ impl ProjectRepo for SqliteDb {
             // earlier capacity/environment wait in the same writer transaction.
             sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1 WHERE status <> 'resolved' AND dedupe_key IN (SELECT 'task-environment-wait:' || id FROM task WHERE project_id=?)")
                 .bind(&updated_at).bind(&updated_at).bind(id).execute(&mut *transaction).await?;
-            sqlx::query("UPDATE task SET metadata_json=json_remove(metadata_json,'$.environment_wait') WHERE project_id=? AND json_valid(metadata_json) AND json_type(metadata_json,'$.environment_wait') IS NOT NULL")
-                .bind(id).execute(&mut *transaction).await?;
-            wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+            crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json=json_remove(metadata_json,'$.environment_wait') WHERE project_id=? AND json_valid(metadata_json) AND json_type(metadata_json,'$.environment_wait') IS NOT NULL")
+                .bind(id).execute_in_tx(&mut transaction).await?;
+            wake_dispatch_for_project_in_tx(self, &mut transaction, id, &updated_at).await?;
         }
         transaction.commit().await?;
         Ok(paused)
@@ -823,8 +832,8 @@ impl ProjectRepo for SqliteDb {
         .await?;
         let cleared = result.rows_affected() > 0;
         if cleared {
-            super::environment_readiness::reset_readiness_in_tx(&mut transaction, id).await?;
-            wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+            super::environment_readiness::reset_readiness_in_tx(self, &mut transaction, id).await?;
+            wake_dispatch_for_project_in_tx(self, &mut transaction, id, &updated_at).await?;
         }
         transaction.commit().await?;
         Ok(cleared)

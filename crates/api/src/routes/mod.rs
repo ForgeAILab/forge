@@ -1031,12 +1031,27 @@ pub async fn workspace_response(
         String::new()
     };
     let placement = workspace_placement_response(placement)?;
+    let pending_remote_cancel = db
+        .workspace_remote_cancels(&workspace.id, &workspace.task_id)
+        .await?
+        .into_iter()
+        .map(|operation| api_types::PendingRemoteCancel {
+            operation_id: operation.operation_id,
+            placement_id: operation.placement_id,
+            daemon_id: operation.daemon_id,
+            runtime_id: operation.runtime_id,
+            generation: operation.generation,
+            step_id: operation.step_id,
+            created_at: operation.created_at,
+        })
+        .collect();
     Ok(WorkspaceResponse {
         id: workspace.id,
         task_id: workspace.task_id,
         repo_id: workspace.repo_id,
         worktree_path,
         placement,
+        pending_remote_cancel,
         branch: workspace.branch,
         status: workspace.status.to_string(),
         before_sha: workspace.before_sha,

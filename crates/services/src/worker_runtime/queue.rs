@@ -26,37 +26,6 @@ const LONG_CONCURRENCY: usize = 4;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 const LEASE_SECONDS: i64 = 60;
 
-tokio::task_local! { pub(crate) static PRODUCER_TASK: String; }
-pub(crate) fn producer_deferred(task_id: &str) -> bool {
-    PRODUCER_TASK.try_with(|id| id == task_id).unwrap_or(false)
-}
-
-/// Holds a CAS enqueue through the service wrapper's short bookkeeping
-/// window. Cancellation stops renewal; its reservation expires after a crash.
-pub(crate) struct ProducerReservation(JoinHandle<()>);
-impl ProducerReservation {
-    pub(crate) fn hold(db: Arc<db::SqliteDb>, id: Option<&str>) -> Option<Self> {
-        let id = id?.to_owned();
-        Some(Self(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(15)).await;
-                match db.renew_step_reservation(&id, &lease_deadline()).await {
-                    Ok(true) => {}
-                    Ok(false) => return,
-                    Err(error) => {
-                        tracing::warn!(%error, "task step producer reservation renewal failed")
-                    }
-                }
-            }
-        })))
-    }
-}
-impl Drop for ProducerReservation {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CascadePayload {
     pub to: String,
@@ -106,6 +75,19 @@ pub struct TaskStepWorker {
     db: Arc<db::SqliteDb>,
     pub(crate) renew_interval: Duration,
 }
+
+#[async_trait::async_trait]
+impl db::task_writer::TaskStepExecutor for TaskStepWorker {
+    async fn drive_inline(&self, task_id: &str) -> db::Result<()> {
+        Arc::new(Self::new(self.engine.clone()))
+            .start_inline_head(task_id)
+            .await
+            .map_err(|error| match error {
+                ServiceError::Db(error) => error,
+                error => db::DbError::Check(error.to_string()),
+            })
+    }
+}
 impl TaskStepWorker {
     pub fn new(engine: WorkflowEngine) -> Self {
         Self {
@@ -113,6 +95,217 @@ impl TaskStepWorker {
             engine,
             renew_interval: Duration::from_secs(15),
         }
+    }
+    pub(crate) async fn request_command<T: serde::de::DeserializeOwned>(
+        self: &Arc<Self>,
+        task_id: &str,
+        command: crate::task_service::commands::TaskCommand,
+    ) -> Result<T> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let requested_version = match command.operation.as_str() {
+            "cancel_task_with_options" => command.arguments[1].as_i64(),
+            "perform_task_action_as" => command.arguments[2].as_i64(),
+            "transition" | "transition_with_plan_publication" => {
+                command.arguments[2]["version"].as_i64()
+            }
+            "update_task" => command.arguments[1]["version"].as_i64(),
+            "engine_transition" => command.arguments["version"].as_i64(),
+            _ => None,
+        };
+        let landed = if command.preempt {
+            let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .ok_or(db::DbError::NotFound)?;
+            let workflow = WorkflowEngine::resolve_workflow_for_task(
+                &task,
+                &project.workflow_definition,
+                &Actor::system(SystemComponent::Workflow),
+            );
+            workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal)
+                && workflow.cancellation_state.as_deref() != Some(task.status.as_str())
+                && sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND integration_started_at IS NOT NULL AND status='done')").bind(task_id).fetch_one(self.db.pool()).await?
+        } else {
+            false
+        };
+        if !landed && requested_version.is_some_and(|version| version != task.version) {
+            if command.operation == "engine_transition" {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            return Err(db::DbError::TaskVersionConflict {
+                expected: requested_version.unwrap(),
+                actual: task.version,
+            }
+            .into());
+        }
+        let startup_checks = if matches!(
+            command.operation.as_str(),
+            "start_execution"
+                | "claim_and_start_task"
+                | "launch_execution"
+                | "follow_up_execution"
+                | "follow_up_interactive_execution"
+                | "dispatch_queued_recovery"
+                | "dispatch_recovery_role"
+                | "dispatch_initial_role_execution_with_metadata_and_admission"
+                | "dispatch_initial_role_execution_with_optional_admission"
+                | "dispatch_role_follow_up"
+                | "dispatch_role_follow_up_with_agent"
+                | "dispatch_role_follow_up_with_admission"
+                | "re_execute_execution_with_context"
+        ) {
+            let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .ok_or(db::DbError::NotFound)?;
+            let settings: api_types::ProjectSettings = serde_json::from_str(&project.settings)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            !settings.environment.checks.is_empty()
+        } else {
+            false
+        };
+        let mut payload: serde_json::Value = serde_json::from_str(&command.payload_json()?)
+            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+        if command.operation == "dispatch_queued_recovery" {
+            if let Some(queued) = crate::deferred_dispatch::queued_recovery(&task) {
+                if queued.request.role_name.is_some() {
+                    payload["admission_agent_id"] = serde_json::json!(queued.request.agent_id);
+                }
+            }
+        }
+        if command.preempt {
+            let hooks: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND status IN ('pending','claimed') AND (kind='hooks' OR (kind='command' AND json_extract(payload_json,'$.operation') IN ('start_execution','claim_task','claim_and_start_task','launch_execution','rerun_review','dispatch_initial_role_execution_with_metadata_and_admission','dispatch_initial_role_execution_with_optional_admission','dispatch_recovery_role','follow_up_interactive_execution','re_execute_execution_with_context'))))")
+                .bind(task_id).fetch_one(self.db.pool()).await?;
+            payload["preempting_hooks"] = serde_json::json!(hooks);
+        }
+        let id = db::new_uuid_v4();
+        let (reply, mut received) = tokio::sync::oneshot::channel();
+        self.engine
+            .task_service
+            .task_step_replies
+            .lock()
+            .expect("Task step replies")
+            .insert(id.clone(), reply);
+        let enqueue = self
+            .db
+            .enqueue_step(&db::EnqueueTaskStep {
+                id: id.clone(),
+                task_id: task_id.to_owned(),
+                kind: "command".to_owned(),
+                payload_json: payload.to_string(),
+                causation_step_id: db::task_writer::current_task_step().map(|step| step.id),
+                causation_key: id.clone(),
+                chain_id: id.clone(),
+                chain_position: 1,
+                expected_status: task.status.clone(),
+                expected_version: task.version,
+                expected_epoch: None,
+                lane: if startup_checks
+                    || command.operation == "rerun_review"
+                    || (command.operation == "dispatch_queued_recovery"
+                        && crate::deferred_dispatch::queued_recovery(&task)
+                            .is_some_and(|q| q.request.offer.reason == "review_checks_retry"))
+                {
+                    "long"
+                } else {
+                    "fast"
+                }
+                .to_owned(),
+                available_at: db::now_rfc3339(),
+            })
+            .await;
+        if let Err(error) = enqueue {
+            self.engine
+                .task_service
+                .task_step_replies
+                .lock()
+                .expect("Task step replies")
+                .remove(&id);
+            return Err(error.into());
+        }
+        if command.preempt {
+            self.db.request_task_preemption(task_id).await?;
+        }
+        let notify = self.db.domain_event_notify();
+        let deadline = tokio::time::Instant::now()
+            + if command.preempt {
+                Duration::from_secs(15)
+            } else {
+                Duration::from_secs(5)
+            };
+        let result = loop {
+            let changed = notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let own = self
+                .db
+                .task_steps(task_id)
+                .await?
+                .into_iter()
+                .find(|step| step.id == id)
+                .ok_or(db::DbError::NotFound)?;
+            if own.status == "superseded" {
+                break Err(db::DbError::VersionConflict.into());
+            }
+            if own.status == "claimed" || own.status == "done" || own.status == "failed" {
+                break received
+                    .await
+                    .map_err(|_| {
+                        ServiceError::invalid_operation("Task step reply was interrupted")
+                    })?
+                    .and_then(|value| {
+                        serde_json::from_value(value)
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))
+                    });
+            }
+            self.start_inline_head(task_id).await?;
+            let protected_merge: bool = command.preempt && sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND integration_started_at IS NOT NULL AND status IN ('pending','claimed'))")
+                .bind(task_id).fetch_one(self.db.pool()).await?;
+            tokio::select! {
+                biased;
+                reply=&mut received=>break reply.map_err(|_|ServiceError::invalid_operation("Task step reply was interrupted"))?
+                    .and_then(|value|serde_json::from_value(value).map_err(|e|ServiceError::invalid_operation(e.to_string()))),
+                _=changed=>{},
+                _=tokio::time::sleep_until(deadline), if !protected_merge =>break Err(db::DbError::TaskBusy {pending_steps:self.db.pending_steps(task_id).await?,retry_after_ms:250}.into()),
+            }
+        };
+        self.engine
+            .task_service
+            .task_step_replies
+            .lock()
+            .expect("Task step replies")
+            .remove(&id);
+        result
+    }
+
+    fn start_inline_head<'a>(
+        self: &'a Arc<Self>,
+        task_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let lane = sqlx::query_scalar::<_, String>("SELECT lane FROM task_step WHERE task_id=? AND status IN ('pending','claimed') ORDER BY CASE WHEN integration_started_at IS NOT NULL THEN 2 ELSE priority END DESC,seq LIMIT 1")
+                .bind(task_id).fetch_optional(self.db.pool()).await?.unwrap_or_else(||"fast".to_owned());
+            if let Some(step) = self
+                .db
+                .claim_step_lane(
+                    &db::new_uuid_v4(),
+                    Some(task_id),
+                    Some(&lane),
+                    &lease_deadline(),
+                )
+                .await?
+            {
+                let activity = self.db.hold_task_step(&step);
+                let worker = self.clone();
+                tokio::spawn(async move {
+                    let _activity = activity;
+                    if let Err(error) = worker.execute(step).await {
+                        tracing::warn!(%error,"inline Task step failed");
+                    }
+                });
+            }
+            Ok(())
+        })
     }
     pub fn start(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         WorkerSupervisor::new(
@@ -222,6 +415,28 @@ impl TaskStepWorker {
         }
     }
     async fn execute(&self, step: TaskStep) -> Result<()> {
+        let id = step.id.clone();
+        match self.execute_attempt(step).await {
+            Err(error) => {
+                let reply = self
+                    .engine
+                    .task_service
+                    .task_step_replies
+                    .lock()
+                    .expect("Task step replies")
+                    .remove(&id);
+                if let Some(reply) = reply {
+                    tracing::warn!(step_id=%id,%error,"Task step settlement failed; preserving durable intent");
+                    let _ = reply.send(Err(error));
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
+    }
+    async fn execute_attempt(&self, step: TaskStep) -> Result<()> {
         let owner = step.claimed_by.as_deref().expect("claimed step owner");
         // Keep ownership until this row settles. A cascade's CAS inserts a
         // separate hooks row; that row owns and checkpoints its effects.
@@ -247,7 +462,83 @@ impl TaskStepWorker {
                 }
             }
         });
-        let result = self.execute_inner(&step).await;
+        let control = self.db.register_step_control(&step);
+        let integration: bool = sqlx::query_scalar(
+            "SELECT integration_started_at IS NOT NULL FROM task_step WHERE id=?",
+        )
+        .bind(&step.id)
+        .fetch_one(self.db.pool())
+        .await?;
+        control
+            .critical
+            .store(integration, std::sync::atomic::Ordering::SeqCst);
+        let mut preempt = control.preempt.subscribe();
+        let requested: bool =
+            sqlx::query_scalar("SELECT preempt_requested_at IS NOT NULL FROM task_step WHERE id=?")
+                .bind(&step.id)
+                .fetch_one(self.db.pool())
+                .await?;
+        if requested {
+            control.preempt.send_replace(true);
+        }
+        let mut work = Box::pin(db::task_writer::in_task_step(
+            step.clone(),
+            self.execute_inner(&step),
+        ));
+        let notify = self.db.domain_event_notify();
+        let mut remote_cancel: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send>>,
+        > = None;
+        let mut remote_cancel_started = false;
+        let mut unconfirmed = false;
+        let mut result = loop {
+            if *preempt.borrow_and_update() {
+                if !control.critical.load(std::sync::atomic::Ordering::SeqCst) {
+                    break None;
+                }
+                // Local integration finishes first. For remote integration,
+                // poll its result while requesting cleanup: an acknowledged
+                // merge finishes normally, but ten seconds without an ACK
+                // leaves a workspace fence and lets Cancel/Hold apply.
+                if !remote_cancel_started {
+                    let operations = self.db.running_remote_task_operations(&step.id).await?;
+                    if !operations.is_empty() {
+                        remote_cancel_started = true;
+                        let db = self.db.clone();
+                        let registry = self.engine.daemon_connections.clone();
+                        remote_cancel = Some(Box::pin(async move {
+                            crate::remote_cancel::cancel_operations(&db, registry, &operations)
+                                .await
+                        }));
+                    }
+                }
+            }
+            tokio::select! {
+                result=&mut work=>break Some(result),
+                _=preempt.changed()=>{},
+                _=notify.notified(), if *preempt.borrow() => {},
+                cancelled=async { remote_cancel.as_mut().expect("active remote cancellation").await }, if remote_cancel.is_some() => {
+                    remote_cancel = None;
+                    unconfirmed = cancelled?;
+                    if unconfirmed { break None; }
+                },
+            }
+        };
+        // Drop the hook future before cancellation/lease settlement;
+        // embedded CI, scripts and startup children are kill_on_drop.
+        drop(work);
+        if let Some(cancel) = remote_cancel {
+            unconfirmed = cancel.await?;
+        }
+        if matches!(&result, Some(Err(_))) && *preempt.borrow() && remote_cancel_started {
+            result = None;
+        }
+        let result = match result {
+            Some(result) => result,
+            None if remote_cancel_started => self.settle_preempted_step(&step, unconfirmed).await,
+            None => self.preempt_step(&step).await,
+        };
+        self.db.release_step_control(&step);
         let _ = stop.send(true);
         if let Err(error) = renewer.await {
             tracing::warn!(%error,"task step renewal task stopped");
@@ -280,11 +571,234 @@ impl TaskStepWorker {
             } else {
                 tracing::warn!(step_id = %step.id, %error, "task step attempt lost ownership or was already settled");
             }
+            if step.kind == "command" {
+                if let Some(reply) = self
+                    .engine
+                    .task_service
+                    .task_step_replies
+                    .lock()
+                    .expect("Task step replies")
+                    .remove(&step.id)
+                {
+                    let _ = reply.send(Err(error));
+                }
+            }
         }
         self.db.release_step(&step.id, owner).await?;
         Ok(())
     }
+    async fn preempt_step(&self, step: &TaskStep) -> Result<()> {
+        let operations = self.db.running_remote_task_operations(&step.id).await?;
+        let unconfirmed = crate::remote_cancel::cancel_operations(
+            &self.db,
+            self.engine.daemon_connections.clone(),
+            &operations,
+        )
+        .await?;
+        self.settle_preempted_step(step, unconfirmed).await
+    }
+    async fn settle_preempted_step(&self, step: &TaskStep, unconfirmed: bool) -> Result<()> {
+        self.settle(
+            step,
+            "superseded",
+            Some(if unconfirmed {
+                "remote_operation_unconfirmed"
+            } else {
+                "preempted by owner command"
+            }),
+            false,
+        )
+        .await?;
+        if let Some(reply) = self
+            .engine
+            .task_service
+            .task_step_replies
+            .lock()
+            .expect("Task step replies")
+            .remove(&step.id)
+        {
+            let _ = reply.send(Err(db::DbError::VersionConflict.into()));
+        }
+        Ok(())
+    }
     async fn execute_inner(&self, step: &TaskStep) -> Result<()> {
+        if step.kind == "mutation" {
+            let before = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await?;
+            let roles_before = db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &step.task_id)
+                .await?
+                .into_iter()
+                .map(|r| (r.role_name, r.assignee_type, r.assignee_id))
+                .collect::<Vec<_>>();
+            self.db.execute_task_mutation(step).await?;
+            if let Some(task) = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await? {
+                let roles_after =
+                    db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &step.task_id)
+                        .await?
+                        .into_iter()
+                        .map(|r| (r.role_name, r.assignee_type, r.assignee_id))
+                        .collect::<Vec<_>>();
+                // Temporary dispatch/replay metadata deliberately leaves the
+                // public Task version unchanged. It must not turn quiet
+                // capacity probes into visible task.updated hints.
+                if before
+                    .as_ref()
+                    .is_some_and(|old| old.version == task.version)
+                    && roles_before == roles_after
+                {
+                    return Ok(());
+                }
+                self.engine.event_bus.publish(events::ForgeEvent {
+                    event_type: "task.updated".into(),
+                    entity_id: task.id,
+                    timestamp: events::event_timestamp(),
+                    context: events::EventContext::TaskUpdated {
+                        project_id: task.project_id,
+                    },
+                });
+            }
+            return Ok(());
+        }
+        if step.kind == "command" {
+            let command: crate::task_service::commands::TaskCommand =
+                serde_json::from_str(&step.payload_json)
+                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+            if !command.preempt
+                && matches!(
+                    command.operation.as_str(),
+                    "transition"
+                        | "transition_with_plan_publication"
+                        | "engine_transition"
+                        | "perform_task_action_as"
+                )
+                && !self.db.step_entry_matches(step).await?
+            {
+                self.settle(
+                    step,
+                    "superseded",
+                    Some("Task left the command's accepted status entry"),
+                    false,
+                )
+                .await?;
+                if let Some(reply) = self
+                    .engine
+                    .task_service
+                    .task_step_replies
+                    .lock()
+                    .expect("Task step replies")
+                    .remove(&step.id)
+                {
+                    let _ = reply.send(Err(db::DbError::VersionConflict.into()));
+                }
+                return Ok(());
+            }
+            if command.preempt {
+                // A disconnect may have failed the server-side hook before
+                // Cancel arrived, although its owner command is still alive.
+                let marked = self.db.pending_remote_cancels(None, None).await?;
+                let operations = self
+                    .db
+                    .running_remote_operations_for_task(&step.task_id)
+                    .await?
+                    .into_iter()
+                    .filter(|operation| {
+                        !marked
+                            .iter()
+                            .any(|marker| marker.operation_id == operation.operation_id)
+                    })
+                    .collect::<Vec<_>>();
+                let unconfirmed = crate::remote_cancel::cancel_operations(
+                    &self.db,
+                    self.engine.daemon_connections.clone(),
+                    &operations,
+                )
+                .await?;
+                for operation in operations {
+                    sqlx::query("UPDATE task_step SET status='superseded',last_error=?,updated_at=? WHERE id=? AND task_id=? AND status IN ('failed','parked')")
+                        .bind(if unconfirmed {"remote_operation_unconfirmed"}else{"preempted by owner command"}).bind(db::now_rfc3339()).bind(operation.step_id).bind(&step.task_id).execute(self.db.pool()).await?;
+                }
+            }
+            let result = if command.operation == "engine_transition" {
+                #[derive(Deserialize)]
+                struct Input {
+                    task_id: String,
+                    target_state: String,
+                    workflow: api_types::WorkflowDefinition,
+                    actor: Actor,
+                    reason: String,
+                    rejection: bool,
+                    skip_before_exit: bool,
+                    defer_dispatch_until: Option<String>,
+                    board_move: Option<crate::workflow::engine::BoardMoveRequest>,
+                    authority: Option<WorkflowAuthority>,
+                    entry_retry: bool,
+                }
+                let input: Input = serde_json::from_value(command.arguments.clone())
+                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                let current = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                self.engine
+                    .transition_inner(
+                        input.task_id,
+                        input.target_state,
+                        current.version,
+                        &input.workflow,
+                        input.actor,
+                        input.reason,
+                        input.rejection,
+                        input.skip_before_exit,
+                        input.defer_dispatch_until,
+                        input.board_move,
+                        None,
+                        input.authority,
+                        input.entry_retry,
+                    )
+                    .await
+                    .and_then(|value| {
+                        serde_json::to_value(value)
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))
+                    })
+            } else {
+                crate::TaskService::with_recovery_command_context(
+                    &step.payload_json,
+                    self.engine.task_service.execute_task_command(&command),
+                )
+                .await
+            };
+            let error = result.as_ref().err().map(ToString::to_string);
+            let stored = serde_json::json!({"result":result.as_ref().ok(),"error":error.as_ref().map(|message|serde_json::json!({"code":"check","message":message}))});
+            let mut tx = db::begin_immediate(self.db.pool()).await?;
+            self.db
+                .finish_step_in_tx(
+                    &mut tx,
+                    step,
+                    if result.is_ok() { "done" } else { "failed" },
+                    error.as_deref(),
+                )
+                .await?;
+            sqlx::query("UPDATE task_step SET result_json=? WHERE id=? AND claimed_by=?")
+                .bind(stored.to_string())
+                .bind(&step.id)
+                .bind(&step.claimed_by)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            self.db
+                .release_step(&step.id, step.claimed_by.as_deref().expect("command owner"))
+                .await?;
+            self.db.domain_event_notify().notify_waiters();
+            if let Some(reply) = self
+                .engine
+                .task_service
+                .task_step_replies
+                .lock()
+                .expect("Task step replies")
+                .remove(&step.id)
+            {
+                let _ = reply.send(result);
+            }
+            return Ok(());
+        }
         let task = TaskRepo::get_by_id(&*self.db, &step.task_id, false).await?;
         if !self.db.step_entry_matches(step).await? {
             return self
@@ -339,6 +853,12 @@ impl TaskStepWorker {
             if let Some(mut follow_up) = result.follow_up {
                 follow_up.available_at = db::now_rfc3339();
                 self.db.enqueue_step_in_tx(&mut tx, &follow_up).await?;
+                if merged {
+                    sqlx::query("UPDATE task_step SET priority=2 WHERE id=?")
+                        .bind(&follow_up.id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
             } else if let Some(error) = result.merge_failure {
                 // Whatever its policy, a merge that cannot complete must not
                 // sit silently in its merge state: annotate it as a failed

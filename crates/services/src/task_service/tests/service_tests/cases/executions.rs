@@ -87,8 +87,7 @@ async fn project_pause_precedes_placement_on_every_execution_launch_path() {
         service
             .launch_execution(&task.id, &agent_id, None, None)
             .await
-            .err()
-            .expect("paused Project refuses launch"),
+            .expect_err("paused Project refuses launch"),
     );
     errors.push(
         service
@@ -100,22 +99,19 @@ async fn project_pause_precedes_placement_on_every_execution_launch_path() {
         service
             .re_execute_execution(&parent.id)
             .await
-            .err()
-            .expect("paused Project refuses launch"),
+            .expect_err("paused Project refuses launch"),
     );
     errors.push(
         service
             .follow_up_execution(&parent.id, "Continue".into(), None, None)
             .await
-            .err()
-            .expect("paused Project refuses launch"),
+            .expect_err("paused Project refuses launch"),
     );
     errors.push(
         service
             .follow_up_interactive_execution(&parent.id, "Continue".into(), None, None)
             .await
-            .err()
-            .expect("paused Project refuses launch"),
+            .expect_err("paused Project refuses launch"),
     );
     assert!(
         matches!(
@@ -7321,7 +7317,7 @@ async fn hard_failed_active_task_cannot_resume_or_submit() {
 }
 
 #[tokio::test]
-async fn manual_stop_annotation_retries_after_task_version_conflict() {
+async fn manual_stop_annotation_serializes_metadata_edits_without_cas_retry() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -7376,7 +7372,7 @@ async fn manual_stop_annotation_retries_after_task_version_conflict() {
             now_rfc3339(),
         )
         .await
-        .expect("manual-stop annotation retries on a stale Task snapshot");
+        .expect("manual-stop annotation applies under the Task lease after a metadata edit");
 
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
@@ -8783,4 +8779,145 @@ async fn planner_completion_advances_default_planning_gate() {
     )
     .expect("outbox path");
     assert!(!outbox.exists(), "published execution outbox is consumed");
+}
+
+#[tokio::test]
+async fn execution_completion_racing_queued_cascade_transitions_exactly_once() {
+    use db::TaskStepRepo;
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::default()));
+    let (project_id, _, _repo) = seed_project_repo(&db).await;
+    let agent = seed_agent(&db).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    workflow
+        .states
+        .retain(|s| matches!(s.name.as_str(), "in_progress" | "done"));
+    for state in &mut workflow.states {
+        state.hooks = api_types::StateHooks::default();
+        state.triggers.clear();
+        if state.name == "in_progress" {
+            state.triggers.insert(
+                api_types::WorkflowTrigger::Accept,
+                api_types::WorkflowTriggerDefinition {
+                    to: "done".into(),
+                    dispatch: None,
+                },
+            );
+        }
+    }
+    workflow.cancellation_state = None;
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id=?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = seed_task_with_status(&db, &project_id, "in_progress".into()).await;
+    seed_role_assignment(&db, &task.id, "coder", Some(&agent)).await;
+    let execution = seed_completed_coder_execution(&db, &task, &agent, None).await;
+    let cascade = service
+        .workflow_engine()
+        .cascade_step_input(
+            &task,
+            &workflow,
+            "done".into(),
+            "racing cascade".into(),
+            false,
+            false,
+            None,
+            None,
+            db::new_uuid_v4(),
+            None,
+        )
+        .await
+        .unwrap();
+    db.enqueue_step(&cascade).await.unwrap();
+    let (completion, drained) = tokio::join!(
+        service.maybe_cascade_executor_completion(&execution.id),
+        service.drain(&task.id)
+    );
+    completion.unwrap();
+    drained.unwrap();
+    assert_eq!(service.drain(&task.id).await.unwrap().status, "done");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM transition_log WHERE task_id=? AND to_state='done'",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(db.pending_steps(&task.id).await.unwrap(), 0);
+}
+
+struct StartedClaimExecutor(Arc<tokio::sync::Notify>);
+#[async_trait]
+impl TaskExecutor for StartedClaimExecutor {
+    async fn execute(
+        &self,
+        _context: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        self.0.notify_one();
+        std::future::pending().await
+    }
+    async fn cancel(&self, _id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn busy_claim_still_starts_its_execution_after_the_fast_head_releases() {
+    use db::TaskStepRepo;
+    let db = Arc::new(sqlite_db().await);
+    let (project, _, _repo) = seed_project_repo(&db).await;
+    let agent = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project, "todo".into()).await;
+    let root = TempDir::new().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+        .with_workspace_root(root.path().to_path_buf())
+        .with_task_executor(Arc::new(StartedClaimExecutor(started.clone())));
+    db.enqueue_task_mutation(
+        &task.id,
+        db::TaskMutation::TaskSetEntryBarrier {
+            id: task.id.clone(),
+            expected_version: task.version,
+            entry_barrier_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    let head = db
+        .claim_step(
+            "fast-owner",
+            Some(&task.id),
+            &db::task_writer::lease_deadline(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let result = service
+        .claim_and_start_task(&task.id, Assignee::Agent(agent), None)
+        .await;
+    assert!(matches!(result, Err(ServiceError::TaskBusy { .. })));
+    assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .is_empty());
+    db::task_writer::in_task_step(head.clone(), db.execute_task_mutation(&head))
+        .await
+        .unwrap();
+    db.release_step(&head.id, "fast-owner").await.unwrap();
+    service.drain(&task.id).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        ExecutionRepo::list_running_by_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }

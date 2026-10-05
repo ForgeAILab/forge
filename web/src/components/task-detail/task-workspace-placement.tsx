@@ -54,8 +54,10 @@ function DisconnectNotice({ disconnectedAt }: { disconnectedAt: string | null })
 
 export function TaskWorkspacePlacement({
   placement,
+  pendingRemoteCancelCount = 0,
 }: {
   placement: WorkspacePlacementResponse | null | undefined
+  pendingRemoteCancelCount?: number
 }) {
   const { data: daemons } = useDaemonsQuery(
     placement?.owner_kind === 'daemon' && !!placement.daemon_id,
@@ -84,6 +86,13 @@ export function TaskWorkspacePlacement({
       </div>
       {placement.state === 'disconnected' ? (
         <DisconnectNotice disconnectedAt={placement.disconnected_at} />
+      ) : null}
+      {pendingRemoteCancelCount > 0 ? (
+        <div className="space-y-2 rounded-md border border-warning/40 bg-warning/10 p-3 text-xs">
+          <p className="font-medium">Remote cleanup pending</p>
+          <p>This workspace is locked until its owner confirms remote work has stopped.</p>
+          <p className="text-muted-foreground">Restart and Retry wait for that confirmation.</p>
+        </div>
       ) : null}
     </section>
   )

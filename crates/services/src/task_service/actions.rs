@@ -27,7 +27,7 @@ pub fn task_review_requires_user_decision(
         })
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct TaskActionResult {
     pub task: Task,
     pub action: TaskAction,
@@ -98,8 +98,73 @@ impl TaskService {
         version: i64,
         actor: Actor,
     ) -> Result<TaskActionResult> {
-        let task_id = task_id.into();
+        let task_id: String = task_id.into();
+        if !db::task_writer::owns_task(&task_id) {
+            return self
+                .request_task_command(
+                    &task_id,
+                    "perform_task_action_as",
+                    serde_json::json!([task_id, action, version, actor]),
+                    matches!(
+                        &action,
+                        api_types::TaskAction::Cancel { .. } | api_types::TaskAction::Hold { .. }
+                    ),
+                )
+                .await;
+        }
+
         let snapshot = self.task_action_snapshot(&task_id, &actor).await?;
+        let preempting_hooks = db::task_writer::current_task_step()
+            .and_then(|step| serde_json::from_str::<Value>(&step.payload_json).ok())
+            .is_some_and(|payload| payload["preempting_hooks"] == true);
+        if matches!(&action, TaskAction::Cancel { .. } | TaskAction::Hold { .. }) {
+            TaskRepo::mutate_metadata(
+                &*self.db,
+                &task_id,
+                None,
+                vec![db::TaskMetadataMutation::Remove {
+                    key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
+                }],
+                &now_rfc3339(),
+            )
+            .await?;
+            let integrated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND integration_started_at IS NOT NULL AND status='done')").bind(&task_id).fetch_one(self.db.pool()).await?;
+            if snapshot.workflow.state_kind(&snapshot.task.status)
+                == Some(api_types::StateKind::Terminal)
+                && snapshot.workflow.cancellation_state.as_deref()
+                    != Some(snapshot.task.status.as_str())
+                && (preempting_hooks || integrated)
+            {
+                return Ok(TaskActionResult {
+                    task: snapshot.task,
+                    action,
+                });
+            }
+        }
+        if let TaskAction::Hold { reason } = &action {
+            if actor.is_user() && preempting_hooks {
+                for execution in snapshot.executions.iter().filter(|execution| {
+                    execution.status == ExecutionStatus::Running && execution.role != "interactive"
+                }) {
+                    self.pause_execution(
+                        execution.id.clone(),
+                        reason.clone().unwrap_or_else(|| "held by owner".to_owned()),
+                    )
+                    .await?;
+                }
+                let fresh = self.task_action_snapshot(&task_id, &actor).await?;
+                let held = self.hold_waiting_task(&fresh, reason.as_deref()).await?;
+                let held = TaskRepo::set_entry_barrier(
+                    &*self.db,
+                    &held.id,
+                    held.version,
+                    None,
+                    &now_rfc3339(),
+                )
+                .await?;
+                return Ok(TaskActionResult { task: held, action });
+            }
+        }
         if snapshot.task.version != version {
             return Err(DbError::TaskVersionConflict {
                 expected: version,
@@ -125,6 +190,24 @@ impl TaskService {
                 .flatten(),
             })?;
         let action = apply_offered_parameters(&offer, action);
+        if matches!(
+            &action,
+            TaskAction::Restart { .. } | TaskAction::Retry { .. } | TaskAction::Release { .. }
+        ) && self.db.task_has_pending_remote_cancel(&task_id).await?
+        {
+            let queued = self
+                .queue_task_action(&snapshot, offer, action.clone(), actor)
+                .await?;
+            let parked=TaskRepo::update(&*self.db,db::UpdateTask {
+                id:queued.id.clone(),expected_version:queued.version,title:None,description:None,priority:None,merge_config:None,plan:None,
+                error_annotation:Some(Some(json!({"type":api_types::FailureKind::WorkspaceResetRequired,"blocking_reason":"pending_remote_cancel","message":"Waiting for the workspace owner to confirm remote work has stopped"}).to_string())),
+                blocked_json:None,failed_json:None,task_state_config:None,parent_task_id:None,updated_at:now_rfc3339(),
+            }).await?;
+            return Ok(TaskActionResult {
+                task: parked,
+                action,
+            });
+        }
         if let TaskAction::SendBack { guidance } = &action {
             validate_required("guidance", guidance)?;
         }

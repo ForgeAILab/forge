@@ -405,6 +405,7 @@ async fn send_back_commits_at_capacity_and_dispatcher_resumes_the_worker_thread(
         .unwrap()
         .task;
     assert_eq!(accepted.status, "working");
+    service.drain(&task.id).await.unwrap();
     let queued =
         crate::deferred_dispatch::queued_recovery(&accepted).expect("worker continuation queued");
     assert_eq!(
@@ -712,6 +713,7 @@ async fn owner_advance_override_stops_the_role_and_dispatches_the_next_without_a
         rx.try_recv().is_err(),
         "the command cannot launch the next role"
     );
+    service.drain(&task.id).await.unwrap();
     service.test_dispatch_task_action(&task.id).await.unwrap();
     service.drain(&task.id).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), rx.recv())

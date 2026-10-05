@@ -137,26 +137,31 @@ impl CrashRecovery {
         let mut recovered = 0;
 
         for task in tasks {
-            let outcome = recover_task(
-                &self.db,
-                task,
-                StopReason::CrashRecovery,
-                &api_types::Actor::system(api_types::SystemComponent::CrashRecovery),
+            let id = db::new_uuid_v4();
+            db::TaskStepRepo::enqueue_step(
+                &*self.db,
+                &db::EnqueueTaskStep {
+                    id: id.clone(),
+                    task_id: task.id.clone(),
+                    kind: "command".into(),
+                    payload_json: crate::task_service::commands::TaskCommand {
+                        operation: "recover_task_after_restart".into(),
+                        arguments: json!([task.id]),
+                        preempt: false,
+                    }
+                    .payload_json()?,
+                    causation_step_id: None,
+                    causation_key: id.clone(),
+                    chain_id: id,
+                    chain_position: 1,
+                    expected_status: task.status,
+                    expected_version: task.version,
+                    expected_epoch: None,
+                    lane: "fast".into(),
+                    available_at: now_rfc3339(),
+                },
             )
             .await?;
-
-            if outcome.annotated {
-                self.publish(ForgeEvent {
-                    event_type: "task.recovered".to_owned(),
-                    entity_id: outcome.task.id,
-                    timestamp: event_timestamp(),
-                    context: EventContext::TaskRecovered {
-                        project_id: outcome.task.project_id,
-                        reason: "crash_recovery".to_owned(),
-                    },
-                });
-                recovered += 1;
-            }
         }
 
         recovered += sweep_stale_recovery_annotations(&self.db).await?;
@@ -168,10 +173,6 @@ impl CrashRecovery {
     #[tracing::instrument(skip(self), fields(agent_id = agent_id.unwrap_or("any")))]
     async fn list_in_progress_tasks(&self, agent_id: Option<&str>) -> Result<Vec<Task>> {
         list_in_progress_tasks(&self.db, agent_id).await
-    }
-
-    fn publish(&self, event: ForgeEvent) {
-        self.event_bus.publish(event);
     }
 }
 
@@ -1147,7 +1148,7 @@ async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result
     Ok(tasks)
 }
 
-async fn recover_task(
+pub(crate) async fn recover_task(
     db: &SqliteDb,
     task: Task,
     stop_reason: StopReason,
@@ -1247,17 +1248,19 @@ async fn recover_task(
         "message": message,
     })
     .to_string();
-    let task = TaskRepo::update_status(
-        db,
-        UpdateTaskStatus {
-            id: task.id.clone(),
-            expected_version: task.version,
-            status: task.status.clone(),
-            assignee_id: None,
-            error_annotation: Some(Some(annotation)),
-            blocked_json: None,
-            failed_json: None,
-            updated_at: now_rfc3339(),
+    db.enqueue_task_mutation(
+        &task.id,
+        db::TaskMutation::TaskUpdateStatus {
+            input: UpdateTaskStatus {
+                id: task.id.clone(),
+                expected_version: task.version,
+                status: task.status.clone(),
+                assignee_id: None,
+                error_annotation: Some(Some(annotation)),
+                blocked_json: None,
+                failed_json: None,
+                updated_at: now_rfc3339(),
+            },
         },
     )
     .await?;
@@ -1329,17 +1332,19 @@ async fn sweep_stale_recovery_annotations(db: &Arc<SqliteDb>) -> Result<u64> {
                     continue;
                 }
 
-                TaskRepo::update_status(
-                    db.as_ref(),
-                    UpdateTaskStatus {
-                        id: task.id.clone(),
-                        expected_version: task.version,
-                        status: task.status.clone(),
-                        assignee_id: None,
-                        error_annotation: Some(None),
-                        blocked_json: None,
-                        failed_json: None,
-                        updated_at: now_rfc3339(),
+                db.enqueue_task_mutation(
+                    &task.id,
+                    db::TaskMutation::TaskUpdateStatus {
+                        input: UpdateTaskStatus {
+                            id: task.id.clone(),
+                            expected_version: task.version,
+                            status: task.status.clone(),
+                            assignee_id: None,
+                            error_annotation: Some(None),
+                            blocked_json: None,
+                            failed_json: None,
+                            updated_at: now_rfc3339(),
+                        },
                     },
                 )
                 .await?;
@@ -2369,9 +2374,9 @@ async fn annotate_owner_recovery(
             "message": format!("Workspace owner recovery required: {cause}"),
     });
     if can_annotate {
-        let updated = sqlx::query("UPDATE task SET error_annotation = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?")
+        let updated = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET error_annotation = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?")
             .bind(annotation.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version)
-            .execute(&mut *transaction).await?;
+            .execute_in_tx(&mut transaction).await?;
         if updated.rows_affected() != 1 {
             return Err(db::DbError::VersionConflict.into());
         }
@@ -2986,7 +2991,7 @@ async fn complete_workspace_reconciliation(
     .bind(format!("workspace-owner:{}", ready.id))
     .execute(&mut *transaction)
     .await?;
-    sqlx::query(
+    db::task_writer::BulkTaskQuery::new(db,
         "UPDATE task SET metadata_json = json_remove(COALESCE(metadata_json, '{}'),
         '$.dispatch_disposition', '$.deferred_dispatch', '$.owner_wait'), version = version + 1, updated_at = ?
         WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
@@ -2997,14 +3002,14 @@ async fn complete_workspace_reconciliation(
     .bind(now_rfc3339())
     .bind(&ready.task_id)
     .bind(&ready.task_id)
-    .execute(&mut *transaction)
+    .execute_in_tx(&mut transaction)
     .await?;
-    sqlx::query("UPDATE task SET blocked_json = NULL,
+    db::task_writer::BulkTaskQuery::new(db,"UPDATE task SET blocked_json = NULL,
         entry_barrier_json = json_set(entry_barrier_json, '$.infrastructure_attempts', 0),
         error_annotation = json_set(error_annotation, '$.blocking_reason', 'review_ci_infrastructure'),
         version = version + 1, updated_at = ? WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
         AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation, '$.blocking_reason') = 'review_ci_infrastructure_exhausted'")
-        .bind(now_rfc3339()).bind(&ready.task_id).bind(&ready.task_id).execute(&mut *transaction).await?;
+        .bind(now_rfc3339()).bind(&ready.task_id).bind(&ready.task_id).execute_in_tx(&mut transaction).await?;
     sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1
         WHERE status <> 'resolved' AND dedupe_key IN (?, ?)")
         .bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("review-ci:{}", ready.task_id))
@@ -3805,6 +3810,15 @@ pub(crate) mod tests {
             .expect("agent exists");
         assert_eq!(updated_agent.status, AgentStatus::Error);
 
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let recovered_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
@@ -4510,6 +4524,15 @@ pub(crate) mod tests {
             (in_progress, in_progress_execution, "in_progress"),
             (merge_failed, merge_failed_execution, "merge_failed"),
         ] {
+            for task_id in sqlx::query_scalar::<_, String>(
+                "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            {
+                crate::test_support::drain_task_steps(&db, &task_id).await;
+            }
             let updated_task = TaskRepo::get_by_id(&*db, &task.id, false)
                 .await
                 .expect("task loads")
@@ -4722,6 +4745,15 @@ pub(crate) mod tests {
             .await
             .expect("recovery runs");
 
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let updated_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
@@ -4767,6 +4799,15 @@ pub(crate) mod tests {
             .await
             .expect("recovery runs");
 
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let updated_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
@@ -4841,6 +4882,15 @@ pub(crate) mod tests {
             .expect("recovery runs");
         assert_eq!(recovered, 1);
 
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let updated = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
@@ -4930,6 +4980,15 @@ pub(crate) mod tests {
             .expect("recovery runs");
         assert_eq!(recovered, 1);
 
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let updated = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
@@ -5464,6 +5523,15 @@ pub(crate) mod tests {
             .expect("recovery runs");
         assert_eq!(recovered, 1);
 
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let updated = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
@@ -6725,6 +6793,15 @@ pub(crate) mod tests {
         monitor.check_once().await.unwrap();
         responder.await.unwrap();
         monitor.finish_placement_workers().await;
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let task = TaskRepo::get_by_id(&*db, &placement.task_id, false)
             .await
             .unwrap()
@@ -6860,7 +6937,7 @@ pub(crate) mod tests {
                 params: serde_json::to_value(notification).unwrap(),
             },
         );
-        let responder = {
+        let mut responder = {
             let registry = restarted_registry.clone();
             let daemon_id = daemon_id.to_owned();
             let execution_id = execution.id.clone();
@@ -6905,13 +6982,45 @@ pub(crate) mod tests {
             })
         };
         let monitor = HeartbeatMonitor::new(db.clone(), Arc::new(EventBus::new(32)))
-            .with_daemon_connections(restarted_registry)
+            .with_daemon_connections(restarted_registry.clone())
             .with_task_service(service);
         monitor.check_once().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), responder)
-            .await
-            .unwrap()
-            .unwrap();
+        let acknowledged = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    result = &mut responder => { result.unwrap(); break; },
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => { monitor.check_once().await.unwrap(); },
+                }
+            }
+        }).await;
+        match acknowledged {
+            Ok(()) => {}
+            Err(_) => panic!(
+                "terminal ACK missing: placement={:?}, task={:?}, steps={:?}, retained={:?}",
+                WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+                    .await
+                    .unwrap()
+                    .map(|p| p.state),
+                TaskRepo::get_by_id(&*db, &execution.task_id, false)
+                    .await
+                    .unwrap()
+                    .map(|t| t.status),
+                db::TaskStepRepo::task_steps(&*db, &execution.task_id)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|s| (
+                        &s.kind,
+                        &s.status,
+                        &s.last_error,
+                        serde_json::from_str::<Value>(&s.payload_json)
+                            .ok()
+                            .map(|p| p["operation"].clone())
+                    ))
+                    .collect::<Vec<_>>(),
+                restarted_registry.retained_terminal_execution_ids()
+            ),
+        }
         monitor.finish_placement_workers().await;
         let receipts: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM execution_terminal_receipt WHERE execution_id = ?",
@@ -6964,6 +7073,15 @@ pub(crate) mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let mut task = TaskRepo::get_by_id(&*db, &execution.task_id, false)
             .await
             .unwrap()
@@ -7190,6 +7308,15 @@ pub(crate) mod tests {
             ready.failure_cause,
             Some(PlacementFailureCause::OwnerLostExecution)
         );
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -7233,6 +7360,15 @@ pub(crate) mod tests {
             .bind(&execution.id).execute(db.pool()).await.unwrap();
         let monitor = HeartbeatMonitor::new(db.clone(), Arc::new(EventBus::new(32)));
         monitor.check_once().await.unwrap();
+        for task_id in sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT task_id FROM task_step WHERE status IN ('pending','claimed')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        {
+            crate::test_support::drain_task_steps(&db, &task_id).await;
+        }
         let recovered = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -8524,5 +8660,52 @@ pub(crate) mod tests {
                 .status,
             ExecutionStatus::Cancelled
         );
+    }
+    #[tokio::test]
+    async fn restart_recovery_queues_dead_execution_settlement_before_worker_runs() {
+        use db::TaskStepRepo;
+        let db = Arc::new(sqlite_db().await);
+        let bus = Arc::new(EventBus::new(32));
+        let (project_id, _) = seed_project_repo(&db).await;
+        let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let task = seed_task(
+            &db,
+            project_id,
+            "in_progress".into(),
+            Some(agent.id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent.id, None).await;
+        let restarted = Arc::new(SqliteDb::new(db.pool().clone()));
+        CrashRecovery::new(restarted.clone(), bus.clone())
+            .run_recovery()
+            .await
+            .unwrap();
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*restarted, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Running
+        );
+        let queued = restarted.task_steps(&task.id).await.unwrap();
+        assert!(queued.iter().any(|s| s.kind == "command"
+            && s.status == "pending"
+            && s.payload_json.contains("recover_task_after_restart")));
+        let service = TaskService::new(restarted.clone(), bus);
+        service.drain(&task.id).await.unwrap();
+        let settled = ExecutionRepo::get_by_id(&*restarted, &execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.status, ExecutionStatus::Cancelled);
+        assert_eq!(settled.resume_policy, Some(ResumePolicy::Auto));
+        assert!(restarted
+            .task_steps(&task.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.kind == "command" && s.status == "done"));
     }
 }

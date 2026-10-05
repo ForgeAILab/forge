@@ -15,7 +15,12 @@ mod repository;
 mod review_conformance;
 mod sqlite;
 mod task_metadata;
+mod task_mutation;
 mod task_step;
+pub mod task_writer;
+pub use task_mutation::*;
+mod remote_cancel;
+pub use remote_cancel::*;
 pub use task_step::*;
 #[cfg(test)]
 mod tests;

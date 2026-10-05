@@ -1652,7 +1652,7 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
     .await
     .expect("response-loss retry");
     // An exact Task action version is still required after response loss. The
-    // cancelled outcome remains unchanged, and its fresh offer set is empty.
+    // cancelled outcome remains unchanged, with Restart as its fresh offer.
     assert_structured_error(&retry, TASK_ACTION_OPERATION, "version_conflict");
     let cancelled_task = db::TaskRepo::get_by_id(&*fixture.db, &task_id, false)
         .await
@@ -1669,7 +1669,12 @@ async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
     .await
     .unwrap();
     assert_structured_error(&terminal, TASK_ACTION_OPERATION, "action_unavailable");
-    assert_eq!(terminal.value["details"]["available_actions"], json!([]));
+    let offers = terminal.value["details"]["available_actions"]
+        .as_array()
+        .expect("current offers");
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0]["action"]["verb"], "restart");
+    assert_eq!(offers[0]["reason"], "cancelled_restart");
     let unchanged = db::TaskRepo::get_by_id(&*fixture.db, &task_id, false)
         .await
         .unwrap()

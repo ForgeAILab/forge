@@ -216,6 +216,10 @@ impl IntoResponse for ApiError {
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {
+            ServiceError::TaskBusy {pending_steps,retry_after_ms} => Self::conflict_with_code_and_details(api_types::TASK_BUSY,
+                "Task has pending steps; accepted work remains queued",serde_json::to_value(api_types::TaskBusyDetails {
+                    pending_steps,retry_after_ms,retry_hint:"Retry after pending steps settle; refetch the Task version first".to_owned(),
+                }).expect("Task busy details serialize")),
             ServiceError::PlacementUnavailable(error) => Self::conflict_with_code_and_details(
                 if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED } else { "placement_unavailable" },
                 error.to_string(),
@@ -451,6 +455,7 @@ impl From<ServiceError> for ApiError {
 impl From<DbError> for ApiError {
     fn from(error: DbError) -> Self {
         match error {
+            DbError::TaskBusy {pending_steps,retry_after_ms} => ServiceError::TaskBusy {pending_steps,retry_after_ms}.into(),
             DbError::NotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "not_found",
@@ -688,5 +693,18 @@ mod placement_tests {
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert_eq!(error.code, "prepare_failed");
         assert_eq!(error.details.unwrap()["failure_cause"], "prepare_failed");
+    }
+    #[test]
+    fn task_busy_preserves_retry_details_across_error_boundaries() {
+        let error = ApiError::from(ServiceError::from(DbError::TaskBusy {
+            pending_steps: 3,
+            retry_after_ms: 250,
+        }));
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code, api_types::TASK_BUSY);
+        let details = error.details.unwrap();
+        assert_eq!(details["pending_steps"], 3);
+        assert_eq!(details["retry_after_ms"], 250);
+        assert!(details["retry_hint"].as_str().unwrap().contains("refetch"));
     }
 }

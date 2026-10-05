@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct NewSubtaskInput {
     pub title: String,
     pub description: Option<String>,
@@ -12,6 +13,16 @@ impl TaskService {
         parent_task_id: String,
         items: Vec<NewSubtaskInput>,
     ) -> Result<Vec<Task>> {
+        if !db::task_writer::owns_task(&parent_task_id) {
+            return self
+                .request_task_command(
+                    &parent_task_id,
+                    "create_subtasks",
+                    serde_json::json!([parent_task_id, items]),
+                    false,
+                )
+                .await;
+        }
         validate_required("parent_task_id", &parent_task_id)?;
         let parent = TaskRepo::get_by_id(&*self.db, &parent_task_id, false)
             .await?

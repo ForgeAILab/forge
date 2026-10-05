@@ -649,7 +649,8 @@ impl AgentService {
         tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
         validate_required("agent_id", &agent_id)?;
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
-        let role_events = TaskService::on_agent_deleted_in_tx(&mut transaction, &agent_id).await?;
+        let role_events =
+            TaskService::on_agent_deleted_in_tx(&self.db, &mut transaction, &agent_id).await?;
         let now = now_rfc3339();
         let result = sqlx::query(
             "UPDATE agent_identity

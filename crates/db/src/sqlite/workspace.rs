@@ -153,13 +153,26 @@ impl WorkspaceRepo for SqliteDb {
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
+        let fenced: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pending_remote_cancel WHERE workspace_id=?) OR EXISTS(SELECT 1 FROM task_remote_operation WHERE workspace_id=? AND state='running')")
+            .bind(id).bind(id).fetch_one(&mut *transaction).await?;
+        if fenced {
+            return Err(DbError::Check(
+                "pending remote operation fences workspace cleanup".into(),
+            ));
+        }
+        sqlx::query("DELETE FROM task_remote_operation WHERE workspace_id=? AND state<>'running'")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
         let result = sqlx::query("DELETE FROM workspace WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        transaction.commit().await?;
         Ok(())
     }
 }

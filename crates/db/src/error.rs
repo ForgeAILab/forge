@@ -25,6 +25,11 @@ pub enum DbError {
 
     #[error("version conflict")]
     VersionConflict,
+    #[error("task_busy: {pending_steps} pending steps; retry after {retry_after_ms} ms")]
+    TaskBusy {
+        pending_steps: i64,
+        retry_after_ms: u64,
+    },
 
     #[error("idempotency key conflicts with a different mutation")]
     IdempotencyConflict,
@@ -129,7 +134,8 @@ impl DbError {
     /// Worker retry classification, deliberately narrower than "any DB error".
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::VersionConflict
+            Self::TaskBusy { .. }
+            | Self::VersionConflict
             | Self::TaskVersionConflict { .. }
             | Self::BoardRevisionConflict { .. } => true,
             Self::Sqlx(

@@ -735,7 +735,13 @@ async fn moved_task_supersedes_pending_cascade() {
         1
     );
     assert_eq!(
-        db::TaskStepRepo::task_steps(&*db, id).await.unwrap()[0].status,
+        db::TaskStepRepo::task_steps(&*db, id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|step| step.kind == "hooks")
+            .unwrap()
+            .status,
         "superseded"
     );
 }
@@ -4037,6 +4043,7 @@ async fn system_review_ci_authority_loss_keeps_base_cancellation_routing() {
         db: Arc<db::SqliteDb>,
         task_id: String,
         authority_loss: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
     }
     #[async_trait::async_trait]
     impl ws::WorkspaceBackend for ReviewCiFault {
@@ -4055,8 +4062,9 @@ async fn system_review_ci_authority_loss_keeps_base_cancellation_routing() {
             _: &db::WorkspacePlacement,
             _: &ws::RunSpec,
         ) -> ws::Result<ws::RunResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.authority_loss {
-                sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+                sqlx::query("UPDATE review SET updated_at='2099-01-01T00:00:00Z' WHERE task_id=? AND status='running'")
                     .bind(&self.task_id)
                     .execute(self.db.pool())
                     .await
@@ -4110,11 +4118,13 @@ async fn system_review_ci_authority_loss_keeps_base_cancellation_routing() {
     }
 
     let mut fixture = failed_ci_fixture(1, FailurePolicy::Block).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     fixture.engine.workspace_backend_router =
         Arc::new(ws::WorkspaceBackendRouter::new(Arc::new(ReviewCiFault {
             db: fixture.db.clone(),
             task_id: fixture.task.id.clone(),
             authority_loss: true,
+            calls: calls.clone(),
         })));
     let result = fixture
         .engine
@@ -4131,6 +4141,11 @@ async fn system_review_ci_authority_loss_keeps_base_cancellation_routing() {
         .await;
     let result = result.unwrap();
     let result = drain_result(fixture.engine.clone(), result).await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "injected CI backend runs"
+    );
     assert_eq!(result.task.status, "in_progress");
     assert!(result.task.entry_barrier_json.is_none());
     let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
@@ -4516,3 +4531,109 @@ mod audit_worker;
 
 #[path = "tests/durable_23b.rs"]
 mod durable_23b;
+
+#[tokio::test]
+async fn removed_dispatch_annotation_retries_preserve_a_queued_manual_stop() {
+    for clear in [false, true] {
+        let db = Arc::new(sqlite_db().await);
+        let id = new_uuid_v4();
+        seed_project_repo_and_task(&db, &id, "todo").await;
+        let original = json!({"type":"dispatch_failed","message":"old refusal"}).to_string();
+        sqlx::query("UPDATE task SET error_annotation=? WHERE id=?")
+            .bind(&original)
+            .bind(&id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let blocker_id = db
+            .enqueue_task_mutation(
+                &id,
+                db::TaskMutation::Sql {
+                    task_id: id.clone(),
+                    query: "UPDATE task SET title=title WHERE id=?".into(),
+                    arguments: vec![json!(id)],
+                },
+            )
+            .await
+            .unwrap();
+        let blocker = db
+            .claim_step(
+                "blocker",
+                Some(&id),
+                &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocker.id, blocker_id);
+        let activity = db.hold_task_step(&blocker);
+        let manual = json!({"type":"manual_stop","message":"owner held"}).to_string();
+        db.enqueue_task_mutation(
+            &id,
+            db::TaskMutation::Sql {
+                task_id: id.clone(),
+                query: "UPDATE task SET error_annotation=?,version=version+1 WHERE id=?".into(),
+                arguments: vec![json!(manual), json!(id)],
+            },
+        )
+        .await
+        .unwrap();
+        let producer_db = db.clone();
+        let producer_id = id.clone();
+        let producer = tokio::spawn(async move {
+            if clear {
+                super::clear_dispatch_failure_annotation(&producer_db, &producer_id, None).await
+            } else {
+                super::annotate_dispatch_failure(
+                    &producer_db,
+                    &producer_id,
+                    "todo",
+                    "new refusal",
+                    None,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let notify = db.domain_event_notify();
+                let changed = notify.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if db.task_steps(&id).await.unwrap().len() == 3 {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, &id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .error_annotation
+                .as_deref(),
+            Some(original.as_str())
+        );
+        db::task_writer::in_task_step(blocker.clone(), db.execute_task_mutation(&blocker))
+            .await
+            .unwrap();
+        db.release_step(&blocker.id, "blocker").await.unwrap();
+        drop(activity);
+        producer.await.unwrap().unwrap();
+        let task = TaskRepo::get_by_id(&*db, &id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.error_annotation.as_deref(), Some(manual.as_str()));
+        assert_eq!(task.version, 2);
+        assert!(db
+            .task_steps(&id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| s.status == "done" && s.attempts == 1));
+    }
+}

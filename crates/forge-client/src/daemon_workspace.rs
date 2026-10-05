@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -41,6 +41,33 @@ type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
 struct WorkspaceRegistry {
     locations: HashMap<String, VerifiedLocation>,
     handles: HashMap<String, OwnedWorkspace>,
+    /// Cancellation tombstones prevent a delayed request from starting after
+    /// an `unknown` acknowledgment, including after an owner restart.
+    #[serde(default)]
+    cancelled_operations: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct RunningWorkspaceCommand {
+    cancel: tokio::sync::watch::Sender<bool>,
+    finished: tokio::sync::watch::Receiver<Option<WorkspaceCancelState>>,
+}
+
+struct WorkspaceCommandGuard<'a> {
+    running: &'a Mutex<HashMap<String, RunningWorkspaceCommand>>,
+    id: String,
+    finished: tokio::sync::watch::Sender<Option<WorkspaceCancelState>>,
+    state: WorkspaceCancelState,
+}
+
+impl Drop for WorkspaceCommandGuard<'_> {
+    fn drop(&mut self) {
+        self.finished.send_replace(Some(self.state));
+        self.running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +112,7 @@ pub struct DaemonWorkspaceBackend {
     state: Mutex<WorkspaceRegistry>,
     operation_lock: tokio::sync::Mutex<()>,
     provision_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    running_commands: Mutex<HashMap<String, RunningWorkspaceCommand>>,
 }
 
 impl DaemonWorkspaceBackend {
@@ -121,6 +149,7 @@ impl DaemonWorkspaceBackend {
             state: Mutex::new(state),
             operation_lock: tokio::sync::Mutex::new(()),
             provision_locks: Mutex::new(HashMap::new()),
+            running_commands: Mutex::new(HashMap::new()),
         })
     }
 
@@ -137,6 +166,7 @@ impl DaemonWorkspaceBackend {
                 | METHOD_WORKSPACE_PREPARE
                 | METHOD_WORKSPACE_DESCRIBE
                 | METHOD_WORKSPACE_RUN
+                | METHOD_WORKSPACE_CANCEL
                 | METHOD_WORKSPACE_DIFF
                 | METHOD_WORKSPACE_READ
                 | METHOD_WORKSPACE_MERGE
@@ -146,6 +176,127 @@ impl DaemonWorkspaceBackend {
     }
 
     pub async fn handle(
+        &self,
+        method: &str,
+        params: Value,
+        active_ids: impl FnOnce() -> Vec<String>,
+    ) -> CommandResult<Value> {
+        if method == METHOD_WORKSPACE_CANCEL {
+            return encode(self.cancel_command(decode(params)?).await?);
+        }
+        if !matches!(
+            method,
+            METHOD_WORKSPACE_PREPARE
+                | METHOD_WORKSPACE_RUN
+                | METHOD_WORKSPACE_MERGE
+                | METHOD_WORKSPACE_RESET
+                | METHOD_WORKSPACE_CLEANUP
+        ) {
+            return self.handle_inner(method, params, active_ids).await;
+        }
+        let fence: WorkspaceMutationFence = decode(params.clone())?;
+        let id = fence.operation_id;
+        validate_id(&id)?;
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let (finished, completed) = tokio::sync::watch::channel(None);
+        {
+            // Register before waiting for the workspace mutation lock. Cancel
+            // must also stop a command that has not yet spawned its child.
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.cancelled_operations.contains(&id) {
+                return Err(error(WORKSPACE_ERROR, "workspace operation was cancelled"));
+            }
+            let mut running = self
+                .running_commands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if running.contains_key(&id) {
+                return Err(interrupted_error(&id));
+            }
+            running.insert(
+                id.clone(),
+                RunningWorkspaceCommand {
+                    cancel,
+                    finished: completed,
+                },
+            );
+        }
+        let mut guard = WorkspaceCommandGuard {
+            running: &self.running_commands,
+            id,
+            finished,
+            state: WorkspaceCancelState::Killed,
+        };
+        let result = if method == METHOD_WORKSPACE_MERGE {
+            // Integration finishes before a cancel acknowledgement. The
+            // server fences an unreachable owner until this handler settles.
+            let result = self.handle_inner(method, params, active_ids).await;
+            guard.state = WorkspaceCancelState::AlreadyFinished;
+            result
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancelled.changed() => Err(error(WORKSPACE_ERROR, "workspace operation was cancelled")),
+                result = self.handle_inner(method, params, active_ids) => {
+                    guard.state = WorkspaceCancelState::AlreadyFinished;
+                    result
+                }
+            }
+        };
+        // The selected future has been dropped here. Its ProcessGroupGuard
+        // kills descendants before the completion acknowledgment is visible.
+        drop(guard);
+        result
+    }
+
+    async fn cancel_command(
+        &self,
+        request: WorkspaceCancelParams,
+    ) -> CommandResult<WorkspaceCancelResult> {
+        validate_id(&request.operation_id)?;
+        let running = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut updated = state.clone();
+            updated
+                .cancelled_operations
+                .insert(request.operation_id.clone());
+            self.journal
+                .save_workspace_state(&updated)
+                .map_err(storage_error)?;
+            *state = updated;
+            self.running_commands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&request.operation_id)
+                .cloned()
+        };
+        let state = if let Some(mut running) = running {
+            running.cancel.send_replace(true);
+            loop {
+                if let Some(state) = *running.finished.borrow_and_update() {
+                    break state;
+                }
+                if running.finished.changed().await.is_err() {
+                    break WorkspaceCancelState::Killed;
+                }
+            }
+        } else if self
+            .journal
+            .operation(&request.operation_id)
+            .map_err(storage_error)?
+            .is_some()
+        {
+            WorkspaceCancelState::AlreadyFinished
+        } else {
+            WorkspaceCancelState::Unknown
+        };
+        Ok(WorkspaceCancelResult {
+            operation_id: request.operation_id,
+            state,
+        })
+    }
+
+    async fn handle_inner(
         &self,
         method: &str,
         params: Value,

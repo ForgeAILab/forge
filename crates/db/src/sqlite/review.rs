@@ -69,6 +69,7 @@ async fn update_status_inner(
     origin: crate::ReviewEventOrigin,
 ) -> Result<(Review, Option<Task>)> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let review = sqlx::query("SELECT * FROM review WHERE id = ?")
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -104,7 +105,7 @@ async fn update_status_inner(
         return Err(DbError::InvalidTransition);
     }
 
-    let task_authority = if let Some(task_authority) = task_authority {
+    let task_authority = if let Some(mut task_authority) = task_authority {
         if !matches!(status, ReviewStatus::Passed | ReviewStatus::Failed) {
             return Err(DbError::Check(
                 "task review authority requires a terminal Review status".to_owned(),
@@ -139,6 +140,9 @@ async fn update_status_inner(
             .await?
             .ok_or(DbError::NotFound)?;
         let task = map_task(task_row)?;
+        if crate::task_writer::owns_task(&task.id) {
+            task_authority.expected_version = task.version;
+        }
         if task.deleted_at.is_some() || task.version != task_authority.expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -292,6 +296,7 @@ async fn update_status_with_review_authority_inner(
     carry: Option<&crate::NewReviewAuthorityCarry>,
 ) -> Result<(Review, Option<Task>)> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
+    db.fence_current_step_in_tx(&mut transaction).await?;
     let review = sqlx::query("SELECT * FROM review WHERE id = ?")
         .bind(id)
         .fetch_optional(&mut *transaction)
@@ -332,6 +337,11 @@ async fn update_status_with_review_authority_inner(
         .await?
         .ok_or(DbError::NotFound)?;
     let task = map_task(task_row)?;
+    let expected_task_version = if crate::task_writer::owns_task(&task.id) {
+        task.version
+    } else {
+        expected_task_version
+    };
     if task.deleted_at.is_some()
         || task.version != expected_task_version
         || task.status != expected_task_status
@@ -601,6 +611,16 @@ impl ReviewRepo for SqliteDb {
         &self,
         input: CreateManualReviewPass,
     ) -> Result<(Review, Task)> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return self
+                .run_task_mutation(
+                    &input.task_id,
+                    crate::TaskMutation::ReviewCreateManualPass {
+                        input: input.clone(),
+                    },
+                )
+                .await;
+        }
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let result =
             ReviewRepo::create_manual_pass_with_task_authority_in_tx(self, &mut transaction, input)
@@ -612,8 +632,14 @@ impl ReviewRepo for SqliteDb {
     async fn create_manual_pass_with_task_authority_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
-        input: CreateManualReviewPass,
+        mut input: CreateManualReviewPass,
     ) -> Result<(Review, Task)> {
+        if !crate::task_writer::owns_task(&input.task_id) {
+            return Err(DbError::Check(
+                "manual Review projection requires the Task step".to_owned(),
+            ));
+        }
+        self.fence_current_step_in_tx(transaction).await?;
         let source = sqlx::query("SELECT * FROM review WHERE id = ?")
             .bind(&input.source_review_id)
             .fetch_optional(&mut **transaction)
@@ -649,6 +675,7 @@ impl ReviewRepo for SqliteDb {
             .await?
             .ok_or(DbError::NotFound)?;
         let task = map_task(task_row)?;
+        input.expected_task_version = task.version;
         if task.deleted_at.is_some()
             || task.version != input.expected_task_version
             || task.status != input.expected_task_status
@@ -756,7 +783,10 @@ impl ReviewRepo for SqliteDb {
             .fetch_one(&mut **transaction)
             .await?;
         let task = map_task(task_row)?;
-        Ok((review, task))
+        let outcome = (review, task);
+        self.record_mutation_reply_in_tx(transaction, &outcome)
+            .await?;
+        Ok(outcome)
     }
 
     async fn create_attempt_with_execution_and_lease(
@@ -766,6 +796,19 @@ impl ReviewRepo for SqliteDb {
         lease: ClaimExecutionLease,
         admission: Option<ExecutionAdmission>,
     ) -> Result<(Review, Execution)> {
+        if !crate::task_writer::owns_task(&review.task_id) {
+            return self
+                .run_task_mutation(
+                    &review.task_id,
+                    crate::TaskMutation::ReviewCreateAttemptWithExecution {
+                        review: Box::new(review.clone()),
+                        execution: Box::new(execution),
+                        lease,
+                        admission,
+                    },
+                )
+                .await;
+        }
         let invalid_deadline = lease
             .hard_deadline_at
             .as_deref()
@@ -839,15 +882,23 @@ impl ReviewRepo for SqliteDb {
             .bind(&review.updated_at)
             .execute(&mut *transaction)
             .await?;
+        let persisted_review = map_review(
+            sqlx::query("SELECT * FROM review WHERE id=?")
+                .bind(&review.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        )?;
+        let persisted_execution = map_execution(
+            sqlx::query("SELECT * FROM execution WHERE id=?")
+                .bind(&execution.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        )?;
+        let outcome = (persisted_review, persisted_execution);
+        self.record_mutation_reply_in_tx(&mut transaction, &outcome)
+            .await?;
         transaction.commit().await?;
-
-        let persisted_review = ReviewRepo::get_by_id(self, &review.id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        let persisted_execution = ExecutionRepo::get_by_id(self, &execution.id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        Ok((persisted_review, persisted_execution))
+        Ok(outcome)
     }
 
     async fn update_status(
@@ -920,6 +971,28 @@ impl ReviewRepo for SqliteDb {
         review_passed_at: Option<String>,
         origin: crate::ReviewEventOrigin,
     ) -> Result<(Review, Task)> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithTaskAuthority {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        review_passed_at: review_passed_at.clone(),
+                        origin,
+                    },
+                )
+                .await;
+        }
+
         let (review, task) = update_status_inner(
             self,
             id,
@@ -953,6 +1026,28 @@ impl ReviewRepo for SqliteDb {
         review_passed_at: Option<String>,
         expected_candidate_execution_id: &str,
     ) -> Result<(Review, Task)> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithTaskAuthorityAndCandidate {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        review_passed_at: review_passed_at.clone(),
+                        expected_candidate_execution_id: expected_candidate_execution_id.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let (review, task) = update_status_inner(
             self,
             id,
@@ -990,6 +1085,33 @@ impl ReviewRepo for SqliteDb {
         expected_review_updated_at: &str,
         expected_candidate_execution_id: &str,
     ) -> Result<(Review, Task)> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithTaskAuthorityAndProjectCandidate {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        review_passed_at: review_passed_at.clone(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition
+                            .map(str::to_owned),
+                        expected_review_status: expected_review_status.clone(),
+                        expected_review_updated_at: expected_review_updated_at.to_owned(),
+                        expected_candidate_execution_id: expected_candidate_execution_id.to_owned(),
+                    },
+                )
+                .await;
+        }
+
         let (review, task) = update_status_inner(
             self,
             id,
@@ -1027,6 +1149,34 @@ impl ReviewRepo for SqliteDb {
         expected_review_updated_at: &str,
         expected_candidate_execution_id: Option<&str>,
     ) -> Result<Review> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithReviewAuthority {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        expected_task_status: expected_task_status.to_owned(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition
+                            .map(str::to_owned),
+                        expected_review_status: expected_review_status.clone(),
+                        expected_review_updated_at: expected_review_updated_at.to_owned(),
+                        expected_candidate_execution_id: expected_candidate_execution_id
+                            .map(str::to_owned),
+                    },
+                )
+                .await;
+        }
+
         if !matches!(status, ReviewStatus::Running | ReviewStatus::AwaitingHuman) {
             return Err(DbError::Check(
                 "review authority updates require a non-terminal Review status".to_owned(),
@@ -1069,6 +1219,34 @@ impl ReviewRepo for SqliteDb {
         expected_candidate_execution_id: &str,
         task_projection: Option<Option<String>>,
     ) -> Result<Review> {
+        let _task_id = ReviewRepo::get_by_id(self, id)
+            .await?
+            .ok_or(DbError::NotFound)?
+            .task_id;
+        if !crate::task_writer::owns_task(&_task_id) {
+            return self
+                .run_task_mutation(
+                    &_task_id,
+                    crate::TaskMutation::ReviewUpdateStatusWithReviewAuthorityAndTaskProjection {
+                        id: id.to_owned(),
+                        status: status.clone(),
+                        step_results_json: step_results_json.clone(),
+                        finished_at: finished_at.clone(),
+                        updated_at: updated_at.to_owned(),
+                        expected_task_version,
+                        expected_task_status: expected_task_status.to_owned(),
+                        expected_project_version,
+                        expected_workflow_definition: expected_workflow_definition
+                            .map(str::to_owned),
+                        expected_review_status: expected_review_status.clone(),
+                        expected_review_updated_at: expected_review_updated_at.to_owned(),
+                        expected_candidate_execution_id: expected_candidate_execution_id.to_owned(),
+                        task_projection: task_projection.clone(),
+                    },
+                )
+                .await;
+        }
+
         let (review, _) = update_status_with_review_authority_inner(
             self,
             id,

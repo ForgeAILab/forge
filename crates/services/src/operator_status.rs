@@ -189,6 +189,10 @@ impl OperatorStatusService {
         let event_consumers = self.event_consumers(now).await?;
         let periodic_workers = self.periodic_workers.status().await?;
         let task_steps = self.task_step_status(now).await?;
+        let pending_remote_cancels: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pending_remote_cancel")
+                .fetch_one(self.db.pool())
+                .await?;
         let storage = db::sqlite_storage_status(self.db.pool()).await?;
         let database = DatabaseStorageStatus {
             incremental_vacuum: storage.incremental_vacuum,
@@ -335,6 +339,7 @@ impl OperatorStatusService {
             event_consumers,
             periodic_workers,
             task_steps,
+            pending_remote_cancels,
             event_relay,
             database,
             computed_at,
