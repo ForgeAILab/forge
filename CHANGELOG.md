@@ -8,6 +8,32 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Task commands can return `409 task_busy`; the request stays queued
+  (refactor 2.3c).** Task workflow writes run one at a time per Task. A command
+  waits at most 5 seconds (Cancel/Hold: 15 seconds) for work queued ahead of it,
+  then returns HTTP 409 `task_busy` with `{pending_steps, retry_after_ms,
+  retry_hint}`. The request was accepted and still applies; refetch the Task
+  instead of resubmitting (a retry with the old version gets a version
+  conflict). The web shows "Queued; it will apply after the current step",
+  `forge-ctl` prints the pending steps and retry hint, and MCP returns the same
+  details. A Cancel that arrives while a merge is integrating waits for it; if
+  the merge landed, the Task is done and a comment records that the Cancel had
+  no effect.
+- **New daemon method `workspace.cancel` (refactor 2.3c).** `{operation_id}`
+  acknowledges `{operation_id, state}` (`killed`, `already_finished`,
+  `unknown`). Cancel/Hold uses it to stop remote CI, before-work scripts and
+  agent startup. A daemon that rejects the method cannot be cancelled remotely;
+  upgrade it. Daemons keep cancellation tombstones for 7 days.
+- **`pending_remote_cancel` records (refactor 2.3c).** When remote work cannot
+  be confirmed stopped within 10 seconds, Cancel/Hold still applies, the
+  workspace response lists `pending_remote_cancel` records and operator status
+  reports `pending_remote_cancels`. New steps and executions cannot use that
+  workspace, and Restart/Retry/Release park with an annotation naming the
+  machine, until it reconnects and confirms cleanup. Deleting the Project, Task
+  or workspace never fails on these records.
+- **Delete conflicts return `409 resource_in_use` (refactor 2.3c).** A delete
+  refused because other records still reference the target used to return 500.
+
 - **Native chat topic responses can be pending (plan 3.6).**
   `POST /api/v1/agent-chats/{chat_id}/topics` now returns nullable `topic` and
   `divider_message_id` plus `rotation_pending`. On a native chat, a request
@@ -361,6 +387,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **One writer per Task (refactor 2.3c).** Every write to a Task's workflow
+  state runs through that Task's leased step queue. Cancel/Hold stops CI,
+  scripts and agent startup at a safe point; a merge that has started
+  integrating always finishes first.
+  - Cancelling a root Task queues each subtask's cancel without waiting for
+    busy subtasks.
+  - Dispatch wakes, wait clears, dependency blocks, role clears and execution
+    completion cascades are no longer lost when the Task changes status or is
+    held first; releasing a hold whose run had already finished moves the
+    Task on instead of re-running the role.
+  - After a restart, `task.recovered` (reason `crash_recovery`) is published
+    when recovery settles a Task's dead executions, and repeated restarts
+    queue one recovery per Task.
 
 - **Native chats use topic-scoped, budgeted working sets (plan 3.6).** Each
   topic is one runtime session and one LCM timeline. Main runs at 48k/64k
