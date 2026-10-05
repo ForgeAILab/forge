@@ -614,11 +614,71 @@ impl agent_runtime::harness::LcmTimelineResolver for TopicTimelineResolver {
     }
 }
 
+/// Whether a persisted session's LCM state carries the fixed request
+/// overhead the runtime measured from a successful plan.
+fn lcm_overhead_measured(snapshot: &agent_runtime::core::store::SessionSnapshot) -> bool {
+    snapshot
+        .extension_state
+        .get(agent_runtime::harness::LCM_COMPONENT_ID)
+        .and_then(|state| state.value.get("fixed_overhead_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|tokens| tokens > 0)
+}
+
+/// The fixed, non-conversation part of a chat request (system prompt, state
+/// card and tool schemas), sized with the runtime's default request sizer,
+/// the same one the planner uses.
+fn estimated_fixed_overhead(
+    system_prompt: Option<&str>,
+    state_card: Option<&str>,
+    tools: &[Arc<dyn agent_runtime::core::tool::Tool>],
+) -> u32 {
+    use agent_runtime::context::RequestSizer;
+    let sizer = agent_runtime::context::CharRatioSizer::default();
+    let mut tokens = 0u32;
+    if let Some(prompt) = system_prompt {
+        tokens = tokens.saturating_add(sizer.size_message(&Message::text(Role::System, prompt)));
+    }
+    if let Some(card) = state_card {
+        tokens = tokens.saturating_add(sizer.size_message(&Message::text(Role::User, card)));
+    }
+    tools.iter().fold(tokens, |tokens, tool| {
+        tokens.saturating_add(sizer.size_tool_schema(&tool.spec().to_schema()))
+    })
+}
+
+/// The working set for a turn whose session has no measured overhead yet.
+///
+/// LCM pressure budgets the conversation as `target - measured overhead`,
+/// but the runtime measures that overhead only after a successful plan. A
+/// cold session (new, adopted from pre-working-set state, or one whose every
+/// plan so far failed) therefore budgets history against the whole target.
+/// When the gap between target and hard cap cannot hold the system prompt,
+/// tools and card (a model window at or below the surface target clamps both
+/// to the same value), history stays under hard pressure while the planner
+/// refuses the request, and the failed plan never records an overhead to
+/// recover with. Lowering the target so the estimated overhead fits under the
+/// hard cap lets LCM compact first. It changes nothing when the gap already
+/// holds the overhead, and is never applied once an overhead is measured.
+fn cold_start_working_set(policy: WorkingSetPolicy, estimated_overhead: u32) -> WorkingSetPolicy {
+    WorkingSetPolicy {
+        target_tokens: policy
+            .target_tokens
+            .min(policy.hard_tokens.saturating_sub(estimated_overhead))
+            .max(policy.target_tokens / 4)
+            .max(1),
+        hard_tokens: policy.hard_tokens,
+    }
+}
+
 impl NativeAgentRuntimeBackend {
+    /// `overhead_measured` is false when the session's persisted LCM state
+    /// has no measured request overhead yet (see [`cold_start_working_set`]).
     async fn prepare_runtime(
         &self,
         request: &AgentTurnRequest,
         successor: Option<&str>,
+        overhead_measured: bool,
     ) -> Result<PreparedNativeRuntime, AgentHostError> {
         request.scope.validate()?;
         let binding = self
@@ -837,10 +897,25 @@ impl NativeAgentRuntimeBackend {
                         .context_tokens
                         .saturating_sub(request.provider.max_output_tokens),
                 );
-                builder = builder.working_set_policy(WorkingSetPolicy {
+                let mut policy = WorkingSetPolicy {
                     target_tokens: policy.target_tokens.min(window),
                     hard_tokens: policy.hard_tokens.min(window),
-                });
+                };
+                if !overhead_measured {
+                    let card = request
+                        .server_state_card
+                        .as_ref()
+                        .map(|card| format!("{}{card}", self.state_card_marker));
+                    policy = cold_start_working_set(
+                        policy,
+                        estimated_fixed_overhead(
+                            request.system_prompt.as_deref(),
+                            card.as_deref(),
+                            &composition.tools(),
+                        ),
+                    );
+                }
+                builder = builder.working_set_policy(policy);
             }
         }
         if context_mode.structural_compaction {
@@ -1065,6 +1140,26 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         if request.cancellation.is_cancelled() {
             return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
         }
+        use agent_runtime::core::store::SessionStore;
+        use agent_runtime::prelude::CheckpointStore;
+        let id = SessionId::new(&request.runtime_session_id);
+        let snapshot = match self
+            .protected_store
+            .load(&id)
+            .await
+            .map_err(host_runtime_error)?
+        {
+            Some(snapshot) => Some(snapshot),
+            None => self
+                .protected_store
+                .load_latest(&id)
+                .await
+                .map_err(host_runtime_error)?
+                .map(|checkpoint| checkpoint.snapshot),
+        };
+        let saved = snapshot.is_some();
+        let overhead_measured = snapshot.as_ref().is_some_and(lcm_overhead_measured);
+        drop(snapshot);
         let PreparedNativeRuntime {
             runtime,
             context_mode,
@@ -1073,27 +1168,14 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             needs_adoption,
             summary_cap: _,
             topic_reads,
-        } = self.prepare_runtime(&request, None).await?;
+        } = self
+            .prepare_runtime(&request, None, overhead_measured)
+            .await?;
         let mut topic_reads_guard = TopicReadTurnGuard {
             failed: Arc::clone(&self.failed_topic_reads),
             runtime_session_id: request.runtime_session_id.clone(),
             completed: false,
         };
-        use agent_runtime::core::store::SessionStore;
-        use agent_runtime::prelude::CheckpointStore;
-        let id = SessionId::new(&request.runtime_session_id);
-        let saved = self
-            .protected_store
-            .load(&id)
-            .await
-            .map_err(host_runtime_error)?
-            .is_some()
-            || self
-                .protected_store
-                .load_latest(&id)
-                .await
-                .map_err(host_runtime_error)?
-                .is_some();
         let start = if !context_mode.persistent_session {
             let mut start = StartSession::ephemeral(Vec::new());
             start.session_id = Some(id);
@@ -1481,7 +1563,11 @@ impl NativeAgentRuntimeBackend {
         {
             return Err(AgentHostError::VersionConflict);
         }
-        let prepared = self.prepare_runtime(&request, Some(successor)).await?;
+        // A fork plans no provider request, so the cold-start working set
+        // never applies to it.
+        let prepared = self
+            .prepare_runtime(&request, Some(successor), true)
+            .await?;
         let saved_seed: Option<SealedTopicSeed> = sqlx::query_as(
             "SELECT summary_ciphertext, summary_nonce FROM agent_chat_topic_rotation WHERE id = ?",
         )
@@ -1644,7 +1730,7 @@ impl NativeAgentRuntimeBackend {
     /// source session, so the source keeps taking turns. A no-op when no
     /// fork is pending; refused by the runtime once the successor was saved.
     pub async fn abort_topic_fork(&self, request: AgentTurnRequest) -> Result<(), AgentHostError> {
-        let prepared = self.prepare_runtime(&request, None).await?;
+        let prepared = self.prepare_runtime(&request, None, true).await?;
         prepared
             .runtime
             .abort_fork(&SessionId::new(&request.runtime_session_id))

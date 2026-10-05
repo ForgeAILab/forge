@@ -2079,6 +2079,15 @@ the hard cap, and runtime-derived pressure/leaf/round defaults govern compaction
 Forge's serialized-entry sizer, chars/4 overhead calculation and pressure overrides
 are removed.
 
+The runtime measures fixed overhead only after a successful plan, so a cold
+session (new, adopted, or with no successful plan yet) would budget history
+against the whole target. On such a turn Forge sizes the system prompt, state card
+and tool schemas with the runtime's default request sizer and lowers the target to
+`min(target, hard - estimate)` (never below a quarter of the target). With the
+default gaps this is a no-op; it matters when a small model window clamps target and
+hard cap to the same value. Once the session persists a measured overhead, turns use
+the configured target unchanged.
+
 `ProviderLcmSummaryModel` uses the agent's configured provider/model with bounded
 host instructions and a low reasoning setting (minimal for Gemini, low for other
 controllable models; fixed/unsupported reasoning is left unconfigured). The runtime
