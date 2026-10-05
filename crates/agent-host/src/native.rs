@@ -1708,13 +1708,18 @@ pub(crate) fn provider_turn_failure(
     use agent_runtime::core::provider::ProviderErrorKind;
     use api_types::TurnFailure;
     match error.kind {
-        ProviderErrorKind::BadRequest | ProviderErrorKind::Unsupported => {
+        // A provider can mark a rejection retryable (e.g. a transient 4xx);
+        // only a non-retryable rejection is a deterministic schema failure.
+        ProviderErrorKind::BadRequest | ProviderErrorKind::Unsupported if error.retryable => {
             TurnFailure::ProviderRejected {
-                retryable: error.retryable,
+                retryable: true,
                 retry_after: error.retry_after_ms,
             }
         }
-        ProviderErrorKind::Auth => TurnFailure::Configuration,
+        ProviderErrorKind::BadRequest | ProviderErrorKind::Unsupported => {
+            TurnFailure::ProviderSchema
+        }
+        ProviderErrorKind::Auth => TurnFailure::ProviderAuth,
         ProviderErrorKind::LimitExhausted => TurnFailure::UsageLimit {
             resets_at: error.limit_resets_at_ms,
         },
@@ -1737,7 +1742,7 @@ fn runtime_turn_failure(error: &RuntimeError) -> api_types::TurnFailure {
     match &error.class {
         FailureClass::PolicyDenied { .. } => return TurnFailure::Authority,
         FailureClass::ContextOverflow { .. } => return TurnFailure::ContextOverflow,
-        FailureClass::Auth { .. } => return TurnFailure::Configuration,
+        FailureClass::Auth { .. } => return TurnFailure::ProviderAuth,
         FailureClass::QuotaExhausted { .. } => {
             return TurnFailure::UsageLimit {
                 resets_at: error.limit_resets_at_ms,
@@ -1746,9 +1751,13 @@ fn runtime_turn_failure(error: &RuntimeError) -> api_types::TurnFailure {
         FailureClass::RequestRejected {
             stage: FailureStage::Provider,
         } => {
-            return TurnFailure::ProviderRejected {
-                retryable: error.retryable,
-                retry_after: error.retry_after_ms,
+            return if error.retryable {
+                TurnFailure::ProviderRejected {
+                    retryable: true,
+                    retry_after: error.retry_after_ms,
+                }
+            } else {
+                TurnFailure::ProviderSchema
             };
         }
         FailureClass::TurnLimit { limit, .. } => {
@@ -1847,7 +1856,7 @@ mod turn_failure_tests {
                 },
                 TurnFailure::ContextOverflow,
             ),
-            (FailureClass::Auth { stage }, TurnFailure::Configuration),
+            (FailureClass::Auth { stage }, TurnFailure::ProviderAuth),
             (
                 FailureClass::QuotaExhausted { stage },
                 TurnFailure::UsageLimit { resets_at: Some(0) },
@@ -1856,10 +1865,7 @@ mod turn_failure_tests {
                 FailureClass::RequestRejected {
                     stage: FailureStage::Provider,
                 },
-                TurnFailure::ProviderRejected {
-                    retryable: false,
-                    retry_after: Some(0),
-                },
+                TurnFailure::ProviderSchema,
             ),
             (
                 FailureClass::TurnLimit {
@@ -1943,10 +1949,7 @@ mod turn_failure_tests {
                     ProviderErrorKind::BadRequest,
                     "usage limit config credential",
                 ),
-                TurnFailure::ProviderRejected {
-                    retryable: false,
-                    retry_after: None,
-                },
+                TurnFailure::ProviderSchema,
             ),
             (
                 ProviderError::new(ProviderErrorKind::BadRequest, "rejected").retry_after(1200),
@@ -1969,7 +1972,7 @@ mod turn_failure_tests {
             ),
             (
                 ProviderError::new(ProviderErrorKind::Auth, "x"),
-                TurnFailure::Configuration,
+                TurnFailure::ProviderAuth,
             ),
             (
                 ProviderError::new(ProviderErrorKind::MalformedStream, "config usage limit"),

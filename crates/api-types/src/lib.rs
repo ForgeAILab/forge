@@ -682,3 +682,6 @@ fn export_typescript_to(out_dir: &std::path::Path) {
 }
 
 pub mod execution_outbox;
+
+mod project_escalations;
+pub use project_escalations::*;

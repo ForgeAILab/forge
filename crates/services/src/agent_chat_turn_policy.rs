@@ -11,11 +11,16 @@ const MAX_BACKOFF_SECONDS: i64 = 300;
 const ERROR_LIMIT: usize = 512;
 pub const MAX_PRE_PROVIDER_FAILURES: i64 = 3;
 pub const MAX_USAGE_LIMIT_DEFERRALS: i64 = 24;
+/// Lease expiries refunded per turn; later expiries count against max_attempts.
+pub const MAX_LEASE_REFUNDS: i64 = 3;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UsageLimitDeferrals {
     pub count: i64,
     pub first_at: Option<DateTime<Utc>>,
+    /// Autonomous wake turns fail fast on a usage limit; the sweep owns their
+    /// re-admission. User-authored turns defer until the window resets.
+    pub fail_fast: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +100,8 @@ pub fn failure_after_claim(
         | TurnFailure::Configuration
         | TurnFailure::Authority
         | TurnFailure::ContextOverflow => (TurnRetryDecision::Fail, None),
+        TurnFailure::ProviderSchema | TurnFailure::ProviderAuth => (TurnRetryDecision::Fail, None),
+        TurnFailure::UsageLimit { .. } if deferrals.fail_fast => (TurnRetryDecision::Fail, None),
         TurnFailure::UsageLimit { resets_at } => {
             attempts = attempt_count.saturating_sub(1).max(0);
             deferrals.count = deferrals.count.saturating_add(1);
@@ -174,27 +181,46 @@ pub fn failure_after_claim(
     }
 }
 
-/// Expired leases become retryable/terminal using the same rule as an
-/// invocation failure; no model call is needed to recover a stale lease.
+/// An expired lease refunds its attempt (a restart or stalled renewal is not
+/// the turn's fault) at most [`MAX_LEASE_REFUNDS`] times. Later expiries use
+/// the invocation-failure rule, so a turn that keeps killing its process ends.
 pub fn recover_expired(
     status: AgentChatTurnStatus,
     lease_expires_at: Option<DateTime<Utc>>,
     attempt_count: i64,
     max_attempts: i64,
+    lease_refunds: i64,
     now: DateTime<Utc>,
 ) -> Option<FailureDecision> {
     if status != AgentChatTurnStatus::Leased || lease_expires_at.is_none_or(|until| until > now) {
         return None;
     }
-    Some(failure_after_claim(
-        &TurnFailure::Unclassified,
-        attempt_count,
-        max_attempts,
-        0,
-        UsageLimitDeferrals::default(),
-        now,
-        "turn execution lease expired",
-    ))
+    if lease_refunds >= MAX_LEASE_REFUNDS {
+        return Some(failure_after_claim(
+            &TurnFailure::Unclassified,
+            attempt_count,
+            max_attempts,
+            0,
+            UsageLimitDeferrals::default(),
+            now,
+            "turn execution lease expired",
+        ));
+    }
+    Some(FailureDecision {
+        status: AgentChatTurnStatus::RetryWait,
+        attempt_count: attempt_count.saturating_sub(1).max(0),
+        next_attempt_at: Some(now),
+        error: "turn execution lease expired".to_owned(),
+        retry_decision: TurnRetryDecision::Defer,
+        pre_provider_failure_count: 0,
+        usage_limit_deferral_count: 0,
+        usage_limit_first_deferred_at: None,
+    })
+}
+
+/// Autonomous wake turns carry the admitted wake dedupe key.
+pub fn is_autonomous_wake_turn(job: &db::AgentChatTurnJob) -> bool {
+    job.dedupe_key.starts_with("agent-wake-admitted:")
 }
 
 pub fn bounded_error(error: &str) -> String {
@@ -225,6 +251,8 @@ mod tests {
                 0,
             ),
             (TurnFailure::Configuration, 0),
+            (TurnFailure::ProviderSchema, 0),
+            (TurnFailure::ProviderAuth, 0),
             (TurnFailure::Authority, 0),
             (TurnFailure::ContextOverflow, 0),
             (
@@ -392,6 +420,7 @@ mod tests {
                 UsageLimitDeferrals {
                     count,
                     first_at: Some(at(100)),
+                    fail_fast: false,
                 },
                 at(100),
                 "capacity",
@@ -407,10 +436,12 @@ mod tests {
             UsageLimitDeferrals {
                 count: MAX_USAGE_LIMIT_DEFERRALS - 1,
                 first_at: Some(at(100)),
+                fail_fast: false,
             },
             UsageLimitDeferrals {
                 count: 1,
                 first_at: Some(at(100) - Duration::hours(24)),
+                fail_fast: false,
             },
         ] {
             let decision = failure_after_claim(
@@ -425,6 +456,38 @@ mod tests {
             assert_eq!(decision.retry_decision, TurnRetryDecision::Fail);
             assert_eq!(decision.attempt_count, 0);
             assert!(decision.next_attempt_at.is_none());
+        }
+    }
+
+    #[test]
+    fn deterministic_provider_failures_stop_on_attempt_one_for_autonomous_wakes() {
+        for failure in [
+            TurnFailure::ProviderSchema,
+            TurnFailure::ProviderAuth,
+            TurnFailure::UsageLimit {
+                resets_at: Some(120_000),
+            },
+        ] {
+            let d = failure_after_claim(
+                &failure,
+                1,
+                3,
+                0,
+                UsageLimitDeferrals {
+                    fail_fast: true,
+                    ..UsageLimitDeferrals::default()
+                },
+                at(100),
+                "provider failure",
+            );
+            assert_eq!(d.status, AgentChatTurnStatus::Failed);
+            assert_eq!(d.attempt_count, 1);
+            assert_eq!(d.retry_decision, TurnRetryDecision::Fail);
+            assert!(d.next_attempt_at.is_none());
+            assert!(matches!(
+                failure.code(),
+                "provider_schema" | "provider_auth" | "usage_limit"
+            ));
         }
     }
 
@@ -536,14 +599,40 @@ mod tests {
 
     #[test]
     fn expired_lease_recovery_is_deterministic_and_does_not_reinvoke_model() {
-        let recovered = recover_expired(AgentChatTurnStatus::Leased, Some(at(99)), 2, 3, at(100))
-            .expect("expired lease is recoverable");
+        let recovered =
+            recover_expired(AgentChatTurnStatus::Leased, Some(at(99)), 2, 3, 0, at(100))
+                .expect("expired lease is recoverable");
         assert_eq!(recovered.status, AgentChatTurnStatus::RetryWait);
-        assert_eq!(recovered.attempt_count, 2);
-        assert_eq!(recovered.next_attempt_at, Some(at(110)));
+        assert_eq!(recovered.attempt_count, 1);
+        assert_eq!(recovered.next_attempt_at, Some(at(100)));
         assert!(
-            recover_expired(AgentChatTurnStatus::Leased, Some(at(101)), 0, 3, at(100),).is_none()
+            recover_expired(AgentChatTurnStatus::Leased, Some(at(101)), 0, 3, 0, at(100)).is_none()
         );
+    }
+
+    #[test]
+    fn lease_refunds_are_capped_then_expiries_count_against_max_attempts() {
+        let charged = recover_expired(
+            AgentChatTurnStatus::Leased,
+            Some(at(99)),
+            2,
+            3,
+            MAX_LEASE_REFUNDS,
+            at(100),
+        )
+        .expect("expired lease is recoverable");
+        assert_eq!(charged.status, AgentChatTurnStatus::RetryWait);
+        assert_eq!(charged.attempt_count, 2, "a fourth expiry is charged");
+        let terminal = recover_expired(
+            AgentChatTurnStatus::Leased,
+            Some(at(99)),
+            3,
+            3,
+            MAX_LEASE_REFUNDS,
+            at(100),
+        )
+        .expect("expired lease is recoverable");
+        assert_eq!(terminal.status, AgentChatTurnStatus::Failed);
     }
 
     #[test]

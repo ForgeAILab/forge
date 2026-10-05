@@ -33,6 +33,7 @@ import {
   removeProviderEntry,
   renameProviderEntry,
   resolveAttentionItem,
+  answerProjectEscalation,
   rotateAgentSession,
   setMainAgentBinding,
   setCliRuntimeAvailability,
@@ -604,6 +605,24 @@ export function useResolveAttentionMutation() {
   return useMutation({
     mutationFn: ({ id, expectedVersion }: { id: string; expectedVersion: number }) =>
       resolveAttentionItem(id, expectedVersion),
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.missionControl })
+    },
+  })
+}
+
+export function useAnswerEscalationMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      escalationId,
+      answer,
+    }: {
+      projectId: string
+      escalationId: string
+      answer: string
+    }) => answerProjectEscalation(projectId, escalationId, answer),
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.missionControl })
     },

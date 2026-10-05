@@ -42,7 +42,6 @@ use crate::{
     agent_chat_service::{
         AgentChatService, AppendAgentChatSuccessInput, CommittedAgentChatResponse,
     },
-    agent_chat_turn_policy::failure_after_claim,
     context_manifest::{ContextManifestInput, ContextManifestService, ContextSourceInput},
     embedded_agent_service::{
         CreateFrozenAgentChatSession, CreateScopedSession, RequestedCanonicalScope,
@@ -587,7 +586,7 @@ pub trait AgentChatTurnRunner: Send + Sync {
 
     /// Run one provider attempt while retaining every typed usage report the
     /// adapter observed, including reports attached to a terminal failure.
-    /// The default keeps existing test doubles source-compatible.
+    /// The basic adapter preserves typed failure evidence supplied by its runner.
     async fn run_turn_with_usage(
         &self,
         job: &AgentChatTurnJob,
@@ -599,7 +598,10 @@ pub trait AgentChatTurnRunner: Send + Sync {
                 usage_reports: Vec::new(),
             },
             Err(error) => AgentChatTurnRunOutcome::Failed {
-                failure: TurnFailure::Unclassified,
+                failure: match &error {
+                    ServiceError::TurnFailure { failure, .. } => failure.clone(),
+                    _ => TurnFailure::Unclassified,
+                },
                 error,
                 usage_reports: Vec::new(),
             },
@@ -3933,7 +3935,7 @@ impl AgentChatTurnWorker {
         let failure_json = serde_json::to_string(&TurnFailure::Unclassified)
             .map_err(|error| ServiceError::Domain(error.to_string()))?;
         let expired = sqlx::query(
-            "SELECT id, attempt_count, max_attempts, pre_provider_failure_count, version
+            "SELECT id, attempt_count, max_attempts, lease_refund_count, version
              FROM agent_chat_turn_job
              WHERE status = 'leased' AND leased_until IS NOT NULL AND leased_until <= ?
              ORDER BY created_at ASC, id ASC",
@@ -3946,17 +3948,19 @@ impl AgentChatTurnWorker {
             let id: String = row.try_get("id")?;
             let attempt_count: i64 = row.try_get("attempt_count")?;
             let max_attempts: i64 = row.try_get("max_attempts")?;
-            let pre_provider_failures: i64 = row.try_get("pre_provider_failure_count")?;
+            let refunds: i64 = row.try_get("lease_refund_count")?;
             let version: i64 = row.try_get("version")?;
-            let decision = failure_after_claim(
-                &TurnFailure::Unclassified,
+            let Some(decision) = crate::agent_chat_turn_policy::recover_expired(
+                api_types::AgentChatTurnStatus::Leased,
+                Some(decision_time - ChronoDuration::seconds(1)),
                 attempt_count,
                 max_attempts,
-                pre_provider_failures,
-                crate::agent_chat_turn_policy::UsageLimitDeferrals::default(),
+                refunds,
                 decision_time,
-                "Agent Chat lease expired",
-            );
+            ) else {
+                continue;
+            };
+            let refunded = refunds < crate::agent_chat_turn_policy::MAX_LEASE_REFUNDS;
             let status = match decision.status {
                 api_types::AgentChatTurnStatus::Failed => "failed",
                 _ => "retry_wait",
@@ -3967,16 +3971,19 @@ impl AgentChatTurnWorker {
                     "UPDATE agent_chat_turn_job
                  SET status = ?, lease_owner = NULL, leased_until = NULL,
                      next_attempt_at = ?, error_code = 'lease_expired',
-                     error_message = ?, failure_class_json = ?, retry_decision = ?,
+                     error_message = ?, failure_class_json = ?, retry_decision = ?, attempt_count = ?,
+                     lease_refund_count = lease_refund_count + ?,
                      version = version + 1, updated_at = ?
                  WHERE id = ? AND version = ? AND status = 'leased' AND leased_until IS NOT NULL
                    AND leased_until <= ?",
                 )
                 .bind(status)
-                .bind(decision.next_attempt_at.map(|value| value.to_rfc3339()))
-                .bind(decision.error)
+                .bind(decision.next_attempt_at.map(|at| at.to_rfc3339()))
+                .bind("Agent Chat lease expired")
                 .bind(&failure_json)
                 .bind(decision.retry_decision.as_str())
+                .bind(decision.attempt_count)
+                .bind(i64::from(refunded))
                 .bind(&now)
                 .bind(&id)
                 .bind(version)
@@ -4470,6 +4477,7 @@ impl AgentChatTurnWorker {
                             .as_deref()
                             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
                             .map(|at| at.with_timezone(&Utc)),
+                        fail_fast: crate::agent_chat_turn_policy::is_autonomous_wake_turn(&job),
                     },
                     Utc::now(),
                     "",
@@ -4794,6 +4802,13 @@ impl AgentChatTurnWorker {
                 }
             }
         }
+        if let Err(error) =
+            crate::project_escalation::ProjectEscalationService::new(Arc::clone(&self.db))
+                .after_wake_turn(&commit_job.id)
+                .await
+        {
+            tracing::warn!(turn_id=%commit_job.id,%error,"wake turn follow-up will be reconsidered by sweep");
+        }
     }
 
     async fn settle_reports_if_cancelled(
@@ -4919,13 +4934,11 @@ impl AgentChatTurnWorker {
         let source_event_id = message.source_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("Delivery follow-up has no source wake event")
         })?;
-        if job.causation_id.as_deref() != Some(source_event_id) {
-            return Err(ServiceError::invalid_operation(
-                "Delivery follow-up turn is not caused by its source wake event",
-            ));
-        }
-        let canonical_wake_event = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM domain_event
+        // Attention admits the turn and its audit event together; the event
+        // names the turn it admitted. That turn, or a manual retry of it,
+        // answers the same triggering message.
+        let wake_turn = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.turn_job_id') FROM domain_event
              WHERE id = ? AND sequence = ? AND event_type = 'agent.wake.admitted'
                AND scope_type = 'project' AND scope_id = ?",
         )
@@ -4933,11 +4946,23 @@ impl AgentChatTurnWorker {
         .bind(postcondition.after_event_sequence)
         .bind(&postcondition.required_scope_id)
         .fetch_optional(self.db.pool())
-        .await?
-        .is_some();
-        if !canonical_wake_event {
+        .await?;
+        let Some(wake_turn) = wake_turn else {
             return Err(ServiceError::invalid_operation(
                 "Delivery follow-up postcondition does not match its source wake event",
+            ));
+        };
+        let caused_by_wake = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM agent_chat_turn_job WHERE id = ? AND triggering_message_id = ?",
+        )
+        .bind(wake_turn.as_deref())
+        .bind(&job.triggering_message_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .is_some();
+        if !caused_by_wake {
+            return Err(ServiceError::invalid_operation(
+                "Delivery follow-up turn is not caused by its source wake event",
             ));
         }
         let canonical_project_chat = sqlx::query_scalar::<_, i64>(

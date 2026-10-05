@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 import {
   ArrowClockwise,
@@ -15,6 +15,7 @@ import {
 } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { Textarea } from '@/components/ui/textarea'
 import {
   useAgentChatsQuery,
   useAgentChatTurnsQuery,
@@ -22,7 +23,11 @@ import {
 } from '@/features/agent-chat/hooks'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { RetryTurnAction } from '@/types/generated/bindings/RetryTurnAction'
-import { useMissionControlQuery, useResolveAttentionMutation } from '@/features/federation/hooks'
+import {
+  useAnswerEscalationMutation,
+  useMissionControlQuery,
+  useResolveAttentionMutation,
+} from '@/features/federation/hooks'
 import type {
   AgentHealthItem,
   AttentionConsumerHealth,
@@ -132,12 +137,66 @@ function attentionTone(item: AttentionItem): string {
   return 'border-border-subtle bg-card'
 }
 
+function escalationOf(item: AttentionItem): { id: string; need: string } | null {
+  if (item.recommended_action !== 'answer_escalation' || item.scope_type !== 'project') return null
+  const id = item.details.escalation_id
+  const need = item.details.need
+  return typeof id === 'string' && id
+    ? { id, need: typeof need === 'string' ? need : item.summary }
+    : null
+}
+
+/** The owner's answer to a Project Agent escalation; it wakes the Agent. */
+function EscalationAnswer({
+  item,
+  escalation,
+}: {
+  item: AttentionItem
+  escalation: { id: string; need: string }
+}) {
+  const [answer, setAnswer] = useState('')
+  const submit = useAnswerEscalationMutation()
+  const inputId = `escalation-answer-${item.id}`
+  return (
+    <div className="mt-3 space-y-2">
+      <p className="whitespace-pre-wrap text-xs leading-5 text-foreground">{escalation.need}</p>
+      <label htmlFor={inputId} className="sr-only">
+        Answer
+      </label>
+      <Textarea
+        id={inputId}
+        value={answer}
+        maxLength={4096}
+        placeholder="Answer the Project Agent"
+        disabled={submit.isPending || submit.isSuccess}
+        onChange={(event) => setAnswer(event.target.value)}
+      />
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={!answer.trim() || submit.isPending || submit.isSuccess}
+        onClick={() =>
+          submit.mutate({ projectId: item.scope_id, escalationId: escalation.id, answer })
+        }
+      >
+        {submit.isPending ? 'Answering…' : 'Answer'}
+      </Button>
+      {submit.error ? (
+        <p className="text-xs text-destructive" role="alert">
+          {submit.error.message}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
 function AttentionCard({ item }: { item: AttentionItem }) {
   const isProgressWarning = item.category === 'progress_warning'
   const taskId = isProgressWarning ? attentionTaskId(item) : null
   const retryAction = attentionRetryAction(item)
   const retryTurn = useRetryAgentChatTurnMutation(retryAction?.chat_id)
   const resolve = useResolveAttentionMutation()
+  const escalation = escalationOf(item)
   const turns = useAgentChatTurnsQuery(retryAction?.chat_id)
   const anotherTurnLive =
     turns.data?.some((turn) =>
@@ -226,6 +285,9 @@ function AttentionCard({ item }: { item: AttentionItem }) {
                 <span>{attentionActionLabel(item.recommended_action)}</span>
               )}
             </div>
+          ) : null}
+          {escalation && item.lifecycle !== 'resolved' ? (
+            <EscalationAnswer item={item} escalation={escalation} />
           ) : null}
           {retryTurn.error ? (
             <p className="mt-2 text-xs text-destructive" role="alert">

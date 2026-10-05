@@ -6,6 +6,7 @@ import type { MissionControlResponse } from '@/features/federation/types'
 
 const retryTurn = vi.hoisted(() => vi.fn())
 const resolveAttention = vi.hoisted(() => vi.fn())
+const answerEscalation = vi.hoisted(() => vi.fn())
 const turnState = vi.hoisted(() => ({ live: false }))
 
 vi.mock('@tanstack/react-router', () => ({
@@ -24,6 +25,12 @@ vi.mock('@/features/federation/hooks', () => ({
   }),
   useResolveAttentionMutation: () => ({
     mutate: resolveAttention,
+    isPending: false,
+    isSuccess: false,
+    error: null,
+  }),
+  useAnswerEscalationMutation: () => ({
+    mutate: answerEscalation,
     isPending: false,
     isSuccess: false,
     error: null,
@@ -317,6 +324,46 @@ describe('MissionControlPage', () => {
     } finally {
       data.needs_attention = previous
       resolveAttention.mockClear()
+    }
+  })
+
+  it('shows an escalation need and answers it from the card', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        id: 'attention-escalation',
+        category: 'human_input_required',
+        scope_type: 'project',
+        scope_id: 'project-1',
+        summary: 'Blocker cannot-fix',
+        recommended_action: 'answer_escalation',
+        details: {
+          escalation_id: 'escalation-1',
+          need: '- Blocker cannot-fix (Task "Build login"; reason: disk full)',
+          task_ids: [],
+        },
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      expect(
+        screen.getByText('- Blocker cannot-fix (Task "Build login"; reason: disk full)'),
+      ).toBeTruthy()
+      const answer = screen.getByRole('button', { name: 'Answer' })
+      expect(answer.hasAttribute('disabled')).toBe(true)
+      fireEvent.change(screen.getByLabelText('Answer'), {
+        target: { value: 'Freed 20 GB on the host' },
+      })
+      fireEvent.click(answer)
+      expect(answerEscalation).toHaveBeenCalledWith({
+        projectId: 'project-1',
+        escalationId: 'escalation-1',
+        answer: 'Freed 20 GB on the host',
+      })
+    } finally {
+      data.needs_attention = previous
+      answerEscalation.mockClear()
     }
   })
 

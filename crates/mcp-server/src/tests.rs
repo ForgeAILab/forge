@@ -996,6 +996,7 @@ fn tools_list_returns_descriptors() {
             "forge_list_task_dependents",
             "forge_list_tasks",
             "forge_preview_prompt",
+            "forge_project_escalate",
             "forge_register_agent",
             "forge_remove_task_dependency",
             "forge_reorder_sub_tasks",

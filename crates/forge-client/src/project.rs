@@ -49,6 +49,11 @@ enum ProjectCmd {
         #[arg(long)]
         machine: Option<String>,
     },
+    /// Owner escalations raised by the Project Agent.
+    Escalations {
+        #[command(subcommand)]
+        cmd: EscalationCmd,
+    },
     /// Token and cost accounting for one Project, by surface, model and agent.
     Analytics {
         /// Project id.
@@ -59,6 +64,26 @@ enum ProjectCmd {
         /// Only count usage recorded before this RFC3339 timestamp (exclusive).
         #[arg(long)]
         to: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EscalationCmd {
+    /// List the Project's escalations (owner only).
+    List {
+        /// Project id.
+        project: String,
+        #[arg(long, value_parser = ["open", "answered"])]
+        status: Option<String>,
+    },
+    /// Answer an open escalation; the answer wakes the Project Agent.
+    Answer {
+        /// Project id.
+        project: String,
+        /// Escalation id.
+        id: String,
+        #[arg(long)]
+        answer: String,
     },
 }
 
@@ -97,6 +122,61 @@ impl ProjectArgs {
                     .await?;
                 print_project(output, &saved)
             }
+            ProjectCmd::Escalations { cmd } => match cmd {
+                EscalationCmd::List { project, status } => {
+                    let path = match status {
+                        Some(status) => {
+                            format!("/api/v1/projects/{project}/escalations?status={status}")
+                        }
+                        None => format!("/api/v1/projects/{project}/escalations"),
+                    };
+                    let response: api_types::ProjectEscalationListResponse =
+                        client.get(&path).await?;
+                    match output {
+                        OutputFormat::Json => print_json(&response),
+                        OutputFormat::Table => {
+                            if response.items.is_empty() {
+                                println!("No escalations.");
+                            }
+                            for item in &response.items {
+                                println!("{} · {} · v{}", item.id, item.status, item.version);
+                                println!("{}", item.need);
+                                if let Some(answer) = &item.answer {
+                                    println!("answer: {answer}");
+                                }
+                            }
+                            Ok(())
+                        }
+                    }
+                }
+                EscalationCmd::Answer {
+                    project,
+                    id,
+                    answer,
+                } => {
+                    let path = format!("/api/v1/projects/{project}/escalations/{id}");
+                    let current: api_types::ProjectEscalationResponse = client.get(&path).await?;
+                    let response: api_types::ProjectEscalationResponse = client
+                        .post(
+                            &format!("{path}/answer"),
+                            &api_types::AnswerProjectEscalationRequest {
+                                expected_version: current.version,
+                                answer: answer.clone(),
+                            },
+                        )
+                        .await?;
+                    match output {
+                        OutputFormat::Json => print_json(&response),
+                        OutputFormat::Table => {
+                            println!(
+                                "{} · {} · v{}",
+                                response.id, response.status, response.version
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+            },
             ProjectCmd::Create { name } => {
                 let request = CreateProjectRequest {
                     name: name.clone(),

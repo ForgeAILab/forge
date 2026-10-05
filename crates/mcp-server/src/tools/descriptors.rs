@@ -2,6 +2,8 @@ use serde_json::{json, Value};
 
 pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
     json!([
+        tool_descriptor("forge_project_escalate", services::project_escalation::ESCALATE_DESCRIPTION,
+            json!({"need":{"type":"string","minLength":1,"maxLength":4096},"task_ids":{"type":"array","maxItems":100,"items":{"type":"string"}},"dedupe_key":{"type":"string","minLength":1}}), &["need","dedupe_key"]),
         tool_descriptor(
             "forge_create_task",
             &format!("Create one standalone task or one child of a coordination root. parent_task_id creates a shared-workspace subtask relationship; depends_on_ids creates prerequisite gates without sharing a workspace. Never use the parent as a dependency. Name owned repository-relative paths in the description; keep parallel Task files disjoint and use depends_on_ids to order shared-file edits. {}", services::operating_skills::merge_friendly_task_guidance()),

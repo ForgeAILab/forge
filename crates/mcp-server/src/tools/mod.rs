@@ -62,6 +62,9 @@ pub(crate) async fn dispatch_tool(
         }
         "forge_get_main_agent" => handlers::forge_get_main_agent(state, arguments, context).await,
         "forge_set_main_agent" => handlers::forge_set_main_agent(state, arguments, context).await,
+        "forge_project_escalate" => {
+            handlers::forge_project_escalate(state, arguments, context).await
+        }
         "forge_get_project_agent" => {
             handlers::forge_get_project_agent(state, arguments, context).await
         }
