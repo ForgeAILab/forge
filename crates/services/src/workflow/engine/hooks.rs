@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use api_types::{Actor, FailurePolicy, HookAudience, HookSpec, StateDefinition, StateKind};
-use serde_json::json;
 use serde_json::Value;
 
 use crate::workflow::HookResult;
@@ -11,13 +10,11 @@ pub(crate) fn merged_state_config(
     project: Option<&db::Project>,
     task_state_config_json: Option<&str>,
 ) -> Value {
-    let mut merged = state.config.clone();
-    if state.name == crate::workflow::default_states::REVIEW {
-        merge_project_review_config(&mut merged, project);
-    }
-    if state.name == crate::workflow::default_states::MERGING {
-        merge_project_merge_fix_budget(&mut merged, project);
-    }
+    let mut merged = db::budget::state_config(
+        &state.config,
+        &state.name,
+        project.map(|p| p.settings.as_str()).unwrap_or("{}"),
+    );
 
     let Some(task_state_config_json) = task_state_config_json else {
         return merged;
@@ -38,55 +35,6 @@ pub(crate) fn merged_state_config(
             merged
         }
         _ => Value::Object(overrides.clone()),
-    }
-}
-
-fn merge_project_merge_fix_budget(merged: &mut Value, project: Option<&db::Project>) {
-    let Some(project) = project else {
-        return;
-    };
-    let Ok(settings) = serde_json::from_str::<Value>(&project.settings) else {
-        return;
-    };
-    let Some(merge_fix) = settings
-        .get("retry_budgets")
-        .and_then(|b| b.get("merge_fix"))
-        .cloned()
-    else {
-        return;
-    };
-    match merged {
-        Value::Object(obj) => {
-            let budgets = obj.entry("retry_budgets").or_insert_with(|| json!({}));
-            if let Value::Object(b) = budgets {
-                b.insert("merge_fix".to_string(), merge_fix);
-            }
-        }
-        _ => {
-            *merged = json!({ "retry_budgets": { "merge_fix": merge_fix } });
-        }
-    }
-}
-
-fn merge_project_review_config(merged: &mut Value, project: Option<&db::Project>) {
-    let Some(project) = project else {
-        return;
-    };
-    let Ok(settings) = serde_json::from_str::<Value>(&project.settings) else {
-        return;
-    };
-    let Some(Value::Object(review_config)) = settings.get("default_review_config") else {
-        return;
-    };
-    match merged {
-        Value::Object(defaults) => {
-            for (key, value) in review_config {
-                defaults.entry(key.clone()).or_insert_with(|| value.clone());
-            }
-        }
-        _ => {
-            *merged = Value::Object(review_config.clone());
-        }
     }
 }
 

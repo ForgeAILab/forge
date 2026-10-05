@@ -229,14 +229,17 @@ impl TaskBoardRepo for SqliteDb {
             from_state: task.status.clone(),
             to_state: input.target_status.clone(),
             trigger_name: input.trigger_name.clone(),
-            triggered_by: input.triggered_by.clone(),
+            triggered_by: input.triggered_by.display(),
             bridge: input.bridge.clone(),
             trigger_reason: input.trigger_reason.clone(),
             hook_results_json: None,
             rejection: input.rejection,
             created_at: input.updated_at.clone(),
         };
-        insert_transition_log(&mut tx, &transition_input).await?;
+        if input.entry_barrier_json.is_none() {
+            crate::budget::fresh_entry(&mut tx, &input.task_id, &input.transition_log_id).await?;
+        }
+        insert_transition_log(&mut tx, &transition_input, input.triggered_by.is_owner()).await?;
         let transition_event = CreateDomainEvent::task_transition(
             transition_input.id.clone(),
             transition_input.task_id.clone(),
@@ -513,8 +516,20 @@ async fn renormalize_positions(
 async fn insert_transition_log(
     tx: &mut Transaction<'_, Sqlite>,
     input: &CreateTransitionLog,
+    owner: bool,
 ) -> Result<()> {
     // Runs after the move's status update: record the epoch it entered.
+    crate::budget::transition(
+        tx,
+        &input.task_id,
+        &input.from_state,
+        owner,
+        &input.bridge,
+        input.rejection,
+        &input.id,
+        None,
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload, status_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))",
     )

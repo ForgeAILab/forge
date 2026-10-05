@@ -2806,3 +2806,77 @@ fn paused_task_action_error_preserves_wait_cause_and_turn_scope() {
         assert_eq!(outcome["retry"]["action"], "none");
     }
 }
+
+/// MCP credentials cannot be told apart from an agent's, so an MCP-hosted
+/// Project Agent's send-back spends the review budget like an agent's would;
+/// the owner's REST send-back of the same Task spends nothing.
+#[test]
+fn mcp_send_back_spends_the_review_budget() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let task = seed_task_in_project(&state, project_id).await;
+        sqlx::query("UPDATE task SET status = 'in_progress' WHERE id = ?")
+            .bind(&task.id)
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        let now = now_rfc3339();
+        TaskRoleAssignmentRepo::assign(
+            &*state.db,
+            CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                role_name: "reviewer".to_owned(),
+                assignee_type: Some(AssigneeKind::User),
+                assignee_id: Some("human".to_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        let version = TaskRepo::get_by_id(&*state.db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        state
+            .task_service
+            .transition(
+                task.id.clone(),
+                "review".to_owned(),
+                (version, Some("ready for review".to_owned())),
+            )
+            .await
+            .unwrap();
+        let in_review = state.task_service.drain(&task.id).await.unwrap();
+        assert_eq!(in_review.status, "review");
+        let spent = |state: &AppState, task_id: String| {
+            let pool = state.db.pool().clone();
+            async move {
+                db::budget::spent(&pool, &task_id, db::budget::Kind::Review.key())
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(spent(&state, task.id.clone()).await, 0);
+
+        let sent_back = call_tool(
+            &state,
+            "forge_task_action",
+            json!({
+                "task_id": task.id,
+                "action": {"verb": "send_back", "guidance": "failed CI"},
+                "version": in_review.version,
+            }),
+        )
+        .await;
+        assert_eq!(sent_back["status"], "in_progress");
+        assert_eq!(
+            spent(&state, task.id.clone()).await,
+            1,
+            "an MCP send-back is charged like an agent's"
+        );
+    });
+}

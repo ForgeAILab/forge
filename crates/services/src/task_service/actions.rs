@@ -276,9 +276,12 @@ impl TaskService {
             }
         }
         let actor = match actor {
-            Actor::User { user_id, .. } => Actor::User {
+            Actor::User {
+                user_id, delegated, ..
+            } => Actor::User {
                 user_id,
                 source: UserActionSource::Action(action.clone()),
+                delegated,
             },
             actor => actor,
         };

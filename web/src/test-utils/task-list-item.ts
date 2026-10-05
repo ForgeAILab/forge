@@ -17,6 +17,7 @@ export function taskListItem(overrides: Partial<TaskListItem> = {}): TaskListIte
     subtask_order: null,
     role_assignments: [],
     remaining_retries: {},
+  retry_limits: {},
     error_annotation: null,
     blocked: null,
     failed: null,

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use db::{now_rfc3339, ProjectRepo, ReviewRepo, ReviewStatus, TaskRepo, TransitionLogRepo};
+use db::{now_rfc3339, ProjectRepo, ReviewRepo, ReviewStatus, TaskRepo};
 use serde_json::{json, Value};
 
 use crate::workflow::{
@@ -531,9 +531,9 @@ impl HookAction for AutoCascadeOnReviewPass {
                     }
                     return HookResult::Ok;
                 }
-                let budget = match crate::task_service::config::runtime_retry_budget(
+                let budget = match db::budget::limit(
                     &task,
-                    crate::task_service::config::RetryBudgetKind::Review,
+                    db::budget::Kind::Review,
                     Some(&ctx.state_config),
                     ctx.gate_config.as_ref(),
                 ) {
@@ -544,20 +544,21 @@ impl HookAction for AutoCascadeOnReviewPass {
                         };
                     }
                 };
-                let existing_count = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id)
-                    .await
+                let existing_count = match db::budget::spent(
+                    ctx.db.pool(),
+                    &ctx.task_id,
+                    db::budget::Kind::Review.key(),
+                )
+                .await
                 {
-                    Ok(entries) => crate::task_diagnostics::count_gate_rejections_since_boundary(
-                        &entries,
-                        default_states::REVIEW,
-                    ),
+                    Ok(n) => n,
                     Err(error) => {
                         return HookResult::Failed {
                             reason: error.to_string(),
-                        };
+                        }
                     }
                 };
-                if existing_count + 1 >= i64::from(budget) {
+                if !db::budget::allows_retry(i64::from(budget), existing_count) {
                     let reason = "review retry budget exhausted";
                     if let Err(error) = block_task(
                         ctx,

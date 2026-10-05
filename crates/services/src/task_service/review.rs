@@ -20,9 +20,44 @@ impl TaskService {
         let disconnected = db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id)
             .await?
             .is_some_and(|placement| placement.state == db::PlacementState::Disconnected);
-        let attempts = barrier["infrastructure_attempts"].as_u64().unwrap_or(0)
-            + u64::from(retry && !disconnected);
-        let exhausted = retry && !disconnected && attempts >= 5;
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        if let Some(version) = ctx.project_version {
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ? AND version = ? AND workflow_definition IS ?)")
+                .bind(&task.project_id).bind(version).bind(ctx.project_workflow_definition.as_deref())
+                .fetch_one(&mut *tx).await?;
+            if !valid {
+                return Err(DbError::VersionConflict.into());
+            }
+        }
+        // The episode window opened when this review entry began (or when a
+        // connected CI run last succeeded); entry retries keep it.
+        let attempts = if retry && !disconnected {
+            let identity = crate::workflow::engine::durable::current_hook(&task.id)
+                .map(|h| format!("{}:{}", h.step.id, h.index))
+                .unwrap_or_else(|| format!("ci:{}", task.version));
+            db::budget::charge(
+                &mut tx,
+                &task.id,
+                db::budget::Kind::ReviewCiInfrastructure.key(),
+                i64::from(db::budget::Kind::ReviewCiInfrastructure.default_limit()),
+                &identity,
+            )
+            .await?
+            .spent
+        } else {
+            sqlx::query_scalar(
+                "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id=? AND kind='review_ci_infrastructure'),0)",
+            )
+            .bind(&task.id)
+            .fetch_one(&mut *tx)
+            .await?
+        };
+        let exhausted = retry
+            && !disconnected
+            && !db::budget::allows_retry(
+                i64::from(db::budget::Kind::ReviewCiInfrastructure.default_limit()),
+                attempts,
+            );
         let retry = retry && !exhausted;
         let kind = if reset {
             "workspace_reset_required"
@@ -37,22 +72,11 @@ impl TaskService {
         barrier["status"] = json!("blocked");
         barrier["updated_at"] = json!(now);
         barrier["interrupted_at"] = json!(now);
-        barrier["infrastructure_attempts"] = json!(attempts);
         barrier["blocking_reason"] = json!(reason);
-        let annotation = json!({"type": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed },
-            "blocking_reason": kind, "blocked_at": now, "blocked_by": "system:workflow", "message": reason});
-        let mut tx = db::begin_immediate(self.db.pool()).await?;
-        if let Some(version) = ctx.project_version {
-            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ? AND version = ? AND workflow_definition IS ?)")
-                .bind(&task.project_id).bind(version).bind(ctx.project_workflow_definition.as_deref())
-                .fetch_one(&mut *tx).await?;
-            if !valid {
-                return Err(DbError::VersionConflict.into());
-            }
-        }
+        let annotation = json!({"type":if reset {api_types::FailureKind::WorkspaceResetRequired} else {api_types::FailureKind::BeforeWorkHookFailed},"blocking_reason":kind,"blocked_at":now,"blocked_by":"system:workflow","message":reason});
         let deferral = retry.then(|| json!({
             "target_state": task.status, "reason": reason,
-            "not_before": (Utc::now() + chrono::Duration::seconds(5 * (1_i64 << attempts.saturating_sub(1).min(4)))).to_rfc3339(),
+            "not_before": (Utc::now() + chrono::Duration::seconds(5 * (1_i64 << attempts.saturating_sub(1).clamp(0,4)))).to_rfc3339(),
         }).to_string());
         let changed = db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET entry_barrier_json = ?, error_annotation = ?,
             blocked_json = ?, metadata_json = CASE WHEN ? IS NULL THEN
@@ -177,7 +201,7 @@ impl TaskService {
             &finished_at,
             task.version,
             Some(finished_at.clone()),
-            db::ReviewEventOrigin::User,
+            db::ReviewEventOrigin::for_human(&actor),
         )
         .await?;
 
@@ -269,7 +293,7 @@ impl TaskService {
             &finished_at,
             task.version,
             None,
-            db::ReviewEventOrigin::User,
+            db::ReviewEventOrigin::for_human(&actor),
         )
         .await?;
 
@@ -320,7 +344,7 @@ impl TaskService {
             crate::workflow::default_roles::CODER,
         )
         .await?;
-        if remaining_retries > 0
+        if db::budget::allows_retry(i64::from(remaining_retries), 0)
             && !follow_up_already_dispatched
             && !Self::task_action_command_active()
         {

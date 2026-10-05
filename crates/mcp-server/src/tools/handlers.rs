@@ -1,4 +1,7 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use api_types::{Actor, SystemComponent};
 use api_types::{
@@ -178,10 +181,42 @@ async fn tasks_with_role_assignments(
     state: &AppState,
     tasks: Vec<db::Task>,
 ) -> Result<Vec<Value>, McpToolError> {
+    let ids = tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>();
+    let mut assignments_by_task = HashMap::<String, Vec<db::TaskRoleAssignment>>::new();
+    for assignment in TaskRoleAssignmentRepo::list_by_tasks(&*state.db, &ids).await? {
+        assignments_by_task
+            .entry(assignment.task_id.clone())
+            .or_default()
+            .push(assignment);
+    }
+    let mut budget_spent = db::budget::load_many(state.db.pool(), &ids).await?;
+    let mut projects = HashMap::<String, db::Project>::new();
     let mut values = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let assignments = TaskRoleAssignmentRepo::list_by_task(&*state.db, &task.id).await?;
+        if !projects.contains_key(&task.project_id) {
+            let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
+                .await?
+                .ok_or(db::DbError::NotFound)?;
+            projects.insert(task.project_id.clone(), project);
+        }
+        let project = &projects[&task.project_id];
+        let workflow = services::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            &Actor::system(api_types::SystemComponent::General),
+        );
+        let workflow = db::budget::with_project_defaults(&workflow, &project.settings);
+        let recovery_limit = db::budget::recovery_limit(&project.settings);
+        let counts = budget_spent.remove(&task.id).unwrap_or_default();
+        let remaining = db::budget::projection(&task, &workflow, &counts, recovery_limit)?;
+        let limits = db::budget::projection(&task, &workflow, &Default::default(), recovery_limit)?;
+        let assignments = assignments_by_task.remove(&task.id).unwrap_or_default();
         let mut value = task_value(task);
+        value["remaining_retries"] = json!(remaining);
+        value["retry_limits"] = json!(limits);
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "role_assignments".to_owned(),
@@ -415,10 +450,10 @@ pub(super) async fn forge_get_task(
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let params: GetTaskParams = parse_params(params)?;
-    let actor = Actor::User {
-        user_id: Some(authenticated_user(context)?.to_owned()),
-        source: api_types::UserActionSource::Api,
-    };
+    let actor = Actor::delegated_user(
+        authenticated_user(context)?,
+        api_types::UserActionSource::Api,
+    );
     let snapshot = state
         .task_service
         .task_action_snapshot(&params.task_id, &actor)
@@ -429,7 +464,21 @@ pub(super) async fn forge_get_task(
 fn task_snapshot_value(snapshot: services::TaskSnapshot) -> Result<Value, McpToolError> {
     let offers = services::available_actions(&snapshot);
     let exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
+    let remaining = db::budget::projection(
+        &snapshot.task,
+        &snapshot.workflow,
+        &snapshot.budget_spent,
+        snapshot.recovery_budget_limit,
+    )?;
+    let limits = db::budget::projection(
+        &snapshot.task,
+        &snapshot.workflow,
+        &Default::default(),
+        snapshot.recovery_budget_limit,
+    )?;
     let mut value = task_value(snapshot.task);
+    value["remaining_retries"] = json!(remaining);
+    value["retry_limits"] = json!(limits);
     value["available_actions"] = json!(offers);
     value["workflow_exception"] = serde_json::to_value(exception)
         .map_err(|error| McpToolError::new(-32603, error.to_string()))?;
@@ -617,10 +666,13 @@ pub(super) async fn task_action(
     params: Value,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let actor = Actor::User {
-        user_id: Some(authenticated_user(context)?.to_owned()),
-        source: api_types::UserActionSource::Api,
-    };
+    // MCP credentials (PATs, sessions, OAuth tokens) all resolve to the user;
+    // none is agent-scoped, so an MCP-hosted Project Agent is indistinguishable
+    // from the owner. MCP actions keep owner action authority but spend budgets.
+    let actor = Actor::delegated_user(
+        authenticated_user(context)?,
+        api_types::UserActionSource::Api,
+    );
     let task_id = params
         .get("task_id")
         .and_then(Value::as_str)

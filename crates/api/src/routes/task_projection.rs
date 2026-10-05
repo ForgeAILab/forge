@@ -2,7 +2,8 @@ use super::*;
 
 pub(super) struct TaskDiagnosticRows<'a> {
     pub role_assignments: &'a [TaskRoleAssignment],
-    pub transition_logs: &'a [db::TransitionLog],
+    pub remaining_retries: &'a HashMap<String, i64>,
+    pub retry_limits: &'a HashMap<String, i64>,
     pub latest_review: Option<&'a Review>,
     pub latest_execution: Option<&'a Execution>,
     pub execution_authority: &'a [Execution],
@@ -12,6 +13,7 @@ pub(super) struct TaskDiagnosticRows<'a> {
 pub(super) struct TaskDiagnosticProjection {
     pub(super) canonical_phase: api_types::CanonicalPhase,
     pub(super) remaining_retries: HashMap<String, i64>,
+    pub(super) retry_limits: HashMap<String, i64>,
     pub(super) error_annotation: Option<TaskAnnotation>,
     pub(super) workflow_health: Option<api_types::WorkflowHealthSummary>,
     pub(super) workflow_exception: Option<api_types::WorkflowExceptionSummary>,
@@ -25,7 +27,8 @@ pub(super) fn task_diagnostic_projection(
 ) -> TaskDiagnosticProjection {
     let TaskDiagnosticRows {
         role_assignments: task_role_assignments,
-        transition_logs,
+        remaining_retries,
+        retry_limits,
         latest_review,
         latest_execution,
         execution_authority,
@@ -35,46 +38,9 @@ pub(super) fn task_diagnostic_projection(
         serde_json::from_str::<TaskAnnotation>(s)
             .unwrap_or_else(|_| TaskAnnotation::Legacy(parse_json_value(s)))
     });
-    let blocked_metadata_annotation = blocked_metadata_annotation(task);
-    let error_blocking_annotation = match error_annotation.as_ref() {
-        Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
-        _ => None,
-    };
-    // A populated typed annotation is the current recovery contract. Legacy
-    // blocked metadata only fills the gap for old/empty annotations; it must
-    // never override or widen the explicit action set used by the recovery
-    // service and workflow-exception projection.
-    let blocking_annotation = blocking_annotation_for_projection(
-        task,
-        blocked_metadata_annotation.as_ref(),
-        error_blocking_annotation,
-    );
     let canonical_phase = workflow.canonical_phase_for_state(&task.status);
-    let mut remaining_retries = HashMap::new();
-    for state in &workflow.states {
-        if state.kind != StateKind::Gate {
-            continue;
-        }
-        let Some(max_rejections) = state
-            .gate_config
-            .as_ref()
-            .and_then(|config| config.max_rejections)
-        else {
-            continue;
-        };
-        let count = count_gate_rejections_since_boundary(transition_logs, &state.name);
-        let exhausted = blocking_annotation.is_some_and(|annotation| {
-            retry_budget_exhausted_for_state(&task.status, state, annotation)
-        });
-        remaining_retries.insert(
-            state.name.clone(),
-            if exhausted {
-                0
-            } else {
-                (i64::from(max_rejections) - count).max(0)
-            },
-        );
-    }
+    let remaining_retries = remaining_retries.clone();
+    let retry_limits = retry_limits.clone();
     let current_role = workflow
         .states
         .iter()
@@ -128,6 +94,7 @@ pub(super) fn task_diagnostic_projection(
     TaskDiagnosticProjection {
         canonical_phase,
         remaining_retries,
+        retry_limits,
         error_annotation,
         workflow_health,
         workflow_exception,
@@ -164,6 +131,7 @@ pub(super) fn task_list_response(
         subtask_order: task.subtask_order,
         role_assignments,
         remaining_retries: projection.remaining_retries,
+        retry_limits: projection.retry_limits,
         error_annotation: projection.error_annotation,
         blocked: task
             .blocked_json

@@ -845,7 +845,14 @@ async fn workflow_dispatched_commitless_completion_fails_and_schedules_retry() {
     let metadata: serde_json::Value =
         serde_json::from_str(task_after.metadata_json.as_deref().unwrap_or("{}"))
             .expect("task metadata parses");
-    assert_eq!(metadata["execution_retry_count"], 1);
+    assert_eq!(
+        json!(
+            db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                .await
+                .unwrap()
+        ),
+        1
+    );
     assert!(
         metadata.get("deferred_dispatch").is_some(),
         "a deferred redispatch is scheduled: {metadata}"
@@ -983,7 +990,7 @@ async fn completed_reviewer_execution_keeps_the_task_retry_budget_it_has_spent()
     // was usable. Clearing the retry budget on that completion reset the counter
     // on every attempt, so `attempt > budget` never tripped and a reviewer whose
     // assessment could not be parsed was re-dispatched without bound. The
-    // sibling bounded-retry tests pre-seed `execution_retry_count` and drive the
+    // sibling bounded-retry tests pre-seed the Execution ledger and drive the
     // cascade directly, so none of them covered this reset.
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -1020,10 +1027,11 @@ async fn completed_reviewer_execution_keeps_the_task_retry_budget_it_has_spent()
         claimed.execution.agent_id.as_deref(),
     )
     .await;
+    seed_budget_spent(&db, &task.id, db::budget::Kind::Execution, 2).await;
     sqlx::query(
         "UPDATE task SET status = 'review', metadata_json = ?, version = version + 1 WHERE id = ?",
     )
-    .bind(r#"{"execution_retry_count":2}"#)
+    .bind("{}")
     .bind(&task.id)
     .execute(db.pool())
     .await
@@ -1061,9 +1069,11 @@ async fn completed_reviewer_execution_keeps_the_task_retry_budget_it_has_spent()
         serde_json::from_str(task_after.metadata_json.as_deref().unwrap_or("{}"))
             .expect("task metadata parses");
     assert_eq!(
-        metadata
-            .get("execution_retry_count")
-            .and_then(|v| v.as_u64()),
+        Some(
+            db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                .await
+                .unwrap() as u64
+        ),
         Some(2),
         "a completed reviewer must not refund the retry budget it has already spent: {metadata}"
     );
@@ -1162,7 +1172,14 @@ async fn reviewer_provider_unavailability_uses_bounded_task_retry_budget() {
         metadata.get("deferred_dispatch").is_some(),
         "reviewer execution should wait for provider recovery: {metadata}"
     );
-    assert_eq!(metadata["execution_retry_count"], 1);
+    assert_eq!(
+        json!(
+            db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                .await
+                .unwrap()
+        ),
+        1
+    );
     assert!(task_after.blocked_json.is_none());
 }
 
@@ -1225,8 +1242,15 @@ async fn capacity_limit_without_fallback_defers_until_reset_or_backoff() {
             .unwrap();
         let retry_count = u64::from(hint.is_none());
         if retry_count > 0 {
+            seed_budget_spent(
+                &db,
+                &task.id,
+                db::budget::Kind::Execution,
+                retry_count as i64,
+            )
+            .await;
             sqlx::query("UPDATE task SET metadata_json = ?, version = version + 1 WHERE id = ?")
-                .bind(json!({"execution_retry_count": retry_count}).to_string())
+                .bind("{}")
                 .bind(&task.id)
                 .execute(db.pool())
                 .await
@@ -1258,7 +1282,14 @@ async fn capacity_limit_without_fallback_defers_until_reset_or_backoff() {
             delay >= expected && delay <= expected + 30,
             "{delay} vs {expected}"
         );
-        assert_eq!(metadata["execution_retry_count"], retry_count + 1);
+        assert_eq!(
+            json!(
+                db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                    .await
+                    .unwrap()
+            ),
+            retry_count + 1
+        );
         let persisted_execution = ExecutionRepo::get_by_id(&*db, &execution.id)
             .await
             .unwrap()
@@ -1340,8 +1371,15 @@ async fn assert_capacity_limit_retry_block(budget: u64, retry_count: u64, reason
         .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
         .await
         .unwrap();
+    seed_budget_spent(
+        &db,
+        &task.id,
+        db::budget::Kind::Execution,
+        retry_count as i64,
+    )
+    .await;
     sqlx::query("UPDATE task SET metadata_json = ?, task_state_config = ?, version = version + 1 WHERE id = ?")
-        .bind(json!({"execution_retry_count": retry_count}).to_string())
+        .bind("{}")
         .bind(json!({"retry_budgets": {"execution": budget}}).to_string())
         .bind(&task.id)
         .execute(db.pool())
@@ -1375,7 +1413,14 @@ async fn assert_capacity_limit_retry_block(budget: u64, retry_count: u64, reason
     assert!(after.failed_json.is_none());
     assert_eq!(execution.resume_policy, Some(db::ResumePolicy::Manual));
     let metadata: Value = serde_json::from_str(after.metadata_json.as_deref().unwrap()).unwrap();
-    assert_eq!(metadata["execution_retry_count"], retry_count);
+    assert_eq!(
+        json!(
+            db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                .await
+                .unwrap()
+        ),
+        retry_count
+    );
     assert!(metadata.get("deferred_dispatch").is_none());
 }
 
@@ -1474,7 +1519,14 @@ async fn uncommitted_native_worker_failure_prompts_a_retry_and_preserves_the_dif
     let metadata: serde_json::Value =
         serde_json::from_str(task_after.metadata_json.as_deref().unwrap_or("{}"))
             .expect("task metadata parses");
-    assert_eq!(metadata["execution_retry_count"], 1);
+    assert_eq!(
+        json!(
+            db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                .await
+                .unwrap()
+        ),
+        1
+    );
     assert!(metadata.get("deferred_dispatch").is_some());
     let execution_after = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
         .await
@@ -3658,7 +3710,7 @@ async fn seed_admitted_review_with(
     let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
     sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
         .bind(task_state_config)
-        .bind(r#"{"execution_retry_count":0}"#)
+        .bind("{}")
         .bind(&task.id)
         .execute(db.pool())
         .await
@@ -4107,10 +4159,9 @@ async fn a_reply_without_a_result_uses_bounded_reviewer_execution_retry() {
         serde_json::from_str(current.metadata_json.as_deref().unwrap_or("{}"))
             .expect("metadata parses");
     assert_eq!(
-        metadata
-            .get("execution_retry_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
+        db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+            .await
+            .unwrap(),
         1
     );
     assert!(metadata.get("deferred_dispatch").is_some());
@@ -4420,8 +4471,14 @@ async fn review_finding_routing_owner_parks_without_spending_budget() {
         .await
         .unwrap()
         .unwrap();
-    let metadata: Value = serde_json::from_str(current.metadata_json.as_deref().unwrap()).unwrap();
-    assert_eq!(metadata["execution_retry_count"], 0);
+    assert_eq!(
+        json!(
+            db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                .await
+                .unwrap()
+        ),
+        0
+    );
     let version = current.version;
     service
         .maybe_cascade_executor_completion(&execution.id)
@@ -4467,7 +4524,7 @@ async fn review_finding_routing_repeat_after_failed_attempt_parks() {
         "repeat park spends no review budget"
     );
     assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(
+        crate::task_diagnostics::audit_gate_rejections_since_boundary(
             &after,
             crate::workflow::default_states::REVIEW,
         ),
@@ -4533,7 +4590,7 @@ async fn review_finding_routing_first_attempt_repeat_returns_to_coder() {
         .await
         .unwrap();
     assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(
+        crate::task_diagnostics::audit_gate_rejections_since_boundary(
             &transitions,
             crate::workflow::default_states::REVIEW,
         ),
@@ -4836,7 +4893,7 @@ async fn review_finding_routing_defer_creates_linked_backlog_and_passes_review()
         .await
         .unwrap();
     assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(
+        crate::task_diagnostics::audit_gate_rejections_since_boundary(
             &transitions,
             crate::workflow::default_states::REVIEW,
         ),
@@ -5030,9 +5087,16 @@ async fn assert_failed_reviewer_disposition(
         Some(&agent_id),
     )
     .await;
+    seed_budget_spent(
+        &db,
+        &task.id,
+        db::budget::Kind::Execution,
+        retry_count as i64,
+    )
+    .await;
     sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
         .bind(json!({ "retry_budgets": { "execution": budget } }).to_string())
-        .bind(json!({ "execution_retry_count": retry_count }).to_string())
+        .bind("{}")
         .bind(&task.id)
         .execute(db.pool())
         .await
@@ -5147,7 +5211,14 @@ async fn assert_failed_reviewer_disposition(
         );
         assert!(current.blocked_json.is_none());
         assert!(current.error_annotation.is_none());
-        assert_eq!(metadata["execution_retry_count"], retry_count + 1);
+        assert_eq!(
+            json!(
+                db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                    .await
+                    .unwrap()
+            ),
+            retry_count + 1
+        );
         assert!(metadata.get("deferred_dispatch").is_some());
     } else {
         assert_eq!(
@@ -5186,7 +5257,14 @@ async fn assert_failed_reviewer_disposition(
             .unwrap()
             .get("recovery_actions")
             .is_none());
-        assert_eq!(metadata["execution_retry_count"], retry_count);
+        assert_eq!(
+            json!(
+                db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                    .await
+                    .unwrap()
+            ),
+            retry_count
+        );
         assert!(metadata.get("deferred_dispatch").is_none());
         assert!(current.failed_json.is_none());
     }
@@ -8020,8 +8098,14 @@ async fn executor_completion_guard_rejection_follows_up_before_blocking() {
         .await
         .expect("task loads")
         .expect("task exists");
-    let metadata = task.metadata().expect("metadata parses");
-    assert_eq!(metadata.extra["workflow_guard_retry_count"], json!(1));
+    assert_eq!(
+        json!(
+            db::budget::spent(db.pool(), &task.id, db::budget::Kind::WorkflowGuard.key())
+                .await
+                .unwrap()
+        ),
+        json!(1)
+    );
     assert!(task.blocked_json.is_none());
 }
 
@@ -9346,4 +9430,59 @@ async fn pre_upgrade_hook_checkpoint_replays_with_backfilled_bridge() {
     let refresh = pre_upgrade_hooks_step_replays(Some(saved)).await;
     // The saved result replayed instead of re-running the hook.
     assert_eq!(refresh.trigger_reason, saved);
+}
+
+async fn seed_budget_spent(db: &SqliteDb, task: &str, kind: db::budget::Kind, spent: i64) {
+    sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,?,'fixture',?) ON CONFLICT(task_id,kind) DO UPDATE SET spent=excluded.spent,window_id=excluded.window_id").bind(task).bind(kind.key()).bind(spent).execute(db.pool()).await.unwrap();
+}
+
+#[tokio::test]
+async fn execution_budget_is_not_refunded_by_a_review_lap() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _, _repo_dir) = seed_project_repo(&db).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    for state in &mut workflow.states {
+        state.hooks = api_types::StateHooks::default();
+    }
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id=?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = seed_task_with_status(&db, &project_id, "in_progress".into()).await;
+    seed_budget_spent(&db, &task.id, db::budget::Kind::Execution, 2).await;
+    let review = service
+        .transition(
+            task.id.clone(),
+            "review".to_owned(),
+            (task.version, Some("submit".to_owned())),
+        )
+        .await
+        .unwrap()
+        .task;
+    assert_eq!(
+        db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+            .await
+            .unwrap(),
+        2
+    );
+    let returned = service
+        .transition(
+            task.id.clone(),
+            "in_progress".to_owned(),
+            (review.version, Some("owner retry".to_owned())),
+        )
+        .await
+        .unwrap()
+        .task;
+    assert_eq!(returned.status, "in_progress");
+    assert_eq!(
+        db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(db::budget::remaining(3, 2), 1);
 }

@@ -729,7 +729,7 @@ impl EmbeddedTaskExecutor {
     }
 
     /// Give a reviewer whose reply has no readable result block up to
-    /// [`review_correction::MAX_REPORT_CORRECTIONS`] follow-up turns to add
+    /// two follow-up turns to add
     /// one, checked by the same parser the review cascade applies. Only
     /// review executions (those with a frozen contract) are corrected.
     async fn correct_review_report(

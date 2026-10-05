@@ -304,7 +304,7 @@ mod tests {
         let mut rejected = rebase;
         rejected.rejection = true;
         assert_eq!(
-            crate::task_diagnostics::count_gate_rejections_since_boundary(&[rejected], "merging"),
+            crate::task_diagnostics::audit_gate_rejections_since_boundary(&[rejected], "merging"),
             0
         );
     }

@@ -517,53 +517,61 @@ impl WorkflowExecution<'_> {
                                     .as_ref()
                                     .and_then(|config| config.reject_target.clone())
                                 {
-                                    let existing_rejections =
-                                        crate::task_diagnostics::count_gate_rejections_for_task(
+                                    let cancelled = latest_review(&self.db, &task.id)
+                                        .await?
+                                        .is_some_and(|r| r.status == db::ReviewStatus::Cancelled);
+                                    if cancelled {
+                                        // A cancelled Review's re-entry is capped by the
+                                        // gate alone; its bounce is charged by the cascade.
+                                        let allowed =
+                                            db::budget::cancelled_review_entry_allows_retry(
+                                                &self.db,
+                                                &task,
+                                                to_state.gate_config.as_ref(),
+                                            )
+                                            .await?;
+                                        let barrier = (!allowed).then(|| {
+                                            db::budget::exhausted_review_barrier(
+                                                &target_state,
+                                                &entry_barrier_started_at,
+                                            )
+                                        });
+                                        task = self
+                                            .set_entry_barrier_with_authority(
+                                                &task_id,
+                                                task.version,
+                                                barrier,
+                                                &now_rfc3339(),
+                                                authority.as_ref(),
+                                            )
+                                            .await?;
+                                        if allowed {
+                                            before_enter_rejection_cascade = true;
+                                            cascade =
+                                                Some((reject_target, error, Default::default()));
+                                        }
+                                    } else {
+                                        let max_rejections = db::budget::review_entry_limit(
+                                            &task,
+                                            &enter_ctx.state_config,
+                                            to_state.gate_config.as_ref(),
+                                        );
+                                        let (settled, allowed) = db::budget::failed_review_entry(
                                             &self.db,
-                                            &task_id,
-                                            &target_state,
+                                            &task,
+                                            i64::from(max_rejections),
+                                            &step.id,
+                                            &entry_barrier_started_at,
                                         )
                                         .await?;
-                                    let max_rejections = to_state
-                                        .gate_config
-                                        .as_ref()
-                                        .and_then(|gc| gc.max_rejections)
-                                        .unwrap_or(i32::MAX);
-
-                                    if existing_rejections + 1 >= i64::from(max_rejections) {
-                                        let blocked_at = now_rfc3339();
-                                        let barrier = serde_json::json!({
-                                            "state": target_state.as_str(),
-                                            "status": "blocked",
-                                            "started_at": entry_barrier_started_at.as_str(),
-                                            "updated_at": blocked_at.as_str(),
-                                            "blocking_reason": "review retry budget exhausted",
-                                        })
-                                        .to_string();
-                                        task = self
-                                            .set_entry_barrier_with_authority(
-                                                &task_id,
-                                                task.version,
-                                                Some(barrier),
-                                                &blocked_at,
-                                                authority.as_ref(),
-                                            )
-                                            .await?;
-                                        skip_target_enter_hooks = true;
-                                    } else {
-                                        let clear_updated_at = now_rfc3339();
-                                        task = self
-                                            .set_entry_barrier_with_authority(
-                                                &task_id,
-                                                task.version,
-                                                None,
-                                                &clear_updated_at,
-                                                authority.as_ref(),
-                                            )
-                                            .await?;
-                                        before_enter_rejection_cascade = true;
-                                        cascade = Some((reject_target, error, Default::default()));
+                                        task = settled;
+                                        if allowed {
+                                            before_enter_rejection_cascade = true;
+                                            cascade =
+                                                Some((reject_target, error, Default::default()));
+                                        }
                                     }
+                                    skip_target_enter_hooks = true;
                                 } else {
                                     let blocked_at = now_rfc3339();
                                     let barrier = serde_json::json!({

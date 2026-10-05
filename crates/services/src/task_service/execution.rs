@@ -813,32 +813,21 @@ pub(super) fn execution_retry_clear_mutations(
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
     let mut mutations = Vec::new();
-    if let Some(expected_count) = metadata.extra.get("execution_retry_count").cloned() {
-        let mut nested = vec![
-            db::TaskMetadataMutation::Remove {
-                key: "execution_retry_count".to_owned(),
-            },
-            db::TaskMetadataMutation::Remove {
-                key: "last_execution_failure_at".to_owned(),
-            },
-            db::TaskMetadataMutation::Remove {
-                key: "last_execution_failure_execution_id".to_owned(),
-            },
-        ];
-        if clear_deferred_dispatch {
-            nested.push(db::TaskMetadataMutation::Remove {
-                key: "deferred_dispatch".to_owned(),
+    for key in [
+        "last_execution_failure_at",
+        "last_execution_failure_execution_id",
+    ] {
+        if let Some(expected) = metadata.extra.get(key).cloned() {
+            mutations.push(db::TaskMetadataMutation::RemoveIf {
+                key: key.into(),
+                expected,
             });
         }
-        mutations.push(db::TaskMetadataMutation::CompareAndMutate {
-            key: "execution_retry_count".to_owned(),
-            expected: expected_count,
-            mutations: nested,
-        });
-    } else if clear_deferred_dispatch {
+    }
+    if clear_deferred_dispatch {
         if let Some(expected) = metadata.extra.get("deferred_dispatch").cloned() {
             mutations.push(db::TaskMetadataMutation::RemoveIf {
-                key: "deferred_dispatch".to_owned(),
+                key: "deferred_dispatch".into(),
                 expected,
             });
         }

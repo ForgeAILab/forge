@@ -502,6 +502,20 @@ impl SqliteDb {
             .map(map_task)
             .transpose()
     }
+
+    /// Reads a page of Tasks (soft-deleted included) in one query.
+    pub async fn get_tasks_by_ids(&self, ids: &[&str]) -> Result<Vec<Task>> {
+        let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
+        sqlx::query(&format!(
+            "SELECT {TASK_COLUMNS} FROM task WHERE id IN (SELECT value FROM json_each(?))"
+        ))
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_task)
+        .collect()
+    }
 }
 
 fn map_task(row: SqliteRow) -> Result<Task> {
@@ -980,6 +994,27 @@ impl SqliteDb {
             // authoritative rule as role/recovery launches.
             self.ensure_agent_execution_capacity_in_tx(transaction, input, admission)
                 .await?;
+        }
+        if admission.and_then(|a| a.purpose)
+            == Some(api_types::ExecutionPurpose::AutomaticReviewRecovery)
+        {
+            let settings: String = sqlx::query_scalar(
+                "SELECT settings FROM project WHERE id=(SELECT project_id FROM task WHERE id=?)",
+            )
+            .bind(&input.task_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            let maximum = crate::budget::recovery_limit(&settings);
+            crate::budget::apply(
+                transaction,
+                &input.task_id,
+                crate::budget::Mutation::Charge {
+                    key: crate::budget::Kind::AutomaticReviewRecovery.key().into(),
+                    limit: maximum,
+                    step: input.id.clone(),
+                },
+            )
+            .await?;
         }
         let stop_reason = input.stop_reason.as_ref().map(ToString::to_string);
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);

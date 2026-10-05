@@ -11,7 +11,9 @@ use std::future::Future;
 use forge_agent_host::{AgentHostError, AgentTurnOutput};
 
 /// Follow-up turns one reviewer run may spend fixing its result block.
-pub(super) const MAX_REPORT_CORRECTIONS: usize = 2;
+#[cfg(test)]
+pub(super) const MAX_REPORT_CORRECTIONS: usize =
+    db::budget::Kind::ReportCorrection.default_limit() as usize;
 
 /// The follow-up turn's input. The model still has its review in context,
 /// so only the missing block is asked for.
@@ -42,10 +44,11 @@ where
     R: FnMut(String, String) -> Fut,
     Fut: Future<Output = Result<AgentTurnOutput, AgentHostError>>,
 {
-    for _ in 0..MAX_REPORT_CORRECTIONS {
-        let Some(problem) = problem_of(&output.text) else {
+    let mut budget = db::budget::Invocation::new(db::budget::Kind::ReportCorrection);
+    while let Some(problem) = problem_of(&output.text) {
+        if !budget.consume() {
             break;
-        };
+        }
         match rerun(problem, output.text.clone()).await {
             Ok(next) => output = merge_turns(output, next),
             Err(AgentHostError::RuntimeWithUsage { usage_reports, .. }) => {

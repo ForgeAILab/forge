@@ -1494,7 +1494,7 @@ impl TaskService {
             .is_some_and(crate::task_diagnostics::is_retry_budget_exhausted);
         let (gate_state, budget, count) = self.current_gate_retry_budget(&task).await?;
         if gate_state != crate::workflow::default_states::REVIEW
-            || (count < i64::from(budget) && !has_exhausted_annotation)
+            || (db::budget::allows_retry(i64::from(budget), count) && !has_exhausted_annotation)
         {
             return Err(ServiceError::invalid_operation(format!(
                 "retry without resetting the budget is not supported for the current exception in state {}",
@@ -1624,7 +1624,7 @@ impl TaskService {
         plan: ResumeProcessPlan,
         require_interruption: bool,
     ) -> Result<Task> {
-        if plan.count >= i64::from(plan.budget) {
+        if !db::budget::allows_retry(i64::from(plan.budget), plan.count) {
             return Err(ServiceError::invalid_operation(format!(
                 "resume_process is not supported because retry budget is exhausted for state {}",
                 plan.gate_state
@@ -1852,23 +1852,21 @@ impl TaskService {
             origin
         };
 
-        let budget = if state.name == crate::workflow::default_states::REVIEW {
-            crate::task_service::config::runtime_retry_budget(
-                task,
-                crate::task_service::config::RetryBudgetKind::Review,
-                Some(&state.config),
-                state.gate_config.as_ref(),
-            )?
+        let kind = if state.name == crate::workflow::default_states::REVIEW {
+            db::budget::Kind::Review
         } else {
-            state
-                .gate_config
-                .as_ref()
-                .and_then(|gate_config| gate_config.max_rejections)
-                .unwrap_or(i32::MAX)
+            db::budget::Kind::GateRejection
         };
-        let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
+        let mut origin = task.clone();
+        origin.status = state.name.clone();
+        let budget = db::budget::limit(
+            &origin,
+            kind,
+            Some(&state.config),
+            state.gate_config.as_ref(),
+        )?;
         let count =
-            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, &state.name);
+            db::budget::spent(self.db.pool(), &task.id, &db::budget::gate_key(&state.name)).await?;
         Ok((state.name.clone(), budget, count))
     }
 

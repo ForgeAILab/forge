@@ -1915,7 +1915,7 @@ async fn dispatcher_failed_review_recovers_after_grace_idempotently() {
         .await
         .unwrap();
     assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        crate::task_diagnostics::audit_gate_rejections_since_boundary(&entries, "review"),
         1
     );
     // The remediation transition fences a duplicate delivery of this entry.
@@ -2081,7 +2081,7 @@ async fn dispatcher_failed_review_composes_finding_routing_with_ci_budget() {
             .await
             .unwrap();
         assert_eq!(
-            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+            crate::task_diagnostics::audit_gate_rejections_since_boundary(&entries, "review"),
             expected_rejections
         );
         assert!(!fixture

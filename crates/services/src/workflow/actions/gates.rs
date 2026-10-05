@@ -87,9 +87,9 @@ impl HookAction for CheckRetryBudget {
                 Ok(task) => task,
                 Err(reason) => return HookResult::Failed { reason },
             };
-            let budget = match crate::task_service::config::runtime_retry_budget(
+            let budget = match db::budget::limit(
                 &task,
-                crate::task_service::config::RetryBudgetKind::Review,
+                db::budget::Kind::Review,
                 Some(&ctx.state_config),
                 ctx.gate_config.as_ref(),
             ) {
@@ -100,48 +100,63 @@ impl HookAction for CheckRetryBudget {
                     };
                 }
             };
-            let entries = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-                Ok(entries) => entries,
+            let count = match db::budget::spent(
+                ctx.db.pool(),
+                &ctx.task_id,
+                db::budget::Kind::Review.key(),
+            )
+            .await
+            {
+                Ok(n) => n,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: format!("retry budget unavailable: {error}"),
-                    };
+                        reason: error.to_string(),
+                    }
                 }
             };
-            let count = crate::task_diagnostics::count_gate_rejections_since_boundary(
-                &entries,
-                default_states::REVIEW,
-            );
             (budget, count)
         } else {
             let Some(gate_config) = &ctx.gate_config else {
                 return HookResult::Ok;
             };
-            let Some(max_rejections) = gate_config.max_rejections else {
+            let Some(_) = gate_config.max_rejections else {
                 return HookResult::Ok;
             };
-            let count = match crate::task_diagnostics::count_gate_rejections_for_task(
-                &ctx.db,
+            let budget_task = match task(ctx).await {
+                Ok(t) => t,
+                Err(reason) => return HookResult::Failed { reason },
+            };
+            let max_rejections = match db::budget::limit(
+                &budget_task,
+                db::budget::Kind::GateRejection,
+                Some(&ctx.state_config),
+                Some(gate_config),
+            ) {
+                Ok(n) => n,
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    }
+                }
+            };
+            let count = match db::budget::spent(
+                ctx.db.pool(),
                 &ctx.task_id,
-                &ctx.to_state,
+                &db::budget::gate_key(&ctx.to_state),
             )
             .await
             {
-                Ok(count) => count,
+                Ok(n) => n,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: format!("retry budget unavailable: {error}"),
-                    };
+                        reason: error.to_string(),
+                    }
                 }
             };
             (max_rejections, count)
         };
 
-        if crate::task_diagnostics::gate_entry_retry_exhausted(
-            &ctx.to_state,
-            i64::from(max_rejections),
-            count,
-        ) {
+        if db::budget::gate_entry_exhausted(&ctx.to_state, i64::from(max_rejections), count) {
             let task = match task(ctx).await {
                 Ok(task) => task,
                 Err(reason) => return HookResult::Failed { reason },

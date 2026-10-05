@@ -269,11 +269,59 @@ async fn set_review_passed_at_inner(
     Ok(updated)
 }
 
+async fn apply_task_mutation(
+    transaction: &mut Transaction<'_, Sqlite>,
+    task: &str,
+    metadata: &mut TaskMetadata,
+    mutation: TaskMetadataMutation,
+) -> Result<bool> {
+    match mutation {
+        TaskMetadataMutation::Budget(effect) => {
+            crate::budget::apply(transaction, task, effect).await
+        }
+        TaskMetadataMutation::BudgetIfSpent {
+            key,
+            expected,
+            window_id,
+            mutations,
+        } => {
+            if !crate::budget::matches_spent(transaction, task, &key, expected, &window_id).await? {
+                return Ok(false);
+            }
+            let mut changed = false;
+            for mutation in mutations {
+                changed |=
+                    Box::pin(apply_task_mutation(transaction, task, metadata, mutation)).await?;
+            }
+            Ok(changed)
+        }
+        TaskMetadataMutation::CompareAndMutate {
+            key,
+            expected,
+            mutations,
+        } => {
+            if metadata.extra.get(&key) != Some(&expected) {
+                return Ok(false);
+            }
+            let mut changed = false;
+            for mutation in mutations {
+                changed |=
+                    Box::pin(apply_task_mutation(transaction, task, metadata, mutation)).await?;
+            }
+            Ok(changed)
+        }
+        mutation => apply_metadata_mutation(metadata, mutation),
+    }
+}
+
 fn apply_metadata_mutation(
     metadata: &mut TaskMetadata,
     mutation: TaskMetadataMutation,
 ) -> Result<bool> {
     match mutation {
+        TaskMetadataMutation::Budget(_) | TaskMetadataMutation::BudgetIfSpent { .. } => Err(
+            DbError::Check("budget effects require a Task transaction".into()),
+        ),
         TaskMetadataMutation::Set { key, value } => {
             if metadata.extra.get(&key) == Some(&value) {
                 return Ok(false);
@@ -346,6 +394,9 @@ async fn insert_recovery_marker_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     marker: &CreateTransitionLog,
 ) -> Result<()> {
+    if marker.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::RetryWindowReset) {
+        crate::budget::reset_all(transaction, &marker.task_id, &marker.id).await?;
+    }
     sqlx::query(
         "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
@@ -802,7 +853,7 @@ async fn update_recovery_metadata_inner(
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
         for mutation in metadata_mutations {
-            apply_metadata_mutation(&mut metadata, mutation)?;
+            apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         task.metadata_json = metadata.to_json();
     }
@@ -1564,7 +1615,8 @@ impl TaskRepo for SqliteDb {
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
         let mut changed = false;
         for mutation in mutations {
-            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+            changed |=
+                apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         if !changed {
             transaction.commit().await?;
@@ -1635,7 +1687,8 @@ impl TaskRepo for SqliteDb {
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
         let mut changed = false;
         for mutation in mutations {
-            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+            changed |=
+                apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         if !changed {
             transaction.commit().await?;
@@ -1723,7 +1776,8 @@ impl TaskRepo for SqliteDb {
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
         let mut changed = false;
         for mutation in mutations {
-            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+            changed |=
+                apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         if !changed {
             transaction.commit().await?;
@@ -1806,7 +1860,8 @@ impl TaskRepo for SqliteDb {
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
         let mut changed = false;
         for mutation in mutations {
-            changed |= apply_metadata_mutation(&mut metadata, mutation)?;
+            changed |=
+                apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
         if !changed {
             transaction.commit().await?;
@@ -2023,6 +2078,17 @@ impl TaskRepo for SqliteDb {
                 .await;
         }
 
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.fence_current_step_in_tx(&mut transaction).await?;
+        if entry_barrier_json.is_none() {
+            crate::budget::reset(
+                &mut transaction,
+                id,
+                crate::budget::Kind::ReviewCiInfrastructure.key(),
+                &format!("ci-success:{updated_at}"),
+            )
+            .await?;
+        }
         let result = sqlx::query(
             "UPDATE task SET entry_barrier_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
@@ -2030,14 +2096,17 @@ impl TaskRepo for SqliteDb {
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
-        TaskRepo::get_by_id(self, id, true)
+        let task = self
+            .get_task_in_tx(&mut transaction, id)
             .await?
-            .ok_or(DbError::NotFound)
+            .ok_or(DbError::NotFound)?;
+        transaction.commit().await?;
+        Ok(task)
     }
 
     async fn set_entry_barrier_with_workflow_authority(
@@ -2074,6 +2143,15 @@ impl TaskRepo for SqliteDb {
             &expected_workflow_definition,
         )
         .await?;
+        if entry_barrier_json.is_none() {
+            crate::budget::reset(
+                &mut transaction,
+                id,
+                crate::budget::Kind::ReviewCiInfrastructure.key(),
+                &format!("ci-success:{updated_at}"),
+            )
+            .await?;
+        }
         let result = sqlx::query(
             "UPDATE task SET entry_barrier_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )

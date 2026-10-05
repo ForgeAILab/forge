@@ -4377,19 +4377,101 @@ during validation. `DefaultWorkflow` is unchanged and uses declared `planner`,
 
 ### Retry budgets
 
-Audit-log derived. Gate states may set `gate_config.max_rejections`;
-`check_retry_budget` counts `transition_log` rows with `from_state = gate` and
-`rejection = true`, then cascades to `blocked` when exhausted. Generic
-user-triggered gate-to-active bounces are logged with `rejection = false` and
-do not consume budget. Both `retry { reset_budget: true }` and the stronger
-`restart` recovery action establish a new audit boundary, so a full
-Task reset restores every gate's retry window rather than carrying an exhausted
-merge/review budget back to `todo`.
+`db::budget` owns every Task budget limit, comparison, charge and remaining
+projection. Persisted spending lives in `task_budget(task_id, kind, window_id,
+spent)`; `task_budget_charge` receipts identify the consuming step/effect so
+replay cannot spend twice. Ledger changes commit in the authority-fenced
+transaction that consumes the attempt (verdict settlement, retry scheduling,
+execution admission, carried review or transition). Counts never come from
+transition-log scans, execution summaries, or JSON counters.
+
+The resolver reads the Task-wide `task_state_config.retry_budgets` first, then
+the state config the consuming step supplies, then gate `max_rejections`
+(Review/MergeFix), then the kind default. Workflow hooks supply their merged
+state config, which carries the Task's per-state overrides
+(`task_state_config[state]`); reviewer completion, Execution retry and the
+workflow guard supply the workflow's own state config, so per-state values
+apply only on hook paths. The web editor writes Task-wide values, which
+therefore win everywhere. Existing Project merging policy and review
+configuration participate in the merged state config; Project top-level
+review/execution retry fields retain their existing inert behavior. Invalid
+nonnegative-i32 retry values fall through. A review entry hook that fails with
+no failed Review uses the same order but falls back to "unlimited" when there
+is neither an override nor a gate cap. WorkflowGuard
+uses the execution limit but has independent spending. The merging gate cap
+and MergeFix are distinct existing constraints: both previously counted the
+same merging rejection rows, and now have independent ledger rows. This keeps
+the gate's effective cap when a repair override differs from its gate limit.
+
+`remaining = max(limit - spent, 0)`. Review charges each chargeable failed
+verdict, including the one that parks: the standard limit two gives one routed
+bounce, with remaining two → one → zero. Entry into review and a passing
+verification remain legal even when the remediation budget is spent. Existing
+hook gate cascades marked as rejections retain their budget debit; a failed
+verdict and its bounce share one charge, rather than charging both, and a
+failed review entry with no failed Review shares its `entry:<hook step>`
+receipt with the bounce cascade. Exhausting that entry budget, or the
+cancelled-review entry cap, parks the Task behind a `review retry budget
+exhausted` entry barrier. Already
+admitted outcomes can leave spending above a subsequently reduced limit;
+remaining stays zero. Additional-retry kinds admit their last allowed retry
+and block the following one. Limits bound each kind, not total Task Executions.
+Owner retries, send-backs and escalation answers do not spend agent retry
+budgets. Owner authority is typed (`Actor::is_owner`): REST, web and
+`forge-ctl` sessions and owner escalation answers. MCP credentials (PATs,
+sessions, OAuth tokens) all resolve to the user with no agent-scoped kind, so
+MCP `forge_task_action` carries a delegated user actor: it keeps owner action
+offers but spends budgets like an agent. Audit rejection flags remain evidence
+and are not budget counters.
+
+| Kind | Standard allowance | Natural window / charge |
+|---|---|---|
+| Review | 2 failures, 1 routed bounce (fallback/autonomous limit 3) | Review origin window; failed verdict and existing charged gate outcome |
+| GateRejection(state) | Planning 2; merging 1; cancelled review entry `max_rejections - 1`; custom gate limit | Matching gate; rejected transition |
+| MergeFix | 1 ordinary repair; 0 disables | Merging origin window; ordinary repair transition |
+| Execution | 3 additional automatic failure retries | Explicit reset window; failure-driven retry scheduling |
+| WorkflowGuard | 3 additional follow-ups, using execution overrides | Since successful completion; guard follow-up intent |
+| TargetMovedRebase | 5 clean refreshes | Explicit reset window; successful typed clean-rebase cascade |
+| ConflictHandoff | 5 Worker handoffs | Explicit reset window; typed repair handoff (physical conflict can already have occurred) |
+| ReviewCarry | 5 carries, then real review | Authoritative review contract; carried Review settlement |
+| AutomaticReviewRecovery | Disabled normally; configured default 1 | Review-budget exhaustion episode; execution admission |
+| ReportCorrection | 2 native correction turns | Volatile counter per invocation; provider-turn intent |
+| ReviewCheckRerun | 2 check re-runs after a timeout (3 runs) | Volatile counter per review evaluation |
+| ReviewCiInfrastructure | 5 connected failures, 4 automatic retries | Interruption episode (each fresh review entry); connected retryable CI failure |
+
+A typed `RetryWindowReset` additionally resets every persisted kind. Successful
+completion resets WorkflowGuard; a fresh passed contract resets ReviewCarry;
+a fresh state entry, CI success or owner reconnect starts a fresh
+infrastructure episode, while an entry retry keeps it. Execution
+spending does **not** reset merely because status changes, so review laps cannot
+refund failure retries. Automatic recovery opens an episode when Review
+exhausts (decided where the review limit is resolved, so a Project stored with
+the `'{}'` workflow uses the default workflow's gate), closes it on reset or a
+new exhaustion, and counts cancelled attempts within that episode.
+Completed/cancelled execution evidence remains intact. ReportCorrection and
+ReviewCheckRerun remain volatile; their limits/comparisons use the same module.
+
+Owner-fixable failures and repeated coder findings after a previous matching
+failed reviewer attempt spend nothing. The charge point verifies the assessment,
+all-zero checks, reason provenance and previous verdict. Environment blocks also
+spend nothing. Parking and recovery use that same classifier; first-attempt
+repeat flags remain ordinary chargeable failures.
+
+Migration `V202610051649__task_budgets` snapshots retained counters and each
+kind's current derived window, preserving upgrade allowances without recovering
+erased history. A Project whose stored workflow has no states array (the `'{}'`
+column default) is read as the default workflow's gates, so its planning-gate
+spending survives. Task configuration is never rewritten: resolution keeps its
+pre-ledger order. It keeps audit/review/execution evidence, converts queued typed
+metadata effects atomically with the ledger, and removes replaced JSON counters.
+A pre-upgrade failed verdict awaiting disposition is reconciled once; already
+routed or exhausted verdicts receive backfilled charge receipts. Budget writes
+invalidate Task-list revisions in the same transaction.
 
 Review-CI infrastructure retry applies only to a typed unreachable owner or an
 RPC timeout before a CI command was sent. It spends no review rejection budget
 and creates no Review row if CI never ran. Barrier, annotation, persisted
-attempt count, and deferral commit atomically under Task/Project authority.
+ledger spending, and deferral commit atomically under Task/Project authority.
 Automatic retries back off from five seconds exponentially, stop after five
 connected-owner failures, and park with a blocker and `execution_failed` Attention
 whose details name the cause. Disconnected placements wait on the same owner

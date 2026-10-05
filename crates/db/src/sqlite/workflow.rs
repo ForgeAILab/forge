@@ -471,6 +471,25 @@ impl TransitionLogRepo for SqliteDb {
         &self,
         input: CreateTransitionLog,
     ) -> std::result::Result<TransitionLog, DbError> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let task = self
+            .get_task_in_tx(&mut transaction, &input.task_id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        // A logged-only transition (a recovery marker) carries no typed actor
+        // and so no owner authority. Production markers never consume a budget;
+        // a RetryWindowReset marker resets every kind whoever records it.
+        crate::budget::transition(
+            &mut transaction,
+            &task.id,
+            &input.from_state,
+            false,
+            &input.bridge,
+            input.rejection,
+            &input.id,
+            None,
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -486,7 +505,7 @@ impl TransitionLogRepo for SqliteDb {
         .bind(&input.created_at)
         .bind(input.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
         .bind(input.bridge.bridge_payload.as_ref().map(ToString::to_string))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
@@ -494,11 +513,13 @@ impl TransitionLogRepo for SqliteDb {
             "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload FROM transition_log WHERE id = ?",
         )
         .bind(&input.id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *transaction)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
-        map_transition_log_row(row)
+        let result = map_transition_log_row(row)?;
+        transaction.commit().await?;
+        Ok(result)
     }
 
     async fn insert_recovery_marker(
@@ -549,40 +570,6 @@ impl TransitionLogRepo for SqliteDb {
     async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TransitionLog>> {
         let mut connection = self.pool.acquire().await?;
         transitions_for_tasks(&mut connection, task_ids).await
-    }
-
-    async fn count_gate_rejections(
-        &self,
-        task_id: &str,
-        gate_state: &str,
-    ) -> std::result::Result<i64, DbError> {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
-             FROM transition_log AS rejection
-             WHERE rejection.task_id = ?
-               AND rejection.from_state = ?
-               AND rejection.rejection = 1
-               AND NOT EXISTS (
-                   SELECT 1
-                   FROM transition_log AS boundary
-                   WHERE boundary.task_id = rejection.task_id
-                     AND boundary.from_state = rejection.from_state
-                     AND boundary.rejection = 0
-                     AND boundary.bridge_kind = 'retry_window_reset'
-                     AND (
-                         boundary.created_at > rejection.created_at
-                         OR (
-                             boundary.created_at = rejection.created_at
-                             AND boundary.rowid > rejection.rowid
-                         )
-                     )
-               )",
-        )
-        .bind(task_id)
-        .bind(gate_state)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_workflow_sqlx_error)
     }
 
     async fn count_to_state_since(

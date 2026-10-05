@@ -149,8 +149,9 @@ pub async fn list_tasks(
         })
         .await?;
     let has_more = page.next_cursor.is_some();
-    let project_workflow = std::sync::Arc::new(WorkflowEngine::resolve_workflow(
-        &project_workflow_definition,
+    let project_workflow = std::sync::Arc::new(db::budget::with_project_defaults(
+        &WorkflowEngine::resolve_workflow(&project_workflow_definition),
+        &snapshot.project_settings,
     ));
     let tasks = page
         .items
@@ -172,20 +173,6 @@ pub async fn list_tasks(
         .iter()
         .map(|(task, _)| task.id.as_str())
         .collect::<Vec<_>>();
-    let retry_task_ids = tasks
-        .iter()
-        .filter(|(_, workflow)| {
-            workflow.states.iter().any(|state| {
-                state.kind == StateKind::Gate
-                    && state
-                        .gate_config
-                        .as_ref()
-                        .and_then(|config| config.max_rejections)
-                        .is_some()
-            })
-        })
-        .map(|(task, _)| task.id.as_str())
-        .collect::<Vec<_>>();
     let execution_queries = tasks
         .iter()
         .map(|(task, workflow)| db::TaskExecutionProjectionQuery {
@@ -202,7 +189,8 @@ pub async fn list_tasks(
     let reviews = snapshot.reviews(&task_ids).await?;
     let executions = snapshot.executions(&execution_queries).await?;
     let assignments = snapshot.roles(&task_ids).await?;
-    let transitions = snapshot.transitions(&retry_task_ids).await?;
+    let mut budget_counts = snapshot.budgets(&task_ids).await?;
+    let recovery_limit = db::budget::recovery_limit(&snapshot.project_settings);
     let links = snapshot.links(&task_ids).await?;
     let reviews = reviews
         .into_iter()
@@ -226,13 +214,6 @@ pub async fn list_tasks(
             .or_default()
             .push(assignment);
     }
-    let mut transitions_by_task = std::collections::HashMap::<_, Vec<_>>::new();
-    for transition in transitions {
-        transitions_by_task
-            .entry(transition.task_id.clone())
-            .or_default()
-            .push(transition);
-    }
     let items = tasks
         .into_iter()
         .map(|(task, workflow)| {
@@ -248,7 +229,13 @@ pub async fn list_tasks(
                 .cloned()
                 .collect::<Vec<_>>();
             let assignments = assignments_by_task.remove(&task.id).unwrap_or_default();
-            let transitions = transitions_by_task.remove(&task.id).unwrap_or_default();
+            let counts = budget_counts.remove(&task.id).unwrap_or_default();
+            let remaining_values =
+                db::budget::projection(&task, &workflow, &counts, recovery_limit)
+                    .expect("validated budget policy");
+            let limit_values =
+                db::budget::projection(&task, &workflow, &Default::default(), recovery_limit)
+                    .expect("validated budget policy");
             let latest_review = reviews.get(&task.id);
             let external_link = links.get(&task.id);
             crate::routes::task_projection::task_list_response(
@@ -256,7 +243,8 @@ pub async fn list_tasks(
                 &workflow,
                 crate::routes::task_projection::TaskDiagnosticRows {
                     role_assignments: &assignments,
-                    transition_logs: &transitions,
+                    remaining_retries: &remaining_values,
+                    retry_limits: &limit_values,
                     latest_review,
                     latest_execution,
                     execution_authority: &executions,

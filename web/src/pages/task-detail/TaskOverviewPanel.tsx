@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { isTransientApiError } from '@/lib/api-error'
+import { visibleRemainingBudgets } from '@/lib/retry-budget-display'
 import { PlanChecklist } from '@/components/plan-checklist'
 import {
   type AssigneeSelection,
@@ -133,18 +134,20 @@ export function TaskOverviewPanel({
     return () => window.clearTimeout(timeout)
   }, [task])
 
+  const remainingBudgets = task
+    ? visibleRemainingBudgets(task.remaining_retries, task.retry_limits)
+    : []
   const effectiveRetryBudget = (
     key: 'review' | 'merge_fix' | 'execution',
     draft: string,
-    fallback: number,
   ) => {
     const taskOverride = budgetValue(Number(draft.trim()))
     if (draft.trim() && taskOverride !== undefined) {
       return `(effective: ${taskOverride} — task override)`
     }
     const workflowDefault = budgetValue(workflowRetryBudgets?.[key])
-    if (workflowDefault !== undefined) return `(effective: ${workflowDefault} — workflow default)`
-    return `(effective: ${fallback} — system default)`
+    if (workflowDefault !== undefined) return `(effective: ${workflowDefault} — current server limit)`
+    return '(server limit unavailable)'
   }
 
   const handleSaveTitle = () => {
@@ -484,10 +487,10 @@ export function TaskOverviewPanel({
               </div>
             ) : null}
 
-            {Object.keys(task.remaining_retries).length > 0 ? (
+            {remainingBudgets.length > 0 ? (
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span className="font-medium uppercase tracking-wide">Remaining retries</span>
-                {Object.entries(task.remaining_retries).map(([key, value]) => (
+                <span className="font-medium uppercase tracking-wide">Remaining budget</span>
+                {remainingBudgets.map(([key, value]) => (
                   <span key={key}>
                     {key.replace(/_/g, ' ')}:{' '}
                     <span className="font-mono text-foreground">{value}</span>
@@ -509,7 +512,7 @@ export function TaskOverviewPanel({
               </div>
               <div className="grid gap-3 sm:grid-cols-4">
                 <div className="space-y-1">
-                  <Label htmlFor="task-review-retry-budget">Review retries</Label>
+                  <Label htmlFor="task-review-retry-budget">Review failure allowance</Label>
                   <Input
                     id="task-review-retry-budget"
                     type="number"
@@ -519,7 +522,7 @@ export function TaskOverviewPanel({
                     onChange={(e) => setReviewRetryOverride(e.target.value)}
                   />
                   <p className="text-xs text-muted-foreground">
-                    {effectiveRetryBudget('review', reviewRetryOverride, 3)}
+                    {effectiveRetryBudget('review', reviewRetryOverride)}
                   </p>
                 </div>
                 <div className="space-y-1">
@@ -533,7 +536,7 @@ export function TaskOverviewPanel({
                     onChange={(e) => setMergeFixRetryOverride(e.target.value)}
                   />
                   <p className="text-xs text-muted-foreground">
-                    {effectiveRetryBudget('merge_fix', mergeFixRetryOverride, 1)}
+                    {effectiveRetryBudget('merge_fix', mergeFixRetryOverride)}
                   </p>
                 </div>
                 <div className="space-y-1">
@@ -547,7 +550,7 @@ export function TaskOverviewPanel({
                     onChange={(e) => setExecutionRetryOverride(e.target.value)}
                   />
                   <p className="text-xs text-muted-foreground">
-                    {effectiveRetryBudget('execution', executionRetryOverride, 3)}
+                    {effectiveRetryBudget('execution', executionRetryOverride)}
                   </p>
                 </div>
               </div>

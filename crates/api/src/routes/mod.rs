@@ -3,25 +3,21 @@ use std::{collections::HashMap, str::FromStr};
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse,
     ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewDetails,
-    ReviewResponse, StateKind, StepResultEntry, StepResultResponse, TaskAnnotation,
-    TaskBlockingAnnotation, TaskResponse, TaskRoleAssignmentResponse, TaskType, UsageAggregate,
-    WorkspacePlacementResponse, WorkspaceResponse,
+    ReviewResponse, StepResultEntry, StepResultResponse, TaskAnnotation, TaskBlockingAnnotation,
+    TaskResponse, TaskRoleAssignmentResponse, TaskType, UsageAggregate, WorkspacePlacementResponse,
+    WorkspaceResponse,
 };
 use chrono::{DateTime, Utc};
 use db::{
     Agent, Daemon, Execution, Page, PageRequest, Project, ProjectRepo, Repo, Review, SortBy,
-    SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo, Workspace,
-    WorkspaceRepo,
+    SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo, Workspace, WorkspaceRepo,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use services::workflow::engine::WorkflowEngine;
 use services::{
     plan_artifact::{read_plan_with_router, PlanArtifactError},
-    task_diagnostics::{
-        compare_running_execution_authority, count_gate_rejections_since_boundary,
-        derive_workflow_health,
-    },
+    task_diagnostics::{compare_running_execution_authority, derive_workflow_health},
     task_service::action_resolver::list_execution_action_authority,
 };
 use sqlx::Row;
@@ -381,19 +377,25 @@ async fn task_response_inner(
     let effective_coder =
         effective_coder.map(|resolved| task_role_assignment_response(resolved.assignment));
 
-    let has_retry_budget = workflow.states.iter().any(|state| {
-        state.kind == StateKind::Gate
-            && state
-                .gate_config
-                .as_ref()
-                .and_then(|config| config.max_rejections)
-                .is_some()
-    });
-    let transition_logs = if has_retry_budget {
-        TransitionLogRepo::list_by_task(db, &task.id).await?
-    } else {
-        Vec::new()
-    };
+    let budget_counts = db::budget::load(db.pool(), &task.id).await?;
+    let settings = db::ProjectRepo::get_by_id(db, &task.project_id)
+        .await?
+        .ok_or(db::DbError::NotFound)?
+        .settings;
+    let resolved_budget_workflow = db::budget::with_project_defaults(workflow, &settings);
+    let recovery_limit = db::budget::recovery_limit(&settings);
+    let remaining_values = db::budget::projection(
+        &task,
+        &resolved_budget_workflow,
+        &budget_counts,
+        recovery_limit,
+    )?;
+    let limit_values = db::budget::projection(
+        &task,
+        &resolved_budget_workflow,
+        &HashMap::new(),
+        recovery_limit,
+    )?;
     let workspace_model =
         WorkspaceRepo::get_by_task_id(db, task.parent_task_id.as_deref().unwrap_or(&task.id))
             .await?;
@@ -423,6 +425,7 @@ async fn task_response_inner(
     let task_projection::TaskDiagnosticProjection {
         canonical_phase,
         remaining_retries,
+        retry_limits,
         error_annotation,
         workflow_health,
         workflow_exception,
@@ -431,7 +434,8 @@ async fn task_response_inner(
         workflow,
         task_projection::TaskDiagnosticRows {
             role_assignments: &task_role_assignments,
-            transition_logs: &transition_logs,
+            remaining_retries: &remaining_values,
+            retry_limits: &limit_values,
             latest_review: latest_review.as_ref(),
             latest_execution: latest_execution.as_ref(),
             execution_authority: &execution_authority,
@@ -488,6 +492,7 @@ async fn task_response_inner(
         effective_coder,
         effective_coder_source,
         remaining_retries,
+        retry_limits,
         available_actions: offers,
         error_annotation,
         blocked: task
@@ -556,6 +561,7 @@ fn blocking_annotation_for_projection<'a>(
         .or(error_annotation)
 }
 
+#[cfg(test)]
 fn retry_budget_exhausted_for_state(
     task_status: &str,
     state: &api_types::StateDefinition,

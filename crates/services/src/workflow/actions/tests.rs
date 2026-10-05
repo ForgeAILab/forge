@@ -1865,6 +1865,7 @@ async fn auto_cascade_review_failure_at_budget_blocks_with_metadata() {
     )
     .await;
 
+    sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review','fixture',2) ON CONFLICT(task_id,kind) DO UPDATE SET spent=2").bind(&ctx.task_id).execute(ctx.db.pool()).await.unwrap();
     match AutoCascadeOnReviewPass.execute(&ctx).await {
         HookResult::Ok => {}
         other => panic!("expected review budget block, got {other:?}"),
@@ -1910,6 +1911,7 @@ async fn auto_cascade_review_failure_budget_blocks_with_metadata() {
     .await;
     let mut rx = ctx.event_bus.subscribe();
 
+    sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review','fixture',2) ON CONFLICT(task_id,kind) DO UPDATE SET spent=2").bind(&ctx.task_id).execute(ctx.db.pool()).await.unwrap();
     match AutoCascadeOnReviewPass.execute(&ctx).await {
         HookResult::Ok => {}
         other => panic!("expected review budget block, got {other:?}"),
@@ -2205,7 +2207,7 @@ fn review_refresh_bridge_does_not_reset_or_spend_merge_fix_window() {
     };
 
     assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(
+        crate::task_diagnostics::audit_gate_rejections_since_boundary(
             &[rejection("merge conflict"), bridge],
             default_states::MERGING,
         ),
@@ -4596,6 +4598,7 @@ async fn carries_are_bounded_per_review() {
         .await
         .expect("carry row seeds");
     }
+    sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review_carry',?,5) ON CONFLICT(task_id,kind) DO UPDATE SET spent=5,window_id=excluded.window_id").bind(&ctx.task_id).bind(&contract_execution_id).execute(ctx.db.pool()).await.unwrap();
     enter_review_after_bridge(
         &mut ctx,
         &reason,

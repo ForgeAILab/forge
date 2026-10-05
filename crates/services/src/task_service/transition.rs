@@ -687,21 +687,16 @@ impl TaskService {
             .states
             .iter()
             .find(|state| state.name == default_states::REVIEW);
-        let max_retries = super::config::runtime_retry_budget(
+        let max_retries = db::budget::limit(
             &task,
-            super::config::RetryBudgetKind::Review,
+            db::budget::Kind::Review,
             review_state.map(|state| &state.config),
             review_state.and_then(|state| state.gate_config.as_ref()),
         )?;
 
-        let used = crate::task_diagnostics::count_gate_rejections_for_task(
-            &self.db,
-            task_id,
-            default_states::REVIEW,
-        )
-        .await?;
-        let remaining = i64::from(max_retries) - used;
-        Ok(remaining.clamp(0, i64::from(i32::MAX)) as i32)
+        let used =
+            db::budget::spent(self.db.pool(), task_id, db::budget::Kind::Review.key()).await?;
+        Ok(db::budget::remaining(i64::from(max_retries), used).min(i64::from(i32::MAX)) as i32)
     }
 
     pub async fn cancel_task(&self, task_id: impl Into<String>) -> Result<Task> {

@@ -587,6 +587,7 @@ fn task_response(
         effective_coder: None,
         effective_coder_source: None,
         remaining_retries: HashMap::new(),
+        retry_limits: HashMap::new(),
         available_actions: Vec::new(),
         error_annotation: None,
         blocked: None,

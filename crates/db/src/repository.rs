@@ -296,6 +296,13 @@ pub struct LatestExecutionMetadataClaim {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TaskMetadataMutation {
+    Budget(crate::budget::Mutation),
+    BudgetIfSpent {
+        key: String,
+        expected: i64,
+        window_id: String,
+        mutations: Vec<Self>,
+    },
     Set {
         key: String,
         value: serde_json::Value,
@@ -1398,11 +1405,6 @@ pub trait ExecutionRepo: Send + Sync {
     ) -> Result<Option<Execution>>;
     /// Count and test in-flight automatic recovery executions without loading
     /// the complete execution history into the service process.
-    async fn count_by_task_and_purpose(
-        &self,
-        task_id: &str,
-        purpose: api_types::ExecutionPurpose,
-    ) -> Result<i64>;
     async fn has_running_by_task_and_purpose(
         &self,
         task_id: &str,
@@ -1812,13 +1814,30 @@ pub trait ScopedMemoryRepository: Send + Sync {
 pub enum ReviewEventOrigin {
     Runner,
     User,
+    /// A human decision made through a credential an agent may also hold
+    /// (MCP). Audited as the user's, charged like the runner's.
+    DelegatedUser,
+    Executor,
 }
 
 impl ReviewEventOrigin {
     pub(crate) fn actor_type(self) -> &'static str {
         match self {
-            Self::Runner => "review_runner",
-            Self::User => "user",
+            Self::Runner | Self::Executor => "review_runner",
+            Self::User | Self::DelegatedUser => "user",
+        }
+    }
+    /// The owner's decision, or a reviewer execution that failed before giving
+    /// a verdict, spends no Review budget.
+    pub(crate) fn spends_no_budget(self) -> bool {
+        matches!(self, Self::User | Self::Executor)
+    }
+    /// The origin of a human decision made by `actor`.
+    pub fn for_human(actor: &api_types::Actor) -> Self {
+        if actor.is_owner() {
+            Self::User
+        } else {
+            Self::DelegatedUser
         }
     }
 }
@@ -3618,11 +3637,6 @@ pub trait TransitionLogRepo: Send + Sync {
         task_id: &str,
     ) -> std::result::Result<Vec<TransitionLog>, crate::DbError>;
     async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TransitionLog>>;
-    async fn count_gate_rejections(
-        &self,
-        task_id: &str,
-        gate_state: &str,
-    ) -> std::result::Result<i64, crate::DbError>;
     async fn count_to_state_since(
         &self,
         task_id: &str,

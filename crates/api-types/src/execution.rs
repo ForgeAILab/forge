@@ -213,7 +213,11 @@ pub struct TaskResponse {
     pub effective_coder_source: Option<EffectiveCoderSource>,
     #[serde(default)]
     #[ts(type = "Record<string, number>")]
+    /// Gate state keys plus non-gate budget kinds; all values are authoritative remaining allowances.
     pub remaining_retries: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    #[ts(type = "Record<string, number>")]
+    pub retry_limits: std::collections::HashMap<String, i64>,
     #[serde(default)]
     pub available_actions: Vec<Offer>,
     pub error_annotation: Option<TaskAnnotation>,
@@ -269,7 +273,11 @@ pub struct TaskListItemResponse {
     pub role_assignments: Vec<TaskRoleAssignmentResponse>,
     #[serde(default)]
     #[ts(type = "Record<string, number>")]
+    /// Gate state keys plus non-gate budget kinds; all values are authoritative remaining allowances.
     pub remaining_retries: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    #[ts(type = "Record<string, number>")]
+    pub retry_limits: std::collections::HashMap<String, i64>,
     pub error_annotation: Option<TaskAnnotation>,
     pub blocked: Option<InterruptionMetadata>,
     pub failed: Option<InterruptionMetadata>,
@@ -309,6 +317,7 @@ impl From<TaskResponse> for TaskListItemResponse {
             subtask_order: task.subtask_order,
             role_assignments: task.role_assignments,
             remaining_retries: task.remaining_retries,
+            retry_limits: task.retry_limits,
             error_annotation: task.error_annotation,
             blocked: task.blocked,
             failed: task.failed,
