@@ -140,6 +140,16 @@ mod tests {
         Arc::new(SqliteDb::new(pool))
     }
 
+    /// File-backed database for tests that abort the relay mid-query. An
+    /// aborted query can close the in-memory pool's only connection, and its
+    /// replacement would open a fresh, empty in-memory database.
+    async fn file_database(dir: &tempfile::TempDir) -> Arc<SqliteDb> {
+        let url = format!("sqlite://{}", dir.path().join("forge.db").display());
+        let pool = db::create_sqlite_pool(&url).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        Arc::new(SqliteDb::new(pool))
+    }
+
     #[tokio::test]
     async fn broadcasts_a_transactionally_written_event_exactly_once() {
         let db = database().await;
@@ -287,7 +297,8 @@ mod tests {
     }
     #[tokio::test]
     async fn audit2_supervised_relay_restarts_and_catches_up_without_duplicate() {
-        let db = database().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = file_database(&dir).await;
         let bus = Arc::new(EventBus::new(1024));
         let mut rx = bus.subscribe();
         let relay = Arc::new(DomainEventBroadcastConsumer::new(
