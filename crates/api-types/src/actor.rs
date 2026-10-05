@@ -14,6 +14,12 @@ pub enum Actor {
     User {
         user_id: Option<String>,
         source: UserActionSource,
+        /// The request authenticated with a credential an agent may also hold
+        /// (MCP: PATs, sessions and OAuth tokens all resolve to the user, with
+        /// no agent-scoped kind). It keeps the user's action authority but not
+        /// the owner's budget exemption: see [`Actor::is_owner`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        delegated: bool,
     },
     Agent {
         agent_id: String,
@@ -61,6 +67,17 @@ impl Actor {
         Self::User {
             user_id: None,
             source,
+            delegated: false,
+        }
+    }
+
+    /// A user acting through a credential that cannot be told apart from an
+    /// agent's (MCP).
+    pub fn delegated_user(user_id: impl Into<String>, source: UserActionSource) -> Self {
+        Self::User {
+            user_id: Some(user_id.into()),
+            source,
+            delegated: true,
         }
     }
 
@@ -77,6 +94,18 @@ impl Actor {
 
     pub fn is_user(&self) -> bool {
         matches!(self, Self::User { .. })
+    }
+
+    /// Authenticated as the human owner (REST, web and `forge-ctl` sessions,
+    /// escalation answers). Only the owner's actions spend no retry budget.
+    pub fn is_owner(&self) -> bool {
+        matches!(
+            self,
+            Self::User {
+                delegated: false,
+                ..
+            }
+        )
     }
 
     pub fn is_agent(&self) -> bool {
@@ -97,12 +126,17 @@ impl Actor {
     /// produce nested `user:override:user:override:...` audit values.
     pub fn into_override(self) -> Self {
         match self {
-            Self::User { user_id, source } => Self::User {
+            Self::User {
+                user_id,
+                source,
+                delegated,
+            } => Self::User {
                 user_id,
                 source: match source {
                     UserActionSource::Override(_) => source,
                     source => UserActionSource::Override(Box::new(source)),
                 },
+                delegated,
             },
             actor => actor,
         }
@@ -181,6 +215,25 @@ mod tests {
             Actor::user(UserActionSource::Api).into_override().display(),
             "user:override:api"
         );
+    }
+
+    #[test]
+    fn delegated_user_keeps_audit_format_but_not_owner_authority() {
+        let delegated = Actor::delegated_user("u", UserActionSource::Api);
+        assert_eq!(delegated.display(), "user:api");
+        assert!(delegated.is_user());
+        assert!(!delegated.is_owner());
+        assert!(!delegated.clone().into_override().is_owner());
+        assert!(Actor::user(UserActionSource::Api).is_owner());
+        assert!(!Actor::agent("a").is_owner());
+        let json = serde_json::to_value(Actor::user(UserActionSource::Api)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"User":{"user_id":null,"source":"Api"}})
+        );
+        let round: Actor =
+            serde_json::from_value(serde_json::to_value(&delegated).unwrap()).unwrap();
+        assert_eq!(round, delegated);
     }
 
     #[test]

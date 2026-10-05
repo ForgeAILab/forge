@@ -8,6 +8,55 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **One Task budget ledger; budget numbers are authoritative (refactor 2.5).**
+  Every retry and repair allowance is spent in a per-Task ledger and read
+  from it, so the number shown is the number enforced.
+  - REST Task detail/list, MCP `forge_get_task`/`forge_list_tasks` and
+    `forge-ctl` JSON: `remaining_retries` keeps its gate-state keys and adds
+    `review_gate` (the cancelled-review entry cap), `merge_fix`, `execution`,
+    `workflow_guard`, `target_moved_rebase`, `conflict_handoff`,
+    `review_carry`, `automatic_review_recovery`, `review_ci_infrastructure`
+    and `report_correction`. A new `retry_limits` object has the same keys
+    with each resolved limit.
+  - `remaining_retries.review` counts every failed review verdict, including
+    the one that parks the Task, and uses the Task's review override. A
+    standard review shows 2, then 1 after the first failed verdict, then 0
+    when the second parks it. Before, the key was the gate's `max_rejections`
+    minus logged bounces: it ignored Task overrides and still showed 1 at the
+    park until the exhaustion annotation was written.
+  - The upgrade (migration `V202610051649`) moves
+    `metadata_json.execution_retry_count`,
+    `metadata_json.workflow_guard_retry_count` and
+    `entry_barrier_json.infrastructure_attempts` into the ledger and removes
+    those keys. Every Task keeps exactly its remaining allowances, including
+    Projects stored with the `'{}'` (default) workflow. Task configuration is
+    not rewritten.
+- **Owner actions spend no retry budget; MCP actions still do (refactor
+  2.5).** Owner send-back, retry, review re-run, human review verdicts and
+  escalation answers from REST, the web and `forge-ctl` no longer consume a
+  budget. Example: with review limit 2, an owner send-back used to leave 1
+  remaining; it now leaves 2. MCP `forge_task_action` cannot be told apart
+  from an agent (PATs, sessions and OAuth tokens all resolve to the user), so
+  MCP actions, including a Project Agent's, spend exactly as before.
+- **Execution retries are no longer refunded by status changes (refactor
+  2.5).** Automatic execution-failure retries used to reset whenever the Task
+  changed status, so a review lap granted three fresh retries. Example: after
+  two failed executions and a review lap, spending used to drop from 2 to 0
+  (three retries left); it now stays 2 (one left) until Retry with budget
+  reset or Restart.
+- **A failed review entry with no failed Review honors Task review overrides
+  (refactor 2.5).** When the review entry hook fails and no failed Review
+  exists (for example, invalid `ci_steps`), the bounce allowance came from the
+  review gate's `max_rejections` alone, and was unlimited without one. It now
+  resolves like every review limit: Task-wide `retry_budgets.review`, then the
+  review state config (including the Task's per-state `review` override),
+  then `max_rejections`, still unlimited with none. Example: gate
+  `max_rejections: 2` and Task `retry_budgets.review: 5` used to bounce once
+  and park on the second failure; they now bounce four times and park on the
+  fifth. A CI failure that records a failed Review already honored overrides
+  and is unchanged, and without an override the counts are unchanged (gate
+  `max_rejections: 3` still allows two bounces).
+
 - **Transition reasons no longer carry workflow markers (refactor 2.4).** New
   `trigger_reason` text drops the `[review-refresh]`, `[target-moved-rebase]`,
   `[conflict-handoff]` and `[review-carry]` tags and the `; paths_json=[…]`
@@ -407,6 +456,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Operator status reports the Task's Execution limit (refactor 2.5).**
+  `retry_pressure[].max_attempts` is the Task's resolved Execution retry limit
+  (Task override, then workflow state, then 3) instead of a constant 3.
+  `attempt_count` still counts transition rejections.
+- **Task budget display (refactor 2.5).** The web Task overview's "Remaining
+  budget" shows only kinds with an active limit for the Task (it hides
+  `report_correction`, `review_gate`, and `automatic_review_recovery` while
+  recovery is disabled), and the retry-budget editor hints show the server's
+  resolved limit.
 
 - **One workflow engine, typed classification (refactor 2.4).** Task services
   share one workflow engine. Automatic review-recovery runs carry

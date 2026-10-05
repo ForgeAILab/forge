@@ -218,15 +218,12 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
         Ok(task) => task,
         Err(reason) => return Some(HookResult::Failed { reason }),
     };
-    let budget = match db::budget::task_limit(
-        &ctx.db,
+    let budget = match db::budget::limit(
         &task,
         db::budget::Kind::MergeFix,
         Some(&ctx.state_config),
         ctx.gate_config.as_ref(),
-    )
-    .await
-    {
+    ) {
         Ok(budget) => budget,
         Err(error) => {
             return Some(HookResult::Failed {

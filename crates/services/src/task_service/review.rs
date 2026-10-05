@@ -29,26 +29,8 @@ impl TaskService {
                 return Err(DbError::VersionConflict.into());
             }
         }
-        let has_episode:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_budget WHERE task_id=? AND kind='review_ci_infrastructure')").bind(&task.id).fetch_one(&mut *tx).await?;
-        if !has_episode {
-            let window = barrier
-                .get("started_at")
-                .and_then(Value::as_str)
-                .unwrap_or(&task.updated_at);
-            db::budget::reset(
-                &mut tx,
-                &task.id,
-                db::budget::Kind::ReviewCiInfrastructure.key(),
-                window,
-            )
-            .await?;
-        }
-        let previous: i64 = sqlx::query_scalar(
-            "SELECT spent FROM task_budget WHERE task_id=? AND kind='review_ci_infrastructure'",
-        )
-        .bind(&task.id)
-        .fetch_one(&mut *tx)
-        .await?;
+        // The episode window opened when this review entry began (or when a
+        // connected CI run last succeeded); entry retries keep it.
         let attempts = if retry && !disconnected {
             let identity = crate::workflow::engine::durable::current_hook(&task.id)
                 .map(|h| format!("{}:{}", h.step.id, h.index))
@@ -63,7 +45,12 @@ impl TaskService {
             .await?
             .spent
         } else {
-            previous
+            sqlx::query_scalar(
+                "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id=? AND kind='review_ci_infrastructure'),0)",
+            )
+            .bind(&task.id)
+            .fetch_one(&mut *tx)
+            .await?
         };
         let exhausted = retry
             && !disconnected
@@ -214,7 +201,7 @@ impl TaskService {
             &finished_at,
             task.version,
             Some(finished_at.clone()),
-            db::ReviewEventOrigin::User,
+            db::ReviewEventOrigin::for_human(&actor),
         )
         .await?;
 
@@ -306,7 +293,7 @@ impl TaskService {
             &finished_at,
             task.version,
             None,
-            db::ReviewEventOrigin::User,
+            db::ReviewEventOrigin::for_human(&actor),
         )
         .await?;
 

@@ -484,8 +484,7 @@ async fn apply_migration_sql(pool: &SqlitePool, migration: &Migration, sql: &str
 
         sqlx::raw_sql(sql).execute(&mut *transaction).await?;
         if migration.name == "task_budgets" {
-            crate::budget::normalize_retained_policy(&mut transaction).await?;
-            crate::budget::migrate_pending_mutations(&mut transaction, pool).await?;
+            crate::budget::migrate_pending_mutations(&mut transaction).await?;
         }
         sqlx::query("INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(migration.version)

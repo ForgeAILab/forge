@@ -121,22 +121,12 @@ async fn upgrade_preserves_remaining_for_every_persisted_kind() {
             "{kind}"
         );
     }
-    let normalized: String = sqlx::query_scalar("SELECT task_state_config FROM task WHERE id='t'")
+    // Resolution keeps its old order, so no Task configuration is rewritten.
+    let policy: String = sqlx::query_scalar("SELECT task_state_config FROM task WHERE id='t'")
         .fetch_one(&pool)
         .await
         .unwrap();
-    let normalized: serde_json::Value = serde_json::from_str(&normalized).unwrap();
-    assert_eq!(
-        normalized.pointer("/review/retry_budgets/execution"),
-        Some(&json!(3))
-    );
-    let archived: String = sqlx::query_scalar(
-        "SELECT task_state_config FROM task_budget_policy_snapshot WHERE task_id='t'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(archived, original_policy);
+    assert_eq!(policy, original_policy);
     let queued: String =
         sqlx::query_scalar("SELECT payload_json FROM task_step WHERE id='queued-0'")
             .fetch_one(&pool)

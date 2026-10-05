@@ -194,6 +194,56 @@ async fn task_response_remaining_retries_resets_at_recovery_boundary() {
     assert_eq!(response.remaining_retries.get("review"), Some(&1));
 }
 
+/// The web editor writes only top-level `retry_budgets` and keeps per-state
+/// keys; that save must take effect over a stored per-state value.
+#[tokio::test]
+async fn editor_task_wide_save_takes_effect_over_per_state_value() {
+    let harness = test_app().await;
+    let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
+    let _: Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/workflow"),
+        json!({ "definition": review_budget_workflow() }),
+        StatusCode::OK,
+    )
+    .await;
+    let mut task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Editor save" }),
+        StatusCode::OK,
+    )
+    .await;
+    for review in [4, 1] {
+        let _: Value = json_request(
+            &harness.app,
+            Method::PATCH,
+            &format!("/api/v1/tasks/{}", task.id),
+            json!({
+                "version": task.version,
+                "task_state_config": {
+                    "retry_budgets": { "review": review },
+                    "review": { "retry_budgets": { "review": 5 } }
+                }
+            }),
+            StatusCode::OK,
+        )
+        .await;
+        task = json_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{}", task.id),
+            json!({}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(task.retry_limits.get("review"), Some(&review));
+        assert_eq!(task.remaining_retries.get("review"), Some(&review));
+    }
+}
+
 fn review_budget_workflow() -> Value {
     json!({
         "roles": [],

@@ -1859,14 +1859,12 @@ impl TaskService {
         };
         let mut origin = task.clone();
         origin.status = state.name.clone();
-        let budget = db::budget::task_limit(
-            &self.db,
+        let budget = db::budget::limit(
             &origin,
             kind,
             Some(&state.config),
             state.gate_config.as_ref(),
-        )
-        .await?;
+        )?;
         let count =
             db::budget::spent(self.db.pool(), &task.id, &db::budget::gate_key(&state.name)).await?;
         Ok((state.name.clone(), budget, count))

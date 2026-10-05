@@ -87,15 +87,12 @@ impl HookAction for CheckRetryBudget {
                 Ok(task) => task,
                 Err(reason) => return HookResult::Failed { reason },
             };
-            let budget = match db::budget::task_limit(
-                &ctx.db,
+            let budget = match db::budget::limit(
                 &task,
                 db::budget::Kind::Review,
                 Some(&ctx.state_config),
                 ctx.gate_config.as_ref(),
-            )
-            .await
-            {
+            ) {
                 Ok(budget) => budget,
                 Err(error) => {
                     return HookResult::Failed {
@@ -129,15 +126,12 @@ impl HookAction for CheckRetryBudget {
                 Ok(t) => t,
                 Err(reason) => return HookResult::Failed { reason },
             };
-            let max_rejections = match db::budget::task_limit(
-                &ctx.db,
+            let max_rejections = match db::budget::limit(
                 &budget_task,
                 db::budget::Kind::GateRejection,
                 Some(&ctx.state_config),
                 Some(gate_config),
-            )
-            .await
-            {
+            ) {
                 Ok(n) => n,
                 Err(error) => {
                     return HookResult::Failed {

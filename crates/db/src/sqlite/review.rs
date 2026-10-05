@@ -191,12 +191,11 @@ async fn update_status_inner(
         .ok_or(DbError::NotFound)?;
     crate::budget::review_verdict(
         &mut transaction,
-        db,
         &budget_task,
         &review,
         &status,
         &details,
-        origin != crate::ReviewEventOrigin::Runner,
+        origin.spends_no_budget(),
     )
     .await?;
     let result = sqlx::query(
@@ -402,16 +401,8 @@ async fn update_status_with_review_authority_inner(
     }
 
     if carry.is_none() {
-        crate::budget::review_verdict(
-            &mut transaction,
-            db,
-            &task,
-            &review,
-            &status,
-            &details,
-            false,
-        )
-        .await?;
+        crate::budget::review_verdict(&mut transaction, &task, &review, &status, &details, false)
+            .await?;
     }
     let result = sqlx::query(
         "UPDATE review

@@ -1336,7 +1336,7 @@ pub struct CompareAndMoveTask {
     /// Server-derived effective workflow semantics, pinned to task_version.
     pub workflow_snapshot: serde_json::Value,
     pub trigger_name: Option<String>,
-    pub triggered_by: String,
+    pub triggered_by: api_types::Actor,
     pub bridge: api_types::TransitionBridge,
     pub trigger_reason: String,
     pub rejection: bool,

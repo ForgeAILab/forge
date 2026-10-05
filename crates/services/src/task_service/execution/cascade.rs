@@ -851,14 +851,12 @@ impl TaskService {
             return Ok(());
         }
 
-        let budget = db::budget::task_limit(
-            &self.db,
+        let budget = db::budget::limit(
             task,
             db::budget::Kind::Execution,
             Some(&current_state.config),
             current_state.gate_config.as_ref(),
-        )
-        .await?;
+        )?;
         let retry_count = db::budget::spent(
             self.db.pool(),
             &task.id,
@@ -1484,14 +1482,8 @@ impl TaskService {
             ));
         }
 
-        let budget = db::budget::task_limit(
-            &self.db,
-            task,
-            db::budget::Kind::Execution,
-            state_config,
-            gate_config,
-        )
-        .await?;
+        let budget =
+            db::budget::limit(task, db::budget::Kind::Execution, state_config, gate_config)?;
         if !db::budget::allows_retry(i64::from(budget), 0) {
             return Ok(ExecutionRetryDisposition::NotScheduled(
                 "automatic retries are disabled by the execution retry budget",
@@ -1774,7 +1766,7 @@ impl TaskService {
             }
             None => None,
         };
-        let mut check_attempt = 1;
+        let mut check_reruns = db::budget::Invocation::new(db::budget::Kind::ReviewCheckRerun);
         let conformance = loop {
             let conformance = match workspace_io.as_ref() {
                 Some(path) => {
@@ -1802,23 +1794,23 @@ impl TaskService {
             else {
                 break conformance;
             };
-            if check_attempt >= REVIEW_CHECK_ATTEMPTS {
+            let attempt = check_reruns.spent() + 1;
+            if !check_reruns.consume() {
                 return self
                     .block_task_for_review_environment(
                         &task,
                         execution,
-                        format!("{reason} ({check_attempt} attempts)"),
+                        format!("{reason} ({attempt} attempts)"),
                     )
                     .await;
             }
             tracing::warn!(
                 task_id = %task.id,
                 execution_id = %execution.id,
-                attempt = check_attempt,
+                attempt,
                 %reason,
                 "review checks timed out; re-running the checks only"
             );
-            check_attempt += 1;
         };
         let conformance = match conformance {
             Ok(result) if result.status != api_types::ConformanceStatus::Unverified => result,
@@ -2363,11 +2355,12 @@ impl TaskService {
             return Err(DbError::VersionConflict.into());
         }
         let task = &current;
-        if let Some(review) =
+        let latest_review =
             ReviewRepo::list_latest_reviews_for_tasks(&*self.db, &[task.id.as_str()])
                 .await?
-                .first()
-        {
+                .into_iter()
+                .next();
+        if let Some(review) = &latest_review {
             db::budget::reconcile_failed_review(&self.db, task, review).await?;
         }
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
@@ -2382,17 +2375,23 @@ impl TaskService {
             .states
             .iter()
             .find(|state| state.name == task.status);
-        let budget = db::budget::task_limit(
-            &self.db,
+        let budget = db::budget::limit(
             task,
             db::budget::Kind::Review,
             review_state.map(|state| &state.config),
             review_state.and_then(|state| state.gate_config.as_ref()),
-        )
-        .await?;
+        )?;
         let existing_count =
             db::budget::spent(self.db.pool(), &task.id, db::budget::Kind::Review.key()).await?;
         if !db::budget::allows_retry(i64::from(budget), existing_count) {
+            // The verdict that exhausted the budget opens its own automatic
+            // recovery episode, here where the limit is resolved.
+            if let Some(review) = latest_review
+                .as_ref()
+                .filter(|review| review.status == ReviewStatus::Failed)
+            {
+                db::budget::open_recovery_episode(&self.db, &task.id, &review.id).await?;
+            }
             let reason = "review retry budget exhausted";
             if let Some((task, recovery_reason)) = self
                 .try_dispatch_automatic_review_recovery(
@@ -2715,10 +2714,6 @@ impl TaskService {
             .is_some_and(|gate_config| gate_config.requires_user_approval()))
     }
 }
-
-/// How many times Forge runs a review's clean-checkout checks before a
-/// timeout parks the Task instead of retrying.
-const REVIEW_CHECK_ATTEMPTS: u32 = 3;
 
 /// Whether `task` is already parked by a review-environment block that this
 /// reviewer execution raised.

@@ -521,44 +521,47 @@ impl WorkflowExecution<'_> {
                                         .await?
                                         .is_some_and(|r| r.status == db::ReviewStatus::Cancelled);
                                     if cancelled {
-                                        if actor.is_user()
-                                            || db::budget::cancelled_review_entry_allows_retry(
+                                        // A cancelled Review's re-entry is capped by the
+                                        // gate alone; its bounce is charged by the cascade.
+                                        let allowed =
+                                            db::budget::cancelled_review_entry_allows_retry(
                                                 &self.db,
                                                 &task,
                                                 to_state.gate_config.as_ref(),
                                             )
-                                            .await?
-                                        {
-                                            task = self
-                                                .set_entry_barrier_with_authority(
-                                                    &task_id,
-                                                    task.version,
-                                                    None,
-                                                    &now_rfc3339(),
-                                                    authority.as_ref(),
-                                                )
-                                                .await?;
+                                            .await?;
+                                        let barrier = (!allowed).then(|| {
+                                            db::budget::exhausted_review_barrier(
+                                                &target_state,
+                                                &entry_barrier_started_at,
+                                            )
+                                        });
+                                        task = self
+                                            .set_entry_barrier_with_authority(
+                                                &task_id,
+                                                task.version,
+                                                barrier,
+                                                &now_rfc3339(),
+                                                authority.as_ref(),
+                                            )
+                                            .await?;
+                                        if allowed {
                                             before_enter_rejection_cascade = true;
                                             cascade =
                                                 Some((reject_target, error, Default::default()));
                                         }
                                     } else {
-                                        let max_rejections = db::budget::task_limit(
-                                            &self.db,
+                                        let max_rejections = db::budget::review_entry_limit(
                                             &task,
-                                            db::budget::Kind::Review,
-                                            Some(&enter_ctx.state_config),
+                                            &enter_ctx.state_config,
                                             to_state.gate_config.as_ref(),
-                                        )
-                                        .await?;
-                                        let identity = format!("entry:{}:{}", step.id, index);
+                                        );
                                         let (settled, allowed) = db::budget::failed_review_entry(
                                             &self.db,
                                             &task,
                                             i64::from(max_rejections),
-                                            &identity,
+                                            &step.id,
                                             &entry_barrier_started_at,
-                                            actor.is_user(),
                                         )
                                         .await?;
                                         task = settled;

@@ -330,7 +330,7 @@ impl TaskService {
                 transition_log_id: new_uuid_v4(),
                 workflow_snapshot,
                 trigger_name: None,
-                triggered_by: Actor::user(UserActionSource::BoardDrag).display(),
+                triggered_by: Actor::user(UserActionSource::BoardDrag),
                 bridge: Default::default(),
                 trigger_reason: "board reorder".to_owned(),
                 rejection: false,

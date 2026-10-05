@@ -203,15 +203,12 @@ impl HookAction for RunMerge {
                 // committed with markers and handed back, exactly as when the
                 // target moves under an agent-reviewed candidate. A merge-fix
                 // budget of 0 opts the Project out of automatic merge repair.
-                match db::budget::task_limit(
-                    &ctx.db,
+                match db::budget::limit(
                     &task,
                     db::budget::Kind::MergeFix,
                     Some(&ctx.state_config),
                     ctx.gate_config.as_ref(),
-                )
-                .await
-                {
+                ) {
                     Ok(0) => {
                         return merge_failure_result(
                             ctx,
@@ -804,15 +801,12 @@ pub(super) async fn merge_failure_result(
         return HookResult::Ok;
     }
 
-    let budget = match db::budget::task_limit(
-        &ctx.db,
+    let budget = match db::budget::limit(
         &task,
         db::budget::Kind::MergeFix,
         Some(&ctx.state_config),
         ctx.gate_config.as_ref(),
-    )
-    .await
-    {
+    ) {
         Ok(budget) => budget,
         Err(error) => {
             return failed(ctx, error);

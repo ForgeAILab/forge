@@ -11,22 +11,26 @@ CREATE TABLE task_budget_charge (
  PRIMARY KEY(task_id,kind,window_id,step_id),
  FOREIGN KEY(task_id,kind) REFERENCES task_budget(task_id,kind) ON DELETE CASCADE
 );
--- Preserve original configuration byte-for-byte when precedence normalization is
--- needed. This is upgrade provenance, never a runtime fallback or counter.
-CREATE TABLE task_budget_policy_snapshot (
- task_id TEXT PRIMARY KEY REFERENCES task(id) ON DELETE CASCADE,
- task_state_config TEXT NOT NULL
-);
+-- A Project whose stored workflow has no states array (the column default '{}',
+-- or JSON the runtime cannot parse) runs the default workflow. Its gates as of
+-- this release: planning 2, review 2, merging 1 rejections.
+CREATE TEMP TABLE budget_workflow AS
+SELECT p.id AS project_id,
+ CASE WHEN json_valid(p.workflow_definition) AND json_type(p.workflow_definition,'$.states')='array'
+ THEN p.workflow_definition
+ ELSE '{"states":[{"name":"planning","kind":"gate","gate_config":{"max_rejections":2}},{"name":"review","kind":"gate","gate_config":{"max_rejections":2}},{"name":"merging","kind":"gate","gate_config":{"max_rejections":1}}]}'
+ END AS definition
+FROM project p;
 -- Defaults have no spend; generic gates below are parameterized by their state.
 INSERT INTO task_budget(task_id,kind,window_id,spent)
 SELECT t.id,k.value,'initial',0 FROM task t CROSS JOIN json_each(
  '["review","merge_fix","execution","workflow_guard","target_moved_rebase","conflict_handoff","review_carry","automatic_review_recovery","review_ci_infrastructure"]') k;
 INSERT OR IGNORE INTO task_budget(task_id,kind,window_id,spent)
 SELECT t.id,CASE json_extract(s.value,'$.name') WHEN 'review' THEN 'review' ELSE 'gate:'||json_extract(s.value,'$.name') END,'initial',0
-FROM task t JOIN project p ON p.id=t.project_id JOIN json_each(CASE WHEN json_valid(p.workflow_definition) THEN p.workflow_definition ELSE '{}' END,'$.states') s
+FROM task t JOIN budget_workflow w ON w.project_id=t.project_id JOIN json_each(w.definition,'$.states') s
 WHERE json_extract(s.value,'$.kind')='gate' AND json_extract(s.value,'$.gate_config.max_rejections') IS NOT NULL;
 INSERT OR IGNORE INTO task_budget(task_id,kind,window_id,spent)
-SELECT t.id,'gate:review','initial',0 FROM task t JOIN project p ON p.id=t.project_id JOIN json_each(CASE WHEN json_valid(p.workflow_definition) THEN p.workflow_definition ELSE '{}' END,'$.states') s WHERE json_extract(s.value,'$.name')='review' AND json_extract(s.value,'$.gate_config.max_rejections') IS NOT NULL;
+SELECT t.id,'gate:review','initial',0 FROM task t JOIN budget_workflow w ON w.project_id=t.project_id JOIN json_each(w.definition,'$.states') s WHERE json_extract(s.value,'$.name')='review' AND json_extract(s.value,'$.gate_config.max_rejections') IS NOT NULL;
 -- Match the old per-origin reset, not merely the last reset of another gate.
 UPDATE task_budget AS b SET spent=(
  SELECT COUNT(*) FROM transition_log r WHERE r.task_id=b.task_id AND r.rejection=1
@@ -40,10 +44,10 @@ AND boundary.from_state=CASE b.kind WHEN 'review' THEN 'review' WHEN 'merge_fix'
 WHERE kind IN ('review','merge_fix') OR kind LIKE 'gate:%';
 -- A parked final verdict was not logged as a bounce. Preserve its zero allowance.
 UPDATE task_budget AS b SET spent=MAX(spent,COALESCE(
- (SELECT json_extract(t.task_state_config,'$.review.retry_budgets.review') FROM task t WHERE t.id=b.task_id AND json_valid(t.task_state_config)),
  (SELECT json_extract(t.task_state_config,'$.retry_budgets.review') FROM task t WHERE t.id=b.task_id AND json_valid(t.task_state_config)),
- (SELECT json_extract(s.value,'$.config.retry_budgets.review') FROM task t JOIN project p ON p.id=t.project_id JOIN json_each(CASE WHEN json_valid(p.workflow_definition) THEN p.workflow_definition ELSE '{}' END,'$.states') s WHERE t.id=b.task_id AND json_extract(s.value,'$.name')='review'),
- (SELECT json_extract(s.value,'$.gate_config.max_rejections') FROM task t JOIN project p ON p.id=t.project_id JOIN json_each(CASE WHEN json_valid(p.workflow_definition) THEN p.workflow_definition ELSE '{}' END,'$.states') s WHERE t.id=b.task_id AND json_extract(s.value,'$.name')='review'),2))
+ (SELECT json_extract(t.task_state_config,'$.review.retry_budgets.review') FROM task t WHERE t.id=b.task_id AND json_valid(t.task_state_config)),
+ (SELECT json_extract(s.value,'$.config.retry_budgets.review') FROM task t JOIN budget_workflow w ON w.project_id=t.project_id JOIN json_each(w.definition,'$.states') s WHERE t.id=b.task_id AND json_extract(s.value,'$.name')='review'),
+ (SELECT json_extract(s.value,'$.gate_config.max_rejections') FROM task t JOIN budget_workflow w ON w.project_id=t.project_id JOIN json_each(w.definition,'$.states') s WHERE t.id=b.task_id AND json_extract(s.value,'$.name')='review'),2))
 WHERE kind='review' AND EXISTS(SELECT 1 FROM task t WHERE t.id=b.task_id AND
  ((json_valid(t.error_annotation) AND json_extract(t.error_annotation,'$.type')='review_budget_exhausted') OR
  (json_valid(t.entry_barrier_json) AND json_extract(t.entry_barrier_json,'$.blocking_reason')='review retry budget exhausted')));
@@ -70,6 +74,7 @@ AND (EXISTS(SELECT 1 FROM transition_log l WHERE l.task_id=r.task_id AND l.from_
 OR EXISTS(SELECT 1 FROM task t WHERE t.id=r.task_id AND ((json_valid(t.error_annotation) AND json_extract(t.error_annotation,'$.type')='review_budget_exhausted') OR (json_valid(t.entry_barrier_json) AND json_extract(t.entry_barrier_json,'$.blocking_reason')='review retry budget exhausted'))));
 UPDATE task SET metadata_json=json_remove(metadata_json,'$.execution_retry_count','$.workflow_guard_retry_count') WHERE json_valid(metadata_json) AND (json_type(metadata_json,'$.execution_retry_count') IS NOT NULL OR json_type(metadata_json,'$.workflow_guard_retry_count') IS NOT NULL);
 UPDATE task SET entry_barrier_json=json_remove(entry_barrier_json,'$.infrastructure_attempts') WHERE json_valid(entry_barrier_json) AND json_type(entry_barrier_json,'$.infrastructure_attempts') IS NOT NULL;
+DROP TABLE budget_workflow;
 CREATE TRIGGER task_list_revision_budget_insert AFTER INSERT ON task_budget BEGIN
  UPDATE project SET list_revision=list_revision+1 WHERE id=(SELECT project_id FROM task WHERE id=NEW.task_id);
 END;

@@ -1443,7 +1443,7 @@ impl WorkflowExecution<'_> {
                             transition_log_id: transition_log_id.clone(),
                             workflow_snapshot: workflow_snapshot.clone(),
                             trigger_name: trigger_name.clone(),
-                            triggered_by: actor.display(),
+                            triggered_by: actor.clone(),
                             bridge: bridge.clone(),
                             trigger_reason: reason.clone(),
                             rejection,
@@ -1597,7 +1597,25 @@ impl WorkflowExecution<'_> {
                     .bind(&task.id)
                     .execute(&mut *transaction)
                     .await?;
-                    db::budget::transition(&mut transaction,&task,&current_status,&actor.display(),&bridge,rejection,&transition_log_id).await?;
+                    if entry_barrier_json.is_none() {
+                        db::budget::fresh_entry(&mut transaction, &task.id, &transition_log_id).await?;
+                    }
+                    // A cascade out of a failed review entry shares that entry's charge.
+                    let entry_step = step
+                        .as_ref()
+                        .filter(|step| step.kind == "cascade")
+                        .and_then(|step| step.causation_step_id.as_deref());
+                    db::budget::transition(
+                        &mut transaction,
+                        &task.id,
+                        &current_status,
+                        actor.is_owner(),
+                        &bridge,
+                        rejection,
+                        &transition_log_id,
+                        entry_step,
+                    )
+                    .await?;
                     if let Some(step) = &step {
                         self.db.finish_step_in_tx(&mut transaction, step, "done", None).await?;
                     }

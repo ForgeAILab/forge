@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { isTransientApiError } from '@/lib/api-error'
+import { visibleRemainingBudgets } from '@/lib/retry-budget-display'
 import { PlanChecklist } from '@/components/plan-checklist'
 import {
   type AssigneeSelection,
@@ -133,6 +134,9 @@ export function TaskOverviewPanel({
     return () => window.clearTimeout(timeout)
   }, [task])
 
+  const remainingBudgets = task
+    ? visibleRemainingBudgets(task.remaining_retries, task.retry_limits)
+    : []
   const effectiveRetryBudget = (
     key: 'review' | 'merge_fix' | 'execution',
     draft: string,
@@ -483,10 +487,10 @@ export function TaskOverviewPanel({
               </div>
             ) : null}
 
-            {Object.keys(task.remaining_retries).length > 0 ? (
+            {remainingBudgets.length > 0 ? (
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
                 <span className="font-medium uppercase tracking-wide">Remaining budget</span>
-                {Object.entries(task.remaining_retries).map(([key, value]) => (
+                {remainingBudgets.map(([key, value]) => (
                   <span key={key}>
                     {key.replace(/_/g, ' ')}:{' '}
                     <span className="font-mono text-foreground">{value}</span>

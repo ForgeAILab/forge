@@ -476,14 +476,18 @@ impl TransitionLogRepo for SqliteDb {
             .get_task_in_tx(&mut transaction, &input.task_id)
             .await?
             .ok_or(DbError::NotFound)?;
+        // A logged-only transition (a recovery marker) carries no typed actor
+        // and so no owner authority. Production markers never consume a budget;
+        // a RetryWindowReset marker resets every kind whoever records it.
         crate::budget::transition(
             &mut transaction,
-            &task,
+            &task.id,
             &input.from_state,
-            &input.triggered_by,
+            false,
             &input.bridge,
             input.rejection,
             &input.id,
+            None,
         )
         .await?;
         sqlx::query(

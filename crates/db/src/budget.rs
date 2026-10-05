@@ -20,6 +20,8 @@ pub enum Kind {
     AutomaticReviewRecovery,
     ReportCorrection,
     ReviewCiInfrastructure,
+    /// Clean-checkout review checks re-run after a timeout, per evaluation.
+    ReviewCheckRerun,
 }
 impl Kind {
     pub const PERSISTED: [Self; 9] = [
@@ -46,6 +48,7 @@ impl Kind {
             Self::AutomaticReviewRecovery => "automatic_review_recovery",
             Self::ReportCorrection => "report_correction",
             Self::ReviewCiInfrastructure => "review_ci_infrastructure",
+            Self::ReviewCheckRerun => "review_check_rerun",
         }
     }
     pub const fn default_limit(self) -> i32 {
@@ -57,10 +60,17 @@ impl Kind {
             | Self::ConflictHandoff
             | Self::ReviewCarry
             | Self::ReviewCiInfrastructure => 5,
-            Self::ReportCorrection => 2,
+            Self::ReportCorrection | Self::ReviewCheckRerun => 2,
         }
     }
+    /// Per-invocation counters live in memory and never reach the ledger.
+    pub const fn is_volatile(self) -> bool {
+        matches!(self, Self::ReportCorrection | Self::ReviewCheckRerun)
+    }
 }
+/// Review-gate rejections, counted against the cancelled-review entry cap
+/// (`max_rejections - 1`); the Review kind itself is keyed `review`.
+pub const REVIEW_GATE_KEY: &str = "gate:review";
 pub fn gate_key(state: &str) -> String {
     match state {
         "review" => "review".into(),
@@ -75,8 +85,14 @@ fn configured(value: &Value, key: &str) -> Option<i32> {
         .and_then(|n| i32::try_from(n).ok())
         .filter(|n| *n >= 0)
 }
-/// Explicit Task per-state settings precede Task-wide settings; state configuration
-/// is the resolved workflow/Project default supplied by the consuming step.
+/// Resolve a kind's limit in the order every consuming step has always used:
+/// Task-wide `retry_budgets`, then the state config the step supplies, then the
+/// gate's `max_rejections` (Review/MergeFix), then the kind default.
+///
+/// Task per-state overrides are not read here. Hook steps pass their merged
+/// state config, which already carries `task_state_config[state]`; reviewer
+/// completion, Execution retry and the workflow guard pass the workflow's own
+/// state config and so never saw per-state values.
 pub fn limit(
     task: &Task,
     kind: Kind,
@@ -100,46 +116,38 @@ pub fn limit(
             n
         });
     }
-    let key = if kind == Kind::WorkflowGuard {
-        "execution"
-    } else {
-        kind.key()
-    };
-    let state = match kind {
-        Kind::Review => "review",
-        Kind::MergeFix => {
-            if task.status == "merge_failed" {
-                "merge_failed"
-            } else {
-                "merging"
-            }
-        }
-        _ => task.status.as_str(),
-    };
-    let config = task
-        .task_state_config
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-    if let Some(n) = config
-        .as_ref()
-        .and_then(|c| c.get(state))
-        .and_then(|c| configured(c, key))
-    {
+    if let Some(n) = configured_override(task, state_config, kind) {
         return Ok(n);
     }
-    if let Some(n) = config.as_ref().and_then(|c| configured(c, key)) {
-        return Ok(n);
-    }
-    // Explicit state retry settings are existing overrides, including Project merging policy.
-    if let Some(n) = state_config.and_then(|c| configured(c, key)) {
-        return Ok(n);
-    }
-    if matches!(kind, Kind::Review | Kind::MergeFix | Kind::GateRejection) {
+    if matches!(kind, Kind::Review | Kind::MergeFix) {
         if let Some(n) = gate.and_then(|g| g.max_rejections) {
             return Ok(n.max(0));
         }
     }
     Ok(kind.default_limit())
+}
+
+/// The Task-wide value, else the supplied state config's value, for a kind.
+fn configured_override(task: &Task, state_config: Option<&Value>, kind: Kind) -> Option<i32> {
+    let key = if kind == Kind::WorkflowGuard {
+        Kind::Execution.key()
+    } else {
+        kind.key()
+    };
+    task.task_state_config
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|config| configured(&config, key))
+        .or_else(|| state_config.and_then(|config| configured(config, key)))
+}
+
+/// The review-entry failure with no failed Review: base capped it at the gate's
+/// `max_rejections` alone and never blocked without one. Review overrides now
+/// apply here too; with neither an override nor a gate cap it stays unlimited.
+pub fn review_entry_limit(task: &Task, state_config: &Value, gate: Option<&GateConfig>) -> i32 {
+    configured_override(task, Some(state_config), Kind::Review)
+        .or_else(|| gate.and_then(|g| g.max_rejections).map(|n| n.max(0)))
+        .unwrap_or(i32::MAX)
 }
 pub fn remaining(limit: i64, spent: i64) -> i64 {
     limit.saturating_sub(spent).max(0)
@@ -191,6 +199,27 @@ pub async fn load(pool: &sqlx::SqlitePool, task: &str) -> Result<HashMap<String,
         .map(|r| Ok((r.try_get("kind")?, r.try_get("spent")?)))
         .collect()
 }
+/// Spending for a page of Tasks in one query, keyed by Task id.
+pub async fn load_many(
+    pool: &sqlx::SqlitePool,
+    tasks: &[&str],
+) -> Result<HashMap<String, HashMap<String, i64>>> {
+    let ids = serde_json::to_string(tasks).map_err(|e| DbError::Check(e.to_string()))?;
+    let rows = sqlx::query(
+        "SELECT task_id, kind, spent FROM task_budget WHERE task_id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    let mut spent = HashMap::<String, HashMap<String, i64>>::new();
+    for row in rows {
+        spent
+            .entry(row.try_get("task_id")?)
+            .or_default()
+            .insert(row.try_get("kind")?, row.try_get("spent")?);
+    }
+    Ok(spent)
+}
 pub async fn reset(
     tx: &mut Transaction<'_, Sqlite>,
     task: &str,
@@ -213,8 +242,31 @@ pub async fn reset_all(tx: &mut Transaction<'_, Sqlite>, task: &str, window: &st
         .await?;
     Ok(())
 }
+/// The receipt identity a failed review entry charges under. The cascade that
+/// bounces that entry back reuses it, so one failed entry is charged once.
+pub fn entry_charge_step(hook_step: &str) -> String {
+    format!("entry:{hook_step}")
+}
+/// A fresh state entry (any status write that does not carry the previous entry
+/// barrier) starts a new review-CI interruption episode. An entry retry keeps
+/// its barrier and with it the episode's spending.
+pub async fn fresh_entry(tx: &mut Transaction<'_, Sqlite>, task: &str, window: &str) -> Result<()> {
+    reset(tx, task, Kind::ReviewCiInfrastructure.key(), window).await
+}
+/// Record an outcome the workflow already admitted (a logged rejection, an
+/// exhausting verdict, a queued pre-upgrade increment): it always spends once
+/// per receipt, whatever the limit.
+pub async fn admit(
+    tx: &mut Transaction<'_, Sqlite>,
+    task: &str,
+    key: &str,
+    step: &str,
+) -> Result<bool> {
+    Ok(charge(tx, task, key, i64::MAX, step).await?.charged)
+}
 /// This is the only persisted charge point. Its receipt and consuming write share
 /// the caller's authority-fenced transaction. Step identities include effect ordinals.
+/// A charge that would exceed `limit` is refused (not recorded).
 pub async fn charge(
     tx: &mut Transaction<'_, Sqlite>,
     task: &str,
@@ -222,20 +274,8 @@ pub async fn charge(
     limit: i64,
     step: &str,
 ) -> Result<Charge> {
-    charge_consumption(tx, task, key, limit, step, false).await
-}
-async fn charge_consumption(
-    tx: &mut Transaction<'_, Sqlite>,
-    task: &str,
-    key: &str,
-    limit: i64,
-    step: &str,
-    admitted_outcome: bool,
-) -> Result<Charge> {
-    if key == Kind::ReportCorrection.key() {
-        return Err(DbError::Check(
-            "report corrections are invocation-scoped".into(),
-        ));
+    if key == Kind::ReportCorrection.key() || key == Kind::ReviewCheckRerun.key() {
+        return Err(DbError::Check(format!("{key} is invocation-scoped")));
     }
     sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,?,COALESCE((SELECT window_id FROM task_budget WHERE task_id=? AND kind='execution'),'initial'),0) ON CONFLICT DO NOTHING")
         .bind(task).bind(key).bind(task).execute(&mut **tx).await?;
@@ -247,7 +287,7 @@ async fn charge_consumption(
             .await?;
     let recorded: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_budget_charge WHERE task_id=? AND kind=? AND window_id=? AND step_id=?)")
         .bind(task).bind(key).bind(&window).bind(step).fetch_one(&mut **tx).await?;
-    if recorded || (!admitted_outcome && !allows_retry(limit, old)) {
+    if recorded || !allows_retry(limit, old) {
         return Ok(Charge {
             spent: old,
             remaining: remaining(limit, old),
@@ -300,14 +340,19 @@ pub async fn apply(tx: &mut Transaction<'_, Sqlite>, task: &str, effect: Mutatio
         }
     }
 }
-/// Native result-block corrections are deliberately scoped to one invocation.
+/// Volatile kinds (native result-block corrections, review check re-runs) are
+/// deliberately scoped to one invocation.
 pub struct Invocation {
     kind: Kind,
     spent: i64,
 }
 impl Invocation {
     pub fn new(kind: Kind) -> Self {
+        debug_assert!(kind.is_volatile());
         Self { kind, spent: 0 }
+    }
+    pub fn spent(&self) -> i64 {
+        self.spent
     }
     pub fn consume(&mut self) -> bool {
         if !allows_retry(i64::from(self.kind.default_limit()), self.spent) {
@@ -363,7 +408,7 @@ pub fn projection(
             )?;
             out.insert(
                 "review_gate".into(),
-                remaining(i64::from(cap), *counts.get("gate:review").unwrap_or(&0)),
+                remaining(i64::from(cap), *counts.get(REVIEW_GATE_KEY).unwrap_or(&0)),
             );
         }
         out.insert(
@@ -406,10 +451,12 @@ pub fn projection(
     Ok(out)
 }
 
-/// Preserve the reviewer finding policy at the charge point, including recovery.
+/// Preserve the reviewer finding policy at the charge point. A verdict was
+/// already admitted, so it always spends; whether it exhausts the budget, and
+/// so opens a recovery episode, is decided where the limit is resolved
+/// (`review_failure_target`).
 pub async fn review_verdict(
     tx: &mut Transaction<'_, Sqlite>,
-    db: &SqliteDb,
     task: &Task,
     review: &Review,
     status: &ReviewStatus,
@@ -460,148 +507,97 @@ pub async fn review_verdict(
             return Ok(());
         }
     }
-    let (project, settings): (String, String) =
-        sqlx::query_as("SELECT workflow_definition,settings FROM project WHERE id=?")
-            .bind(&task.project_id)
-            .fetch_one(&mut **tx)
-            .await?;
-    let workflow = serde_json::from_str::<WorkflowDefinition>(&project)
-        .ok()
-        .map(|w| with_project_defaults(&w, &settings));
-    let state = workflow
-        .as_ref()
-        .and_then(|w| w.states.iter().find(|s| s.name == task.status));
-    let n = limit(
-        task,
-        Kind::Review,
-        state.map(|s| &s.config),
-        state.and_then(|s| s.gate_config.as_ref()),
-    )?;
-    let result = charge_consumption(
+    admit(
         tx,
         &task.id,
         Kind::Review.key(),
-        i64::from(n),
         &format!("review:{}", review.id),
-        true,
     )
     .await?;
-    if !allows_retry(i64::from(n), result.spent) {
-        reset(
-            tx,
-            &task.id,
-            Kind::AutomaticReviewRecovery.key(),
-            &format!("exhaustion:{}", review.id),
-        )
-        .await?;
-    }
-    let _ = db;
     Ok(())
 }
 
+/// The review budget ran out on `review`: open that exhaustion's automatic
+/// recovery episode. Idempotent per exhausting verdict.
+pub async fn open_recovery_episode(db: &SqliteDb, task: &str, review: &str) -> Result<()> {
+    let mut tx = crate::begin_immediate(db.pool()).await?;
+    db.fence_task_lease_in_tx(&mut tx, task, "review recovery episode")
+        .await?;
+    open_recovery_episode_in_tx(&mut tx, task, review).await?;
+    tx.commit().await?;
+    Ok(())
+}
+async fn open_recovery_episode_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task: &str,
+    review: &str,
+) -> Result<()> {
+    reset(
+        tx,
+        task,
+        Kind::AutomaticReviewRecovery.key(),
+        &format!("exhaustion:{review}"),
+    )
+    .await
+}
+
+/// Charge the budget a committed transition consumed. Every charge here is an
+/// outcome the workflow already admitted, so limits are not consulted.
+///
+/// `owner` is the transition actor's typed owner authority
+/// ([`api_types::Actor::is_owner`]): an owner's move spends nothing.
+/// `entry_step` is the hook step whose failed review entry produced this
+/// cascade; the bounce shares that entry's receipt instead of charging twice.
 #[allow(clippy::too_many_arguments)]
 pub async fn transition(
     tx: &mut Transaction<'_, Sqlite>,
-    task: &Task,
+    task: &str,
     from: &str,
-    actor: &str,
+    owner: bool,
     bridge: &api_types::TransitionBridge,
     rejection: bool,
     step: &str,
+    entry_step: Option<&str>,
 ) -> Result<()> {
     if bridge.bridge_kind == Some(api_types::TransitionBridgeKind::RetryWindowReset) {
-        return reset_all(tx, &task.id, step).await;
+        return reset_all(tx, task, step).await;
     }
-    if actor.starts_with("user") {
+    if owner {
         return Ok(());
     }
     if from == "review" && rejection {
-        let latest:Option<(String,String)>=sqlx::query_as("SELECT id,status FROM review WHERE task_id=? ORDER BY attempt_number DESC,id DESC LIMIT 1").bind(&task.id).fetch_optional(&mut **tx).await?;
+        let latest:Option<(String,String)>=sqlx::query_as("SELECT id,status FROM review WHERE task_id=? ORDER BY attempt_number DESC,id DESC LIMIT 1").bind(task).fetch_optional(&mut **tx).await?;
         // Failed verdict settlement is the charge point for failures. This branch
         // retains only the already-existing gate-outcome debit (or a gate with no Review).
         if latest.as_ref().is_none_or(|(_, status)| status != "failed") {
-            let (definition, settings): (String, String) =
-                sqlx::query_as("SELECT workflow_definition,settings FROM project WHERE id=?")
-                    .bind(&task.project_id)
-                    .fetch_one(&mut **tx)
-                    .await?;
-            let workflow = serde_json::from_str::<WorkflowDefinition>(&definition)
-                .ok()
-                .map(|w| with_project_defaults(&w, &settings));
-            let state = workflow
-                .as_ref()
-                .and_then(|w| w.states.iter().find(|s| s.name == from));
-            let n = limit(
+            let receipt = entry_step.map(entry_charge_step);
+            admit(
+                tx,
                 task,
-                Kind::Review,
-                state.map(|s| &s.config),
-                state.and_then(|s| s.gate_config.as_ref()),
-            )?;
-            charge_consumption(tx, &task.id, Kind::Review.key(), i64::from(n), step, true).await?;
+                Kind::Review.key(),
+                receipt.as_deref().unwrap_or(step),
+            )
+            .await?;
         }
-        let (definition, settings): (String, String) =
-            sqlx::query_as("SELECT workflow_definition,settings FROM project WHERE id=?")
-                .bind(&task.project_id)
-                .fetch_one(&mut **tx)
-                .await?;
-        let workflow = serde_json::from_str::<WorkflowDefinition>(&definition)
-            .ok()
-            .map(|w| with_project_defaults(&w, &settings));
-        let state = workflow
-            .as_ref()
-            .and_then(|w| w.states.iter().find(|s| s.name == "review"));
-        let cap = limit(
-            task,
-            Kind::GateRejection,
-            state.map(|s| &s.config),
-            state.and_then(|s| s.gate_config.as_ref()),
-        )?;
-        charge_consumption(tx, &task.id, "gate:review", i64::from(cap), step, true).await?;
+        admit(tx, task, REVIEW_GATE_KEY, step).await?;
         return Ok(());
     }
-    let kind = match bridge.bridge_kind {
-        Some(api_types::TransitionBridgeKind::TargetMovedRebase) => Some(Kind::TargetMovedRebase),
-        Some(api_types::TransitionBridgeKind::ConflictHandoff) => Some(Kind::ConflictHandoff),
-        _ if rejection && from == "merging" && !bridge.is_review_refresh() => Some(Kind::MergeFix),
-        _ if rejection && from != "review" => Some(Kind::GateRejection),
+    let key = match bridge.bridge_kind {
+        Some(api_types::TransitionBridgeKind::TargetMovedRebase) => {
+            Some(Kind::TargetMovedRebase.key().to_owned())
+        }
+        Some(api_types::TransitionBridgeKind::ConflictHandoff) => {
+            Some(Kind::ConflictHandoff.key().to_owned())
+        }
+        _ if rejection && from == "merging" && !bridge.is_review_refresh() => {
+            admit(tx, task, &gate_key(from), step).await?;
+            Some(Kind::MergeFix.key().to_owned())
+        }
+        _ if rejection && from != "review" => Some(gate_key(from)),
         _ => None,
     };
-    if let Some(kind) = kind {
-        let (project, settings): (String, String) =
-            sqlx::query_as("SELECT workflow_definition,settings FROM project WHERE id=?")
-                .bind(&task.project_id)
-                .fetch_one(&mut **tx)
-                .await?;
-        let workflow = serde_json::from_str::<WorkflowDefinition>(&project)
-            .ok()
-            .map(|w| with_project_defaults(&w, &settings));
-        let state = workflow
-            .as_ref()
-            .and_then(|w| w.states.iter().find(|s| s.name == from));
-        let mut origin = task.clone();
-        origin.status = from.into();
-        let n = limit(
-            &origin,
-            kind,
-            state.map(|s| &s.config),
-            state.and_then(|s| s.gate_config.as_ref()),
-        )?;
-        let key = if kind == Kind::GateRejection {
-            gate_key(from)
-        } else {
-            kind.key().into()
-        };
-        // The graph/status step already admitted this outcome. Keep the old
-        // entry-hook ordering; retry admission checks occur before producing it.
-        charge_consumption(tx, &task.id, &key, i64::from(n), step, true).await?;
-        if kind == Kind::MergeFix {
-            let gate_limit = state
-                .and_then(|s| s.gate_config.as_ref())
-                .and_then(|g| g.max_rejections)
-                .map(i64::from)
-                .unwrap_or(i64::from(i32::MAX));
-            charge_consumption(tx, &task.id, &gate_key(from), gate_limit, step, true).await?;
-        }
+    if let Some(key) = key {
+        admit(tx, task, &key, step).await?;
     }
     Ok(())
 }
@@ -661,41 +657,19 @@ pub fn with_project_defaults(workflow: &WorkflowDefinition, settings: &str) -> W
     }
     workflow
 }
-pub async fn task_limit(
-    db: &SqliteDb,
-    task: &Task,
-    kind: Kind,
-    config: Option<&Value>,
-    gate: Option<&GateConfig>,
-) -> Result<i32> {
-    let settings: String = sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
-        .bind(&task.project_id)
-        .fetch_one(db.pool())
-        .await?;
-    let state = match kind {
-        Kind::Review => "review",
-        Kind::MergeFix => {
-            if task.status == "merge_failed" {
-                "merge_failed"
-            } else {
-                "merging"
-            }
-        }
-        _ => task.status.as_str(),
-    };
-    let config = state_config(config.unwrap_or(&Value::Null), state, &settings);
-    limit(task, kind, Some(&config), gate)
-}
-
+/// Whether the Task step running now acts for the owner: a hook, cascade or
+/// request whose typed actor has owner authority, or a `rerun_review` command.
 fn owner_step(task: &str) -> bool {
     crate::task_writer::current_task_step()
         .filter(|s| s.task_id == task)
         .and_then(|s| serde_json::from_str::<Value>(&s.payload_json).ok())
         .is_some_and(|p| {
-            p.get("actor").is_some_and(|a| a.get("User").is_some())
-                || p.pointer("/request/actor")
-                    .is_some_and(|a| a.get("User").is_some())
-                || p.get("operation").and_then(Value::as_str) == Some("rerun_review")
+            ["/actor", "/request/actor"].into_iter().any(|pointer| {
+                p.pointer(pointer).is_some_and(|actor| {
+                    serde_json::from_value::<api_types::Actor>(actor.clone())
+                        .is_ok_and(|actor| actor.is_owner())
+                })
+            }) || p.get("operation").and_then(Value::as_str) == Some("rerun_review")
         })
 }
 
@@ -749,15 +723,16 @@ pub fn owner_review_failure_message(
     (assessment.repeat && previous_failed).then(|| format!("repeated finding: {reason}"))
 }
 
-/// A failed review-entry hook with no Review verdict consumes the same failed
-/// attempt. Its receipt and either barrier or retry disposition commit together.
+/// A failed review-entry hook with no failed Review consumes one Review
+/// attempt, owner-entered or not, exactly as base counted the bounce. Its
+/// receipt ([`entry_charge_step`]) and either the exhausted barrier or the
+/// cleared barrier commit together; the bounce cascade reuses the receipt.
 pub async fn failed_review_entry(
     db: &SqliteDb,
     task: &Task,
     limit: i64,
-    step: &str,
+    hook_step: &str,
     started_at: &str,
-    owner: bool,
 ) -> Result<(Task, bool)> {
     let mut tx = crate::begin_immediate(db.pool()).await?;
     db.fence_task_lease_in_tx(&mut tx, &task.id, "failed review entry budget")
@@ -769,13 +744,16 @@ pub async fn failed_review_entry(
     if current.status != task.status {
         return Err(DbError::VersionConflict);
     }
-    let allowed = if owner {
-        true
-    } else {
-        let charged = charge(&mut tx, &task.id, Kind::Review.key(), limit, step).await?;
-        allows_retry(limit, charged.spent)
-    };
-    let barrier=(!allowed).then(||serde_json::json!({"state":task.status,"status":"blocked","started_at":started_at,"updated_at":crate::now_rfc3339(),"blocking_reason":"review retry budget exhausted"}).to_string());
+    let charged = charge(
+        &mut tx,
+        &task.id,
+        Kind::Review.key(),
+        limit,
+        &entry_charge_step(hook_step),
+    )
+    .await?;
+    let allowed = allows_retry(limit, charged.spent);
+    let barrier = (!allowed).then(|| exhausted_review_barrier(&task.status, started_at));
     sqlx::query("UPDATE task SET entry_barrier_json=?,updated_at=?,version=version+1 WHERE id=?")
         .bind(barrier)
         .bind(crate::now_rfc3339())
@@ -788,6 +766,19 @@ pub async fn failed_review_entry(
         .ok_or(DbError::NotFound)?;
     tx.commit().await?;
     Ok((updated, allowed))
+}
+
+/// The entry barrier that parks a Task whose review entry budget ran out. The
+/// reset-and-retry offers key on its `blocking_reason`.
+pub fn exhausted_review_barrier(state: &str, started_at: &str) -> String {
+    serde_json::json!({
+        "state": state,
+        "status": "blocked",
+        "started_at": started_at,
+        "updated_at": crate::now_rfc3339(),
+        "blocking_reason": "review retry budget exhausted",
+    })
+    .to_string()
 }
 
 /// A pre-upgrade verdict, or a crash between verdict persistence and disposition,
@@ -824,16 +815,7 @@ pub async fn reconcile_failed_review(db: &SqliteDb, task: &Task, review: &Review
     if current.status != task.status {
         return Err(DbError::VersionConflict);
     }
-    review_verdict(
-        &mut tx,
-        db,
-        &current,
-        review,
-        &review.status,
-        &details,
-        owner,
-    )
-    .await?;
+    review_verdict(&mut tx, &current, review, &review.status, &details, owner).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -849,11 +831,7 @@ pub async fn matches_spent(
 }
 /// Upgrade pending, typed DB effects atomically with their retained ledger.
 /// Arbitrary metadata Set values and opaque command arguments are never traversed.
-pub(crate) async fn migrate_pending_mutations(
-    tx: &mut Transaction<'_, Sqlite>,
-    pool: &sqlx::SqlitePool,
-) -> Result<()> {
-    let db = SqliteDb::new(pool.clone());
+pub(crate) async fn migrate_pending_mutations(tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
     let rows:Vec<(String,String,String)>=sqlx::query_as("SELECT id,task_id,payload_json FROM task_step WHERE kind='mutation' AND status IN ('pending','claimed','failed')").fetch_all(&mut **tx).await?;
     for (step, task_id, raw) in rows {
         let mut payload: Value =
@@ -882,21 +860,6 @@ pub(crate) async fn migrate_pending_mutations(
         };
         let original: Vec<crate::TaskMetadataMutation> =
             serde_json::from_value(mutations.clone()).map_err(|e| DbError::Check(e.to_string()))?;
-        let task = db
-            .get_task_in_tx(tx, &task_id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        let (definition, settings): (String, String) =
-            sqlx::query_as("SELECT workflow_definition,settings FROM project WHERE id=?")
-                .bind(&task.project_id)
-                .fetch_one(&mut **tx)
-                .await?;
-        let workflow = serde_json::from_str::<WorkflowDefinition>(&definition)
-            .ok()
-            .map(|w| with_project_defaults(&w, &settings));
-        let state = workflow
-            .as_ref()
-            .and_then(|w| w.states.iter().find(|s| s.name == task.status));
         let mut changed = false;
         let mut converted = Vec::new();
         for (ordinal, mutation) in original.into_iter().enumerate() {
@@ -910,14 +873,11 @@ pub(crate) async fn migrate_pending_mutations(
                     } else {
                         Kind::WorkflowGuard
                     };
+                    // The old binary admitted this increment before queuing
+                    // it and applied it unconditionally: it is not re-checked.
                     crate::TaskMetadataMutation::Budget(Mutation::Charge {
                         key: kind.key().into(),
-                        limit: i64::from(limit(
-                            &task,
-                            kind,
-                            state.map(|s| &s.config),
-                            state.and_then(|s| s.gate_config.as_ref()),
-                        )?),
+                        limit: i64::MAX,
                         step: format!("upgrade:{step}:{ordinal}"),
                     })
                 }
@@ -980,65 +940,8 @@ pub async fn cancelled_review_entry_allows_retry(
     let cap = limit(task, Kind::GateRejection, None, gate)?;
     Ok(allows_retry(
         i64::from(cap),
-        spent(db.pool(), &task.id, "gate:review").await?,
+        spent(db.pool(), &task.id, REVIEW_GATE_KEY).await?,
     ))
-}
-
-/// Raising per-state precedence must not reduce a retained Task's allowance.
-/// Normalize conflicting previously-shadowed cells to the old winning Task
-/// value, retaining the complete original configuration as immutable provenance.
-pub(crate) async fn normalize_retained_policy(tx: &mut Transaction<'_, Sqlite>) -> Result<()> {
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT id,task_state_config FROM task WHERE task_state_config IS NOT NULL")
-            .fetch_all(&mut **tx)
-            .await?;
-    for (id, raw) in rows {
-        let Ok(mut config) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        let winners = configured_winners(&config);
-        let Some(states) = config.as_object_mut() else {
-            continue;
-        };
-        let mut changed = false;
-        for (name, state) in states.iter_mut() {
-            if name == "retry_budgets" {
-                continue;
-            }
-            for (key, value) in &winners {
-                if (*key == "review" && name != "review")
-                    || (*key == "merge_fix" && !matches!(name.as_str(), "merging" | "merge_failed"))
-                {
-                    continue;
-                }
-                if configured(state, key).is_some_and(|current| current != *value) {
-                    state["retry_budgets"][*key] = Value::from(*value);
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            sqlx::query(
-                "INSERT INTO task_budget_policy_snapshot(task_id,task_state_config) VALUES(?,?)",
-            )
-            .bind(&id)
-            .bind(&raw)
-            .execute(&mut **tx)
-            .await?;
-            sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
-                .bind(config.to_string())
-                .bind(id)
-                .execute(&mut **tx)
-                .await?;
-        }
-    }
-    Ok(())
-}
-fn configured_winners(config: &Value) -> Vec<(&'static str, i32)> {
-    ["review", "merge_fix", "execution"]
-        .into_iter()
-        .filter_map(|key| configured(config, key).map(|n| (key, n)))
-        .collect()
 }
 
 #[cfg(test)]
@@ -1130,12 +1033,13 @@ mod tests {
         for state in ["review", "planning", "merging"] {
             transition(
                 &mut tx,
-                &task,
+                &task.id,
                 state,
-                "user:send_back",
+                true,
                 &api_types::TransitionBridge::new(api_types::TransitionBridgeKind::GateRejected),
                 true,
                 state,
+                None,
             )
             .await
             .unwrap();
@@ -1173,12 +1077,13 @@ mod tests {
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
         transition(
             &mut tx,
-            &task,
+            &task.id,
             "review",
-            "user:retry",
+            true,
             &api_types::TransitionBridge::recovery("retry", true),
             false,
             "reset",
+            None,
         )
         .await
         .unwrap();
@@ -1209,7 +1114,6 @@ mod tests {
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
         review_verdict(
             &mut tx,
-            &db,
             &task,
             &review,
             &ReviewStatus::Failed,
@@ -1232,7 +1136,6 @@ mod tests {
         };
         review_verdict(
             &mut tx,
-            &db,
             &task,
             &review,
             &ReviewStatus::Failed,
@@ -1249,7 +1152,6 @@ mod tests {
         sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('r1','t','e',2,'running','{}','now','now','now')").execute(&mut *tx).await.unwrap();
         review_verdict(
             &mut tx,
-            &db,
             &task,
             &review,
             &ReviewStatus::Failed,
@@ -1271,7 +1173,6 @@ mod tests {
         sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('r2','t','e',3,'running','{}','now','now','now')").execute(&mut *tx).await.unwrap();
         review_verdict(
             &mut tx,
-            &db,
             &task,
             &second,
             &ReviewStatus::Failed,
@@ -1287,13 +1188,43 @@ mod tests {
                 .unwrap();
         assert_eq!(remaining(2, second_spent), 0);
         assert!(!allows_retry(2, second_spent));
-        let episode:String=sqlx::query_scalar("SELECT window_id FROM task_budget WHERE task_id='t' AND kind='automatic_review_recovery'").fetch_one(&mut *tx).await.unwrap();
-        assert_eq!(episode, "exhaustion:r2");
         tx.commit().await.unwrap();
     }
 
     #[tokio::test]
-    async fn resolver_honors_state_then_task_then_workflow_and_gate() {
+    async fn exhausting_verdict_opens_one_recovery_episode() {
+        let (db, task) = fixture().await;
+        let key = Kind::AutomaticReviewRecovery.key();
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        let episode = "SELECT window_id,spent FROM task_budget WHERE task_id='t' AND kind='automatic_review_recovery'";
+        assert!(
+            charge(&mut tx, &task.id, key, 1, "attempt")
+                .await
+                .unwrap()
+                .charged
+        );
+        open_recovery_episode_in_tx(&mut tx, &task.id, "r2")
+            .await
+            .unwrap();
+        let opened: (String, i64) = sqlx::query_as(episode).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(opened, ("exhaustion:r2".to_owned(), 0));
+        // Re-resolving the same exhausted verdict keeps the episode's spending.
+        assert!(
+            charge(&mut tx, &task.id, key, 1, "recovery")
+                .await
+                .unwrap()
+                .charged
+        );
+        open_recovery_episode_in_tx(&mut tx, &task.id, "r2")
+            .await
+            .unwrap();
+        let kept: (String, i64) = sqlx::query_as(episode).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(kept, ("exhaustion:r2".to_owned(), 1));
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolver_honors_task_wide_then_supplied_state_config_then_gate() {
         let (_db, mut task) = fixture().await;
         let gate = api_types::GateConfig {
             reject_target: None,
@@ -1304,13 +1235,24 @@ mod tests {
             optional_when_unassigned: None,
         };
         assert_eq!(limit(&task, Kind::Review, None, Some(&gate)).unwrap(), 2);
+        // A per-state value is only seen where the step supplies its merged config.
+        task.task_state_config = Some(json!({"review":{"retry_budgets":{"review":4}}}).to_string());
+        assert_eq!(limit(&task, Kind::Review, None, Some(&gate)).unwrap(), 2);
+        let merged = json!({"retry_budgets":{"review":4}});
+        assert_eq!(
+            limit(&task, Kind::Review, Some(&merged), Some(&gate)).unwrap(),
+            4
+        );
+        // The web editor's Task-wide save wins over every per-state value.
         task.task_state_config = Some(
-            json!({"retry_budgets":{"review":5},"review":{"retry_budgets":{"review":4}}})
+            json!({"retry_budgets":{"review":1},"review":{"retry_budgets":{"review":4}}})
                 .to_string(),
         );
-        assert_eq!(limit(&task, Kind::Review, None, Some(&gate)).unwrap(), 4);
-        task.task_state_config = Some(json!({"retry_budgets":{"review":5}}).to_string());
-        assert_eq!(limit(&task, Kind::Review, None, Some(&gate)).unwrap(), 5);
+        assert_eq!(
+            limit(&task, Kind::Review, Some(&merged), Some(&gate)).unwrap(),
+            1
+        );
+        assert_eq!(limit(&task, Kind::Review, None, Some(&gate)).unwrap(), 1);
     }
 
     #[test]

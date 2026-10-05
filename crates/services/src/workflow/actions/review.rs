@@ -531,15 +531,12 @@ impl HookAction for AutoCascadeOnReviewPass {
                     }
                     return HookResult::Ok;
                 }
-                let budget = match db::budget::task_limit(
-                    &ctx.db,
+                let budget = match db::budget::limit(
                     &task,
                     db::budget::Kind::Review,
                     Some(&ctx.state_config),
                     ctx.gate_config.as_ref(),
-                )
-                .await
-                {
+                ) {
                     Ok(budget) => budget,
                     Err(error) => {
                         return HookResult::Failed {

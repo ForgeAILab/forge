@@ -687,14 +687,12 @@ impl TaskService {
             .states
             .iter()
             .find(|state| state.name == default_states::REVIEW);
-        let max_retries = db::budget::task_limit(
-            &self.db,
+        let max_retries = db::budget::limit(
             &task,
             db::budget::Kind::Review,
             review_state.map(|state| &state.config),
             review_state.and_then(|state| state.gate_config.as_ref()),
-        )
-        .await?;
+        )?;
 
         let used =
             db::budget::spent(self.db.pool(), task_id, db::budget::Kind::Review.key()).await?;

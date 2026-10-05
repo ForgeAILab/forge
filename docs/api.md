@@ -5121,7 +5121,10 @@ JSON output passes these through. The web displays remaining budgets and uses
 server-resolved limits in its editor, rather than reconstructing defaults.
 
 Gate state names remain keys (`planning`, `review`, `merging`, custom gate names).
-The cancelled-review entry cap is exposed as `review_gate`.
+The cancelled-review entry cap is exposed as `review_gate`. The web's
+"Remaining budget" panel shows only kinds with an active limit for the Task: it
+omits `report_correction`, `review_gate`, and `automatic_review_recovery` while
+recovery is disabled.
 Additional kind keys are `merge_fix`, `execution`, `workflow_guard`,
 `target_moved_rebase`, `conflict_handoff`, `review_carry`,
 `automatic_review_recovery`, `review_ci_infrastructure`, and `report_correction`.
@@ -5132,8 +5135,11 @@ a new invocation; its live counter is volatile and is not Task-level spending.
 Every resolved value comes from `db::budget`. Remaining is saturated at zero;
 a standard review reports 2 initially, 1 after its first failed verdict, and 0
 at its second failure, retaining one automatic routed bounce. Owner retry and
-send-back actions do not reduce these values. Review-CI failures honor the same
-Task overrides as reviewer failures. Execution failure retries survive status
+send-back actions do not reduce these values; MCP `forge_task_action` cannot be
+told apart from an agent and spends like one. A review entry hook that fails
+with no failed Review honors the same Task overrides as reviewer failures.
+Task-wide `retry_budgets` (what the web editor writes) win over per-state
+values. Execution failure retries survive status
 changes until an explicit budget reset. Other kinds retain their natural
 contract/completion/interruption/exhaustion windows; reset additionally restores
 all persisted kinds. There is no lifetime execution maximum.

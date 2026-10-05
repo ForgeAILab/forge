@@ -502,6 +502,20 @@ impl SqliteDb {
             .map(map_task)
             .transpose()
     }
+
+    /// Reads a page of Tasks (soft-deleted included) in one query.
+    pub async fn get_tasks_by_ids(&self, ids: &[&str]) -> Result<Vec<Task>> {
+        let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
+        sqlx::query(&format!(
+            "SELECT {TASK_COLUMNS} FROM task WHERE id IN (SELECT value FROM json_each(?))"
+        ))
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_task)
+        .collect()
+    }
 }
 
 fn map_task(row: SqliteRow) -> Result<Task> {

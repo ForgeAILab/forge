@@ -2570,6 +2570,17 @@ async fn system_review_ci_failure_routes_to_coder_and_spends_review_budget() {
             crate::task_diagnostics::audit_gate_rejections_since_boundary(&entries, "review"),
             1
         );
+        assert_eq!(
+            db::budget::spent(
+                fixture.db.pool(),
+                &fixture.task.id,
+                db::budget::Kind::Review.key()
+            )
+            .await
+            .unwrap(),
+            1,
+            "the failed CI verdict spends one Review attempt"
+        );
         assert!(
             std::path::Path::new(&fixture.workspace.embedded_worktree_path_for_backend()).exists()
         );
@@ -4918,4 +4929,370 @@ async fn failure_memory_records_failed_hook_and_dispatch_rollback_from_typed_evi
         .as_deref()
         .is_some_and(|annotation| annotation.contains("dispatch_failed")));
     assert_eq!(transition_memory_count(&db, &rollback.id).await, 1);
+}
+
+// A review entry hook that fails with no failed Review is charged once per
+// entry: the gate cap `max_rejections` allows `max - 1` bounces, then parks.
+async fn entry_failure_outcomes(
+    max_rejections: i32,
+    review_override: Option<i32>,
+    actor: api_types::Actor,
+) -> Vec<String> {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(64));
+    let task_id = new_uuid_v4();
+    let mut workflow =
+        user_approval_review_workflow(hook("run_ci_steps", FailurePolicy::Block), Vec::new());
+    workflow
+        .states
+        .iter_mut()
+        .find(|s| s.name == "review")
+        .unwrap()
+        .gate_config
+        .as_mut()
+        .unwrap()
+        .max_rejections = Some(max_rejections);
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+    let mut task_config = serde_json::json!({"review":{"ci_steps":"not-an-array"}});
+    if let Some(review) = review_override {
+        task_config["retry_budgets"] = serde_json::json!({ "review": review });
+    }
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(task_config.to_string())
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut outcomes = Vec::new();
+    for _ in 0..(review_override.unwrap_or(max_rejections) + 1) {
+        let task = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        if task.status != "working" {
+            break;
+        }
+        let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+            .workflow_execution()
+            .transition(
+                &task_id,
+                "review",
+                task.version,
+                &workflow,
+                &actor,
+                "submit for validation",
+                false,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let result = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
+        let blocked = result
+            .task
+            .entry_barrier_json
+            .as_deref()
+            .is_some_and(|b| b.contains("review retry budget exhausted"));
+        // One failed entry, one Review charge: the bounce cascade shares it.
+        assert_eq!(
+            db::budget::spent(db.pool(), &task_id, db::budget::Kind::Review.key())
+                .await
+                .unwrap(),
+            outcomes.len() as i64 + 1,
+            "max_rejections={max_rejections}"
+        );
+        outcomes.push(if result.task.status == "working" {
+            "bounce".to_owned()
+        } else if blocked {
+            "block".to_owned()
+        } else {
+            format!("other:{}", result.task.status)
+        });
+    }
+    outcomes
+}
+
+#[tokio::test]
+async fn review_entry_failure_without_failed_review_bounces_max_minus_one() {
+    for max in [2, 3, 4] {
+        let outcomes = entry_failure_outcomes(
+            max,
+            None,
+            api_types::Actor::system(api_types::SystemComponent::Workflow),
+        )
+        .await;
+        let mut expected = vec!["bounce".to_owned(); (max - 1) as usize];
+        expected.push("block".to_owned());
+        assert_eq!(outcomes, expected, "max_rejections={max}");
+    }
+}
+
+// Allowed change 1: the same entry failure honours the Task's review override
+// over the gate cap (base parked on the second failure here).
+#[tokio::test]
+async fn review_entry_failure_without_failed_review_honors_task_override() {
+    let outcomes = entry_failure_outcomes(
+        2,
+        Some(5),
+        api_types::Actor::system(api_types::SystemComponent::Workflow),
+    )
+    .await;
+    assert_eq!(outcomes, ["bounce", "bounce", "bounce", "bounce", "block"]);
+}
+
+// A new review entry starts a new CI-infrastructure interruption episode.
+#[tokio::test]
+async fn review_ci_infrastructure_second_entry_gets_full_allowance() {
+    use crate::workspace_backend as ws;
+    struct ReviewCiFault {
+        db: Arc<db::SqliteDb>,
+        task_id: String,
+        authority_loss: bool,
+    }
+    #[async_trait::async_trait]
+    impl ws::WorkspaceBackend for ReviewCiFault {
+        async fn prepare(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::PrepareSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
+            unreachable!()
+        }
+        async fn run(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::RunSpec,
+        ) -> ws::Result<ws::RunResult> {
+            if self.authority_loss {
+                sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+                    .bind(&self.task_id)
+                    .execute(self.db.pool())
+                    .await
+                    .unwrap();
+                Ok(ws::RunResult {
+                    exit_code: 0,
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    duration_ms: 1,
+                })
+            } else {
+                sqlx::query("UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.concurrent_ci_note', 'retained') WHERE id = ?")
+                    .bind(&self.task_id).execute(self.db.pool()).await.unwrap();
+                Err(ws::WorkspaceBackendError::OwnerUnreachable {
+                    daemon_id: "review-owner".into(),
+                })
+            }
+        }
+
+        async fn diff(&self, _: &db::WorkspacePlacement, _: &ws::DiffSpec) -> ws::Result<ws::Diff> {
+            unreachable!()
+        }
+        async fn read(&self, _: &db::WorkspacePlacement, _: &str, _: u64) -> ws::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn merge(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::MergeSpec,
+        ) -> ws::Result<ws::MergeOutcome> {
+            unreachable!()
+        }
+        async fn reset(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::ResetSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        async fn cleanup(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::CleanupAck> {
+            unreachable!()
+        }
+        async fn harvest_outbox(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &str,
+        ) -> ws::Result<ws::OutboxHarvest> {
+            unreachable!()
+        }
+        async fn consume_outbox(&self, _: &db::WorkspacePlacement, _: &str) -> ws::Result<()> {
+            unreachable!()
+        }
+    }
+
+    let mut fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    fixture.engine.workspace_backend_router =
+        Arc::new(ws::WorkspaceBackendRouter::new(Arc::new(ReviewCiFault {
+            db: fixture.db.clone(),
+            task_id: fixture.task.id.clone(),
+            authority_loss: false,
+        })));
+    let system = api_types::Actor::system(api_types::SystemComponent::Workflow);
+    let dispatcher = api_types::Actor::system(api_types::SystemComponent::TaskDispatcher);
+    // Episode 1: two connected infrastructure failures, then the Task leaves review.
+    let mut result = fixture
+        .engine
+        .workflow_execution()
+        .transition_with_authority(
+            &fixture.task.id,
+            "review",
+            fixture.task.version,
+            &fixture.workflow,
+            &system,
+            "worker completed",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    result = drain_result(fixture.engine.clone(), result).await;
+    result = fixture
+        .engine
+        .workflow_execution()
+        .retry_entry_barrier_with_authority(
+            &fixture.task.id,
+            result.task.version,
+            &fixture.workflow,
+            &dispatcher,
+            "retry owner",
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    result = drain_result(fixture.engine.clone(), result).await;
+    assert!(result.task.blocked_json.is_none());
+    // Owner moves the Task back to work; the engine's status update drops the barrier.
+    let owner = api_types::Actor::user(api_types::UserActionSource::Board).into_override();
+    result = fixture
+        .engine
+        .workflow_execution()
+        .transition_with_authority(
+            &fixture.task.id,
+            "in_progress",
+            result.task.version,
+            &fixture.workflow,
+            &owner,
+            "owner moves back",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    result = drain_result(fixture.engine.clone(), result).await;
+    assert_eq!(result.task.status, "in_progress");
+    sqlx::query("UPDATE task SET blocked_json = NULL, error_annotation = NULL, metadata_json = '{}' WHERE id = ?")
+        .bind(&fixture.task.id).execute(fixture.db.pool()).await.unwrap();
+    // Episode 2: a fresh review entry; count connected failures until the park.
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    result = fixture
+        .engine
+        .workflow_execution()
+        .transition_with_authority(
+            &fixture.task.id,
+            "review",
+            task.version,
+            &fixture.workflow,
+            &system,
+            "worker completed again",
+            false,
+            fixture.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    result = drain_result(fixture.engine.clone(), result).await;
+    let mut failures = 1;
+    while result.task.blocked_json.is_none() && failures < 10 {
+        result = fixture
+            .engine
+            .workflow_execution()
+            .retry_entry_barrier_with_authority(
+                &fixture.task.id,
+                result.task.version,
+                &fixture.workflow,
+                &dispatcher,
+                "retry owner",
+                fixture.workflow_authority().await,
+            )
+            .await
+            .unwrap();
+        result = drain_result(fixture.engine.clone(), result).await;
+        failures += 1;
+    }
+    assert_eq!(
+        failures, 5,
+        "a new review entry gets the full five-failure allowance"
+    );
+}
+
+// Exhausting the cancelled-review entry cap (max_rejections - 1) parks the Task.
+#[tokio::test]
+async fn cancelled_review_entry_cap_exhaustion_parks() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(64));
+    let task_id = new_uuid_v4();
+    let mut workflow =
+        user_approval_review_workflow(hook("run_ci_steps", FailurePolicy::Block), Vec::new());
+    workflow
+        .states
+        .iter_mut()
+        .find(|s| s.name == "review")
+        .unwrap()
+        .gate_config
+        .as_mut()
+        .unwrap()
+        .max_rejections = Some(3);
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(r#"{"review":{"ci_steps":"not-an-array"}}"#)
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('audit-e',?,'coder','completed',?,?)")
+        .bind(&task_id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('audit-r',?,'audit-e',1,'cancelled','{}',?,?,?)")
+        .bind(&task_id).bind(&now).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    let actor = api_types::Actor::system(api_types::SystemComponent::Workflow);
+    let mut outcomes = Vec::new();
+    for _ in 0..4 {
+        let task = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        if task.status != "working" {
+            break;
+        }
+        let result = engine(Arc::clone(&db), Arc::clone(&event_bus))
+            .workflow_execution()
+            .transition(
+                &task_id,
+                "review",
+                task.version,
+                &workflow,
+                &actor,
+                "submit",
+                false,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let result = drain_result(engine(Arc::clone(&db), Arc::clone(&event_bus)), result).await;
+        let barrier = result.task.entry_barrier_json.clone().unwrap_or_default();
+        outcomes.push(if result.task.status == "working" {
+            "bounce".to_owned()
+        } else if barrier.contains("review retry budget exhausted") {
+            "block".to_owned()
+        } else {
+            format!(
+                "other:{}:barrier={}:blocked={:?}:annotation={:?}",
+                result.task.status, barrier, result.task.blocked_json, result.task.error_annotation
+            )
+        });
+    }
+    assert_eq!(outcomes, vec!["bounce", "bounce", "block"]);
 }

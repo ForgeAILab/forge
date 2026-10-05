@@ -716,13 +716,19 @@ impl OperatorStatusService {
     }
 
     async fn retry_pressure(&self) -> Result<Vec<RetryPressureSummary>, ServiceError> {
+        // `attempt_count` counts transition rejections, as it always has; the
+        // Execution spend comes from the budget ledger. Both are page queries.
         let rows = sqlx::query(
             "SELECT
                 t.id AS task_id,
                 t.title,
                 t.status,
                 t.metadata_json,
-                COALESCE(SUM(b.spent),0) AS attempt_count,
+                COUNT(tl.id) AS attempt_count,
+                COALESCE((
+                    SELECT b.spent FROM task_budget b
+                    WHERE b.task_id = t.id AND b.kind = 'execution'
+                ), 0) AS execution_spent,
                 (
                     SELECT e.error
                     FROM execution e
@@ -731,15 +737,50 @@ impl OperatorStatusService {
                     LIMIT 1
                 ) AS last_error
              FROM task t
-             LEFT JOIN task_budget b ON b.task_id = t.id
+             LEFT JOIN transition_log tl ON tl.task_id = t.id AND tl.rejection = 1
              WHERE t.deleted_at IS NULL
                AND t.status NOT IN ('done', 'cancelled')
              GROUP BY t.id, t.title, t.status, t.metadata_json
-             HAVING COALESCE(SUM(b.spent),0) >= 1 OR t.metadata_json IS NOT NULL
+             HAVING COUNT(tl.id) >= 1 OR t.metadata_json IS NOT NULL OR execution_spent > 0
              ORDER BY attempt_count DESC, t.updated_at DESC, t.id ASC",
         )
         .fetch_all(self.db.pool())
         .await?;
+
+        let retried = rows
+            .iter()
+            .filter(|row| row.try_get::<i64, _>("execution_spent").unwrap_or(0) > 0)
+            .map(|row| row.try_get::<String, _>("task_id"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let retried = self
+            .db
+            .get_tasks_by_ids(&retried.iter().map(String::as_str).collect::<Vec<_>>())
+            .await?;
+        let mut workflows = std::collections::HashMap::<String, String>::new();
+        let mut execution_limits = std::collections::HashMap::<String, i32>::new();
+        for task in &retried {
+            if !workflows.contains_key(&task.project_id) {
+                let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                workflows.insert(task.project_id.clone(), project.workflow_definition);
+            }
+            let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+                task,
+                &workflows[&task.project_id],
+                &api_types::Actor::system(api_types::SystemComponent::General),
+            );
+            let state = workflow.states.iter().find(|s| s.name == task.status);
+            execution_limits.insert(
+                task.id.clone(),
+                db::budget::limit(
+                    task,
+                    db::budget::Kind::Execution,
+                    state.map(|s| &s.config),
+                    state.and_then(|s| s.gate_config.as_ref()),
+                )?,
+            );
+        }
 
         let mut pressure = Vec::new();
         for row in rows {
@@ -750,29 +791,7 @@ impl OperatorStatusService {
                 .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
                 .unwrap_or(Value::Null);
             let task_id: String = row.try_get("task_id")?;
-            let execution_retry_count =
-                db::budget::spent(self.db.pool(), &task_id, db::budget::Kind::Execution.key())
-                    .await? as u32;
-            let task = db::TaskRepo::get_by_id(&*self.db, &task_id, false)
-                .await?
-                .ok_or(db::DbError::NotFound)?;
-            let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
-                .await?
-                .ok_or(db::DbError::NotFound)?;
-            let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
-                &task,
-                &project.workflow_definition,
-                &api_types::Actor::system(api_types::SystemComponent::General),
-            );
-            let state = workflow.states.iter().find(|s| s.name == task.status);
-            let maximum = db::budget::task_limit(
-                &self.db,
-                &task,
-                db::budget::Kind::Execution,
-                state.map(|s| &s.config),
-                state.and_then(|s| s.gate_config.as_ref()),
-            )
-            .await?;
+            let execution_retry_count = row.try_get::<i64, _>("execution_spent")?.max(0) as u32;
             let deferred = metadata.get("deferred_dispatch").and_then(Value::as_object);
             let retry_reason = deferred
                 .and_then(|value| value.get("reason"))
@@ -791,10 +810,12 @@ impl OperatorStatusService {
                 continue;
             }
             pressure.push(RetryPressureSummary {
-                task_id: row.try_get("task_id")?,
+                max_attempts: execution_limits
+                    .get(&task_id)
+                    .map(|limit| (*limit).max(0) as u32),
+                task_id,
                 title: row.try_get("title")?,
                 attempt_count,
-                max_attempts: (execution_retry_count > 0).then_some(maximum as u32),
                 current_state: row.try_get("status")?,
                 retry_reason,
                 due_time,
@@ -1622,9 +1643,6 @@ mod tests {
         insert_rejected_transition(&db, &done_task_id).await;
         insert_rejected_transition(&db, &active_task_id).await;
 
-        for id in [&done_task_id, &active_task_id] {
-            sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review','fixture',1)").bind(id).execute(db.pool()).await.unwrap();
-        }
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.retry_pressure.len(), 1);

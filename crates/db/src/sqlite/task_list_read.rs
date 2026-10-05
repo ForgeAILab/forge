@@ -121,7 +121,7 @@ mod tests {
             transition_log_id: new_uuid_v4(),
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
-            triggered_by: "user:board_drag".to_owned(),
+            triggered_by: api_types::Actor::user(api_types::UserActionSource::BoardDrag),
             bridge: Default::default(),
             trigger_reason: "board reorder".to_owned(),
             rejection: false,

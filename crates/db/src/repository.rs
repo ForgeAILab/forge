@@ -1814,6 +1814,9 @@ pub trait ScopedMemoryRepository: Send + Sync {
 pub enum ReviewEventOrigin {
     Runner,
     User,
+    /// A human decision made through a credential an agent may also hold
+    /// (MCP). Audited as the user's, charged like the runner's.
+    DelegatedUser,
     Executor,
 }
 
@@ -1821,7 +1824,20 @@ impl ReviewEventOrigin {
     pub(crate) fn actor_type(self) -> &'static str {
         match self {
             Self::Runner | Self::Executor => "review_runner",
-            Self::User => "user",
+            Self::User | Self::DelegatedUser => "user",
+        }
+    }
+    /// The owner's decision, or a reviewer execution that failed before giving
+    /// a verdict, spends no Review budget.
+    pub(crate) fn spends_no_budget(self) -> bool {
+        matches!(self, Self::User | Self::Executor)
+    }
+    /// The origin of a human decision made by `actor`.
+    pub fn for_human(actor: &api_types::Actor) -> Self {
+        if actor.is_owner() {
+            Self::User
+        } else {
+            Self::DelegatedUser
         }
     }
 }
