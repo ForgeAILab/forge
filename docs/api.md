@@ -1258,14 +1258,24 @@ reset hints (`resets_at`) are milliseconds (delay and Unix timestamp,
 respectively). Historical jobs retain their original codes/messages and have
 null typed evidence; message text is never used to infer a class.
 
-Provider schema rejection, authentication, usage exhaustion, non-retryable provider rejection, configuration, authority, and context overflow
+Provider schema rejection, authentication, non-retryable provider rejection, configuration, authority, and context overflow
 fail immediately. Overflow cannot force session compaction through the current
 host. Postcondition failures use the ordinary attempt budget with the existing
 corrective overlay. Transient and retryable provider rejection use the ordinary three-attempt budget and a provider delay
 hint when present. Empty response, turn limits, and unclassified failures retain
 that budget. Ordinary retries wait at least `5 seconds × 2^(attempt_count - 1)`,
 capped at five minutes. A provider delay hint can lengthen that wait, up to six
-hours, but cannot shorten the exponential-backoff floor. Usage exhaustion fails immediately with `usage_limit`; a reset hint does not schedule another invocation. Chat provider health uses typed failure evidence; message parsing remains only for Task and connection-test paths without typed evidence. Pre-provider
+hours, but cannot shorten the exponential-backoff floor. Usage exhaustion on an
+autonomous wake turn fails immediately with `usage_limit` (the wake sweep owns
+re-admission). A user-authored turn defers without charging the attempt: reset
+hints have a floor of 1, 5, 15, 30, then 60 minutes, counted separately from
+attempts, and a six-hour ceiling per wait. Missing or past reset hints use a
+fifteen-minute cooldown raised to that floor. It fails with `usage_limit` on its
+24th deferral or after 24 hours from its first deferral; each scheduled time is
+capped at that deadline. Chat provider health uses typed failure evidence;
+message parsing remains only for Task and connection-test paths without typed
+evidence. A lease expiry refunds the attempt at most three times per turn; later
+expiries are charged like an unclassified failure. Pre-provider
 admission failures also refund the attempt, back off, and stop at three admission failures. Invocation identities advance
 independently of the charged budget, preserving usage accounting on resumption.
 
@@ -1290,8 +1300,9 @@ be retried while it remains eligible.
 Configuration changes never trigger automatic retry. The request body is a
 breaking change from the previous bodyless endpoint.
 
-Only configuration, authority and non-retryable provider rejection raise a typed
-Attention incident. Manual retry and supersession resolve it through the
+Only configuration, authority, provider schema/auth rejection, usage
+exhaustion and non-retryable provider rejection raise a typed Attention
+incident. Manual retry and supersession resolve it through the
 Attention resolver, clearing snoozes. During usage-limit deferral Chat displays
 the reason and resume time. The deferred turn still occupies the single live-turn
 slot, so the composer remains disabled until it resumes, finishes, or is cancelled.
@@ -5017,20 +5028,40 @@ Project doctrine @19 names `forge_scope_read` operation `work.read` for live Tas
 The Project Agent may invoke native `project.escalate` with `{need, task_ids}`
 through the Project orchestration proposal tool. The descriptor has 17 words.
 MCP exposes `forge_project_escalate` with the same payload plus `dedupe_key`;
-its Project comes from the authenticated MCP scope, and its identity comes
-from that owned Project's active binding. Neither transport accepts another
-Project or identity in the payload. Every referenced Task must belong to that
-Project. A replay returns the original owner Notification and Attention item.
+its Project comes from the authenticated MCP scope and its caller must be the
+Project owner. The escalation event records the caller's real authority: the
+native tool records the bound Agent (`actor_type=agent`), MCP records the owner
+(`actor_type=user`). Neither transport accepts another Project or identity in
+the payload. Every referenced Task must belong to that Project. A replay returns
+the original owner Notification and Attention item.
 
+`GET /api/v1/projects/{project_id}/escalations` lists escalations oldest first
+as `ProjectEscalationListResponse` (`items`, `next_cursor`, `has_more`). Query
+`ListProjectEscalationsQuery`: `status` (`open` or `answered`; omitted lists
+both), opaque `cursor`, and `limit` (default 50, at most 100). An unknown status
+or malformed cursor returns 400.
 `GET /api/v1/projects/{project_id}/escalations/{id}` returns
-`ProjectEscalationResponse` to the Project owner. The response includes `need`,
-`task_ids`, `attention_id`, `notification_id`, `status`, `answer`, and `version`.
+`ProjectEscalationResponse`. The response includes `need`, `task_ids`,
+`attention_id`, `notification_id`, `status`, `answer`, and `version`.
 `POST /api/v1/projects/{project_id}/escalations/{id}/answer` accepts
-`AnswerProjectEscalationRequest` (`expected_version`, `answer`). Only the owner
-may answer; a stale version or second answer returns 409. Answering atomically
-resolves the owner Attention item and records `project.escalation.answered`;
-Attention admits the owning Agent's continuation from that answer, with its
-affected Tasks, using the decision budget.
+`AnswerProjectEscalationRequest` (`expected_version`, `answer`). All three are
+owner-only: another Project member gets 403 `authorization.invalid`; anyone
+else, and a missing Project or escalation, gets 404. A stale version or second
+answer returns 409. Answering atomically resolves the owner Attention item and
+records `project.escalation.answered`; Attention admits the owning Agent's
+continuation from that answer, with its affected Tasks. The continuation is
+owner-initiated and never charged to the autonomy budget.
+
+Resolving an escalation's Attention item (`recommended_action=answer_escalation`)
+through `POST /api/v1/mission-control/attention/{id}/resolve` is an owner answer
+with the text "Resolved by the owner.": it closes the escalation and wakes the
+Agent. A non-owner gets 403/404 as above. Mission Control shows the escalation
+need and an Answer box on that item; `forge-ctl project escalations list|answer`
+wraps the same endpoints.
+
+An escalation's `need` is human-readable: the Agent's own text, or for an
+automatic blocker escalation one bounded line per blocker with its summary and
+key details (Task title and status, role, failure kind, reason).
 
 Autonomous wakes are admitted by Attention: the audit event, disposition,
 message, queued turn and budget charge commit together. `agent.wake.*` events
@@ -5045,15 +5076,27 @@ policy reasons (`duplicate_incident`, `cooldown`, `budget_exhausted`,
 resource.
 
 The default 10/h autonomous budget has independent buckets: blocker 4/h,
-delivery 4/h, decision 2/h. Suppressed or unconfigured incidents spend nothing.
+delivery 4/h, decision 2/h. A `wake_budget` of 5 or more splits 40/40/20 with at
+least one wake per bucket; 1–4 is one shared pool, served blocker, then
+decision, then delivery. Owner escalation answers are never charged.
+Suppressed or unconfigured incidents spend nothing.
 A five-minute Project blocker window admits one combined wake for all open,
-eligible blocker digests. After one admitted turn for an unchanged digest,
-Forge escalates to the owner once rather than waking it again. The supervised
-60-second sweep revisits open blockers suppressed by budget, cooldown or
-incident dedupe when the limits allow admission.
+eligible blocker digests. Only a completed turn consumes a digest: after one
+for an unchanged digest Forge escalates to the owner once rather than waking it
+again, unless that turn recorded a recovery action and the blocker has not
+recurred. No member of a pending batch turn is woken or charged again. A digest
+change, a reopen, or an owner answer re-arms the blocker. Infrastructure turn
+failures are re-admitted after the cooldown; deterministic provider failures
+are never escalated, raise one "Project Agent can't run" notice, and wait for a
+Profile change or the usage reset. The supervised 60-second sweep also revisits
+decisions suppressed by their bucket, cooldown or a duplicate. Blockers imported
+from before the upgrade get one normal, batched re-admission per Project.
 
-Provider schema rejection, authentication failure and exhausted provider usage
-fail on attempt one with typed `TurnFailure` kinds/codes `provider_schema`,
-`provider_auth`, and `usage_limit`. Retryable rate limiting remains transient.
-Restart lease expiry refunds the claim's attempt while preserving invocation
-accounting and frozen admission provenance.
+Provider schema rejection and authentication failure fail on attempt one with
+typed `TurnFailure` kinds/codes `provider_schema` and `provider_auth`; a
+provider rejection marked retryable stays `provider_rejected` and retries.
+Exhausted provider usage (`usage_limit`) fails on attempt one for autonomous
+wake turns; user-authored turns defer until the window resets. Retryable rate
+limiting remains transient. A lease expiry refunds the claim's attempt at most
+three times per turn while preserving invocation accounting and frozen
+admission provenance.

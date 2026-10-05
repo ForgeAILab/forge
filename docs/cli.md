@@ -271,6 +271,21 @@ The update uses the current Project version; a concurrent edit returns 409.
 Project settings also accept `placement.provision = when_verified` (default)
 or `never`, editable in the web Environment settings.
 
+### Project owner escalations
+
+```bash
+forge-ctl project escalations list <PROJECT_ID>
+forge-ctl project escalations list <PROJECT_ID> --status open
+forge-ctl project escalations answer <PROJECT_ID> <ESCALATION_ID> --answer "Token added to the vault"
+```
+
+`list` reads `GET /api/v1/projects/{id}/escalations` (first page, oldest
+first); table output shows each escalation's id, status, version, need, and
+answer. `answer` reads the escalation's current version and posts the answer;
+it wakes the Project Agent without spending its wake budget. Both are
+owner-only: another Project member gets 403 and anyone else 404. A stale or
+second answer returns 409.
+
 ### Project environment readiness and re-check
 
 ```bash

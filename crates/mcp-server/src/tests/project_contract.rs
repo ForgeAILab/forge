@@ -452,4 +452,16 @@ async fn project_escalate_mcp_is_scoped_owner_authenticated_and_idempotent() {
     .await
     .unwrap();
     assert_eq!(count, 1);
+    // n3: the escalation records the authenticated owner, not the Agent.
+    let (actor_type, actor_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT actor_type, actor_id FROM domain_event WHERE event_type='project.escalated' AND entity_id=?",
+    )
+    .bind(first["id"].as_str().unwrap())
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (actor_type.as_str(), actor_id.as_deref()),
+        ("user", Some("chat-user"))
+    );
 }

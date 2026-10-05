@@ -963,6 +963,13 @@ pub fn canonical_attention_incident_digest(attention: &AttentionProjection) -> S
                 }
             }
             strip_delivery_metadata(&mut value);
+            // A renamed Task or a changed action offer is not a new blocker.
+            if let Some(task) = value.get_mut("task").and_then(|v| v.as_object_mut()) {
+                task.remove("task_title");
+            }
+            if let Some(recovery) = value.get_mut("recovery").and_then(|v| v.as_object_mut()) {
+                recovery.remove("actions");
+            }
             value.to_string()
         })
         .unwrap_or(bounded_details);

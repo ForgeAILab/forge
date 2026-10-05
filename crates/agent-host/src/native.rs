@@ -1708,6 +1708,14 @@ pub(crate) fn provider_turn_failure(
     use agent_runtime::core::provider::ProviderErrorKind;
     use api_types::TurnFailure;
     match error.kind {
+        // A provider can mark a rejection retryable (e.g. a transient 4xx);
+        // only a non-retryable rejection is a deterministic schema failure.
+        ProviderErrorKind::BadRequest | ProviderErrorKind::Unsupported if error.retryable => {
+            TurnFailure::ProviderRejected {
+                retryable: true,
+                retry_after: error.retry_after_ms,
+            }
+        }
         ProviderErrorKind::BadRequest | ProviderErrorKind::Unsupported => {
             TurnFailure::ProviderSchema
         }
@@ -1743,7 +1751,14 @@ fn runtime_turn_failure(error: &RuntimeError) -> api_types::TurnFailure {
         FailureClass::RequestRejected {
             stage: FailureStage::Provider,
         } => {
-            return TurnFailure::ProviderSchema;
+            return if error.retryable {
+                TurnFailure::ProviderRejected {
+                    retryable: true,
+                    retry_after: error.retry_after_ms,
+                }
+            } else {
+                TurnFailure::ProviderSchema
+            };
         }
         FailureClass::TurnLimit { limit, .. } => {
             return AgentHostError::TurnLimitReached {
@@ -1938,7 +1953,10 @@ mod turn_failure_tests {
             ),
             (
                 ProviderError::new(ProviderErrorKind::BadRequest, "rejected").retry_after(1200),
-                TurnFailure::ProviderSchema,
+                TurnFailure::ProviderRejected {
+                    retryable: true,
+                    retry_after: Some(1200),
+                },
             ),
             (
                 ProviderError::new(ProviderErrorKind::LimitExhausted, "x").limit_resets_at(12345),

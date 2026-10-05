@@ -627,10 +627,24 @@ pub(super) async fn task_action(
         .ok_or_else(|| invalid_field_error("task_id", "required", None))?;
     let request: api_types::TaskActionRequest =
         parse_params(json!({ "action": params.get("action"), "version": params.get("version") }))?;
+    let unblocking = services::project_escalation::is_unblocking_verb(request.action.verb());
     let result = state
         .task_service
         .perform_task_action_as(task_id, request.action, request.version, actor.clone())
         .await?;
+    if unblocking {
+        // An MCP Project Agent's recovery during its blocker turn is an outcome.
+        if let Some(identity) =
+            ProjectAgentBindingRepo::get_active_project_binding(&*state.db, &result.task.project_id)
+                .await?
+                .filter(|b| b.state == "active")
+                .and_then(|b| b.identity_id)
+        {
+            services::project_escalation::ProjectEscalationService::new(state.db.clone())
+                .record_unblocking_action(&result.task.project_id, &identity, &result.task.id)
+                .await?;
+        }
+    }
     let snapshot = state
         .task_service
         .task_action_snapshot(&result.task.id, &actor)
@@ -2026,13 +2040,6 @@ pub(super) async fn forge_project_escalate(
             "Project owner authentication is required",
         ));
     }
-    let binding = ProjectAgentBindingRepo::get_active_project_binding(&*state.db, project_id)
-        .await?
-        .filter(|b| b.state == "active")
-        .ok_or_else(|| setup_required("Project Agent setup is required"))?;
-    let identity = binding
-        .identity_id
-        .ok_or_else(|| setup_required("Project Agent setup is required"))?;
     let mut payload = params;
     let key = payload
         .get("dedupe_key")
@@ -2046,7 +2053,12 @@ pub(super) async fn forge_project_escalate(
     let request: api_types::ProjectEscalateRequest = parse_params(payload)?;
     Ok(serialize_public(
         services::project_escalation::ProjectEscalationService::new(state.db.clone())
-            .escalate(project_id, &identity, request, &key)
+            .escalate(
+                project_id,
+                services::project_escalation::EscalationAuthority::Owner(user_id),
+                request,
+                &key,
+            )
             .await?,
     ))
 }

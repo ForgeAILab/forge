@@ -2,16 +2,40 @@
 ALTER TABLE agent_wake_budget_window RENAME TO previous_agent_wake_budget_window;
 CREATE TABLE agent_wake_budget_window (
     identity_id TEXT REFERENCES agent_identity(id) ON DELETE SET NULL,
-    scope_type TEXT NOT NULL, scope_id TEXT NOT NULL,
+    scope_type TEXT NOT NULL CHECK (scope_type IN ('account', 'project', 'room', 'task', 'agent_chat')),
+    scope_id TEXT NOT NULL,
     category TEXT NOT NULL CHECK(category IN ('blocker','delivery','decision')),
-    window_started_at TEXT NOT NULL, window_seconds INTEGER NOT NULL DEFAULT 3600,
+    window_started_at TEXT NOT NULL, window_seconds INTEGER NOT NULL DEFAULT 3600 CHECK (window_seconds > 0),
     admitted_count INTEGER NOT NULL DEFAULT 0 CHECK(admitted_count >= 0),
     version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL,
     PRIMARY KEY(scope_type, scope_id, category)
 );
-INSERT INTO agent_wake_budget_window SELECT MIN(identity_id),scope_type,scope_id,'delivery',MAX(window_started_at),MAX(window_seconds),SUM(admitted_count),MAX(version),MAX(updated_at) FROM previous_agent_wake_budget_window GROUP BY scope_type,scope_id;
+-- Only charges still inside their hour survive. Several identity rows for one
+-- scope collapse into one row that starts at the oldest live window, so no
+-- charge outlives its own hour (never moved into a newer window).
+INSERT INTO agent_wake_budget_window
+SELECT MIN(identity_id),scope_type,scope_id,'delivery',MIN(window_started_at),3600,SUM(admitted_count),MAX(version),MAX(updated_at)
+FROM previous_agent_wake_budget_window
+WHERE julianday(window_started_at) > julianday('now','-1 hour')
+GROUP BY scope_type,scope_id;
 DROP TABLE previous_agent_wake_budget_window;
 CREATE INDEX idx_agent_wake_budget_window_updated ON agent_wake_budget_window(updated_at);
+CREATE TRIGGER agent_wake_budget_window_reject_legacy_room_insert
+BEFORE INSERT ON agent_wake_budget_window
+WHEN NEW.scope_type = 'room'
+BEGIN
+    SELECT RAISE(ABORT, 'Room scopes are retired; use an Agent Chat scope');
+END;
+CREATE TRIGGER agent_wake_budget_window_reject_legacy_room_update
+BEFORE UPDATE OF scope_type, scope_id ON agent_wake_budget_window
+WHEN NEW.scope_type = 'room'
+BEGIN
+    SELECT RAISE(ABORT, 'Room scopes are retired; use an Agent Chat scope');
+END;
+
+-- Lease expiries refund at most three attempts per turn; later expiries count.
+ALTER TABLE agent_chat_turn_job ADD COLUMN lease_refund_count INTEGER NOT NULL DEFAULT 0
+    CHECK (lease_refund_count >= 0);
 
 CREATE TABLE agent_wake_escalation (
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
@@ -30,6 +54,36 @@ CREATE TABLE agent_wake_blocker (
     admitted_at TEXT NOT NULL, PRIMARY KEY(attention_id, incident_digest)
 );
 CREATE INDEX idx_agent_wake_blocker_turn ON agent_wake_blocker(turn_job_id);
+CREATE INDEX idx_agent_wake_blocker_escalation ON agent_wake_blocker(escalation_id) WHERE escalation_id IS NOT NULL;
+CREATE INDEX idx_agent_wake_escalation_project_status ON agent_wake_escalation(project_id, status, created_at);
+-- The latest wake decision per Attention item (every batch member), so the
+-- sweep reads one indexed row instead of joining every disposition's payload.
+CREATE TABLE agent_wake_attention_latest (
+    attention_id TEXT PRIMARY KEY REFERENCES attention_projection(id) ON DELETE CASCADE,
+    incident_digest TEXT, disposition TEXT NOT NULL, reason TEXT NOT NULL,
+    identity_id TEXT, updated_at TEXT NOT NULL
+);
+INSERT OR REPLACE INTO agent_wake_attention_latest(attention_id,incident_digest,disposition,reason,identity_id,updated_at)
+SELECT attention_id,incident_digest,disposition,reason,identity_id,created_at FROM (
+    SELECT json_extract(e.payload_json,'$.attention_id') AS attention_id, d.incident_digest, d.disposition, d.reason,
+           json_extract(e.payload_json,'$.identity_id') AS identity_id, d.created_at,
+           ROW_NUMBER() OVER (PARTITION BY json_extract(e.payload_json,'$.attention_id') ORDER BY e.sequence DESC, d.attempt_number DESC) AS rn
+    FROM agent_wake_disposition d JOIN domain_event e ON e.id=d.source_event_id
+    WHERE json_extract(e.payload_json,'$.attention_id') IN (SELECT id FROM attention_projection)
+) WHERE rn=1;
+-- A resolve followed by a reopen re-arms a blocker: its finished turns and its
+-- latest decision no longer speak for the reopened incident. A turn still
+-- queued or running stays linked, so no second turn starts beside it.
+CREATE TRIGGER agent_wake_blocker_rearm_on_reopen
+AFTER UPDATE OF status ON attention_projection
+WHEN OLD.status = 'resolved' AND NEW.status <> 'resolved'
+BEGIN
+    DELETE FROM agent_wake_blocker
+    WHERE attention_id = NEW.id
+      AND turn_job_id IN (SELECT id FROM agent_chat_turn_job
+                          WHERE status IN ('succeeded', 'failed', 'cancelled'));
+    DELETE FROM agent_wake_attention_latest WHERE attention_id = NEW.id;
+END;
 CREATE TABLE agent_wake_batch (
     project_id TEXT PRIMARY KEY REFERENCES project(id) ON DELETE CASCADE,
     admitted_at TEXT NOT NULL, cooldown_until TEXT NOT NULL,

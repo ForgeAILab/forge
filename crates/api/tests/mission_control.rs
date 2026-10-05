@@ -577,3 +577,93 @@ fn jwt_for(user_id: &str) -> String {
     )
     .expect("encode test JWT")
 }
+
+#[tokio::test]
+async fn owner_lists_answers_and_resolves_project_escalations() {
+    let workspace = common::TestDir::new("mission-control-escalation-ws");
+    let harness = common::test_app(workspace.path(), "mission-control-escalation").await;
+    let project: ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name": "Escalation project"}),
+        StatusCode::OK,
+    )
+    .await;
+    let escalations =
+        services::project_escalation::ProjectEscalationService::new(harness.state.db.clone());
+    let escalation = escalations
+        .escalate(
+            &project.id,
+            services::project_escalation::EscalationAuthority::Owner("test-user-id"),
+            api_types::ProjectEscalateRequest {
+                need: "Need the staging token".to_owned(),
+                task_ids: vec![],
+            },
+            "token",
+        )
+        .await
+        .expect("owner escalation");
+    let list: api_types::ProjectEscalationListResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/escalations?status=open", project.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(list.items.len(), 1);
+    assert_eq!(list.items[0].need, "Need the staging token");
+    let _: ErrorResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/escalations?status=closed", project.id),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    // Anyone outside the Project cannot learn the escalation exists.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/projects/{}/escalations", project.id))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", jwt_for("outsider-id")),
+                )
+                .body(Body::empty())
+                .expect("build outsider request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // A generic Resolve of the escalation item is the owner's answer.
+    let item = harness
+        .state
+        .db
+        .get_attention(&escalation.attention_id)
+        .await
+        .expect("attention read")
+        .expect("escalation attention");
+    let _: serde_json::Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/mission-control/attention/{}/resolve", item.id),
+        json!({"expected_version": item.version}),
+        StatusCode::OK,
+    )
+    .await;
+    let answered: api_types::ProjectEscalationResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!(
+            "/api/v1/projects/{}/escalations/{}",
+            project.id, escalation.id
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(answered.status, "answered");
+    assert_eq!(answered.answer.as_deref(), Some("Resolved by the owner."));
+}

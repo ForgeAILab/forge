@@ -98,6 +98,7 @@ pub mod terminal_service;
 pub mod turn_log_sink;
 pub mod types;
 pub mod usage_projection;
+pub(crate) mod wake_blocker;
 pub mod wake_turn_consumer;
 pub mod worker_runtime;
 pub mod workflow;

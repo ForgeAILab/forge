@@ -408,7 +408,7 @@ The typed `TurnFailure` crosses the Agent Runtime host boundary before any
 human-readable error formatting. `ProviderAttemptFinished.error` retains the
 provider kind, retryability, delay, and usage reset hint; `BudgetFailure(Input)`
 identifies context overflow. The turn policy owns all automatic retry decisions.
-Deterministic configuration, authority, provider schema rejection, authentication and usage exhaustion fail immediately; context overflow also fails because the host exposes no forced compaction. Provider schema/auth failures carry `provider_schema`/`provider_auth`, and quota exhaustion carries `usage_limit`. Transient failures, empty responses, turn limits, unclassified and postcondition failures retain the three-attempt budget. Postcondition retries keep the existing instruction overlay.
+Deterministic configuration, authority, provider schema rejection and authentication fail immediately; context overflow also fails because the host exposes no forced compaction. Provider schema/auth failures carry `provider_schema`/`provider_auth`; a provider rejection the provider marks retryable stays `provider_rejected` with its delay. Quota exhaustion carries `usage_limit`: an autonomous wake turn fails on attempt one (the sweep owns its re-admission), while a user-authored turn defers until the window resets (refunded attempt, escalating floor, six-hour per-wait and 24-hour total ceilings). Transient failures, empty responses, turn limits, unclassified and postcondition failures retain the three-attempt budget. Postcondition retries keep the existing instruction overlay.
 Pre-provider admission failures refund the attempt and stop at a separate cap of
 three. A monotonic invocation counter keeps accounting identities distinct when
 a charged attempt is refunded. Leases continue to fence every failure settlement.
@@ -2568,30 +2568,72 @@ and category budget charge. `agent-wake-turns` only checkpoints audit events; it
 never treats them as work. Suppressed/setup-required incidents spend no budget.
 
 The default Project budget remains 10/h, divided into blocker 4/h, delivery 4/h
-and decision 2/h. Custom totals use 40% rounded up for blockers, 40% rounded down
-for delivery and the remainder for decisions. Historical shared-window charges
-are preserved in delivery at migration. One five-minute Project blocker window
-admits a single combined directive carrying all eligible open blockers. The
-material-state digest excludes event delivery IDs, sequences and projection
-versions, so refreshing an unchanged incident cannot create new work.
+and decision 2/h. Totals of 5 or more split 40/40/20 (blockers rounded up,
+delivery down, decisions the remainder) with at least one wake per bucket.
+Totals of 1–4 are one shared pool, so no category is starved; the sweep serves
+blockers, then decisions, then delivery. A zero total stops autonomy and raises
+the budget-stall notice once per binding. An owner's escalation answer is
+owner-initiated and never charged. Migration keeps only charges still inside
+their hour, in delivery, starting at the oldest live window. One five-minute
+Project blocker window admits a single combined directive carrying all eligible
+open blockers. The material-state digest excludes event delivery IDs,
+sequences, projection versions, the Task title and the action-offer list, so
+refreshing or renaming an unchanged incident cannot create new work.
 
-Attention's supervised WorkerRuntime tick runs every 60 seconds. It reconciles
-new blockers and open blockers whose latest suppression was budget, cooldown or
-duplicate incident. Admission evidence binds each included digest to the single
-batch turn. Pending turns are allowed to finish; a terminal turn whose blocker
-remains unchanged receives one owner escalation, never another wake. Successful
-recovery tools record an outcome on wake rows; silent terminal blocker turns are
-escalated immediately by the turn worker, and the sweep repairs interrupted
-escalation writes. Escalation records, owner Notification and owner Attention
-commit together. An owner answer resolves that Attention and commits the decision
-continuation event. These paths read Tasks but never mutate Task state.
+The sweep runs at most every 60 seconds on Attention's WorkerRuntime tick
+(superseded turn incidents still resolve every loop). It reads open Attention
+with one keyed row per item in `agent_wake_attention_latest` (the latest
+decision and its digest for every batch member) and isolates each scope: a
+failing Project is logged and skipped. For a Project blocker it reads the turns
+linked through `agent_wake_blocker`:
+
+- any linked turn queued or running, whatever digest it carried: no wake and no
+  escalation (no member gets a second turn or charge while the batch turn is
+  pending);
+- a succeeded turn for the current digest: the digest has had its turn; the
+  owner is escalated once per completed turn, unless the turn recorded a
+  recovery outcome and the blocker has not recurred since that turn ended;
+- a failed or cancelled turn: infrastructure failures (transient, lease loss,
+  cancellation) do not consume the digest, so the sweep re-admits after the
+  Project cooldown; deterministic provider failures (`provider_auth`,
+  `provider_schema`, `usage_limit`, `configuration_invalid`) never escalate,
+  raise "Project Agent can't run" once per responder Profile version, and hold
+  the blocker until the responder's Profile changes or, for a usage limit, the
+  window resets (one hour when the provider gave no reset);
+- otherwise the blocker is admitted unless its latest decision is a policy
+  suppression (`ineligible_scope`, `self_event`, `reaction_depth_exceeded`,
+  `resolved_incident`, `repeated_failure`, `retry_exhausted_same_chat`) for the
+  same digest and responder.
+
+A digest change, or a resolve followed by a reopen, re-arms the blocker.
+Rows imported from before the upgrade never count as a completed turn: each
+open imported blocker gets one normal, budgeted re-admission batched per
+Project, and escalation applies only after a post-upgrade turn for the same
+digest. Decision wakes suppressed by their bucket, cooldown or a duplicate are
+also reconsidered: an unanswered decision is level state.
+
+Recorded outcomes are `agent_wake_blocker.recorded_outcome`, set by the native
+and MCP `task.action` verbs `retry`, `release`, `restart`, `cancel`,
+`send_back` and `approve` during the responder's live blocker turn, and the
+persisted `task.transitioned` events that responder authored on a blocker Task
+after the turn started. The owner escalation `need` is one bounded line per
+blocker: its summary plus the Task title, status, role, failure kind and reason.
+Escalation records, owner Notification and owner Attention commit together. An
+owner answer (the answer endpoint, `forge-ctl project escalations answer`, the
+Mission Control Answer box, or a generic Resolve of the escalation item, which
+records "Resolved by the owner.") resolves that Attention and commits the
+decision continuation event; the continuation turn becomes the escalated
+blockers' turn, so a blocker still unchanged after it escalates again rather
+than going silent. These paths read Tasks but never mutate Task state.
 
 Frozen responder, Profile, operating-skill and policy provenance are reused on
-ordinary turn retries. Deterministic provider schema/auth/usage failures stop on
-attempt one. Restart lease expiry refunds its attempt charge while retaining the
-separate invocation ordinal and usage coverage gap. Server-owned Project doctrine
-revision @21 adds two short recovery/escalation sentences and retains @20 and
-older immutable bodies for already-admitted turns.
+ordinary turn retries. Deterministic provider schema/auth failures, and usage
+limits on autonomous wakes, stop on attempt one. A lease expiry refunds its
+attempt charge at most three times per turn (`lease_refund_count`); later
+expiries count against `max_attempts`, so a turn that keeps killing its process
+ends. The invocation ordinal and usage coverage gap are kept either way.
+Server-owned Project doctrine revision @21 adds two short recovery/escalation
+sentences and retains @20 and older immutable bodies for already-admitted turns.
 
 Execution terminal outcomes are written by the winning execution terminal CAS:
 the terminal row, active `WorkspaceLease` disposition, and one durable
@@ -2806,15 +2848,11 @@ removed. Error kind (`failure`, `transient`, `terminal`) and bounded message com
 from worker health or recent quarantine records. The same health result supplies
 Mission Control's capacity status.
 
-Wake semantic retry errors are isolated by disposition ID. A failing row cannot
-abort later rows. Transient failures back off without strikes; waiting rows are
-filtered before the SQL limit and waiting is not a tick error. Unexpected failures
-have an independent eight-strike cap in `worker_item_failure`; a terminal storage
-rejection or cap exhaustion commits a terminal `wake_retry_failed` disposition
-and a dead letter together. Evaluation/admission rejections that have a typed wake
-outcome retain `wake_evaluation_invalid` / `turn_admission_rejected`; commit-time
-missing authority defers as before. Initial and retry
-admission, disposition and decision-incident resolution commit together. Consumer
+Wake decisions have no semantic retry rows, strike counts or dead letters:
+Attention admits the turn, its audit event, disposition and budget charge in one
+transaction, and the level-triggered sweep reconsiders whatever is still open.
+A failing scope is logged and retried on the next sweep. Initial admission,
+disposition and decision-incident resolution commit together. Consumer
 `after_commit` hooks hold no durable effect; Attention only emits its budget-stall
 bus notification for the zero configured-budget branch, using the budget scope.
 

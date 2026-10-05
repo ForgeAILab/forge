@@ -3063,7 +3063,12 @@ impl CoordinationToolProvider {
                 serde_json::from_value(payload).map_err(|e| invalid_arguments(e.to_string()))?;
             let result =
                 crate::project_escalation::ProjectEscalationService::new(Arc::clone(&self.db))
-                    .escalate(&project_id, actor_identity_id, request, &idempotency_key)
+                    .escalate(
+                        &project_id,
+                        crate::project_escalation::EscalationAuthority::Agent(actor_identity_id),
+                        request,
+                        &idempotency_key,
+                    )
                     .await
                     .map_err(service_error)?;
             return Ok(
@@ -3109,7 +3114,7 @@ impl CoordinationToolProvider {
                     reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
                 ));
             }
-            let unblocking = matches!(request.action.verb(), "retry" | "release" | "restart");
+            let unblocking = crate::project_escalation::is_unblocking_verb(request.action.verb());
             let result = task_service
                 .perform_task_action_as(
                     task.id,

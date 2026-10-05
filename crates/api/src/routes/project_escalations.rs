@@ -1,9 +1,30 @@
 use crate::{errors::ApiResult, routes::auth::AuthenticatedUser, state::AppState};
-use api_types::{AnswerProjectEscalationRequest, ProjectEscalationResponse};
+use api_types::{
+    AnswerProjectEscalationRequest, ListProjectEscalationsQuery, ProjectEscalationListResponse,
+    ProjectEscalationResponse,
+};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
+pub async fn list(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(project_id): Path<String>,
+    Query(query): Query<ListProjectEscalationsQuery>,
+) -> ApiResult<Json<ProjectEscalationListResponse>> {
+    Ok(Json(
+        services::project_escalation::ProjectEscalationService::new(state.db)
+            .list_for_owner(
+                &project_id,
+                &user.user_id,
+                query.status.as_deref(),
+                query.cursor.as_deref(),
+                query.limit,
+            )
+            .await?,
+    ))
+}
 pub async fn get(
     State(state): State<AppState>,
     user: AuthenticatedUser,
