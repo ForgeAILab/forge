@@ -313,7 +313,7 @@ mod usage_limit_tests {
         for status in [401, 403] {
             assert_eq!(
                 crate::native::provider_turn_failure(&http_rejection(status, "temporary", None)),
-                TurnFailure::Configuration
+                TurnFailure::ProviderAuth
             );
         }
         for status in [408, 425, 429] {

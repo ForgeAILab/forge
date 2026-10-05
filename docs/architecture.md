@@ -408,21 +408,7 @@ The typed `TurnFailure` crosses the Agent Runtime host boundary before any
 human-readable error formatting. `ProviderAttemptFinished.error` retains the
 provider kind, retryability, delay, and usage reset hint; `BudgetFailure(Input)`
 identifies context overflow. The turn policy owns all automatic retry decisions.
-Deterministic configuration, authority, and request rejection fail immediately;
-context overflow also fails because the host exposes no forced compaction.
-A provider's prompt-too-long HTTP 400 is reported as `provider_rejected` because
-no typed evidence distinguishes it from other request rejections; a retry fails
-the same way until the context shrinks.
-Transient/retryable request rejection, empty response, turn limits, unclassified
-and postcondition failures use the existing three-attempt budget.
-Postcondition retries keep the existing instruction overlay. Usage limits refund
-the claim's attempt and defer with a separately counted floor (1, 5, 15, 30, then
-60 minutes),
-a fifteen-minute missing/past reset fallback, and a six-hour per-wait ceiling.
-The 24th deferral or 24 hours from the first deferral terminalizes the turn with
-`usage_limit`; no scheduled time exceeds that deadline. Chat provider health
-uses the typed failure and the turn's resume time, with no message classifier.
-Task and connection-test health retain message parsing and their 24-hour ceiling.
+Deterministic configuration, authority, provider schema rejection, authentication and usage exhaustion fail immediately; context overflow also fails because the host exposes no forced compaction. Provider schema/auth failures carry `provider_schema`/`provider_auth`, and quota exhaustion carries `usage_limit`. Transient failures, empty responses, turn limits, unclassified and postcondition failures retain the three-attempt budget. Postcondition retries keep the existing instruction overlay.
 Pre-provider admission failures refund the attempt and stop at a separate cap of
 three. A monotonic invocation counter keeps accounting identities distinct when
 a charged attempt is refunded. Leases continue to fence every failure settlement.
@@ -2336,8 +2322,8 @@ rows are recreated. The consumer placements are:
 | --- | --- | --- | --- | --- |
 | `scoped-memory-agent-chat-indexer` | Exact `agent_chat.message.admitted`, `agent_chat.response.completed`, `agent_chat.message.completed` | Prepare semantic memory / insert source-idempotent memory | None | None |
 | `agent-coordination-outcomes` | Exact `task.transitioned`, `task.done`, `task.completed`, `task.blocked`, `task.failed`, `task.cancelled` | Read Task, scope-validated commitments and action origins / acknowledge proposal inbox, reconcile commitments and deliver outcomes | None | None |
-| `attention_projection` | All (case-insensitive and substring classification) | Prepare incident, resolution and wake policy / write incident, resolutions, wake decision and budget | Resolve superseded turn incidents | Publish zero configured-budget notification with the resolved budget scope |
-| `agent-wake-turns` | Literal prefix `agent.wake.` | Plan admission/disposition / persist disposition and optional message/turn admission | Reconsider due deferred or changed setup dispositions, isolating and bounding failures per row | None; decision resolution shares admission/cursor commit |
+| `attention_projection` | All (case-insensitive and substring classification) | Prepare incident and shared responder / write incident, resolutions, audit decision, disposition, message/turn and category budget | Every 60 seconds: reconcile open blocker batches, setup changes, and one-time owner escalations | Publish zero configured-budget notification with the resolved budget scope |
+| `agent-wake-turns` | Literal prefix `agent.wake.` | Checkpoint audit records only | None | None |
 | `project-hooks` | Exact `task.transitioned`, `task.status_changed`, `project_hook.task_created`, `project_hook.task_archived` | Evaluate existing completion/epoch rules and prepare action content / claim run and write notification, comment or Task (including dispatch automation Task) with cursor | Settle stale started runs from execution evidence | Publish live hints and comment-memory indexing; launch external Agent execution only for the admitted started run |
 | `notifications` | Exact `task.transitioned`, `task.status_changed`, `review.status_changed`, `notification.requested` | Prepare the existing human notification / insert notification row with cursor | None | Publish `notification.created` live hint |
 | `conflict-hotspots` | Exact `task.transitioned` | Validate workflow handoff and read its full transition reason / seek Project Tasks then merge-failed log rows, count every path once, and commit episode/detection/cursor atomically | None | None |
@@ -2575,31 +2561,37 @@ scope-validated originating commitment, one delivery evidence/lifecycle
 projection.  Its event-derived dedupe keys make a crash between projection
 and cursor checkpoint safe to replay.
 
-The `agent-wake-turns` consumer (also started by `forge-cli`) closes the wake
-loop. Migration `V088` records an install-time cutover cursor, so events that
-commit after installation are evaluated even when the process has not polled
-yet; startup never derives a cursor from the runtime event maximum. Each
-`agent.wake.*` candidate receives one durable current disposition:
-`turn_admitted`, `deterministically_suppressed`, `deferred`, or
-`setup_required`. The disposition, cursor advancement and optional Agent Chat message/turn
-admission commit in one transaction. Deferred and setup-required incidents retain bounded retry or
-authoritative-state reconsideration lineage instead of disappearing as
-completed delivery. Checkpointed candidates are ordered by ascending subscribed
-`domain_event.sequence`; the cursor cannot skip an undisposed wake sequence. A disposition replay is
-idempotent and advances the cursor at most once, only after its disposition
-and any admitted turn/message commit.
+Attention owns autonomous wake admission. It prepares the shared responder snapshot
+outside the write transaction, then revalidates Attention and binding authority
+inside the transaction that writes the audit event, disposition, message, turn job
+and category budget charge. `agent-wake-turns` only checkpoints audit events; it
+never treats them as work. Suppressed/setup-required incidents spend no budget.
 
-Immediately before an admitted wake commits, the consumer revalidates the
-durable Attention version, status, digest, source, dedupe identity, and
-canonical scope. It then uses the same `AgentTurnAdmissionService` as user
-messages and handoffs. That service resolves the current owning binding,
-identity, selected Profile, operating-skill revision, permission/tool policy,
-and canonical scope, and freezes their exact versions/digests on the queued
-turn. Explicit retries and the turn runner continue from that persisted
-snapshot rather than substituting later binding or Profile state. A worker
-retry of a `retry_wait` job is not a new admission: it reclaims that same turn
-job and invokes the runner with the same frozen provenance, changing only
-lease/attempt metadata.
+The default Project budget remains 10/h, divided into blocker 4/h, delivery 4/h
+and decision 2/h. Custom totals use 40% rounded up for blockers, 40% rounded down
+for delivery and the remainder for decisions. Historical shared-window charges
+are preserved in delivery at migration. One five-minute Project blocker window
+admits a single combined directive carrying all eligible open blockers. The
+material-state digest excludes event delivery IDs, sequences and projection
+versions, so refreshing an unchanged incident cannot create new work.
+
+Attention's supervised WorkerRuntime tick runs every 60 seconds. It reconciles
+new blockers and open blockers whose latest suppression was budget, cooldown or
+duplicate incident. Admission evidence binds each included digest to the single
+batch turn. Pending turns are allowed to finish; a terminal turn whose blocker
+remains unchanged receives one owner escalation, never another wake. Successful
+recovery tools record an outcome on wake rows; silent terminal blocker turns are
+escalated immediately by the turn worker, and the sweep repairs interrupted
+escalation writes. Escalation records, owner Notification and owner Attention
+commit together. An owner answer resolves that Attention and commits the decision
+continuation event. These paths read Tasks but never mutate Task state.
+
+Frozen responder, Profile, operating-skill and policy provenance are reused on
+ordinary turn retries. Deterministic provider schema/auth/usage failures stop on
+attempt one. Restart lease expiry refunds its attempt charge while retaining the
+separate invocation ordinal and usage coverage gap. Server-owned Project doctrine
+revision @21 adds two short recovery/escalation sentences and retains @20 and
+older immutable bodies for already-admitted turns.
 
 Execution terminal outcomes are written by the winning execution terminal CAS:
 the terminal row, active `WorkspaceLease` disposition, and one durable

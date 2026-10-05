@@ -1245,9 +1245,8 @@ budgets, optimistic versions, and idempotency keys make retries observable
 and prevent duplicate assistant messages. A missing assistant message with a
 non-success turn is never rendered as a completed exchange.
 
-The durable wake consumer records exactly one current disposition for each
-subscribed wake event: `turn_admitted`, `deterministically_suppressed`, `deferred`, or
-`setup_required`. Those dispositions are delivery provenance, not a separate
+Attention atomically records one current disposition alongside each wake audit event: `turn_admitted`, `deterministically_suppressed`, `deferred`, or
+`setup_required`. Those dispositions are admission provenance, not a separate
 REST resource or generated API type; no wake-disposition endpoint is exposed.
 REST callers observe an admitted wake through the normal
 `AgentChatTurnJobResponse` and its finite turn status, while setup blockers use
@@ -1259,22 +1258,14 @@ reset hints (`resets_at`) are milliseconds (delay and Unix timestamp,
 respectively). Historical jobs retain their original codes/messages and have
 null typed evidence; message text is never used to infer a class.
 
-Non-retryable provider rejection, configuration, authority, and context overflow
+Provider schema rejection, authentication, usage exhaustion, non-retryable provider rejection, configuration, authority, and context overflow
 fail immediately. Overflow cannot force session compaction through the current
 host. Postcondition failures use the ordinary attempt budget with the existing
 corrective overlay. Transient and retryable provider rejection use the ordinary three-attempt budget and a provider delay
 hint when present. Empty response, turn limits, and unclassified failures retain
 that budget. Ordinary retries wait at least `5 seconds × 2^(attempt_count - 1)`,
 capped at five minutes. A provider delay hint can lengthen that wait, up to six
-hours, but cannot shorten the exponential-backoff floor. Usage limits defer
-without charging the attempt: reset hints have
-a floor of 1, 5, 15, 30, then 60 minutes, counted separately from attempts,
-and a six-hour ceiling per wait. Missing or past reset hints use a fifteen-minute
-cooldown raised to that floor. A turn fails with `usage_limit` on its 24th deferral
-or after 24 hours from its first deferral; each scheduled time is capped at that
-deadline. Chat provider health uses this typed failure and the same resume time;
-message parsing remains only for Task and connection-test paths without typed
-turn evidence (their provider-health ceiling remains 24 hours). Pre-provider
+hours, but cannot shorten the exponential-backoff floor. Usage exhaustion fails immediately with `usage_limit`; a reset hint does not schedule another invocation. Chat provider health uses typed failure evidence; message parsing remains only for Task and connection-test paths without typed evidence. Pre-provider
 admission failures also refund the attempt, back off, and stop at three admission failures. Invocation identities advance
 independently of the charged budget, preserving usage accounting on resumption.
 
@@ -5020,3 +5011,49 @@ The web renders Task controls from live offers, including placement waits (`hold
 Solo's review card derives decisions from offers. Request changes collects nonblank guidance before submitting send-back; a required approval reason is collected before approval.
 
 Project doctrine @19 names `forge_scope_read` operation `work.read` for live Task offers and versions, and the `task.action` contract and required inputs. Migration V202610030100 adds it without changing @17/@18 bodies or digests, and advances current Project bindings. Frozen historical admissions remain immutable.
+
+### Project owner escalations
+
+The Project Agent may invoke native `project.escalate` with `{need, task_ids}`
+through the Project orchestration proposal tool. The descriptor has 17 words.
+MCP exposes `forge_project_escalate` with the same payload plus `dedupe_key`;
+its Project comes from the authenticated MCP scope, and its identity comes
+from that owned Project's active binding. Neither transport accepts another
+Project or identity in the payload. Every referenced Task must belong to that
+Project. A replay returns the original owner Notification and Attention item.
+
+`GET /api/v1/projects/{project_id}/escalations/{id}` returns
+`ProjectEscalationResponse` to the Project owner. The response includes `need`,
+`task_ids`, `attention_id`, `notification_id`, `status`, `answer`, and `version`.
+`POST /api/v1/projects/{project_id}/escalations/{id}/answer` accepts
+`AnswerProjectEscalationRequest` (`expected_version`, `answer`). Only the owner
+may answer; a stale version or second answer returns 409. Answering atomically
+resolves the owner Attention item and records `project.escalation.answered`;
+Attention admits the owning Agent's continuation from that answer, with its
+affected Tasks, using the decision budget.
+
+Autonomous wakes are admitted by Attention: the audit event, disposition,
+message, queued turn and budget charge commit together. `agent.wake.*` events
+are audit records and cannot enqueue jobs. `agent.wake.admitted` now carries
+`reason=turn_admitted`, `admission_phase=turn`, and the committed `turn_job_id`;
+`pre_admitted` and the unused legacy `action` field are removed.
+The former delivery-stage validation/retry reason vocabulary is removed; the
+policy reasons (`duplicate_incident`, `cooldown`, `budget_exhausted`,
+`reaction_depth_exceeded`, `self_event`, `retry_exhausted_same_chat`,
+`ineligible_scope`, `resolved_incident`, `repeated_failure`) and setup reason
+`responder_binding_missing` remain. There is still no wake-disposition REST
+resource.
+
+The default 10/h autonomous budget has independent buckets: blocker 4/h,
+delivery 4/h, decision 2/h. Suppressed or unconfigured incidents spend nothing.
+A five-minute Project blocker window admits one combined wake for all open,
+eligible blocker digests. After one admitted turn for an unchanged digest,
+Forge escalates to the owner once rather than waking it again. The supervised
+60-second sweep revisits open blockers suppressed by budget, cooldown or
+incident dedupe when the limits allow admission.
+
+Provider schema rejection, authentication failure and exhausted provider usage
+fail on attempt one with typed `TurnFailure` kinds/codes `provider_schema`,
+`provider_auth`, and `usage_limit`. Retryable rate limiting remains transient.
+Restart lease expiry refunds the claim's attempt while preserving invocation
+accounting and frozen admission provenance.

@@ -29,6 +29,7 @@ struct TinyWorker {
     skip_on_refresh: bool,
     ticks: AtomicUsize,
     tick_timeout: Duration,
+    tick_interval: Duration,
     active: AtomicUsize,
     after_failure: bool,
     tick_panics: AtomicUsize,
@@ -53,6 +54,7 @@ impl TinyWorker {
             skip_on_refresh: false,
             ticks: AtomicUsize::new(0),
             tick_timeout: Duration::from_secs(30),
+            tick_interval: Duration::ZERO,
             active: AtomicUsize::new(0),
             after_failure: false,
             tick_panics: AtomicUsize::new(0),
@@ -84,6 +86,9 @@ impl Worker for TinyWorker {
     }
     fn handle_timeout(&self) -> Duration {
         self.timeout
+    }
+    fn tick_interval(&self) -> Duration {
+        self.tick_interval
     }
     fn tick_timeout(&self) -> Duration {
         self.tick_timeout
@@ -1384,4 +1389,21 @@ async fn audit2_hung_tick_does_not_repeat_during_failure_backoff() {
     }
     schedule.reset();
     assert!(schedule.ready());
+}
+
+#[tokio::test]
+async fn supervised_tick_period_does_not_gate_event_admission() {
+    let db = database().await;
+    let mut tiny = TinyWorker::new("periodic-sweep");
+    tiny.tick_interval = Duration::from_secs(60);
+    let worker = Arc::new(tiny);
+    let runtime = WorkerRuntime::new(db.clone(), worker.clone());
+    runtime.run_once(10).await.unwrap();
+    assert_eq!(worker.ticks.load(Ordering::SeqCst), 1);
+    append(&db, "wanted", "good").await;
+    runtime.run_once(10).await.unwrap();
+    assert_eq!(worker.ticks.load(Ordering::SeqCst), 1);
+    runtime.tick_schedule.lock().unwrap().due = Some(Instant::now() - Duration::from_secs(1));
+    runtime.run_once(10).await.unwrap();
+    assert_eq!(worker.ticks.load(Ordering::SeqCst), 2);
 }

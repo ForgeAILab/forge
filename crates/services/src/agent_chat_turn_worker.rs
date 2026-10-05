@@ -42,7 +42,6 @@ use crate::{
     agent_chat_service::{
         AgentChatService, AppendAgentChatSuccessInput, CommittedAgentChatResponse,
     },
-    agent_chat_turn_policy::failure_after_claim,
     context_manifest::{ContextManifestInput, ContextManifestService, ContextSourceInput},
     embedded_agent_service::{
         CreateFrozenAgentChatSession, CreateScopedSession, RequestedCanonicalScope,
@@ -587,7 +586,7 @@ pub trait AgentChatTurnRunner: Send + Sync {
 
     /// Run one provider attempt while retaining every typed usage report the
     /// adapter observed, including reports attached to a terminal failure.
-    /// The default keeps existing test doubles source-compatible.
+    /// The basic adapter preserves typed failure evidence supplied by its runner.
     async fn run_turn_with_usage(
         &self,
         job: &AgentChatTurnJob,
@@ -599,7 +598,10 @@ pub trait AgentChatTurnRunner: Send + Sync {
                 usage_reports: Vec::new(),
             },
             Err(error) => AgentChatTurnRunOutcome::Failed {
-                failure: TurnFailure::Unclassified,
+                failure: match &error {
+                    ServiceError::TurnFailure { failure, .. } => failure.clone(),
+                    _ => TurnFailure::Unclassified,
+                },
                 error,
                 usage_reports: Vec::new(),
             },
@@ -3948,35 +3950,26 @@ impl AgentChatTurnWorker {
             let max_attempts: i64 = row.try_get("max_attempts")?;
             let pre_provider_failures: i64 = row.try_get("pre_provider_failure_count")?;
             let version: i64 = row.try_get("version")?;
-            let decision = failure_after_claim(
-                &TurnFailure::Unclassified,
-                attempt_count,
-                max_attempts,
-                pre_provider_failures,
-                crate::agent_chat_turn_policy::UsageLimitDeferrals::default(),
-                decision_time,
-                "Agent Chat lease expired",
-            );
-            let status = match decision.status {
-                api_types::AgentChatTurnStatus::Failed => "failed",
-                _ => "retry_wait",
-            };
+            let next_attempt = decision_time.to_rfc3339();
+            let _ = (max_attempts, pre_provider_failures);
+            let status = "retry_wait";
             let updated = async {
                 let mut transaction = db::begin_immediate(self.db.pool()).await?;
                 let updated = sqlx::query(
                     "UPDATE agent_chat_turn_job
                  SET status = ?, lease_owner = NULL, leased_until = NULL,
                      next_attempt_at = ?, error_code = 'lease_expired',
-                     error_message = ?, failure_class_json = ?, retry_decision = ?,
+                     error_message = ?, failure_class_json = ?, retry_decision = ?, attempt_count = ?,
                      version = version + 1, updated_at = ?
                  WHERE id = ? AND version = ? AND status = 'leased' AND leased_until IS NOT NULL
                    AND leased_until <= ?",
                 )
                 .bind(status)
-                .bind(decision.next_attempt_at.map(|value| value.to_rfc3339()))
-                .bind(decision.error)
+                .bind(&next_attempt)
+                .bind("Agent Chat lease expired")
                 .bind(&failure_json)
-                .bind(decision.retry_decision.as_str())
+                .bind("defer")
+                .bind(attempt_count.saturating_sub(1).max(0))
                 .bind(&now)
                 .bind(&id)
                 .bind(version)
@@ -4793,6 +4786,13 @@ impl AgentChatTurnWorker {
                     tracing::warn!(job_id = %commit_job.id, error = %commit_error, "Agent Chat failure could not be persisted");
                 }
             }
+        }
+        if let Err(error) =
+            crate::project_escalation::ProjectEscalationService::new(Arc::clone(&self.db))
+                .escalate_silent_turn(&commit_job.id)
+                .await
+        {
+            tracing::warn!(turn_id=%commit_job.id,%error,"blocker owner escalation will be reconsidered by sweep");
         }
     }
 

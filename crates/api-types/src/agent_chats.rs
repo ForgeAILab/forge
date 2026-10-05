@@ -288,6 +288,8 @@ pub struct CancelAgentChatTurnRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
 pub enum TurnFailure {
+    ProviderSchema,
+    ProviderAuth,
     ProviderRejected {
         retryable: bool,
         retry_after: Option<u64>,
@@ -316,7 +318,10 @@ impl TurnFailure {
     pub fn requires_attention(&self) -> bool {
         matches!(
             self,
-            Self::Configuration
+            Self::ProviderSchema
+                | Self::ProviderAuth
+                | Self::UsageLimit { .. }
+                | Self::Configuration
                 | Self::Authority
                 | Self::ProviderRejected {
                     retryable: false,
@@ -327,6 +332,8 @@ impl TurnFailure {
 
     pub fn code(&self) -> &'static str {
         match self {
+            Self::ProviderSchema => "provider_schema",
+            Self::ProviderAuth => "provider_auth",
             Self::ProviderRejected { .. } => "provider_rejected",
             Self::ContextOverflow => "context_overflow",
             Self::Authority => "authority_denied",

@@ -2007,6 +2007,50 @@ fn parse_json(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| json!({}))
 }
 
+pub(super) async fn forge_project_escalate(
+    state: &AppState,
+    params: Value,
+    context: &McpContext,
+) -> Result<Value, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    let project_id = context
+        .project_id
+        .as_deref()
+        .ok_or_else(|| McpToolError::new(-32602, "project scope is required"))?;
+    let owner = ProjectRepo::get_by_id(&*state.db, project_id)
+        .await?
+        .is_some_and(|p| p.owner_id.as_deref() == Some(user_id));
+    if !owner {
+        return Err(McpToolError::new(
+            -32602,
+            "Project owner authentication is required",
+        ));
+    }
+    let binding = ProjectAgentBindingRepo::get_active_project_binding(&*state.db, project_id)
+        .await?
+        .filter(|b| b.state == "active")
+        .ok_or_else(|| setup_required("Project Agent setup is required"))?;
+    let identity = binding
+        .identity_id
+        .ok_or_else(|| setup_required("Project Agent setup is required"))?;
+    let mut payload = params;
+    let key = payload
+        .get("dedupe_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| McpToolError::new(-32602, "dedupe_key is required"))?
+        .to_owned();
+    payload
+        .as_object_mut()
+        .ok_or_else(|| McpToolError::new(-32602, "object required"))?
+        .remove("dedupe_key");
+    let request: api_types::ProjectEscalateRequest = parse_params(payload)?;
+    Ok(serialize_public(
+        services::project_escalation::ProjectEscalationService::new(state.db.clone())
+            .escalate(project_id, &identity, request, &key)
+            .await?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

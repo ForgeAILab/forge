@@ -638,3 +638,5 @@ mod execution_admission_error_tests {
 #[cfg(test)]
 #[path = "pricing_auto_tests.rs"]
 mod pricing_auto_tests;
+
+pub mod project_escalation;

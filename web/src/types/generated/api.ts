@@ -1879,3 +1879,7 @@ export interface ProviderUsageResponse {
   fetched_at: string
   detail: string | null
 }
+
+export type { ProjectEscalateRequest } from './bindings/ProjectEscalateRequest'
+export type { AnswerProjectEscalationRequest } from './bindings/AnswerProjectEscalationRequest'
+export type { ProjectEscalationResponse } from './bindings/ProjectEscalationResponse'

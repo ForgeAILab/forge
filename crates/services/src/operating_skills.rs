@@ -66,7 +66,7 @@ pub const PROJECT_OPERATING_SKILL_POLICY_JSON: &str =
 pub const PROJECT_OPERATING_SKILL_POLICY_DIGEST: &str =
     "b9364db0792d4a7aa3e9dcae9ebfab78f6a239db55dc21831b201c9b905dd54b";
 pub const PROJECT_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "fdf2aae9169e70fd2c0c48fad30afc38eb1d90ecb951237ff64385d7f2fc40ca";
+    "7390ebdd93c563fe03109b43b922edfd71f3df81983bce0485f5cb5529df65e3";
 
 /// Returns the exact immutable body of the Main Agent account baseline skill.
 /// This body is server-owned source code, not a seeded database row.
@@ -1033,6 +1033,7 @@ You are the Project's engine, not its stenographer. Between user messages, Forge
 - After the Charter handoff: create the chartered milestones and implementation Tasks, assign any enabled configured Agent needed by each Task workflow, and let the scheduler dispatch. Keep work flowing through the Task's configured agent review, no-review, or human-required review toward the milestone without further prompting. Main/Project chat work is coordination and does not consume Task execution quota.
 - On a delivery follow-up wake: the message carries a server-authored work order naming the milestone, its version, its current definition revision, and every required acceptance check still missing an authoritative result. Settle what that order assigns you in the same turn — exercise the delivered software against each check's expected result and record what you observed with `project.validation` (`record`), one call per check, capturing any required proof artifact with `project.evidence` (`capture`) — and only then evaluate readiness. Naming the blockers is not settling them.
 - On an attention wake: diagnose with your read tools first, then repair what your authority covers. Retry or release only when the action is offered and the previous attempt's cause has been addressed. A denial marked `retry: none` is final for the turn: repeating the call will be refused again; use offered alternatives and escalate to the user only when your authority cannot cover the blocker. Use other offered operations to correct a Task definition, reassign a role from eligible agents, cancel obsolete or wedged work with `task.action`, or replace incorrect work through the adaptive envelope, including cancelling a verification-shaped Task and settling its checks yourself. Escalate to the user only what your authority or the envelope cannot cover.
+- Verify recovery took effect; never retry an unchanged blocker. Escalate the exact need with `project.escalate`.
 - Missing-prerequisite rule: when a prerequisite has an eligible, reversible server-visible default (an agent for a role, a milestone selection, a task ordering), choose it, record the decision with rationale, and continue. Ask the user only when no eligible option exists or the choice is consequential or irreversible — and then ask concretely, with your recommendation.
 - Progress needs no announcement. Work silently through typed actions; message the user for approvals, genuine decisions, blockers outside your authority, and a concise outcome summary when a milestone's work completes.
 
@@ -1781,7 +1782,7 @@ mod tests {
             ),
             (
                 PROJECT_OPERATING_SKILL_KEY,
-                "forge.project.orchestration/v1@20",
+                "forge.project.orchestration/v1@21",
                 canonical_project_operating_skill_body(),
                 PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
                 PROJECT_OPERATING_SKILL_POLICY_JSON,
@@ -1842,7 +1843,7 @@ mod tests {
             ).bind(revision).fetch_one(&pool).await.unwrap();
             assert_eq!(digest, expected_digest);
             assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);
-            assert_eq!(current.replace(&new_rule, old_rule), body);
+            assert_eq!(current.replace("- Verify recovery took effect; never retry an unchanged blocker. Escalate the exact need with `project.escalate`.\n", "").replace(&new_rule, old_rule), body);
         }
     }
 

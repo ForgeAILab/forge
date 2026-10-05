@@ -599,6 +599,34 @@ fn map_wake_write_error(error: sqlx::Error) -> DbError {
 }
 
 impl SqliteDb {
+    /// Translate exact install-time admitted snapshots to the material-state digest.
+    /// The historical evidence stays intact when Attention already moved to another source.
+    pub async fn rekey_imported_blocker_digests(&self) -> Result<()> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT b.attention_id FROM agent_wake_blocker b JOIN attention_projection a ON a.id=b.attention_id WHERE b.legacy_source_event_id=a.source_event_id")
+            .fetch_all(&self.pool).await?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut tx = crate::begin_immediate(&self.pool).await?;
+        for id in ids {
+            if let Some(a) = self.get_attention_in_tx(&mut tx, &id).await? {
+                sqlx::query("UPDATE OR IGNORE agent_wake_blocker SET incident_digest=?,legacy_source_event_id=NULL WHERE attention_id=? AND legacy_source_event_id=?")
+                    .bind(canonical_attention_incident_digest(&a)).bind(&id).bind(&a.source_event_id).execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn get_agent_wake_disposition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        consumer: &str,
+        event_id: &str,
+    ) -> Result<Option<AgentWakeDisposition>> {
+        current_disposition_in_tx(tx, consumer, event_id).await
+    }
+
     pub async fn retry_agent_wake_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,

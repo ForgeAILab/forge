@@ -41,11 +41,11 @@ use forge_agent_host::{
     MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
     PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_OPERATION,
-    PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
+    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
+    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -3037,6 +3037,39 @@ impl CoordinationToolProvider {
         causation_id: Option<String>,
         causation_depth: i64,
     ) -> Result<Value, AgentHostError> {
+        if operation == PROJECT_ESCALATE_OPERATION {
+            let project_id = target_id.ok_or_else(|| {
+                AgentHostError::Authority("escalation requires a bound Project".to_owned())
+            })?;
+            let policy_payload = payload.to_string();
+            let (policy, reason) = self
+                .actions
+                .evaluate_direct_command_policy(
+                    actor_identity_id,
+                    scope_type_name(scope.scope_type),
+                    &scope.scope_id,
+                    requested_permission,
+                    operation,
+                    Some(&policy_payload),
+                )
+                .await
+                .map_err(service_error)?;
+            if !matches!(policy, AgentActionPolicyResult::Allowed) {
+                return Err(AgentHostError::Authority(
+                    reason.unwrap_or_else(|| "escalation denied".to_owned()),
+                ));
+            }
+            let request: api_types::ProjectEscalateRequest =
+                serde_json::from_value(payload).map_err(|e| invalid_arguments(e.to_string()))?;
+            let result =
+                crate::project_escalation::ProjectEscalationService::new(Arc::clone(&self.db))
+                    .escalate(&project_id, actor_identity_id, request, &idempotency_key)
+                    .await
+                    .map_err(service_error)?;
+            return Ok(
+                json!({"operation":operation,"status":"succeeded","materialized":true,"domain_committed":true,"domain_result":result,"correlation_id":correlation_id,"requires_user_authorization":false}),
+            );
+        }
         if operation == TASK_ACTION_OPERATION {
             let task_service = self.task_service_handle().ok_or_else(|| {
                 AgentHostError::Configuration("Task actions are not wired".to_owned())
@@ -3076,6 +3109,7 @@ impl CoordinationToolProvider {
                     reason.unwrap_or_else(|| DeniedBy::Unspecified.to_string()),
                 ));
             }
+            let unblocking = matches!(request.action.verb(), "retry" | "release" | "restart");
             let result = task_service
                 .perform_task_action_as(
                     task.id,
@@ -3085,6 +3119,12 @@ impl CoordinationToolProvider {
                 )
                 .await
                 .map_err(service_error)?;
+            if unblocking {
+                crate::project_escalation::ProjectEscalationService::new(Arc::clone(&self.db))
+                    .record_unblocking_action(&project_id, actor_identity_id, &result.task.id)
+                    .await
+                    .map_err(service_error)?;
+            }
             let offers = task_service
                 .task_action_offers(&result.task.id, &api_types::Actor::agent(actor_identity_id))
                 .await

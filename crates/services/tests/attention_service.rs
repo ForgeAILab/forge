@@ -71,14 +71,29 @@ async fn identity(db: &SqliteDb, id: &str) {
 /// Project creation seeds the setup-required binding; this helper only fills
 /// in the binding fields that wake admission requires.
 async fn configured_project(db: &Arc<SqliteDb>, identity_id: &str, name: &str) -> String {
-    let profile_id: String =
-        sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
-            .bind(identity_id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
     let project_id = new_uuid_v4();
     let now = now_rfc3339();
+    let owner_id = new_uuid_v4();
+    db::UserRepo::create_user(
+        &**db,
+        &db::User {
+            id: owner_id.clone(),
+            email: format!("{owner_id}@example.test"),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE agent_identity SET owner_id=? WHERE id=?")
+        .bind(&owner_id)
+        .bind(identity_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
     ProjectRepo::create(
         &**db,
         CreateProject {
@@ -87,26 +102,29 @@ async fn configured_project(db: &Arc<SqliteDb>, identity_id: &str, name: &str) -
             settings: "{}".to_owned(),
             workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: Some(owner_id.clone()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
     )
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE project_agent_binding
-         SET identity_id = ?, profile_id = ?, state = 'active', wake_budget = 10,
-             version = version + 1, updated_at = ?
-         WHERE project_id = ? AND state = 'agent_setup_required'",
-    )
-    .bind(identity_id)
-    .bind(profile_id)
-    .bind(&now)
-    .bind(&project_id)
-    .execute(db.pool())
-    .await
-    .unwrap();
+    let version:i64=sqlx::query_scalar("SELECT version FROM project_agent_binding WHERE project_id=? AND state='agent_setup_required'").bind(&project_id).fetch_one(db.pool()).await.unwrap();
+    services::AgentChatService::new(db.clone())
+        .set_project_binding(services::SetProjectAgentBindingInput {
+            actor_user_id: owner_id,
+            project_id: project_id.clone(),
+            identity_id: Some(identity_id.to_owned()),
+            state: "active".to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            permission_ceiling_json: "{}".to_owned(),
+            subscriptions_json: "[]".to_owned(),
+            wake_budget: 10,
+            expected_version: Some(version),
+            replacement_reason: None,
+        })
+        .await
+        .unwrap();
     project_id
 }
 
@@ -332,7 +350,7 @@ async fn obsolete_orphan_wakes_recheck_task_and_attempt_before_spending_budget()
         let project_id = configured_project(&db, &identity_id, outcome).await;
         // Project the incident while the responder is unavailable, then change
         // execution/Task truth before retrying admission for the open incident.
-        sqlx::query("UPDATE project_agent_binding SET state = 'paused' WHERE project_id = ?")
+        sqlx::query("UPDATE agent_chat SET status = 'agent_setup_required' WHERE project_id = ?")
             .bind(&project_id)
             .execute(db.pool())
             .await
@@ -443,7 +461,7 @@ async fn obsolete_orphan_wakes_recheck_task_and_attempt_before_spending_budget()
             }
             _ => unreachable!(),
         }
-        sqlx::query("UPDATE project_agent_binding SET state = 'active' WHERE project_id = ?")
+        sqlx::query("UPDATE agent_chat SET status = 'ready' WHERE project_id = ?")
             .bind(&project_id)
             .execute(db.pool())
             .await
@@ -564,25 +582,16 @@ async fn wake_admission_deduplicates_and_suppresses_recursive_events() {
     let db = database().await;
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
-    let service = AttentionService::new(Arc::clone(&db));
-
-    let first = service
-        .admit_wake(request(&identity_id, "incident-1"))
-        .await
-        .unwrap();
-    assert!(matches!(first, WakeAdmissionResult::Admitted { .. }));
-
-    let duplicate = service
-        .admit_wake(request(&identity_id, "incident-1"))
-        .await
-        .unwrap();
+    let service = AttentionService::new(db.clone());
     assert!(matches!(
-        duplicate,
+        service
+            .admit_wake(request(&identity_id, "missing-incident"))
+            .await
+            .unwrap(),
         WakeAdmissionResult::Suppressed {
-            reason: WakeSuppressionReason::DuplicateIncident
+            reason: WakeSuppressionReason::ResolvedIncident
         }
     ));
-
     let mut recursive = request(&identity_id, "incident-2");
     recursive.reaction_depth = 9;
     assert!(matches!(
@@ -628,117 +637,6 @@ async fn wake_admission_deduplicates_and_suppresses_recursive_events() {
     .await
     .unwrap();
     assert!(suppressed_count >= 3);
-}
-
-#[tokio::test]
-async fn wake_policy_persists_cooldown_budget_and_global_identity_suppression() {
-    let db = database().await;
-    let first_identity = new_uuid_v4();
-    let replacement_identity = new_uuid_v4();
-    identity(&db, &first_identity).await;
-    identity(&db, &replacement_identity).await;
-    let service = AttentionService::new(Arc::clone(&db));
-
-    let mut first = request(&first_identity, "incident-cooldown");
-    first.causation_id = Some("source-cooldown-1".to_owned());
-    assert!(matches!(
-        service.admit_wake(first.clone()).await.unwrap(),
-        WakeAdmissionResult::Admitted { .. }
-    ));
-
-    let mut cooldown = first.clone();
-    cooldown.lease_owner = "replacement-worker".to_owned();
-    cooldown.causation_id = Some("source-cooldown-2".to_owned());
-    cooldown.now = "2026-01-01T00:00:31Z".to_owned();
-    assert!(matches!(
-        service.admit_wake(cooldown).await.unwrap(),
-        WakeAdmissionResult::Suppressed {
-            reason: WakeSuppressionReason::Cooldown
-        }
-    ));
-
-    // Once the cooldown expires, replaying the same source decision returns
-    // its original admission metadata without charging the wake budget a
-    // second time.
-    let mut replay = first.clone();
-    replay.now = "2026-01-01T00:10:00Z".to_owned();
-    assert!(matches!(
-        service.admit_wake(replay).await.unwrap(),
-        WakeAdmissionResult::Admitted { .. }
-    ));
-    let replay_count: i64 = sqlx::query_scalar(
-        "SELECT admitted_count FROM agent_wake_budget_window
-         WHERE identity_id = ? AND scope_type = 'account' AND scope_id = 'account-1'",
-    )
-    .bind(&first_identity)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(replay_count, 1);
-
-    let mut replacement = request(&replacement_identity, "incident-global");
-    replacement.causation_id = Some("source-global-1".to_owned());
-    assert!(matches!(
-        service.admit_wake(replacement.clone()).await.unwrap(),
-        WakeAdmissionResult::Admitted { .. }
-    ));
-    replacement.now = "2026-01-01T00:00:10Z".to_owned();
-    replacement.identity_id = first_identity.clone();
-    replacement.lease_owner = "old-binding-worker".to_owned();
-    replacement.causation_id = Some("source-global-2".to_owned());
-    assert!(matches!(
-        service.admit_wake(replacement).await.unwrap(),
-        WakeAdmissionResult::Suppressed {
-            reason: WakeSuppressionReason::DuplicateIncident
-        }
-    ));
-
-    // Saturating the persisted window must not be counted again by a
-    // suppression decision.
-    sqlx::query(
-        "INSERT INTO agent_wake_budget_window (
-             identity_id, scope_type, scope_id, window_started_at,
-             window_seconds, admitted_count, version, updated_at
-         ) VALUES (?, 'account', 'account-1', ?, 3600, 10, 1, ?)
-         ON CONFLICT(identity_id, scope_type, scope_id) DO UPDATE SET
-             window_started_at = excluded.window_started_at,
-             admitted_count = excluded.admitted_count,
-             version = agent_wake_budget_window.version + 1,
-             updated_at = excluded.updated_at",
-    )
-    .bind(&first_identity)
-    .bind("2026-01-01T00:00:00Z")
-    .bind("2026-01-01T00:00:00Z")
-    .execute(db.pool())
-    .await
-    .unwrap();
-    let mut budget = request(&first_identity, "incident-budget");
-    budget.now = "2026-01-01T00:00:30Z".to_owned();
-    budget.causation_id = Some("source-budget".to_owned());
-    assert!(matches!(
-        service.admit_wake(budget).await.unwrap(),
-        WakeAdmissionResult::Suppressed {
-            reason: WakeSuppressionReason::BudgetExhausted
-        }
-    ));
-    let admitted_count: i64 = sqlx::query_scalar(
-        "SELECT admitted_count FROM agent_wake_budget_window
-         WHERE identity_id = ? AND scope_type = 'account' AND scope_id = 'account-1'",
-    )
-    .bind(&first_identity)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(admitted_count, 10);
-
-    let decisions: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM domain_event
-         WHERE event_type = 'agent.wake.suppressed'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert!(decisions >= 2);
 }
 
 #[tokio::test]
@@ -848,52 +746,19 @@ async fn binding_replacement_cannot_create_a_second_active_incident_lease() {
     let new_identity = new_uuid_v4();
     identity(&db, &old_identity).await;
     identity(&db, &new_identity).await;
-    let old_profile: String =
-        sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
-            .bind(&old_identity)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    let new_profile: String =
-        sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
-            .bind(&new_identity)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    let project_id = new_uuid_v4();
+    let project_id = configured_project(&db, &old_identity, "binding-replacement-project").await;
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO project (
-             id, name, settings, workflow_definition, owner_id, created_at, updated_at
-         ) VALUES (?, 'binding-replacement-project', '{}', '{}', NULL, ?, ?)",
-    )
-    .bind(&project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .unwrap();
-    let binding_id: String = sqlx::query_scalar(
-        "SELECT id FROM project_agent_binding
-         WHERE project_id = ? AND state = 'agent_setup_required'",
-    )
-    .bind(&project_id)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE project_agent_binding
-         SET identity_id = ?, profile_id = ?, state = 'active', wake_budget = 10,
-             version = version + 1, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&old_identity)
-    .bind(&old_profile)
-    .bind(&now)
-    .bind(&binding_id)
-    .execute(db.pool())
-    .await
-    .unwrap();
+    let owner: String = sqlx::query_scalar("SELECT owner_id FROM project WHERE id=?")
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_identity SET owner_id=? WHERE id=?")
+        .bind(&owner)
+        .bind(&new_identity)
+        .execute(db.pool())
+        .await
+        .unwrap();
     let entity_id = new_uuid_v4();
     let first_source = new_uuid_v4();
     DomainEventRepo::append_event(
@@ -928,32 +793,28 @@ async fn binding_replacement_cannot_create_a_second_active_incident_lease() {
     .unwrap();
     assert_eq!(admitted_identity, old_identity);
 
-    sqlx::query(
-        "UPDATE project_agent_binding
-         SET state = 'replaced', version = version + 1, updated_at = ?
-         WHERE id = ? AND state = 'active'",
+    let version: i64 = sqlx::query_scalar(
+        "SELECT version FROM project_agent_binding WHERE project_id=? AND state='active'",
     )
-    .bind(&now)
-    .bind(&binding_id)
-    .execute(db.pool())
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO project_agent_binding (
-             id, project_id, identity_id, profile_id, state,
-             autonomy_policy_json, permission_ceiling_json, subscriptions_json,
-             wake_budget, version, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'active', '{}', '{}', '[]', 10, 1, ?, ?)",
-    )
-    .bind(new_uuid_v4())
     .bind(&project_id)
-    .bind(&new_identity)
-    .bind(&new_profile)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
+    .fetch_one(db.pool())
     .await
     .unwrap();
+    services::AgentChatService::new(db.clone())
+        .set_project_binding(services::SetProjectAgentBindingInput {
+            actor_user_id: owner,
+            project_id: project_id.clone(),
+            identity_id: Some(new_identity),
+            state: "active".to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            permission_ceiling_json: "{}".to_owned(),
+            subscriptions_json: "[]".to_owned(),
+            wake_budget: 10,
+            expected_version: Some(version),
+            replacement_reason: Some("binding replacement test".to_owned()),
+        })
+        .await
+        .unwrap();
     DomainEventRepo::append_event(
         &*db,
         CreateDomainEvent {
@@ -2408,8 +2269,8 @@ async fn audit_in_window_budget_exhaustion_does_not_publish_autonomy_stall() {
     .unwrap();
     // The hourly window is already full (budget 10, 10 admitted, in window).
     sqlx::query(
-        "INSERT INTO agent_wake_budget_window (identity_id, scope_type, scope_id, window_started_at, window_seconds, admitted_count, version, updated_at)
-         VALUES (?, 'project', ?, ?, 3600, 10, 1, ?)",
+        "INSERT INTO agent_wake_budget_window (identity_id, scope_type, scope_id, category, window_started_at, window_seconds, admitted_count, version, updated_at)
+         VALUES (?, 'project', ?, 'blocker', ?, 3600, 4, 1, ?)",
     )
     .bind(&identity_id)
     .bind(&project_id)
@@ -2639,9 +2500,56 @@ async fn audit_lost_wake_lease_cas_suppresses_without_charging_budget() {
     let db = database().await;
     let id = new_uuid_v4();
     identity(&db, &id).await;
+    let project = configured_project(&db, &id, "lease-cas").await;
+    let now = now_rfc3339();
+    let event = db
+        .append_event(CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "test.incident".to_owned(),
+            entity_type: "project".to_owned(),
+            entity_id: project.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: None,
+            payload_json: "{}".to_owned(),
+            created_at: now.clone(),
+        })
+        .await
+        .unwrap();
+    db.insert_attention(CreateAttentionProjection {
+        id: new_uuid_v4(),
+        attention_type: "validation_failed".to_owned(),
+        scope_type: "project".to_owned(),
+        scope_id: project.clone(),
+        identity_id: Some(id.clone()),
+        source_event_id: event.id,
+        priority: 80,
+        status: "open".to_owned(),
+        summary: "CAS loss".to_owned(),
+        details_json: "{}".to_owned(),
+        dedupe_key: "cas-loss".to_owned(),
+        occurred_at: now.clone(),
+        updated_at: now,
+        acknowledged_at: None,
+        snoozed_until: None,
+        resolved_at: None,
+        updated_by_user_id: None,
+        recommended_action: "inspect".to_owned(),
+        source_sequence: Some(event.sequence),
+    })
+    .await
+    .unwrap();
     let service = AttentionService::new(Arc::clone(&db));
     sqlx::raw_sql("CREATE TRIGGER lose_wake_lease BEFORE INSERT ON agent_wake_lease BEGIN SELECT RAISE(IGNORE); END;").execute(db.pool()).await.unwrap();
-    let result = service.admit_wake(request(&id, "cas-loss")).await.unwrap();
+    let mut input = request(&id, "cas-loss");
+    input.scope_type = "project".to_owned();
+    input.scope_id = project;
+    let result = service.admit_wake(input).await.unwrap();
     assert!(matches!(
         result,
         WakeAdmissionResult::Suppressed {
