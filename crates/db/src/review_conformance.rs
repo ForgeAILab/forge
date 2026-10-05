@@ -614,11 +614,9 @@ impl ReviewConformanceRepo for SqliteDb {
         let contract = verified_passed_contract(&mut tx, task_id, Some(&raw)).await?;
         let prior_details: Value = serde_json::from_str(&raw).map_err(json_error)?;
         let carries_since_review: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM review_authority_carry
-             WHERE task_id = ? AND contract_execution_id = ?",
+            "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id = ? AND kind='review_carry'),0)",
         )
         .bind(task_id)
-        .bind(&contract.execution_id)
         .fetch_one(&mut *tx)
         .await?;
         let review_id: String = current.try_get("id")?;

@@ -515,6 +515,21 @@ async fn insert_transition_log(
     input: &CreateTransitionLog,
 ) -> Result<()> {
     // Runs after the move's status update: record the epoch it entered.
+    let row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id=?"))
+        .bind(&input.task_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let task = map_task(row)?;
+    crate::budget::transition(
+        tx,
+        &task,
+        &input.from_state,
+        &input.triggered_by,
+        &input.bridge,
+        input.rejection,
+        &input.id,
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload, status_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id = ?))",
     )

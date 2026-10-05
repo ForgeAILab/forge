@@ -2567,7 +2567,7 @@ async fn system_review_ci_failure_routes_to_coder_and_spends_review_budget() {
             rejection.trigger_reason,
         );
         assert_eq!(
-            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+            crate::task_diagnostics::audit_gate_rejections_since_boundary(&entries, "review"),
             1
         );
         assert!(
@@ -3886,7 +3886,7 @@ async fn system_review_ci_placement_error_retries_without_review_rejection() {
         .await
         .unwrap();
     assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        crate::task_diagnostics::audit_gate_rejections_since_boundary(&entries, "review"),
         0
     );
     let retried = fixture
@@ -3913,7 +3913,7 @@ async fn system_review_ci_placement_error_retries_without_review_rejection() {
         .await
         .unwrap();
     assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        crate::task_diagnostics::audit_gate_rejections_since_boundary(&entries, "review"),
         0
     );
 }
@@ -4052,8 +4052,16 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
         );
         let barrier: serde_json::Value =
             serde_json::from_str(result.task.entry_barrier_json.as_deref().unwrap()).unwrap();
+        assert_eq!(barrier["status"], "blocked");
         assert_eq!(
-            barrier["infrastructure_attempts"], 1,
+            db::budget::spent(
+                fixture.db.pool(),
+                &fixture.task.id,
+                db::budget::Kind::ReviewCiInfrastructure.key()
+            )
+            .await
+            .unwrap(),
+            1,
             "disconnected attempts do not spend the infrastructure cap"
         );
     }
@@ -4065,7 +4073,17 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
     for attempt in 1..=5 {
         let barrier: serde_json::Value =
             serde_json::from_str(result.task.entry_barrier_json.as_deref().unwrap()).unwrap();
-        assert_eq!(barrier["infrastructure_attempts"], attempt);
+        assert_eq!(barrier["status"], "blocked");
+        assert_eq!(
+            db::budget::spent(
+                fixture.db.pool(),
+                &fixture.task.id,
+                db::budget::Kind::ReviewCiInfrastructure.key()
+            )
+            .await
+            .unwrap(),
+            attempt
+        );
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM review WHERE task_id = ?")
             .bind(&fixture.task.id)
             .fetch_one(fixture.db.pool())
@@ -4132,7 +4150,7 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
         .await
         .unwrap();
     assert_eq!(
-        crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, "review"),
+        crate::task_diagnostics::audit_gate_rejections_since_boundary(&entries, "review"),
         0
     );
 }

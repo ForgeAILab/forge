@@ -2990,7 +2990,7 @@ Revision coverage for `TaskListItemResponse`:
 | `canonical_phase` | Task status/type/parent/config updates and Project `workflow_definition` updates |
 | `awaiting_human` | Constant `false` in this list projection; review/metadata-driven waiting is shown in `workflow_health` |
 | `role_assignments` | Role assignment insert/update/delete |
-| `remaining_retries` | Transition-log insert/update/delete, Task annotations/config, Project workflow changes |
+| `remaining_retries`, `retry_limits` | Task-budget ledger insert/update/delete, Task config, Project workflow/settings changes |
 | `error_annotation`, `blocked`, `failed`, `review_passed_at`, `archived_at`, `version`, `created_at`, `updated_at` | Changes to their Task columns (including metadata-only writes without a Task version increment) |
 | `workflow_health`, `workflow_exception` | Task annotations/metadata/config, role assignments, review projection fields, execution projection fields, and Project workflow changes |
 | `external_issue_number`, `external_issue_url` | External-link insert/update/delete |
@@ -5112,3 +5112,28 @@ the machine it is waiting on. Operations status exposes `pending_remote_cancels`
 The records are daemon-scoped cleanup records: deleting the Project, Task,
 workspace or placement never fails on them, and reconnect still sends
 `workspace.cancel` for each.
+
+### Task budget projections
+
+REST Task detail/list, MCP `forge_get_task`/`forge_list_tasks` and task results
+expose `remaining_retries` and `retry_limits` as numeric objects. `forge-ctl`
+JSON output passes these through. The web displays remaining budgets and uses
+server-resolved limits in its editor, rather than reconstructing defaults.
+
+Gate state names remain keys (`planning`, `review`, `merging`, custom gate names).
+The cancelled-review entry cap is exposed as `review_gate`.
+Additional kind keys are `merge_fix`, `execution`, `workflow_guard`,
+`target_moved_rebase`, `conflict_handoff`, `review_carry`,
+`automatic_review_recovery`, `review_ci_infrastructure`, and `report_correction`.
+Merging's gate cap and the repair budget are separate constraints. Disabled
+automatic recovery reports zero. `report_correction` reports the allowance for
+a new invocation; its live counter is volatile and is not Task-level spending.
+
+Every resolved value comes from `db::budget`. Remaining is saturated at zero;
+a standard review reports 2 initially, 1 after its first failed verdict, and 0
+at its second failure, retaining one automatic routed bounce. Owner retry and
+send-back actions do not reduce these values. Review-CI failures honor the same
+Task overrides as reviewer failures. Execution failure retries survive status
+changes until an explicit budget reset. Other kinds retain their natural
+contract/completion/interruption/exhaustion windows; reset additionally restores
+all persisted kinds. There is no lifetime execution maximum.

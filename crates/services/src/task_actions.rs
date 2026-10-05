@@ -42,6 +42,8 @@ pub struct TaskSnapshot {
     pub latest_review: Option<Review>,
     pub role_assignments: Vec<TaskRoleAssignment>,
     pub transition_logs: Vec<TransitionLog>,
+    pub budget_spent: std::collections::HashMap<String, i64>,
+    pub recovery_budget_limit: i64,
     pub caller: ActionCaller,
     pub has_agent: bool,
     pub dependencies_satisfied: bool,
@@ -260,31 +262,26 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                     .is_some())
     });
     let gate_budget = |gate: &api_types::StateDefinition| {
-        if gate.name == crate::workflow::default_states::REVIEW {
-            crate::task_service::config::runtime_retry_budget(
-                task,
-                crate::task_service::config::RetryBudgetKind::Review,
-                Some(&gate.config),
-                gate.gate_config.as_ref(),
-            )
-            .ok()
+        let kind = if gate.name == crate::workflow::default_states::REVIEW {
+            db::budget::Kind::Review
         } else {
-            gate.gate_config
-                .as_ref()
-                .and_then(|config| config.max_rejections)
-        }
+            db::budget::Kind::GateRejection
+        };
+        let mut origin = task.clone();
+        origin.status = gate.name.clone();
+        db::budget::limit(&origin, kind, Some(&gate.config), gate.gate_config.as_ref()).ok()
     };
     let exhausted = condition.is_some_and(|kind| {
         kind.is_budget_exhausted_annotation() || kind.is_retry_exhausted_metadata()
     }) || retry_gate.is_some_and(|gate| {
         gate_budget(gate).is_some_and(|budget| {
-            crate::task_diagnostics::gate_entry_retry_exhausted(
+            db::budget::gate_entry_exhausted(
                 &gate.name,
                 i64::from(budget),
-                crate::task_diagnostics::count_gate_rejections_since_boundary(
-                    &snapshot.transition_logs,
-                    &gate.name,
-                ),
+                *snapshot
+                    .budget_spent
+                    .get(&db::budget::gate_key(&gate.name))
+                    .unwrap_or(&0),
             )
         })
     });
@@ -307,10 +304,13 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         && retry_gate.is_some_and(|gate| {
             gate.name == "review"
                 && (gate_budget(gate).is_some_and(|budget| {
-                    crate::task_diagnostics::count_gate_rejections_since_boundary(
-                        &snapshot.transition_logs,
-                        &gate.name,
-                    ) >= i64::from(budget)
+                    !db::budget::allows_retry(
+                        i64::from(budget),
+                        *snapshot
+                            .budget_spent
+                            .get(&db::budget::gate_key(&gate.name))
+                            .unwrap_or(&0),
+                    )
                 }) || snapshot.annotation().is_some_and(|annotation| {
                     crate::task_diagnostics::is_retry_budget_exhausted(&annotation)
                 }))
@@ -1383,6 +1383,7 @@ pub async fn load_snapshot(
         }
     }
     let transition_logs = TransitionLogRepo::list_by_task(db, &task.id).await?;
+    let budget_spent = db::budget::load(db.pool(), &task.id).await?;
     let dependencies_satisfied = TaskDependencyRepo::unsatisfied_dependencies(db, &task.id)
         .await?
         .is_empty();
@@ -1402,6 +1403,14 @@ pub async fn load_snapshot(
     let action_agent_id = select_action_agent(db, &task, selected_role, connections).await?;
     let has_agent = action_agent_id.is_some();
     let project = db::ProjectRepo::get_by_id(db, &task.project_id).await?;
+    let recovery_budget_limit = project
+        .as_ref()
+        .map(|p| db::budget::recovery_limit(&p.settings))
+        .unwrap_or(0);
+    let workflow = project
+        .as_ref()
+        .map(|p| db::budget::with_project_defaults(&workflow, &p.settings))
+        .unwrap_or_else(|| workflow.clone());
     let project_paused = project
         .as_ref()
         .is_some_and(|project| project.paused_at.is_some());
@@ -1550,6 +1559,8 @@ pub async fn load_snapshot(
         latest_review,
         role_assignments: assignments,
         transition_logs,
+        budget_spent,
+        recovery_budget_limit,
         caller,
         has_agent,
         dependencies_satisfied,
@@ -1798,6 +1809,8 @@ mod tests {
             latest_review: None,
             role_assignments: Vec::new(),
             transition_logs: Vec::new(),
+            budget_spent: Default::default(),
+            recovery_budget_limit: 0,
             caller: ActionCaller::owner(),
             has_agent: true,
             dependencies_satisfied: true,
@@ -1860,6 +1873,7 @@ mod tests {
             "review",
             "in_progress",
         )];
+        snapshot.budget_spent.insert("review".into(), 1);
         snapshot.latest_review = Some(super::condition_matrix::review(ReviewStatus::AwaitingHuman));
         snapshot.executions = vec![super::condition_matrix::exec(
             "candidate",
@@ -2441,6 +2455,22 @@ mod condition_matrix {
                                         latest_review,
                                         role_assignments: Vec::new(),
                                         transition_logs,
+                                        budget_spent: gate
+                                            .filter(|_| exhausted)
+                                            .map(|g| {
+                                                std::collections::HashMap::from([(
+                                                    db::budget::gate_key(&g.name),
+                                                    i64::from(
+                                                        g.gate_config
+                                                            .as_ref()
+                                                            .unwrap()
+                                                            .max_rejections
+                                                            .unwrap(),
+                                                    ),
+                                                )])
+                                            })
+                                            .unwrap_or_default(),
+                                        recovery_budget_limit: 0,
                                         caller: ActionCaller::owner(),
                                         has_agent: flag != "no_agent",
                                         dependencies_satisfied: flag != "deps_unsatisfied",

@@ -7,7 +7,7 @@ use api_types::{
 use chrono::{DateTime, Utc};
 use db::{
     AssigneeKind, Execution, ExecutionStatus, ResumePolicy, Review, ReviewStatus, Task,
-    TaskMetadata, TaskRoleAssignment, TransitionLog, TransitionLogRepo,
+    TaskMetadata, TaskRoleAssignment, TransitionLog,
 };
 use serde_json::Value;
 
@@ -657,19 +657,14 @@ pub fn entries_since_retry_window_boundary<'a>(
         .unwrap_or(entries)
 }
 
-/// Gate-entry enforcement. Review exhaustion is settled only on a failed
-/// verdict; entering/re-running review or deciding a human gate remains legal.
-pub fn gate_entry_retry_exhausted(state: &str, budget: i64, count: i64) -> bool {
-    state != crate::workflow::default_states::REVIEW && count >= budget
-}
-
 /// Count gate rejections in the current retry window.
 ///
 /// Merge-refresh and conflict-handoff rows are mechanical bridges, not
 /// merge-fix attempts. Excluding them here keeps
 /// recovery, runtime admission, and API diagnostics on the same policy even
 /// while the current engine normalizes new bridge rows to `rejection = false`.
-pub fn count_gate_rejections_since_boundary(entries: &[TransitionLog], gate_state: &str) -> i64 {
+#[cfg(test)]
+pub fn audit_gate_rejections_since_boundary(entries: &[TransitionLog], gate_state: &str) -> i64 {
     let entries = entries_since_retry_window_boundary(entries, Some(gate_state));
     let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
     entries
@@ -687,15 +682,13 @@ pub fn count_gate_rejections_since_boundary(entries: &[TransitionLog], gate_stat
         .count() as i64
 }
 
-/// Load and count one Task's gate rejections using the same boundary policy
-/// as the in-memory API projection and recovery admission checks.
-pub async fn count_gate_rejections_for_task(
+#[cfg(test)]
+pub async fn budget_spent_for_gate(
     db: &db::SqliteDb,
     task_id: &str,
     gate_state: &str,
 ) -> db::Result<i64> {
-    let entries = TransitionLogRepo::list_by_task(db, task_id).await?;
-    Ok(count_gate_rejections_since_boundary(&entries, gate_state))
+    db::budget::spent(db.pool(), task_id, &db::budget::gate_key(gate_state)).await
 }
 
 fn latest_failed_review(review: Option<&Review>) -> Option<&Review> {
@@ -888,7 +881,7 @@ fn cascades_when_role_unassigned(state: &api_types::StateDefinition) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::count_gate_rejections_since_boundary;
+    use super::audit_gate_rejections_since_boundary;
     use db::TransitionLog;
 
     fn log(
@@ -926,7 +919,7 @@ mod tests {
             log("merging", "review", Some("review_refresh"), false),
         ];
 
-        assert_eq!(count_gate_rejections_since_boundary(&entries, "merging"), 1);
+        assert_eq!(audit_gate_rejections_since_boundary(&entries, "merging"), 1);
     }
 
     #[test]
@@ -940,7 +933,7 @@ mod tests {
         bridge.trigger_reason = "Target advanced".to_owned();
         let entries = vec![log("merging", "merge_failed", Some("reject"), true), bridge];
 
-        assert_eq!(count_gate_rejections_since_boundary(&entries, "merging"), 1);
+        assert_eq!(audit_gate_rejections_since_boundary(&entries, "merging"), 1);
     }
 
     #[test]
@@ -954,7 +947,7 @@ mod tests {
         handoff.trigger_reason =
             "rebased onto main; conflicts were committed with markers in: exports.py".to_owned();
         assert_eq!(
-            count_gate_rejections_since_boundary(&[handoff], "merging"),
+            audit_gate_rejections_since_boundary(&[handoff], "merging"),
             0
         );
     }
@@ -967,6 +960,6 @@ mod tests {
             log("review", "in_progress", Some("reject"), true),
         ];
 
-        assert_eq!(count_gate_rejections_since_boundary(&entries, "review"), 1);
+        assert_eq!(audit_gate_rejections_since_boundary(&entries, "review"), 1);
     }
 }

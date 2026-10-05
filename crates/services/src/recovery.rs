@@ -3059,8 +3059,20 @@ async fn complete_workspace_reconciliation(
     .bind(&ready.task_id)
     .execute_in_tx(&mut transaction)
     .await?;
+    let exhausted_tasks:Vec<String>=sqlx::query_scalar("SELECT id FROM task WHERE (id=? OR parent_task_id=?) AND deleted_at IS NULL AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation,'$.blocking_reason')='review_ci_infrastructure_exhausted'").bind(&ready.task_id).bind(&ready.task_id).fetch_all(&mut *transaction).await?;
+    for task in exhausted_tasks {
+        let window = format!("reconnect:{}:{}", ready.id, ready.version);
+        db::budget::reset(
+            &mut transaction,
+            &task,
+            db::budget::Kind::ReviewCiInfrastructure.key(),
+            &window,
+        )
+        .await?;
+        sqlx::query("UPDATE task SET entry_barrier_json=json_set(entry_barrier_json,'$.started_at',?) WHERE id=?").bind(&window).bind(&task).execute(&mut *transaction).await?;
+    }
     db::task_writer::BulkTaskQuery::new(db,"UPDATE task SET blocked_json = NULL,
-        entry_barrier_json = json_set(entry_barrier_json, '$.infrastructure_attempts', 0),
+        entry_barrier_json = entry_barrier_json,
         error_annotation = json_set(error_annotation, '$.blocking_reason', 'review_ci_infrastructure'),
         version = version + 1, updated_at = ? WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
         AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation, '$.blocking_reason') = 'review_ci_infrastructure_exhausted'")
@@ -4098,7 +4110,14 @@ pub(crate) mod tests {
             .expect("task exists");
         let metadata: Value = serde_json::from_str(updated_task.metadata_json.as_deref().unwrap())
             .expect("metadata parses");
-        assert_eq!(metadata["execution_retry_count"], 1);
+        assert_eq!(
+            json!(
+                db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                    .await
+                    .unwrap()
+            ),
+            1
+        );
         assert_eq!(
             metadata["deferred_dispatch"]["reason"],
             "execution retry (attempt 1)"
@@ -4149,7 +4168,7 @@ pub(crate) mod tests {
         .expect("reviewer role assignment creates");
         sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
             .bind(r#"{"retry_budgets":{"execution":3}}"#)
-            .bind(r#"{"execution_retry_count":0}"#)
+            .bind("{}")
             .bind(&task.id)
             .execute(db.pool())
             .await
@@ -4223,7 +4242,14 @@ pub(crate) mod tests {
         let metadata: Value =
             serde_json::from_str(current_task.metadata_json.as_deref().unwrap_or("{}"))
                 .expect("metadata parses");
-        assert_eq!(metadata["execution_retry_count"], 1);
+        assert_eq!(
+            json!(
+                db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+                    .await
+                    .unwrap()
+            ),
+            1
+        );
         assert!(metadata.get("deferred_dispatch").is_some());
     }
 
@@ -6875,11 +6901,12 @@ pub(crate) mod tests {
         // The terminal/drain committed before the server stopped; readiness
         // did not. The new monitor receives no reconnect event.
         sqlx::query("UPDATE task SET status = 'review', entry_barrier_json = ?, error_annotation = ?, blocked_json = ? WHERE id = ?")
-            .bind(json!({"state": "review", "status": "blocked", "infrastructure_attempts": 5}).to_string())
+            .bind(json!({"state": "review", "status": "blocked", "started_at":"episode"}).to_string())
             .bind(json!({"type": "before_work_hook_failed", "blocking_reason": "review_ci_infrastructure_exhausted", "recovery_actions": ["retry_hook"]}).to_string())
             .bind("{}").bind(&placement.task_id).execute(db.pool()).await.unwrap();
         sqlx::query("UPDATE execution SET status = 'completed', after_sha = 'owner-head', lease_owner = NULL, lease_expires_at = NULL WHERE id = ?")
             .bind(&execution.id).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review_ci_infrastructure','episode',5) ON CONFLICT(task_id,kind) DO UPDATE SET spent=5,window_id='episode'").bind(&placement.task_id).execute(db.pool()).await.unwrap();
         let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
         let daemon_id = placement.daemon_id.clone().unwrap();
         let (id, mut outbound) = owner_connection(&registry, &daemon_id, false);
@@ -6927,8 +6954,13 @@ pub(crate) mod tests {
             "review_ci_infrastructure"
         );
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(task.entry_barrier_json.as_deref().unwrap())
-                .unwrap()["infrastructure_attempts"],
+            db::budget::spent(
+                db.pool(),
+                &task.id,
+                db::budget::Kind::ReviewCiInfrastructure.key()
+            )
+            .await
+            .unwrap(),
             0
         );
         assert_eq!(

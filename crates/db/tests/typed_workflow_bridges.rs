@@ -33,6 +33,7 @@ async fn populated_upgrade_backfills_bridges_queue_checkpoints_and_execution_pur
             && !name
                 .to_string_lossy()
                 .ends_with("__typed_workflow_bridges.sql")
+            && !name.to_string_lossy().ends_with("__task_budgets.sql")
         {
             std::fs::copy(entry.path(), old_migrations.join(name)).unwrap();
         }
@@ -493,11 +494,7 @@ async fn populated_upgrade_backfills_bridges_queue_checkpoints_and_execution_pur
         ]
     );
     let count = || {
-        ExecutionRepo::count_by_task_and_purpose(
-            &db,
-            "t",
-            ExecutionPurpose::AutomaticReviewRecovery,
-        )
+        sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM execution WHERE task_id='t' AND purpose='automatic_review_recovery' AND status='running'").fetch_one(db.pool())
     };
     assert_eq!(count().await.unwrap(), 1);
     assert!(ExecutionRepo::has_running_by_task_and_purpose(
@@ -539,7 +536,10 @@ async fn pre_bridge_pool(name: &str) -> (tempfile::TempDir, String, sqlx::Sqlite
     for entry in std::fs::read_dir(&migrations).unwrap() {
         let entry = entry.unwrap();
         let file = entry.file_name().to_string_lossy().to_string();
-        if file.ends_with(".sql") && !file.ends_with("__typed_workflow_bridges.sql") {
+        if file.ends_with(".sql")
+            && !file.ends_with("__typed_workflow_bridges.sql")
+            && !file.ends_with("__task_budgets.sql")
+        {
             std::fs::copy(entry.path(), old.join(&file)).unwrap();
         }
     }
@@ -719,11 +719,7 @@ async fn recovery_attempt_count_matches_base_after_terminal_summary() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    let typed = db::ExecutionRepo::count_by_task_and_purpose(
-        &db,
-        "t",
-        api_types::ExecutionPurpose::AutomaticReviewRecovery,
-    )
+    let typed = sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM execution WHERE task_id='t' AND purpose='automatic_review_recovery' AND status='running'").fetch_one(db.pool())
     .await
     .unwrap();
     assert_eq!(
@@ -781,11 +777,7 @@ async fn unknown_stored_kind_and_purpose_are_typed_not_panics() {
         .await
         .unwrap();
     assert_eq!(
-        ExecutionRepo::count_by_task_and_purpose(
-            &db,
-            "t",
-            ExecutionPurpose::AutomaticReviewRecovery
-        )
+        sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM execution WHERE task_id='t' AND purpose='automatic_review_recovery' AND status='running'").fetch_one(db.pool())
         .await
         .unwrap(),
         0

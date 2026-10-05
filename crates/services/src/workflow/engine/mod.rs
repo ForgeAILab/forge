@@ -1597,6 +1597,7 @@ impl WorkflowExecution<'_> {
                     .bind(&task.id)
                     .execute(&mut *transaction)
                     .await?;
+                    db::budget::transition(&mut transaction,&task,&current_status,&actor.display(),&bridge,rejection,&transition_log_id).await?;
                     if let Some(step) = &step {
                         self.db.finish_step_in_tx(&mut transaction, step, "done", None).await?;
                     }

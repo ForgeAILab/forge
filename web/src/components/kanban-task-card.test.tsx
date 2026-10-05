@@ -43,6 +43,7 @@ function queuedTask(reason = 'project_at_capacity'): TaskListItem {
     board_position: 0,
     subtask_order: null,
     remaining_retries: {},
+  retry_limits: {},
     error_annotation: null,
     blocked: null,
     failed: null,

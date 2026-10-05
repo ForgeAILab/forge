@@ -103,6 +103,7 @@ async fn test_retry_budget_reset_preserves_history_and_refreshes_budget() {
     .await;
     let first_log_id = seed_review_rejection_log(&db, &task.id, "review failed once").await;
     let second_log_id = seed_review_rejection_log(&db, &task.id, "review failed twice").await;
+    sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review','fixture',2) ON CONFLICT(task_id,kind) DO UPDATE SET spent=2").bind(&task.id).execute(db.pool()).await.unwrap();
     let task = set_retry_exhausted_metadata(&db, &task).await;
 
     let original_logs = TransitionLogRepo::list_by_task(&*db, &task.id)
@@ -112,10 +113,10 @@ async fn test_retry_budget_reset_preserves_history_and_refreshes_budget() {
         .await
         .expect("reviews load");
     assert_eq!(
-        TransitionLogRepo::count_gate_rejections(
-            &*db,
+        db::budget::spent(
+            db.pool(),
             &task.id,
-            crate::workflow::default_states::REVIEW,
+            &db::budget::gate_key(crate::workflow::default_states::REVIEW)
         )
         .await
         .expect("rejection count loads"),
@@ -161,14 +162,14 @@ async fn test_retry_budget_reset_preserves_history_and_refreshes_budget() {
     assert!(!marker.rejection);
 
     assert_eq!(
-        TransitionLogRepo::count_gate_rejections(
-            &*db,
+        db::budget::spent(
+            db.pool(),
             &task.id,
-            crate::workflow::default_states::REVIEW,
+            &db::budget::gate_key(crate::workflow::default_states::REVIEW)
         )
         .await
         .expect("post-reset rejection count loads"),
-        1
+        0
     );
     assert_eq!(
         recovered.status,
@@ -386,10 +387,10 @@ async fn restart_starts_a_fresh_merge_retry_window() {
 
     assert_eq!(recovered.status, crate::workflow::default_states::TODO);
     assert_eq!(
-        TransitionLogRepo::count_gate_rejections(
-            &*db,
+        db::budget::spent(
+            db.pool(),
             &task.id,
-            crate::workflow::default_states::MERGING,
+            &db::budget::gate_key(crate::workflow::default_states::MERGING)
         )
         .await
         .expect("merge retry count loads"),
@@ -459,10 +460,10 @@ async fn test_retry_without_reset_from_review_reject_target_preserves_exhausted_
         .trigger_reason
         .contains("Guidance: address the latest review finding"));
     assert_eq!(
-        TransitionLogRepo::count_gate_rejections(
-            &*db,
+        db::budget::spent(
+            db.pool(),
             &task.id,
-            crate::workflow::default_states::REVIEW,
+            &db::budget::gate_key(crate::workflow::default_states::REVIEW)
         )
         .await
         .expect("post-recovery rejection count loads"),

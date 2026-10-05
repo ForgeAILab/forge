@@ -9,6 +9,7 @@ pub struct TaskListRead {
     pub board_revision: i64,
     pub list_revision: i64,
     pub workflow_definition: String,
+    pub project_settings: String,
     pub conditional_safe: bool,
 }
 
@@ -17,7 +18,7 @@ impl SqliteDb {
         let mut transaction = self.pool.begin().await?;
         // The first SELECT fixes the snapshot. Conditional hits use this indexed row and the deferred-dispatch index.
         let row = sqlx::query(
-            "SELECT board_revision, list_revision, workflow_definition FROM project WHERE id = ?",
+            "SELECT board_revision, list_revision, workflow_definition, settings FROM project WHERE id = ?",
         )
         .bind(project_id)
         .fetch_optional(&mut *transaction)
@@ -26,6 +27,7 @@ impl SqliteDb {
         Ok(TaskListRead {
             board_revision: row.try_get("board_revision")?,
             workflow_definition: row.try_get("workflow_definition")?,
+            project_settings: row.try_get("settings")?,
             list_revision: row.try_get("list_revision")?,
             conditional_safe: !sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM task WHERE project_id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL AND deleted_at IS NULL)",
@@ -36,6 +38,22 @@ impl SqliteDb {
 }
 
 impl TaskListRead {
+    pub async fn budgets(
+        &mut self,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, i64>>> {
+        let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
+        let rows=sqlx::query("SELECT task_id,kind,spent FROM task_budget WHERE task_id IN (SELECT value FROM json_each(?))").bind(ids).fetch_all(&mut *self.transaction).await?;
+        let mut result =
+            std::collections::HashMap::<String, std::collections::HashMap<String, i64>>::new();
+        for r in rows {
+            result
+                .entry(r.try_get("task_id")?)
+                .or_default()
+                .insert(r.try_get("kind")?, r.try_get("spent")?);
+        }
+        Ok(result)
+    }
     pub async fn list(&mut self, query: TaskListQuery) -> Result<Page<Task>> {
         task::list_page(&mut self.transaction, query).await
     }

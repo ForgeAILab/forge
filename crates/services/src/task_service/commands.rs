@@ -486,6 +486,16 @@ impl TaskService {
 
                     encode(Box::pin(self.advance_coordination_root(&parent_task_id)).await?)
                 }
+                "review_failure_target" => {
+                    let (id, status, execution): (String, String, Option<String>) =
+                        serde_json::from_value(command.arguments.clone())
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    let task = self.command_task(&id).await?;
+                    if task.status != status {
+                        return Err(db::DbError::VersionConflict.into());
+                    }
+                    encode(Box::pin(self.review_failure_target(&task, execution.as_deref())).await?)
+                }
                 "transition" => {
                     let (task_id, new_status, mut options): (
                         String,

@@ -445,24 +445,6 @@ impl ExecutionRepo for SqliteDb {
         .transpose()
     }
 
-    async fn count_by_task_and_purpose(
-        &self,
-        task_id: &str,
-        purpose: api_types::ExecutionPurpose,
-    ) -> Result<i64> {
-        // Only unfinished attempts count, as base's summary-prefix count did:
-        // terminalization replaced the prompt summary. 2.5 redefines this.
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM execution
-             WHERE task_id = ? AND purpose = ? AND status = 'running'",
-        )
-        .bind(task_id)
-        .bind(purpose.as_str())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(Into::into)
-    }
-
     async fn has_running_by_task_and_purpose(
         &self,
         task_id: &str,

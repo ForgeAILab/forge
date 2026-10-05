@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202610051343 (typed workflow bridges and execution purpose, data-preserving history/queue/checkpoint backfill; open kind/purpose columns and base gate-decision rules); previous V202610051045 (data-preserving single Task writer commands, replies, preemption and remote cancellation fences); previous V202610050233 (topic working sets, protected fork seeds, timeline claims, bounded native-only rotation intents and a summary-usage outbox); previous V202610042145 (level-triggered wakes, category budgets, owner escalation, per-Attention wake decisions, capped lease refunds and Project doctrine @21); previous V202610040225 (durable post-commit hook steps and hook/script checkpoints); previous V202610032100 (conflict hot-spot episodes, indexed transition-log windows and UTC installation time); previous V202610031934 (Task status epochs and step epoch fences, fast/long step lanes, retained workflow references and prune indexes; V202610031431 merge-friendly layout guidance; V202610030400 Task cascade outbox; dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
+// Embedded migration bundle revision: V202610051649 (per-kind Task budget ledger and retained-allowance backfill); previous V202610051343 (typed workflow bridges and execution purpose, data-preserving history/queue/checkpoint backfill; open kind/purpose columns and base gate-decision rules); previous V202610051045 (data-preserving single Task writer commands, replies, preemption and remote cancellation fences); previous V202610050233 (topic working sets, protected fork seeds, timeline claims, bounded native-only rotation intents and a summary-usage outbox); previous V202610042145 (level-triggered wakes, category budgets, owner escalation, per-Attention wake decisions, capped lease refunds and Project doctrine @21); previous V202610040225 (durable post-commit hook steps and hook/script checkpoints); previous V202610032100 (conflict hot-spot episodes, indexed transition-log windows and UTC installation time); previous V202610031934 (Task status epochs and step epoch fences, fast/long step lanes, retained workflow references and prune indexes; V202610031431 merge-friendly layout guidance; V202610030400 Task cascade outbox; dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later
@@ -483,6 +483,10 @@ async fn apply_migration_sql(pool: &SqlitePool, migration: &Migration, sql: &str
         let mut transaction = crate::begin_immediate(pool).await?;
 
         sqlx::raw_sql(sql).execute(&mut *transaction).await?;
+        if migration.name == "task_budgets" {
+            crate::budget::normalize_retained_policy(&mut transaction).await?;
+            crate::budget::migrate_pending_mutations(&mut transaction, pool).await?;
+        }
         sqlx::query("INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(migration.version)
             .bind(&migration.name)
@@ -594,6 +598,7 @@ mod tests {
         let expected: std::collections::BTreeSet<String> =
             include_str!("../migrations/V202610011636__task_list_revisions.sql")
                 .lines()
+                .chain(include_str!("../migrations/V202610051649__task_budgets.sql").lines())
                 .filter_map(|line| line.strip_prefix("CREATE TRIGGER "))
                 .filter_map(|line| line.split_whitespace().next())
                 .filter(|name| name.starts_with("task_list_revision_"))

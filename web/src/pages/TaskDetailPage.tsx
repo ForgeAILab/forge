@@ -31,7 +31,6 @@ import {
   getErrorInfo,
   getLatestReview,
   getTaskDetailApiErrorMessage,
-  isRecord,
   readTaskStateConfig,
   stripRunSuffix,
   type UpdateTaskRequestWithStateConfig,
@@ -46,7 +45,6 @@ import type {
   
   
   TaskStatus,
-  WorkflowDefinition,
 } from '@/types/generated'
 
 export type TaskDetailTab =
@@ -70,29 +68,6 @@ export const taskDetailTabs = [
 
 export function isTaskDetailTab(value: string | undefined): value is TaskDetailTab {
   return taskDetailTabs.some((tab) => tab === value)
-}
-
-function retryBudgetFromStateConfig(
-  workflow: WorkflowDefinition | undefined,
-  taskStatus?: string,
-): Record<string, unknown> | undefined {
-  if (!workflow) return undefined
-  const review = workflow.states.find((state) => state.name === 'review')
-  const mergeFailed = workflow.states.find((state) => state.name === 'merge_failed')
-  const current = workflow.states.find((state) => state.name === taskStatus)
-  const mergeBudgets = isRecord(mergeFailed?.config.retry_budgets)
-    ? mergeFailed.config.retry_budgets
-    : undefined
-  const currentBudgets = isRecord(current?.config.retry_budgets)
-    ? current.config.retry_budgets
-    : undefined
-  return {
-    ...(review?.gate_config?.max_rejections == null
-      ? {}
-      : { review: review.gate_config.max_rejections }),
-    ...(mergeBudgets?.merge_fix == null ? {} : { merge_fix: mergeBudgets.merge_fix }),
-    ...(currentBudgets?.execution == null ? {} : { execution: currentBudgets.execution }),
-  }
 }
 
 export function TaskDetailPage({
@@ -145,7 +120,9 @@ export function TaskDetailPage({
   const comments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data])
   const workflow = taskDetailQuery.data?.workflow
   const effectiveWorkflow = workflow
-  const workflowRetryBudgets = retryBudgetFromStateConfig(effectiveWorkflow, task?.status)
+  const workflowRetryBudgets = task?.retry_limits
+    ? { review: task.retry_limits.review, merge_fix: task.retry_limits.merge_fix, execution: task.retry_limits.execution }
+    : undefined
 
   const errorInfo = task ? getErrorInfo(task) : undefined
   const showReviewTab = true

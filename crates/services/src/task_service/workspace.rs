@@ -3652,7 +3652,7 @@ mod tests {
         let workspace_root = TempDir::new().unwrap();
         let (project_id, _) = seed_project_with_real_repo(&db, repo_dir.path()).await;
         let task = seed_task(&db, &project_id, None).await;
-        sqlx::query("UPDATE task SET metadata_json = '{\"execution_retry_count\":2}' WHERE id = ?")
+        sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'execution','fixture',2) ON CONFLICT(task_id,kind) DO UPDATE SET spent=2")
             .bind(&task.id)
             .execute(db.pool())
             .await

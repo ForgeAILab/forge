@@ -126,6 +126,7 @@ describe('task interruption annotations', () => {
       effective_coder: null,
       effective_coder_source: null,
       remaining_retries: {},
+  retry_limits: {},
       placement: null,
       blocked: null,
       failed: null,

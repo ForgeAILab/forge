@@ -1,10 +1,8 @@
 use async_trait::async_trait;
-use db::TransitionLogRepo;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
     merge_service::MergeOutcome,
-    task_service::config::{runtime_retry_budget, RetryBudgetKind},
     workflow::{default_states, HookAction, HookContext, HookResult},
 };
 
@@ -205,12 +203,15 @@ impl HookAction for RunMerge {
                 // committed with markers and handed back, exactly as when the
                 // target moves under an agent-reviewed candidate. A merge-fix
                 // budget of 0 opts the Project out of automatic merge repair.
-                match runtime_retry_budget(
+                match db::budget::task_limit(
+                    &ctx.db,
                     &task,
-                    RetryBudgetKind::MergeFix,
+                    db::budget::Kind::MergeFix,
                     Some(&ctx.state_config),
                     ctx.gate_config.as_ref(),
-                ) {
+                )
+                .await
+                {
                     Ok(0) => {
                         return merge_failure_result(
                             ctx,
@@ -388,19 +389,7 @@ fn merge_budget_annotation(reason: &str) -> String {
 /// can legitimately lose several in a row. Five is well above realistic
 /// contention for a single repository while still bounding a livelock where
 /// the target branch is being written faster than this Task can be reviewed.
-const MAX_TARGET_MOVED_REBASES: i64 = 5;
-
-fn target_moved_rebases_since_boundary(entries: &[db::TransitionLog]) -> i64 {
-    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
-    let entries = crate::task_diagnostics::entries_since_retry_window_boundary(entries, None);
-    entries
-        .iter()
-        .filter(|entry| {
-            entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::TargetMovedRebase)
-                && entry.triggered_by == workflow_actor
-        })
-        .count() as i64
-}
+const MAX_TARGET_MOVED_REBASES: i64 = db::budget::Kind::TargetMovedRebase.default_limit() as i64;
 
 /// The integration target moved while this Task was in review.
 ///
@@ -418,13 +407,17 @@ pub(crate) async fn target_moved_result(
     reason: &str,
     target_branch: &str,
 ) -> HookResult {
-    let entries = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            return failed(ctx, error);
-        }
+    let count = match db::budget::spent(
+        ctx.db.pool(),
+        &ctx.task_id,
+        db::budget::Kind::TargetMovedRebase.key(),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(error) => return failed(ctx, error),
     };
-    if target_moved_rebases_since_boundary(&entries) >= MAX_TARGET_MOVED_REBASES {
+    if !db::budget::allows_retry(MAX_TARGET_MOVED_REBASES, count) {
         let block_reason = format!(
             "{target_branch} kept advancing during review; stopped after {MAX_TARGET_MOVED_REBASES} rebase attempts"
         );
@@ -654,18 +647,7 @@ bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::Target
 /// Forge escalates. Each handoff is a *new* conflict — a sibling landed first
 /// again — not a failed repair; a repair that leaves markers behind escalates
 /// on its own through [`MergeOutcome::UnresolvedConflictMarkers`].
-const MAX_CONFLICT_HANDOFFS: i64 = 5;
-
-fn conflict_handoffs_since_boundary(entries: &[db::TransitionLog]) -> i64 {
-    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
-    crate::task_diagnostics::entries_since_retry_window_boundary(entries, None)
-        .iter()
-        .filter(|entry| {
-            entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff)
-                && entry.triggered_by == workflow_actor
-        })
-        .count() as i64
-}
+const MAX_CONFLICT_HANDOFFS: i64 = db::budget::Kind::ConflictHandoff.default_limit() as i64;
 
 /// A rebase onto the moved target conflicted and Forge committed the conflict
 /// with its markers. Send the Task to `merge_failed` so its Worker reconciles
@@ -677,14 +659,18 @@ async fn conflict_handoff_result(
     target_branch: &str,
     paths: &[String],
 ) -> HookResult {
-    let entries = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            return failed(ctx, error);
-        }
+    let count = match db::budget::spent(
+        ctx.db.pool(),
+        &ctx.task_id,
+        db::budget::Kind::ConflictHandoff.key(),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(error) => return failed(ctx, error),
     };
     let files = paths.join(", ");
-    if conflict_handoffs_since_boundary(&entries) >= MAX_CONFLICT_HANDOFFS {
+    if !db::budget::allows_retry(MAX_CONFLICT_HANDOFFS, count) {
         let block_reason = format!(
             "rebase onto {target_branch} conflicted again after {MAX_CONFLICT_HANDOFFS} conflict repairs (now in {files}); the branch is committed with conflict markers for repair"
         );
@@ -818,28 +804,31 @@ pub(super) async fn merge_failure_result(
         return HookResult::Ok;
     }
 
-    let budget = match runtime_retry_budget(
+    let budget = match db::budget::task_limit(
+        &ctx.db,
         &task,
-        RetryBudgetKind::MergeFix,
+        db::budget::Kind::MergeFix,
         Some(&ctx.state_config),
         ctx.gate_config.as_ref(),
-    ) {
+    )
+    .await
+    {
         Ok(budget) => budget,
         Err(error) => {
             return failed(ctx, error);
         }
     };
-    let existing_follow_ups = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-        Ok(entries) => crate::task_diagnostics::count_gate_rejections_since_boundary(
-            &entries,
-            default_states::MERGING,
-        ),
-        Err(error) => {
-            return failed(ctx, error);
-        }
+    let existing_follow_ups = match db::budget::spent(
+        ctx.db.pool(),
+        &ctx.task_id,
+        db::budget::Kind::MergeFix.key(),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(error) => return failed(ctx, error),
     };
-
-    if existing_follow_ups >= i64::from(budget) {
+    if !db::budget::allows_retry(i64::from(budget), existing_follow_ups) {
         let block_reason = "merge-fix retry budget exhausted";
         if let Err(error) = block_task_with_annotation(
             ctx,

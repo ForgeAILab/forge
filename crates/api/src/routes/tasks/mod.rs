@@ -2,7 +2,7 @@ use api_types::{
     Actor, AddDependencyRequest, AssignRoleRequest, AuthorType, CanonicalPhase, ClaimTaskRequest,
     CommentResponse, CreateCommentRequest, CreateTaskRequest, DiffEnvelope, HookResultEntry,
     LaunchExecutionRequest, LaunchExecutionResponse, MoveTaskRequest, MoveTaskResponse,
-    PaginatedResponse, PromptPreviewResponse, ReorderSubtasksRequest, ReviewConfig, StateKind,
+    PaginatedResponse, PromptPreviewResponse, ReorderSubtasksRequest, ReviewConfig,
     SystemComponent, TaskActionRequest, TaskDependency, TaskMediaResponse, TaskResponse,
     TaskRoleAssignmentResponse, TasksResponse, TransitionLogEntry, TransitionSource,
     TransitionTaskRequest, TransitionTaskResponse, UpdateTaskRequest, WorkflowTrigger,

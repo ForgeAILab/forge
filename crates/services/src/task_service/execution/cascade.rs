@@ -851,26 +851,22 @@ impl TaskService {
             return Ok(());
         }
 
-        let budget = crate::task_service::config::runtime_retry_budget(
+        let budget = db::budget::task_limit(
+            &self.db,
             task,
-            crate::task_service::config::RetryBudgetKind::Execution,
+            db::budget::Kind::Execution,
             Some(&current_state.config),
             current_state.gate_config.as_ref(),
-        )?;
-        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "invalid task metadata for {}: {error}",
-                task.id
-            ))
-        })?;
-        let retry_count = metadata
-            .extra
-            .get("workflow_guard_retry_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        )
+        .await?;
+        let retry_count = db::budget::spent(
+            self.db.pool(),
+            &task.id,
+            db::budget::Kind::WorkflowGuard.key(),
+        )
+        .await? as u64;
 
-        if budget <= 0
-            || retry_count >= budget as u64
+        if !db::budget::allows_retry(i64::from(budget), retry_count as i64)
             || execution.agent_session_id.is_none()
             || execution.agent_id.is_none()
         {
@@ -886,10 +882,11 @@ impl TaskService {
             task.version,
             super::latest_execution_authority(execution, project.version),
             vec![
-                db::TaskMetadataMutation::Increment {
-                    key: "workflow_guard_retry_count".to_owned(),
-                    by: 1,
-                },
+                db::TaskMetadataMutation::Budget(db::budget::Mutation::Charge {
+                    key: db::budget::Kind::WorkflowGuard.key().into(),
+                    limit: i64::from(budget),
+                    step: format!("guard:{}", execution.id),
+                }),
                 db::TaskMetadataMutation::Set {
                     key: "last_workflow_guard_rejection_at".to_owned(),
                     value: Value::String(now.clone()),
@@ -913,28 +910,12 @@ impl TaskService {
         else {
             return Ok(());
         };
-        let updated_metadata =
-            TaskMetadata::parse(updated_task.metadata_json.as_deref()).map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "invalid task metadata for {}: {error}",
-                    task.id
-                ))
-            })?;
-        let attempt = updated_metadata
-            .extra
-            .get("workflow_guard_retry_count")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(format!(
-                    "workflow guard retry counter missing for task {}",
-                    task.id
-                ))
-            })?;
-        if attempt > budget as u64 {
-            return self
-                .annotate_workflow_guard_block(execution, &updated_task, guard, reason)
-                .await;
-        }
+        let attempt = db::budget::spent(
+            self.db.pool(),
+            &task.id,
+            db::budget::Kind::WorkflowGuard.key(),
+        )
+        .await? as u64;
 
         let prompt = render_workflow_guard_follow_up_prompt(guard, reason, attempt, budget as u64);
         self.resume_execution_for_workflow_guard(execution, &updated_task, prompt)
@@ -1102,94 +1083,48 @@ impl TaskService {
         Ok(())
     }
 
+    fn guard_success_mutations(task: &Task, identity: &str) -> Vec<db::TaskMetadataMutation> {
+        let mut mutations = vec![db::TaskMetadataMutation::Budget(
+            db::budget::Mutation::Reset {
+                key: db::budget::Kind::WorkflowGuard.key().into(),
+                window: format!("success:{identity}"),
+            },
+        )];
+        for key in [
+            "last_workflow_guard_rejection_at",
+            "last_workflow_guard_name",
+            "last_workflow_guard_reason",
+            "last_workflow_guard_execution_id",
+        ] {
+            mutations.push(db::TaskMetadataMutation::Remove { key: key.into() });
+        }
+        let _ = task;
+        mutations
+    }
     async fn clear_workflow_guard_retry_metadata(&self, task: &Task) -> Result<()> {
-        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "invalid task metadata for {}: {error}",
-                task.id
-            ))
-        })?;
-        let Some(expected_count) = metadata.extra.get("workflow_guard_retry_count").cloned() else {
-            return Ok(());
-        };
         TaskRepo::mutate_metadata(
             &*self.db,
             &task.id,
             None,
-            vec![db::TaskMetadataMutation::CompareAndMutate {
-                key: "workflow_guard_retry_count".to_owned(),
-                expected: expected_count,
-                mutations: vec![
-                    db::TaskMetadataMutation::Remove {
-                        key: "workflow_guard_retry_count".to_owned(),
-                    },
-                    db::TaskMetadataMutation::Remove {
-                        key: "last_workflow_guard_rejection_at".to_owned(),
-                    },
-                    db::TaskMetadataMutation::Remove {
-                        key: "last_workflow_guard_name".to_owned(),
-                    },
-                    db::TaskMetadataMutation::Remove {
-                        key: "last_workflow_guard_reason".to_owned(),
-                    },
-                    db::TaskMetadataMutation::Remove {
-                        key: "last_workflow_guard_execution_id".to_owned(),
-                    },
-                ],
-            }],
+            Self::guard_success_mutations(task, &task.updated_at),
             &now_rfc3339(),
         )
         .await?;
         Ok(())
     }
-
     async fn clear_workflow_guard_retry_metadata_for_latest_execution(
         &self,
         task: &Task,
         execution: &Execution,
         project_version: i64,
     ) -> Result<bool> {
-        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "invalid task metadata for {}: {error}",
-                task.id
-            ))
-        })?;
-        let mutations = metadata
-            .extra
-            .get("workflow_guard_retry_count")
-            .cloned()
-            .map(|expected_count| {
-                vec![db::TaskMetadataMutation::CompareAndMutate {
-                    key: "workflow_guard_retry_count".to_owned(),
-                    expected: expected_count,
-                    mutations: vec![
-                        db::TaskMetadataMutation::Remove {
-                            key: "workflow_guard_retry_count".to_owned(),
-                        },
-                        db::TaskMetadataMutation::Remove {
-                            key: "last_workflow_guard_rejection_at".to_owned(),
-                        },
-                        db::TaskMetadataMutation::Remove {
-                            key: "last_workflow_guard_name".to_owned(),
-                        },
-                        db::TaskMetadataMutation::Remove {
-                            key: "last_workflow_guard_reason".to_owned(),
-                        },
-                        db::TaskMetadataMutation::Remove {
-                            key: "last_workflow_guard_execution_id".to_owned(),
-                        },
-                    ],
-                }]
-            })
-            .unwrap_or_default();
         Ok(
             TaskRepo::mutate_metadata_and_bump_version_for_latest_execution(
                 &*self.db,
                 &task.id,
                 task.version,
                 super::latest_execution_authority(execution, project_version),
-                mutations,
+                Self::guard_success_mutations(task, &execution.id),
                 &now_rfc3339(),
             )
             .await?
@@ -1549,13 +1484,15 @@ impl TaskService {
             ));
         }
 
-        let budget = crate::task_service::config::runtime_retry_budget(
+        let budget = db::budget::task_limit(
+            &self.db,
             task,
-            crate::task_service::config::RetryBudgetKind::Execution,
+            db::budget::Kind::Execution,
             state_config,
             gate_config,
-        )?;
-        if budget <= 0 {
+        )
+        .await?;
+        if !db::budget::allows_retry(i64::from(budget), 0) {
             return Ok(ExecutionRetryDisposition::NotScheduled(
                 "automatic retries are disabled by the execution retry budget",
             ));
@@ -1567,11 +1504,9 @@ impl TaskService {
                 task.id
             ))
         })?;
-        let retry_count = metadata
-            .extra
-            .get("execution_retry_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let retry_count =
+            db::budget::spent(self.db.pool(), &task.id, db::budget::Kind::Execution.key()).await?
+                as u64;
         let already_recorded = metadata
             .extra
             .get("last_execution_failure_execution_id")
@@ -1610,7 +1545,7 @@ impl TaskService {
             .await?;
             return Ok(ExecutionRetryDisposition::Scheduled);
         }
-        if retry_count >= budget as u64 {
+        if !db::budget::allows_retry(i64::from(budget), retry_count as i64) {
             return Ok(ExecutionRetryDisposition::NotScheduled(
                 "retry budget exhausted",
             ));
@@ -1647,10 +1582,11 @@ impl TaskService {
             &next_dispatch_at.to_rfc3339(),
             &reason,
             vec![
-                db::TaskMetadataMutation::Increment {
-                    key: "execution_retry_count".to_owned(),
-                    by: 1,
-                },
+                db::TaskMetadataMutation::Budget(db::budget::Mutation::Charge {
+                    key: db::budget::Kind::Execution.key().into(),
+                    limit: i64::from(budget),
+                    step: format!("failure:{}", execution.id),
+                }),
                 db::TaskMetadataMutation::Set {
                     key: "last_execution_failure_at".to_owned(),
                     value: Value::String(now.clone()),
@@ -1911,7 +1847,8 @@ impl TaskService {
         };
         let passed = conformance.status == api_types::ConformanceStatus::Passed;
         let blocked = conformance.status == api_types::ConformanceStatus::Blocked;
-        let owner_finding = owner_review_failure_message(&conformance, &review, &reviews);
+        let owner_finding =
+            db::budget::owner_review_failure_message(&conformance, &review, &reviews);
         let status = if passed && user_approval_required {
             ReviewStatus::AwaitingHuman
         } else if passed {
@@ -2232,7 +2169,7 @@ impl TaskService {
                     }
                     let reviews = ReviewRepo::list_by_task(&*self.db, &task.id).await?;
                     if let Some(message) =
-                        owner_review_failure_message(&conformance, review, &reviews)
+                        db::budget::owner_review_failure_message(&conformance, review, &reviews)
                     {
                         return self
                             .block_task_for_review_finding(
@@ -2355,7 +2292,7 @@ impl TaskService {
             &finished_at,
             task.version,
             None,
-            db::ReviewEventOrigin::Runner,
+            db::ReviewEventOrigin::Executor,
         )
         .await?;
 
@@ -2409,6 +2346,30 @@ impl TaskService {
         task: &Task,
         execution_id: Option<&str>,
     ) -> Result<(Task, Option<String>, String)> {
+        if !db::task_writer::owns_task(&task.id) {
+            return self
+                .request_task_command(
+                    &task.id,
+                    "review_failure_target",
+                    json!([task.id, task.status, execution_id]),
+                    false,
+                )
+                .await;
+        }
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        if current.status != task.status {
+            return Err(DbError::VersionConflict.into());
+        }
+        let task = &current;
+        if let Some(review) =
+            ReviewRepo::list_latest_reviews_for_tasks(&*self.db, &[task.id.as_str()])
+                .await?
+                .first()
+        {
+            db::budget::reconcile_failed_review(&self.db, task, review).await?;
+        }
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -2421,16 +2382,17 @@ impl TaskService {
             .states
             .iter()
             .find(|state| state.name == task.status);
-        let budget = crate::task_service::config::runtime_retry_budget(
+        let budget = db::budget::task_limit(
+            &self.db,
             task,
-            crate::task_service::config::RetryBudgetKind::Review,
+            db::budget::Kind::Review,
             review_state.map(|state| &state.config),
             review_state.and_then(|state| state.gate_config.as_ref()),
-        )?;
-        let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
+        )
+        .await?;
         let existing_count =
-            crate::task_diagnostics::count_gate_rejections_since_boundary(&entries, &task.status);
-        if existing_count + 1 >= i64::from(budget) {
+            db::budget::spent(self.db.pool(), &task.id, db::budget::Kind::Review.key()).await?;
+        if !db::budget::allows_retry(i64::from(budget), existing_count) {
             let reason = "review retry budget exhausted";
             if let Some((task, recovery_reason)) = self
                 .try_dispatch_automatic_review_recovery(
@@ -2565,14 +2527,14 @@ impl TaskService {
             return Ok(None);
         };
 
-        let max_attempts = recovery.max_attempts.max(1) as usize;
-        let recovery_attempts = ExecutionRepo::count_by_task_and_purpose(
-            &*self.db,
+        let max_attempts = db::budget::recovery_limit(&project.settings) as usize;
+        let recovery_attempts = db::budget::spent(
+            self.db.pool(),
             &task.id,
-            api_types::ExecutionPurpose::AutomaticReviewRecovery,
+            db::budget::Kind::AutomaticReviewRecovery.key(),
         )
         .await? as usize;
-        if recovery_attempts >= max_attempts {
+        if !db::budget::allows_retry(max_attempts as i64, recovery_attempts as i64) {
             return Ok(None);
         }
         if ExecutionRepo::has_running_by_task_and_purpose(
@@ -2757,56 +2719,6 @@ impl TaskService {
 /// How many times Forge runs a review's clean-checkout checks before a
 /// timeout parks the Task instead of retrying.
 const REVIEW_CHECK_ATTEMPTS: u32 = 3;
-
-/// Honor routing only when the reviewer verdict caused the failure. Forge
-/// replaces the assessment reason when setup, checks, or reproduction fail.
-fn owner_review_failure_message(
-    conformance: &api_types::ReviewConformance,
-    review: &Review,
-    reviews: &[Review],
-) -> Option<String> {
-    let assessment = conformance.assessment.as_ref()?;
-    if conformance.status != api_types::ConformanceStatus::Failed
-        || assessment.result != api_types::ReviewResult::Fail
-        || conformance.checks.iter().any(|check| check.exit_code != 0)
-        || conformance.reason.as_deref().unwrap_or_default() != assessment.reason
-    {
-        return None;
-    }
-    let reason = if assessment.reason.is_empty() {
-        "reviewer reported a blocking finding"
-    } else {
-        &assessment.reason
-    };
-    if assessment.fixable_by == api_types::FixableBy::Owner {
-        return Some(format!("fixable by owner: {reason}"));
-    }
-    let previous_failed = reviews
-        .iter()
-        .filter(|previous| previous.attempt_number < review.attempt_number)
-        .max_by_key(|previous| (previous.attempt_number, previous.id.as_str()))
-        .is_some_and(|previous| {
-            previous.status == ReviewStatus::Failed
-                && strict_review_details(previous)
-                    .ok()
-                    .and_then(|details| {
-                        serde_json::from_value::<api_types::ReviewConformance>(
-                            details["conformance"].clone(),
-                        )
-                        .ok()
-                    })
-                    .is_some_and(|conformance| {
-                        conformance.status == api_types::ConformanceStatus::Failed
-                            && conformance.checks.iter().all(|check| check.exit_code == 0)
-                            && conformance.assessment.as_ref().is_some_and(|assessment| {
-                                assessment.result == api_types::ReviewResult::Fail
-                                    && conformance.reason.as_deref()
-                                        == Some(assessment.reason.as_str())
-                            })
-                    })
-        });
-    (assessment.repeat && previous_failed).then(|| format!("repeated finding: {reason}"))
-}
 
 /// Whether `task` is already parked by a review-environment block that this
 /// reviewer execution raised.

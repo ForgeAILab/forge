@@ -18,7 +18,7 @@ use super::common::{
 /// before a real review is required again. Each carry is a fresh chance for
 /// the tree to drift from what the reviewer saw, so the bound keeps a Task that
 /// keeps losing merge races from riding one approval indefinitely.
-pub(crate) const MAX_REVIEW_CARRIES: i64 = 5;
+pub(crate) const MAX_REVIEW_CARRIES: i64 = db::budget::Kind::ReviewCarry.default_limit() as i64;
 
 /// `on_enter` hook of `review`, ahead of reviewer dispatch: when the Task
 /// arrives here only because Forge rebased it (or its Worker reconciled a
@@ -163,7 +163,7 @@ async fn carry(ctx: &HookContext) -> Result<HookResult, CarryError> {
     if base.review_id != review.id {
         return Err(ineligible("the open review attempt changed"));
     }
-    if base.carries_since_review >= MAX_REVIEW_CARRIES {
+    if !db::budget::allows_retry(MAX_REVIEW_CARRIES, base.carries_since_review) {
         return Err(ineligible(format!(
             "{MAX_REVIEW_CARRIES} integrations were already carried under this review"
         )));

@@ -795,11 +795,10 @@ async fn condition_stored_data_scenarios() {
         for row in rows {
             db::TransitionLogRepo::insert(&*db, row).await.unwrap();
         }
-        let memory =
-            crate::task_diagnostics::count_gate_rejections_for_task(&db, &task.id, "review")
-                .await
-                .unwrap();
-        let sql = db::TransitionLogRepo::count_gate_rejections(&*db, &task.id, "review")
+        let memory = crate::task_diagnostics::budget_spent_for_gate(&db, &task.id, "review")
+            .await
+            .unwrap();
+        let sql = db::budget::spent(db.pool(), &task.id, &db::budget::gate_key("review"))
             .await
             .unwrap();
         let _ = writeln!(out, "D1 two rejections: memory={memory} sql={sql}");
@@ -812,11 +811,10 @@ async fn condition_stored_data_scenarios() {
         ] {
             let row = log("review", "review", name, false);
             db::TransitionLogRepo::insert(&*db, row).await.unwrap();
-            let memory =
-                crate::task_diagnostics::count_gate_rejections_for_task(&db, &task.id, "review")
-                    .await
-                    .unwrap();
-            let sql = db::TransitionLogRepo::count_gate_rejections(&*db, &task.id, "review")
+            let memory = crate::task_diagnostics::budget_spent_for_gate(&db, &task.id, "review")
+                .await
+                .unwrap();
+            let sql = db::budget::spent(db.pool(), &task.id, &db::budget::gate_key("review"))
                 .await
                 .unwrap();
             let _ = writeln!(
@@ -829,11 +827,10 @@ async fn condition_stored_data_scenarios() {
             db::TransitionLogRepo::insert(&*db, row).await.unwrap();
             let row = log("review", "review", name, false);
             db::TransitionLogRepo::insert(&*db, row).await.unwrap();
-            let memory =
-                crate::task_diagnostics::count_gate_rejections_for_task(&db, &task.id, "review")
-                    .await
-                    .unwrap();
-            let sql = db::TransitionLogRepo::count_gate_rejections(&*db, &task.id, "review")
+            let memory = crate::task_diagnostics::budget_spent_for_gate(&db, &task.id, "review")
+                .await
+                .unwrap();
+            let sql = db::budget::spent(db.pool(), &task.id, &db::budget::gate_key("review"))
                 .await
                 .unwrap();
             let _ = writeln!(
@@ -845,11 +842,10 @@ async fn condition_stored_data_scenarios() {
         db::TransitionLogRepo::insert(&*db, row).await.unwrap();
         let row = log("review", "review", "retry", false);
         db::TransitionLogRepo::insert(&*db, row).await.unwrap();
-        let memory =
-            crate::task_diagnostics::count_gate_rejections_for_task(&db, &task.id, "review")
-                .await
-                .unwrap();
-        let sql = db::TransitionLogRepo::count_gate_rejections(&*db, &task.id, "review")
+        let memory = crate::task_diagnostics::budget_spent_for_gate(&db, &task.id, "review")
+            .await
+            .unwrap();
+        let sql = db::budget::spent(db.pool(), &task.id, &db::budget::gate_key("review"))
             .await
             .unwrap();
         let _ = writeln!(
@@ -876,10 +872,9 @@ async fn condition_stored_data_scenarios() {
         seed_review_rejection_log(&db, &task.id, "first").await;
         seed_review_rejection_log(&db, &task.id, "second").await;
         let task = set_retry_exhausted_metadata(&db, &reload(&db, &task.id).await).await;
-        let before =
-            crate::task_diagnostics::count_gate_rejections_for_task(&db, &task.id, "review")
-                .await
-                .unwrap();
+        let before = crate::task_diagnostics::budget_spent_for_gate(&db, &task.id, "review")
+            .await
+            .unwrap();
         let offers = offers_text(&service, &task.id).await;
         let command = service
             .perform_task_action(
@@ -905,11 +900,10 @@ async fn condition_stored_data_scenarios() {
             ));
         }
         let after = reload(&db, &task.id).await;
-        let memory =
-            crate::task_diagnostics::count_gate_rejections_for_task(&db, &task.id, "review")
-                .await
-                .unwrap();
-        let sql = db::TransitionLogRepo::count_gate_rejections(&*db, &task.id, "review")
+        let memory = crate::task_diagnostics::budget_spent_for_gate(&db, &task.id, "review")
+            .await
+            .unwrap();
+        let sql = db::budget::spent(db.pool(), &task.id, &db::budget::gate_key("review"))
             .await
             .unwrap();
         let logs = db::TransitionLogRepo::list_by_task(&*db, &task.id)

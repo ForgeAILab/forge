@@ -230,8 +230,8 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
     assert_eq!(result.status, "in_progress");
     assert_eq!(
         result.remaining_retries.get("review"),
-        Some(&1),
-        "the API projection must share the fresh retry window with runtime admission"
+        Some(&2),
+        "owner send-back preserves the freshly reset agent budget"
     );
     assert_eq!(
         harness
@@ -240,8 +240,8 @@ async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up()
             .remaining_retries(&task_id)
             .await
             .expect("post-rejection retry budget resolves"),
-        1,
-        "the rejection after an explicit reset consumes only the fresh window"
+        2,
+        "owner rejection leaves the freshly reset agent budget untouched"
     );
     // The send-back commits the coder follow-up as queued dispatch intent and
     // leaves the in_progress entry's hooks step pending; that step fences

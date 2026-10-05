@@ -296,6 +296,13 @@ pub struct LatestExecutionMetadataClaim {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TaskMetadataMutation {
+    Budget(crate::budget::Mutation),
+    BudgetIfSpent {
+        key: String,
+        expected: i64,
+        window_id: String,
+        mutations: Vec<Self>,
+    },
     Set {
         key: String,
         value: serde_json::Value,
@@ -1398,11 +1405,6 @@ pub trait ExecutionRepo: Send + Sync {
     ) -> Result<Option<Execution>>;
     /// Count and test in-flight automatic recovery executions without loading
     /// the complete execution history into the service process.
-    async fn count_by_task_and_purpose(
-        &self,
-        task_id: &str,
-        purpose: api_types::ExecutionPurpose,
-    ) -> Result<i64>;
     async fn has_running_by_task_and_purpose(
         &self,
         task_id: &str,
@@ -1812,12 +1814,13 @@ pub trait ScopedMemoryRepository: Send + Sync {
 pub enum ReviewEventOrigin {
     Runner,
     User,
+    Executor,
 }
 
 impl ReviewEventOrigin {
     pub(crate) fn actor_type(self) -> &'static str {
         match self {
-            Self::Runner => "review_runner",
+            Self::Runner | Self::Executor => "review_runner",
             Self::User => "user",
         }
     }
@@ -3618,11 +3621,6 @@ pub trait TransitionLogRepo: Send + Sync {
         task_id: &str,
     ) -> std::result::Result<Vec<TransitionLog>, crate::DbError>;
     async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TransitionLog>>;
-    async fn count_gate_rejections(
-        &self,
-        task_id: &str,
-        gate_state: &str,
-    ) -> std::result::Result<i64, crate::DbError>;
     async fn count_to_state_since(
         &self,
         task_id: &str,

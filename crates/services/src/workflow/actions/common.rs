@@ -3,7 +3,7 @@ use std::sync::Arc;
 use db::{
     new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, Execution, ExecutionRepo,
     ProjectRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo, TaskRoleAssignment,
-    TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    UpdateTask, WorkspaceRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
@@ -218,12 +218,15 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
         Ok(task) => task,
         Err(reason) => return Some(HookResult::Failed { reason }),
     };
-    let budget = match crate::task_service::config::runtime_retry_budget(
+    let budget = match db::budget::task_limit(
+        &ctx.db,
         &task,
-        crate::task_service::config::RetryBudgetKind::MergeFix,
+        db::budget::Kind::MergeFix,
         Some(&ctx.state_config),
         ctx.gate_config.as_ref(),
-    ) {
+    )
+    .await
+    {
         Ok(budget) => budget,
         Err(error) => {
             return Some(HookResult::Failed {
@@ -231,21 +234,24 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
             });
         }
     };
-    let count = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-        Ok(entries) => crate::task_diagnostics::count_gate_rejections_since_boundary(
-            &entries,
-            default_states::MERGING,
-        ),
+    let count = match db::budget::spent(
+        ctx.db.pool(),
+        &ctx.task_id,
+        db::budget::Kind::MergeFix.key(),
+    )
+    .await
+    {
+        Ok(n) => n,
         Err(error) => {
             return Some(HookResult::Failed {
                 reason: error.to_string(),
-            });
+            })
         }
     };
     // This runs after `merging -> merge_failed` has been logged. The current
     // merge_failed entry consumes one allowed merge-fix follow-up, so exhaustion
     // is count > budget here; budget=0 blocks on the first conflict.
-    if count > i64::from(budget) {
+    if db::budget::after_charge_exhausted(i64::from(budget), count) {
         let reason = "merge-fix follow-up failed: conflict";
         if let Err(error) = block_task(
             ctx,

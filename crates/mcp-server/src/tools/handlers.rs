@@ -181,7 +181,22 @@ async fn tasks_with_role_assignments(
     let mut values = Vec::with_capacity(tasks.len());
     for task in tasks {
         let assignments = TaskRoleAssignmentRepo::list_by_task(&*state.db, &task.id).await?;
+        let budget_counts = db::budget::load(state.db.pool(), &task.id).await?;
+        let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        let workflow = services::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            &Actor::system(api_types::SystemComponent::General),
+        );
+        let workflow = db::budget::with_project_defaults(&workflow, &project.settings);
+        let recovery_limit = db::budget::recovery_limit(&project.settings);
+        let remaining = db::budget::projection(&task, &workflow, &budget_counts, recovery_limit)?;
+        let limits = db::budget::projection(&task, &workflow, &Default::default(), recovery_limit)?;
         let mut value = task_value(task);
+        value["remaining_retries"] = json!(remaining);
+        value["retry_limits"] = json!(limits);
         if let Some(object) = value.as_object_mut() {
             object.insert(
                 "role_assignments".to_owned(),
@@ -429,7 +444,21 @@ pub(super) async fn forge_get_task(
 fn task_snapshot_value(snapshot: services::TaskSnapshot) -> Result<Value, McpToolError> {
     let offers = services::available_actions(&snapshot);
     let exception = services::task_diagnostics::task_exception(&snapshot, offers.clone());
+    let remaining = db::budget::projection(
+        &snapshot.task,
+        &snapshot.workflow,
+        &snapshot.budget_spent,
+        snapshot.recovery_budget_limit,
+    )?;
+    let limits = db::budget::projection(
+        &snapshot.task,
+        &snapshot.workflow,
+        &Default::default(),
+        snapshot.recovery_budget_limit,
+    )?;
     let mut value = task_value(snapshot.task);
+    value["remaining_retries"] = json!(remaining);
+    value["retry_limits"] = json!(limits);
     value["available_actions"] = json!(offers);
     value["workflow_exception"] = serde_json::to_value(exception)
         .map_err(|error| McpToolError::new(-32603, error.to_string()))?;

@@ -981,6 +981,27 @@ impl SqliteDb {
             self.ensure_agent_execution_capacity_in_tx(transaction, input, admission)
                 .await?;
         }
+        if admission.and_then(|a| a.purpose)
+            == Some(api_types::ExecutionPurpose::AutomaticReviewRecovery)
+        {
+            let settings: String = sqlx::query_scalar(
+                "SELECT settings FROM project WHERE id=(SELECT project_id FROM task WHERE id=?)",
+            )
+            .bind(&input.task_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            let maximum = crate::budget::recovery_limit(&settings);
+            crate::budget::apply(
+                transaction,
+                &input.task_id,
+                crate::budget::Mutation::Charge {
+                    key: crate::budget::Kind::AutomaticReviewRecovery.key().into(),
+                    limit: maximum,
+                    step: input.id.clone(),
+                },
+            )
+            .await?;
+        }
         let stop_reason = input.stop_reason.as_ref().map(ToString::to_string);
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();

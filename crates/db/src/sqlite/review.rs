@@ -185,6 +185,20 @@ async fn update_status_inner(
         None
     };
 
+    let budget_task = db
+        .get_task_in_tx(&mut transaction, &review.task_id)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    crate::budget::review_verdict(
+        &mut transaction,
+        db,
+        &budget_task,
+        &review,
+        &status,
+        &details,
+        origin != crate::ReviewEventOrigin::Runner,
+    )
+    .await?;
     let result = sqlx::query(
         "UPDATE review SET status = ?, step_results_json = ?, finished_at = ?, updated_at = ? WHERE id = ?",
     )
@@ -387,6 +401,18 @@ async fn update_status_with_review_authority_inner(
         return Err(DbError::VersionConflict);
     }
 
+    if carry.is_none() {
+        crate::budget::review_verdict(
+            &mut transaction,
+            db,
+            &task,
+            &review,
+            &status,
+            &details,
+            false,
+        )
+        .await?;
+    }
     let result = sqlx::query(
         "UPDATE review
          SET status = ?, step_results_json = ?, finished_at = ?, updated_at = ?
@@ -421,6 +447,16 @@ async fn update_status_with_review_authority_inner(
     }
 
     if let Some(carry) = carry {
+        crate::budget::apply(
+            &mut transaction,
+            &task.id,
+            crate::budget::Mutation::Charge {
+                key: crate::budget::Kind::ReviewCarry.key().into(),
+                limit: i64::from(crate::budget::Kind::ReviewCarry.default_limit()),
+                step: format!("carry:{}", review.id),
+            },
+        )
+        .await?;
         // Same writer transaction as the settlement: a carried Review without
         // its candidate record (or the reverse) can never be observed.
         sqlx::query(

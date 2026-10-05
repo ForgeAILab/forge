@@ -565,6 +565,7 @@ export interface Task {
   effective_coder: TaskRoleAssignmentResponse | null
   effective_coder_source: EffectiveCoderSource | null
   remaining_retries: Record<string, number>
+  retry_limits?: Record<string, number>
   available_actions?: Offer[]
   awaiting_human?: boolean
   error_annotation?: TaskAnnotation | null
@@ -615,6 +616,7 @@ export interface TaskListItem {
   subtask_order: number | null
   role_assignments: TaskRoleAssignmentResponse[]
   remaining_retries: Record<string, number>
+  retry_limits: Record<string, number>
   error_annotation: TaskAnnotation | null
   blocked: InterruptionMetadata | null
   failed: InterruptionMetadata | null

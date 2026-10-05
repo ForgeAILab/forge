@@ -78,8 +78,8 @@ async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
     );
     assert_eq!(
         remaining_review_retries(&db, &rejected_task_id).await,
-        retries_before_reject - 1,
-        "gate rejection should decrement review retry budget"
+        retries_before_reject,
+        "owner gate rejection keeps its audit evidence without spending agent budget"
     );
 }
 
@@ -225,14 +225,10 @@ async fn remaining_review_retries(db: &SqliteDb, task_id: &str) -> i64 {
         .as_ref()
         .and_then(|config| config.max_rejections)
         .expect("review retry budget exists");
-    let logs = TransitionLogRepo::list_by_task(db, task_id)
+    let used = db::budget::spent(db.pool(), task_id, db::budget::Kind::Review.key())
         .await
-        .expect("transition logs load");
-    let used = services::task_diagnostics::count_gate_rejections_since_boundary(
-        &logs,
-        default_states::REVIEW,
-    );
-    (i64::from(max_rejections) - used).max(0)
+        .expect("budget ledger loads");
+    db::budget::remaining(i64::from(max_rejections), used)
 }
 
 async fn transition_log_for_reason(db: &SqliteDb, task_id: &str, reason: &str) -> TransitionLog {

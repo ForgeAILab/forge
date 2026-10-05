@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_chat_topic_repository;
+pub mod budget;
 mod chat_session_denials;
 mod connection;
 mod environment_readiness;
