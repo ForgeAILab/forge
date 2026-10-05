@@ -1092,6 +1092,32 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
         .execute(harness.state.db.pool())
         .await
         .unwrap();
+    // The @21 doctrine is the tail of the level-triggered wakes migration; its
+    // schema changes are already applied, so replay only the doctrine section.
+    let wakes_migration =
+        include_str!("../../db/migrations/V202610042145__level_triggered_wakes.sql");
+    let doctrine_start = wakes_migration
+        .find("-- Immutable current doctrine")
+        .expect("@21 doctrine section");
+    let doctrine_migration = wakes_migration[doctrine_start..].replace(
+        "INSERT INTO operating_skill_revision",
+        "INSERT OR IGNORE INTO operating_skill_revision",
+    );
+    sqlx::raw_sql(&doctrine_migration)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let binding_revision: String = sqlx::query_scalar(
+        "SELECT operating_skill_revision_id FROM project_agent_binding WHERE id = ?",
+    )
+    .bind(required_string(
+        &genesis.create_response,
+        &["project_agent_binding_id"],
+    ))
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(binding_revision, "forge.project.orchestration/v1@21");
     let current_turn = admit_preview_turn(
         &harness,
         &genesis.project_chat_id,
@@ -1105,7 +1131,7 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
             .unwrap();
     assert_eq!(
         current_job.operating_skill_revision_id.as_deref(),
-        Some("forge.project.orchestration/v1@20")
+        Some("forge.project.orchestration/v1@21")
     );
     let current_preview = runner.preview_prompt(&current_job).await.unwrap();
     assert!(current_preview

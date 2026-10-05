@@ -1422,12 +1422,9 @@ async fn native_rejection_with_one_provider_call(auth_rejected: bool) {
     assert_eq!(
         turn.failure_class,
         Some(if auth_rejected {
-            api_types::TurnFailure::Configuration
+            api_types::TurnFailure::ProviderAuth
         } else {
-            api_types::TurnFailure::ProviderRejected {
-                retryable: false,
-                retry_after: None,
-            }
+            api_types::TurnFailure::ProviderSchema
         })
     );
     assert_eq!(
