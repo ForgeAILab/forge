@@ -1305,6 +1305,23 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
     );
     covered_operations.insert(MAIN_INQUIRY_RUN_OPERATION.to_owned());
 
+    let escalation = invoke_tool(&project, FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+        json!({"operation":"project.escalate","payload":{"need":"Free disk before recovery","task_ids":[]},"dedupe_key":"matrix-escalation","correlation_id":"matrix-escalation"}),"matrix-escalation").await.expect("native Project escalation");
+    assert!(!escalation.is_error, "escalation: {}", escalation.value);
+    assert_eq!(
+        escalation.value["result"]["domain_result"]["need"],
+        "Free disk before recovery"
+    );
+    let notifications: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification WHERE project_id=? AND event_type='project.escalated'",
+    )
+    .bind(PROJECT_ID)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(notifications, 1);
+    covered_operations.insert("project.escalate".to_owned());
+
     let expected_operations = MIGRATED_OPERATION_CONTRACTS
         .iter()
         .map(|contract| contract.operation.to_owned())

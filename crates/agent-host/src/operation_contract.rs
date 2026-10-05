@@ -16,11 +16,12 @@ use crate::operation_catalog::{
     MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
     PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
-    PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
+    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
+    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION,
+    PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -486,6 +487,11 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "result",
                 "input_digest",
             ],
+        ),
+        PROJECT_ESCALATE_OPERATION => described_object_schema(
+            json!({"need":{"type":"string","minLength":1,"maxLength":4096},"task_ids":{"type":"array","maxItems":100,"items":{"type":"string","minLength":1}}}),
+            &["need"],
+            "Ask the Project owner for the exact need blocking named Tasks; creates one Notification and Attention item.",
         ),
         PROJECT_READINESS_OPERATION => object_schema(
             json!({"action":{"const":"evaluate"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1}}),
@@ -1325,34 +1331,51 @@ pub(crate) fn validate_orchestration_proposal_arguments(
         .get("payload")
         .and_then(Value::as_object)
         .ok_or_else(|| RuntimeError::tool("Forge orchestration payload must be an object"))?;
-    let action = payload
-        .get("action")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration payload action is required"))?;
-    let schema = orchestration_payload_schema(operation);
-    let action_schema = schema
-        .get("properties")
-        .and_then(|properties| properties.get("action"))
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration action schema is unavailable"))?;
-    if let Some(expected) = action_schema.get("const").and_then(Value::as_str) {
-        if action != expected {
-            return Err(RuntimeError::tool(format!(
-                "Forge orchestration action must be {expected}"
-            )));
-        }
-    } else if let Some(actions) = action_schema.get("enum").and_then(Value::as_array) {
-        if !actions
-            .iter()
-            .any(|candidate| candidate.as_str() == Some(action))
+    if operation == PROJECT_ESCALATE_OPERATION {
+        let request: api_types::ProjectEscalateRequest =
+            serde_json::from_value(Value::Object(payload.clone()))
+                .map_err(|error| RuntimeError::tool(error.to_string()))?;
+        if request.need.trim().is_empty()
+            || request.need.chars().count() > 4096
+            || request.task_ids.len() > 100
+            || request.task_ids.iter().any(|id| id.is_empty())
         {
             return Err(RuntimeError::tool(
-                "Forge orchestration action is outside this typed contract",
+                "escalation need and Task IDs must be bounded and nonblank",
             ));
         }
     } else {
-        return Err(RuntimeError::tool(
-            "Forge orchestration action schema is not closed",
-        ));
+        let action = payload
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RuntimeError::tool("Forge orchestration payload action is required"))?;
+        let schema = orchestration_payload_schema(operation);
+        let action_schema = schema
+            .get("properties")
+            .and_then(|properties| properties.get("action"))
+            .ok_or_else(|| {
+                RuntimeError::tool("Forge orchestration action schema is unavailable")
+            })?;
+        if let Some(expected) = action_schema.get("const").and_then(Value::as_str) {
+            if action != expected {
+                return Err(RuntimeError::tool(format!(
+                    "Forge orchestration action must be {expected}"
+                )));
+            }
+        } else if let Some(actions) = action_schema.get("enum").and_then(Value::as_array) {
+            if !actions
+                .iter()
+                .any(|candidate| candidate.as_str() == Some(action))
+            {
+                return Err(RuntimeError::tool(
+                    "Forge orchestration action is outside this typed contract",
+                ));
+            }
+        } else {
+            return Err(RuntimeError::tool(
+                "Forge orchestration action schema is not closed",
+            ));
+        }
     }
     if let Some(value) = object.get("causation_id") {
         if !value.is_null() && !value.is_string() {
@@ -1379,6 +1402,29 @@ mod tests {
         MIGRATED_OPERATION_CONTRACTS, OperationInputContract, OperationOutputContract,
         SHARED_ORCHESTRATION_OUTCOME,
     };
+
+    #[test]
+    fn project_escalate_descriptor_is_small_and_project_only() {
+        let schema = orchestration_payload_schema(crate::PROJECT_ESCALATE_OPERATION);
+        let description = schema["description"].as_str().unwrap();
+        assert!(description.split_whitespace().count() <= 25);
+        let c = crate::operation_contract(crate::PROJECT_ESCALATE_OPERATION).unwrap();
+        assert!(
+            !c.supported_scopes
+                .contains(&crate::CanonicalScopeType::Account)
+        );
+        assert!(
+            !c.supported_scopes
+                .contains(&crate::CanonicalScopeType::Task)
+        );
+        assert_eq!(
+            crate::classify_operation(
+                crate::PROJECT_ESCALATE_OPERATION,
+                Some(&serde_json::json!({"need":"disk","task_ids":[]}))
+            ),
+            crate::OperationClassification::DirectCommand
+        );
+    }
 
     #[test]
     fn every_migrated_contract_resolves_to_a_closed_input_and_shared_output() {

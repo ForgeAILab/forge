@@ -764,8 +764,9 @@ async fn expired_lease_persists_its_current_failure_decision() {
     let db = database().await;
     let job = admit_failure_test(&db).await;
     let runner = failure_runner(api_types::TurnFailure::Configuration, false);
-    sqlx::query("UPDATE agent_chat_turn_job SET status = 'leased', lease_owner = 'expired-worker', leased_until = '2000-01-01T00:00:00Z', attempt_count = 3, invocation_count = 3, pre_provider_failure_count = 2, failure_class_json = '{\"kind\":\"configuration\"}', retry_decision = 'retry' WHERE id = ?")
-        .bind(&job.id).execute(db.pool()).await.unwrap();
+    // The lease refunds are spent, so this expiry counts as the final attempt.
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'leased', lease_owner = 'expired-worker', leased_until = '2000-01-01T00:00:00Z', attempt_count = 3, invocation_count = 3, pre_provider_failure_count = 2, lease_refund_count = ?, failure_class_json = '{\"kind\":\"configuration\"}', retry_decision = 'retry' WHERE id = ?")
+        .bind(services::agent_chat_turn_policy::MAX_LEASE_REFUNDS).bind(&job.id).execute(db.pool()).await.unwrap();
     let worker = AgentChatTurnWorker::with_runner(db.clone(), runner.clone());
     assert_eq!(worker.run_once().await.unwrap(), 0);
     let recovered = current_turn(&db, &job.id).await;
@@ -779,6 +780,17 @@ async fn expired_lease_persists_its_current_failure_decision() {
         Some(api_types::TurnRetryDecision::Fail)
     );
     assert_eq!(recovered.pre_provider_failure_count, 2);
+    let refunds: i64 =
+        sqlx::query_scalar("SELECT lease_refund_count FROM agent_chat_turn_job WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        refunds,
+        services::agent_chat_turn_policy::MAX_LEASE_REFUNDS,
+        "a counted expiry is not a refund"
+    );
     assert!(recovered.retry_action().is_some());
     assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
 }
@@ -789,6 +801,9 @@ async fn manual_retry_admits_current_profile_is_versioned_idempotent_and_resolve
     for failure in [
         TurnFailure::Configuration,
         TurnFailure::Authority,
+        TurnFailure::ProviderSchema,
+        TurnFailure::ProviderAuth,
+        // Stored by turns that failed before typed provider failures.
         TurnFailure::ProviderRejected {
             retryable: false,
             retry_after: None,

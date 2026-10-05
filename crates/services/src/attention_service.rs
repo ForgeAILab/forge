@@ -23,8 +23,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{Acquire, Row, Sqlite, Transaction};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use crate::{
+    wake_blocker::BlockerTurnState,
     worker_runtime::{Outcome, Subscription, Worker, WorkerError, WorkerRuntime},
     Result, ServiceError,
 };
@@ -43,6 +45,10 @@ const MAX_ATTENTION_SUMMARY_LEN: usize = 160;
 const TERMINAL_DISPOSITION_GRACE_SECONDS: i64 = 30;
 const WAKE_LEASE_SECONDS: i64 = 60;
 const WAKE_COOLDOWN_SECONDS: i64 = 300;
+/// Below this hourly Project budget every wake category draws on one pool.
+const MIN_SPLIT_WAKE_BUDGET: i64 = 5;
+/// The sweep runs at most this often; the projection tick runs every loop.
+const SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(60);
 /// Maximum causal hop count for an admitted autonomous wake.  A wake decision
 /// consumes the next hop, so depth 8 is terminally suppressed rather than
 /// admitted with a lease depth the next turn would exceed.
@@ -102,6 +108,7 @@ pub enum WakeSuppressionReason {
     RecursiveAgentResponse,
     IneligibleScope,
     ResolvedIncident,
+    RepeatedFailure,
 }
 
 impl WakeSuppressionReason {
@@ -115,6 +122,7 @@ impl WakeSuppressionReason {
             Self::RecursiveAgentResponse => "retry_exhausted_same_chat",
             Self::IneligibleScope => "ineligible_scope",
             Self::ResolvedIncident => "resolved_incident",
+            Self::RepeatedFailure => "repeated_failure",
         }
     }
 }
@@ -146,6 +154,8 @@ struct WakeDecisionContext {
     task_id: Option<String>,
     requires_current_task_intervention: bool,
     orphan_execution_id: Option<String>,
+    turn: Option<Arc<crate::wake_turn_consumer::PreparedWakeTurn>>,
+    batch: Vec<AttentionProjection>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +173,7 @@ pub struct AttentionService {
     db: Arc<SqliteDb>,
     action_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     event_bus: Option<Arc<events::EventBus>>,
+    last_sweep: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl AttentionService {
@@ -171,6 +182,7 @@ impl AttentionService {
             db,
             event_bus: None,
             action_connections: None,
+            last_sweep: Arc::default(),
         }
     }
 
@@ -232,6 +244,7 @@ impl AttentionService {
         let processed_events = WorkerRuntime::new(Arc::clone(&self.db), Arc::new(self.clone()))
             .run_once(limit.clamp(1, 100) as usize)
             .await?;
+        self.sweep_once_at(&now_rfc3339()).await?;
         let last_sequence = self.consumer_cursor().await?.map_or(0, |c| c.last_sequence);
         Ok(AttentionProjectionRun {
             claimed_events: processed_events,
@@ -240,20 +253,31 @@ impl AttentionService {
         })
     }
 
-    /// Apply deterministic wake admission after an Attention projection.
-    /// This is a *pre-admission* decision: an `agent.wake.admitted` event
-    /// reserves one analysis lease and consumes one budget unit, but creates
-    /// no model job.  The wake consumer records the final `turn_admitted`,
-    /// `deterministically_suppressed`, `deferred`, or `setup_required`
-    /// disposition for that decision event before advancing its cursor.
+    /// Atomically admit the current incident, its audit decision and turn.
     pub async fn admit_wake(&self, request: WakeAdmissionRequest) -> Result<WakeAdmissionResult> {
-        let context = self.wake_decision_context_for_incident(&request).await?;
+        let mut context = self.wake_decision_context_for_incident(&request).await?;
+        if let Some(id) = context.attention_id.as_deref() {
+            if let Some(attention) = self.db.get_attention(id).await? {
+                let dedupe = wake_admitted_dedupe_key(&request, &context);
+                context.turn = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+                    .prepare_attention(
+                        &attention,
+                        &dedupe,
+                        request.causation_id.as_deref(),
+                        request.reaction_depth,
+                        &[],
+                    )
+                    .await?
+                    .map(Arc::new);
+                context.batch = vec![attention];
+            }
+        }
         // Projection requests with no current binding carry an empty identity
         // deliberately.  Preserve that configuration failure as a durable
         // setup decision rather than classifying it as an ineligible identity
         // (and never consult or consume a budget for it).
         if request.identity_id.trim().is_empty() {
-            if let Some(reason) = wake_pre_admission_suppression_reason(&request) {
+            if let Some(reason) = wake_policy_suppression_reason(&request) {
                 return self
                     .persist_suppressed_wake(&request, &context, reason)
                     .await;
@@ -263,6 +287,256 @@ impl AttentionService {
             }
         }
         self.admit_wake_with_context(request, context).await
+    }
+
+    /// Level-triggered reconsideration of open Attention. Each scope is
+    /// isolated: a failing Project is logged and skipped, never the tick.
+    /// Within a Project, blockers are batched first, then budget-suppressed
+    /// decisions, then items waiting on setup.
+    pub async fn sweep_once_at(&self, now: &str) -> Result<usize> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.scope_type, a.scope_id, l.incident_digest AS latest_digest,
+                    l.disposition AS latest_disposition, l.reason AS latest_reason,
+                    l.identity_id AS latest_identity
+             FROM attention_projection a
+             LEFT JOIN agent_wake_attention_latest l ON l.attention_id = a.id
+             WHERE a.status = 'open' AND a.recommended_action <> 'answer_escalation'
+               AND (a.snoozed_until IS NULL OR a.snoozed_until <= ?)
+             ORDER BY a.scope_type, a.scope_id, a.occurred_at, a.id",
+        )
+        .bind(now)
+        .fetch_all(self.db.pool())
+        .await?;
+        let mut scopes = std::collections::BTreeMap::<(String, String), Vec<SweepCandidate>>::new();
+        for row in rows {
+            let disposition: Option<String> = row.try_get("latest_disposition")?;
+            let latest = match disposition {
+                Some(disposition) => Some(LatestWakeDecision {
+                    digest: row.try_get("latest_digest")?,
+                    disposition,
+                    reason: row.try_get("latest_reason")?,
+                    identity_id: row.try_get("latest_identity")?,
+                }),
+                None => None,
+            };
+            scopes
+                .entry((row.try_get("scope_type")?, row.try_get("scope_id")?))
+                .or_default()
+                .push(SweepCandidate {
+                    id: row.try_get("id")?,
+                    latest,
+                });
+        }
+        let mut admitted = 0;
+        for ((scope_type, scope_id), candidates) in scopes {
+            match self
+                .sweep_scope(&scope_type, &scope_id, candidates, now)
+                .await
+            {
+                Ok(count) => admitted += count,
+                Err(error) => {
+                    tracing::warn!(%scope_type, %scope_id, %error, "wake sweep skipped a scope after an error");
+                }
+            }
+        }
+        Ok(admitted)
+    }
+
+    async fn sweep_scope(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        candidates: Vec<SweepCandidate>,
+        now: &str,
+    ) -> Result<usize> {
+        let at = parse_rfc3339(now).unwrap_or_else(Utc::now);
+        let responder = if scope_type == "project" {
+            let mut conn = self.db.pool().acquire().await?;
+            crate::wake_blocker::current_project_responder(&mut conn, scope_id).await?
+        } else {
+            None
+        };
+        let mut blockers = Vec::new();
+        let mut decisions = Vec::new();
+        let mut others = Vec::new();
+        for candidate in candidates {
+            let Some(attention) = self.db.get_attention(&candidate.id).await? else {
+                continue;
+            };
+            if attention.scope_type == "project" && blocker_category(&attention.attention_type) {
+                let digest = wake_attention_incident_digest(&attention);
+                let state = {
+                    let mut conn = self.db.pool().acquire().await?;
+                    crate::wake_blocker::blocker_turn_state(
+                        &mut conn,
+                        &attention.id,
+                        &digest,
+                        responder.as_ref(),
+                        at,
+                    )
+                    .await?
+                };
+                match state {
+                    BlockerTurnState::InFlight
+                    | BlockerTurnState::Held
+                    | BlockerTurnState::Completed { escalated: true } => {}
+                    BlockerTurnState::Completed { escalated: false } => {
+                        crate::project_escalation::ProjectEscalationService::new(Arc::clone(
+                            &self.db,
+                        ))
+                        .escalate_blocker(&attention)
+                        .await?;
+                    }
+                    BlockerTurnState::Eligible => {
+                        let suppressed = candidate.latest.as_ref().is_some_and(|latest| {
+                            crate::wake_blocker::is_policy_suppression(&latest.reason)
+                                && latest.digest.as_deref() == Some(digest.as_str())
+                                && latest.identity_id.as_deref()
+                                    == responder.as_ref().map(|r| r.identity_id.as_str())
+                        });
+                        if !suppressed {
+                            blockers.push(attention);
+                        }
+                    }
+                }
+            } else if let Some(latest) = &candidate.latest {
+                if matches!(latest.disposition.as_str(), "setup_required" | "deferred") {
+                    others.push(attention);
+                } else if attention.attention_type == DECISION_RECORDED_CATEGORY
+                    && matches!(
+                        latest.reason.as_str(),
+                        "budget_exhausted" | "cooldown" | "duplicate_incident"
+                    )
+                {
+                    // An unanswered decision is level state: retry it once the
+                    // bucket or cooldown allows.
+                    decisions.push(attention);
+                }
+            }
+        }
+        let mut admitted = 0;
+        if !blockers.is_empty() && self.admit_blocker_batch(blockers, now).await? {
+            admitted += 1;
+        }
+        for attention in decisions.into_iter().chain(others) {
+            let result: Result<WakeAdmissionResult> = async {
+                let request = self.request_for_attention(&attention, now).await?;
+                self.admit_wake(request).await
+            }
+            .await;
+            match result {
+                Ok(WakeAdmissionResult::Admitted { .. }) => admitted += 1,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(attention_id=%attention.id,%error,"wake reconsideration failed");
+                }
+            }
+        }
+        Ok(admitted)
+    }
+
+    /// One wake per Project window for every eligible blocker, with one directive.
+    async fn admit_blocker_batch(
+        &self,
+        batch: Vec<AttentionProjection>,
+        now: &str,
+    ) -> Result<bool> {
+        let mut members = Vec::with_capacity(batch.len());
+        for attention in batch {
+            let request = self.request_for_attention(&attention, now).await?;
+            if let Some(reason) = wake_policy_suppression_reason(&request) {
+                let context = self.wake_decision_context_for_incident(&request).await?;
+                self.persist_suppressed_wake(&request, &context, reason)
+                    .await?;
+                continue;
+            }
+            members.push((attention, request));
+        }
+        let Some((first, request)) = members.first().cloned() else {
+            return Ok(false);
+        };
+        let batch = members.into_iter().map(|(a, _)| a).collect::<Vec<_>>();
+        let mut context = self.wake_decision_context_for_incident(&request).await?;
+        // A re-admission (after a failed or imported turn) must not replay the
+        // earlier admission of the same digest: name the turns it replaces.
+        let mut parts = Vec::with_capacity(batch.len());
+        for attention in &batch {
+            let prior: Vec<String> = sqlx::query_scalar(
+                "SELECT turn_job_id FROM agent_wake_blocker WHERE attention_id = ? ORDER BY turn_job_id",
+            )
+            .bind(&attention.id)
+            .fetch_all(self.db.pool())
+            .await?;
+            let digest = wake_attention_incident_digest(attention);
+            parts.push(if prior.is_empty() {
+                digest
+            } else {
+                format!("{digest}@{}", prior.join(","))
+            });
+        }
+        let combined = parts.join(":");
+        context.incident_digest = Some(wake_incident_digest(&combined, None));
+        context.turn = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+            .prepare_attention(
+                &first,
+                &wake_admitted_dedupe_key(&request, &context),
+                request.causation_id.as_deref(),
+                request.reaction_depth,
+                &batch,
+            )
+            .await?
+            .map(Arc::new);
+        context.batch = batch;
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        let outcome = self.admit_wake_in_tx(&mut tx, &request, &context).await?;
+        tx.commit().await?;
+        if let Some((scope_type, scope_id)) = outcome.stall_scope {
+            self.publish_autonomy_stall(
+                &scope_type,
+                &scope_id,
+                "the Project Agent's hourly wake budget is exhausted",
+            )
+            .await;
+        }
+        Ok(matches!(
+            outcome.result,
+            WakeAdmissionResult::Admitted { .. }
+        ))
+    }
+
+    async fn request_for_attention(
+        &self,
+        attention: &AttentionProjection,
+        now: &str,
+    ) -> Result<WakeAdmissionRequest> {
+        let event = self.db.get_event(&attention.source_event_id).await?;
+        let identity = if attention.scope_type == "project" {
+            db::ProjectAgentBindingRepo::get_active_project_binding(&*self.db, &attention.scope_id)
+                .await?
+                .and_then(|b| b.identity_id)
+        } else {
+            attention.identity_id.clone()
+        };
+        Ok(WakeAdmissionRequest {
+            identity_id: identity.unwrap_or_default(),
+            scope_type: attention.scope_type.clone(),
+            scope_id: attention.scope_id.clone(),
+            incident_key: attention.dedupe_key.clone(),
+            lease_owner: new_uuid_v4(),
+            correlation_id: event
+                .as_ref()
+                .map(|e| e.correlation_id.clone())
+                .unwrap_or_else(|| attention.id.clone()),
+            causation_id: Some(attention.source_event_id.clone()),
+            caused_by_identity_id: event
+                .as_ref()
+                .filter(|e| e.actor_type == "agent")
+                .and_then(|e| e.actor_id.clone()),
+            reaction_depth: event.as_ref().map_or(0, |e| e.causation_depth),
+            now: now.to_owned(),
+            lease_seconds: WAKE_LEASE_SECONDS,
+            cooldown_seconds: WAKE_COOLDOWN_SECONDS,
+        })
     }
 
     async fn wake_decision_context_for_incident(
@@ -343,6 +617,8 @@ impl AttentionService {
             task_id,
             requires_current_task_intervention,
             orphan_execution_id,
+            turn: None,
+            batch: Vec::new(),
         })
     }
 
@@ -351,14 +627,14 @@ impl AttentionService {
         request: WakeAdmissionRequest,
         context: WakeDecisionContext,
     ) -> Result<WakeAdmissionResult> {
-        if let Some(reason) = wake_pre_admission_suppression_reason(&request) {
+        if let Some(reason) = wake_policy_suppression_reason(&request) {
             return self
                 .persist_suppressed_wake(&request, &context, reason)
                 .await;
         }
         // A projection crash can replay the same source event after the
         // lease/event transaction committed. Context-bearing projection calls
-        // are idempotent at the pre-admission boundary: return the original
+        // are idempotent at the admission boundary: return the original
         // lease metadata instead of consuming budget again or turning one
         // source event into an admitted event followed by a duplicate
         // suppression.
@@ -505,7 +781,7 @@ impl AttentionService {
             } else if let Some(task_id) = context.task_id.as_deref() {
                 let row = sqlx::query(
                     "SELECT error_annotation, blocked_json, failed_json
-                     FROM task WHERE id = ? AND deleted_at IS NULL",
+                     FROM task WHERE id = ? AND deleted_at IS NULL AND status NOT IN ('done','cancelled')",
                 )
                 .bind(task_id)
                 .fetch_optional(&mut **transaction)
@@ -563,7 +839,180 @@ impl AttentionService {
             }
         }
 
-        let (budget, budget_scope_type, budget_scope_id) = self
+        if context.attention_id.is_none() {
+            self.append_wake_decision_in_tx(
+                transaction,
+                request,
+                context,
+                WakeDecisionEvent::Suppressed(WakeSuppressionReason::ResolvedIncident),
+                None,
+                None,
+                &now,
+            )
+            .await?;
+            return Ok(WakeAdmissionResult::Suppressed {
+                reason: WakeSuppressionReason::ResolvedIncident,
+            });
+        }
+        if let Some(id) = context.attention_id.as_deref() {
+            let actual = self
+                .db
+                .get_attention_in_tx(transaction, id)
+                .await?
+                .ok_or(db::DbError::VersionConflict)?;
+            if context
+                .attention_version
+                .is_some_and(|version| version != actual.version)
+                || context.source_event_id.as_deref() != Some(actual.source_event_id.as_str())
+            {
+                return Err(db::DbError::VersionConflict.into());
+            }
+            let canonical = match request.scope_type.as_str() {
+                "project" | "account" => {
+                    Some((request.scope_type.clone(), request.scope_id.clone()))
+                }
+                "task" => sqlx::query_scalar::<_, String>(
+                    "SELECT project_id FROM task WHERE id=? AND deleted_at IS NULL",
+                )
+                .bind(&request.scope_id)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .map(|id| ("project".to_owned(), id)),
+                "agent_chat" => {
+                    let chat =
+                        sqlx::query("SELECT project_id,account_id FROM agent_chat WHERE id=?")
+                            .bind(&request.scope_id)
+                            .fetch_optional(&mut **transaction)
+                            .await?;
+                    chat.and_then(|row| {
+                        row.try_get::<Option<String>, _>("project_id")
+                            .ok()
+                            .flatten()
+                            .map(|id| ("project".to_owned(), id))
+                            .or_else(|| {
+                                row.try_get::<Option<String>, _>("account_id")
+                                    .ok()
+                                    .flatten()
+                                    .map(|id| ("account".to_owned(), id))
+                            })
+                    })
+                }
+                _ => None,
+            };
+            if canonical.as_ref() != Some(&(actual.scope_type.clone(), actual.scope_id.clone())) {
+                self.append_wake_decision_in_tx(
+                    transaction,
+                    request,
+                    context,
+                    WakeDecisionEvent::Suppressed(WakeSuppressionReason::IneligibleScope),
+                    None,
+                    None,
+                    &now,
+                )
+                .await?;
+                return Ok(WakeAdmissionResult::Suppressed {
+                    reason: WakeSuppressionReason::IneligibleScope,
+                });
+            }
+        }
+        if context.turn.is_none() {
+            self.append_wake_decision_in_tx(
+                transaction,
+                request,
+                context,
+                WakeDecisionEvent::SetupRequired(WakeSetupReason::ResponderBindingMissing),
+                None,
+                None,
+                &now,
+            )
+            .await?;
+            return Ok(WakeAdmissionResult::SetupRequired {
+                reason: WakeSetupReason::ResponderBindingMissing,
+            });
+        }
+        let category = context
+            .batch
+            .first()
+            .map(wake_budget_category)
+            .unwrap_or("delivery");
+        if category == "delivery" {
+            let repeated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_wake_disposition d JOIN agent_chat_turn_job j ON j.id=d.turn_job_id JOIN agent_identity i ON i.id=j.responder_identity_id JOIN agent_profile p ON p.id=i.selected_profile_id WHERE d.disposition='turn_admitted' AND d.incident_key=? AND d.incident_digest=? AND j.status='failed' AND j.profile_id=p.id AND j.profile_version=p.version)")
+                .bind(&request.incident_key).bind(context.incident_digest.as_deref()).fetch_one(&mut **transaction).await?;
+            if repeated {
+                self.append_wake_decision_in_tx(
+                    transaction,
+                    request,
+                    context,
+                    WakeDecisionEvent::Suppressed(WakeSuppressionReason::RepeatedFailure),
+                    None,
+                    None,
+                    &now,
+                )
+                .await?;
+                return Ok(WakeAdmissionResult::Suppressed {
+                    reason: WakeSuppressionReason::RepeatedFailure,
+                });
+            }
+        }
+        // A blocker digest gets one completed turn, and no member gets a second
+        // turn while any linked turn is queued or running. Owner escalation
+        // owns any later response.
+        if category == "blocker" {
+            let at = parse_rfc3339(&now).unwrap_or_else(Utc::now);
+            for attention in &context.batch {
+                let state = crate::wake_blocker::blocker_turn_state(
+                    transaction,
+                    &attention.id,
+                    &wake_attention_incident_digest(attention),
+                    None,
+                    at,
+                )
+                .await?;
+                if matches!(
+                    state,
+                    BlockerTurnState::InFlight | BlockerTurnState::Completed { .. }
+                ) {
+                    self.append_wake_decision_in_tx(
+                        transaction,
+                        request,
+                        context,
+                        WakeDecisionEvent::Suppressed(WakeSuppressionReason::DuplicateIncident),
+                        None,
+                        None,
+                        &now,
+                    )
+                    .await?;
+                    return Ok(WakeAdmissionResult::Suppressed {
+                        reason: WakeSuppressionReason::DuplicateIncident,
+                    });
+                }
+            }
+            if let Some(project_id) = context
+                .batch
+                .first()
+                .filter(|a| a.scope_type == "project")
+                .map(|a| &a.scope_id)
+            {
+                let cooling: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_wake_batch WHERE project_id = ? AND cooldown_until > ?)")
+                    .bind(project_id).bind(&now).fetch_one(&mut **transaction).await?;
+                if cooling {
+                    self.append_wake_decision_in_tx(
+                        transaction,
+                        request,
+                        context,
+                        WakeDecisionEvent::Suppressed(WakeSuppressionReason::Cooldown),
+                        None,
+                        None,
+                        &now,
+                    )
+                    .await?;
+                    return Ok(WakeAdmissionResult::Suppressed {
+                        reason: WakeSuppressionReason::Cooldown,
+                    });
+                }
+            }
+        }
+        let (total_budget, budget_scope_type, budget_scope_id) = self
             .wake_budget_in_tx(
                 transaction,
                 &request.identity_id,
@@ -571,7 +1020,22 @@ impl AttentionService {
                 &request.scope_id,
             )
             .await?;
-
+        // The owner initiated an answer wake; it never spends autonomy budget.
+        let total_budget = if context.batch.first().is_some_and(is_owner_answer) {
+            None
+        } else {
+            total_budget
+        };
+        // Small budgets share one pool rather than starving a bucket.
+        let shared_pool = budget_scope_type == "project"
+            && total_budget.is_some_and(|total| total < MIN_SPLIT_WAKE_BUDGET);
+        let budget = total_budget.map(|total| {
+            if budget_scope_type == "project" && !shared_pool {
+                category_budget(total, category)
+            } else {
+                total
+            }
+        });
         // The historical lease primary key includes identity_id.  Keep that
         // immutable schema, but make the active policy incident-global by
         // rejecting any live lease/cooldown for the canonical scope before
@@ -622,7 +1086,7 @@ impl AttentionService {
         // Direct callers may not carry an Attention row (and therefore miss
         // the context-bearing replay check above).  Once an existing lease or
         // cooldown is ruled out, a matching admitted decision still means the
-        // source was already pre-admitted; return its metadata rather than
+        // source already admitted its turn; return its metadata rather than
         // incrementing the budget a second time before the domain-event
         // dedupe turns the append into a no-op.
         let dedupe_key = wake_admitted_dedupe_key(request, context);
@@ -666,7 +1130,9 @@ impl AttentionService {
                         scope_type: "project".to_owned(), scope_id: budget_scope_id.clone(),
                         correlation_id: request.correlation_id.clone(), causation_id: request.causation_id.clone(),
                         causation_depth: request.reaction_depth,
-                        dedupe_key: None,
+                        dedupe_key: Some(format!("autonomy-stalled:{}:{}:{}:{}", budget_scope_type, budget_scope_id,
+                            context.turn.as_ref().and_then(|p|p.prepared.responder.binding_id.as_deref()).unwrap_or_default(),
+                            context.turn.as_ref().and_then(|p|p.prepared.responder.binding_version).unwrap_or_default())),
                         payload_json: json!({
                             "project_id": budget_scope_id, "task_id": null,
                             "event_type": "project.autonomy_stalled",
@@ -698,11 +1164,11 @@ impl AttentionService {
             let current = sqlx::query(
                 "SELECT window_started_at, admitted_count
                  FROM agent_wake_budget_window
-                 WHERE identity_id = ? AND scope_type = ? AND scope_id = ?",
+                 WHERE scope_type = ? AND scope_id = ? AND category = ?",
             )
-            .bind(&request.identity_id)
             .bind(&budget_scope_type)
             .bind(&budget_scope_id)
+            .bind(category)
             .fetch_optional(&mut *budget_attempt)
             .await?;
             let (admitted_count, in_window) = current
@@ -713,7 +1179,22 @@ impl AttentionService {
                 })
                 .transpose()?
                 .unwrap_or((0, false));
-            if in_window && admitted_count >= budget {
+            let used = if shared_pool {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COALESCE(SUM(admitted_count), 0) FROM agent_wake_budget_window
+                     WHERE scope_type = ? AND scope_id = ? AND window_started_at > ?",
+                )
+                .bind(&budget_scope_type)
+                .bind(&budget_scope_id)
+                .bind(&window_started)
+                .fetch_one(&mut *budget_attempt)
+                .await?
+            } else if in_window {
+                admitted_count
+            } else {
+                0
+            };
+            if used >= budget {
                 self.append_wake_decision_in_tx(
                     &mut budget_attempt,
                     request,
@@ -732,24 +1213,26 @@ impl AttentionService {
             if in_window {
                 sqlx::query(
                     "UPDATE agent_wake_budget_window
-                     SET admitted_count = admitted_count + 1,
+                     SET admitted_count = admitted_count + 1, identity_id = ?,
                          version = version + 1, updated_at = ?
-                     WHERE identity_id = ? AND scope_type = ? AND scope_id = ?",
+                     WHERE scope_type = ? AND scope_id = ? AND category = ?",
                 )
-                .bind(&now)
                 .bind(&request.identity_id)
+                .bind(&now)
                 .bind(&budget_scope_type)
                 .bind(&budget_scope_id)
+                .bind(category)
                 .execute(&mut *budget_attempt)
                 .await?;
             } else {
                 sqlx::query(
                     "INSERT INTO agent_wake_budget_window (
-                        identity_id, scope_type, scope_id, window_started_at,
+                        identity_id, scope_type, scope_id, category, window_started_at,
                         window_seconds, admitted_count, version, updated_at
-                     ) VALUES (?, ?, ?, ?, 3600, 1, 1, ?)
-                     ON CONFLICT(identity_id, scope_type, scope_id) DO UPDATE SET
+                     ) VALUES (?, ?, ?, ?, ?, 3600, 1, 1, ?)
+                     ON CONFLICT(scope_type, scope_id, category) DO UPDATE SET
                         window_started_at = excluded.window_started_at,
+                        identity_id = excluded.identity_id,
                         admitted_count = 1,
                         version = agent_wake_budget_window.version + 1,
                         updated_at = excluded.updated_at",
@@ -757,12 +1240,13 @@ impl AttentionService {
                 .bind(&request.identity_id)
                 .bind(&budget_scope_type)
                 .bind(&budget_scope_id)
+                .bind(category)
                 .bind(&now)
                 .bind(&now)
                 .execute(&mut *budget_attempt)
                 .await?;
             }
-            Some((budget - admitted_count - 1).max(0))
+            Some((budget - used - 1).max(0))
         } else {
             None
         };
@@ -822,7 +1306,7 @@ impl AttentionService {
         }
 
         budget_attempt.commit().await?;
-        // The lease, budget increment, and pre-admitted wake event share one
+        // The lease, budget increment, and admitted wake audit share one
         // transaction.  No budget is consumed for suppressed/setup-required
         // decision events.
         self.append_wake_decision_in_tx(
@@ -933,8 +1417,8 @@ impl AttentionService {
             } => (
                 "agent.wake.admitted",
                 "turn_admitted",
-                "pre_admitted",
-                "pre_admitted",
+                "turn_admitted",
+                "turn",
                 Some(bounded_wake_ref(&request.lease_owner)),
                 Some(leased_until.clone()),
                 Some(cooldown_until.clone()),
@@ -983,9 +1467,8 @@ impl AttentionService {
         let causation_depth = (request.reaction_depth.max(0) + 1).min(16);
         let payload_json = json!({
             "decision": decision_code,
-            // Keep the historical admitted action token while the consumer
-            // migrates to the explicit decision/phase contract.
-            "action": (event_type == "agent.wake.admitted").then_some("wake_admitted"),
+            "turn_job_id": (event_type == "agent.wake.admitted").then(|| context.turn.as_ref().map(|p|
+                Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{}:turn", p.prepared.dedupe_key).as_bytes()).to_string())).flatten(),
             "reason": reason_code,
             "admission_phase": admission_phase,
             "identity_id": identity_id,
@@ -1022,7 +1505,7 @@ impl AttentionService {
         } else {
             wake_incident_digest(&request.scope_id, None)
         };
-        DomainEventRepo::append_event_in_tx(
+        let event = DomainEventRepo::append_event_in_tx(
             &*self.db,
             transaction,
             &CreateDomainEvent {
@@ -1042,8 +1525,190 @@ impl AttentionService {
                 created_at: now.to_owned(),
             },
         )
-        .await
-        .map_err(ServiceError::from)
+        .await?;
+        let (kind, admission, expected) = match &decision {
+            WakeDecisionEvent::Admitted { .. } => {
+                let prepared = context
+                    .turn
+                    .as_ref()
+                    .ok_or_else(|| ServiceError::invalid_operation("wake has no prepared turn"))?;
+                let mut input = (**prepared).clone();
+                let id = context
+                    .attention_id
+                    .as_deref()
+                    .ok_or_else(|| ServiceError::invalid_operation("wake has no Attention"))?;
+                let actual = self
+                    .db
+                    .get_attention_in_tx(transaction, id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                input.attention = actual.clone();
+                let admitted = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+                    .build_prepared_turn(&event, &input)?;
+                (
+                    db::AgentWakeDispositionKind::TurnAdmitted,
+                    Some(admitted),
+                    Some(expected_attention(&actual)),
+                )
+            }
+            WakeDecisionEvent::Suppressed(_) => (
+                db::AgentWakeDispositionKind::DeterministicallySuppressed,
+                None,
+                None,
+            ),
+            WakeDecisionEvent::SetupRequired(_) if context.attention_id.is_some() => {
+                (db::AgentWakeDispositionKind::SetupRequired, None, None)
+            }
+            WakeDecisionEvent::SetupRequired(_) => (
+                db::AgentWakeDispositionKind::DeterministicallySuppressed,
+                None,
+                None,
+            ),
+        };
+        // The latest decision per Attention item (each batch member, with its
+        // own digest) is what the sweep reads.
+        let disposition_name = kind.to_string();
+        let members: Vec<(String, String)> = if context.batch.is_empty() {
+            context
+                .attention_id
+                .iter()
+                .map(|id| (id.clone(), incident_digest.clone()))
+                .collect()
+        } else {
+            context
+                .batch
+                .iter()
+                .map(|a| (a.id.clone(), wake_attention_incident_digest(a)))
+                .collect()
+        };
+        for (id, digest) in members {
+            sqlx::query(
+                "INSERT INTO agent_wake_attention_latest(attention_id,incident_digest,disposition,reason,identity_id,updated_at)
+                 SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM attention_projection WHERE id=?)
+                 ON CONFLICT(attention_id) DO UPDATE SET incident_digest=excluded.incident_digest,
+                    disposition=excluded.disposition, reason=excluded.reason,
+                    identity_id=excluded.identity_id, updated_at=excluded.updated_at",
+            )
+            .bind(&id)
+            .bind(&digest)
+            .bind(&disposition_name)
+            .bind(reason_code)
+            .bind(identity_id.as_deref())
+            .bind(now)
+            .bind(&id)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        // Audit-event dedupe is checked before persistence, making a replay a no-op.
+        if self
+            .db
+            .get_agent_wake_disposition_in_tx(
+                transaction,
+                crate::wake_turn_consumer_name(),
+                &event.id,
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(event);
+        }
+        let turn_job_id = admission.as_ref().map(|a| a.turn.id.clone());
+        let disposition = db::CreateAgentWakeDisposition {
+            id: Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                format!("wake-disposition:{}", event.id).as_bytes(),
+            )
+            .to_string(),
+            consumer_name: crate::wake_turn_consumer_name().to_owned(),
+            source_event_id: event.id.clone(),
+            source_event_sequence: event.sequence,
+            attempt_number: 1,
+            max_attempts: 3,
+            disposition: kind,
+            reason: reason_code.to_owned(),
+            turn_job_id: turn_job_id.clone(),
+            attention_id: (kind == db::AgentWakeDispositionKind::SetupRequired)
+                .then(|| context.attention_id.clone())
+                .flatten(),
+            retry_at: None,
+            incident_key: Some(bounded_wake_ref(&request.incident_key)),
+            incident_digest: Some(incident_digest),
+            binding_id: admission
+                .as_ref()
+                .and_then(|a| a.turn.responder_binding_id.clone()),
+            binding_version: admission
+                .as_ref()
+                .and_then(|a| a.turn.responder_binding_version),
+            profile_id: admission.as_ref().map(|a| a.turn.profile_id.clone()),
+            profile_version: admission.as_ref().and_then(|a| a.turn.profile_version),
+            provenance_json: Some(json!({"attention_id": context.attention_id}).to_string()),
+            parent_disposition_id: None,
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        };
+        self.db
+            .persist_agent_wake_in_tx(
+                transaction,
+                &event,
+                db::PersistAgentWake {
+                    disposition,
+                    admission,
+                    expected_attention: expected,
+                },
+            )
+            .await?;
+        if let Some(turn_id) = turn_job_id {
+            if context
+                .batch
+                .first()
+                .is_some_and(|a| wake_budget_category(a) == "blocker")
+            {
+                for item in &context.batch {
+                    let current = self
+                        .db
+                        .get_attention_in_tx(transaction, &item.id)
+                        .await?
+                        .ok_or(db::DbError::VersionConflict)?;
+                    if current.status != "open"
+                        || current.version != item.version
+                        || wake_attention_incident_digest(&current)
+                            != wake_attention_incident_digest(item)
+                    {
+                        return Err(db::DbError::VersionConflict.into());
+                    }
+                    // A re-admission replaces a failed or imported row for the digest.
+                    sqlx::query(
+                        "INSERT INTO agent_wake_blocker(attention_id,incident_digest,turn_job_id,admitted_at) VALUES(?,?,?,?)
+                         ON CONFLICT(attention_id,incident_digest) DO UPDATE SET turn_job_id=excluded.turn_job_id,
+                            admitted_at=excluded.admitted_at, escalation_id=NULL, recorded_outcome=NULL,
+                            legacy_source_event_id=NULL",
+                    )
+                    .bind(&item.id)
+                    .bind(wake_attention_incident_digest(item))
+                    .bind(&turn_id)
+                    .bind(now)
+                    .execute(&mut **transaction)
+                    .await?;
+                }
+                sqlx::query("INSERT INTO agent_wake_batch(project_id,admitted_at,cooldown_until,turn_job_id) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET admitted_at=excluded.admitted_at,cooldown_until=excluded.cooldown_until,turn_job_id=excluded.turn_job_id")
+                    .bind(&context.batch[0].scope_id).bind(now).bind(cooldown_until).bind(&turn_id).execute(&mut **transaction).await?;
+            }
+            // The owner's answer turn becomes the escalated blockers' turn, so
+            // they are re-armed: if they persist after it, they escalate again.
+            if let Some(escalation_id) = context.batch.first().and_then(answered_escalation_id) {
+                sqlx::query(
+                    "UPDATE agent_wake_blocker SET turn_job_id = ?, escalation_id = NULL,
+                        recorded_outcome = NULL, admitted_at = ?
+                     WHERE escalation_id = ?",
+                )
+                .bind(&turn_id)
+                .bind(now)
+                .bind(&escalation_id)
+                .execute(&mut **transaction)
+                .await?;
+            }
+        }
+        Ok(event)
     }
 
     async fn wake_budget_in_tx(
@@ -1221,6 +1886,21 @@ impl AttentionService {
                 return Err(ServiceError::from(db::DbError::VersionConflict));
             }
             return Ok(current);
+        }
+        // Resolving an owner escalation is the owner's answer: it closes the
+        // escalation and wakes the Agent, so no blocker stays un-wakeable.
+        if current.recommended_action == "answer_escalation" {
+            if current.version != expected_version {
+                return Err(ServiceError::from(db::DbError::VersionConflict));
+            }
+            crate::project_escalation::ProjectEscalationService::new(Arc::clone(&self.db))
+                .resolve_by_owner(&current, user_id)
+                .await?;
+            return self
+                .db
+                .get_attention(id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("attention", id.to_owned()));
         }
         AttentionRepo::update_attention_lifecycle(
             &*self.db,
@@ -1903,6 +2583,13 @@ impl AttentionService {
                     "automatic_retry": false,
                 },
             });
+            if event.event_type == "project.escalation.answered" {
+                details["answer"] = event_payload.get("answer").cloned().unwrap_or(Value::Null);
+                details["task_ids"] = event_payload
+                    .get("task_ids")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
             if category == "conflict_hotspot" {
                 details["conflict_hotspot"] = event_payload.clone();
             }
@@ -1950,7 +2637,7 @@ impl AttentionService {
             // as recursive suppression even when its binding has already
             // disappeared; setup-required would otherwise hide a recursion
             // decision behind a missing responder.
-            let decision = if let Some(reason) = wake_pre_admission_suppression_reason(&request) {
+            let decision = if let Some(reason) = wake_policy_suppression_reason(&request) {
                 PreparedWakeDecision::Suppressed(reason)
             } else {
                 let configured = self
@@ -1974,8 +2661,31 @@ impl AttentionService {
                     _ => PreparedWakeDecision::SetupRequired,
                 }
             };
+            let turn = if matches!(decision, PreparedWakeDecision::Admit)
+                && !(projection.scope_type == "project" && blocker_category(category))
+            {
+                let candidate = projection_snapshot(&projection);
+                let context = WakeDecisionContext {
+                    source_event_id: Some(event.id.clone()),
+                    incident_digest: Some(wake_attention_incident_digest(&candidate)),
+                    ..Default::default()
+                };
+                crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+                    .prepare_attention(
+                        &candidate,
+                        &wake_admitted_dedupe_key(&request, &context),
+                        request.causation_id.as_deref(),
+                        request.reaction_depth,
+                        &[],
+                    )
+                    .await?
+                    .map(Arc::new)
+            } else {
+                None
+            };
             incident = Some(PreparedAttentionIncident {
                 projection,
+                turn,
                 request,
                 decision,
                 failed_turn,
@@ -2086,8 +2796,16 @@ impl AttentionService {
                 requires_current_task_intervention: event.event_type == "task.interruption_changed"
                     && p.requires_intervention,
                 orphan_execution_id: p.orphan_execution_id.clone(),
+                turn: p.turn.clone(),
+                batch: vec![attention.clone()],
             };
             match &p.decision {
+                PreparedWakeDecision::Admit
+                    if attention.scope_type == "project"
+                        && blocker_category(&attention.attention_type) =>
+                {
+                    // A single Project wake is assembled after the projection window.
+                }
                 PreparedWakeDecision::Admit => {
                     let committed = self.admit_wake_in_tx(tx, &p.request, &context).await?;
                     stall = committed.stall_scope;
@@ -2139,6 +2857,11 @@ impl AttentionService {
     /// A manual terminal attempt that never receives any Task disposition is
     /// retained as a bounded-grace orphan safety net.
     async fn event_category(&self, event: &DomainEvent) -> Result<EventCategoryDecision> {
+        if event.event_type == "project.escalation.answered" {
+            return Ok(EventCategoryDecision::Ready(Some(
+                DECISION_RECORDED_CATEGORY,
+            )));
+        }
         if event
             .event_type
             .eq_ignore_ascii_case("task.interruption_changed")
@@ -3673,6 +4396,7 @@ pub struct PreparedAttention {
 }
 struct PreparedAttentionIncident {
     projection: CreateAttentionProjection,
+    turn: Option<Arc<crate::wake_turn_consumer::PreparedWakeTurn>>,
     request: WakeAdmissionRequest,
     decision: PreparedWakeDecision,
     failed_turn: Option<db::AgentChatTurnJob>,
@@ -3703,10 +4427,26 @@ impl Worker<Option<(String, String)>> for AttentionService {
     fn subscription(&self) -> Subscription {
         Subscription::All
     }
+    /// Superseded turn incidents resolve every loop, as before the sweep; the
+    /// sweep itself runs at most once per [`SWEEP_INTERVAL`].
     async fn tick(&self) -> std::result::Result<(), WorkerError> {
         self.resolve_superseded_turn_incidents()
             .await
-            .map_err(projection_worker_error)
+            .map_err(projection_worker_error)?;
+        let due = {
+            let mut last = self.last_sweep.lock().expect("sweep clock lock");
+            let due = last.is_none_or(|at| at.elapsed() >= SWEEP_INTERVAL);
+            if due {
+                *last = Some(std::time::Instant::now());
+            }
+            due
+        };
+        if due {
+            self.sweep_once_at(&now_rfc3339())
+                .await
+                .map_err(projection_worker_error)?;
+        }
+        Ok(())
     }
     async fn handle(
         &self,
@@ -3751,9 +4491,7 @@ impl Worker<Option<(String, String)>> for AttentionService {
 /// the projection path and direct admission path agree, including the
 /// system-authored `agent_chat.turn.failed` retry-exhausted event that has no
 /// actor identity for the ordinary self-event check.
-fn wake_pre_admission_suppression_reason(
-    request: &WakeAdmissionRequest,
-) -> Option<WakeSuppressionReason> {
+fn wake_policy_suppression_reason(request: &WakeAdmissionRequest) -> Option<WakeSuppressionReason> {
     if request.reaction_depth >= MAX_WAKE_REACTION_DEPTH {
         return Some(WakeSuppressionReason::ReactionDepthExceeded);
     }
@@ -3776,19 +4514,8 @@ fn wake_pre_admission_suppression_reason(
 /// events.  Wake delivery/reconsideration can call this helper on the freshly
 /// loaded projection instead of reimplementing the material-state contract.
 pub fn wake_attention_incident_digest(attention: &AttentionProjection) -> String {
-    wake_attention_state_digest(
-        &attention.attention_type,
-        &attention.scope_type,
-        &attention.scope_id,
-        &attention.status,
-        &attention.source_event_id,
-        attention.source_sequence,
-        &attention.details_json,
-        &attention.recommended_action,
-        attention.version,
-    )
+    db::canonical_attention_incident_digest(attention)
 }
-
 #[allow(clippy::too_many_arguments)]
 fn wake_attention_state_digest(
     attention_type: &str,
@@ -3801,33 +4528,29 @@ fn wake_attention_state_digest(
     recommended_action: &str,
     version: i64,
 ) -> String {
-    let details_digest = wake_incident_digest(&canonical_attention_details(details_json), None);
-    let canonical = format!(
-        "type={};scope_type={};scope_id={};status={};source_event_id={};source_sequence={source_sequence:?};details_digest={};recommended_action={};version={version}",
-        bounded_wake_ref(attention_type),
-        bounded_wake_ref(scope_type),
-        bounded_wake_ref(scope_id),
-        bounded_wake_ref(status),
-        bounded_wake_ref(source_event_id),
-        details_digest,
-        bounded_wake_ref(recommended_action),
-    );
-    wake_incident_digest(&canonical, None)
+    db::canonical_attention_incident_digest(&AttentionProjection {
+        id: String::new(),
+        attention_type: attention_type.to_owned(),
+        scope_type: scope_type.to_owned(),
+        scope_id: scope_id.to_owned(),
+        identity_id: None,
+        source_event_id: source_event_id.to_owned(),
+        priority: 0,
+        status: status.to_owned(),
+        summary: String::new(),
+        details_json: details_json.to_owned(),
+        dedupe_key: String::new(),
+        occurred_at: String::new(),
+        updated_at: String::new(),
+        version,
+        acknowledged_at: None,
+        snoozed_until: None,
+        resolved_at: None,
+        updated_by_user_id: None,
+        recommended_action: recommended_action.to_owned(),
+        source_sequence,
+    })
 }
-
-/// Canonicalize only the bounded Attention details used for the digest.  The
-/// details themselves never enter the wake event payload; this helper hashes
-/// a normalized JSON representation so semantically identical object key
-/// orderings cannot create a new incident admission.  Invalid legacy JSON is
-/// retained as bounded text, preserving a deterministic digest while keeping
-/// the projection observable without leaking its contents.
-fn canonical_attention_details(details_json: &str) -> String {
-    let bounded = details_json.chars().take(8_192).collect::<String>();
-    serde_json::from_str::<Value>(&bounded)
-        .map(|value| value.to_string())
-        .unwrap_or(bounded)
-}
-
 fn wake_admitted_dedupe_key(
     request: &WakeAdmissionRequest,
     context: &WakeDecisionContext,
@@ -3899,6 +4622,101 @@ pub(crate) async fn resolve_turn_incident<D: db::AttentionRepo>(
     )
     .await?;
     Ok(())
+}
+
+pub(crate) fn blocker_category(category: &str) -> bool {
+    matches!(
+        category,
+        "execution_failed" | "environment_not_ready" | "review_risk" | "human_input_required"
+    )
+}
+pub(crate) fn wake_budget_category(attention: &AttentionProjection) -> &'static str {
+    if attention.scope_type != "project" {
+        "delivery"
+    } else if blocker_category(&attention.attention_type) {
+        "blocker"
+    } else if attention.attention_type == "decision_recorded" {
+        "decision"
+    } else {
+        "delivery"
+    }
+}
+/// The 4/4/2 split of a Project budget of at least [`MIN_SPLIT_WAKE_BUDGET`],
+/// with every bucket holding at least one wake.
+fn category_budget(total: i64, category: &str) -> i64 {
+    let blocker = ((total / 10) * 4 + ((total % 10) * 4 + 9) / 10).max(1);
+    let delivery = ((total / 10) * 4 + ((total % 10) * 4) / 10).max(1);
+    match category {
+        "blocker" => blocker,
+        "decision" => (total - blocker - delivery).max(1),
+        _ => delivery,
+    }
+}
+/// An owner's escalation answer, which wakes the Agent without budget.
+fn is_owner_answer(attention: &AttentionProjection) -> bool {
+    answered_escalation_id(attention).is_some()
+}
+fn answered_escalation_id(attention: &AttentionProjection) -> Option<String> {
+    if attention.attention_type != DECISION_RECORDED_CATEGORY {
+        return None;
+    }
+    let details = serde_json::from_str::<Value>(&attention.details_json).ok()?;
+    (details.get("source_event_type").and_then(Value::as_str)
+        == Some("project.escalation.answered"))
+    .then(|| {
+        details
+            .get("entity_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+    .flatten()
+}
+struct SweepCandidate {
+    id: String,
+    latest: Option<LatestWakeDecision>,
+}
+struct LatestWakeDecision {
+    digest: Option<String>,
+    disposition: String,
+    reason: String,
+    identity_id: Option<String>,
+}
+fn expected_attention(a: &AttentionProjection) -> db::ExpectedAttentionSnapshot {
+    db::ExpectedAttentionSnapshot {
+        id: a.id.clone(),
+        version: a.version,
+        digest: Some(wake_attention_incident_digest(a)),
+        status: a.status.clone(),
+        canonical_scope_type: a.scope_type.clone(),
+        canonical_scope_id: a.scope_id.clone(),
+        source_event_id: a.source_event_id.clone(),
+        source_sequence: a.source_sequence,
+        dedupe_key: a.dedupe_key.clone(),
+    }
+}
+fn projection_snapshot(a: &CreateAttentionProjection) -> AttentionProjection {
+    AttentionProjection {
+        id: a.id.clone(),
+        attention_type: a.attention_type.clone(),
+        scope_type: a.scope_type.clone(),
+        scope_id: a.scope_id.clone(),
+        identity_id: a.identity_id.clone(),
+        source_event_id: a.source_event_id.clone(),
+        priority: a.priority,
+        status: a.status.clone(),
+        summary: a.summary.clone(),
+        details_json: a.details_json.clone(),
+        dedupe_key: a.dedupe_key.clone(),
+        occurred_at: a.occurred_at.clone(),
+        updated_at: a.updated_at.clone(),
+        version: 1,
+        acknowledged_at: a.acknowledged_at.clone(),
+        snoozed_until: a.snoozed_until.clone(),
+        resolved_at: a.resolved_at.clone(),
+        updated_by_user_id: a.updated_by_user_id.clone(),
+        recommended_action: a.recommended_action.clone(),
+        source_sequence: a.source_sequence,
+    }
 }
 
 #[cfg(test)]
@@ -4040,6 +4858,15 @@ mod tests {
         .execute(service.db.pool())
         .await
         .unwrap();
+        // Remove the fixture's linked setup disposition before corrupting its source.
+        sqlx::query("DELETE FROM agent_wake_disposition_current")
+            .execute(service.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_wake_disposition")
+            .execute(service.db.pool())
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM attention_projection")
             .execute(service.db.pool())
             .await
@@ -4211,6 +5038,25 @@ mod tests {
             classify_event(&event("project.decision.approved", "{}")),
             None
         );
+    }
+
+    #[test]
+    fn category_split_keeps_every_bucket_and_matches_ten() {
+        let split = |total| {
+            (
+                category_budget(total, "blocker"),
+                category_budget(total, "delivery"),
+                category_budget(total, "decision"),
+            )
+        };
+        assert_eq!(split(10), (4, 4, 2));
+        assert_eq!(split(5), (2, 2, 1));
+        assert_eq!(split(7), (3, 2, 2));
+        for total in MIN_SPLIT_WAKE_BUDGET..=40 {
+            let (blocker, delivery, decision) = split(total);
+            assert!(blocker >= 1 && delivery >= 1 && decision >= 1, "{total}");
+            assert_eq!(blocker + delivery + decision, total, "{total}");
+        }
     }
 
     #[test]

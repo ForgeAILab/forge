@@ -728,6 +728,9 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/operations/refresh",
             post(routes::operations::refresh_operations),
         )
+        .route("/api/v1/projects/{project_id}/escalations", get(routes::project_escalations::list))
+        .route("/api/v1/projects/{project_id}/escalations/{id}", get(routes::project_escalations::get))
+        .route("/api/v1/projects/{project_id}/escalations/{id}/answer", post(routes::project_escalations::answer))
         .route(
             "/api/v1/mission-control",
             get(routes::mission_control::home),

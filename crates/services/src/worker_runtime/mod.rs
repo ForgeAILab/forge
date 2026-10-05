@@ -57,6 +57,9 @@ pub trait Worker<C: Send + Sync + 'static = ()>: Send + Sync + 'static {
     fn handle_timeout(&self) -> Duration {
         Duration::from_secs(300)
     }
+    fn tick_interval(&self) -> Duration {
+        Duration::ZERO
+    }
     fn tick_timeout(&self) -> Duration {
         Duration::from_secs(30)
     }
@@ -107,6 +110,10 @@ impl Schedule {
     }
     fn ready(&self) -> bool {
         self.due.is_none_or(|due| due <= Instant::now())
+    }
+    fn succeeded_after(&mut self, interval: Duration) {
+        self.failures = 0;
+        self.due = Instant::now().checked_add(interval);
     }
     fn reset(&mut self) {
         *self = Self::default();
@@ -249,7 +256,7 @@ impl<W: Worker<C>, C: Send + Sync + 'static> WorkerRuntime<W, C> {
                 self.tick_schedule
                     .lock()
                     .expect("tick schedule lock")
-                    .reset();
+                    .succeeded_after(self.worker.tick_interval());
                 if let Err(error) = self.health.clear_error_if_set(HealthErrorKind::Tick).await {
                     tracing::warn!(worker = self.worker.name(), %error, "failed to clear tick error");
                 }

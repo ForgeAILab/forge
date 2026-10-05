@@ -65,6 +65,7 @@ pub const PROJECT_DECISION_OPERATION: &str = "project.decision";
 pub const PROJECT_MILESTONE_OPERATION: &str = "project.milestone";
 pub const PROJECT_EVIDENCE_OPERATION: &str = "project.evidence";
 pub const PROJECT_VALIDATION_OPERATION: &str = "project.validation";
+pub const PROJECT_ESCALATE_OPERATION: &str = "project.escalate";
 pub const PROJECT_READINESS_OPERATION: &str = "project.readiness";
 pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
 pub const TASK_PROPOSE_OPERATION: &str = "task.propose";
@@ -486,6 +487,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
+        operation: PROJECT_ESCALATE_OPERATION,
+        surface: OperationSurface::ProjectOrchestration,
+        exposure: OperationExposure::TypedProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::ProposeProject,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
         operation: PROJECT_READINESS_OPERATION,
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedProposal,
@@ -900,6 +912,7 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
         // revision and carries its own receipt. The `manual` source kind stays
         // outside this path -- a user attestation is only ever a user's.
         PROJECT_VALIDATION_OPERATION => action == Some("record"),
+        PROJECT_ESCALATE_OPERATION => payload.get("need").and_then(Value::as_str).is_some(),
         PROJECT_READINESS_OPERATION => action == Some("evaluate"),
         // Capturing an artifact the run produced is append-only and carries no
         // authority beyond the Task it is bound to.

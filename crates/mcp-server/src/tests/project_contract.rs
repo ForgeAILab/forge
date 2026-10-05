@@ -399,3 +399,69 @@ async fn mcp_creation_binds_owner_and_known_tools_require_a_principal() {
             .unwrap();
     assert_eq!(orphaned_count, 0);
 }
+
+#[tokio::test]
+async fn project_escalate_mcp_is_scoped_owner_authenticated_and_idempotent() {
+    let state = sqlite_state().await;
+    let (identity, _, _) = seed_chat_account(&state).await;
+    let project = seed_chat_project(&state, &identity).await;
+    let args = json!({"need":"Free disk before recovery","task_ids":[],"dedupe_key":"disk"});
+    assert!(call_as(
+        &state,
+        "mcp-test-user",
+        Some(&project),
+        "forge_project_escalate",
+        args.clone()
+    )
+    .await
+    .is_err());
+    assert!(call_as(
+        &state,
+        "chat-user",
+        None,
+        "forge_project_escalate",
+        args.clone()
+    )
+    .await
+    .is_err());
+    let first = call_as(
+        &state,
+        "chat-user",
+        Some(&project),
+        "forge_project_escalate",
+        args.clone(),
+    )
+    .await
+    .unwrap();
+    let replay = call_as(
+        &state,
+        "chat-user",
+        Some(&project),
+        "forge_project_escalate",
+        args,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["id"], replay["id"]);
+    assert_eq!(first["need"], "Free disk before recovery");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification WHERE project_id=? AND event_type='project.escalated'",
+    )
+    .bind(project)
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    // n3: the escalation records the authenticated owner, not the Agent.
+    let (actor_type, actor_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT actor_type, actor_id FROM domain_event WHERE event_type='project.escalated' AND entity_id=?",
+    )
+    .bind(first["id"].as_str().unwrap())
+    .fetch_one(state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (actor_type.as_str(), actor_id.as_deref()),
+        ("user", Some("chat-user"))
+    );
+}
