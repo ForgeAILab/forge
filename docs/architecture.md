@@ -1099,24 +1099,51 @@ The first native turn records the initial topic; rotation records the successor
 runtime session ID on a new immutable `agent_chat_topic` row. Transcript IDs,
 message provenance and earlier topics remain inspectable.
 
-Genesis start, Project creation/handoff and the first user message after eight
-hours idle mark `rotation_pending` in `agent_chat_topic_rotation`, in the trigger's
-transaction. REST topic requests use the same intent. REST rotates immediately
-when no turn is live, and otherwise returns a pending result. The turn worker
-processes intents before claiming a successor; a leased turn or an active native
-driver prevents rotation. Queued successor jobs wait behind the intent.
+For a chat whose responder (the active Main or Project binding's identity and
+its selected Profile) is native, Genesis start, Project creation/handoff and the
+first user message after eight hours idle mark `rotation_pending` in
+`agent_chat_topic_rotation`, in the trigger's transaction. A CLI chat raises no
+automatic intent and keeps its pre-topic-working-set behaviour: its REST topic
+request rotates directly and is denied while a turn is live. A native REST request
+uses the same intent: it is denied while a Genesis session needs a decision
+(checked in the intent's own transaction), and a request that meets a pending
+intent applies its label and summary to it. REST runs the rotation immediately
+when no turn is live (bounded by the summary timeout) and otherwise returns a
+pending result.
+
+Rotations never run on the turn-claim path. The Agent Chat worker starts one
+background rotation pass per poll (`run_once` runs it before claiming); it attempts
+every due intent concurrently, fresh intents first, skipping chats with a leased or
+originating live turn. Queued successor jobs, including wake turns, wait behind the
+intent. Each attempt is leased and counted; a failure records `last_error_kind` and
+backs off (`next_attempt_at`: 5 s, then 30 s). The third failure abandons the
+intent in one transaction: `rotation_pending` clears, a visible system notice
+(`outcome = topic_rotation_failed`) and an `agent_chat.topic.rotation_failed`
+event (`error_kind`, `attempts`, `session_handed_over`) are recorded, and queued
+turns are admitted again on the current topic. If the runtime fork never saved its
+successor, the source session is kept (a pending fork intent is aborted) and the
+reserved successor is marked `failed`. If the fork completed, the runtime has
+superseded the source, so the successor takes over the chat and only the topic
+record is missing.
 
 The intent reserves its successor Forge/runtime IDs and a renewable lease.
-A provider summary is sealed before calling runtime `fork_session` with
-`ForkSeed::Summary` and `ForkLcm::NewTimeline`. The runtime protects the seed and
-supersedes the parent. Forge then commits the topic, divider, session replacement
-and intent removal together. A crash leaves the same intent and IDs to replay;
-a crash after the fork reuses its protected seed and completed successor. An
-expired lease can be reclaimed. Rotation never grants additional authority.
+A provider summary, bounded by a 30 s timeout, is sealed before calling runtime
+`fork_session` with `ForkSeed::Summary` and `ForkLcm::NewTimeline`; a summary
+timeout or failure falls back to the deterministic seed and never fails the
+rotation. The runtime protects the seed and supersedes the parent. Forge then
+commits the topic, divider, session replacement and intent removal together. A
+crash leaves the same intent and IDs to replay; a crash after the fork reuses its
+protected seed and completed successor. An expired lease can be reclaimed. A
+successor is always bound to a fresh, empty timeline. Rotation never grants
+additional authority.
 
 The request layout is `[system][tools][topic summary][history][state card + input]`.
 The summary is stable within its topic. State cards stay in a transient user-role
-fragment, outside durable history. CLI chat retains its existing transcript path.
+fragment, outside durable history. The runtime renders a contributed text fragment
+on the system role, so the card carries a random per-backend marker line and a
+provider adapter rewrites exactly that marked message to the user role (marker
+removed) until the runtime admits user-role transient contributors. CLI chat
+retains its existing transcript path.
 
 #### Adaptive authority is a closed vocabulary
 
@@ -2031,8 +2058,15 @@ canonical scopes cannot be opened or merged by possessing a timeline/node ID.
 Runtime-to-timeline bindings are durable and authorized by canonical identity
 and scope. U7 ownership claims atomically record owner/generation, increment the
 DAG revision and fence every mutation, including replay and truncation. A session
-created before U7 resumes once with `Adopt`; subsequent resumes are plain.
-Populated history is never silently adopted or retired. Explicit topic forks use
+created before U7 resumes once with `Adopt`; subsequent resumes are plain. A
+pre-V149 timeline with no recorded runtime session is adopted only by the session
+whose own persisted LCM state references it, and adoption stamps that session as
+the timeline's runtime owner in the binding transaction, so no other session (in
+particular a rotation successor) can resolve to it. Adopt's claim and the snapshot
+save are separate writes; if the save fails after the claim, the same session
+re-adopts idempotently on its next resume (the store reports the timeline as
+unclaimed at the snapshot's generation to its own owner, and the repeated claim
+is a no-op). Populated history is never silently adopted or retired. Explicit topic forks use
 an independently authorized empty timeline. Historical V149 retired rows remain
 readable and keep their canonical scope for deletion; new bindings do not rename
 or retire old timelines.
@@ -2046,21 +2080,35 @@ Forge's serialized-entry sizer, chars/4 overhead calculation and pressure overri
 are removed.
 
 `ProviderLcmSummaryModel` uses the agent's configured provider/model with bounded
-host instructions and its lowest declared reasoning setting (minimal for Gemini,
-low for controllable models; fixed/unsupported reasoning is left unconfigured). The deterministic model remains a fallback.
+host instructions and a low reasoning setting (minimal for Gemini, low for other
+controllable models; fixed/unsupported reasoning is left unconfigured). The runtime
+capabilities expose no effort levels, so the value is fixed in Forge. The
+deterministic model remains a fallback.
 Every summary provider call is planner-admitted under the surface hard cap.
-Leaf summary usage is reported from the runtime semantic-summary ledger. Topic
-summary usage is stored durably under `topic_summary` and submitted through the
-next topic turn's usage reports; stable report IDs are retried until acknowledged
-by the canonical usage ledger. Summary seeds are sealed in the protected store.
+Leaf summary usage is reported from the runtime semantic-summary ledger with the
+turn that made the call. A topic summary call is written to the
+`agent_topic_summary_usage` outbox with its sealed seed and settled into the usage
+ledger exactly once, keyed by the outbox row id, as its own invocation (candidate
+`topic_summary`) on the chat's surface: right after the rotation commits, or by
+the worker's rotation pass after a crash or an abandoned rotation. It is charged
+even if the new topic never runs a turn, and never through later turns. Summary
+seeds are sealed in the protected store.
 U6 rebuilds tuning-derived state without deleting its LCM namespace or requiring
 a Forge policy-revision bump. Strict binding and authorization mismatches still
 fail closed.
 
-Within a topic, unchanged `project.current_state` and `project.charter` results
-return `{ "unchanged_since_call": "<original call id>" }`. A changed digest returns
-the full body; a new topic starts with an empty read cache. This changes context
-representation only, never the authority of the underlying read.
+Within a topic, a full `project.current_state` or `project.charter` result carries
+a unique `read_ref`, and an unchanged repeat returns
+`{ "unchanged_since_call": "<read_ref>" }` only while that full result is in the
+model-visible history of the topic. References from the running turn are held in
+memory and become durable, with the result's canonical history index, only when
+the turn completes; a failed, cancelled or retried turn leaves none and clears the
+session's references before its next turn. A durable reference is honoured only
+while no LCM summary node covers its history index (the LCM entry sequence equals
+the history index), and a same-turn reference only while no node reaches into the
+running turn. A changed digest returns the full body; a new topic starts with an
+empty read cache, and rotation deletes the predecessor's references. This changes
+context representation only, never the authority of the underlying read.
 
 The runtime's process-local history/LCM accounting cache still reads authorized
 inclusive ranges in pages of at most 1,024 entries and checks the DAG revision

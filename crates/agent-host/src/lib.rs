@@ -65,7 +65,7 @@ pub use manifest::{
     RuntimeClassificationLink, RuntimeContextManifestLink, RuntimeContextSegmentLink,
     RuntimeLosslessSummaryLink, RuntimeSummaryCoverageLink,
 };
-pub use native::NativeAgentRuntimeBackend;
+pub use native::{NativeAgentRuntimeBackend, TOPIC_SUMMARY_TIMEOUT, topic_summary_usage_id};
 pub use operation_catalog::{
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,

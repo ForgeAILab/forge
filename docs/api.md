@@ -277,7 +277,7 @@ succeeds. The connection test itself updates the health row.
 | POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/retry` | Admit a new turn for a failed or cancelled turn’s triggering message using current authority; requires `expected_version` and `idempotency_key` |
 | GET    | `/api/v1/analytics/usage` | Read account-scoped typed usage/cost analytics across Task, Project/Main/Genesis Chat, and Main inquiry surfaces |
 | GET    | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — List the chat's immutable topic epochs, newest first, with the current one marked |
-| POST   | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — Request a topic rotation in the same chat; completed immediately when idle, durably deferred while a turn is live |
+| POST   | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — Start a topic in the same chat. Native chats: completed immediately when idle, durably deferred while a turn is live; a request that meets a pending rotation applies its label/summary to it. CLI chats: denied while a turn is live. Both: denied (409) while a Genesis session/approval needs an explicit decision |
 | GET    | `/api/v1/agent-chats/{chat_id}/inquiries` | `V130+` — List the chat's Main Agent inquiry runs with opaque keyset pagination |
 | GET    | `/api/v1/inquiries/{id}` | `V130+` — Read one Main Agent inquiry run |
 | GET    | `/api/v1/inquiries/{id}/logs` | `V130+` — One page of a sub-agent's durable activity log |
@@ -5023,12 +5023,22 @@ Solo's review card derives decisions from offers. Request changes collects nonbl
 
 Project doctrine @19 names `forge_scope_read` operation `work.read` for live Task offers and versions, and the `task.action` contract and required inputs. Migration V202610030100 adds it without changing @17/@18 bodies or digests, and advances current Project bindings. Frozen historical admissions remain immutable.
 
-Native topic rotation responses contain `rotation_pending`, nullable `topic`, and
-nullable `divider_message_id`. When pending, both nullable fields are `null`; the
-worker completes the durable request before admitting the next turn. When complete,
-`rotation_pending` is false and both topic/divider fields identify the new epoch.
+Topic rotation responses contain `rotation_pending`, nullable `topic`, and
+nullable `divider_message_id`. When pending (native chat with a live turn), both
+nullable fields are `null`; the worker completes the durable request before
+admitting the next turn. A newer `POST` while a rotation is pending applies its
+`label` and `summary` to that pending rotation (the newest request wins) and also
+returns `rotation_pending: true`. When complete, `rotation_pending` is false and
+both topic/divider fields identify the new epoch. A rotation that fails three
+attempts is abandoned: the chat keeps its topic, a system notice
+(`outcome: "topic_rotation_failed"`) is appended and an
+`agent_chat.topic.rotation_failed` event carries `error_kind`; a `POST` whose own
+attempt ends that way returns `409`. A `POST` while a Genesis session needs a
+decision returns `409` (unchanged).
 Repeated unchanged native `project.current_state`/`project.charter` tool reads within
-one topic return `{ "unchanged_since_call": "<call id>" }`.
+one topic return `{ "unchanged_since_call": "<read_ref>" }`, where `read_ref` is
+the unique reference carried by the earlier full result, and only while that result
+is still visible to the model (not compacted, not from a failed turn).
 
 ### Project owner escalations
 

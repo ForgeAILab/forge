@@ -564,7 +564,13 @@ impl AgentChatTurnLogRoot {
 
 #[async_trait]
 pub trait AgentChatTurnRunner: Send + Sync {
-    async fn rotate_pending_topic(&self, _chat_id: &str) -> Result<bool> {
+    /// One attempt at the chat's pending topic rotation, if it is due at
+    /// `now`. Runs off the turn-claim path (the worker's rotation pass).
+    async fn rotate_pending_topic(
+        &self,
+        _chat_id: &str,
+        _now: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
         Ok(false)
     }
 
@@ -3594,10 +3600,15 @@ impl FederatedAgentChatTurnRunner {
 
 #[async_trait]
 impl AgentChatTurnRunner for FederatedAgentChatTurnRunner {
-    async fn rotate_pending_topic(&self, chat_id: &str) -> Result<bool> {
-        crate::TopicRotator::rotate_pending(
+    async fn rotate_pending_topic(
+        &self,
+        chat_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
+        crate::TopicRotator::rotate_pending_at(
             &crate::TopicRotationCoordinator::new(self.db.clone(), self.embedded_agents.clone()),
             chat_id,
+            now,
         )
         .await
     }
@@ -3691,6 +3702,8 @@ pub struct AgentChatTurnWorker {
     runner: Arc<dyn AgentChatTurnRunner>,
     lease_owner: String,
     lease_renew_interval: Duration,
+    /// Held by the one in-flight topic rotation pass.
+    rotation_pass: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3732,6 +3745,7 @@ impl AgentChatTurnWorker {
             runner,
             lease_owner: format!("agent-chat-worker:{}", db::new_uuid_v4()),
             lease_renew_interval: LEASE_RENEW_INTERVAL,
+            rotation_pass: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -3851,6 +3865,9 @@ impl AgentChatTurnWorker {
     /// Select due work at an explicit clock instant; leases retain real time.
     pub async fn run_once_at(&self, now: chrono::DateTime<Utc>) -> Result<usize> {
         self.recover_expired().await?;
+        // Deterministic for callers: due rotations complete (or back off)
+        // before this pass claims. The polling loop runs them off-path.
+        crate::topic_rotation::run_topic_rotation_pass(&self.db, &self.runner, now).await?;
         let jobs: Vec<_> = self.claim_one_at(now).await?.into_iter().collect();
         let count = jobs.len();
         for job in jobs {
@@ -3862,6 +3879,7 @@ impl AgentChatTurnWorker {
     async fn claim_available(&self, capacity: usize) -> Result<Vec<AgentChatTurnJob>> {
         let mut jobs = Vec::with_capacity(capacity);
         self.recover_expired().await?;
+        self.spawn_topic_rotation_pass();
         for _ in 0..capacity {
             let Some(job) = self.claim_one().await? else {
                 break;
@@ -3875,14 +3893,26 @@ impl AgentChatTurnWorker {
         self.claim_one_at(Utc::now()).await
     }
 
-    async fn claim_one_at(&self, now: chrono::DateTime<Utc>) -> Result<Option<AgentChatTurnJob>> {
-        let pending: Vec<String> = sqlx::query_scalar("SELECT chat_id FROM agent_chat_topic_rotation WHERE owner_token IS NULL OR julianday(lease_until) <= julianday(?) ORDER BY created_at ASC LIMIT 8")
-            .bind(now.to_rfc3339()).fetch_all(self.db.pool()).await?;
-        for chat_id in pending {
-            if let Err(error) = self.runner.rotate_pending_topic(&chat_id).await {
-                tracing::warn!(%chat_id, %error, "topic rotation deferred before turn admission");
+    /// Starts one topic rotation pass in the background unless one is
+    /// already running, so a rotation's provider summary call never delays
+    /// claiming any chat's turns.
+    fn spawn_topic_rotation_pass(&self) {
+        let Ok(guard) = Arc::clone(&self.rotation_pass).try_lock_owned() else {
+            return;
+        };
+        let db = Arc::clone(&self.db);
+        let runner = Arc::clone(&self.runner);
+        tokio::spawn(async move {
+            let _guard = guard;
+            if let Err(error) =
+                crate::topic_rotation::run_topic_rotation_pass(&db, &runner, Utc::now()).await
+            {
+                tracing::warn!(%error, "topic rotation pass failed");
             }
-        }
+        });
+    }
+
+    async fn claim_one_at(&self, now: chrono::DateTime<Utc>) -> Result<Option<AgentChatTurnJob>> {
         let now = now.to_rfc3339();
         let leased_until = lease_deadline();
         let mut transaction = db::begin_immediate(self.db.pool()).await?;

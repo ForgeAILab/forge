@@ -4,6 +4,8 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
+    #[error("Agent Chat topic request denied: {0:?}")]
+    AgentChatTopicDenied(crate::AgentChatTopicDenialReason),
     #[error("LCM timeline ownership changed")]
     LcmTimelineOwned {
         owner: Option<String>,

@@ -587,14 +587,72 @@ impl SqliteProtectedRuntimeStore {
     /// LCM timeline. The runtime id and canonical scope must both match the
     /// persisted Forge session; a timeline id alone cannot be used to open
     /// the store.
+    ///
+    /// A session first resolves to its own durable binding. Without one it
+    /// may continue a timeline it already owns (stamped with its runtime id),
+    /// or adopt the one pre-V149 owner-less timeline its *own* persisted LCM
+    /// state references; that adoption stamps the owner in the same
+    /// transaction, so no other runtime session can resolve to it afterwards.
+    /// Anything else gets a fresh timeline.
     pub async fn lcm_store_for_runtime_session(
         &self,
         runtime_id: &str,
         scope_type: &str,
         scope_id: &str,
     ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+        self.resolve_lcm_store(runtime_id, scope_type, scope_id, false)
+            .await
+    }
+
+    /// Resolves a topic-rotation successor. A successor never adopts or
+    /// shares an existing timeline: it is always bound to a fresh, empty one
+    /// (replays reuse that same binding).
+    pub async fn lcm_store_for_successor_runtime_session(
+        &self,
+        runtime_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+        self.resolve_lcm_store(runtime_id, scope_type, scope_id, true)
+            .await
+    }
+
+    /// The LCM timeline the runtime session's own persisted state is bound
+    /// to, if it has any. Only this timeline may be adopted while owner-less.
+    async fn referenced_lcm_timeline(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<String>, crate::AgentHostError> {
+        let id = SessionId::new(runtime_id);
+        let snapshot = match SessionStore::load(self, &id)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+        {
+            Some(snapshot) => Some(snapshot),
+            None => CheckpointStore::load_latest(self, &id)
+                .await
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+                .map(|checkpoint| checkpoint.snapshot),
+        };
+        Ok(snapshot.and_then(|snapshot| {
+            snapshot
+                .extension_state
+                .get(agent_runtime::harness::LCM_COMPONENT_ID)
+                .and_then(|state| state.value.get("timeline_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }))
+    }
+
+    async fn resolve_lcm_store(
+        &self,
+        runtime_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        successor: bool,
+    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
         let row = sqlx::query(
-            "SELECT session.identity_id, session.created_at, scope.scope_type, scope.scope_id
+            "SELECT session.identity_id, scope.scope_type, scope.scope_id
              FROM agent_session AS session
              JOIN agent_context_scope AS scope
                ON scope.id = session.context_scope_id
@@ -622,6 +680,19 @@ impl SqliteProtectedRuntimeStore {
             agent_runtime::registry::RegistryRevision::from_content(format!(
                 "forge-lcm-authorization-v1\n{identity_id}\n{stored_scope_type}\n{stored_scope_id}"
             ));
+        let has_binding: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?)",
+        )
+        .bind(runtime_id)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        // Decrypting the snapshot happens outside the write transaction.
+        let referenced = if successor || has_binding {
+            None
+        } else {
+            self.referenced_lcm_timeline(runtime_id).await?
+        };
         let mut tx = db::begin_immediate(self.db.pool())
             .await
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
@@ -635,17 +706,79 @@ impl SqliteProtectedRuntimeStore {
         let timeline_id = if let Some(id) = existing {
             id
         } else {
-            let legacy: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM agent_lcm_timeline WHERE identity_id = ? AND scope_type = ? AND canonical_scope_id = ? AND (runtime_session_id = ? OR (runtime_session_id IS NULL AND retired_at IS NULL) OR (scope_type <> 'agent_chat' AND claim_owner IS NULL AND retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM agent_lcm_entry e WHERE e.timeline_id = agent_lcm_timeline.id))) ORDER BY runtime_session_id IS NULL ASC LIMIT 1")
-                .bind(&identity_id).bind(&stored_scope_type).bind(&stored_scope_id).bind(runtime_id)
-                .fetch_optional(&mut *tx).await.map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-            let id = legacy.unwrap_or_else(db::new_uuid_v4);
-            sqlx::query("INSERT OR IGNORE INTO agent_lcm_timeline (id, identity_id, scope_type, scope_id, canonical_scope_id, runtime_session_id, authorization_revision, revision, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)")
-                .bind(&id).bind(&identity_id).bind(&stored_scope_type).bind(format!("{stored_scope_id}#topic:{runtime_id}"))
-                .bind(&stored_scope_id).bind(runtime_id).bind(authorization_revision.as_str()).bind(db::now_rfc3339()).bind(db::now_rfc3339())
-                .execute(&mut *tx).await.map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-            sqlx::query("INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id) VALUES (?, ?)")
-                .bind(runtime_id).bind(&id).execute(&mut *tx).await.map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            let candidate: Option<String> = if successor {
+                None
+            } else {
+                sqlx::query_scalar(
+                    "SELECT id FROM agent_lcm_timeline
+                     WHERE identity_id = ?1 AND scope_type = ?2 AND canonical_scope_id = ?3
+                       AND (runtime_session_id = ?4
+                            OR (runtime_session_id IS NULL AND retired_at IS NULL AND id = ?5)
+                            OR (scope_type <> 'agent_chat' AND claim_owner IS NULL
+                                AND retired_at IS NULL
+                                AND NOT EXISTS(SELECT 1 FROM agent_lcm_entry e
+                                               WHERE e.timeline_id = agent_lcm_timeline.id)))
+                     ORDER BY runtime_session_id IS NULL ASC LIMIT 1",
+                )
+                .bind(&identity_id)
+                .bind(&stored_scope_type)
+                .bind(&stored_scope_id)
+                .bind(runtime_id)
+                .bind(referenced.as_deref())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+            };
+            let id = match candidate {
+                Some(id) => {
+                    // Adopting a legacy owner-less row stamps its owner, so
+                    // the lookup above can never hand it to another session
+                    // (a rotation successor in particular).
+                    sqlx::query(
+                        "UPDATE agent_lcm_timeline SET runtime_session_id = ?
+                         WHERE id = ? AND runtime_session_id IS NULL",
+                    )
+                    .bind(runtime_id)
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                    id
+                }
+                None => {
+                    let id = db::new_uuid_v4();
+                    let now = db::now_rfc3339();
+                    sqlx::query(
+                        "INSERT INTO agent_lcm_timeline (
+                            id, identity_id, scope_type, scope_id, canonical_scope_id,
+                            runtime_session_id, authorization_revision, revision,
+                            created_at, updated_at
+                         ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    )
+                    .bind(&id)
+                    .bind(&identity_id)
+                    .bind(&stored_scope_type)
+                    .bind(format!("{stored_scope_id}#topic:{runtime_id}"))
+                    .bind(&stored_scope_id)
+                    .bind(runtime_id)
+                    .bind(authorization_revision.as_str())
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                    id
+                }
+            };
+            sqlx::query(
+                "INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id)
+                 VALUES (?, ?)",
+            )
+            .bind(runtime_id)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
             id
         };
         tx.commit()

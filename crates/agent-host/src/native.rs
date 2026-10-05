@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
@@ -60,6 +60,12 @@ pub struct NativeAgentRuntimeBackend {
     fetch_transport: Arc<dyn agent_runtime::harness::FetchTransport>,
     provider_override: Option<Arc<dyn Provider>>,
     working_sets: Arc<std::sync::RwLock<(WorkingSetPolicy, WorkingSetPolicy)>>,
+    /// Runtime sessions whose last turn did not complete; their unchanged-
+    /// read references are cleared before their next turn.
+    failed_topic_reads: Arc<Mutex<HashSet<String>>>,
+    /// Random per-backend line that identifies the contributed state card
+    /// on the wire (see [`ServerStateCardProvider`]). Never sent.
+    state_card_marker: String,
 }
 
 struct ActiveNativeSession {
@@ -127,6 +133,8 @@ impl NativeAgentRuntimeBackend {
             forge_tool_provider: None,
             fetch_transport: Arc::new(crate::ForgeFetchTransport::new()),
             provider_override: None,
+            failed_topic_reads: Arc::new(Mutex::new(HashSet::new())),
+            state_card_marker: format!("[forge-state-card:{}]\n", db::new_uuid_v4()),
             working_sets: Arc::new(std::sync::RwLock::new((
                 WorkingSetPolicy {
                     target_tokens: 48_000,
@@ -257,16 +265,160 @@ impl NativeAgentRuntimeBackend {
     }
 }
 
+/// Operations whose repeat reads, unchanged within one topic, return a
+/// reference to the earlier full result instead of the body.
+const UNCHANGED_READ_OPERATIONS: [&str; 2] = ["project.current_state", "project.charter"];
+
+/// Unchanged-read references for one runtime session (= one topic).
+///
+/// A full result carries a unique `read_ref`; a later identical read returns
+/// `{"unchanged_since_call": <read_ref>}` only while that full result is
+/// provably in the model-visible history of this topic:
+///
+/// - results of the running turn are staged in memory and become durable,
+///   with their canonical history index, only when the turn completes, so a
+///   failed, cancelled or retried turn never leaves a reference behind (and
+///   a failed turn also clears the session's durable references);
+/// - a durable reference is honoured only while no LCM summary node covers
+///   its history index (the LCM entry sequence is the history index);
+/// - a staged reference is honoured only while no LCM node reaches into the
+///   running turn;
+/// - each topic is its own runtime session, and rotation deletes the
+///   predecessor's references.
 #[derive(Debug)]
 struct TopicReadFilter {
     db: Arc<db::SqliteDb>,
     runtime_session_id: String,
+    turn: Mutex<TopicReadTurn>,
 }
+
+#[derive(Debug, Default)]
+struct TopicReadTurn {
+    /// Canonical history length when the running turn started.
+    start_history_len: usize,
+    /// operation -> (digest, read_ref) of full results this turn returned.
+    staged: HashMap<String, (String, String)>,
+}
+
+impl TopicReadFilter {
+    fn persistence_error() -> RuntimeError {
+        RuntimeError::internal("topic read cache unavailable")
+    }
+
+    fn begin_turn(&self, start_history_len: usize) {
+        if let Ok(mut turn) = self.turn.lock() {
+            *turn = TopicReadTurn {
+                start_history_len,
+                staged: HashMap::new(),
+            };
+        }
+    }
+
+    /// Highest canonical history index covered by an LCM summary node of
+    /// this session's timeline, or -1.
+    async fn compacted_through(&self) -> Result<i64, RuntimeError> {
+        sqlx::query_scalar(
+            "SELECT COALESCE(MAX(node.range_end), -1)
+             FROM agent_lcm_node AS node
+             JOIN agent_runtime_lcm_binding AS binding ON binding.timeline_id = node.timeline_id
+             WHERE binding.runtime_session_id = ?",
+        )
+        .bind(&self.runtime_session_id)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(|_| Self::persistence_error())
+    }
+
+    /// Makes this turn's references durable once the turn completed and its
+    /// history is persisted. A reference whose result cannot be found in the
+    /// history is dropped rather than trusted.
+    async fn commit(&self, history: &[Message]) -> Result<(), AgentHostError> {
+        let staged = match self.turn.lock() {
+            Ok(mut turn) => std::mem::take(&mut turn.staged),
+            Err(_) => return Err(AgentHostError::ProtectedPersistence),
+        };
+        for (operation, (digest, reference)) in staged {
+            let index = history.iter().rposition(|message| {
+                message.role == Role::Tool
+                    && serde_json::to_string(message)
+                        .is_ok_and(|encoded| encoded.contains(&reference))
+            });
+            let query = match index {
+                Some(index) => sqlx::query(
+                    "INSERT INTO agent_topic_read_digest
+                         (runtime_session_id, operation, digest, call_ref, history_index)
+                     VALUES (?, ?, ?, ?, ?)
+                     ON CONFLICT(runtime_session_id, operation) DO UPDATE SET
+                         digest = excluded.digest, call_ref = excluded.call_ref,
+                         history_index = excluded.history_index",
+                )
+                .bind(&self.runtime_session_id)
+                .bind(&operation)
+                .bind(digest)
+                .bind(reference)
+                .bind(i64::try_from(index).unwrap_or(i64::MAX)),
+                None => sqlx::query(
+                    "DELETE FROM agent_topic_read_digest
+                     WHERE runtime_session_id = ? AND operation = ?",
+                )
+                .bind(&self.runtime_session_id)
+                .bind(&operation),
+            };
+            query
+                .execute(self.db.pool())
+                .await
+                .map_err(|_| AgentHostError::ProtectedPersistence)?;
+        }
+        Ok(())
+    }
+}
+
+/// Clears a session's unchanged-read references at the start of its next
+/// turn when the previous turn did not complete.
+async fn clear_topic_reads(
+    db: &db::SqliteDb,
+    runtime_session_id: &str,
+) -> Result<(), AgentHostError> {
+    sqlx::query("DELETE FROM agent_topic_read_digest WHERE runtime_session_id = ?")
+        .bind(runtime_session_id)
+        .execute(db.pool())
+        .await
+        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+    Ok(())
+}
+
+/// Marks a turn's unchanged-read references for clearing unless the turn
+/// completes ([`Self::complete`]). Synchronous, so every early return and
+/// cancellation is covered; the clearing runs before the session's next
+/// turn plans anything.
+struct TopicReadTurnGuard {
+    failed: Arc<Mutex<HashSet<String>>>,
+    runtime_session_id: String,
+    completed: bool,
+}
+
+impl TopicReadTurnGuard {
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for TopicReadTurnGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Ok(mut failed) = self.failed.lock() {
+            failed.insert(self.runtime_session_id.clone());
+        }
+    }
+}
+
 #[async_trait]
 impl crate::typed_tools::ToolResultFilter for TopicReadFilter {
     async fn filter(
         &self,
-        call_id: &ToolCallId,
+        _call_id: &ToolCallId,
         arguments: &serde_json::Value,
         mut outcome: ToolOutcome,
     ) -> Result<ToolOutcome, RuntimeError> {
@@ -274,7 +426,11 @@ impl crate::typed_tools::ToolResultFilter for TopicReadFilter {
             .get("operation")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        if outcome.is_error || !matches!(operation, "project.current_state" | "project.charter") {
+        if outcome.is_error
+            || !UNCHANGED_READ_OPERATIONS.contains(&operation)
+            || !outcome.content.is_empty()
+            || !outcome.value.is_object()
+        {
             return Ok(outcome);
         }
         use sha2::{Digest, Sha256};
@@ -282,38 +438,71 @@ impl crate::typed_tools::ToolResultFilter for TopicReadFilter {
             serde_json::to_vec(&outcome.value)
                 .map_err(|_| RuntimeError::internal("topic read digest failed"))?,
         ));
-        let mut tx = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|_| RuntimeError::internal("topic read cache unavailable"))?;
-        let previous: Option<(String, String)> = sqlx::query_as("SELECT digest, call_ref FROM agent_topic_read_digest WHERE runtime_session_id = ? AND operation = ?")
-            .bind(&self.runtime_session_id).bind(operation).fetch_optional(&mut *tx).await.map_err(|_| RuntimeError::internal("topic read cache unavailable"))?;
-        if let Some((old_digest, reference)) = previous.filter(|(old, _)| old == &digest) {
-            let _ = old_digest;
+        let compacted = self.compacted_through().await?;
+        let (staged, start_history_len) = {
+            let turn = self.turn.lock().map_err(|_| Self::persistence_error())?;
+            (turn.staged.get(operation).cloned(), turn.start_history_len)
+        };
+        let start_history_len = i64::try_from(start_history_len).unwrap_or(i64::MAX);
+        let visible = match staged {
+            Some((staged_digest, reference)) => {
+                (staged_digest == digest && compacted < start_history_len).then_some(reference)
+            }
+            None => {
+                let previous: Option<(String, String, i64)> = sqlx::query_as(
+                    "SELECT digest, call_ref, history_index FROM agent_topic_read_digest
+                     WHERE runtime_session_id = ? AND operation = ?",
+                )
+                .bind(&self.runtime_session_id)
+                .bind(operation)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(|_| Self::persistence_error())?;
+                previous.and_then(|(previous_digest, reference, history_index)| {
+                    (previous_digest == digest && history_index > compacted).then_some(reference)
+                })
+            }
+        };
+        if let Some(reference) = visible {
             outcome.value = serde_json::json!({"unchanged_since_call": reference});
-            outcome.content = Default::default();
-        } else {
-            sqlx::query("INSERT INTO agent_topic_read_digest (runtime_session_id, operation, digest, call_ref) VALUES (?, ?, ?, ?) ON CONFLICT(runtime_session_id, operation) DO UPDATE SET digest = excluded.digest, call_ref = excluded.call_ref")
-                .bind(&self.runtime_session_id).bind(operation).bind(digest).bind(call_id.as_str()).execute(&mut *tx).await.map_err(|_| RuntimeError::internal("topic read cache unavailable"))?;
+            return Ok(outcome);
         }
-        tx.commit()
-            .await
-            .map_err(|_| RuntimeError::internal("topic read cache unavailable"))?;
+        let reference = format!("read-{}", db::new_uuid_v4());
+        if let serde_json::Value::Object(body) = &mut outcome.value {
+            body.insert(
+                "read_ref".to_owned(),
+                serde_json::Value::String(reference.clone()),
+            );
+        }
+        self.turn
+            .lock()
+            .map_err(|_| Self::persistence_error())?
+            .staged
+            .insert(operation.to_owned(), (digest, reference));
         Ok(outcome)
     }
 }
 
-/// Serialization of the host's identified data card. The pinned runtime admits
-/// a transient TailContext text fragment on System; this adapter narrows that
-/// exact required message to User before the vendor adapter serializes it.
+/// Serialization of the host's identified data card. The pinned runtime renders
+/// a contributed TailContext text fragment on the system role and rejects
+/// user-role contributed messages, so this adapter narrows the card message to
+/// the user role before the vendor adapter serializes it.
+///
+/// The card is identified by an explicit marker, never by matching text: the
+/// contributor prefixes the card with this backend's random marker line, and
+/// only the system-role message that starts with it is rewritten (marker
+/// stripped). User text that repeats or edits the card is never touched.
+/// Remove this adapter once the runtime admits user-role transient
+/// contributors (upstream follow-up).
 struct ServerStateCardProvider {
     inner: Arc<dyn Provider>,
-    card: String,
+    marker: String,
 }
 impl fmt::Debug for ServerStateCardProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerStateCardProvider")
             .field("inner", &self.inner)
-            .field("card", &"[redacted]")
+            .field("marker", &"[redacted]")
             .finish()
     }
 }
@@ -338,21 +527,38 @@ impl Provider for ServerStateCardProvider {
         agent_runtime::core::provider::ProviderStream,
         agent_runtime::core::provider::ProviderError,
     > {
-        let tail = request.messages.last_mut().ok_or_else(|| {
+        unmark_state_card(&mut request.messages, &self.marker)?;
+        self.inner.stream(request, ctx).await
+    }
+}
+
+/// Rewrites the one marked state-card message to the user role and strips
+/// its marker. A request without it is refused: the card is required.
+fn unmark_state_card(
+    messages: &mut [Message],
+    marker: &str,
+) -> Result<(), agent_runtime::core::provider::ProviderError> {
+    let card = messages
+        .iter_mut()
+        .rev()
+        .find(|message| {
+            message.role == Role::System
+                && matches!(
+                    message.content.first(),
+                    Some(ContentPart::Text { text }) if text.starts_with(marker)
+                )
+        })
+        .ok_or_else(|| {
             agent_runtime::core::provider::ProviderError::new(
                 agent_runtime::core::provider::ProviderErrorKind::BadRequest,
                 "planned state card is missing",
             )
         })?;
-        if tail.role != Role::System || tail.joined_text() != self.card {
-            return Err(agent_runtime::core::provider::ProviderError::new(
-                agent_runtime::core::provider::ProviderErrorKind::BadRequest,
-                "planned state card does not match the host card",
-            ));
-        }
-        tail.role = Role::User;
-        self.inner.stream(request, ctx).await
+    if let Some(ContentPart::Text { text }) = card.content.first_mut() {
+        text.replace_range(..marker.len(), "");
     }
+    card.role = Role::User;
+    Ok(())
 }
 
 type SealedTopicSeed = (Option<Vec<u8>>, Option<Vec<u8>>);
@@ -364,6 +570,7 @@ struct PreparedNativeRuntime {
     tool_result_summaries: Arc<Mutex<HashMap<String, ToolResultSummary>>>,
     needs_adoption: bool,
     summary_cap: u32,
+    topic_reads: Option<Arc<TopicReadFilter>>,
 }
 
 #[derive(Debug)]
@@ -488,13 +695,30 @@ impl NativeAgentRuntimeBackend {
                 fetch_transport: Some(Arc::clone(&self.fetch_transport)),
             },
         )?;
-        let composition = if binding.scope.scope_type == CanonicalScopeType::AgentChat {
-            composition.filter_results(Arc::new(TopicReadFilter {
+        let topic_reads = if binding.scope.scope_type == CanonicalScopeType::AgentChat {
+            let failed = self
+                .failed_topic_reads
+                .lock()
+                .map_err(|_| AgentHostError::ProtectedPersistence)?
+                .remove(&request.runtime_session_id);
+            if failed {
+                clear_topic_reads(
+                    &self.protected_store.database(),
+                    &request.runtime_session_id,
+                )
+                .await?;
+            }
+            Some(Arc::new(TopicReadFilter {
                 db: self.protected_store.database(),
                 runtime_session_id: request.runtime_session_id.clone(),
+                turn: Mutex::new(TopicReadTurn::default()),
             }))
         } else {
-            composition
+            None
+        };
+        let composition = match &topic_reads {
+            Some(filter) => composition.filter_results(filter.clone()),
+            None => composition,
         };
         // `RuntimeEvent::ToolCallCompleted` only carries `is_error`; observe
         // each tool's exact result here, keyed by call id, so the bounded
@@ -530,7 +754,9 @@ impl NativeAgentRuntimeBackend {
                 lcm_store.timeline_id().to_owned(),
                 lcm_store.authorization_revision().to_owned(),
             ));
-            needs_adoption = lcm_store.needs_adoption().await?;
+            needs_adoption = lcm_store
+                .needs_adoption(&request.runtime_session_id)
+                .await?;
             let lcm_binding =
                 lcm_store.runtime_binding(SessionId::new(&request.runtime_session_id))?;
             let mut resolver = TopicTimelineResolver {
@@ -541,7 +767,7 @@ impl NativeAgentRuntimeBackend {
             if let Some(successor) = successor {
                 let next = self
                     .protected_store
-                    .lcm_store_for_runtime_session(
+                    .lcm_store_for_successor_runtime_session(
                         successor,
                         scope_type_name(request.scope.scope_type),
                         &request.scope.scope_id,
@@ -566,10 +792,10 @@ impl NativeAgentRuntimeBackend {
         };
         let mut builder = RuntimeBuilder::new(model_id.clone())
             .provider_name(request.provider.provider.clone())
-            .provider(if let Some(card) = request.server_state_card.clone() {
+            .provider(if request.server_state_card.is_some() {
                 Arc::new(ServerStateCardProvider {
                     inner: provider,
-                    card,
+                    marker: self.state_card_marker.clone(),
                 }) as Arc<dyn Provider>
             } else {
                 provider
@@ -626,7 +852,9 @@ impl NativeAgentRuntimeBackend {
             builder = builder.system_prompt(prompt);
         }
         if let Some(card) = request.server_state_card.clone() {
-            builder = builder.context_contributor(Arc::new(ServerStateCard { card }));
+            builder = builder.context_contributor(Arc::new(ServerStateCard {
+                card: format!("{}{card}", self.state_card_marker),
+            }));
         }
         if let Some(effort) = request.provider.reasoning_effort.as_deref() {
             builder = builder.reasoning(ReasoningConfig {
@@ -644,6 +872,7 @@ impl NativeAgentRuntimeBackend {
             tool_result_summaries,
             needs_adoption,
             summary_cap,
+            topic_reads,
         })
     }
 }
@@ -712,7 +941,8 @@ const STATE_CARD_TAIL_SEQUENCE: u64 = 1_000_000;
 /// The fragment trails the conversation, which keeps the system prompt, the
 /// tool schemas and the whole history a byte-stable prefix across a state
 /// change. The runtime renders a contributed text fragment on the system
-/// role, so the card is a trailing system-role message, not user input.
+/// role; [`ServerStateCardProvider`] sends it as the trailing user-role data
+/// message (1B.1), identified by its marker line.
 #[derive(Debug)]
 struct ServerStateCard {
     card: String,
@@ -842,7 +1072,13 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             tool_result_summaries,
             needs_adoption,
             summary_cap: _,
+            topic_reads,
         } = self.prepare_runtime(&request, None).await?;
+        let mut topic_reads_guard = TopicReadTurnGuard {
+            failed: Arc::clone(&self.failed_topic_reads),
+            runtime_session_id: request.runtime_session_id.clone(),
+            completed: false,
+        };
         use agent_runtime::core::store::SessionStore;
         use agent_runtime::prelude::CheckpointStore;
         let id = SessionId::new(&request.runtime_session_id);
@@ -880,6 +1116,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         // everything already in it was reported by the turn that made the
         // call. Only records appended from here on belong to this turn.
         let usage_baseline = session.snapshot().usage.records().len();
+        if let Some(reads) = &topic_reads {
+            reads.begin_turn(session.history().len());
+        }
         let mut events = session.subscribe();
         if request.cancellation.is_cancelled() {
             return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
@@ -1009,6 +1248,15 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             }
         };
         let history = session.history();
+        if matches!(
+            finish,
+            TurnFinish::Completed | TurnFinish::NeedsInput { .. }
+        ) {
+            if let Some(reads) = &topic_reads {
+                reads.commit(&history).await?;
+            }
+            topic_reads_guard.complete();
+        }
         let text = history
             .iter()
             .rev()
@@ -1041,7 +1289,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .get(CounterKind::Output)
             .checked_add(usage.get(CounterKind::Reasoning))
             .ok_or_else(|| AgentHostError::Runtime("usage counter overflow".to_owned()))?;
-        let mut usage_reports = turn_records
+        let usage_reports = turn_records
             .iter()
             .enumerate()
             .filter(|(_, record)| {
@@ -1085,25 +1333,6 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 })
             })
             .collect::<Result<Vec<_>, AgentHostError>>()?;
-        let db = self.protected_store.database();
-        let summary_rows = sqlx::query("SELECT s.* FROM agent_topic_summary_usage s WHERE runtime_session_id = ? AND NOT EXISTS (SELECT 1 FROM usage_event e WHERE e.source_report_id = s.id)")
-            .bind(&request.runtime_session_id).fetch_all(db.pool()).await.map_err(|_| AgentHostError::ProtectedPersistence)?;
-        use sqlx::Row;
-        for row in summary_rows {
-            usage_reports.push(AgentTurnUsageReport {
-                report_id: row.get("id"),
-                request_id: Some(format!("topic_summary:{}", row.get::<String, _>("id"))),
-                attempt_id: None,
-                provider_id: Some(row.get("provider")),
-                model_id: Some(row.get("model")),
-                input_tokens: Some(row.get::<i64, _>("input_tokens") as u64),
-                output_tokens: Some(row.get::<i64, _>("output_tokens") as u64),
-                cache_read_tokens: Some(0),
-                cache_write_tokens: Some(0),
-                telemetry_state: AgentTurnTelemetryState::Metered,
-                failed: row.get("failed"),
-            });
-        }
         let output = AgentTurnOutput {
             runtime_session_id: request.runtime_session_id,
             text,
@@ -1210,6 +1439,28 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
     }
 }
 
+/// Bound on the provider topic-summary call made during a rotation.
+pub const TOPIC_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const TOPIC_SUMMARY_EMPTY: &str = "No earlier conversation.";
+const TOPIC_SUMMARY_FALLBACK: &str =
+    "Earlier conversation continues from the previous topic; consult current state before acting.";
+
+/// The deterministic seed used when the provider summary fails or times out.
+async fn deterministic_topic_seed(request: &agent_runtime::lcm::LcmSummaryModelRequest) -> String {
+    use agent_runtime::lcm::LcmSummaryModel;
+    crate::DeterministicLcmSummaryModel::default()
+        .summarize(request)
+        .await
+        .map(|response| response.text)
+        .unwrap_or_else(|_| TOPIC_SUMMARY_FALLBACK.to_owned())
+}
+
+/// The usage-outbox row id for one rotation intent's summary call.
+#[must_use]
+pub fn topic_summary_usage_id(intent_id: &str) -> String {
+    format!("topic-summary:{intent_id}")
+}
+
 impl NativeAgentRuntimeBackend {
     /// Complete the durable intent using its pre-reserved successor identity.
     pub async fn fork_topic(
@@ -1302,27 +1553,43 @@ impl NativeAgentRuntimeBackend {
                 .revision,
             };
             let model = self.summary_model(&request, prepared.summary_cap)?;
+            // The provider summary is bounded and best-effort: a timeout or
+            // a failure falls back to the deterministic seed, and never
+            // fails the rotation on its own.
             let result = if summary_request.messages.is_empty() {
                 None
             } else {
-                Some(model.summarize(&summary_request).await)
+                Some(
+                    tokio::time::timeout(TOPIC_SUMMARY_TIMEOUT, model.summarize(&summary_request))
+                        .await,
+                )
             };
             let (text, input, output, failed) = match result {
-                Some(Ok(response)) => (
+                Some(Ok(Ok(response))) => (
                     response.text,
                     response.input_tokens,
                     response.output_tokens,
                     false,
                 ),
-                Some(Err(error)) => {
+                Some(Ok(Err(error))) => {
+                    tracing::warn!(intent_id, error = %error, "topic summary failed; using the deterministic seed");
                     let (input, output) = error.reported_usage().unwrap_or((0, 0));
-                    let fallback = crate::DeterministicLcmSummaryModel::default()
-                        .summarize(&summary_request)
-                        .await
-                        .map_err(|e| AgentHostError::Runtime(e.to_string()))?;
-                    (fallback.text, input, output, true)
+                    (
+                        deterministic_topic_seed(&summary_request).await,
+                        input,
+                        output,
+                        true,
+                    )
                 }
-                None => ("No earlier conversation.".to_owned(), 0, 0, false),
+                Some(Err(_elapsed)) => {
+                    tracing::warn!(
+                        intent_id,
+                        timeout_secs = TOPIC_SUMMARY_TIMEOUT.as_secs(),
+                        "topic summary timed out; using the deterministic seed"
+                    );
+                    (deterministic_topic_seed(&summary_request).await, 0, 0, true)
+                }
+                None => (TOPIC_SUMMARY_EMPTY.to_owned(), 0, 0, false),
             };
             let (ciphertext, nonce) = self
                 .protected_store
@@ -1334,9 +1601,25 @@ impl NativeAgentRuntimeBackend {
             sqlx::query("UPDATE agent_chat_topic_rotation SET summary_ciphertext = ?, summary_nonce = ? WHERE id = ? AND summary_ciphertext IS NULL")
                 .bind(ciphertext).bind(nonce).bind(intent_id).execute(&mut *tx).await.map_err(|_| AgentHostError::ProtectedPersistence)?;
             if input != 0 || output != 0 {
-                sqlx::query("INSERT INTO agent_topic_summary_usage (id, runtime_session_id, provider, model, input_tokens, output_tokens, failed, purpose) VALUES (?, ?, ?, ?, ?, ?, ?, 'topic_summary')")
-                    .bind(format!("topic-summary:{intent_id}")).bind(successor).bind(&request.provider.provider).bind(&request.provider.model)
-                    .bind(input as i64).bind(output as i64).bind(failed).execute(&mut *tx).await.map_err(|_| AgentHostError::ProtectedPersistence)?;
+                // Usage outbox, written with the sealed seed. The caller
+                // settles it into the usage ledger once, keyed by this id.
+                sqlx::query(
+                    "INSERT OR IGNORE INTO agent_topic_summary_usage
+                         (id, runtime_session_id, provider, model, input_tokens,
+                          output_tokens, failed, purpose, chat_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 'topic_summary', ?)",
+                )
+                .bind(topic_summary_usage_id(intent_id))
+                .bind(successor)
+                .bind(&request.provider.provider)
+                .bind(&request.provider.model)
+                .bind(i64::try_from(input).unwrap_or(i64::MAX))
+                .bind(i64::try_from(output).unwrap_or(i64::MAX))
+                .bind(failed)
+                .bind(&request.scope.scope_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| AgentHostError::ProtectedPersistence)?;
             }
             tx.commit()
                 .await
@@ -1355,6 +1638,18 @@ impl NativeAgentRuntimeBackend {
             .map_err(host_runtime_error)?;
         child.persist().await.map_err(host_runtime_error)?;
         Ok(())
+    }
+
+    /// Clears a pending fork intent an abandoned topic rotation left on the
+    /// source session, so the source keeps taking turns. A no-op when no
+    /// fork is pending; refused by the runtime once the successor was saved.
+    pub async fn abort_topic_fork(&self, request: AgentTurnRequest) -> Result<(), AgentHostError> {
+        let prepared = self.prepare_runtime(&request, None).await?;
+        prepared
+            .runtime
+            .abort_fork(&SessionId::new(&request.runtime_session_id))
+            .await
+            .map_err(host_runtime_error)
     }
 
     fn summary_model(
@@ -2431,50 +2726,157 @@ mod turn_failure_tests {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
         let database = Arc::new(db::SqliteDb::new(pool));
-        let filter = TopicReadFilter {
+        let filter = |runtime_session_id: &str| TopicReadFilter {
             db: database.clone(),
-            runtime_session_id: "topic-one".into(),
+            runtime_session_id: runtime_session_id.into(),
+            turn: Mutex::new(TopicReadTurn::default()),
         };
+        let topic = filter("topic-one");
         let args = serde_json::json!({"operation": "project.current_state"});
         let outcome = |version| ToolOutcome {
             value: serde_json::json!({"version": version, "body": "current authoritative state"}),
             content: Default::default(),
             is_error: false,
         };
+        let full = |value: &serde_json::Value| value["read_ref"].as_str().unwrap().to_owned();
+        topic.begin_turn(0);
+        let first = topic
+            .filter(&ToolCallId::new("call-1"), &args, outcome(1))
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(first["version"], 1);
+        let reference = full(&first);
+        // Within the running turn the staged result is visible.
         assert_eq!(
-            filter
+            topic
                 .filter(&ToolCallId::new("call-1"), &args, outcome(1))
+                .await
+                .unwrap()
+                .value,
+            serde_json::json!({"unchanged_since_call": reference})
+        );
+        // The completed turn's history holds that result at index 2.
+        let history = vec![
+            Message::user("read the state"),
+            Message::assistant(vec![ContentPart::text("reading")]),
+            Message::tool_result(agent_runtime::core::content::ToolResultBlock {
+                call_id: ToolCallId::new("call-1"),
+                name: "forge_scope_read".to_owned(),
+                content: vec![ContentPart::text(first.to_string())],
+                is_error: false,
+            }),
+        ];
+        topic.commit(&history).await.unwrap();
+        // A provider call id is reused by the next turn; the reference is not.
+        topic.begin_turn(3);
+        assert_eq!(
+            topic
+                .filter(&ToolCallId::new("call-1"), &args, outcome(1))
+                .await
+                .unwrap()
+                .value,
+            serde_json::json!({"unchanged_since_call": reference})
+        );
+        let changed = topic
+            .filter(&ToolCallId::new("call-3"), &args, outcome(2))
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(changed["version"], 2);
+        assert_ne!(full(&changed), reference);
+        // Another topic (runtime session) never sees this one's references.
+        let next = filter("topic-two");
+        next.begin_turn(0);
+        assert_eq!(
+            next.filter(&ToolCallId::new("call-4"), &args, outcome(1))
                 .await
                 .unwrap()
                 .value["version"],
             1
         );
+
+        // LCM compaction past the referenced call: the body is sent again.
+        let compacted = filter("topic-three");
+        compacted.begin_turn(0);
+        let body = compacted
+            .filter(&ToolCallId::new("call-5"), &args, outcome(1))
+            .await
+            .unwrap()
+            .value;
+        compacted.commit(&history_with(&body)).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id)
+             VALUES ('topic-three', 'timeline-three')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_lcm_node (timeline_id, node_id, kind, range_start, range_end,
+                 edges_json, source_fingerprint, summary_revision, summary, policy_revision,
+                 algorithm_revision, sizer_revision, provenance_json, token_count,
+                 source_token_count, classification_json, revision, superseded_by,
+                 operation_id, operation_fingerprint, created_at)
+             VALUES ('timeline-three', 'leaf-0', 'leaf', 0, 2, '[]', 'f', 'r', 's', 'p', 'a',
+                 'z', '{}', 1, 9, '{}', 1, NULL, 'op', 'opf', '2026-10-05T00:00:00Z')",
+        )
+        .execute(database.pool())
+        .await
+        .unwrap();
+        compacted.begin_turn(3);
         assert_eq!(
-            filter
-                .filter(&ToolCallId::new("call-2"), &args, outcome(1))
-                .await
-                .unwrap()
-                .value,
-            serde_json::json!({"unchanged_since_call": "call-1"})
-        );
-        assert_eq!(
-            filter
-                .filter(&ToolCallId::new("call-3"), &args, outcome(2))
+            compacted
+                .filter(&ToolCallId::new("call-6"), &args, outcome(1))
                 .await
                 .unwrap()
                 .value["version"],
-            2
+            1,
+            "a reference compacted into a summary is never returned"
         );
-        let next = TopicReadFilter {
-            db: database,
-            runtime_session_id: "topic-two".into(),
-        };
+    }
+
+    #[test]
+    fn only_the_marked_state_card_is_sent_as_user_input() {
+        let marker = "[forge-state-card:test]\n";
+        let card = "Project state: 3 Tasks open; review before acting.";
+        // The user repeats the card verbatim and sends an edited copy.
+        let mut messages = vec![
+            Message::system("system prompt"),
+            Message::user(card),
+            Message::user(format!("{card} (edited)")),
+            Message::system(format!("{marker}{card}")),
+        ];
+        unmark_state_card(&mut messages, marker).unwrap();
         assert_eq!(
-            next.filter(&ToolCallId::new("call-4"), &args, outcome(2))
-                .await
-                .unwrap()
-                .value["version"],
-            2
+            messages,
+            vec![
+                Message::system("system prompt"),
+                Message::user(card),
+                Message::user(format!("{card} (edited)")),
+                Message::user(card),
+            ]
         );
+        // Card text without the marker, on any role, is never the card.
+        let mut unmarked = vec![Message::user(card), Message::system(card)];
+        assert!(unmark_state_card(&mut unmarked, marker).is_err());
+        assert_eq!(unmarked, vec![Message::user(card), Message::system(card)]);
+    }
+
+    fn history_with(result: &serde_json::Value) -> Vec<Message> {
+        vec![
+            Message::user("read the state"),
+            Message::assistant(vec![ContentPart::text("reading")]),
+            Message::tool_result(agent_runtime::core::content::ToolResultBlock {
+                call_id: ToolCallId::new("call-5"),
+                name: "forge_scope_read".to_owned(),
+                content: vec![ContentPart::text(result.to_string())],
+                is_error: false,
+            }),
+        ]
     }
 }

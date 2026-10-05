@@ -12,8 +12,8 @@ use db::{
     AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, SqliteDb, User, UserRepo,
 };
 use services::{
-    AgentChatService, MainChatTopicService, SendAgentChatMessageInput, ServiceError,
-    SetMainAgentBindingInput, StartMainChatTopicInput,
+    AgentChatService, MainChatTopicService, ProductGenesisService, SendAgentChatMessageInput,
+    ServiceError, SetMainAgentBindingInput, StartMainChatTopicInput,
 };
 
 const ACCOUNT_ID: &str = "topic-service-account";
@@ -148,11 +148,15 @@ async fn fixture() -> Fixture {
         .expect("main chat lookup")
         .expect("main chat exists");
 
-    let topics = MainChatTopicService::new(Arc::clone(&db), Arc::clone(&chat_service))
-        .with_rotator(Arc::new(services::TopicRotationCoordinator::new(
-            db.clone(),
-            embedded,
-        )));
+    let topics = MainChatTopicService::new(
+        Arc::clone(&db),
+        Arc::clone(&chat_service),
+        ProductGenesisService::for_sqlite(Arc::clone(&db)),
+    )
+    .with_rotator(Arc::new(services::TopicRotationCoordinator::new(
+        db.clone(),
+        embedded,
+    )));
 
     Fixture {
         db,
@@ -310,7 +314,7 @@ async fn starting_a_topic_is_deferred_while_a_main_turn_is_live() {
 }
 
 #[tokio::test]
-async fn idle_genesis_intent_rotates_without_bypassing_a_live_turn() {
+async fn starting_a_topic_is_denied_while_genesis_needs_a_decision() {
     let fixture = fixture().await;
     let now = now_rfc3339();
     sqlx::query(
@@ -328,16 +332,52 @@ async fn idle_genesis_intent_rotates_without_bypassing_a_live_turn() {
     .await
     .expect("pending genesis session inserts");
 
-    let result = fixture
+    let error = fixture
         .topics
         .start_topic(StartMainChatTopicInput {
             actor_user_id: ACCOUNT_ID.to_owned(),
             chat_id: fixture.chat_id.clone(),
-            label: Some("Genesis topic".into()),
+            label: Some("Should be blocked".to_owned()),
             summary: None,
         })
         .await
-        .expect("idle Genesis pending intent may rotate before its successor");
-    assert!(!result.rotation_pending);
-    assert!(result.topic.is_some());
+        .expect_err("a Genesis session awaiting finish/cancel denies the topic reset");
+    assert!(matches!(error, ServiceError::Conflict(message) if message.contains("Genesis")));
+}
+
+#[tokio::test]
+async fn a_newer_topic_request_while_one_is_pending_applies_its_label_and_summary() {
+    let fixture = fixture().await;
+    fixture
+        .chat_service
+        .send_message(SendAgentChatMessageInput {
+            actor_user_id: ACCOUNT_ID.to_owned(),
+            chat_id: fixture.chat_id.clone(),
+            content: "keep a turn live".to_owned(),
+            dedupe_key: Some("pending-label".to_owned()),
+        })
+        .await
+        .expect("sending a message admits a live (queued) turn");
+    for (label, summary) in [("First label", None), ("Newer label", Some("Why now"))] {
+        let result = fixture
+            .topics
+            .start_topic(StartMainChatTopicInput {
+                actor_user_id: ACCOUNT_ID.to_owned(),
+                chat_id: fixture.chat_id.clone(),
+                label: Some(label.to_owned()),
+                summary: summary.map(str::to_owned),
+            })
+            .await
+            .expect("the request is recorded");
+        assert!(result.rotation_pending);
+    }
+    let (label, summary): (String, Option<String>) = sqlx::query_as(
+        "SELECT label, requested_summary FROM agent_chat_topic_rotation WHERE chat_id = ?",
+    )
+    .bind(&fixture.chat_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("one pending intent");
+    assert_eq!(label, "Newer label");
+    assert_eq!(summary.as_deref(), Some("Why now"));
 }

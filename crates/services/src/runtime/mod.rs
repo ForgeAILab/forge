@@ -608,11 +608,15 @@ impl ForgeRuntimeBuilder {
         );
         let agent_chat_service = Arc::new(crate::AgentChatService::new(Arc::clone(&self.db)));
         let main_chat_topic_service = Arc::new(
-            MainChatTopicService::new(Arc::clone(&self.db), Arc::clone(&agent_chat_service))
-                .with_rotator(Arc::new(crate::TopicRotationCoordinator::new(
-                    self.db.clone(),
-                    embedded_agent_service.clone(),
-                ))),
+            MainChatTopicService::new(
+                Arc::clone(&self.db),
+                Arc::clone(&agent_chat_service),
+                crate::ProductGenesisService::for_sqlite(Arc::clone(&self.db)),
+            )
+            .with_rotator(Arc::new(crate::TopicRotationCoordinator::new(
+                self.db.clone(),
+                embedded_agent_service.clone(),
+            ))),
         );
         let agent_chat_turn_logs =
             AgentChatTurnLogRoot::new(agent_chat_turn_log_root(&effective_config));

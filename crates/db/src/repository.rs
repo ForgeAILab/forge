@@ -754,21 +754,8 @@ pub struct CreateAgentLcmTimeline {
     pub scope_type: String,
     pub scope_id: String,
     pub authorization_revision: String,
-    /// The native runtime session binding the timeline. A timeline written
-    /// by another runtime session is retired and replaced; see
-    /// `V149__lcm_timeline_session_owner.sql`.
-    pub runtime_session: Option<AgentLcmSessionClaim>,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentLcmSessionClaim {
-    pub runtime_session_id: String,
-    /// When the runtime session was created. A timeline with no recorded
-    /// owner that was last written before this instant belongs to an earlier
-    /// session.
-    pub session_created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

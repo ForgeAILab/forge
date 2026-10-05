@@ -31,7 +31,7 @@ use agent_runtime::{
 use async_trait::async_trait;
 use db::{
     AgentLcmEntryRecord, AgentLcmNodeRecord, AgentLcmRepo, AppendAgentLcmEntries,
-    CommitAgentLcmCondensation, CommitAgentLcmLeaf, CreateAgentLcmTimeline, DbError, SqliteDb,
+    CommitAgentLcmCondensation, CommitAgentLcmLeaf, DbError, SqliteDb,
 };
 use sqlx::Row;
 
@@ -290,14 +290,24 @@ impl SqliteLcmStore {
             .ok_or(LcmError::Unauthorized)
     }
 
-    pub(crate) async fn needs_adoption(&self) -> Result<bool, AgentHostError> {
+    /// Whether `runtime_session_id` resumes with an explicit Adopt policy:
+    /// the timeline is unclaimed (pre-U7), or already claimed by this same
+    /// session. The latter covers a crash between Adopt's claim and the
+    /// snapshot save: [`LcmWriter::claim`] then reports the timeline as
+    /// unclaimed at the snapshot's generation, and Adopt re-runs idempotently.
+    /// A session whose snapshot already records the claim never consults the
+    /// policy.
+    pub(crate) async fn needs_adoption(
+        &self,
+        runtime_session_id: &str,
+    ) -> Result<bool, AgentHostError> {
         let owner: Option<String> =
             sqlx::query_scalar("SELECT claim_owner FROM agent_lcm_timeline WHERE id = ?")
                 .bind(&self.timeline.id)
                 .fetch_one(self.db.pool())
                 .await
                 .map_err(|_| AgentHostError::ProtectedPersistence)?;
-        Ok(owner.is_none())
+        Ok(owner.is_none_or(|owner| owner == runtime_session_id))
     }
 
     fn claim_fence(view: &LcmView) -> Result<Option<db::AgentLcmClaimFence>, LcmError> {
@@ -329,35 +339,6 @@ impl SqliteLcmStore {
             });
         }
         Ok(())
-    }
-
-    /// Creates or retrieves the durable timeline for one canonical scope.
-    ///
-    /// Runtime ownership is acquired separately through `LcmWriter::claim`.
-    /// Opening a binding never retires populated history.
-    pub async fn open_for_binding(
-        db: Arc<SqliteDb>,
-        identity_id: &str,
-        scope_type: &str,
-        scope_id: &str,
-        authorization_revision: &str,
-        runtime_session: Option<db::AgentLcmSessionClaim>,
-        now: &str,
-    ) -> Result<Self, AgentHostError> {
-        let timeline = db
-            .create_or_get_lcm_timeline(CreateAgentLcmTimeline {
-                id: db::new_uuid_v4(),
-                identity_id: identity_id.to_owned(),
-                scope_type: scope_type.to_owned(),
-                scope_id: scope_id.to_owned(),
-                authorization_revision: authorization_revision.to_owned(),
-                runtime_session,
-                created_at: now.to_owned(),
-                updated_at: now.to_owned(),
-            })
-            .await
-            .map_err(|_| AgentHostError::ProtectedPersistence)?;
-        Ok(Self::new(db, timeline))
     }
 
     /// Host-issued view for the adapter's one timeline.
@@ -820,6 +801,18 @@ impl LcmWriter for SqliteLcmStore {
         let next = i64::try_from(requested_generation).map_err(|_| LcmError::InvalidBound)?;
         if owner.as_deref() == Some(requested_owner.as_str()) && generation == next {
             return Ok(LcmClaimResult::Claimed);
+        }
+        if owner.as_deref() == Some(requested_owner.as_str()) && next < generation {
+            // The same session already claimed a later generation that its
+            // persisted state never recorded: Adopt claimed, then the
+            // snapshot save failed. Report the pre-claim shape so the
+            // session's explicit Adopt re-runs; its claim of `generation`
+            // then lands on the idempotent branch above. No other owner is
+            // involved, so no fence is weakened.
+            return Err(LcmError::TimelineOwned {
+                owner: None,
+                generation: (generation - 1) as u64,
+            });
         }
         if !((owner.is_none() && !populated && generation == 0 && next == 0)
             || next == generation + 1)

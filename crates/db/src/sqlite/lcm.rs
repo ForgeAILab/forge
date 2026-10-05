@@ -20,12 +20,23 @@ impl AgentLcmRepo for SqliteDb {
     ) -> Result<AgentLcmTimeline> {
         let mut transaction = crate::begin_immediate(self.pool()).await?;
         let existing: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM agent_lcm_timeline WHERE identity_id = ? AND scope_type = ? AND scope_id = ? AND authorization_revision = ?",
-        ).bind(&input.identity_id).bind(&input.scope_type).bind(&input.scope_id).bind(&input.authorization_revision)
-            .fetch_optional(&mut *transaction).await?;
-        let insert = existing.is_none();
-        let claim = input.runtime_session.as_ref();
-        if insert {
+            "SELECT authorization_revision FROM agent_lcm_timeline
+             WHERE identity_id = ? AND scope_type = ? AND scope_id = ?",
+        )
+        .bind(&input.identity_id)
+        .bind(&input.scope_type)
+        .bind(&input.scope_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if existing
+            .as_deref()
+            .is_some_and(|revision| revision != input.authorization_revision)
+        {
+            return Err(DbError::Check(
+                "LCM binding already exists with a different authorization revision".to_owned(),
+            ));
+        }
+        if existing.is_none() {
             sqlx::query(
                 "INSERT INTO agent_lcm_timeline (
                     id, identity_id, scope_type, scope_id, canonical_scope_id,
@@ -38,7 +49,7 @@ impl AgentLcmRepo for SqliteDb {
             .bind(&input.scope_type)
             .bind(&input.scope_id)
             .bind(&input.scope_id)
-            .bind(claim.map(|claim| claim.runtime_session_id.as_str()))
+            .bind(Option::<&str>::None)
             .bind(&input.authorization_revision)
             .bind(&input.created_at)
             .bind(&input.updated_at)

@@ -1469,6 +1469,8 @@ Environment overrides are `FORGE_SERVER_MAIN_WORKING_SET_TARGET_TOKENS`,
 `FORGE_SERVER_PROJECT_WORKING_SET_TARGET_TOKENS` and
 `FORGE_SERVER_PROJECT_WORKING_SET_HARD_TOKENS`.
 
-Topics rotate after Genesis/handoff turns and before their successors, or before
-the next user turn following eight hours idle. An explicit topic request during a
-live turn is saved and completed at that same idle admission boundary.
+Native chat topics rotate after Genesis/handoff turns and before their successors,
+or before the next user turn following eight hours idle; CLI chats never rotate
+automatically. An explicit topic request during a live turn is saved and completed
+at that same idle admission boundary. A rotation that fails three times is
+abandoned with a visible notice, and the chat continues on its current topic.
