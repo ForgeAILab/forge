@@ -10,6 +10,7 @@ async fn crash_after_cas_keeps_hooks_and_checkpointed_cascade_durable() {
     seed_project_repo_and_task(&db, "crash-cas", "start").await;
     let workflow = cascade_chain_workflow(2);
     let result = engine(db.clone(), bus.clone())
+        .workflow_execution()
         .transition(
             "crash-cas",
             "step_0",
@@ -18,6 +19,7 @@ async fn crash_after_cas_keeps_hooks_and_checkpointed_cascade_durable() {
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "start",
             false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -41,6 +43,8 @@ async fn crash_after_cas_keeps_hooks_and_checkpointed_cascade_durable() {
         &serde_json::to_string(&HookResult::Cascade {
             to: "step_1".into(),
             reason: "completed".into(),
+
+            bridge: Default::default(),
         })
         .unwrap(),
     )
@@ -80,6 +84,7 @@ async fn configured_hooks_count_as_pending_even_when_actor_audience_skips_them()
     workflow.states[1].hooks.on_enter[0].applies_to = api_types::HookAudience::UserOnly;
     let engine = engine(db.clone(), bus);
     let result = engine
+        .workflow_execution()
         .transition(
             "hook-audience",
             "step_0",
@@ -88,6 +93,7 @@ async fn configured_hooks_count_as_pending_even_when_actor_audience_skips_them()
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "start",
             false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -109,6 +115,7 @@ async fn hooks_enqueue_failure_rolls_back_status_cas() {
     seed_project_repo_and_task(&db, "atomic-hook", "start").await;
     sqlx::query("CREATE TRIGGER reject_hooks BEFORE INSERT ON task_step WHEN NEW.kind='hooks' BEGIN SELECT RAISE(ABORT,'hook enqueue failed'); END").execute(db.pool()).await.unwrap();
     assert!(engine(db.clone(), Arc::new(EventBus::new(8)))
+        .workflow_execution()
         .transition(
             "atomic-hook",
             "step_0",
@@ -116,7 +123,8 @@ async fn hooks_enqueue_failure_rolls_back_status_cas() {
             &cascade_chain_workflow(1),
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "start",
-            false
+            false,
+            Default::default(),
         )
         .await
         .is_err());
@@ -141,6 +149,7 @@ async fn workflow_writer_waits_for_hook_lease_and_old_owner_stays_fenced() {
     seed_project_repo_and_task(&db, "hook-fence", "start").await;
     let engine = engine(db.clone(), bus.clone());
     engine
+        .workflow_execution()
         .transition(
             "hook-fence",
             "step_0",
@@ -149,6 +158,7 @@ async fn workflow_writer_waits_for_hook_lease_and_old_owner_stays_fenced() {
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "start",
             false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -219,6 +229,7 @@ async fn resumed_before_work_script_logs_step_and_rerun() {
         .unwrap();
     let result = fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &fixture.task.id,
             "review",
@@ -305,6 +316,7 @@ async fn resumed_dispatch_reuses_a_terminal_execution_for_its_hook() {
         .unwrap();
     fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &fixture.task.id,
             "in_progress",
@@ -375,6 +387,7 @@ async fn cancel_preempts_long_ci_step_and_cancels_the_task() {
     sqlx::query("UPDATE task SET task_state_config=? WHERE id=?").bind(json!({"review":{"ci_steps":[format!("touch {}; sleep 120; touch {}",quote(&started),quote(&completed))]}}).to_string()).bind(&fixture.task.id).execute(fixture.db.pool()).await.unwrap();
     let result = fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &fixture.task.id,
             "review",
@@ -403,6 +416,7 @@ async fn cancel_preempts_long_ci_step_and_cancels_the_task() {
         .unwrap();
     let result = fixture
         .engine
+        .workflow_execution()
         .transition_with_authority(
             &current.id,
             "cancelled",
@@ -417,12 +431,7 @@ async fn cancel_preempts_long_ci_step_and_cancels_the_task() {
         .unwrap();
     assert_eq!(result.task.status, "cancelled");
     assert!(!completed.exists());
-    fixture
-        .engine
-        .task_service
-        .drain(&current.id)
-        .await
-        .unwrap();
+    fixture.engine.drain(&current.id).await.unwrap();
     assert!(fixture
         .db
         .task_steps(&current.id)
@@ -476,6 +485,7 @@ async fn log_policy_effect_failure_settles_step_failed_without_blocking_task() {
         .unwrap()
         .unwrap();
     let result = engine(Arc::clone(&db), event_bus)
+        .workflow_execution()
         .transition(
             task_id,
             default_states::IN_PROGRESS,
@@ -484,6 +494,7 @@ async fn log_policy_effect_failure_settles_step_failed_without_blocking_task() {
             &api_types::Actor::user(api_types::UserActionSource::Test),
             "start work",
             false,
+            Default::default(),
         )
         .await
         .unwrap();

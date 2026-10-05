@@ -320,3 +320,89 @@ async fn queued_board_move_is_fenced_like_transition() {
         after.status
     );
 }
+
+#[tokio::test]
+async fn one_engine_serves_transition_recovery_move_and_role_restart() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(64)));
+    let engine = service.workflow_engine();
+    let cloned = service.clone();
+    assert!(Arc::ptr_eq(&engine, &cloned.workflow_engine()));
+    let (project_id, _, _repo) = seed_project_repo(&db).await;
+    // Isolate the four entry points from unrelated automatic cascades.
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    for state in &mut workflow.states {
+        state.hooks = api_types::StateHooks::default();
+    }
+    sqlx::query("UPDATE project SET workflow_definition=?,version=version+1 WHERE id=?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    let task = cloned
+        .transition(task.id.clone(), "review".to_owned(), (task.version, None))
+        .await
+        .unwrap()
+        .task;
+    assert!(Arc::ptr_eq(&engine, &cloned.workflow_engine()));
+    let after_transition = engine.invocation_count();
+    assert!(after_transition > 0);
+    let task = TaskRepo::set_entry_barrier(
+        &*db,
+        &task.id,
+        task.version,
+        Some(json!({"state":"review","status":"blocked"}).to_string()),
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    let task = cloned
+        .retry_entry_checks(task, Some("Owner retries entry checks".into()))
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&engine, &cloned.workflow_engine()));
+    let after_recovery = engine.invocation_count();
+    assert!(after_recovery > after_transition);
+    let revision = TaskBoardRepo::board_revision(&*db, &project_id)
+        .await
+        .unwrap();
+    cloned
+        .move_task(
+            task.id.clone(),
+            move_request(&task, revision, "in_progress", None, None),
+        )
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&engine, &cloned.workflow_engine()));
+
+    let after_move = engine.invocation_count();
+    assert!(after_move > after_recovery);
+    let active = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    let old_agent = seed_agent(&db).await;
+    let new_agent = seed_agent_with_executor_type(&db, "codex", "{}").await;
+    crate::task_service::tests::helpers::seed_role_assignment(
+        &db,
+        &active.id,
+        "coder",
+        Some(&old_agent),
+    )
+    .await;
+    seed_running_coder_execution(&db, &active.id, Some(old_agent), None).await;
+    cloned
+        .reassign_role(
+            role_assignment_input(&active.id, "coder", Some(new_agent), None),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&engine, &cloned.workflow_engine()));
+    assert!(engine.invocation_count() > after_move);
+    let restarted = TaskRepo::get_by_id(&*db, &active.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restarted.status, "todo");
+}

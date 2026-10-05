@@ -349,6 +349,7 @@ pub(super) async fn seed_review_rejection_log(
             to_state: crate::workflow::default_states::IN_PROGRESS.to_owned(),
             trigger_name: Some("reject".to_owned()),
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Test).display(),
+            bridge: Default::default(),
             trigger_reason: reason.to_owned(),
             hook_results_json: None,
             rejection: true,

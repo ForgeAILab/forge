@@ -840,6 +840,15 @@ impl TaskService {
                 task.id.clone(),
                 target,
                 TransitionOptions {
+                    // Only the plain approval is a gate decision, as base read
+                    // it; owner guidance and send-backs are ordinary moves.
+                    bridge: if trigger == WorkflowTrigger::Accept && guidance.is_none() {
+                        api_types::TransitionBridge::new(
+                            api_types::TransitionBridgeKind::GateApproved,
+                        )
+                    } else {
+                        Default::default()
+                    },
                     version: task.version,
                     reason: Some(match trigger {
                         WorkflowTrigger::Accept => guidance

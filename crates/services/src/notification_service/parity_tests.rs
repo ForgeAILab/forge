@@ -360,6 +360,7 @@ async fn exact_old_notification_set_excludes_hold_ci_restore_and_human_review_wr
             &done.id,
             "done".to_owned(),
             crate::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: done.version,
                 reason: None,
                 triggered_by: Actor::user(UserActionSource::Api),

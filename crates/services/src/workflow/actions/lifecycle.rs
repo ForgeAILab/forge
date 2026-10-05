@@ -553,6 +553,8 @@ impl HookAction for AutoCascadeOnCompletion {
         HookResult::Cascade {
             to: "done".into(),
             reason: "completed".into(),
+
+            bridge: Default::default(),
         }
     }
 }

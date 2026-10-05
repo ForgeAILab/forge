@@ -10,6 +10,8 @@ pub(crate) struct HookDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HookPayload {
+    #[serde(flatten)]
+    pub bridge: api_types::TransitionBridge,
     pub from: String,
     pub to: String,
     pub actor: Actor,
@@ -141,7 +143,7 @@ pub(crate) fn hooks_lane(workflow: &WorkflowDefinition, from: &str, to: &str) ->
     }
 }
 
-impl WorkflowEngine {
+impl WorkflowExecution<'_> {
     async fn run_durable_hook(
         &self,
         step: &db::TaskStep,
@@ -183,6 +185,28 @@ impl WorkflowEngine {
         Ok(DurableHook::Done(result))
     }
 
+    /// Typed failure evidence for failure memory once this transition's
+    /// hooks settled: the Task's interruption kind, and whether the
+    /// review-verdict hook acted on a failed Review.
+    async fn transition_failure_evidence(
+        &self,
+        task: &db::Task,
+        hook_results: &[api_types::HookResultEntry],
+    ) -> crate::Result<crate::memory::TransitionFailureEvidence> {
+        let review_failed = hook_results
+            .iter()
+            .any(|entry| entry.action == "auto_cascade_on_review_pass")
+            && latest_review(&self.db, &task.id)
+                .await?
+                .is_some_and(|review| review.status == db::ReviewStatus::Failed);
+        Ok(crate::memory::TransitionFailureEvidence {
+            failure_kind: crate::memory::TransitionFailureEvidence::annotation_kind(
+                task.error_annotation.as_deref(),
+            ),
+            review_failed,
+        })
+    }
+
     pub(crate) async fn execute_hook_step(
         &self,
         step: &db::TaskStep,
@@ -197,11 +221,17 @@ impl WorkflowEngine {
         let definition: HookDefinition = serde_json::from_str(&self.db.step_workflow(id).await?)
             .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
         let workflow = &definition.workflow;
-        let from_state = Self::find_state(workflow, &payload.from).ok_or_else(|| {
-            ServiceError::invalid_operation(Self::undefined_state_message(&payload.from, workflow))
+        let from_state = WorkflowEngine::find_state(workflow, &payload.from).ok_or_else(|| {
+            ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
+                &payload.from,
+                workflow,
+            ))
         })?;
-        let to_state = Self::find_state(workflow, &payload.to).ok_or_else(|| {
-            ServiceError::invalid_operation(Self::undefined_state_message(&payload.to, workflow))
+        let to_state = WorkflowEngine::find_state(workflow, &payload.to).ok_or_else(|| {
+            ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
+                &payload.to,
+                workflow,
+            ))
         })?;
         let mut task = TaskRepo::get_by_id(&*self.db, &step.task_id, false)
             .await?
@@ -210,7 +240,6 @@ impl WorkflowEngine {
         let current_status = payload.from.clone();
         let target_state = payload.to.clone();
         let actor = payload.actor.clone();
-        let reason = payload.reason.clone();
         let authority = match (
             payload.authority,
             definition.project_workflow_definition.as_ref(),
@@ -228,6 +257,7 @@ impl WorkflowEngine {
             .into_iter()
             .find(|t| t.id == transition_log_id)
             .ok_or(db::DbError::NotFound)?;
+        let bridge = &transition_log.bridge;
         let entry_barrier_started_at = transition_log.created_at.clone();
         let context = |state: &StateDefinition, config: serde_json::Value| HookContext {
             task_id: task.id.clone(),
@@ -241,16 +271,16 @@ impl WorkflowEngine {
             project_version: authority.as_ref().map(|a| a.project_version),
             project_workflow_definition: authority.as_ref().map(|a| a.workflow_definition.clone()),
             triggered_by: actor.clone(),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
+            review_runner: self.task_service.review_runner.clone(),
+            merge_service: self.task_service.merge_service.clone(),
+            cleanup_scheduler: self.task_service.cleanup_scheduler.clone(),
             task_service: self.task_service.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_backend_router: self.workspace_backend_router.clone(),
+            daemon_connections: self.task_service.daemon_connections.clone(),
+            workspace_exec_locks: self.task_service.workspace_exec_locks.clone(),
+            terminal_activity: self.task_service.terminal_activity.clone(),
+            workspace_root: self.task_service.workspace_root.clone(),
+            repo_cache_locks: self.task_service.repo_cache_locks.clone(),
+            workspace_backend_router: self.task_service.workspace_backend_router.clone(),
             workspace_id: payload.workspace_id.clone(),
             agent_id: payload.agent_id.clone(),
             execution_id: payload.execution_id.clone(),
@@ -268,7 +298,7 @@ impl WorkflowEngine {
         let mut skip_target_enter_hooks = false;
         let review_refresh_bridge = current_status == crate::workflow::default_states::MERGING
             && target_state == crate::workflow::default_states::MERGE_FAILED
-            && reason.contains(crate::workflow::REVIEW_REFRESH_MARKER)
+            && bridge.is_review_refresh()
             && actor == crate::worker_runtime::queue::cascade_actor();
         let defer_dispatch_until = payload.defer_dispatch_until.clone();
         let action_dispatch = payload.action_dispatch;
@@ -367,8 +397,10 @@ impl WorkflowEngine {
                 HookResult::Cascade {
                     to,
                     reason: cascade_reason,
+
+                    bridge: cascade_bridge,
                 } => {
-                    cascade = Some((to, cascade_reason));
+                    cascade = Some((to, cascade_reason, cascade_bridge));
                     break;
                 }
                 HookResult::Ok | HookResult::Skipped { .. } => {}
@@ -470,7 +502,9 @@ impl WorkflowEngine {
                             .await?
                         {
                             task = settled.task;
-                            cascade = settled.cascade.map(|(target, _)| (target, error.clone()));
+                            cascade = settled
+                                .cascade
+                                .map(|(target, _)| (target, error.clone(), Default::default()));
                             before_enter_rejection_cascade = cascade.is_some();
                             skip_target_enter_hooks = true;
                             break;
@@ -528,7 +562,7 @@ impl WorkflowEngine {
                                             )
                                             .await?;
                                         before_enter_rejection_cascade = true;
-                                        cascade = Some((reject_target, error));
+                                        cascade = Some((reject_target, error, Default::default()));
                                     }
                                 } else {
                                     let blocked_at = now_rfc3339();
@@ -578,8 +612,10 @@ impl WorkflowEngine {
                     HookResult::Cascade {
                         to,
                         reason: cascade_reason,
+
+                        bridge: cascade_bridge,
                     } => {
-                        cascade = Some((to, cascade_reason));
+                        cascade = Some((to, cascade_reason, cascade_bridge));
                         break;
                     }
                     HookResult::Ok | HookResult::Skipped { .. } => {}
@@ -787,6 +823,7 @@ impl WorkflowEngine {
                                     cascade = Some((
                                         fallback,
                                         format!("dispatch failed entering {target_state}: {error}"),
+                                        Default::default(),
                                     ));
                                     cascade_skip_before_exit = true;
                                     break;
@@ -797,8 +834,10 @@ impl WorkflowEngine {
                     HookResult::Cascade {
                         to,
                         reason: cascade_reason,
+
+                        bridge: cascade_bridge,
                     } => {
-                        cascade = Some((to, cascade_reason));
+                        cascade = Some((to, cascade_reason, cascade_bridge));
                         break;
                     }
                     HookResult::Ok => {
@@ -925,8 +964,10 @@ impl WorkflowEngine {
                     HookResult::Cascade {
                         to,
                         reason: cascade_reason,
+
+                        bridge: cascade_bridge,
                     } => {
-                        cascade = Some((to, cascade_reason));
+                        cascade = Some((to, cascade_reason, cascade_bridge));
                         break;
                     }
                     HookResult::Ok | HookResult::Skipped { .. } => {}
@@ -934,7 +975,7 @@ impl WorkflowEngine {
             }
         }
 
-        if to_state.kind == StateKind::Terminal && self.cleanup_scheduler.is_some() {
+        if to_state.kind == StateKind::Terminal && self.task_service.cleanup_scheduler.is_some() {
             let delay = match workflow.cleanup_policy_for(&target_state) {
                 Some(api_types::CleanupPolicy::Delayed { seconds }) => {
                     std::time::Duration::from_secs(seconds)
@@ -974,17 +1015,27 @@ impl WorkflowEngine {
                 );
             } else {
                 let memory_service = crate::MemoryService::new(Arc::clone(&self.db));
-                if let Err(error) = memory_service
-                    .record_transition_if_failure(&task.project_id, &transition_log, Some(&payload))
-                    .await
-                {
+                let recorded = match self.transition_failure_evidence(&task, &hook_results).await {
+                    Ok(evidence) => {
+                        memory_service
+                            .record_transition_if_failure(
+                                &task.project_id,
+                                &transition_log,
+                                Some(&payload),
+                                evidence,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = recorded {
                     tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
                 }
             }
         }
 
         let mut follow_up = None;
-        if let Some((cascade_to, cascade_reason)) = cascade {
+        if let Some((cascade_to, cascade_reason, cascade_bridge)) = cascade {
             if to_state.kind == StateKind::Gate
                 && to_state
                     .gate_config
@@ -993,7 +1044,8 @@ impl WorkflowEngine {
                 && !before_enter_rejection_cascade
                 && !to_state.gate_config.as_ref().is_some_and(|gate_config| {
                     gate_config.optional_when_unassigned()
-                        && cascade_reason.starts_with("gate skipped:")
+                        && cascade_bridge.bridge_kind
+                            == Some(api_types::TransitionBridgeKind::GateSkipped)
                 })
             {
                 tracing::info!(
@@ -1014,10 +1066,12 @@ impl WorkflowEngine {
 
             let cascade_rejection = before_enter_rejection_cascade
                 || (to_state.kind == StateKind::Gate
-                    && !cascade_reason.starts_with("gate skipped:")
-                    && !cascade_reason.contains(crate::workflow::REVIEW_REFRESH_MARKER)
-                    && !cascade_reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER)
-                    && !Self::is_terminal(workflow, &cascade_to));
+                    && cascade_bridge.bridge_kind
+                        != Some(api_types::TransitionBridgeKind::GateSkipped)
+                    && !cascade_bridge.is_review_refresh()
+                    && cascade_bridge.bridge_kind
+                        != Some(api_types::TransitionBridgeKind::ConflictHandoff)
+                    && !WorkflowEngine::is_terminal(workflow, &cascade_to));
             // Fence the entry this transition committed, not a later
             // writer's. The hook row carries that entry's epoch (read inside
             // the status CAS, or by the startup recovery sweep for an entry
@@ -1030,6 +1084,7 @@ impl WorkflowEngine {
                     workflow,
                     cascade_to,
                     cascade_reason,
+                    cascade_bridge,
                     cascade_rejection,
                     cascade_skip_before_exit,
                     authority.clone(),
@@ -1071,7 +1126,7 @@ impl WorkflowEngine {
         project: &db::Project,
         workflow: &WorkflowDefinition,
     ) -> crate::Result<Option<String>> {
-        let Some(to_state) = Self::find_state(workflow, &task.status) else {
+        let Some(to_state) = WorkflowEngine::find_state(workflow, &task.status) else {
             return Ok(None);
         };
         // An engine or board entry logs its epoch. A pre-upgrade entry has
@@ -1097,8 +1152,14 @@ impl WorkflowEngine {
         let Some((entry_id, from)) = entry else {
             return Ok(None);
         };
-        let from_state = Self::find_state(workflow, &from).unwrap_or(to_state);
+        let from_state = WorkflowEngine::find_state(workflow, &from).unwrap_or(to_state);
         let from = from_state.name.clone();
+        let bridge = TransitionLogRepo::list_by_task(&*self.db, &task.id)
+            .await?
+            .into_iter()
+            .find(|log| log.id == entry_id)
+            .map(|log| log.bridge)
+            .unwrap_or_default();
         let actor = Actor::system(api_types::SystemComponent::TaskDispatcher);
         let reason = "recovering post-commit hooks lost before restart".to_owned();
         let input = self
@@ -1107,6 +1168,7 @@ impl WorkflowEngine {
                 workflow,
                 task.status.clone(),
                 reason.clone(),
+                bridge.clone(),
                 false,
                 false,
                 Some(WorkflowAuthority {
@@ -1162,6 +1224,7 @@ impl WorkflowEngine {
             to: task.status.clone(),
             actor,
             reason,
+            bridge,
             transition_log_id: entry_id,
             workflow_ref: crate::worker_runtime::queue::WorkflowReference::Snapshot(frozen),
             authority: Some(project.version),

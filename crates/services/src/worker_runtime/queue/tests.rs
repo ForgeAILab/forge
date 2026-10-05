@@ -26,7 +26,7 @@ async fn fixture() -> (Arc<db::SqliteDb>, TaskStepWorker) {
     .execute(db.pool())
     .await
     .unwrap();
-    let worker = TaskStepWorker::new(service.workflow_engine());
+    let worker = TaskStepWorker::new(service.clone());
     (db, worker)
 }
 fn workflow() -> WorkflowDefinition {
@@ -68,6 +68,7 @@ fn step(to: &str) -> EnqueueTaskStep {
         id: db::new_uuid_v4(),
         task_id: "t".into(),
         payload_json: serde_json::to_string(&CascadePayload {
+            bridge: Default::default(),
             to: to.into(),
             reason: "automatic".into(),
             rejection: false,
@@ -118,7 +119,7 @@ async fn reclaimed_step_drains_after_worker_restart_and_completes_atomically() {
         .unwrap()
         .unwrap();
     let service = crate::TaskService::new(db.clone(), Arc::new(events::EventBus::new(32)));
-    let restarted = TaskStepWorker::new(service.workflow_engine());
+    let restarted = TaskStepWorker::new(service.clone());
     assert_eq!(restarted.drain("t").await.unwrap().status, "done");
     let completed = &db.task_steps("t").await.unwrap()[0];
     assert_eq!(completed.status, "done");
@@ -145,6 +146,7 @@ async fn drain_waits_for_status_step_lease_handover() {
     let payload = serde_json::from_str(&claimed.payload_json).unwrap();
     worker
         .engine
+        .bind(&worker.task_service)
         .transition_step(&claimed, &payload, &workflow(), None)
         .await
         .unwrap();
@@ -541,7 +543,6 @@ async fn loop_event_is_broadcast_once_with_durable_audit_envelope() {
         "workflow_loop"
     );
     let snapshot = worker
-        .engine
         .task_service
         .task_action_snapshot("t", &Actor::user(api_types::UserActionSource::Test))
         .await
@@ -607,7 +608,7 @@ async fn remote_hook_fixture() -> (
         .await
         .unwrap();
     let service = crate::TaskService::new(db.clone(), Arc::new(events::EventBus::new(32)));
-    let worker = TaskStepWorker::new(service.workflow_engine());
+    let worker = TaskStepWorker::new(service.clone());
     (db, worker, task, placement, claimed)
 }
 
@@ -623,6 +624,7 @@ async fn cancel_remote_task(worker: &TaskStepWorker, task: &db::Task) -> db::Tas
         .unwrap();
     worker
         .engine
+        .bind(&worker.task_service)
         .transition(
             &task.id,
             "cancelled",
@@ -631,6 +633,7 @@ async fn cancel_remote_task(worker: &TaskStepWorker, task: &db::Task) -> db::Tas
             &Actor::user(api_types::UserActionSource::Test),
             "Cancel remote CI",
             false,
+            Default::default(),
         )
         .await
         .unwrap()
@@ -644,7 +647,7 @@ async fn connected_remote_cancel_ack_supersedes_hook_then_cancels_task() {
     let daemon_id = placement.daemon_id.clone().unwrap();
     let (connection, mut outbound) =
         crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
-    worker.engine.daemon_connections = Some(registry.clone());
+    worker.task_service.daemon_connections = Some(registry.clone());
     let responder = tokio::spawn(async move {
         let api_types::DaemonFrame::Request { id, method, params } = outbound.recv().await.unwrap()
         else {
@@ -810,7 +813,7 @@ async fn older_daemon_rejection_still_cancels_task_and_fences_workspace() {
     let daemon_id = placement.daemon_id.clone().unwrap();
     let (connection, mut outbound) =
         crate::recovery::tests::owner_connection(&registry, &daemon_id, false);
-    worker.engine.daemon_connections = Some(registry.clone());
+    worker.task_service.daemon_connections = Some(registry.clone());
     let responder = tokio::spawn(async move {
         let api_types::DaemonFrame::Request { id, method, .. } = outbound.recv().await.unwrap()
         else {

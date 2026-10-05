@@ -36,19 +36,26 @@ fn assignment_snapshot_matches(
         && current.updated_at == expected.updated_at
 }
 
-fn map_transition_log_row(row: SqliteRow) -> TransitionLog {
-    TransitionLog {
-        id: row.get(0),
+fn map_transition_log_row(row: SqliteRow) -> Result<TransitionLog> {
+    let id: String = row.get(0);
+    let bridge = crate::decode_transition_bridge(
+        &id,
+        row.get::<Option<String>, _>("bridge_kind").as_deref(),
+        row.get::<Option<String>, _>("bridge_payload").as_deref(),
+    )?;
+    Ok(TransitionLog {
+        id,
         task_id: row.get(1),
         from_state: row.get(2),
         to_state: row.get(3),
         trigger_name: row.get(4),
         triggered_by: row.get(5),
+        bridge,
         trigger_reason: row.get(6),
         hook_results_json: row.get(7),
         rejection: row.get::<i64, _>(8) != 0,
         created_at: row.get(9),
-    }
+    })
 }
 
 fn map_workflow_sqlx_error(error: sqlx::Error) -> DbError {
@@ -465,7 +472,7 @@ impl TransitionLogRepo for SqliteDb {
         input: CreateTransitionLog,
     ) -> std::result::Result<TransitionLog, DbError> {
         sqlx::query(
-            "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -477,19 +484,21 @@ impl TransitionLogRepo for SqliteDb {
         .bind(input.hook_results_json.as_deref())
         .bind(if input.rejection { 1_i64 } else { 0_i64 })
         .bind(&input.created_at)
+        .bind(input.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+        .bind(input.bridge.bridge_payload.as_ref().map(ToString::to_string))
         .execute(&self.pool)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
         let row = sqlx::query(
-            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at FROM transition_log WHERE id = ?",
+            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload FROM transition_log WHERE id = ?",
         )
         .bind(&input.id)
         .fetch_one(&self.pool)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
-        Ok(map_transition_log_row(row))
+        map_transition_log_row(row)
     }
 
     async fn insert_recovery_marker(
@@ -507,6 +516,13 @@ impl TransitionLogRepo for SqliteDb {
             to_state: current_state.to_owned(),
             trigger_name: Some(action_kind.to_owned()),
             triggered_by: triggered_by.to_owned(),
+            bridge: api_types::TransitionBridge::recovery(
+                action_kind,
+                matches!(
+                    action_kind,
+                    "restart" | "reset_to_initial" | "reset_retry_window"
+                ),
+            ),
             trigger_reason: reason.to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -520,14 +536,14 @@ impl TransitionLogRepo for SqliteDb {
         task_id: &str,
     ) -> std::result::Result<Vec<TransitionLog>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at FROM transition_log WHERE task_id = ? ORDER BY created_at, rowid",
+            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload FROM transition_log WHERE task_id = ? ORDER BY created_at, rowid",
         )
         .bind(task_id)
         .fetch_all(&self.pool)
         .await
         .map_err(map_workflow_sqlx_error)?;
 
-        Ok(rows.into_iter().map(map_transition_log_row).collect())
+        rows.into_iter().map(map_transition_log_row).collect()
     }
 
     async fn list_by_tasks(&self, task_ids: &[&str]) -> Result<Vec<TransitionLog>> {
@@ -552,13 +568,7 @@ impl TransitionLogRepo for SqliteDb {
                    WHERE boundary.task_id = rejection.task_id
                      AND boundary.from_state = rejection.from_state
                      AND boundary.rejection = 0
-                     AND (boundary.trigger_name IN ('restart', 'reset_retry_window', 'reset_to_initial')
-                          OR (boundary.trigger_name = 'retry' AND EXISTS (
-                              SELECT 1 FROM json_each(CASE WHEN json_valid(boundary.hook_results_json) THEN boundary.hook_results_json ELSE '[]' END) AS result
-                              WHERE json_extract(result.value, '$.action') = 'retry'
-                                AND json_extract(result.value, '$.phase') = 'action'
-                                AND json_extract(result.value, '$.outcome') = 'reset_budget'
-                          )))
+                     AND boundary.bridge_kind = 'retry_window_reset'
                      AND (
                          boundary.created_at > rejection.created_at
                          OR (
@@ -646,7 +656,7 @@ pub(super) async fn transitions_for_tasks(
     }
     let mut query = sqlx::QueryBuilder::<Sqlite>::new(
         "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by,
-                    trigger_reason, hook_results_json, rejection, created_at
+                    trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload
              FROM transition_log WHERE task_id IN (",
     );
     let mut ids = query.separated(", ");
@@ -655,5 +665,5 @@ pub(super) async fn transitions_for_tasks(
     }
     ids.push_unseparated(") ORDER BY task_id, created_at, rowid");
     let rows = query.build().fetch_all(&mut *connection).await?;
-    Ok(rows.into_iter().map(map_transition_log_row).collect())
+    rows.into_iter().map(map_transition_log_row).collect()
 }

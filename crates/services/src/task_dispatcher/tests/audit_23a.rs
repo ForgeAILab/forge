@@ -5,6 +5,7 @@ use db::TaskStepRepo;
 
 fn system_options(version: i64, reason: &str) -> crate::task_service::TransitionOptions {
     crate::task_service::TransitionOptions {
+        bridge: Default::default(),
         version,
         reason: Some(reason.to_owned()),
         triggered_by: Actor::system(SystemComponent::General),

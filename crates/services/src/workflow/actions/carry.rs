@@ -121,7 +121,14 @@ async fn carry(ctx: &HookContext) -> Result<HookResult, CarryError> {
                 && details["carry_hook_step_id"] == attempt.step.id
                 && details["carry_hook_index"] == attempt.index
             {
-                return Ok(HookResult::Cascade { to: default_states::MERGING.into(), reason: "[review-carry] resumed carried review authority; CI passed; re-review skipped".into() });
+                return Ok(HookResult::Cascade {
+                    to: default_states::MERGING.into(),
+                    reason: "resumed carried review authority; CI passed; re-review skipped".into(),
+
+                    bridge: api_types::TransitionBridge::new(
+                        api_types::TransitionBridgeKind::ReviewCarry,
+                    ),
+                });
             }
         }
     }
@@ -236,8 +243,8 @@ async fn carry(ctx: &HookContext) -> Result<HookResult, CarryError> {
     }
     Ok(HookResult::Cascade {
         to: default_states::MERGING.to_string(),
-        reason: format!(
-            "[review-carry] carried review authority across {what}; CI passed; re-review skipped"
-        ),
+        reason: format!("carried review authority across {what}; CI passed; re-review skipped"),
+
+        bridge: api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ReviewCarry),
     })
 }

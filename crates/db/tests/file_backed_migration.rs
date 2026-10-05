@@ -5194,23 +5194,10 @@ async fn conflict_hotspot_migration_seeds_current_head_on_migrated_clone() {
         .bind(&log_time).bind(&log_time).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO task (id, project_id, title, created_at, updated_at) VALUES ('hotspot-format-task', 'hotspot-format-project', 'format', ?, ?)")
         .bind(&log_time).bind(&log_time).execute(&pool).await.unwrap();
-    db::TransitionLogRepo::insert(
-        &db::SqliteDb::new(pool.clone()),
-        db::CreateTransitionLog {
-            id: "hotspot-format-log".into(),
-            task_id: "hotspot-format-task".into(),
-            from_state: "merging".into(),
-            to_state: "merge_failed".into(),
-            trigger_name: None,
-            triggered_by: "system:workflow".into(),
-            trigger_reason: "format probe".into(),
-            hook_results_json: None,
-            rejection: false,
-            created_at: log_time.clone(),
-        },
-    )
-    .await
-    .unwrap();
+    // Seed the pre-upgrade schema with its own columns; the current repository
+    // intentionally requires the new typed history schema.
+    sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,rejection,created_at) VALUES('hotspot-format-log','hotspot-format-task','merging','merge_failed','system:workflow','format probe',0,?)")
+        .bind(&log_time).execute(&pool).await.unwrap();
     let stored: String =
         sqlx::query_scalar("SELECT created_at FROM transition_log WHERE id = 'hotspot-format-log'")
             .fetch_one(&pool)

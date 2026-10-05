@@ -84,6 +84,24 @@ async fn transition_log_records_review_retry_and_completion_history() {
             ),
         ]
     );
+    let approval = entries
+        .iter()
+        .find(|entry| entry["trigger_reason"] == "gate approved")
+        .unwrap();
+    assert_eq!(approval["bridge_kind"], "gate_approved");
+    assert!(approval["bridge_payload"].is_null());
+    // A send-back with guidance is an ordinary rejection, as base read it.
+    let rejection = entries
+        .iter()
+        .find(|entry| entry["trigger_reason"] == "missing tests")
+        .unwrap();
+    assert!(rejection["bridge_kind"].is_null());
+    let ordinary = entries
+        .iter()
+        .find(|entry| entry["trigger_reason"] == "ready for review")
+        .unwrap();
+    assert!(ordinary["bridge_kind"].is_null());
+    assert!(ordinary["bridge_payload"].is_null());
     assert!(entries
         .iter()
         .all(|entry| entry["triggered_by"] == "user:api"

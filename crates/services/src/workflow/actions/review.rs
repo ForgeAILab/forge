@@ -493,6 +493,14 @@ impl HookAction for AutoCascadeOnReviewPass {
                     } else {
                         "review passed".to_string()
                     },
+
+                    bridge: if review_is_ci_only(&review) {
+                        api_types::TransitionBridge::new(
+                            api_types::TransitionBridgeKind::CiOnlyReviewPassed,
+                        )
+                    } else {
+                        Default::default()
+                    },
                 }
             }
             Some(review)
@@ -569,6 +577,8 @@ impl HookAction for AutoCascadeOnReviewPass {
                     HookResult::Cascade {
                         to: default_states::IN_PROGRESS.to_string(),
                         reason: "review failed".to_string(),
+
+                        bridge: Default::default(),
                     }
                 }
             }
@@ -664,6 +674,8 @@ impl HookAction for AutoCascadeOnUnconfiguredReview {
         HookResult::Cascade {
             to: default_states::MERGING.to_string(),
             reason: "review skipped: no checks or reviewer assigned".to_string(),
+
+            bridge: Default::default(),
         }
     }
 }

@@ -142,20 +142,7 @@ impl TaskService {
             .as_deref()
             .and_then(|json| serde_json::from_str::<Value>(json).ok())
             .and_then(|v| v.get("reason").and_then(Value::as_str).map(str::to_owned));
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
-        };
+        let engine = self.workflow_execution();
         let defer_dispatch_until = options
             .defer_dispatch_seconds
             .map(|seconds| (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339());
@@ -178,6 +165,7 @@ impl TaskService {
                     workflow_definition: project.workflow_definition.clone(),
                     clear_review_passed_at_on_commit,
                 }),
+                options.bridge,
             )
             .await?;
         // The engine returns the requested transition's committed CAS
@@ -357,7 +345,7 @@ impl TaskService {
             .iter()
             .any(|hook| hook.action == "run_merge")
         {
-            let engine = self.workflow_engine();
+            let engine = self.workflow_execution();
             engine
                 .manual_override_transition_with_authority(
                     &task.id,
@@ -380,6 +368,7 @@ impl TaskService {
                 task.id.clone(),
                 target.to_owned(),
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: Some("resuming integration after project pause".to_owned()),
                     triggered_by: actor,
@@ -626,12 +615,8 @@ impl TaskService {
             .find(|entry| entry.to_state == task.status)
             .map(|entry| entry.created_at.as_str())
             .unwrap_or(task.created_at.as_str());
-        let has_decision_since_entry = transition_log.iter().any(|entry| {
-            entry.from_state == task.status
-                && entry.created_at.as_str() >= entered_at
-                && (entry.trigger_reason.starts_with("gate approved")
-                    || entry.trigger_reason.starts_with("gate rejected"))
-        });
+        let has_decision_since_entry =
+            gate_decision_since_entry(&transition_log, &task.status, entered_at);
         if let Some(gate_config) = state
             .gate_config
             .as_ref()
@@ -814,6 +799,7 @@ impl TaskService {
                 task_id,
                 cancel_target,
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: expected_version.unwrap_or(task.version),
                     reason: Some(reason.clone()),
                     triggered_by: actor.clone(),
@@ -909,20 +895,7 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let engine = WorkflowEngine {
-            db: Arc::clone(&self.db),
-            event_bus: Arc::clone(&self.event_bus),
-            review_runner: self.review_runner.clone(),
-            merge_service: self.merge_service.clone(),
-            cleanup_scheduler: self.cleanup_scheduler.clone(),
-            task_service: self.clone(),
-            daemon_connections: self.daemon_connections.clone(),
-            workspace_exec_locks: self.workspace_exec_locks.clone(),
-            terminal_activity: self.terminal_activity.clone(),
-            workspace_root: self.workspace_root.clone(),
-            repo_cache_locks: self.repo_cache_locks.clone(),
-            workspace_backend_router: Arc::clone(&self.workspace_backend_router),
-        };
+        let engine = self.workflow_execution();
         let result = engine
             .manual_override_transition_with_authority(
                 &task.id,
@@ -1562,6 +1535,63 @@ mod audit_tests {
             let final_task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
             assert_eq!(final_task.status, "in_progress");
             assert!(final_task.error_annotation.is_none());
+        }
+    }
+}
+
+fn gate_decision_since_entry(entries: &[db::TransitionLog], state: &str, entered_at: &str) -> bool {
+    entries.iter().any(|entry| {
+        entry.from_state == state
+            && entry.created_at.as_str() >= entered_at
+            && matches!(
+                entry.bridge.bridge_kind,
+                Some(
+                    api_types::TransitionBridgeKind::GateApproved
+                        | api_types::TransitionBridgeKind::GateRejected
+                )
+            )
+    })
+}
+
+#[cfg(test)]
+mod typed_gate_tests {
+    use super::*;
+    #[test]
+    fn gate_decision_reader_uses_kind_with_custom_guidance_and_ignores_prefixes() {
+        let mut row = db::TransitionLog {
+            id: "decision".into(),
+            task_id: "task".into(),
+            from_state: "review".into(),
+            to_state: "review".into(),
+            trigger_name: None,
+            triggered_by: "user:api".into(),
+            bridge: Default::default(),
+            trigger_reason: "gate approved; gate rejected".into(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: "2026-10-05".into(),
+        };
+        assert!(!gate_decision_since_entry(
+            &[row.clone()],
+            "review",
+            "2026-10-05"
+        ));
+        for kind in [
+            api_types::TransitionBridgeKind::GateApproved,
+            api_types::TransitionBridgeKind::GateRejected,
+        ] {
+            row.bridge = api_types::TransitionBridge::new(kind);
+            row.trigger_reason = "Owner supplied custom guidance".into();
+            assert!(gate_decision_since_entry(
+                &[row.clone()],
+                "review",
+                "2026-10-05"
+            ));
+            assert!(!gate_decision_since_entry(
+                &[row.clone()],
+                "review",
+                "2026-10-06"
+            ));
         }
     }
 }

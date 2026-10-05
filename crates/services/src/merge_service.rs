@@ -1373,11 +1373,10 @@ mod tests {
                 trigger_name: None,
                 triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow)
                     .display(),
-                trigger_reason: format!(
-                    "{} rebased onto main; conflicts were committed with markers in: handoff.txt{}[\"handoff.txt\"]",
-                    crate::workflow::CONFLICT_HANDOFF_MARKER,
-                    crate::workflow::CONFLICT_HANDOFF_PATHS_PREFIX,
-                ),
+                bridge: api_types::TransitionBridge::conflict_handoff(&["handoff.txt".into()]),
+                trigger_reason:
+                    "rebased onto main; conflicts were committed with markers in: handoff.txt"
+                        .to_owned(),
                 hook_results_json: None,
                 rejection: false,
                 created_at: now_rfc3339(),

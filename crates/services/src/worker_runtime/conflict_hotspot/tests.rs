@@ -28,14 +28,24 @@ fn timestamp(seconds_ago: i64) -> String {
 fn input(project: &str, task: &str, paths: &[&str], at: &str) -> CreateDomainEvent {
     let id = new_uuid_v4();
     CreateDomainEvent {
-        id: id.clone(), event_type: "task.transitioned".into(), entity_type: "task".into(),
-        entity_id: task.into(), actor_type: "system".into(), actor_id: Some("workflow".into()),
-        scope_type: "task".into(), scope_id: task.into(), correlation_id: id.clone(),
-        causation_id: None, causation_depth: 0, dedupe_key: Some(id.clone()),
+        id: id.clone(),
+        event_type: "task.transitioned".into(),
+        entity_type: "task".into(),
+        entity_id: task.into(),
+        actor_type: "system".into(),
+        actor_id: Some("workflow".into()),
+        scope_type: "task".into(),
+        scope_id: task.into(),
+        correlation_id: id.clone(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some(id.clone()),
         payload_json: json!({"transition_log_id": id, "project_id": project,
             "from_state": "merging", "to_state": "merge_failed", "trigger_name": null,
-            "trigger_reason": format!("{CONFLICT_HANDOFF_MARKER} conflict{CONFLICT_HANDOFF_PATHS_PREFIX}{}", json!(paths)),
-            "rejection": false}).to_string(),
+            "trigger_reason": format!("Conflict handed to worker: {}", paths.join(", ")),
+            "bridge_kind": "conflict_handoff", "bridge_payload": {"paths": paths},
+            "rejection": false})
+        .to_string(),
         created_at: at.into(),
     }
 }
@@ -59,10 +69,11 @@ async fn append_input(db: &SqliteDb, event: CreateDomainEvent) -> DomainEvent {
         |id| format!("{}:{id}", event.actor_type),
     );
     let mut tx = db::begin_immediate(db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO transition_log (id, task_id, from_state, to_state, triggered_by, trigger_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO transition_log (id, task_id, from_state, to_state, triggered_by, trigger_reason, created_at, bridge_kind, bridge_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(payload["transition_log_id"].as_str().unwrap()).bind(&event.entity_id)
         .bind(payload["from_state"].as_str().unwrap()).bind(payload["to_state"].as_str().unwrap())
         .bind(actor).bind(payload["trigger_reason"].as_str().unwrap()).bind(&event.created_at)
+        .bind(payload["bridge_kind"].as_str()).bind(if payload["bridge_payload"].is_null() { None } else { Some(payload["bridge_payload"].to_string()) })
         .execute(&mut *tx).await.unwrap();
     let recorded = db.append_event_in_tx(&mut tx, &event).await.unwrap();
     tx.commit().await.unwrap();
@@ -220,15 +231,11 @@ async fn lockfiles_are_excluded_by_basename() {
 }
 
 #[tokio::test]
-async fn punctuation_and_unicode_paths_preserve_json_and_last_prefix() {
+async fn punctuation_and_unicode_paths_preserve_json() {
     let db = database().await;
     let path = "src/日本語 ; punctuation, \"quoted\".rs";
     for task in ["one", "two", "three"] {
-        let mut event = input("project-1", task, &[path], &timestamp(10));
-        let mut payload: Value = serde_json::from_str(&event.payload_json).unwrap();
-        payload["trigger_reason"] = json!(format!("{CONFLICT_HANDOFF_MARKER} earlier{CONFLICT_HANDOFF_PATHS_PREFIX}discarded{CONFLICT_HANDOFF_PATHS_PREFIX}{}", json!([path])));
-        event.payload_json = payload.to_string();
-        append_input(&db, event).await;
+        append_input(&db, input("project-1", task, &[path], &timestamp(10))).await;
     }
     run(&db).await;
     assert_eq!(detections(&db).await[0]["path"], path);
@@ -255,9 +262,10 @@ async fn non_workflow_actor_and_different_states_are_ignored() {
             "from" => payload["from_state"] = json!("review"),
             "to" => payload["to_state"] = json!("done"),
             "marker" => {
-                payload["trigger_reason"] = json!("plain merge failure; paths_json=[\"shared.rs\"]")
+                payload["bridge_kind"] = Value::Null;
+                payload["trigger_reason"] = json!("[conflict-handoff]; paths_json=[\"shared.rs\"]")
             }
-            "json" => payload["trigger_reason"] = json!("[conflict-handoff]; paths_json=broken"),
+            "json" => payload["bridge_payload"] = json!({"paths":"broken"}),
             _ => unreachable!(),
         }
         event.payload_json = payload.to_string();
@@ -522,9 +530,9 @@ async fn bulk_transitions(db: &SqliteDb, count: i64, same_project: bool, old: bo
     // Real merge-failed log rows exercise the state/time index, including old
     // rows of the SAME Project. Their marker can never count in this window.
     sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
-        INSERT INTO transition_log (id, task_id, from_state, to_state, triggered_by, trigger_reason, created_at)
+        INSERT INTO transition_log (id, task_id, from_state, to_state, triggered_by, trigger_reason, created_at, bridge_kind, bridge_payload)
         SELECT 'bulk-log-' || i, 'bulk-task-' || (1 + i % 5000), 'merging', 'merge_failed', 'system:workflow',
-            '[conflict-handoff]; paths_json=[\"a.rs\",\"b.rs\",\"c.rs\",\"d.rs\",\"e.rs\"]', ? FROM n")
+            '[conflict-handoff]; paths_json=[\"a.rs\",\"b.rs\",\"c.rs\",\"d.rs\",\"e.rs\"]', ?, 'conflict_handoff', json_object('paths',json('[\"a.rs\",\"b.rs\",\"c.rs\",\"d.rs\",\"e.rs\"]')) FROM n")
         .bind(count).bind(&at).execute(db.pool()).await.unwrap();
     // Retain the audit's ledger population so a regression to ledger counting
     // would still take work proportional to the 200k irrelevant rows.

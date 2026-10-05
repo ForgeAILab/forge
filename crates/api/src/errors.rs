@@ -598,6 +598,11 @@ impl From<DbError> for ApiError {
             DbError::ReviewDetailsCorrupt { review_id, .. } => Self::internal(format!(
                 "persisted review {review_id} has invalid step_results_json"
             )),
+            DbError::TransitionBridgeCorrupt {
+                transition_log_id, ..
+            } => Self::internal(format!(
+                "persisted transition {transition_log_id} has an unreadable bridge"
+            )),
             DbError::InvalidSoftDelete => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_soft_delete",

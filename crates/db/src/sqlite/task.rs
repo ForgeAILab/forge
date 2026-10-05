@@ -347,7 +347,7 @@ async fn insert_recovery_marker_in_tx(
     marker: &CreateTransitionLog,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&marker.id)
     .bind(&marker.task_id)
@@ -359,6 +359,8 @@ async fn insert_recovery_marker_in_tx(
     .bind(marker.hook_results_json.as_deref())
     .bind(if marker.rejection { 1_i64 } else { 0_i64 })
     .bind(&marker.created_at)
+    .bind(marker.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+    .bind(marker.bridge.bridge_payload.as_ref().map(ToString::to_string))
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -2326,6 +2328,7 @@ impl TaskRepo for SqliteDb {
                 to_state: task.status.clone(),
                 trigger_name: None,
                 triggered_by: claim_triggered_by,
+                bridge: Default::default(),
                 trigger_reason: "task claimed".to_owned(),
                 hook_results_json: None,
                 rejection: false,

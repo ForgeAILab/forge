@@ -169,20 +169,7 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
     if current_effective_workflow != workflow {
         return Err("project workflow authority changed while cancelling subtask".to_owned());
     }
-    let engine = WorkflowEngine {
-        db: Arc::clone(&ctx.db),
-        event_bus: Arc::clone(&ctx.event_bus),
-        review_runner: ctx.review_runner.clone(),
-        merge_service: ctx.merge_service.clone(),
-        cleanup_scheduler: ctx.cleanup_scheduler.clone(),
-        task_service: ctx.task_service.clone(),
-        daemon_connections: ctx.daemon_connections.clone(),
-        workspace_exec_locks: ctx.workspace_exec_locks.clone(),
-        terminal_activity: ctx.terminal_activity.clone(),
-        workspace_root: ctx.workspace_root.clone(),
-        repo_cache_locks: ctx.repo_cache_locks.clone(),
-        workspace_backend_router: Arc::clone(&ctx.workspace_backend_router),
-    };
+    let engine = ctx.task_service.workflow_execution();
     engine
         .transition_with_authority(
             &subtask.id,

@@ -301,7 +301,7 @@ fn dispatch_role_follow_up_impl(
         let agent = AgentRepo::get_by_id(&*service.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        let admission = if let Some(admission) = admission_override {
+        let mut admission = if let Some(admission) = admission_override {
             // The dispatch action can pass the same Task/assignment/Review
             // snapshot that produced its prompt. Never replace those facts
             // with a later repository read here.
@@ -363,6 +363,10 @@ fn dispatch_role_follow_up_impl(
             }
             admission
         };
+        // Purpose is established at admission, never inferred from summary or
+        // inherited from the parent's attempt.
+        admission.purpose = (trigger == "automatic_review_recovery")
+            .then_some(api_types::ExecutionPurpose::AutomaticReviewRecovery);
         let durable_parent_execution_id = if role == crate::workflow::default_roles::REVIEWER {
             admission
                 .expected_reviewer_parent_execution_id

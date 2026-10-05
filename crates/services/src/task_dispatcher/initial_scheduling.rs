@@ -429,6 +429,7 @@ impl TaskDispatcher {
                 task.id.clone(),
                 target.transition_to.clone(),
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: task.version,
                     reason: Some("scheduled by task dispatcher".to_owned()),
                     triggered_by: Actor::system(SystemComponent::TaskDispatcher),

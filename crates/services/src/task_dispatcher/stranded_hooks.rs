@@ -31,7 +31,7 @@ impl TaskDispatcher {
     /// row, and its causation key is unique per entry.
     pub async fn recover_stranded_hook_entries(&self) -> Result<u64> {
         let mut recovered = 0;
-        let engine = self.task_service.workflow_engine();
+        let engine = self.task_service.workflow_execution();
         for project in self.list_projects().await? {
             let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
             let merge_states = workflow

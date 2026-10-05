@@ -2309,6 +2309,7 @@ async fn connected_cancel_kills_remote_ci_and_supersedes_its_hook_step() {
             &task_id,
             "review".to_owned(),
             services::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 triggered_by: Actor::system(SystemComponent::Workflow),
                 reason: Some("remote CI entry".into()),
@@ -2399,6 +2400,7 @@ async fn disconnected_cancel_fences_workspace_until_real_owner_reconnect_cleanup
             &task_id,
             "review".to_owned(),
             services::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 triggered_by: Actor::system(SystemComponent::Workflow),
                 reason: Some("remote CI".into()),
@@ -2513,6 +2515,7 @@ async fn disconnected_hold_parks_follow_up_on_the_named_machine_until_reconnect(
             &task_id,
             "review".to_owned(),
             services::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 triggered_by: Actor::system(SystemComponent::Workflow),
                 reason: Some("remote CI".into()),
@@ -2688,6 +2691,7 @@ async fn cancel_during_remote_merge_push_finishes_integration_and_reports_done()
             &task_id,
             "merging".into(),
             services::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 triggered_by: Actor::system(SystemComponent::Workflow),
                 reason: Some("approved remote merge".into()),
@@ -2824,6 +2828,7 @@ async fn cancel_during_slow_remote_merge_push_reports_done() {
             &task_id,
             "merging".into(),
             services::task_service::TransitionOptions {
+                bridge: Default::default(),
                 version: task.version,
                 triggered_by: Actor::system(SystemComponent::Workflow),
                 reason: Some("approved remote merge".into()),

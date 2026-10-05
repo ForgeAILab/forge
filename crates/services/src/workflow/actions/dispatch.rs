@@ -104,9 +104,11 @@ impl HookAction for DispatchRoleAgent {
                 };
                 return HookResult::Cascade {
                     to: target,
-                    reason: format!(
-                        "{} mechanical merge contention resolved; fresh review required",
-                        crate::workflow::REVIEW_REFRESH_MARKER
+                    reason: "Mechanical merge contention resolved; fresh review required"
+                        .to_owned(),
+
+                    bridge: api_types::TransitionBridge::new(
+                        api_types::TransitionBridgeKind::ReviewRefresh,
                     ),
                 };
             }

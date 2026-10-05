@@ -1,3 +1,139 @@
+/// Durable classification of a mechanical transition or accepted gate action.
+/// Human reason text is never an input to this classification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TransitionBridgeKind {
+    ReviewRefresh,
+    TargetMovedRebase,
+    ConflictHandoff,
+    RetryWindowReset,
+    Recovery,
+    GateSkipped,
+    GateApproved,
+    GateRejected,
+    CiOnlyReviewPassed,
+    ReviewCarry,
+}
+
+impl TransitionBridgeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReviewRefresh => "review_refresh",
+            Self::TargetMovedRebase => "target_moved_rebase",
+            Self::ConflictHandoff => "conflict_handoff",
+            Self::RetryWindowReset => "retry_window_reset",
+            Self::Recovery => "recovery",
+            Self::GateSkipped => "gate_skipped",
+            Self::GateApproved => "gate_approved",
+            Self::GateRejected => "gate_rejected",
+            Self::CiOnlyReviewPassed => "ci_only_review_passed",
+            Self::ReviewCarry => "review_carry",
+        }
+    }
+    pub const fn is_review_refresh(self) -> bool {
+        matches!(self, Self::ReviewRefresh | Self::TargetMovedRebase)
+    }
+    pub const fn is_mechanical(self) -> bool {
+        matches!(
+            self,
+            Self::ReviewRefresh | Self::TargetMovedRebase | Self::ConflictHandoff
+        )
+    }
+}
+
+impl std::str::FromStr for TransitionBridgeKind {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "review_refresh" => Ok(Self::ReviewRefresh),
+            "target_moved_rebase" => Ok(Self::TargetMovedRebase),
+            "conflict_handoff" => Ok(Self::ConflictHandoff),
+            "retry_window_reset" => Ok(Self::RetryWindowReset),
+            "recovery" => Ok(Self::Recovery),
+            "gate_skipped" => Ok(Self::GateSkipped),
+            "gate_approved" => Ok(Self::GateApproved),
+            "gate_rejected" => Ok(Self::GateRejected),
+            "ci_only_review_passed" => Ok(Self::CiOnlyReviewPassed),
+            "review_carry" => Ok(Self::ReviewCarry),
+            _ => Err(format!("unknown transition bridge kind: {value}")),
+        }
+    }
+}
+
+/// Structured companion to audit prose; flattened in persisted command inputs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TransitionBridge {
+    pub bridge_kind: Option<TransitionBridgeKind>,
+    #[ts(type = "unknown | null")]
+    pub bridge_payload: Option<serde_json::Value>,
+}
+
+impl TransitionBridge {
+    pub fn new(kind: TransitionBridgeKind) -> Self {
+        Self {
+            bridge_kind: Some(kind),
+            bridge_payload: None,
+        }
+    }
+    pub fn conflict_handoff(paths: &[String]) -> Self {
+        Self {
+            bridge_kind: Some(TransitionBridgeKind::ConflictHandoff),
+            bridge_payload: Some(serde_json::json!({"paths": paths})),
+        }
+    }
+    pub fn recovery(verb: &str, reset: bool) -> Self {
+        Self {
+            bridge_kind: Some(if reset {
+                TransitionBridgeKind::RetryWindowReset
+            } else {
+                TransitionBridgeKind::Recovery
+            }),
+            bridge_payload: Some(serde_json::json!({"verb": verb})),
+        }
+    }
+    pub fn is_review_refresh(&self) -> bool {
+        self.bridge_kind
+            .is_some_and(TransitionBridgeKind::is_review_refresh)
+    }
+    pub fn is_mechanical(&self) -> bool {
+        self.bridge_kind
+            .is_some_and(TransitionBridgeKind::is_mechanical)
+    }
+    pub fn conflict_paths(&self) -> Option<Vec<String>> {
+        if self.bridge_kind != Some(TransitionBridgeKind::ConflictHandoff) {
+            return None;
+        }
+        serde_json::from_value(self.bridge_payload.as_ref()?.get("paths")?.clone()).ok()
+    }
+}
+
+/// Execution purpose is independent of mutable summary/prompt text.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ExecutionPurpose {
+    AutomaticReviewRecovery,
+}
+impl ExecutionPurpose {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutomaticReviewRecovery => "automatic_review_recovery",
+        }
+    }
+}
+
+impl std::str::FromStr for ExecutionPurpose {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "automatic_review_recovery" => Ok(Self::AutomaticReviewRecovery),
+            _ => Err(format!("unknown execution purpose: {value}")),
+        }
+    }
+}
+
 use crate::assignee::AssigneeKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1024,6 +1160,9 @@ pub struct InitialRoleAssignment {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct TransitionLogEntry {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub bridge: TransitionBridge,
     pub id: String,
     pub task_id: String,
     pub from_state: String,

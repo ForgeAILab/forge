@@ -162,6 +162,7 @@ fn transition_log_entry(entry: db::TransitionLog) -> ApiResult<TransitionLogEntr
         from_state: entry.from_state,
         to_state: entry.to_state,
         triggered_by: entry.triggered_by,
+        bridge: entry.bridge,
         trigger_reason: entry.trigger_reason,
         hook_results_json,
         rejection: entry.rejection,

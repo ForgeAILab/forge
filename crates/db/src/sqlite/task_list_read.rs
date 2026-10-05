@@ -104,6 +104,7 @@ mod tests {
             workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
             triggered_by: "user:board_drag".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "board reorder".to_owned(),
             rejection: false,
             expected_project_version: None,

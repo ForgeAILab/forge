@@ -1319,7 +1319,7 @@ mod tests {
         for entry in std::fs::read_dir(&src).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("V202610040225") {
+            if name.ends_with(".sql") && name.as_str() < "V202610040225" {
                 std::fs::copy(entry.path(), old.path().join(&name)).unwrap();
             }
         }

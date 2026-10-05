@@ -195,6 +195,7 @@ pub(crate) async fn execution_admission_for_task(
         )
     };
     Ok(ExecutionAdmission {
+        purpose: None,
         expected_queued_recovery_id: None,
         expected_project_version: Some(expected_project_version),
         expected_task_version: task.version,
@@ -411,25 +412,26 @@ pub(super) fn is_transient_error_annotation(raw_annotation: &str) -> bool {
 
 #[derive(Clone)]
 pub struct TaskService {
+    workflow_engine: Arc<WorkflowEngine>,
     task_step_driver:
         Arc<std::sync::Mutex<Option<Arc<crate::worker_runtime::queue::TaskStepWorker>>>>,
     pub(crate) task_step_replies: Arc<
         std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
     >,
-    db: Arc<SqliteDb>,
-    event_bus: Arc<EventBus>,
-    merge_service: Option<Arc<MergeService>>,
-    cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
-    review_runner: Option<Arc<ReviewRunner>>,
+    pub(crate) db: Arc<SqliteDb>,
+    pub(crate) event_bus: Arc<EventBus>,
+    pub(crate) merge_service: Option<Arc<MergeService>>,
+    pub(crate) cleanup_scheduler: Option<Arc<WorkspaceCleanupScheduler>>,
+    pub(crate) review_runner: Option<Arc<ReviewRunner>>,
     task_executor: Option<Arc<dyn TaskExecutor>>,
     placement_adapter_registry: Option<Arc<executors::AdapterRegistry>>,
-    daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
-    workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
-    terminal_activity: Option<Arc<TerminalActivityTracker>>,
-    repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
-    workspace_backend_router: Arc<WorkspaceBackendRouter>,
+    pub(crate) daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
+    pub(crate) workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
+    pub(crate) terminal_activity: Option<Arc<TerminalActivityTracker>>,
+    pub(crate) repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    pub(crate) workspace_backend_router: Arc<WorkspaceBackendRouter>,
     test_workspace_backend: bool,
-    workspace_root: PathBuf,
+    pub(crate) workspace_root: PathBuf,
     workspace_max_disconnect: Duration,
     memory_service: Arc<MemoryService>,
     move_operation_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -449,6 +451,8 @@ pub struct TransitionResult {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct TransitionOptions {
+    #[serde(flatten)]
+    pub bridge: api_types::TransitionBridge,
     pub version: i64,
     pub reason: Option<String>,
     pub triggered_by: Actor,
@@ -459,6 +463,7 @@ pub struct TransitionOptions {
 impl From<i64> for TransitionOptions {
     fn from(version: i64) -> Self {
         Self {
+            bridge: Default::default(),
             version,
             reason: None,
             triggered_by: Actor::system(api_types::SystemComponent::General),
@@ -471,6 +476,7 @@ impl From<i64> for TransitionOptions {
 impl From<(i64, Option<String>)> for TransitionOptions {
     fn from((version, reason): (i64, Option<String>)) -> Self {
         Self {
+            bridge: Default::default(),
             version,
             reason,
             triggered_by: Actor::user(UserActionSource::Api),
@@ -483,6 +489,7 @@ impl From<(i64, Option<String>)> for TransitionOptions {
 impl From<(i64, Option<String>, bool)> for TransitionOptions {
     fn from((version, reason, rejection): (i64, Option<String>, bool)) -> Self {
         Self {
+            bridge: Default::default(),
             version,
             reason,
             triggered_by: Actor::user(UserActionSource::Api),
@@ -510,7 +517,10 @@ impl TaskService {
             .initialize_identity(&::config::embedded_machine_id());
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
         let workspace_root = default_workspace_root();
+        let workflow_engine =
+            Arc::new(WorkflowEngine::new(Arc::clone(&db), Arc::clone(&event_bus)));
         Self {
+            workflow_engine,
             db,
             task_step_driver: Arc::default(),
             task_step_replies: Arc::default(),
@@ -2088,9 +2098,7 @@ impl TaskService {
         let mut service = self.clone();
         // The worker's service must not retain the cache that owns it.
         service.task_step_driver = Arc::default();
-        let worker = Arc::new(crate::worker_runtime::queue::TaskStepWorker::new(
-            service.workflow_engine(),
-        ));
+        let worker = Arc::new(crate::worker_runtime::queue::TaskStepWorker::new(service));
         let executor: Arc<dyn db::task_writer::TaskStepExecutor> = worker.clone();
         self.db.set_task_step_executor(Arc::downgrade(&executor));
         *cached = Some(worker.clone());

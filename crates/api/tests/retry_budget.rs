@@ -105,6 +105,7 @@ async fn task_response_remaining_retries_resets_at_recovery_boundary() {
             to_state: "in_progress".to_owned(),
             trigger_name: Some("reject".to_owned()),
             triggered_by: "test".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "first rejection".to_owned(),
             hook_results_json: None,
             rejection: true,
@@ -122,6 +123,9 @@ async fn task_response_remaining_retries_resets_at_recovery_boundary() {
             to_state: "in_progress".to_owned(),
             trigger_name: Some("review_refresh".to_owned()),
             triggered_by: "system:workflow".to_owned(),
+            bridge: api_types::TransitionBridge::new(
+                api_types::TransitionBridgeKind::ReviewRefresh,
+            ),
             trigger_reason: "[review-refresh] target advanced".to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -154,6 +158,9 @@ async fn task_response_remaining_retries_resets_at_recovery_boundary() {
             to_state: "review".to_owned(),
             trigger_name: Some("reset_to_initial".to_owned()),
             triggered_by: "test".to_owned(),
+            bridge: api_types::TransitionBridge::new(
+                api_types::TransitionBridgeKind::RetryWindowReset,
+            ),
             trigger_reason: "reset retry window".to_owned(),
             hook_results_json: None,
             rejection: false,

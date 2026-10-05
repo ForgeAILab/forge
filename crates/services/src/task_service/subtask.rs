@@ -176,6 +176,7 @@ impl TaskService {
                 parent.id.clone(),
                 next_target,
                 TransitionOptions {
+                    bridge: Default::default(),
                     version: parent.version,
                     reason: Some("ordered subtasks completed".to_owned()),
                     triggered_by: api_types::Actor::system(
@@ -227,6 +228,7 @@ impl TaskService {
                     parent.id.clone(),
                     target,
                     TransitionOptions {
+                        bridge: Default::default(),
                         version: parent.version,
                         reason: Some("all ordered subtasks completed".to_owned()),
                         triggered_by: api_types::Actor::system(
