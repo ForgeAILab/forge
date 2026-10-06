@@ -2105,6 +2105,7 @@ impl TaskRepo for SqliteDb {
             .get_task_in_tx(&mut transaction, id)
             .await?
             .ok_or(DbError::NotFound)?;
+        self.sync_condition_in_tx(&mut transaction, id).await?;
         transaction.commit().await?;
         Ok(task)
     }
@@ -2721,6 +2722,9 @@ async fn update_task_status_inner(
     DomainEventRepo::append_event_in_tx(db, &mut transaction, &event).await?;
     if let Some(marker) = recovery_marker {
         insert_recovery_marker_in_tx(&mut transaction, marker).await?;
+    }
+    if crate::task_writer::owns_task(&task.id) {
+        db.sync_condition_in_tx(&mut transaction, &task.id).await?;
     }
     transaction.commit().await?;
     Ok(Some(task))

@@ -3722,6 +3722,67 @@ Project deletion; shared retries/dead letters and existing wake budgets apply.
 The Project Agent proposes one splitting Task; the user resolves the incident
 in Mission Control.
 
+### Task condition dual-write foundation
+
+`V202610060030__task_condition` adds one private, non-null `condition_json`
+column and an expression index on its tagged enum kind. Stage one keeps
+`error_annotation`, `blocked_json`, `failed_json`, `entry_barrier_json` and
+condition metadata authoritative. Task serialization, admission, dispatch,
+actions, health, human-readiness, flow-control slot counts, events and Attention
+continue to read those legacy inputs. The migration does not change their bytes,
+Task versions/timestamps, retained queue intents, publication claims or budget
+receipts, including archived/deleted Tasks and malformed historical JSON.
+
+The internal `db::TaskCondition` variants are `Clear`, `Entering`, `Running`,
+`Deferred`, `Parked`, `Failed` and `Settled`. Parks carry one primary typed reason,
+ordered secondary reasons, a continuation and lossless legacy condition evidence.
+The stage-one mapper derives only `Clear`, `Deferred`, `Parked` and `Failed` from
+the five legacy condition inputs. `Entering`, `Running` and `Settled` require
+matching durable ownership/workflow witnesses, which this import does not have:
+an old `running` entry barrier becomes `UnknownCondition(UnownedEntry)` rather
+than a fabricated step owner. No custom workflow hooks are retried by this stage.
+
+The marked SELECT in the new migration is the single deterministic mapping
+used by backfill, the `task_condition_legacy` view and
+`db::map_legacy_condition` on an immutable bound snapshot. Its correlated query
+maps only the affected Task; it does not scan every Task for each write.
+Known failure/budget/hold, barrier, approval, dispatch/capacity, environment,
+placement, owner, upgrade and paused-integration facts become typed reasons.
+Generic `retry_exhausted` retains an unresolved optional budget kind until a
+producer supplies the ledger/gate witness; it is not guessed as Execution.
+Explicit failed-process metadata retains precedence; holds and exhausted budgets
+precede ordinary failure reasons. Same-cause annotation/block rows deduplicate,
+while their original strings remain in evidence. Selected metadata values are
+raw JSON fragments: large numbers, lone Unicode escapes and deep historical
+evidence are preserved without a second JSON-value decode. Invalid extracted
+UTF-16 text becomes a nullable import hint, not an invalid Rust string.
+Malformed/non-object inputs and
+unknown annotation kinds become named `UnknownCondition` reasons. Unrelated
+metadata keys remain untouched in their existing owner and do not invent parks.
+
+Insert and legacy-column-update triggers write the shadow in the same SQLite
+transaction as **every** legacy write, including raw queue settlement, budget,
+execution admission, reconnect and data-preserving fixture SQL. They update only
+`condition_json`: no version/time change, legacy list/board revision, event,
+Attention incident or wake is added. A condition-write guard rejects disagreement
+with the legacy mapping. Repository update/status/recovery/barrier and
+TaskQuery/BulkTaskQuery adapters additionally use one `SqliteDb::set_condition`
+seam. It requires the matching claimed Task step, checks its live lease, rejects
+an expected-version mismatch and compares all five source values (metadata can
+change without advancing Task.version). It never silently rebinds a stale
+condition version. A no-op sync leaves the existing row unchanged.
+`check_task_condition_invariant(task)` compares the persisted shadow with mapping
+of the supplied Task snapshot for writer tests.
+
+Queue intent/claim/receipt **bodies** stay out of condition evidence. A queued
+recovery continuation retains only its intent id; the original command remains
+its execution/rollback authority. Planner markers, pause generations and other
+condition evidence remain private. Raw legacy annotations are preserved only as
+private import evidence, not advertised action lists or new public aliases.
+No condition payload is fed to Attention in stage one, so incident digests and
+consumed wake decisions are unchanged. Stage two must move each producer to typed
+facts and retain existing material blocker identity before switching any reader.
+
 ### Task condition actions
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, existing interruption columns, entry-barrier/flow-control metadata, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.

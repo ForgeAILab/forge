@@ -261,6 +261,9 @@ impl SqliteDb {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         result: &T,
     ) -> Result<()> {
+        if let Some(step) = current_task_step() {
+            self.sync_condition_in_tx(tx, &step.task_id).await?;
+        }
         let Some(step) = current_task_step().filter(|step| step.kind == "mutation") else {
             return Ok(());
         };
@@ -730,12 +733,14 @@ impl TaskQuery {
     ) -> Result<TaskQueryResult> {
         if owns_task(&self.task_id) {
             self.db.fence_current_step_in_tx(tx).await?;
-            return Ok(TaskQueryResult::Applied(
-                bind_query(&self.query, self.arguments)?
-                    .execute(&mut **tx)
-                    .await?
-                    .rows_affected(),
-            ));
+            let rows = bind_query(&self.query, self.arguments)?
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+            if rows != 0 {
+                self.db.sync_condition_in_tx(tx, &self.task_id).await?;
+            }
+            return Ok(TaskQueryResult::Applied(rows));
         }
         let step_id = self
             .db
@@ -813,7 +818,13 @@ impl BulkTaskQuery {
             arguments.insert(set_arguments, serde_json::json!(task_id));
             if owns_task(&task_id) {
                 self.db.fence_current_step_in_tx(tx).await?;
-                bind_query(&query, arguments)?.execute(&mut **tx).await?;
+                let rows = bind_query(&query, arguments)?
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected();
+                if rows != 0 {
+                    self.db.sync_condition_in_tx(tx, &task_id).await?;
+                }
                 result.applied += 1;
             } else {
                 self.db
