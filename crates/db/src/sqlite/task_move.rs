@@ -284,6 +284,8 @@ impl TaskBoardRepo for SqliteDb {
         if let Some(step) = &input.post_commit_step {
             crate::TaskStepRepo::enqueue_step_in_tx(self, &mut tx, step).await?;
         }
+        // Publish after the entry receipt even for a same-status reorder.
+        crate::task_condition::sync_condition(&mut tx, &input.task_id).await?;
         tx.commit().await?;
 
         Ok(MoveTaskPersistence::Committed {

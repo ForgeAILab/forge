@@ -228,6 +228,7 @@ pub async fn reset(
 ) -> Result<()> {
     sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,?,?,0) ON CONFLICT(task_id,kind) DO UPDATE SET window_id=excluded.window_id, spent=0 WHERE task_budget.window_id != excluded.window_id")
         .bind(task).bind(key).bind(window).execute(&mut **tx).await?;
+    crate::task_condition::sync_condition(tx, task).await?;
     Ok(())
 }
 pub async fn reset_all(tx: &mut Transaction<'_, Sqlite>, task: &str, window: &str) -> Result<()> {
@@ -240,6 +241,7 @@ pub async fn reset_all(tx: &mut Transaction<'_, Sqlite>, task: &str, window: &st
         .bind(window)
         .execute(&mut **tx)
         .await?;
+    crate::task_condition::sync_condition(tx, task).await?;
     Ok(())
 }
 /// The receipt identity a failed review entry charges under. The cascade that
@@ -308,6 +310,7 @@ pub async fn charge(
         .bind(key)
         .execute(&mut **tx)
         .await?;
+    crate::task_condition::sync_condition(tx, task).await?;
     Ok(Charge {
         spent,
         remaining: remaining(limit, spent),

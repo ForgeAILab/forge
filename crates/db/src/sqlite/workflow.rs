@@ -491,7 +491,7 @@ impl TransitionLogRepo for SqliteDb {
         )
         .await?;
         sqlx::query(
-            "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload, status_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id=?))",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -505,6 +505,7 @@ impl TransitionLogRepo for SqliteDb {
         .bind(&input.created_at)
         .bind(input.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
         .bind(input.bridge.bridge_payload.as_ref().map(ToString::to_string))
+        .bind(&input.task_id)
         .execute(&mut *transaction)
         .await
         .map_err(map_workflow_sqlx_error)?;
@@ -518,6 +519,7 @@ impl TransitionLogRepo for SqliteDb {
         .map_err(map_workflow_sqlx_error)?;
 
         let result = map_transition_log_row(row)?;
+        crate::task_condition::sync_condition(&mut transaction, &input.task_id).await?;
         transaction.commit().await?;
         Ok(result)
     }

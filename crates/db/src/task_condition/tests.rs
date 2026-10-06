@@ -6,7 +6,7 @@ use crate::{
 use serde_json::{json, Value};
 use sqlx::SqliteConnection;
 
-async fn db() -> SqliteDb {
+pub(super) async fn db() -> SqliteDb {
     let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
     crate::run_migrations(&pool).await.unwrap();
     let db = SqliteDb::new(pool);
@@ -27,7 +27,7 @@ async fn db() -> SqliteDb {
     .unwrap();
     db
 }
-async fn task(db: &SqliteDb, id: &str) -> Task {
+pub(super) async fn task(db: &SqliteDb, id: &str) -> Task {
     TaskRepo::create(
         db,
         CreateTask {
@@ -53,7 +53,7 @@ async fn task(db: &SqliteDb, id: &str) -> Task {
     .await
     .unwrap()
 }
-async fn claim(db: &SqliteDb, id: &str) -> crate::TaskStep {
+pub(super) async fn claim(db: &SqliteDb, id: &str) -> crate::TaskStep {
     let t = TaskRepo::get_by_id(db, id, false).await.unwrap().unwrap();
     let step_id = crate::new_uuid_v4();
     db.enqueue_step(&EnqueueTaskStep {
@@ -82,7 +82,7 @@ async fn claim(db: &SqliteDb, id: &str) -> crate::TaskStep {
     .unwrap()
     .unwrap()
 }
-fn input(
+pub(super) fn input(
     annotation: Option<Value>,
     blocked: Option<Value>,
     failed: Option<Value>,
@@ -96,6 +96,7 @@ fn input(
         entry_barrier_json: barrier.map(|v| v.to_string()),
         metadata_json: metadata.map(|v| v.to_string()),
         non_text: Vec::new(),
+        facts: None,
     }
 }
 fn reasons(condition: &TaskCondition) -> Vec<&ParkReason> {
@@ -110,7 +111,7 @@ fn reasons(condition: &TaskCondition) -> Vec<&ParkReason> {
             additional,
             ..
         } => std::iter::once(failure).chain(additional).collect(),
-        _ => vec![],
+        _ => condition.evidence().observations.iter().collect(),
     }
 }
 
@@ -243,7 +244,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
                 Some(json!({"state":"review","status":"running"})),
                 None,
             ),
-            "parked",
+            "clear",
             Some("unknown_condition"),
         ),
         (
@@ -461,7 +462,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
                 None,
                 Some(json!({"deferred_dispatch":[1],"awaiting_human":"yes"})),
             ),
-            "parked",
+            "clear",
             Some("unknown_condition"),
         ),
         (
@@ -639,7 +640,7 @@ fn every_condition_variant_round_trips_without_fabricated_owners() {
             evidence: evidence.clone(),
         },
         TaskCondition::Deferred {
-            until: "later".into(),
+            until: Some("later".into()),
             reason: RetryCause::ExecutionFailure,
             resume: ConditionContinuation::Dispatch {
                 target_state: "working".into(),
@@ -821,6 +822,9 @@ async fn each_writer_family_keeps_condition_invariant_and_legacy_observability()
         "task_query_sql_computed",
         "bulk_query",
         "direct_sql_seam",
+        "removed_machine_cancel_clear",
+        "removed_machine_owner_wait_clear",
+        "removed_machine_annotation",
     ] {
         let t = task(&db, family).await;
         db.check_task_condition_invariant(&t).await.unwrap();
@@ -855,12 +859,15 @@ async fn each_writer_family_keeps_condition_invariant_and_legacy_observability()
                     db.sync_condition_in_tx(&mut tx,&t.id).await.unwrap();tx.commit().await.unwrap();
                     let after:(i64,String)=sqlx::query_as("SELECT version,updated_at FROM task WHERE id=?").bind(&t.id).fetch_one(db.pool()).await.unwrap();assert_eq!(before,after);
                 },
+                "removed_machine_cancel_clear"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=NULL,metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.deferred_dispatch','$.dispatch_disposition') ELSE metadata_json END,version=version+1 WHERE id=?").bind(&t.id).identity_fenced().execute(db.pool()).await.unwrap();},
+                "removed_machine_owner_wait_clear"=>{TaskRepo::mutate_metadata(&db,&t.id,None,vec![TaskMetadataMutation::Set{key:"owner_wait".into(),value:json!({"daemon_id":"removed"})}],&crate::now_rfc3339()).await.unwrap();crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET metadata_json=json_remove(metadata_json,'$.owner_wait','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.owner_wait.daemon_id')=?").bind(&t.id).bind("removed").identity_fenced().execute(db.pool()).await.unwrap();},
+                "removed_machine_annotation"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=?,version=version+1 WHERE id=?").bind(json!({"type":"recovery_required","blocking_reason":"machine_removed","blocked_by":"removed"}).to_string()).bind(&t.id).identity_fenced().execute(db.pool()).await.unwrap();},
                 _=>unreachable!(),
             }
             let current=TaskRepo::get_by_id(&db,&t.id,true).await.unwrap().unwrap();
             db.check_task_condition_invariant(&current).await.unwrap_or_else(|e|panic!("{family}: {e}"));
             let condition=db.task_condition(&t.id).await.unwrap();
-            assert_eq!(condition.is_blocked(),!matches!(family,"wake"|"wake_project"),"{family}: {condition:?}");
+            assert_eq!(condition.is_blocked(),!matches!(family,"wake"|"wake_project"|"removed_machine_cancel_clear"|"removed_machine_owner_wait_clear"),"{family}: {condition:?}");
             // A shadow-only sync must leave legacy versions/revisions/events alone.
             let before:(i64,i64,i64,i64)=sqlx::query_as("SELECT t.version,p.board_revision,p.list_revision,(SELECT COUNT(*) FROM domain_event) FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=?").bind(&t.id).fetch_one(db.pool()).await.unwrap();
             let mut tx=crate::begin_immediate(db.pool()).await.unwrap();db.sync_condition_in_tx(&mut tx,&t.id).await.unwrap();tx.commit().await.unwrap();
@@ -920,7 +927,8 @@ async fn stale_condition_version_source_and_lease_are_rejected() {
                 .await,
             Err(DbError::Check(_))
         ));
-        let parked = map_legacy_condition(&current);
+        let facts = ConditionFacts::load(&mut tx, &t.id).await.unwrap();
+        let parked = facts.apply(map_legacy_condition(&current));
         db.set_condition(&mut tx, &t.id, t.version, &current, &parked)
             .await
             .unwrap();
@@ -1586,10 +1594,13 @@ async fn hostile_legacy_values_survive_backfill_and_writer_seam() {
         .unwrap();
         db.sync_condition_in_tx(&mut tx, "tmpl").await.unwrap();
         tx.commit().await.unwrap();
-        assert!(
-            db.task_condition("tmpl").await.unwrap().is_blocked(),
-            "{column}"
-        );
+        let condition = db.task_condition("tmpl").await.unwrap();
+        if column == "metadata_json" {
+            assert!(!condition.is_blocked(), "ignored malformed metadata");
+            assert!(!condition.evidence().observations.is_empty());
+        } else {
+            assert!(condition.is_blocked(), "{column}");
+        }
         sqlx::query(&format!("UPDATE task SET {column}=NULL WHERE id='tmpl'"))
             .execute(db.pool())
             .await
@@ -1783,13 +1794,13 @@ fn real_producer_shapes_map_to_what_legacy_blocks_on() {
                 Some(json!({"state":"review","status":"passed"})),
                 None,
             ),
-            "parked",
+            "clear",
             Some("unknown_condition"),
         ),
         (
             "barrier no status",
             input(None, None, None, Some(json!({"state":"review"})), None),
-            "parked",
+            "clear",
             Some("unknown_condition"),
         ),
         (
@@ -1801,13 +1812,13 @@ fn real_producer_shapes_map_to_what_legacy_blocks_on() {
                 Some(json!({"state":"review","status":"running"})),
                 None,
             ),
-            "parked",
+            "clear",
             Some("unknown_condition"),
         ),
         (
             "awaiting_human string true",
             meta(json!({"awaiting_human":"true"})),
-            "parked",
+            "clear",
             Some("unknown_condition"),
         ),
         (
@@ -2016,8 +2027,11 @@ async fn evidence_is_bounded_and_large_unrelated_fields_are_not_copied() {
 /// condition column.
 #[test]
 fn seam_is_skipped_for_sql_that_cannot_change_a_condition() {
-    assert!(!writes_legacy_condition(
+    assert!(writes_legacy_condition(
         "UPDATE task SET status='done',version=version+1 WHERE id=? AND blocked_json IS NULL"
+    ));
+    assert!(!writes_legacy_condition(
+        "UPDATE task SET title=? WHERE id=? AND blocked_json IS NULL"
     ));
     assert!(writes_legacy_condition(
         "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait') WHERE id = ?"

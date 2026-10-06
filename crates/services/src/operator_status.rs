@@ -324,6 +324,19 @@ impl OperatorStatusService {
             raise_severity(&mut overall_severity, OperatorSeverity::Error);
         }
 
+        let condition_checks = self.db.condition_check_status();
+        if let Some(occurred_at) = condition_checks.last_at {
+            recent_errors.push(RecentErrorSummary {
+                severity: api_types::OperatorSeverity::Healthy,
+                entity_type: "task_condition_invariant".into(),
+                entity_id: "task-dispatcher".into(),
+                error: format!(
+                    "checked={} repaired={} ticks={}",
+                    condition_checks.checked, condition_checks.repaired, condition_checks.ticks
+                ),
+                occurred_at,
+            });
+        }
         Ok(OperatorStatusResponse {
             overall_severity,
             active_executions,
@@ -2161,5 +2174,23 @@ mod tests {
         assert_eq!(status.task_steps.failed, 0);
         assert_eq!(status.task_steps.parked, 1);
         assert!(status.task_steps.oldest_pending_age_seconds.is_some());
+    }
+}
+
+#[cfg(test)]
+mod condition_check_tests {
+    #[tokio::test]
+    async fn repairs_are_visible_without_changing_operator_response_shape() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = std::sync::Arc::new(db::SqliteDb::new(pool));
+        db.check_task_conditions(8).await.unwrap();
+        let service = super::OperatorStatusService::new_for_test(db);
+        let status = service.compute_status().await.unwrap();
+        assert!(status
+            .recent_errors
+            .iter()
+            .any(|row| row.entity_type == "task_condition_invariant"
+                && row.error.contains("checked=0 repaired=0")));
     }
 }

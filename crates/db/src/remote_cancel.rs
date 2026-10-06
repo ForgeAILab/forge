@@ -110,8 +110,18 @@ impl SqliteDb {
     pub async fn mark_pending_remote_cancel(&self, operation: &RemoteTaskOperation) -> Result<()> {
         // Orphan cleanup intentionally has no registration FK. Only explicit
         // revocation may suppress a marker for still-running remote work.
+        let mut tx = begin_immediate(self.pool()).await?;
         sqlx::query("INSERT INTO pending_remote_cancel(operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at) SELECT operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at FROM task_remote_operation WHERE operation_id=? AND step_id=? AND state='running' AND NOT EXISTS(SELECT 1 FROM daemon d WHERE d.id=task_remote_operation.daemon_id AND d.removed_at IS NOT NULL) ON CONFLICT DO NOTHING")
-            .bind(&operation.operation_id).bind(&operation.step_id).execute(self.pool()).await?;
+            .bind(&operation.operation_id).bind(&operation.step_id).execute(&mut *tx).await?;
+        let tasks: Vec<String> = sqlx::query_scalar("SELECT id FROM task WHERE id=(SELECT task_id FROM task_step WHERE id=?) OR id=(SELECT task_id FROM workspace WHERE id=?)")
+            .bind(&operation.step_id)
+            .bind(&operation.workspace_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        for task in tasks {
+            crate::task_condition::sync_condition(&mut tx, &task).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -127,9 +137,10 @@ impl SqliteDb {
         .bind(&operation.step_id)
         .execute(&mut *tx)
         .await?;
-        let tasks:Vec<String>=sqlx::query_scalar("SELECT id FROM task WHERE deleted_at IS NULL AND (id=(SELECT task_id FROM workspace WHERE id=?) OR id IN (SELECT task_id FROM execution WHERE workspace_id=?))")
-            .bind(&operation.workspace_id).bind(&operation.workspace_id).fetch_all(&mut *tx).await?;
+        let tasks:Vec<String>=sqlx::query_scalar("SELECT id FROM task WHERE deleted_at IS NULL AND (id=(SELECT task_id FROM workspace WHERE id=?) OR id IN (SELECT task_id FROM execution WHERE workspace_id=?) OR id=(SELECT task_id FROM task_step WHERE id=?))")
+            .bind(&operation.workspace_id).bind(&operation.workspace_id).bind(&operation.step_id).fetch_all(&mut *tx).await?;
         for task_id in tasks {
+            crate::task_condition::sync_condition(&mut tx, &task_id).await?;
             if !sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM pending_remote_cancel WHERE workspace_id=?)",
             )

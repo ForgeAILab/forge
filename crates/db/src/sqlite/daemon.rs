@@ -459,6 +459,7 @@ impl SqliteDb {
             }).await?;
             self.mark_step_identity_fenced_in_tx(&mut tx, &queued)
                 .await?;
+            crate::task_condition::sync_condition(&mut tx, task_id).await?;
         }
         let result = api_types::RemoveDaemonResponse {
             id: id.to_owned(),

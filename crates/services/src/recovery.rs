@@ -9093,6 +9093,9 @@ pub(crate) async fn settle_removed_machine_task(
             .extend(TaskService::on_agent_deleted_in_tx(db, &mut transaction, &agent_id).await?);
         transaction.commit().await?;
     }
+    let mut condition_tx = db::begin_immediate(db.pool()).await?;
+    db.sync_condition_in_tx(&mut condition_tx, task_id).await?;
+    condition_tx.commit().await?;
     Ok(settlement)
 }
 

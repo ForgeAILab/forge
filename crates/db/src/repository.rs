@@ -1048,7 +1048,10 @@ impl CreateDomainEvent {
     }
 }
 
-fn event_interruption_details(source: &str, value: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn event_interruption_details(
+    source: &str,
+    value: &serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "source": source,
         "kind": value
@@ -1097,7 +1100,7 @@ pub fn task_interruption_requires_intervention(
         })
 }
 
-fn parse_event_json_object(raw: &str) -> serde_json::Value {
+pub(crate) fn parse_event_json_object(raw: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(raw)
         .ok()
         .filter(serde_json::Value::is_object)

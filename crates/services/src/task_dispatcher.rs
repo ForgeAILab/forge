@@ -153,6 +153,11 @@ impl TaskDispatcher {
 
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
+        // First supervised tick is the non-blocking startup check. Later ticks
+        // reuse this loop, with a fixed bounded page and a 60s check cadence.
+        if let Err(error) = self.db.check_task_conditions_if_due().await {
+            tracing::warn!(%error,"Task condition invariant check deferred");
+        }
         let mut dispatched = 0;
         let environment_changed = match self.sync_due_environment_checks().await {
             Ok(changed) => changed,

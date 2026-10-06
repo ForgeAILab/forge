@@ -142,6 +142,7 @@ mod workspace_placement;
 
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
+    pub(crate) condition_checks: Arc<std::sync::Mutex<crate::ConditionCheckState>>,
     pub(crate) task_step_controls: Arc<
         std::sync::Mutex<
             std::collections::HashMap<String, Arc<crate::task_writer::TaskStepControl>>,
@@ -167,6 +168,7 @@ impl SqliteDb {
         let domain_event_hooks = crate::connection::domain_event_hooks(&pool);
         Self {
             pool,
+            condition_checks: Default::default(),
             task_step_controls: Default::default(),
             task_step_executor: Default::default(),
             task_step_activity: Default::default(),
@@ -1080,9 +1082,7 @@ impl SqliteDb {
             .execute(&mut **transaction)
             .await?;
         }
-        if input.status == ExecutionStatus::Running {
-            crate::task_condition::sync_condition(transaction, &input.task_id).await?;
-        }
+        crate::task_condition::sync_condition(transaction, &input.task_id).await?;
 
         let row = sqlx::query("SELECT * FROM execution WHERE id = ?")
             .bind(&input.id)

@@ -1,4 +1,4 @@
-//! Refactor 3.1 stage 1 write-cost measurement (not a correctness test).
+//! Refactor 3.1 stage 2 write-cost measurement (not a correctness test).
 //!
 //! Uses only API that exists on the base commit, so the same file runs on
 //! both sides of the change:
@@ -149,9 +149,13 @@ async fn measure_task_write_cost() {
         for round in 0..3 {
             let t = Instant::now();
             for i in 0..n {
-                TaskRepo::mutate_metadata(&db, "b0", None, vec![TaskMetadataMutation::Set { key: "custom".into(), value: json!(i) }], "u").await.unwrap();
+                TaskRepo::mutate_metadata(&db, "b0", None, vec![TaskMetadataMutation::Set { key: "custom".into(), value: json!({"sequence":i,"note":"Budget awaiting_human queued_recovery"}) }], "u").await.unwrap();
             }
             let unrelated = t.elapsed() / n;
+            let t = Instant::now();
+            for i in 0..n { baseline_da4_metadata(&db, "b0", i).await; }
+            let baseline = t.elapsed() / n;
+            println!("COST ordinary[{round}] da4-baseline-ns={} stage2-ns={} ratio={:.4}", baseline.as_nanos(), unrelated.as_nanos(), unrelated.as_secs_f64()/baseline.as_secs_f64());
             let t = Instant::now();
             for i in 0..n {
                 TaskRepo::mutate_metadata(&db, "b0", None, vec![TaskMetadataMutation::Set { key: "owner_wait".into(), value: json!({"daemon_id": i}) }], "u").await.unwrap();
@@ -174,4 +178,32 @@ async fn measure_task_write_cost() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+/// Exact ordinary Set-key path from da4c45fd::mutate_metadata_with_change,
+/// exercised in the same migrated file/pool/lease and interleaved with modern
+/// calls. No repository clone, alternate build or altered production schema.
+async fn baseline_da4_metadata(db: &SqliteDb, id: &str, value: u32) {
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    db.fence_current_step_in_tx(&mut tx).await.unwrap();
+    let task = TaskRepo::get_by_id_in_tx(db, &mut tx, id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut metadata = db::TaskMetadata::parse(task.metadata_json.as_deref()).unwrap();
+    let new = json!({"sequence":value,"note":"Budget awaiting_human queued_recovery"});
+    if metadata.extra.get("custom") == Some(&new) {
+        tx.commit().await.unwrap();
+        return;
+    }
+    metadata.extra.insert("custom".into(), new);
+    sqlx::query("UPDATE task SET metadata_json=?,updated_at=? WHERE id=? AND deleted_at IS NULL")
+        .bind(metadata.to_json())
+        .bind("u")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    // da4's reply adapter is a no-op for this command-kind lease.
+    tx.commit().await.unwrap();
 }

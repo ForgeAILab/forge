@@ -398,7 +398,7 @@ async fn insert_recovery_marker_in_tx(
         crate::budget::reset_all(transaction, &marker.task_id, &marker.id).await?;
     }
     sqlx::query(
-        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transition_log (id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at, bridge_kind, bridge_payload, status_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT status_epoch FROM task WHERE id=?))",
     )
     .bind(&marker.id)
     .bind(&marker.task_id)
@@ -412,8 +412,10 @@ async fn insert_recovery_marker_in_tx(
     .bind(&marker.created_at)
     .bind(marker.bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
     .bind(marker.bridge.bridge_payload.as_ref().map(ToString::to_string))
+    .bind(&marker.task_id)
     .execute(&mut **transaction)
     .await?;
+    crate::task_condition::sync_condition(transaction, &marker.task_id).await?;
     Ok(())
 }
 
@@ -454,6 +456,7 @@ async fn update_task_inner(
     if task.version != input.expected_version {
         return Err(DbError::VersionConflict);
     }
+    let previous_parent = task.parent_task_id.clone();
     let previous_error_annotation = task.error_annotation.clone();
     let previous_blocked_json = task.blocked_json.clone();
     let previous_failed_json = task.failed_json.clone();
@@ -541,6 +544,12 @@ async fn update_task_inner(
     let result = query.build().execute(&mut *transaction).await?;
     if result.rows_affected() == 0 {
         return Err(DbError::VersionConflict);
+    }
+    crate::task_condition::store_task_condition(&mut transaction, &task).await?;
+    if previous_parent != task.parent_task_id {
+        if let Some(parent) = previous_parent {
+            crate::task_condition::sync_condition(&mut transaction, &parent).await?;
+        }
     }
     if interruption_fields_changed(
         &previous_error_annotation,
@@ -778,6 +787,7 @@ async fn set_error_annotation_if_no_running_execution_inner(
     if result.rows_affected() == 0 {
         return Err(DbError::VersionConflict);
     }
+    crate::task_condition::store_task_condition(&mut transaction, &task).await?;
     if previous_error_annotation != task.error_annotation {
         append_task_interruption_event(db, &mut transaction, &task).await?;
     }
@@ -881,6 +891,7 @@ async fn update_recovery_metadata_inner(
     if result.rows_affected() == 0 {
         return Err(DbError::VersionConflict);
     }
+    crate::task_condition::store_task_condition(&mut transaction, &task).await?;
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,
@@ -1072,7 +1083,9 @@ impl TaskRepo for SqliteDb {
             .bind(&input.id)
             .fetch_one(&mut **transaction)
             .await?;
-        map_task(row)
+        let task = map_task(row)?;
+        crate::task_condition::store_task_condition(transaction, &task).await?;
+        Ok(task)
     }
 
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>> {
@@ -1617,6 +1630,7 @@ impl TaskRepo for SqliteDb {
 
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let condition_changed = crate::task_condition::metadata_changes_condition(&mutations);
         let mut changed = false;
         for mutation in mutations {
             changed |=
@@ -1629,22 +1643,26 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, condition_json = ?, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, updated_at = ?
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
-        .bind(crate::task_condition::condition_json(
+        .bind(condition_changed)
+        .bind(condition_changed.then(|| crate::task_condition::condition_json(
             crate::task_condition::LegacyView {
                 metadata_json: metadata_json.as_deref(),
                 metadata_is_object: true,
                 ..(&task).into()
             },
-        ))
+        )))
         .bind(updated_at)
         .bind(id)
         .execute(&mut *transaction)
         .await?;
         task.metadata_json = metadata_json;
+        if condition_changed {
+            crate::task_condition::store_task_condition(&mut transaction, &task).await?;
+        }
         task.updated_at = updated_at.to_owned();
         self.record_mutation_reply_in_tx(&mut transaction, &(&task, true))
             .await?;
@@ -1696,6 +1714,7 @@ impl TaskRepo for SqliteDb {
 
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let condition_changed = crate::task_condition::metadata_changes_condition(&mutations);
         let mut changed = false;
         for mutation in mutations {
             changed |=
@@ -1709,17 +1728,18 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, condition_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
-        .bind(crate::task_condition::condition_json(
+        .bind(condition_changed)
+        .bind(condition_changed.then(|| crate::task_condition::condition_json(
             crate::task_condition::LegacyView {
                 metadata_json: metadata_json.as_deref(),
                 metadata_is_object: true,
                 ..(&task).into()
             },
-        ))
+        )))
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -1729,6 +1749,9 @@ impl TaskRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         task.metadata_json = metadata_json;
+        if condition_changed {
+            crate::task_condition::store_task_condition(&mut transaction, &task).await?;
+        }
         task.version += 1;
         task.updated_at = updated_at.to_owned();
         self.record_mutation_reply_in_tx(&mut transaction, &task)
@@ -1792,6 +1815,7 @@ impl TaskRepo for SqliteDb {
 
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let condition_changed = crate::task_condition::metadata_changes_condition(&mutations);
         let mut changed = false;
         for mutation in mutations {
             changed |=
@@ -1805,17 +1829,18 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, condition_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
-        .bind(crate::task_condition::condition_json(
+        .bind(condition_changed)
+        .bind(condition_changed.then(|| crate::task_condition::condition_json(
             crate::task_condition::LegacyView {
                 metadata_json: metadata_json.as_deref(),
                 metadata_is_object: true,
                 ..(&task).into()
             },
-        ))
+        )))
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -1825,6 +1850,9 @@ impl TaskRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         task.metadata_json = metadata_json;
+        if condition_changed {
+            crate::task_condition::store_task_condition(&mut transaction, &task).await?;
+        }
         task.version += 1;
         task.updated_at = updated_at.to_owned();
         self.record_mutation_reply_in_tx(&mut transaction, &task)
@@ -1883,6 +1911,7 @@ impl TaskRepo for SqliteDb {
 
         let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref())
             .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let condition_changed = crate::task_condition::metadata_changes_condition(&mutations);
         let mut changed = false;
         for mutation in mutations {
             changed |=
@@ -1895,17 +1924,18 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, condition_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
-        .bind(crate::task_condition::condition_json(
+        .bind(condition_changed)
+        .bind(condition_changed.then(|| crate::task_condition::condition_json(
             crate::task_condition::LegacyView {
                 metadata_json: metadata_json.as_deref(),
                 metadata_is_object: true,
                 ..(&task).into()
             },
-        ))
+        )))
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -1915,6 +1945,9 @@ impl TaskRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         task.metadata_json = metadata_json;
+        if condition_changed {
+            crate::task_condition::store_task_condition(&mut transaction, &task).await?;
+        }
         task.version += 1;
         task.updated_at = updated_at.to_owned();
         transaction.commit().await?;
@@ -1966,10 +1999,11 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, condition_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(true)
         .bind(crate::task_condition::condition_json(
             crate::task_condition::LegacyView {
                 metadata_json: metadata_json.as_deref(),
@@ -1986,6 +2020,9 @@ impl TaskRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         task.metadata_json = metadata_json;
+        {
+            crate::task_condition::store_task_condition(&mut transaction, &task).await?;
+        }
         task.version += 1;
         task.updated_at = input.updated_at;
         self.record_mutation_reply_in_tx(&mut transaction, &task)
@@ -2043,10 +2080,11 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, condition_json = ?, updated_at = ?, version = version + 1
+             SET metadata_json = ?, condition_json = CASE WHEN ? THEN ? ELSE condition_json END, updated_at = ?, version = version + 1
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(true)
         .bind(crate::task_condition::condition_json(
             crate::task_condition::LegacyView {
                 metadata_json: metadata_json.as_deref(),
@@ -2066,6 +2104,7 @@ impl TaskRepo for SqliteDb {
             .fetch_one(&mut *transaction)
             .await?;
         let updated_task = map_task(updated_row)?;
+        crate::task_condition::store_task_condition(&mut transaction, &updated_task).await?;
         transaction.commit().await?;
         Ok(updated_task)
     }
@@ -2237,16 +2276,19 @@ impl TaskRepo for SqliteDb {
         task.deleted_at = Some(input.deleted_at);
         task.updated_at = input.updated_at;
         task.version += 1;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let result = sqlx::query("UPDATE task SET deleted_at = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
             .bind(task.deleted_at.as_deref())
             .bind(&task.updated_at)
             .bind(&task.id)
             .bind(input.expected_version)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+        crate::task_condition::store_task_condition(&mut transaction, &task).await?;
+        transaction.commit().await?;
         Ok(task)
     }
 
@@ -2741,6 +2783,7 @@ async fn update_task_status_inner(
         return Err(DbError::VersionConflict);
     }
 
+    crate::task_condition::store_task_condition(&mut transaction, &task).await?;
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,

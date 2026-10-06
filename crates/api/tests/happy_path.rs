@@ -267,8 +267,8 @@ PY"# }
     assert_task_conditions_match_legacy(&harness.state.db).await;
 }
 
-/// Refactor 3.1 stage 1: every writer the end-to-end flow went through kept
-/// the Task condition shadow equal to the mapping of its legacy fields.
+/// Every producer in the end-to-end flow agrees with its legacy fields and
+/// the durable entry, execution, ledger, operation and child witnesses.
 async fn assert_task_conditions_match_legacy(db: &db::SqliteDb) {
     assert_eq!(
         db.task_condition_violations()

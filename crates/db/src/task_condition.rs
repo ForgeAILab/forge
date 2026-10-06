@@ -33,7 +33,7 @@ pub enum TaskCondition {
         evidence: ConditionEvidence,
     },
     Deferred {
-        until: String,
+        until: Option<String>,
         reason: RetryCause,
         resume: ConditionContinuation,
         evidence: ConditionEvidence,
@@ -65,6 +65,12 @@ pub enum TaskCondition {
 /// This evidence is private and non-authoritative.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConditionEvidence {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<ParkReason>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witnesses: Vec<ConditionWitness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<MaterialBlocker>,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
     pub failed_json: Option<String>,
@@ -83,6 +89,8 @@ pub enum LegacyConditionField {
     FailedJson,
     EntryBarrierJson,
     MetadataJson,
+    /// Durable exclusion receipt rather than a Task column.
+    PendingRemoteCancel,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConditionSource {
@@ -181,6 +189,10 @@ pub enum ParkReason {
         cancelled: bool,
         source: ConditionSource,
     },
+    Children {
+        root_id: String,
+        remaining: Vec<String>,
+    },
     PlanSettlementWait {
         execution_id: Option<String>,
     },
@@ -201,12 +213,15 @@ pub enum RetryCause {
     WorkflowGuard,
     ReviewCiInfrastructure,
     PlanTransport,
+    Environment,
+    ChildrenReady,
     Legacy,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConditionContinuation {
     Reconcile,
+    AdvanceAggregateReview { child_ids: Vec<String> },
     Dispatch { target_state: String },
     RetryEntry { state: Option<String> },
     Integrate { state: Option<String> },
@@ -293,6 +308,9 @@ const OBJECT_METADATA_KEYS: [&str; 8] = [
 /// intentionally leave Task.version unchanged. No timestamp enters the map.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LegacyConditionInput {
+    /// Optional durable facts, captured in the writer's transaction. A bare
+    /// legacy input remains the import fallback.
+    pub facts: Option<ConditionFacts>,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
     pub failed_json: Option<String>,
@@ -311,6 +329,7 @@ impl From<&Task> for LegacyConditionInput {
             entry_barrier_json: task.entry_barrier_json.clone(),
             metadata_json: task.metadata_json.clone(),
             non_text: Vec::new(),
+            facts: None,
         }
     }
 }
@@ -349,6 +368,9 @@ impl LegacyConditionInput {
                 LegacyConditionField::FailedJson => &mut input.failed_json,
                 LegacyConditionField::EntryBarrierJson => &mut input.entry_barrier_json,
                 LegacyConditionField::MetadataJson => &mut input.metadata_json,
+                LegacyConditionField::PendingRemoteCancel => {
+                    unreachable!("durable sources are not legacy columns")
+                }
             } = value;
         }
         Ok(input)
@@ -610,7 +632,11 @@ fn interruption_reasons(
 /// table is read. `Running`/`Entering`/`Settled` need durable witnesses absent
 /// from these five inputs; the stage-one mapping never fabricates them.
 pub fn map_legacy_condition(input: &LegacyConditionInput) -> TaskCondition {
-    map_view(&input.view())
+    let legacy = map_view(&input.view());
+    match &input.facts {
+        Some(facts) => facts.apply(legacy),
+        None => legacy,
+    }
 }
 
 pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
@@ -788,6 +814,18 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
             ),
         ));
     }
+    if m.get("coordination_review_pending")
+        .is_some_and(|raw| !matches!(shape(raw), Shape::True | Shape::False | Shape::Null))
+    {
+        found.push((
+            80,
+            unknown(
+                &Field::MetadataJson,
+                Some("coordination_review_pending"),
+                Problem::InvalidShape,
+            ),
+        ));
+    }
     for (offset, key) in OBJECT_METADATA_KEYS.iter().enumerate() {
         if m.get(*key)
             .is_some_and(|raw| !matches!(shape(raw), Shape::Object | Shape::Null))
@@ -903,6 +941,17 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
     // One reason per cause (a reason minus where it was read from); the
     // earliest source wins. Then failed-process reasons, holds and exhausted
     // budgets lead, and the rest keep source order.
+    let mut observations = Vec::new();
+    found.retain(|(ordinal, reason)| {
+        // Legacy ignores malformed metadata / wrongly typed waits and barriers
+        // without a blocked status. Retain their diagnosis without parking.
+        let ignored = matches!(reason, ParkReason::UnknownCondition { .. })
+            && (*ordinal >= 60 || *ordinal == 40);
+        if ignored {
+            observations.push(reason.clone());
+        }
+        !ignored
+    });
     let mut reasons: Vec<(u16, u16, ParkReason)> = Vec::with_capacity(found.len());
     let mut causes: Vec<serde_json::Value> = Vec::new();
     found.sort_by_key(|(ordinal, _)| *ordinal);
@@ -930,6 +979,13 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
     let mut reasons = reasons.into_iter().map(|(_, _, reason)| reason);
 
     let evidence = ConditionEvidence {
+        observations,
+        witnesses: Vec::new(),
+        material: legacy_material_blocker(
+            view.error_annotation,
+            view.blocked_json,
+            view.failed_json,
+        ),
         error_annotation: view.error_annotation.map(bounded),
         blocked_json: view.blocked_json.map(bounded),
         failed_json: view.failed_json.map(bounded),
@@ -992,7 +1048,7 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
     let Some(primary) = reasons.next() else {
         return match &valid_deferred {
             Some((until, _)) => TaskCondition::Deferred {
-                until: until.clone(),
+                until: Some(until.clone()),
                 reason: if plan_wait.is_some() {
                     RetryCause::PlanTransport
                 } else if ci_infrastructure {
@@ -1007,6 +1063,17 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
                 resume: resume(),
                 evidence,
             },
+            None if deferred.as_ref().is_some_and(|d| {
+                text(d, "kind").is_some_and(|k| k.starts_with("environment_"))
+            }) =>
+            {
+                TaskCondition::Deferred {
+                    until: None,
+                    reason: RetryCause::Environment,
+                    resume: ConditionContinuation::Reconcile,
+                    evidence,
+                }
+            }
             None => TaskCondition::Clear { evidence },
         };
     };
@@ -1064,22 +1131,24 @@ pub(crate) fn condition_json(view: LegacyView<'_>) -> String {
     encode(&map_view(&view))
 }
 
-/// Unfenced shadow write shared by every seam: store `condition` unless the
+/// Version-fenced shadow write shared by every producer seam: store `condition` unless the
 /// row already holds exactly it. Touches only `condition_json`: no version,
 /// timestamp, revision, event or Attention change.
-async fn store_condition(
+async fn set_condition(
     connection: &mut SqliteConnection,
     task_id: &str,
     condition: &str,
+    expected_version: Option<i64>,
 ) -> Result<()> {
     debug_assert!(
         decode(condition).is_ok_and(|decoded| encode(&decoded) == condition),
         "Task condition must round-trip through its stored form"
     );
     let written =
-        sqlx::query("UPDATE task SET condition_json=?1 WHERE id=?2 AND condition_json IS NOT ?1")
+        sqlx::query("UPDATE task SET condition_json=?1 WHERE id=?2 AND (?3 IS NULL OR version=?3) AND condition_json IS NOT ?1")
             .bind(condition)
             .bind(task_id)
+            .bind(expected_version)
             .execute(connection)
             .await?
             .rows_affected();
@@ -1093,7 +1162,20 @@ pub(crate) async fn store_task_condition(
     connection: &mut SqliteConnection,
     task: &Task,
 ) -> Result<()> {
-    store_condition(connection, &task.id, &condition_json(task.into())).await
+    let input = LegacyConditionInput::from(task);
+    let facts = ConditionFacts::load(connection, &task.id).await?;
+    let condition = facts.apply(map_legacy_condition(&input));
+    set_condition(
+        connection,
+        &task.id,
+        &encode(&condition),
+        Some(facts.version),
+    )
+    .await?;
+    if let Some(parent) = &task.parent_task_id {
+        sync_condition(connection, parent).await?;
+    }
+    Ok(())
 }
 
 /// Dual-write seam for a writer whose SQL computed the legacy values (JSON
@@ -1101,6 +1183,18 @@ pub(crate) async fn store_task_condition(
 /// and write the shadow only if it changed. A stored condition is compared as
 /// text and never decoded, so an undecodable one is simply overwritten.
 pub(crate) async fn sync_condition(connection: &mut SqliteConnection, task_id: &str) -> Result<()> {
+    sync_condition_row(connection, task_id).await?;
+    let parent: Option<String> = sqlx::query_scalar("SELECT parent_task_id FROM task WHERE id=?")
+        .bind(task_id)
+        .fetch_optional(&mut *connection)
+        .await?
+        .flatten();
+    if let Some(parent) = parent {
+        sync_condition_row(connection, &parent).await?;
+    }
+    Ok(())
+}
+async fn sync_condition_row(connection: &mut SqliteConnection, task_id: &str) -> Result<()> {
     let row = sqlx::query(&format!("SELECT {LEGACY_SELECT} FROM task WHERE id=?"))
         .bind(task_id)
         .fetch_optional(&mut *connection)
@@ -1108,13 +1202,13 @@ pub(crate) async fn sync_condition(connection: &mut SqliteConnection, task_id: &
     let Some(row) = row else {
         return Ok(()); // Hard deletion has no shadow row.
     };
-    let condition = encode(&map_legacy_condition(&LegacyConditionInput::from_row(
-        &row,
-    )?));
+    let input = LegacyConditionInput::from_row(&row)?;
+    let facts = ConditionFacts::load(connection, task_id).await?;
+    let condition = encode(&facts.apply(map_legacy_condition(&input)));
     if row.try_get::<Vec<u8>, _>(5)? == condition.as_bytes() {
         return Ok(());
     }
-    store_condition(connection, task_id, &condition).await
+    set_condition(connection, task_id, &condition, Some(facts.version)).await
 }
 
 /// Whether a Task SQL statement can change a legacy condition column, so the
@@ -1128,6 +1222,10 @@ pub(crate) fn writes_legacy_condition(query: &str) -> bool {
         "failed_json",
         "entry_barrier_json",
         "metadata_json",
+        "status",
+        "status_epoch",
+        "parent_task_id",
+        "deleted_at",
     ]
     .iter()
     .any(|column| assignments.contains(column))
@@ -1138,6 +1236,7 @@ pub(crate) fn writes_legacy_condition(query: &str) -> bool {
 /// transaction; only `condition_json` changes, and only where it differs from
 /// the column default.
 pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
+    let full_schema: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('project','execution','task_step')").fetch_one(&mut *connection).await?;
     let mut after: Option<String> = None;
     loop {
         let rows = sqlx::query(&format!(
@@ -1151,10 +1250,19 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
         };
         after = Some(last.try_get(6)?);
         for row in &rows {
-            let condition = encode(&map_legacy_condition(&LegacyConditionInput::from_row(row)?));
+            let mapped = map_legacy_condition(&LegacyConditionInput::from_row(row)?);
+            let id: String = row.try_get(6)?;
+            let condition = if full_schema == 3 {
+                match ConditionFacts::load(connection, &id).await {
+                    Ok(facts) => encode(&facts.apply(mapped)),
+                    Err(_) => encode(&mapped),
+                }
+            } else {
+                encode(&mapped)
+            };
             if row.try_get::<Vec<u8>, _>(5)? != condition.as_bytes() {
                 let id: String = row.try_get(6)?;
-                store_condition(&mut *connection, &id, &condition).await?;
+                set_condition(&mut *connection, &id, &condition, None).await?;
             }
         }
     }
@@ -1199,17 +1307,21 @@ impl SqliteDb {
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(DbError::NotFound)?;
+        let mut bare = expected_legacy.clone();
+        bare.facts = None;
         if row.try_get::<i64, _>(6)? != expected_version
-            || LegacyConditionInput::from_row(&row)? != *expected_legacy
+            || LegacyConditionInput::from_row(&row)? != bare
         {
             return Err(DbError::VersionConflict);
         }
-        if map_legacy_condition(expected_legacy) != *condition {
+        let facts = ConditionFacts::load(tx, task_id).await?;
+        let mapped = map_legacy_condition(&bare);
+        if facts.apply(mapped) != *condition {
             return Err(DbError::Check(
                 "Task condition differs from legacy fields".into(),
             ));
         }
-        store_condition(tx, task_id, &encode(condition)).await
+        set_condition(tx, task_id, &encode(condition), Some(expected_version)).await
     }
 
     /// The dual-write seam for a direct SQL writer of a legacy condition
@@ -1227,12 +1339,15 @@ impl SqliteDb {
     /// Invariant usable by writer tests: the persisted shadow equals the
     /// mapping of the supplied Task snapshot.
     pub async fn check_task_condition_invariant(&self, task: &Task) -> Result<()> {
+        let mut connection = self.pool().begin().await?;
         let actual: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
             .bind(&task.id)
-            .fetch_optional(self.pool())
-            .await?
-            .ok_or(DbError::NotFound)?;
-        if actual != condition_json(task.into()) {
+            .fetch_one(&mut *connection)
+            .await?;
+        let facts = ConditionFacts::load(&mut connection, &task.id).await?;
+        let expected =
+            encode(&facts.apply(map_legacy_condition(&LegacyConditionInput::from(task))));
+        if actual != expected {
             return Err(DbError::Check(format!(
                 "Task condition invariant failed for {}",
                 task.id
@@ -1242,21 +1357,48 @@ impl SqliteDb {
     }
 
     /// Test-support sweep: ids of every Task whose shadow is not the mapping
-    /// of its legacy fields. Stage three owns the production sweep.
+    /// of its legacy fields and durable facts. Production uses bounded pages.
     pub async fn task_condition_violations(&self) -> Result<Vec<String>> {
+        let mut connection = self.pool().begin().await?;
         let rows = sqlx::query(&format!("SELECT {LEGACY_SELECT},id FROM task ORDER BY id"))
-            .fetch_all(self.pool())
+            .fetch_all(&mut *connection)
             .await?;
         let mut violations = Vec::new();
         for row in &rows {
-            let expected = encode(&map_legacy_condition(&LegacyConditionInput::from_row(row)?));
+            let id: String = row.try_get(6)?;
+            let facts = ConditionFacts::load(&mut connection, &id).await?;
+            let expected =
+                encode(&facts.apply(map_legacy_condition(&LegacyConditionInput::from_row(row)?)));
             if row.try_get::<Vec<u8>, _>(5)? != expected.as_bytes() {
-                violations.push(row.try_get(6)?);
+                violations.push(id);
             }
         }
         Ok(violations)
     }
 }
 
+mod checks;
+pub use checks::{ConditionCheckState, ConditionCheckStatus};
+mod facts;
+use facts::legacy_material_blocker;
+pub use facts::{material_blocker, ConditionFacts, ConditionWitness, MaterialBlocker};
+#[cfg(test)]
+mod stage2_tests;
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn metadata_changes_condition(mutations: &[crate::TaskMetadataMutation]) -> bool {
+    use crate::TaskMetadataMutation as Mutation;
+    mutations.iter().any(|mutation| match mutation {
+        Mutation::Budget(_) | Mutation::BudgetIfSpent { .. } => true,
+        Mutation::CompareAndMutate { mutations, .. } => metadata_changes_condition(mutations),
+        Mutation::Set { key, .. }
+        | Mutation::SetIf { key, .. }
+        | Mutation::SetIfAbsent { key, .. }
+        | Mutation::Increment { key, .. }
+        | Mutation::Remove { key }
+        | Mutation::RemoveIf { key, .. } => {
+            key == "queued_recovery" || EVIDENCE_METADATA_KEYS.contains(&key.as_str())
+        }
+    })
+}
