@@ -153,11 +153,6 @@ impl TaskDispatcher {
 
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
-        // First supervised tick is the non-blocking startup check. Later ticks
-        // reuse this loop, with a fixed bounded page and a 60s check cadence.
-        if let Err(error) = self.db.check_task_conditions_if_due().await {
-            tracing::warn!(%error,"Task condition invariant check deferred");
-        }
         let mut dispatched = 0;
         let environment_changed = match self.sync_due_environment_checks().await {
             Ok(changed) => changed,
@@ -226,6 +221,13 @@ impl TaskDispatcher {
             }
         }
 
+        // After the dispatch pass, never before it: the check reuses this
+        // supervised loop and must not delay a dispatch. It reads off the
+        // writer, takes it only for a row it repairs, and after a mapping
+        // change re-runs the backfill here in slices instead of at startup.
+        if let Err(error) = self.db.check_task_conditions_if_due().await {
+            tracing::warn!(%error, "Task condition invariant check deferred");
+        }
         tracing::info!(
             dispatched_tasks = dispatched,
             "task dispatcher check completed"

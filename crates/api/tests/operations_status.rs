@@ -32,6 +32,66 @@ async fn operations_status_empty_db_is_healthy() {
     assert!(!status.usage_index.fallback);
 }
 
+/// The dispatcher runs the Task condition check on its ticks. A healthy
+/// database must keep the Operations empty state: the check reports through
+/// `recent_errors` only when a completed pass had to repair a row.
+#[tokio::test]
+async fn operations_status_stays_empty_while_the_dispatcher_ticks() {
+    let workspace_root = common::TestDir::new("operations-status-ticking");
+    let harness = common::test_app(workspace_root.path(), "operations-status-ticking").await;
+    let admin_token = common::admin_jwt();
+    let dispatcher = services::TaskDispatcher::new(
+        harness.state.db.clone(),
+        harness.state.event_bus.clone(),
+        harness.state.task_service.clone(),
+    );
+    for _ in 0..3 {
+        dispatcher.check_once().await.unwrap();
+    }
+    let checks = harness.state.db.condition_check_status();
+    assert!(checks.ticks >= 1, "the check ran: {checks:?}");
+    assert!(checks.last_pass.is_some(), "a pass completed: {checks:?}");
+
+    let status: OperatorStatusResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/operations/status",
+        &admin_token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
+    assert!(status.active_executions.is_empty());
+    assert!(status.blocked_tasks.is_empty());
+    assert!(status.daemon_issues.is_empty());
+    assert!(status.workspace_cleanup.is_empty());
+    assert!(status.retry_pressure.is_empty());
+    assert!(
+        status.recent_errors.is_empty(),
+        "{:?}",
+        status.recent_errors
+    );
+    // The mapping revision marker is internal: the settings API never lists it.
+    let settings: Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/admin/settings",
+        &admin_token,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        !settings.to_string().contains(db::MAPPING_REVISION_KEY),
+        "{settings}"
+    );
+    assert_eq!(
+        db::SystemSettingRepo::get_setting(&*harness.state.db, db::MAPPING_REVISION_KEY)
+            .await
+            .unwrap(),
+        Some(db::MAPPING_REVISION.to_string())
+    );
+}
+
 #[tokio::test]
 async fn operations_status_reports_blocked_task_as_degraded() {
     let workspace_root = common::TestDir::new("operations-status-blocked");

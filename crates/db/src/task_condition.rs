@@ -261,6 +261,13 @@ pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
     "dispatch_failed",
 ];
 
+/// Revision of the mapping and of the stored encoding. A database whose
+/// recorded revision differs is recomputed once in the background, off the
+/// startup path. Bump it with every change to either.
+pub const MAPPING_REVISION: i64 = 2;
+/// Protected `system_setting` key recording the revision last backfilled.
+pub const MAPPING_REVISION_KEY: &str = "task_condition_mapping_revision";
+
 /// Per-value cap on evidence copied into a condition.
 pub const EVIDENCE_VALUE_LIMIT: usize = 4096;
 /// Cap on a typed string lifted out of legacy JSON (actor, state, id).
@@ -383,12 +390,11 @@ impl LegacyConditionInput {
             entry_barrier_json: self.entry_barrier_json.as_deref(),
             metadata_json: self.metadata_json.as_deref(),
             non_text: &self.non_text,
-            metadata_is_object: false,
         }
     }
 }
 
-/// Borrowed mapping input, so a writer holding a Task never clones its JSON.
+/// Borrowed mapping input.
 #[derive(Clone, Copy)]
 pub(crate) struct LegacyView<'a> {
     pub error_annotation: Option<&'a str>,
@@ -397,24 +403,7 @@ pub(crate) struct LegacyView<'a> {
     pub entry_barrier_json: Option<&'a str>,
     pub metadata_json: Option<&'a str>,
     pub non_text: &'a [LegacyConditionField],
-    /// The writer serialized `metadata_json` from a parsed metadata object
-    /// itself, so it is known to be a JSON object (or absent).
-    pub metadata_is_object: bool,
 }
-impl<'a> From<&'a Task> for LegacyView<'a> {
-    fn from(task: &'a Task) -> Self {
-        Self {
-            error_annotation: task.error_annotation.as_deref(),
-            blocked_json: task.blocked_json.as_deref(),
-            failed_json: task.failed_json.as_deref(),
-            entry_barrier_json: task.entry_barrier_json.as_deref(),
-            metadata_json: task.metadata_json.as_deref(),
-            non_text: &[],
-            metadata_is_object: false,
-        }
-    }
-}
-
 /// One level of a JSON object. Values stay raw text, so an unrelated large
 /// key is skipped by the scanner and never decoded or re-serialized, and
 /// large numbers, lone escapes and deep nesting survive untouched.
@@ -943,10 +932,12 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
     // budgets lead, and the rest keep source order.
     let mut observations = Vec::new();
     found.retain(|(ordinal, reason)| {
-        // Legacy ignores malformed metadata / wrongly typed waits and barriers
-        // without a blocked status. Retain their diagnosis without parking.
+        // Legacy reads a wrongly typed wait key (80+) as absent and never
+        // decodes a non-text annotation (40): diagnosis, not a park. An entry
+        // barrier of any shape and metadata that does not parse (60-71) stop
+        // today's dispatcher, so they park.
         let ignored = matches!(reason, ParkReason::UnknownCondition { .. })
-            && (*ordinal >= 60 || *ordinal == 40);
+            && (*ordinal >= 80 || *ordinal == 40);
         if ignored {
             observations.push(reason.clone());
         }
@@ -1103,34 +1094,6 @@ fn decode(raw: &str) -> Result<TaskCondition> {
 fn encode(condition: &TaskCondition) -> String {
     serde_json::to_string(condition).expect("Task condition serializes")
 }
-/// The stored form of a Task's mapped condition, for a writer that folds the
-/// shadow into its own legacy `UPDATE` (no extra statement).
-pub(crate) fn condition_json(view: LegacyView<'_>) -> String {
-    // The common Task write: no interruption column set and metadata that
-    // names no condition key. That maps to the empty Clear without parsing.
-    // A key name inside an unrelated value only costs the full mapping.
-    let no_condition_metadata = match view.metadata_json {
-        None => true,
-        Some(raw) => {
-            view.metadata_is_object && !EVIDENCE_METADATA_KEYS.iter().any(|key| raw.contains(key))
-        }
-    };
-    if no_condition_metadata
-        && view.non_text.is_empty()
-        && view.error_annotation.is_none()
-        && view.blocked_json.is_none()
-        && view.failed_json.is_none()
-        && view.entry_barrier_json.is_none()
-    {
-        static CLEAR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        let clear = CLEAR.get_or_init(|| encode(&map_legacy_condition(&Default::default())));
-        #[cfg(test)]
-        assert_eq!(*clear, encode(&map_view(&view)));
-        return clear.clone();
-    }
-    encode(&map_view(&view))
-}
-
 /// Version-fenced shadow write shared by every producer seam: store `condition` unless the
 /// row already holds exactly it. Touches only `condition_json`: no version,
 /// timestamp, revision, event or Attention change.
@@ -1156,85 +1119,17 @@ async fn set_condition(
     Ok(())
 }
 
-/// Dual-write seam for a writer that holds the Task as it now stands in the
-/// database (all five legacy fields current).
-pub(crate) async fn store_task_condition(
-    connection: &mut SqliteConnection,
-    task: &Task,
-) -> Result<()> {
-    let input = LegacyConditionInput::from(task);
-    let facts = ConditionFacts::load(connection, &task.id).await?;
-    let condition = facts.apply(map_legacy_condition(&input));
-    set_condition(
-        connection,
-        &task.id,
-        &encode(&condition),
-        Some(facts.version),
-    )
-    .await?;
-    if let Some(parent) = &task.parent_task_id {
-        sync_condition(connection, parent).await?;
-    }
-    Ok(())
-}
-
-/// Dual-write seam for a writer whose SQL computed the legacy values (JSON
-/// functions, CASE, bulk predicates): read the row's legacy facts, map them
-/// and write the shadow only if it changed. A stored condition is compared as
-/// text and never decoded, so an undecodable one is simply overwritten.
+/// The full recompute of one row: the mapping fallback, used by the backfill,
+/// the invariant check and a writer with no narrower claim. A stored condition
+/// is compared as text and never decoded, so an undecodable one is overwritten.
 pub(crate) async fn sync_condition(connection: &mut SqliteConnection, task_id: &str) -> Result<()> {
-    sync_condition_row(connection, task_id).await?;
-    let parent: Option<String> = sqlx::query_scalar("SELECT parent_task_id FROM task WHERE id=?")
-        .bind(task_id)
-        .fetch_optional(&mut *connection)
-        .await?
-        .flatten();
-    if let Some(parent) = parent {
-        sync_condition_row(connection, &parent).await?;
-    }
-    Ok(())
-}
-async fn sync_condition_row(connection: &mut SqliteConnection, task_id: &str) -> Result<()> {
-    let row = sqlx::query(&format!("SELECT {LEGACY_SELECT} FROM task WHERE id=?"))
-        .bind(task_id)
-        .fetch_optional(&mut *connection)
-        .await?;
-    let Some(row) = row else {
-        return Ok(()); // Hard deletion has no shadow row.
-    };
-    let input = LegacyConditionInput::from_row(&row)?;
-    let facts = ConditionFacts::load(connection, task_id).await?;
-    let condition = encode(&facts.apply(map_legacy_condition(&input)));
-    if row.try_get::<Vec<u8>, _>(5)? == condition.as_bytes() {
-        return Ok(());
-    }
-    set_condition(connection, task_id, &condition, Some(facts.version)).await
-}
-
-/// Whether a Task SQL statement can change a legacy condition column, so the
-/// queue adapters skip the seam for writes that cannot.
-pub(crate) fn writes_legacy_condition(query: &str) -> bool {
-    let lower = query.to_ascii_lowercase();
-    let assignments = lower.split(" where ").next().unwrap_or(&lower);
-    [
-        "error_annotation",
-        "blocked_json",
-        "failed_json",
-        "entry_barrier_json",
-        "metadata_json",
-        "status",
-        "status_epoch",
-        "parent_task_id",
-        "deleted_at",
-    ]
-    .iter()
-    .any(|column| assignments.contains(column))
+    produce(connection, task_id, ConditionChange::Full).await
 }
 
 /// Migration post-step for `V202610060030__task_condition`: map every existing
-/// Task with the same function the writers use. Runs inside the migration's
-/// transaction; only `condition_json` changes, and only where it differs from
-/// the column default.
+/// Task with the same function the writers use, and record the mapping
+/// revision it wrote. Runs inside the migration's transaction; on a Task only
+/// `condition_json` changes, and only where it differs from the column default.
 pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
     let full_schema: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('project','execution','task_step')").fetch_one(&mut *connection).await?;
     let mut after: Option<String> = None;
@@ -1246,7 +1141,7 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
         .fetch_all(&mut *connection)
         .await?;
         let Some(last) = rows.last() else {
-            return Ok(());
+            break;
         };
         after = Some(last.try_get(6)?);
         for row in &rows {
@@ -1266,6 +1161,22 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
             }
         }
     }
+    // Every row now holds this revision's encoding: record it, so the first
+    // dispatcher tick after a clean upgrade does not walk the table again.
+    let settings: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='system_setting'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if full_schema == 3 && settings == 1 {
+        sqlx::query("INSERT INTO system_setting(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at")
+            .bind(MAPPING_REVISION_KEY)
+            .bind(MAPPING_REVISION.to_string())
+            .bind(crate::now_rfc3339())
+            .execute(&mut *connection)
+            .await?;
+    }
+    Ok(())
 }
 
 impl SqliteDb {
@@ -1282,8 +1193,11 @@ impl SqliteDb {
     /// Strict single-writer seam for a producer that states a condition. It
     /// requires the Task's claimed step and its live lease, never rebinds a
     /// stale version, and compares all five source values (metadata changes
-    /// without advancing Task.version). In stage one the legacy fields are
-    /// authoritative, so a condition other than their mapping is refused.
+    /// without advancing Task.version). The legacy fields are authoritative,
+    /// so a condition is refused unless it is their mapping under the
+    /// witnesses it states itself. Those witnesses are the producer's claim:
+    /// they are not re-read here (the invariant check does that), so stating a
+    /// condition costs no fact query.
     /// The shadow write bumps no version and emits no event or Attention.
     pub async fn set_condition(
         &self,
@@ -1301,7 +1215,7 @@ impl SqliteDb {
         self.fence_task_lease_in_tx(tx, task_id, "set_condition")
             .await?;
         let row = sqlx::query(&format!(
-            "SELECT {LEGACY_SELECT},version FROM task WHERE id=?"
+            "SELECT {LEGACY_SELECT},version,status,status_epoch FROM task WHERE id=?"
         ))
         .bind(task_id)
         .fetch_optional(&mut **tx)
@@ -1314,9 +1228,16 @@ impl SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        let facts = ConditionFacts::load(tx, task_id).await?;
-        let mapped = map_legacy_condition(&bare);
-        if facts.apply(mapped) != *condition {
+        let stated = ConditionFacts::recover(condition)
+            .filter(|facts| facts.task_id == task_id)
+            .map(|mut facts| {
+                facts.version = expected_version;
+                facts.state = row.get(7);
+                facts.children_pending = facts::children_pending(bare.metadata_json.as_deref());
+                facts
+            })
+            .filter(|facts| facts.epoch == row.get::<i64, _>(8));
+        if stated.is_none_or(|facts| facts.apply(map_legacy_condition(&bare)) != *condition) {
             return Err(DbError::Check(
                 "Task condition differs from legacy fields".into(),
             ));
@@ -1324,10 +1245,77 @@ impl SqliteDb {
         set_condition(tx, task_id, &encode(condition), Some(expected_version)).await
     }
 
-    /// The dual-write seam for a direct SQL writer of a legacy condition
-    /// column: call it in the same transaction, after the legacy write. It is
-    /// not lease-fenced (Task creation, bulk clears and admission writes hold
-    /// no step) and adds no rejection to the legacy write.
+    /// The producer seam for a writer outside this crate that has fenced its
+    /// step lease in this transaction (the engine's status CAS, the worker's
+    /// step settlement): call it after the write, naming what the write
+    /// changed. Under the Task's step the condition is stated through
+    /// [`Self::set_condition`]; the same writer running with no step (an
+    /// owner command applied inline), or after settling its step in this
+    /// transaction, uses the version fence alone. A condition the strict
+    /// seam refuses is logged and not written. It never refuses the legacy
+    /// write it follows.
+    /// It adds no version, timestamp, event or wake to the legacy write.
+    pub async fn state_condition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+        change: ConditionChange,
+    ) -> Result<()> {
+        let Some(produced) = producers::derive(tx, task_id, change, None).await? else {
+            return Ok(());
+        };
+        if produced.changed {
+            let stated = if crate::task_writer::owns_task(task_id) {
+                self.set_condition(
+                    tx,
+                    task_id,
+                    produced.version,
+                    &produced.legacy,
+                    &produced.condition,
+                )
+                .await
+            } else {
+                Err(DbError::VersionConflict)
+            };
+            match stated {
+                Ok(()) => {}
+                // No step, or a step this transaction has already settled:
+                // the legacy write stands on its own fences and the
+                // condition must still describe it, under the version fence.
+                Err(DbError::VersionConflict) => {
+                    set_condition(tx, task_id, &produced.encoded, Some(produced.version)).await?
+                }
+                // The strict seam refused the condition itself. Nothing is
+                // written: the legacy write is authoritative and proceeds,
+                // and the invariant check restates the row.
+                Err(DbError::Check(reason)) => {
+                    tracing::error!(task_id, ?change, %reason, "Task condition refused by set_condition; left to the invariant check")
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if let Some(parent) = &produced.parent {
+            produce_children(tx, parent).await?;
+        }
+        Ok(())
+    }
+
+    /// The producer seam for a direct SQL writer that holds no step lease
+    /// (bulk clears, admission and reconnect writes): same transaction, after
+    /// the write, naming what the write changed. It adds no rejection to the
+    /// legacy write beyond its own read.
+    pub async fn produce_condition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+        change: ConditionChange,
+    ) -> Result<()> {
+        produce(tx, task_id, change).await
+    }
+
+    /// The mapping fallback for one row: recompute every fact family and
+    /// store the result. Tests and repair paths use it; a writer that knows
+    /// what it changed uses [`Self::produce_condition_in_tx`].
     pub async fn sync_condition_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -1378,10 +1366,20 @@ impl SqliteDb {
 }
 
 mod checks;
-pub use checks::{ConditionCheckState, ConditionCheckStatus};
+pub use checks::{
+    ConditionCheckPass, ConditionCheckState, ConditionCheckStatus, CONDITION_CHECK_PAGE,
+};
 mod facts;
+mod producers;
 use facts::legacy_material_blocker;
 pub use facts::{material_blocker, ConditionFacts, ConditionWitness, MaterialBlocker};
+pub use producers::ConditionChange;
+pub(crate) use producers::{
+    execution_joined_workspace, metadata_condition, produce, produce_best_effort, produce_children,
+    sql_change, workflow_changed,
+};
+#[cfg(test)]
+mod producer_tests;
 #[cfg(test)]
 mod stage2_tests;
 #[cfg(test)]

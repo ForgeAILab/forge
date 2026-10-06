@@ -3285,6 +3285,14 @@ IDs are stable and opaque; the stored worker/item key identifies the source for
 admin replay and dismiss actions. Resolved rows remain available in the audit list.
 Relay read errors or a stopped/restarting enabled relay raise attention.
 
+`recent_errors` carries a `task_condition_invariant` entry (`entity_id:
+"task-dispatcher"`, `severity: "attention"`) only while the last completed
+pass of the internal Task condition check had to repair at least one Task. Its
+`error` reads "The last Task condition check repaired N of M Tasks" and
+`occurred_at` is when that pass completed. The next clean pass removes it. A
+healthy server never shows this entry; the check's counts go to the server
+log.
+
 A stalled consumer raises `overall_severity` to at least `attention` and appears
 in the existing `recent_errors` operator issue list with `entity_type:
 "event_consumer"`, its consumer name as `entity_id`, and `severity: "attention"`.

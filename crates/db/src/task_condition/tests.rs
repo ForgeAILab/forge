@@ -1,3 +1,4 @@
+use super::producer_tests::{enqueue, pending_cancel, set_parent, workspace};
 use super::*;
 use crate::{
     CreateProject, CreateTask, EnqueueTaskStep, ProjectRepo, TaskMetadataMutation, TaskRepo,
@@ -244,7 +245,7 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
                 Some(json!({"state":"review","status":"running"})),
                 None,
             ),
-            "clear",
+            "parked",
             Some("unknown_condition"),
         ),
         (
@@ -825,6 +826,11 @@ async fn each_writer_family_keeps_condition_invariant_and_legacy_observability()
         "removed_machine_cancel_clear",
         "removed_machine_owner_wait_clear",
         "removed_machine_annotation",
+        // Writers of a mapped fact that is not a Task column.
+        "preempt_supersede",
+        "subtask_reorder",
+        "workspace_delete",
+        "workflow_edit",
     ] {
         let t = task(&db, family).await;
         db.check_task_condition_invariant(&t).await.unwrap();
@@ -862,12 +868,42 @@ async fn each_writer_family_keeps_condition_invariant_and_legacy_observability()
                 "removed_machine_cancel_clear"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=NULL,metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.deferred_dispatch','$.dispatch_disposition') ELSE metadata_json END,version=version+1 WHERE id=?").bind(&t.id).identity_fenced().execute(db.pool()).await.unwrap();},
                 "removed_machine_owner_wait_clear"=>{TaskRepo::mutate_metadata(&db,&t.id,None,vec![TaskMetadataMutation::Set{key:"owner_wait".into(),value:json!({"daemon_id":"removed"})}],&crate::now_rfc3339()).await.unwrap();crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET metadata_json=json_remove(metadata_json,'$.owner_wait','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.owner_wait.daemon_id')=?").bind(&t.id).bind("removed").identity_fenced().execute(db.pool()).await.unwrap();},
                 "removed_machine_annotation"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=?,version=version+1 WHERE id=?").bind(json!({"type":"recovery_required","blocking_reason":"machine_removed","blocked_by":"removed"}).to_string()).bind(&t.id).identity_fenced().execute(db.pool()).await.unwrap();},
+                // An owner command preempts and supersedes the pending entry hooks step.
+                "preempt_supersede"=>{
+                    let hook=enqueue(&db,&t.id,"hooks","todo","{}").await;
+                    enqueue(&db,&t.id,"command","todo",&json!({"preempt":true}).to_string()).await;
+                    let status:String=sqlx::query_scalar("SELECT status FROM task_step WHERE id=?").bind(&hook).fetch_one(db.pool()).await.unwrap();assert_eq!(status,"superseded");
+                },
+                // Child witnesses follow the sequence order.
+                "subtask_reorder"=>{
+                    let (a,b)=(task(&db,"reorder-a").await,task(&db,"reorder-b").await);
+                    set_parent(&db,&t.id,&[&a.id,&b.id]).await;
+                    TaskRepo::mutate_metadata(&db,&t.id,None,vec![TaskMetadataMutation::Set{key:"coordination_review_pending".into(),value:json!(true)}],&crate::now_rfc3339()).await.unwrap();
+                    TaskRepo::reorder_subtasks(&db,&t.id,&[b.id.clone(),a.id.clone()],&crate::now_rfc3339()).await.unwrap();
+                    assert!(matches!(db.task_condition(&t.id).await.unwrap(),TaskCondition::Parked{primary:ParkReason::Children{remaining,..},..} if remaining==vec![b.id.clone(),a.id.clone()]));
+                },
+                // A cancellation fences its Task through the workspace row.
+                "workspace_delete"=>{
+                    let _directory=workspace(&db,"family-workspace",&t.id).await;
+                    pending_cancel(&db,"family-op",&step_id,"family-workspace").await;
+                    assert!(db.task_condition(&t.id).await.unwrap().is_blocked());
+                    sqlx::query("UPDATE task_step SET status='superseded',completed_at=? WHERE id=?").bind(crate::now_rfc3339()).bind(&step_id).execute(db.pool()).await.unwrap();
+                    crate::WorkspaceRepo::delete(&db,"family-workspace").await.unwrap();
+                },
+                // Terminal classification reads the Project workflow.
+                "workflow_edit"=>{
+                    TaskRepo::update_status(&db,UpdateTaskStatus{id:t.id.clone(),expected_version:t.version,status:"released".into(),assignee_id:None,error_annotation:None,blocked_json:None,failed_json:None,updated_at:crate::now_rfc3339()}).await.unwrap();
+                    assert!(matches!(db.task_condition(&t.id).await.unwrap(),TaskCondition::Clear{..}));
+                    let p=ProjectRepo::get_by_id(&db,"p").await.unwrap().unwrap();
+                    ProjectRepo::update_workflow(&db,"p",&json!({"states":[{"name":"todo","kind":"initial"},{"name":"review","kind":"gate"},{"name":"released","kind":"terminal"}]}).to_string(),None,p.version,&crate::now_rfc3339()).await.unwrap();
+                    assert!(matches!(db.task_condition(&t.id).await.unwrap(),TaskCondition::Settled{..}));
+                },
                 _=>unreachable!(),
             }
             let current=TaskRepo::get_by_id(&db,&t.id,true).await.unwrap().unwrap();
             db.check_task_condition_invariant(&current).await.unwrap_or_else(|e|panic!("{family}: {e}"));
             let condition=db.task_condition(&t.id).await.unwrap();
-            assert_eq!(condition.is_blocked(),!matches!(family,"wake"|"wake_project"|"removed_machine_cancel_clear"|"removed_machine_owner_wait_clear"),"{family}: {condition:?}");
+            assert_eq!(condition.is_blocked(),!matches!(family,"wake"|"wake_project"|"removed_machine_cancel_clear"|"removed_machine_owner_wait_clear"|"preempt_supersede"|"workspace_delete"|"workflow_edit"),"{family}: {condition:?}");
             // A shadow-only sync must leave legacy versions/revisions/events alone.
             let before:(i64,i64,i64,i64)=sqlx::query_as("SELECT t.version,p.board_revision,p.list_revision,(SELECT COUNT(*) FROM domain_event) FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=?").bind(&t.id).fetch_one(db.pool()).await.unwrap();
             let mut tx=crate::begin_immediate(db.pool()).await.unwrap();db.sync_condition_in_tx(&mut tx,&t.id).await.unwrap();tx.commit().await.unwrap();
@@ -1594,13 +1630,10 @@ async fn hostile_legacy_values_survive_backfill_and_writer_seam() {
         .unwrap();
         db.sync_condition_in_tx(&mut tx, "tmpl").await.unwrap();
         tx.commit().await.unwrap();
-        let condition = db.task_condition("tmpl").await.unwrap();
-        if column == "metadata_json" {
-            assert!(!condition.is_blocked(), "ignored malformed metadata");
-            assert!(!condition.evidence().observations.is_empty());
-        } else {
-            assert!(condition.is_blocked(), "{column}");
-        }
+        assert!(
+            db.task_condition("tmpl").await.unwrap().is_blocked(),
+            "{column}"
+        );
         sqlx::query(&format!("UPDATE task SET {column}=NULL WHERE id='tmpl'"))
             .execute(db.pool())
             .await
@@ -1794,13 +1827,13 @@ fn real_producer_shapes_map_to_what_legacy_blocks_on() {
                 Some(json!({"state":"review","status":"passed"})),
                 None,
             ),
-            "clear",
+            "parked",
             Some("unknown_condition"),
         ),
         (
             "barrier no status",
             input(None, None, None, Some(json!({"state":"review"})), None),
-            "clear",
+            "parked",
             Some("unknown_condition"),
         ),
         (
@@ -1812,7 +1845,7 @@ fn real_producer_shapes_map_to_what_legacy_blocks_on() {
                 Some(json!({"state":"review","status":"running"})),
                 None,
             ),
-            "clear",
+            "parked",
             Some("unknown_condition"),
         ),
         (
@@ -2027,18 +2060,26 @@ async fn evidence_is_bounded_and_large_unrelated_fields_are_not_copied() {
 /// condition column.
 #[test]
 fn seam_is_skipped_for_sql_that_cannot_change_a_condition() {
-    assert!(writes_legacy_condition(
-        "UPDATE task SET status='done',version=version+1 WHERE id=? AND blocked_json IS NULL"
-    ));
-    assert!(!writes_legacy_condition(
-        "UPDATE task SET title=? WHERE id=? AND blocked_json IS NULL"
-    ));
-    assert!(writes_legacy_condition(
-        "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait') WHERE id = ?"
-    ));
-    assert!(writes_legacy_condition(
-        "UPDATE task\n SET error_annotation=NULL\n WHERE id=?"
-    ));
+    assert_eq!(
+        sql_change(
+            "UPDATE task SET status='done',version=version+1 WHERE id=? AND blocked_json IS NULL"
+        ),
+        Some(ConditionChange::Entry)
+    );
+    assert_eq!(
+        sql_change("UPDATE task SET title=? WHERE id=? AND blocked_json IS NULL"),
+        None
+    );
+    assert_eq!(
+        sql_change(
+            "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait') WHERE id = ?"
+        ),
+        Some(ConditionChange::Legacy)
+    );
+    assert_eq!(
+        sql_change("UPDATE task\n SET error_annotation=NULL\n WHERE id=?"),
+        Some(ConditionChange::Legacy)
+    );
 }
 
 /// Port of `audit_backfill_timing_5k` (measurement, not a correctness check).

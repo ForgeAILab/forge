@@ -574,8 +574,13 @@ impl ExecutionRepo for SqliteDb {
             .map(map_execution)
             .transpose()?
             .ok_or(DbError::NotFound)?;
-        if changes_binding {
-            crate::task_condition::sync_condition(&mut transaction, &updated.task_id).await?;
+        if changes_binding && updated.role != "interactive" {
+            crate::task_condition::produce(
+                &mut transaction,
+                &updated.task_id,
+                crate::ConditionChange::Execution,
+            )
+            .await?;
         }
         transaction.commit().await?;
         Ok(updated)
@@ -1149,7 +1154,15 @@ impl ExecutionRepo for SqliteDb {
             created_at: input.updated_at,
         };
         let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
-        crate::task_condition::sync_condition(&mut transaction, &updated.task_id).await?;
+        // The terminal result is authoritative; the shadow never refuses it.
+        if updated.role != "interactive" {
+            crate::task_condition::produce_best_effort(
+                &mut transaction,
+                &updated.task_id,
+                crate::ConditionChange::Execution,
+            )
+            .await;
+        }
         transaction.commit().await?;
         Ok(ExecutionTerminalOutcome::Committed {
             execution: updated,
@@ -1832,7 +1845,15 @@ impl ExecutionRepo for SqliteDb {
                 .bind(&input.terminal_report_id).bind(&terminal.updated_at)
                 .execute(&mut *transaction).await?;
         }
-        crate::task_condition::sync_condition(&mut transaction, &updated.task_id).await?;
+        // The terminal result is authoritative; the shadow never refuses it.
+        if updated.role != "interactive" {
+            crate::task_condition::produce_best_effort(
+                &mut transaction,
+                &updated.task_id,
+                crate::ConditionChange::Execution,
+            )
+            .await;
+        }
         transaction.commit().await?;
         Ok(ExecutionTerminalOutcome::Committed {
             execution: updated,

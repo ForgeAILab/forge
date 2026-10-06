@@ -921,6 +921,40 @@ pub struct AttentionProjection {
     pub source_sequence: Option<i64>,
 }
 
+/// Remove, at any depth, what identifies one delivery of a blocker rather
+/// than the blocker: event identity, Task version, bookkeeping times and the
+/// execution that happened to report it. The incident digest and the Task
+/// condition's material blocker share this one definition.
+pub fn strip_attention_delivery_metadata(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for key in [
+                "source_event_id",
+                "source_event_type",
+                "source_sequence",
+                "task_version",
+                "created_at",
+                "updated_at",
+                "detected_at",
+                "last_checked_at",
+                "next_check_at",
+                "execution_id",
+            ] {
+                object.remove(key);
+            }
+            for child in object.values_mut() {
+                strip_attention_delivery_metadata(child);
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for child in array {
+                strip_attention_delivery_metadata(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Canonical, redaction-safe digest used to bind a wake decision to the exact
 /// Attention materialization it observed.  Keep this in `db` so the atomic
 /// admission transaction can validate a snapshot without depending on the
@@ -933,36 +967,7 @@ pub fn canonical_attention_incident_digest(attention: &AttentionProjection) -> S
         .collect::<String>();
     let canonical_details = serde_json::from_str::<serde_json::Value>(&bounded_details)
         .map(|mut value| {
-            fn strip_delivery_metadata(value: &mut serde_json::Value) {
-                match value {
-                    serde_json::Value::Object(object) => {
-                        for key in [
-                            "source_event_id",
-                            "source_event_type",
-                            "source_sequence",
-                            "task_version",
-                            "created_at",
-                            "updated_at",
-                            "detected_at",
-                            "last_checked_at",
-                            "next_check_at",
-                            "execution_id",
-                        ] {
-                            object.remove(key);
-                        }
-                        for child in object.values_mut() {
-                            strip_delivery_metadata(child);
-                        }
-                    }
-                    serde_json::Value::Array(array) => {
-                        for child in array {
-                            strip_delivery_metadata(child);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            strip_delivery_metadata(&mut value);
+            strip_attention_delivery_metadata(&mut value);
             // A renamed Task or a changed action offer is not a new blocker.
             if let Some(task) = value.get_mut("task").and_then(|v| v.as_object_mut()) {
                 task.remove("task_title");

@@ -165,12 +165,23 @@ impl WorkspaceRepo for SqliteDb {
                 reason: "a remote workspace operation is still running".into(),
             });
         }
+        // A cancellation fences Tasks through its workspace row. Read who it
+        // fences before the row goes, and restate their conditions after.
+        let fenced = crate::remote_cancel::fenced_tasks(&mut transaction, id).await?;
         let result = sqlx::query("DELETE FROM workspace WHERE id = ?")
             .bind(id)
             .execute(&mut *transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
+        }
+        for task_id in &fenced {
+            crate::task_condition::produce(
+                &mut transaction,
+                task_id,
+                crate::ConditionChange::Operations,
+            )
+            .await?;
         }
         transaction.commit().await?;
         Ok(())

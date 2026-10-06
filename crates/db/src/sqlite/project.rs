@@ -575,11 +575,12 @@ impl ProjectRepo for SqliteDb {
         updated_at: &str,
     ) -> Result<()> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let current_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
+        let (current_version, previous_workflow): (i64, String) =
+            sqlx::query_as("SELECT version, workflow_definition FROM project WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(DbError::NotFound)?;
         if current_version != expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -600,6 +601,7 @@ impl ProjectRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
         wake_dispatch_for_project_in_tx(self, &mut transaction, id, updated_at).await?;
+        crate::task_condition::workflow_changed(&mut transaction, id, &previous_workflow).await?;
         transaction.commit().await?;
         Ok(())
     }

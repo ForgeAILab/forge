@@ -155,6 +155,7 @@ impl TaskStepRepo for SqliteDb {
             .bind(&i.id).bind(&i.task_id).bind(&i.kind).bind(&i.payload_json).bind(&i.causation_step_id).bind(&i.causation_key)
             .bind(&i.chain_id).bind(i.chain_position).bind(&i.expected_status).bind(i.expected_version)
             .bind(i.expected_epoch).bind(&i.task_id).bind(&i.lane).bind(&i.available_at).bind(&now).bind(&now).bind(&i.task_id).execute(&mut **tx).await?;
+        let mut superseded = 0;
         if serde_json::from_str::<serde_json::Value>(&i.payload_json)
             .ok()
             .is_some_and(|p| p["preempt"] == true)
@@ -163,11 +164,13 @@ impl TaskStepRepo for SqliteDb {
                 .bind(&i.id)
                 .execute(&mut **tx)
                 .await?;
-            sqlx::query("UPDATE task_step SET status='superseded',last_error='preempted by owner command',completed_at=?,updated_at=? WHERE task_id=? AND seq<(SELECT seq FROM task_step WHERE id=?) AND priority=0 AND integration_started_at IS NULL AND entry_fenced=1 AND status='pending' AND kind IN ('hooks','cascade','command','mutation')")
-                .bind(&now).bind(&now).bind(&i.task_id).bind(&i.id).execute(&mut **tx).await?;
+            superseded = sqlx::query("UPDATE task_step SET status='superseded',last_error='preempted by owner command',completed_at=?,updated_at=? WHERE task_id=? AND seq<(SELECT seq FROM task_step WHERE id=?) AND priority=0 AND integration_started_at IS NULL AND entry_fenced=1 AND status='pending' AND kind IN ('hooks','cascade','command','mutation')")
+                .bind(&now).bind(&now).bind(&i.task_id).bind(&i.id).execute(&mut **tx).await?.rows_affected();
         }
-        if i.kind == "hooks" {
-            crate::task_condition::sync_condition(tx, &i.task_id).await?;
+        // An enqueued hooks step may become the entry's owner; a preempting
+        // command may have superseded the one that was.
+        if i.kind == "hooks" || superseded != 0 {
+            crate::task_condition::produce(tx, &i.task_id, crate::ConditionChange::Hooks).await?;
         }
         Ok(
             sqlx::query_scalar("SELECT id FROM task_step WHERE task_id = ? AND causation_key = ?")
@@ -337,7 +340,16 @@ impl TaskStepRepo for SqliteDb {
         if n != 1 {
             return Err(DbError::VersionConflict);
         }
-        crate::task_condition::sync_condition(tx, &s.task_id).await?;
+        // Only a hooks step is witnessed. Its settlement is authoritative;
+        // the shadow never refuses it.
+        if s.kind == "hooks" {
+            crate::task_condition::produce_best_effort(
+                tx,
+                &s.task_id,
+                crate::ConditionChange::Hooks,
+            )
+            .await;
+        }
         Ok(())
     }
     async fn release_step(&self, id: &str, owner: &str) -> Result<()> {

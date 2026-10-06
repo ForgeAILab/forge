@@ -3,116 +3,134 @@ use super::*;
 use crate::{CreateDomainEvent, TaskRepo, TaskStepRepo};
 use serde_json::{json, Value};
 
+/// `material_blocker(condition)` is the interruption the
+/// `task.interruption_changed` event states, minus what the incident digest
+/// strips. The digest half, against incidents the Attention service really
+/// materializes, is
+/// `services::attention_service::tests::material_blocker_keeps_the_real_incident_digest`.
 #[tokio::test]
-async fn material_blocker_matches_existing_event_and_incident_digest() {
+async fn material_blocker_matches_the_interruption_event() {
     let db = db().await;
     let mut t = task(&db, "material").await;
+    for (a, b, f) in material_shapes() {
+        t.error_annotation = a.clone();
+        t.blocked_json = b.clone();
+        t.failed_json = f.clone();
+        let old: Value =
+            serde_json::from_str(&CreateDomainEvent::task_interruption_changed(&t).payload_json)
+                .unwrap();
+        let condition = map_legacy_condition(&LegacyConditionInput::from(&t));
+        let projected = material_blocker(&condition);
+        assert_eq!(
+            json!(projected.requires_intervention),
+            old["requires_intervention"],
+            "{a:?} {b:?} {f:?}"
+        );
+        let mut interruption = old["interruption"].clone();
+        crate::strip_attention_delivery_metadata(&mut interruption);
+        assert_eq!(json!(projected.interruption), interruption);
+        // The reporting execution is delivery metadata, not blocker identity.
+        assert!(!json!(projected.interruption)
+            .to_string()
+            .contains("execution_id"));
+    }
+}
+/// Every blocker shape today's writers produce, plus malformed and
+/// non-object values in each column.
+fn material_shapes() -> Vec<(Option<String>, Option<String>, Option<String>)> {
+    let text = |value: Value| Some(value.to_string());
     let mut shapes = vec![
         (
-            Some(json!({"type":"manual_stop","blocking_reason":"held"})),
+            text(json!({"type":"manual_stop","blocking_reason":"held"})),
             None,
             None,
         ),
         (
-            Some(
+            text(
                 json!({"type":"review_needs_owner","blocking_reason":"finding","blocked_execution_id":"e"}),
             ),
-            Some(json!({"kind":"review_needs_owner","reason":"owner","execution_id":"e"})),
+            text(json!({"kind":"review_needs_owner","reason":"owner","execution_id":"e"})),
             None,
         ),
         (
-            Some(json!({"type":"merge_conflict","message":"advisory"})),
-            None,
-            None,
-        ),
-        (
-            Some(json!({"type":"retry_exhausted","message":"spent"})),
-            Some(json!({"kind":"retry_exhausted","reason":"spent"})),
-            None,
-        ),
-        (
-            None,
-            None,
-            Some(json!({"kind":"executor_failed","reason":"failure"})),
-        ),
-        (
-            Some(json!({"type":"unknown","message":"retained"})),
+            text(json!({"type":"merge_conflict","message":"advisory"})),
             None,
             None,
         ),
         (
-            None,
-            Some(json!({"kind":"manual_stop","reason":"manual"})),
+            text(json!({"type":"retry_exhausted","message":"spent"})),
+            text(json!({"kind":"retry_exhausted","reason":"spent"})),
             None,
         ),
         (
-            Some(json!({"type":"workspace_error","message":"m".repeat(10000)})),
             None,
+            None,
+            text(json!({"kind":"executor_failed","reason":"failure"})),
+        ),
+        (
+            text(json!({"type":"unknown","message":"retained"})),
+            None,
+            None,
+        ),
+        (
+            None,
+            text(json!({"kind":"manual_stop","reason":"manual"})),
+            None,
+        ),
+        (
+            text(json!({"type":"workspace_error","message":"m".repeat(10000)})),
+            None,
+            None,
+        ),
+        // Malformed and non-object values: the event decodes them as `{}`.
+        (Some("not json".into()), None, None),
+        (Some("[1,2]".into()), None, None),
+        (Some("\"text\"".into()), None, None),
+        (None, Some("not json".into()), None),
+        (None, Some("42".into()), None),
+        (None, None, Some("{".into())),
+        (None, None, Some("[]".into())),
+        (
+            Some("not json".into()),
+            text(json!({"kind":"workspace_error","reason":"real","execution_id":"e"})),
             None,
         ),
     ];
     for kind in LEGACY_BLOCKING_ANNOTATION_KINDS {
         let annotation = json!({"type":kind,"message":"detail","blocking_reason":"reason","blocked_by":"owner","blocked_execution_id":"execution"});
         let interruption = json!({"kind":kind,"reason":"reason","execution_id":"execution","details":{"key":"detail"}});
-        shapes.push((Some(annotation.clone()), None, None));
-        shapes.push((Some(annotation.clone()), Some(interruption.clone()), None));
+        shapes.push((text(annotation.clone()), None, None));
+        shapes.push((text(annotation.clone()), text(interruption.clone()), None));
         shapes.push((
-            Some(annotation),
-            Some(interruption.clone()),
-            Some(interruption),
+            text(annotation),
+            text(interruption.clone()),
+            text(interruption),
         ));
     }
-    for (a, b, f) in shapes {
-        let legacy = input(a, b, f, None, None);
-        t.error_annotation = legacy.error_annotation.clone();
-        t.blocked_json = legacy.blocked_json.clone();
-        t.failed_json = legacy.failed_json.clone();
-        let old: Value =
-            serde_json::from_str(&CreateDomainEvent::task_interruption_changed(&t).payload_json)
-                .unwrap();
-        let condition = map_legacy_condition(&legacy);
-        let projected = material_blocker(&condition);
-        assert_eq!(
-            json!(projected.requires_intervention),
-            old["requires_intervention"]
-        );
-        assert_eq!(json!(projected.interruption), old["interruption"]);
-        let mut attention=crate::AttentionProjection{id:"incident".into(),attention_type:"execution_failed".into(),scope_type:"project".into(),scope_id:"p".into(),identity_id:None,source_event_id:"old".into(),priority:1,status:"open".into(),summary:"old".into(),details_json:json!({"interruption":old["interruption"],"recovery":{"requires_intervention":old["requires_intervention"]}}).to_string(),dedupe_key:"stable".into(),occurred_at:"old".into(),updated_at:"old".into(),version:1,acknowledged_at:None,snoozed_until:None,resolved_at:None,updated_by_user_id:None,recommended_action:"retry".into(),source_sequence:None};
-        let digest = crate::canonical_attention_incident_digest(&attention);
-        attention.details_json=json!({"interruption":projected.interruption,"recovery":{"requires_intervention":projected.requires_intervention}}).to_string();
-        assert_eq!(
-            digest,
-            crate::canonical_attention_incident_digest(&attention)
-        );
-    }
+    shapes
 }
+/// Legacy reads a wrongly typed wait key as absent, so the condition keeps
+/// the diagnosis and does not park.
 #[test]
-fn ignored_metadata_and_barriers_remain_non_parking_observations() {
+fn wrongly_typed_wait_keys_stay_non_parking_observations() {
     for metadata in [
-        "not JSON",
-        "[]",
         r#"{"awaiting_human":"yes"}"#,
         r#"{"coordination_review_pending":"yes"}"#,
+        r#"{"deferred_dispatch":42}"#,
+        r#"{"dispatch_disposition":"x"}"#,
+        r#"{"paused_integration":[1]}"#,
         r#"{"owner_wait":42}"#,
+        r#"{"environment_wait":"x"}"#,
+        r#"{"placement_refusal":7}"#,
+        r#"{"daemon_upgrade_refusal":"x"}"#,
+        r#"{"plan_settlement_wait":true}"#,
     ] {
         let mapped = map_legacy_condition(&LegacyConditionInput {
             metadata_json: Some(metadata.into()),
             ..Default::default()
         });
         assert!(!mapped.is_blocked(), "{metadata}: {mapped:?}");
-        assert!(!mapped.evidence().observations.is_empty());
-    }
-    for barrier in [
-        "not JSON",
-        r#"{"status":"running"}"#,
-        r#"{"status":"done"}"#,
-    ] {
-        let mapped = map_legacy_condition(&LegacyConditionInput {
-            entry_barrier_json: Some(barrier.into()),
-            ..Default::default()
-        });
-        assert!(!mapped.is_blocked());
-        assert!(!mapped.evidence().observations.is_empty());
+        assert!(!mapped.evidence().observations.is_empty(), "{metadata}");
     }
     let environment = input(
         None,
@@ -129,6 +147,53 @@ fn ignored_metadata_and_barriers_remain_non_parking_observations() {
             ..
         }
     ));
+}
+/// Legacy refuses to dispatch a Task with any entry barrier
+/// (`active_recovery.rs`, `stranded_hooks.rs`, `task_hierarchy::root_blocked`)
+/// and skips one whose metadata does not parse (`task.metadata()?` in both
+/// scans). Both park.
+#[test]
+fn entry_barriers_and_unparsable_metadata_park_like_legacy() {
+    for barrier in [
+        json!({"state":"review","status":"running"}).to_string(),
+        json!({"state":"review","status":"passed"}).to_string(),
+        json!({"state":"review"}).to_string(),
+        json!({}).to_string(),
+        json!([1]).to_string(),
+        "not json".to_owned(),
+    ] {
+        let mapped = map_legacy_condition(&LegacyConditionInput {
+            entry_barrier_json: Some(barrier.clone()),
+            ..Default::default()
+        });
+        assert!(
+            matches!(
+                &mapped,
+                TaskCondition::Parked {
+                    primary: ParkReason::UnknownCondition { source, .. },
+                    ..
+                } if source.field == LegacyConditionField::EntryBarrierJson
+            ),
+            "{barrier}: {mapped:?}"
+        );
+        assert!(mapped.evidence().observations.is_empty(), "{barrier}");
+    }
+    for metadata in ["not JSON", "[]", "42"] {
+        let mapped = map_legacy_condition(&LegacyConditionInput {
+            metadata_json: Some(metadata.into()),
+            ..Default::default()
+        });
+        assert!(
+            matches!(
+                &mapped,
+                TaskCondition::Parked {
+                    primary: ParkReason::UnknownCondition { source, .. },
+                    ..
+                } if source.field == LegacyConditionField::MetadataJson
+            ),
+            "{metadata}: {mapped:?}"
+        );
+    }
 }
 #[tokio::test]
 async fn bounded_repair_changes_only_shadow_and_reports_counts() {
@@ -383,9 +448,7 @@ async fn inherited_child_execution_and_custom_terminal_use_their_actual_workflow
     assert!(db.task_condition_violations().await.unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn cancelled_invariant_check_does_not_disable_later_ticks() {
-    let directory = tempfile::tempdir().unwrap();
+async fn file_db(directory: &tempfile::TempDir) -> SqliteDb {
     let pool = crate::create_sqlite_pool(&format!(
         "sqlite:{}",
         directory.path().join("conditions.sqlite").display()
@@ -394,18 +457,204 @@ async fn cancelled_invariant_check_does_not_disable_later_ticks() {
     .unwrap();
     crate::run_migrations(&pool).await.unwrap();
     let db = SqliteDb::new(pool);
-    let lock = crate::begin_immediate(db.pool()).await.unwrap();
-    assert!(tokio::time::timeout(
-        std::time::Duration::from_millis(20),
-        db.check_task_conditions(1)
+    crate::ProjectRepo::create(
+        &db,
+        crate::CreateProject {
+            id: "p".into(),
+            owner_id: None,
+            name: "Conditions".into(),
+            primary_repo_id: None,
+            updated_at: crate::now_rfc3339(),
+            settings: "{}".into(),
+            workflow_definition: "{}".into(),
+            created_at: crate::now_rfc3339(),
+        },
     )
     .await
-    .is_err());
-    // A zero-budget tick needs no DB lock and proves the cancelled check
-    // released its in-progress guard before the supervised loop resumes.
-    assert_eq!(db.check_task_conditions(0).await.unwrap().ticks, 1);
+    .unwrap();
+    db
+}
+
+/// The check reads off the writer: a healthy page completes while another
+/// connection holds the write lock. Only a repair waits for it, and a tick
+/// cancelled there does not disable later ticks.
+#[tokio::test]
+async fn check_reads_without_the_writer_and_survives_a_cancelled_repair() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = file_db(&directory).await;
+    task(&db, "healthy").await;
+    let lock = crate::begin_immediate(db.pool()).await.unwrap();
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        db.check_task_conditions(CONDITION_CHECK_PAGE),
+    )
+    .await
+    .expect("a healthy page needs no write lock")
+    .unwrap();
+    assert_eq!((status.checked, status.repaired, status.ticks), (1, 0, 1));
     lock.rollback().await.unwrap();
-    assert_eq!(db.check_task_conditions(1).await.unwrap().ticks, 2);
+
+    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"corrupt\"}'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let lock = crate::begin_immediate(db.pool()).await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            db.check_task_conditions(CONDITION_CHECK_PAGE)
+        )
+        .await
+        .is_err(),
+        "the repair waits for the writer"
+    );
+    lock.rollback().await.unwrap();
+    let status = db
+        .check_task_conditions(CONDITION_CHECK_PAGE)
+        .await
+        .unwrap();
+    assert_eq!(status.repaired, 1, "the cancelled tick released its guard");
+    assert!(db.task_condition_violations().await.unwrap().is_empty());
+}
+
+/// A row written between the check's read and its repair is left alone.
+#[tokio::test]
+async fn repair_is_fenced_on_the_row_it_read() {
+    let db = db().await;
+    let t = task(&db, "raced").await;
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
+        .bind(&t.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let repair = "{\"kind\":\"repair\"}";
+    // The Task version moved, or its condition was restated, since the read.
+    assert_eq!(
+        db.repair_condition(&t.id, t.version + 1, &stored, repair)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.repair_condition(&t.id, t.version, b"{\"kind\":\"older\"}", repair)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(db.task_condition_violations().await.unwrap().is_empty());
+}
+
+/// Operator status reports a completed pass, and only one that repaired.
+#[tokio::test]
+async fn completed_pass_is_recorded_with_its_own_counts() {
+    let db = db().await;
+    for i in 0..3 {
+        task(&db, &format!("pass{i}")).await;
+    }
+    assert!(db.condition_check_status().last_pass.is_none());
+    db.check_task_conditions(2).await.unwrap();
+    assert!(
+        db.condition_check_status().last_pass.is_none(),
+        "a page is not a pass"
+    );
+    db.check_task_conditions(2).await.unwrap();
+    let pass = db.condition_check_status().last_pass.unwrap();
+    assert_eq!((pass.checked, pass.repaired), (3, 0));
+    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"corrupt\"}' WHERE id='pass1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.check_task_conditions(CONDITION_CHECK_PAGE)
+        .await
+        .unwrap();
+    let pass = db.condition_check_status().last_pass.unwrap();
+    assert_eq!((pass.checked, pass.repaired), (3, 1));
+    db.check_task_conditions(CONDITION_CHECK_PAGE)
+        .await
+        .unwrap();
+    let pass = db.condition_check_status().last_pass.unwrap();
+    assert_eq!((pass.checked, pass.repaired), (3, 0), "the next clean pass");
+}
+
+/// A database whose recorded mapping revision is stale (here: rows a stage-1
+/// binary wrote, bare of witnesses) is recomputed once by the supervised
+/// tick, off the startup path, and the revision is then recorded.
+#[tokio::test]
+async fn stale_mapping_revision_reruns_the_backfill_once() {
+    let db = db().await;
+    for i in 0..(CONDITION_CHECK_PAGE + 20) {
+        let t = task(&db, &format!("bf{i:04}")).await;
+        if i % 5 == 0 {
+            sqlx::query("UPDATE task SET status='done', error_annotation=? WHERE id=?")
+                .bind(json!({"type":"ci_failed"}).to_string())
+                .bind(&t.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+    // What a stage-1 binary stored: the bare mapping, no facts.
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM task")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    for (id,) in &rows {
+        let t = TaskRepo::get_by_id(&db, id, true).await.unwrap().unwrap();
+        sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+            .bind(encode(&map_legacy_condition(&LegacyConditionInput::from(
+                &t,
+            ))))
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db.task_condition_violations().await.unwrap().len(),
+        rows.len(),
+        "every stage-1 row is stale under this revision"
+    );
+    // The migration that created the column recorded this revision. A
+    // database a stage-1 binary migrated has no record of it.
+    assert_eq!(
+        crate::SystemSettingRepo::get_setting(&db, MAPPING_REVISION_KEY)
+            .await
+            .unwrap(),
+        Some(MAPPING_REVISION.to_string())
+    );
+    crate::SystemSettingRepo::delete_setting(&db, MAPPING_REVISION_KEY)
+        .await
+        .unwrap();
+    for _ in 0..50 {
+        db.check_task_conditions_if_due().await.unwrap();
+        if db.task_condition_violations().await.unwrap().is_empty() {
+            break;
+        }
+    }
+    assert!(db.task_condition_violations().await.unwrap().is_empty());
+    assert_eq!(
+        crate::SystemSettingRepo::get_setting(&db, MAPPING_REVISION_KEY)
+            .await
+            .unwrap(),
+        Some(MAPPING_REVISION.to_string())
+    );
+    let status = db.condition_check_status();
+    assert!(status.repaired >= rows.len() as u64);
+    assert!(
+        status.last_pass.is_none(),
+        "rewriting after a mapping change is not an operator issue"
+    );
+    // Steady state: one page per interval, so an immediate second tick and a
+    // third are at most one page of work.
+    let ticks = status.ticks;
+    db.check_task_conditions_if_due().await.unwrap();
+    db.check_task_conditions_if_due().await.unwrap();
+    assert_eq!(db.condition_check_status().ticks, ticks + 1);
+    // The stage-1 migration backfill itself still agrees with the producers.
+    let mut connection = db.pool().acquire().await.unwrap();
+    backfill(&mut connection).await.unwrap();
+    drop(connection);
+    assert!(db.task_condition_violations().await.unwrap().is_empty());
 }
 
 #[tokio::test]

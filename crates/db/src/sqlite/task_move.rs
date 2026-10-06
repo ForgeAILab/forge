@@ -218,7 +218,6 @@ impl TaskBoardRepo for SqliteDb {
                 .fetch_one(&mut *tx)
                 .await?;
         let updated_task = map_task(updated_task_row)?;
-        crate::task_condition::store_task_condition(&mut tx, &updated_task).await?;
         if task.blocked_json != updated_task.blocked_json {
             let interruption_event = CreateDomainEvent::task_interruption_changed(&updated_task);
             DomainEventRepo::append_event_in_tx(self, &mut tx, &interruption_event).await?;
@@ -284,8 +283,10 @@ impl TaskBoardRepo for SqliteDb {
         if let Some(step) = &input.post_commit_step {
             crate::TaskStepRepo::enqueue_step_in_tx(self, &mut tx, step).await?;
         }
-        // Publish after the entry receipt even for a same-status reorder.
-        crate::task_condition::sync_condition(&mut tx, &input.task_id).await?;
+        // State the entry after its receipt and hooks step exist, even for a
+        // same-status reorder.
+        crate::task_condition::produce(&mut tx, &input.task_id, crate::ConditionChange::Entry)
+            .await?;
         tx.commit().await?;
 
         Ok(MoveTaskPersistence::Committed {
