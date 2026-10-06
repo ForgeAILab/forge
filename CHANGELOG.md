@@ -465,6 +465,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Internal typed Task condition, shadow only (plan 3.1 stage 1).** Tasks gain
+  a `condition_json` column filled by a data-preserving backfill and kept in
+  step by every Task writer in its own transaction. The existing condition
+  fields and every reader remain authoritative; no public, event or behaviour
+  change.
+
 - **Operator status reports the Task's Execution limit (refactor 2.5).**
   `retry_pressure[].max_attempts` is the Task's resolved Execution retry limit
   (Task override, then workflow state, then 3) instead of a constant 3.
