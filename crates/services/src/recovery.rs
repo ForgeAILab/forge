@@ -2311,48 +2311,16 @@ async fn fail_owned_execution(
     execution: &Execution,
     cause: PlacementFailureCause,
 ) -> Result<bool> {
-    let now = now_rfc3339();
-    let mut input = crate::task_service::execution::ledger::terminal_with_ledger(
-        TerminalizeExecution {
-            execution_id: execution.id.clone(),
-            expected_version: execution.execution_version,
-            lease_owner: execution.lease_owner.clone(),
-            status: ExecutionStatus::Failed,
-            stop_reason: Some(Some(StopReason::DaemonDisconnected)),
-            stopped_by: Some(Some(
-                api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor).display(),
-            )),
-            stopped_at: Some(Some(now.clone())),
-            resume_policy: Some(Some(ResumePolicy::Manual)),
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            last_progress_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: Some(Some(
-                json!({"cause": cause.to_string(), "placement_id": placement.id,
-            "daemon_id": placement.daemon_id})
-                .to_string(),
-            )),
-            executor_config_snapshot_json: None,
-            updated_at: now.clone(),
-            actor_type: "system".to_owned(),
-            actor_id: None,
-            correlation_id: Some(placement.id.clone()),
-            causation_id: None,
-            causation_depth: 0,
-            lease_disposition: ExecutionLeaseDisposition::Expire,
-        },
-        Vec::new(),
+    let Some(execution) = terminalize_owner_lost(
+        db,
+        placement,
+        execution,
+        &cause.to_string(),
+        &api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor).display(),
         None,
-        None,
-    );
-    input.mark_unreplayable_pending_unsettled = true;
-    let outcome = ExecutionRepo::terminalize_with_ledger(db, input).await?;
-    let ExecutionTerminalOutcome::Committed { execution, .. } = outcome else {
+    )
+    .await?
+    else {
         return Ok(false);
     };
     // Infrastructure settlement parks the Task without entering work/review
@@ -2369,6 +2337,62 @@ async fn fail_owned_execution(
         },
     });
     Ok(true)
+}
+
+/// The one terminal write for a run whose workspace owner is gone. `user_id`
+/// attributes an owner's own decision (machine removal); the heartbeat passes none.
+async fn terminalize_owner_lost(
+    db: &SqliteDb,
+    placement: &WorkspacePlacement,
+    execution: &Execution,
+    cause: &str,
+    stopped_by: &str,
+    user_id: Option<&str>,
+) -> Result<Option<Execution>> {
+    let now = now_rfc3339();
+    let mut input = crate::task_service::execution::ledger::terminal_with_ledger(
+        TerminalizeExecution {
+            execution_id: execution.id.clone(),
+            expected_version: execution.execution_version,
+            lease_owner: execution.lease_owner.clone(),
+            status: ExecutionStatus::Failed,
+            stop_reason: Some(Some(StopReason::DaemonDisconnected)),
+            stopped_by: Some(Some(stopped_by.to_owned())),
+            stopped_at: Some(Some(now.clone())),
+            resume_policy: Some(Some(ResumePolicy::Manual)),
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            last_progress_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some(Some(
+                json!({"cause": cause, "placement_id": placement.id,
+            "daemon_id": placement_execution_daemon_id(placement).or(placement.daemon_id.as_deref())})
+                .to_string(),
+            )),
+            executor_config_snapshot_json: None,
+            updated_at: now.clone(),
+            actor_type: if user_id.is_some() { "user" } else { "system" }.to_owned(),
+            actor_id: user_id.map(str::to_owned),
+            correlation_id: Some(placement.id.clone()),
+            causation_id: None,
+            causation_depth: 0,
+            lease_disposition: ExecutionLeaseDisposition::Expire,
+        },
+        Vec::new(),
+        None,
+        None,
+    );
+    input.mark_unreplayable_pending_unsettled = true;
+    Ok(
+        match ExecutionRepo::terminalize_with_ledger(db, input).await? {
+            ExecutionTerminalOutcome::Committed { execution, .. } => Some(execution),
+            _ => None,
+        },
+    )
 }
 
 async fn annotate_owner_recovery(
@@ -8854,5 +8878,672 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|s| s.kind == "command" && s.status == "done"));
+    }
+}
+
+/// What the removal transaction recorded for one Task before it released the
+/// machine's placements and retired its Agents.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct RemovedMachineFacts {
+    pub actor_id: String,
+    pub hostname: String,
+    /// Runs that were live on the machine.
+    #[serde(default)]
+    pub executions: Vec<String>,
+    /// The Task's own workspace lived on the machine and was released.
+    #[serde(default)]
+    pub workspace_lost: bool,
+    /// The Task's workspace was owned by, or executing on, the machine.
+    #[serde(default)]
+    pub placed: bool,
+}
+
+impl RemovedMachineFacts {
+    /// Removal is the owner's decision; settlement is attributed to them.
+    pub(crate) fn actor(&self) -> api_types::Actor {
+        api_types::Actor::User {
+            user_id: Some(self.actor_id.clone()),
+            source: api_types::UserActionSource::Api,
+            delegated: false,
+        }
+    }
+}
+
+pub(crate) struct RemovedMachineSettlement {
+    /// The Task lost a run or its workspace and must be admitted again.
+    pub lost_work: bool,
+    pub role_events: Vec<crate::task_service::RoleSweepEvent>,
+}
+
+pub(crate) const MACHINE_REMOVED_REASON: &str = "machine_removed";
+const OWNER_LOSS_REASONS: [&str; 3] = [
+    "owner_disconnected_timeout",
+    "owner_lost_execution",
+    "owner_workspace_reset_required",
+];
+
+/// Runs under the affected Task's normal lease, including after a restart. The
+/// removal transaction changes no Task row: it releases the machine's
+/// placements and records the facts this step settles.
+///
+/// A removed owner is permanent loss, so nothing here waits for it. Live runs
+/// fail as daemon-disconnected, an owner wait or owner-recovery annotation is
+/// replaced by `machine_removed`, and a retired Agent is unassigned through the
+/// archive sweep. The caller then admits the Task again through its queued
+/// action, where placement selects another machine or parks it.
+pub(crate) async fn settle_removed_machine_task(
+    db: &SqliteDb,
+    event_bus: &EventBus,
+    task_id: &str,
+    daemon_id: &str,
+    facts: &RemovedMachineFacts,
+) -> Result<RemovedMachineSettlement> {
+    db::task_writer::debug_assert_task_lease(task_id, "machine removal settlement");
+    let mut settlement = RemovedMachineSettlement {
+        lost_work: false,
+        role_events: Vec::new(),
+    };
+    if !db.daemon_removed(daemon_id).await? {
+        return Ok(settlement);
+    }
+    db::task_writer::TaskQuery::new(db,task_id,
+        "UPDATE task SET error_annotation=NULL, metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.dispatch_disposition','$.deferred_dispatch') ELSE metadata_json END, version=version+1,updated_at=? WHERE id=? AND deleted_at IS NULL AND json_valid(error_annotation) AND json_extract(error_annotation,'$.blocking_reason')='pending_remote_cancel' AND NOT EXISTS(SELECT 1 FROM pending_remote_cancel c LEFT JOIN workspace w ON w.id=c.workspace_id LEFT JOIN task_step s ON s.id=c.step_id WHERE w.task_id=? OR s.task_id=? OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=? AND e.workspace_id=c.workspace_id))")
+        .bind(now_rfc3339()).bind(task_id).bind(task_id).bind(task_id).bind(task_id)
+        .identity_fenced().execute(db.pool()).await?;
+    let remaining = db.task_pending_remote_cancel_machines(task_id).await?;
+    if !remaining.is_empty() {
+        if let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? {
+            if let Some(raw) = task.error_annotation.as_deref() {
+                if let Ok(mut annotation) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if annotation["blocking_reason"] == "pending_remote_cancel" {
+                        let machines = remaining.join(", ");
+                        annotation["blocked_by"] = json!(format!("machine:{machines}"));
+                        annotation["message"] = json!(format!("Waiting for machine {machines} to confirm its remote work has stopped. Reconnect that machine to finish cleanup."));
+                        db::task_writer::TaskQuery::new(db, task_id,
+                            "UPDATE task SET error_annotation=?,version=version+1,updated_at=? WHERE id=? AND error_annotation=?")
+                            .bind(annotation.to_string()).bind(now_rfc3339()).bind(task_id).bind(raw)
+                            .identity_fenced().execute(db.pool()).await?;
+                    }
+                }
+            }
+        }
+    }
+    // A Task may be waiting on this machine's environment, provisioning attempt
+    // or reconnection. Wake its existing scheduler path instead of leaving a
+    // delay that can no longer end.
+    for (key, owner) in [
+        ("environment_wait", "environment_wait.machine.daemon_id"),
+        ("owner_wait", "owner_wait.daemon_id"),
+    ] {
+        db::task_writer::TaskQuery::new(db,task_id,
+            format!("UPDATE task SET metadata_json=json_remove(metadata_json,'$.{key}','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.{owner}')=?"))
+            .bind(task_id).bind(daemon_id).identity_fenced().execute(db.pool()).await?;
+    }
+    let actor = facts.actor();
+    for execution_id in &facts.executions {
+        let Some(execution) = ExecutionRepo::get_by_id(db, execution_id).await? else {
+            continue;
+        };
+        if execution.task_id != task_id {
+            continue;
+        }
+        if execution.status != ExecutionStatus::Running {
+            // A replayed step still reports the loss it already settled.
+            settlement.lost_work |= execution.status == ExecutionStatus::Failed
+                && execution.error.as_deref().is_some_and(|error| {
+                    serde_json::from_str::<serde_json::Value>(error)
+                        .is_ok_and(|error| error["cause"] == MACHINE_REMOVED_REASON)
+                });
+            continue;
+        }
+        let placement = match execution.workspace_id.as_deref() {
+            Some(id) => WorkspacePlacementRepo::get_by_workspace_id(db, id).await?,
+            None => None,
+        };
+        let failed = match placement {
+            Some(placement) => {
+                let failed = terminalize_owner_lost(
+                    db,
+                    &placement,
+                    &execution,
+                    MACHINE_REMOVED_REASON,
+                    &actor.display(),
+                    Some(&facts.actor_id),
+                )
+                .await?;
+                if let Some(failed) = failed.as_ref() {
+                    event_bus.publish(ForgeEvent {
+                        event_type: "reconciliation.event".to_owned(),
+                        entity_id: failed.task_id.clone(),
+                        timestamp: event_timestamp(),
+                        context: EventContext::ReconciliationEvent {
+                            task_id: Some(failed.task_id.clone()),
+                            execution_id: Some(failed.id.clone()),
+                            reason: MACHINE_REMOVED_REASON.to_owned(),
+                        },
+                    });
+                }
+                failed
+            }
+            None => {
+                fail_execution_daemon_disconnected(
+                    db,
+                    event_bus,
+                    None,
+                    FailDaemonDisconnectedExecution {
+                        execution: &execution,
+                        daemon_id,
+                        error_message:
+                            json!({"cause": MACHINE_REMOVED_REASON, "daemon_id": daemon_id})
+                                .to_string(),
+                        stopped_by: &actor.display(),
+                        reconciliation_reason: MACHINE_REMOVED_REASON,
+                    },
+                )
+                .await?
+            }
+        };
+        settlement.lost_work |= failed.is_some();
+    }
+    let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? else {
+        return Ok(settlement);
+    };
+    let reason = task
+        .error_annotation
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|annotation| annotation["blocking_reason"].as_str().map(str::to_owned));
+    // An accepted "retry on the workspace owner" can never run: that owner is
+    // gone. It is re-accepted below as an ordinary retry on another machine.
+    let parked = crate::deferred_dispatch::queued_recovery(&task);
+    let stale_owner_retry = parked
+        .as_ref()
+        .is_some_and(|queued| queued.request.offer.reason == "owner_reconcile");
+    if stale_owner_retry {
+        db::task_writer::TaskQuery::new(db, task_id,
+            "UPDATE task SET metadata_json=json_remove(metadata_json,?,'$.deferred_dispatch','$.dispatch_disposition'),version=version+1,updated_at=? WHERE id=? AND json_valid(metadata_json)")
+            .bind(format!("$.{}", crate::deferred_dispatch::QUEUED_RECOVERY_KEY))
+            .bind(now_rfc3339()).bind(task_id).identity_fenced().execute(db.pool()).await?;
+    }
+    settlement.lost_work |= stale_owner_retry
+        || (facts.placed
+            && reason
+                .as_deref()
+                .is_some_and(|reason| OWNER_LOSS_REASONS.contains(&reason)));
+    if settlement.lost_work && (parked.is_none() || stale_owner_retry) {
+        annotate_machine_removed(db, &task, facts, &actor).await?;
+    }
+    // Retired Agents leave their Tasks through the archive sweep, so each Task
+    // follows the same unassigned path as any other archived Agent's.
+    let retired: Vec<String> = sqlx::query_scalar(
+        "SELECT i.id FROM agent_identity i WHERE i.archived_at IS NOT NULL
+         AND i.selected_profile_id IN (SELECT id FROM agent_profile WHERE daemon_id=?)
+         AND (EXISTS(SELECT 1 FROM task t WHERE t.id=? AND t.assignee_type='agent' AND t.assignee_id=i.id)
+           OR EXISTS(SELECT 1 FROM task_role_assignment r WHERE r.task_id=? AND r.assignee_type='agent' AND r.assignee_id=i.id))",
+    )
+    .bind(daemon_id)
+    .bind(task_id)
+    .bind(task_id)
+    .fetch_all(db.pool())
+    .await?;
+    for agent_id in retired {
+        let mut transaction = db::begin_immediate(db.pool()).await?;
+        settlement
+            .role_events
+            .extend(TaskService::on_agent_deleted_in_tx(db, &mut transaction, &agent_id).await?);
+        transaction.commit().await?;
+    }
+    Ok(settlement)
+}
+
+/// Replaces an owner wait with the fact that the owner is gone. It never
+/// overwrites a failure, a terminal Task or an unrelated blocking condition.
+async fn annotate_machine_removed(
+    db: &SqliteDb,
+    task: &Task,
+    facts: &RemovedMachineFacts,
+    actor: &api_types::Actor,
+) -> Result<()> {
+    let project = ProjectRepo::get_by_id(db, &task.project_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
+    let workflow =
+        WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, actor);
+    let terminal = workflow
+        .states
+        .iter()
+        .filter(|state| state.kind == api_types::StateKind::Terminal)
+        .map(|state| state.name.clone())
+        .collect::<Vec<_>>();
+    let annotation = json!({"type": api_types::FailureKind::RecoveryRequired,
+        "blocking_reason": MACHINE_REMOVED_REASON, "blocked_by": actor.display(),
+        "blocked_at": now_rfc3339(),
+        "message": if facts.workspace_lost {
+            format!("Machine {} was removed. Its workspace and any work that was not pushed were abandoned; the Task continues on another machine from its last server-known branch.", facts.hostname)
+        } else {
+            format!("Machine {} was removed while it was running this Task. The run was stopped; the Task continues on another machine.", facts.hostname)
+        },
+    });
+    // An expired owner wait also blocked the Task; that blocker goes with it.
+    db::task_writer::TaskQuery::new(db, &task.id,
+        "UPDATE task SET error_annotation=?,
+            blocked_json=CASE WHEN json_valid(error_annotation) AND json_extract(error_annotation,'$.blocked_by')='system:workflow' THEN NULL ELSE blocked_json END,
+            updated_at=?, version=version+1
+         WHERE id=? AND deleted_at IS NULL AND failed_json IS NULL
+           AND status NOT IN (SELECT value FROM json_each(?))
+           AND (error_annotation IS NULL OR (json_valid(error_annotation)
+                AND json_extract(error_annotation,'$.blocking_reason') IN (SELECT value FROM json_each(?))))")
+        .bind(annotation.to_string())
+        .bind(now_rfc3339())
+        .bind(&task.id)
+        .bind(json!(terminal).to_string())
+        .bind(json!([OWNER_LOSS_REASONS.as_slice(), &[MACHINE_REMOVED_REASON]].concat()).to_string())
+        .identity_fenced()
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod removed_machine_tests {
+    use super::*;
+    use api_types::TaskAction;
+
+    #[tokio::test]
+    async fn removed_owner_settles_running_execution_and_releases_its_workspace() {
+        use crate::workspace_backend::WorkspaceBackend;
+        let db = Arc::new(SqliteDb::new(
+            db::create_sqlite_pool("sqlite::memory:").await.unwrap(),
+        ));
+        db::run_migrations(db.pool()).await.unwrap();
+        let (task, placement, execution) = tests::daemon_owned_fixture(&db).await;
+        let daemon_id = placement.daemon_id.as_deref().unwrap();
+        DaemonRepo::mark_offline(&*db, daemon_id, &now_rfc3339())
+            .await
+            .unwrap();
+        let bus = Arc::new(EventBus::new(64));
+        let service = TaskService::new(db.clone(), bus.clone());
+        let original_name = DaemonRepo::get_by_id(&*db, daemon_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .hostname;
+        sqlx::query("INSERT INTO repo_provision_retry(repo_id,runtime_id,next_attempt_at) SELECT w.repo_id,p.runtime_id,? FROM workspace w JOIN workspace_placement p ON p.workspace_id=w.id WHERE p.id=?")
+            .bind(now_rfc3339()).bind(&placement.id).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO project_machine_readiness(project_id,owner_kind,daemon_id,runtime_id,status,checks_digest) VALUES (?,'daemon',?,?,'not_ready','old-digest')")
+            .bind(&task.project_id).bind(daemon_id).bind(&placement.runtime_id).execute(db.pool()).await.unwrap();
+        let preview = db
+            .daemon_removal_preview(daemon_id, "admin", true)
+            .await
+            .unwrap();
+        assert_eq!((preview.tasks_to_replace, preview.agents_to_retire), (1, 1));
+        let result = db
+            .remove_daemon(daemon_id, "admin", true, "local", false)
+            .await
+            .unwrap();
+        assert_eq!(result.provisioning_attempts_cleared, 1);
+        assert_eq!(result.readiness_records_cleared, 1);
+        assert_eq!(result.placements_failed, 1);
+        assert_eq!(result.tasks_to_replace, 1);
+        assert_eq!(result.agents_retired, 1);
+        assert_eq!(result.tasks_queued, 1);
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Running,
+            "the removal transaction writes no Task or execution row"
+        );
+        let settled = service.drain(&task.id).await.unwrap();
+        let failed = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        assert_eq!(failed.stop_reason, Some(StopReason::DaemonDisconnected));
+        assert_eq!(failed.resume_policy, Some(ResumePolicy::Manual));
+        assert_eq!(
+            failed.stopped_by.as_deref(),
+            Some("user:api"),
+            "settlement is attributed to the removing user, not the heartbeat"
+        );
+        assert_eq!(
+            settled.status, task.status,
+            "owner loss does not spend workflow retries"
+        );
+        let annotation: serde_json::Value =
+            serde_json::from_str(settled.error_annotation.as_deref().unwrap()).unwrap();
+        assert_eq!(annotation["blocking_reason"], "machine_removed");
+        assert_eq!(annotation["blocked_by"], "user:api");
+        assert_eq!(
+            settled.assignee_id, None,
+            "the retired Agent's Task follows the archive sweep"
+        );
+        let current = WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.state,
+            PlacementState::Cleaned,
+            "the workspace is released, not pinned to the removed owner"
+        );
+        assert!(current.workspace_handle.is_none());
+        assert_eq!(
+            current.failure_cause,
+            Some(PlacementFailureCause::OwnerDisconnected),
+            "an existing failure cause is kept"
+        );
+        let workspace = WorkspaceRepo::get_by_id(&*db, &placement.workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.status, db::WorkspaceStatus::Cleaned);
+        let actor = api_types::Actor::user(api_types::UserActionSource::Api);
+        let snapshot = service
+            .task_action_snapshot(&task.id, &actor)
+            .await
+            .unwrap();
+        assert!(!snapshot.owner_disconnected);
+        assert!(!crate::available_actions(&snapshot)
+            .iter()
+            .any(|offer| offer.reason == "owner_reconcile"));
+        let name:String=sqlx::query_scalar("SELECT d.hostname FROM execution e JOIN workspace_placement p ON p.workspace_id=e.workspace_id JOIN daemon d ON d.id=p.daemon_id WHERE e.id=?")
+            .bind(&execution.id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(name, original_name);
+        let backend = crate::workspace_backend::DaemonWorkspaceBackend::new(
+            db.clone(),
+            Arc::new(DaemonConnectionRegistry::without_handlers()),
+        );
+        assert!(
+            !backend.cleanup(&current).await.unwrap().removed,
+            "removal abandons physical files without an RPC"
+        );
+        let status = crate::OperatorStatusService::new_for_test(db.clone());
+        let status = status.compute_status().await.unwrap();
+        assert!(!status
+            .daemon_issues
+            .iter()
+            .any(|row| row.daemon_id == daemon_id));
+        assert!(!status
+            .daemon_pressure
+            .iter()
+            .any(|row| row.daemon_id == daemon_id));
+    }
+
+    /// A server-owned workspace that only executed on the removed machine is
+    /// not released, and a failure it already recorded is not overwritten.
+    #[tokio::test]
+    async fn removal_keeps_a_server_owned_workspace_that_only_executed_there() {
+        let db = Arc::new(SqliteDb::new(
+            db::create_sqlite_pool("sqlite::memory:").await.unwrap(),
+        ));
+        db::run_migrations(db.pool()).await.unwrap();
+        let (task, placement, execution) = tests::daemon_owned_fixture(&db).await;
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        DaemonRepo::mark_offline(&*db, &daemon_id, &now_rfc3339())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspace_placement SET owner_kind='server',daemon_id=NULL,runtime_id=NULL,state='failed',failure_cause='prepare_failed',disconnected_at=NULL WHERE id=?")
+            .bind(&placement.id).execute(db.pool()).await.unwrap();
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::new(64)));
+        let result = db
+            .remove_daemon(&daemon_id, "admin", true, "local", false)
+            .await
+            .unwrap();
+        assert_eq!(result.placements_failed, 0);
+        assert_eq!(result.tasks_to_replace, 0);
+        service.drain(&task.id).await.unwrap();
+        let current = WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, PlacementState::Failed);
+        assert_eq!(
+            current.failure_cause,
+            Some(PlacementFailureCause::PrepareFailed)
+        );
+        assert_eq!(current.workspace_handle, placement.workspace_handle);
+        assert_eq!(current.execution_daemon_id, None);
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Failed,
+            "the run that was live on the machine still settles"
+        );
+    }
+
+    /// A server-owned workspace stranded by the vanished executor is not
+    /// released, but its wait for that executor ends: left `failed` on an owner
+    /// that no longer exists it would offer only a retry that can never run.
+    #[tokio::test]
+    async fn removal_ends_a_server_owned_workspaces_wait_for_the_removed_executor() {
+        let db = Arc::new(SqliteDb::new(
+            db::create_sqlite_pool("sqlite::memory:").await.unwrap(),
+        ));
+        db::run_migrations(db.pool()).await.unwrap();
+        let (task, placement, _execution) = tests::daemon_owned_fixture(&db).await;
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        DaemonRepo::mark_offline(&*db, &daemon_id, &now_rfc3339())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workspace_placement SET owner_kind='server',daemon_id=NULL,runtime_id=NULL,state='failed',failure_cause='owner_disconnected_timeout' WHERE id=?")
+            .bind(&placement.id).execute(db.pool()).await.unwrap();
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::new(64)));
+        let result = db
+            .remove_daemon(&daemon_id, "admin", true, "local", false)
+            .await
+            .unwrap();
+        assert_eq!(result.placements_failed, 0);
+        service.drain(&task.id).await.unwrap();
+        let current = WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, PlacementState::Ready);
+        assert_eq!(current.failure_cause, None);
+        assert_eq!(current.execution_daemon_id, None);
+        assert_eq!(current.workspace_handle, placement.workspace_handle);
+        let after = offers(&service, &task.id).await;
+        assert!(
+            !after.iter().any(|offer| offer.contains("owner_reconcile")),
+            "{after:?}"
+        );
+    }
+
+    async fn offers(service: &TaskService, task_id: &str) -> Vec<String> {
+        let actor = api_types::Actor::user(api_types::UserActionSource::Api);
+        let snapshot = service.task_action_snapshot(task_id, &actor).await.unwrap();
+        crate::available_actions(&snapshot)
+            .into_iter()
+            .map(|offer| format!("{}[{}]", offer.action.verb(), offer.reason))
+            .collect()
+    }
+
+    /// A Task whose workspace lived on the removed machine must have some
+    /// action that moves it off that machine.
+    #[tokio::test]
+    async fn task_on_removed_machine_has_an_exit() {
+        let db = Arc::new(SqliteDb::new(
+            db::create_sqlite_pool("sqlite::memory:").await.unwrap(),
+        ));
+        db::run_migrations(db.pool()).await.unwrap();
+        let (task, placement, _execution) = tests::daemon_owned_fixture(&db).await;
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        DaemonRepo::mark_offline(&*db, &daemon_id, &now_rfc3339())
+            .await
+            .unwrap();
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::new(64)));
+        db.remove_daemon(&daemon_id, "admin", true, "local", false)
+            .await
+            .unwrap();
+        let settled = service.drain(&task.id).await.unwrap();
+        let before = offers(&service, &task.id).await;
+        assert!(
+            !before.iter().any(|offer| offer.contains("owner_reconcile")),
+            "Retry on Workspace Owner is never offered for a removed owner: {before:?}"
+        );
+        // The proof's follow-up actions: neither may leave the Task pinned.
+        let _retry = service
+            .perform_task_action(
+                &task.id,
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                settled.version,
+            )
+            .await;
+        let drained = service.drain(&task.id).await.unwrap();
+        let _restart = service
+            .perform_task_action(
+                &task.id,
+                TaskAction::Restart { reason: None },
+                drained.version,
+            )
+            .await;
+        service.drain(&task.id).await.unwrap();
+        let after = offers(&service, &task.id).await;
+        let current = WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !(current.state == PlacementState::Failed
+                && current.daemon_id.as_deref() == Some(daemon_id.as_str())
+                && after == before),
+            "Task is still pinned to the removed machine with the same no-op offers: {after:?}"
+        );
+    }
+
+    /// The brief's primary case on the Task's LIVE workspace: a parked action
+    /// fenced by a pending remote cancel on the removed machine.
+    #[tokio::test]
+    async fn parked_action_on_live_workspace_proceeds_after_removal() {
+        let db = Arc::new(SqliteDb::new(
+            db::create_sqlite_pool("sqlite::memory:").await.unwrap(),
+        ));
+        db::run_migrations(db.pool()).await.unwrap();
+        let (task, placement, execution) = tests::daemon_owned_fixture(&db).await;
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        DaemonRepo::mark_offline(&*db, &daemon_id, &now_rfc3339())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE workspace_placement SET state='disconnected', disconnected_at=? WHERE id=?",
+        )
+        .bind(now_rfc3339())
+        .bind(&placement.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pending_remote_cancel VALUES ('lost-op','lost-step',?,?,?,?,1,0,?)",
+        )
+        .bind(&placement.workspace_id)
+        .bind(&placement.id)
+        .bind(&daemon_id)
+        .bind(placement.runtime_id.as_deref().unwrap())
+        .bind(now_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        // The owner Cancel/Hold already terminalized the run locally.
+        sqlx::query("UPDATE execution SET status='cancelled' WHERE id=?")
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::new(64)));
+        let parked = service
+            .perform_task_action(
+                &task.id,
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: Some(true),
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                task.version,
+            )
+            .await
+            .unwrap()
+            .task;
+        assert!(crate::deferred_dispatch::queued_recovery(&parked).is_some());
+        let result = db
+            .remove_daemon(&daemon_id, "admin", true, "local", false)
+            .await
+            .unwrap();
+        assert_eq!(result.pending_remote_cancels_cleared, 1);
+        let current = service.drain(&task.id).await.unwrap();
+        let after = offers(&service, &task.id).await;
+        let p = WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !(p.state == PlacementState::Failed
+                && p.daemon_id.as_deref() == Some(daemon_id.as_str())),
+            "parked action did not proceed: Task still pinned to the removed machine, offers {after:?}"
+        );
+        assert!(
+            !after.iter().any(|offer| offer.contains("owner_reconcile")),
+            "{after:?}"
+        );
+        assert!(
+            !current
+                .error_annotation
+                .as_deref()
+                .is_some_and(|raw| raw.contains("no apply plan")),
+            "the parked owner retry must not be replayed without a plan: {:?}",
+            current.error_annotation
+        );
+    }
+
+    /// Agents pinned to the removed machine are retired with it.
+    #[tokio::test]
+    async fn removed_machine_agents_are_retired() {
+        let db = Arc::new(SqliteDb::new(
+            db::create_sqlite_pool("sqlite::memory:").await.unwrap(),
+        ));
+        db::run_migrations(db.pool()).await.unwrap();
+        let (_task, placement, _execution) = tests::daemon_owned_fixture(&db).await;
+        let daemon_id = placement.daemon_id.clone().unwrap();
+        DaemonRepo::mark_offline(&*db, &daemon_id, &now_rfc3339())
+            .await
+            .unwrap();
+        db.remove_daemon(&daemon_id, "admin", true, "local", false)
+            .await
+            .unwrap();
+        let pinned: Vec<(String, String)> =
+            sqlx::query_as("SELECT id,status FROM agent_current WHERE daemon_id=?")
+                .bind(&daemon_id)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            pinned.is_empty(),
+            "agents still pinned to the tombstone: {pinned:?}"
+        );
+        let retired: Vec<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT i.paused,i.archived_at,i.description FROM agent_identity i JOIN agent_profile p ON p.id=i.selected_profile_id WHERE p.daemon_id=?",
+        )
+        .bind(&daemon_id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(retired.len(), 1, "the row is kept for history");
+        assert_eq!(retired[0].0, 1);
+        assert!(retired[0].1.is_some());
+        assert!(retired[0].2.as_deref().unwrap().contains("was removed"));
     }
 }

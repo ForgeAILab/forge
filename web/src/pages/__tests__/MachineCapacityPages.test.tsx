@@ -18,7 +18,7 @@ vi.mock('@/stores/auth', () => ({ useAuthStore: (selector: (state: unknown) => u
 vi.mock('@tanstack/react-router', () => ({ Link: ({ children }: { children: React.ReactNode }) => <span>{children}</span> }))
 vi.mock('sonner', () => ({ toast: { error: vi.fn(), success: vi.fn() } }))
 
-const daemon: Daemon = { id: 'daemon', machine_id: 'remote', hostname: 'Remote', os: 'linux', arch: 'x64',
+const daemon: Daemon = { id: 'daemon', owner_id: null, machine_id: 'remote', hostname: 'Remote', os: 'linux', arch: 'x64',
   status: 'online', detected_clis: [], labels: {}, version: 3, created_at: '', updated_at: '',
   max_concurrent_runs: 6, run_limit: 2, effective_max_concurrent_runs: 2 }
 

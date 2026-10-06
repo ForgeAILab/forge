@@ -32,6 +32,18 @@ pub async fn register_daemon(
     headers: HeaderMap,
     Json(request): Json<DaemonRegisterRequest>,
 ) -> ApiResult<Json<DaemonRegisterResponse>> {
+    // `embedded:` names a server's own in-process daemon and `removed:` a
+    // tombstone; neither is an identity an external daemon may claim.
+    let machine_id = request.machine_id.trim();
+    if machine_id.starts_with("removed:")
+        || (machine_id.starts_with("embedded:")
+            && !services::embedded_daemon::is_embedded_daemon_machine(machine_id))
+    {
+        return Err(ApiError::conflict_with_code(
+            "machine_id_reserved",
+            "This machine_id is reserved for the Forge server",
+        ));
+    }
     let owner_id = registration_owner_id(&state, &headers).await?;
     let visibility = owner_id.as_ref().map(|_| "account".to_owned());
 
@@ -439,6 +451,33 @@ pub async fn get_daemon(
         .await?
         .ok_or_else(|| ApiError::not_found("daemon", id))?;
     Ok(Json(daemon_response(&state.db, daemon)))
+}
+
+pub async fn remove_daemon(
+    State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api_types::RemoveDaemonResponse>> {
+    // Database ownership/connection checks are atomic with credential revocation.
+    Ok(Json(
+        state
+            .daemon_service
+            .remove(&id, &user.user_id, user.is_admin)
+            .await?,
+    ))
+}
+
+pub async fn preview_daemon_removal(
+    State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api_types::RemoveDaemonPreview>> {
+    Ok(Json(
+        state
+            .daemon_service
+            .removal_preview(&id, &user.user_id, user.is_admin)
+            .await?,
+    ))
 }
 
 pub async fn update_daemon(

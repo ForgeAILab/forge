@@ -8,6 +8,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Machine registration can no longer change owners.**
+  `POST /api/v1/daemons/register` for a `machine_id` that belongs to another
+  user, or without authentication when it has an owner, returns
+  `409 machine_owned` and leaves the registration untouched. The same owner
+  re-registering still rotates its credential. A `machine_id` starting with
+  `removed:`, or with `embedded:` and not this server's own embedded identity,
+  is rejected with `409 machine_id_reserved`.
+
 - **One Task budget ledger; budget numbers are authoritative (refactor 2.5).**
   Every retry and repair allowance is spent in a per-Task ledger and read
   from it, so the number shown is the number enforced.
@@ -876,6 +884,26 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- **Remove a machine that will never return.** `DELETE /api/v1/daemons/{id}`,
+  `forge-ctl daemon remove <id>` and a Remove button with a confirmation on the
+  machines settings page. Only a disconnected machine can be removed
+  (`409 machine_connected`); the embedded server machine never can
+  (`409 local_machine`). The registration owner or an administrator may remove
+  it; anyone else gets 404. `GET /api/v1/daemons/{id}/removal` previews the
+  effect (`tasks_to_replace`, `agents_to_retire`).
+  - Removal revokes the machine's credential, clears its pending remote
+    cancellations and cleanup records, and keeps its name in history.
+    Registering the same host again creates a new machine identity.
+  - No Task stays pinned to a removed machine. Its workspaces are released and
+    each Task is re-placed on another eligible machine with a fresh workspace
+    from its last server-known branch; **work on the removed machine that was
+    not pushed is abandoned**. Runs that were live there fail as
+    `daemon_disconnected` (`cause: machine_removed`) without spending retries,
+    and a parked Restart, Retry or Release proceeds.
+  - Agents pinned to the removed machine are archived and their Tasks
+    unassigned. A `machine.removed` event records the removing user and the
+    counts.
 
 - **Typed transition bridges (refactor 2.4).** Items from
   `GET /api/v1/tasks/{id}/transitions` and MCP transition history include

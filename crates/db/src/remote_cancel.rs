@@ -40,6 +40,15 @@ impl SqliteDb {
     ) -> Result<()> {
         let mut tx = begin_immediate(self.pool()).await?;
         self.fence_hook_in_tx(&mut tx, step).await?;
+        let removed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM daemon WHERE id=? AND removed_at IS NOT NULL)",
+        )
+        .bind(placement.daemon_id.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+        if removed {
+            return Err(DbError::NotFound);
+        }
         sqlx::query("INSERT INTO task_remote_operation(operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,state,created_at) VALUES(?,?,?,?,?,?,?,?,'running',?) ON CONFLICT(operation_id) DO NOTHING")
             .bind(operation_id).bind(&step.id).bind(&placement.workspace_id).bind(&placement.id)
             .bind(placement.daemon_id.as_deref().ok_or(DbError::NotFound)?)
@@ -99,7 +108,9 @@ impl SqliteDb {
     }
 
     pub async fn mark_pending_remote_cancel(&self, operation: &RemoteTaskOperation) -> Result<()> {
-        sqlx::query("INSERT INTO pending_remote_cancel(operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at) SELECT operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at FROM task_remote_operation WHERE operation_id=? AND step_id=? AND state='running' ON CONFLICT DO NOTHING")
+        // Orphan cleanup intentionally has no registration FK. Only explicit
+        // revocation may suppress a marker for still-running remote work.
+        sqlx::query("INSERT INTO pending_remote_cancel(operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at) SELECT operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at FROM task_remote_operation WHERE operation_id=? AND step_id=? AND state='running' AND NOT EXISTS(SELECT 1 FROM daemon d WHERE d.id=task_remote_operation.daemon_id AND d.removed_at IS NOT NULL) ON CONFLICT DO NOTHING")
             .bind(&operation.operation_id).bind(&operation.step_id).execute(self.pool()).await?;
         Ok(())
     }

@@ -476,6 +476,27 @@ Existing ready placements become disconnected while an upgrade is needed, with
 an attention item and frozen leases. They wait up to `max_disconnect` (24 hours
 by default), then fail with `owner_disconnected_timeout`.
 
+### Removing a disconnected machine
+
+```bash
+forge-ctl daemon remove <daemon-id>
+forge-ctl --output json daemon remove <daemon-id>
+```
+
+Stop the daemon first. Connected machines return `machine_connected` (409), and
+the embedded server machine returns `local_machine` (409). The registration owner
+or an administrator may remove it. Removal revokes the old credential, clears
+pending remote cleanup, releases the workspaces the machine owned and retires the
+Agents pinned to it. Every Task that had a workspace there is re-placed on
+another machine with a fresh workspace from its last server-known branch;
+**work on the removed machine that was not pushed is abandoned**.
+Table output reports the machine name, the cleared cancellations, the released
+workspaces (`placements_failed`), the Tasks that will re-place, the retired Agents
+and the queued Tasks; JSON output returns every removal count. Execution history
+retains the name. Physical files remain on the missing machine. Connecting again
+requires `daemon link` to register a new identity. See
+[the API contract](api.md#removing-a-machine).
+
 ### Installing MCP client config
 
 `forge-ctl mcp install` writes the Forge MCP URL into a supported MCP client
