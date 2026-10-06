@@ -529,6 +529,8 @@ async fn update_task_inner(
         .push_bind(task.task_state_config.as_deref())
         .push(", parent_task_id = ")
         .push_bind(task.parent_task_id.as_deref())
+        .push(", condition_json = ")
+        .push_bind(crate::task_condition::condition_json((&task).into()))
         .push(", version = version + 1, updated_at = ")
         .push_bind(&task.updated_at)
         .push(" WHERE id = ")
@@ -763,10 +765,11 @@ async fn set_error_annotation_if_no_running_execution_inner(
     task.version += 1;
     let result = sqlx::query(
         "UPDATE task
-         SET error_annotation = ?, version = version + 1, updated_at = ?
+         SET error_annotation = ?, condition_json = ?, version = version + 1, updated_at = ?
          WHERE id = ? AND version = ? AND deleted_at IS NULL",
     )
     .bind(task.error_annotation.as_deref())
+    .bind(crate::task_condition::condition_json((&task).into()))
     .bind(&task.updated_at)
     .bind(&task.id)
     .bind(expected_version)
@@ -862,13 +865,14 @@ async fn update_recovery_metadata_inner(
     let result = sqlx::query(
         "UPDATE task
          SET error_annotation = ?, blocked_json = ?, failed_json = ?, metadata_json = ?,
-             version = version + 1, updated_at = ?
+             condition_json = ?, version = version + 1, updated_at = ?
          WHERE id = ? AND version = ? AND deleted_at IS NULL",
     )
     .bind(task.error_annotation.as_deref())
     .bind(task.blocked_json.as_deref())
     .bind(task.failed_json.as_deref())
     .bind(task.metadata_json.as_deref())
+    .bind(crate::task_condition::condition_json((&task).into()))
     .bind(&task.updated_at)
     .bind(&task.id)
     .bind(expected_version)
@@ -1625,10 +1629,17 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, updated_at = ?
+             SET metadata_json = ?, condition_json = ?, updated_at = ?
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(crate::task_condition::condition_json(
+            crate::task_condition::LegacyView {
+                metadata_json: metadata_json.as_deref(),
+                metadata_is_object: true,
+                ..(&task).into()
+            },
+        ))
         .bind(updated_at)
         .bind(id)
         .execute(&mut *transaction)
@@ -1698,10 +1709,17 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = ?, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(crate::task_condition::condition_json(
+            crate::task_condition::LegacyView {
+                metadata_json: metadata_json.as_deref(),
+                metadata_is_object: true,
+                ..(&task).into()
+            },
+        ))
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -1787,10 +1805,17 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = ?, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(crate::task_condition::condition_json(
+            crate::task_condition::LegacyView {
+                metadata_json: metadata_json.as_deref(),
+                metadata_is_object: true,
+                ..(&task).into()
+            },
+        ))
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -1870,10 +1895,17 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = ?, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(crate::task_condition::condition_json(
+            crate::task_condition::LegacyView {
+                metadata_json: metadata_json.as_deref(),
+                metadata_is_object: true,
+                ..(&task).into()
+            },
+        ))
         .bind(updated_at)
         .bind(id)
         .bind(expected_version)
@@ -1934,10 +1966,17 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, version = version + 1, updated_at = ?
+             SET metadata_json = ?, condition_json = ?, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(crate::task_condition::condition_json(
+            crate::task_condition::LegacyView {
+                metadata_json: metadata_json.as_deref(),
+                metadata_is_object: true,
+                ..(&task).into()
+            },
+        ))
         .bind(&input.updated_at)
         .bind(&input.task_id)
         .bind(input.expected_task_version)
@@ -2004,10 +2043,17 @@ impl TaskRepo for SqliteDb {
         let metadata_json = metadata.to_json();
         let result = sqlx::query(
             "UPDATE task
-             SET metadata_json = ?, updated_at = ?, version = version + 1
+             SET metadata_json = ?, condition_json = ?, updated_at = ?, version = version + 1
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(metadata_json.as_deref())
+        .bind(crate::task_condition::condition_json(
+            crate::task_condition::LegacyView {
+                metadata_json: metadata_json.as_deref(),
+                metadata_is_object: true,
+                ..(&task).into()
+            },
+        ))
         .bind(updated_at)
         .bind(id)
         .execute(&mut *transaction)
@@ -2105,7 +2151,7 @@ impl TaskRepo for SqliteDb {
             .get_task_in_tx(&mut transaction, id)
             .await?
             .ok_or(DbError::NotFound)?;
-        self.sync_condition_in_tx(&mut transaction, id).await?;
+        crate::task_condition::store_task_condition(&mut transaction, &task).await?;
         transaction.commit().await?;
         Ok(task)
     }
@@ -2170,6 +2216,7 @@ impl TaskRepo for SqliteDb {
             .fetch_one(&mut *transaction)
             .await?;
         let task = map_task(row)?;
+        crate::task_condition::store_task_condition(&mut transaction, &task).await?;
         self.record_mutation_reply_in_tx(&mut transaction, &task)
             .await?;
 
@@ -2378,10 +2425,14 @@ impl TaskRepo for SqliteDb {
             }
         }
 
-        let result = sqlx::query("UPDATE task SET assignee_type = ?, assignee_id = ?, status = ?, review_passed_at = NULL, entry_barrier_json = NULL, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
+        let result = sqlx::query("UPDATE task SET assignee_type = ?, assignee_id = ?, status = ?, review_passed_at = NULL, entry_barrier_json = NULL, condition_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND version = ? AND deleted_at IS NULL")
             .bind(&input.assignee_type)
             .bind(input.assignee_id.as_deref())
             .bind(&input.target_status)
+            .bind(crate::task_condition::condition_json(crate::task_condition::LegacyView {
+                entry_barrier_json: None,
+                ..(&task).into()
+            }))
             .bind(&input.claimed_at)
             .bind(&input.task_id)
             .bind(input.expected_version)
@@ -2676,6 +2727,8 @@ async fn update_task_status_inner(
     }
     query
         .push(", entry_barrier_json = NULL")
+        .push(", condition_json = ")
+        .push_bind(crate::task_condition::condition_json((&task).into()))
         .push(", version = version + 1, updated_at = ")
         .push_bind(&task.updated_at)
         .push(" WHERE id = ")
@@ -2722,9 +2775,6 @@ async fn update_task_status_inner(
     DomainEventRepo::append_event_in_tx(db, &mut transaction, &event).await?;
     if let Some(marker) = recovery_marker {
         insert_recovery_marker_in_tx(&mut transaction, marker).await?;
-    }
-    if crate::task_writer::owns_task(&task.id) {
-        db.sync_condition_in_tx(&mut transaction, &task.id).await?;
     }
     transaction.commit().await?;
     Ok(Some(task))

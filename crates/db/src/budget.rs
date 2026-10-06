@@ -764,6 +764,7 @@ pub async fn failed_review_entry(
         .get_task_in_tx(&mut tx, &task.id)
         .await?
         .ok_or(DbError::NotFound)?;
+    crate::task_condition::store_task_condition(&mut tx, &updated).await?;
     tx.commit().await?;
     Ok((updated, allowed))
 }

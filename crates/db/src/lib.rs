@@ -17,7 +17,13 @@ mod review_conformance;
 mod sqlite;
 mod task_condition;
 mod task_metadata;
-pub use task_condition::*;
+pub use task_condition::{
+    legacy_annotation_blocks, map_legacy_condition, ConditionCapacityScope, ConditionContinuation,
+    ConditionEnvironmentKind, ConditionEvidence, ConditionSource, HumanBoundary,
+    LegacyConditionField, LegacyConditionInput, ParkReason, RetryCause, TaskCondition,
+    TerminalOutcome, UnknownConditionProblem, EVIDENCE_VALUE_LIMIT,
+    LEGACY_BLOCKING_ANNOTATION_KINDS,
+};
 mod task_mutation;
 mod task_step;
 pub mod task_writer;

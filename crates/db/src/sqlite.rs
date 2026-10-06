@@ -1057,6 +1057,9 @@ impl SqliteDb {
             .bind(&input.task_id)
             .execute(&mut **transaction)
             .await?;
+            // Admission clears are SQL-computed: sync the condition shadow.
+            // The recovery-intent consume below only runs for a Running
+            // admission too, so one sync after both covers them.
         }
 
         if let Some(recovery_id) = admission
@@ -1076,6 +1079,9 @@ impl SqliteDb {
             .bind(recovery_id)
             .execute(&mut **transaction)
             .await?;
+        }
+        if input.status == ExecutionStatus::Running {
+            crate::task_condition::sync_condition(transaction, &input.task_id).await?;
         }
 
         let row = sqlx::query("SELECT * FROM execution WHERE id = ?")

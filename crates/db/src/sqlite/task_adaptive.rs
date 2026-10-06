@@ -266,10 +266,16 @@ pub(super) async fn apply_adaptive_task_command(
                     // not visible before commit, so this complete default
                     // document cannot race an independent marker writer.
                     sqlx::query(
-                        "UPDATE task SET metadata_json = ?, updated_at = ?
+                        "UPDATE task SET metadata_json = ?, condition_json = ?, updated_at = ?
                          WHERE id = ? AND project_id = ?",
                     )
                     .bind(&metadata)
+                    .bind(crate::task_condition::condition_json(
+                        crate::task_condition::LegacyView {
+                            metadata_json: Some(metadata.as_str()),
+                            ..(&task).into()
+                        },
+                    ))
                     .bind(&now)
                     .bind(&task.id)
                     .bind(&source.project_id)
