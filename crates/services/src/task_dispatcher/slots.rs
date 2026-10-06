@@ -703,6 +703,121 @@ mod tests {
         assert_eq!((slots.active, slots.parked), (2, annotations.len() as u32));
         assert_eq!(slots, walk_project_slots(&db, &project).await.unwrap());
     }
+    /// Refactor 3.1 M1: the Task condition shadow parks a Task exactly where
+    /// this dispatcher's own predicate blocks it. The annotation kinds are one
+    /// shared list, and the mapping is checked against `has_blocking_annotation`
+    /// itself, so neither side can drift.
+    #[tokio::test]
+    async fn condition_mapping_blocks_exactly_where_the_dispatcher_blocks() {
+        assert!(std::ptr::eq(
+            helpers::BLOCKING_ANNOTATION_KINDS,
+            db::LEGACY_BLOCKING_ANNOTATION_KINDS
+        ));
+        let (db, project) = fixture().await;
+        let template = task(&db, &project, "todo", None).await;
+        let kinds = [
+            "dispatch_failed",
+            "workflow_loop",
+            "cascade_failed",
+            "dependency_cancelled",
+            "merge_conflict",
+            "target_repo_dirty",
+            "dirty_worktree",
+            "ci_failed",
+            "review_gate_failed",
+            "review_budget_exhausted",
+            "review_blocked",
+            "review_needs_owner",
+            "environment_not_ready",
+            "retry_exhausted",
+            "merge_fix_budget_exhausted",
+            "workflow_guard_rejected",
+            "internal_command_failed",
+            "executor_failed",
+            "workspace_failed",
+            "workspace_reset_required",
+            "workspace_error",
+            "before_work_hook_timeout",
+            "before_work_hook_failed",
+            "max_turns_exceeded",
+            "manual_stop",
+            "recovery_required",
+            "executor_unavailable",
+            "agent_timeout",
+            "pull_request_merge",
+            "merge_fix_ci_failed",
+            "plan_settlement_wait",
+            "unknown",
+            "future_kind",
+            "",
+        ];
+        for kind in helpers::BLOCKING_ANNOTATION_KINDS {
+            assert!(kinds.contains(kind), "table covers blocking kind {kind}");
+        }
+        let mut annotations: Vec<Option<String>> = kinds
+            .iter()
+            .map(|kind| Some(serde_json::json!({"type": kind, "message": "m"}).to_string()))
+            .collect();
+        annotations.extend([
+            None,
+            Some("{}".to_owned()),
+            Some(r#"{"message":"untyped"}"#.to_owned()),
+            Some(r#"{"kind":"manual_stop"}"#.to_owned()),
+            Some(r#"{"type":["manual_stop"]}"#.to_owned()),
+            Some(r#"{"type":"ci_failed","type":"manual_stop"}"#.to_owned()),
+            Some(r#"{"type":"manual_stop","type":"ci_failed"}"#.to_owned()),
+            Some(r#"{"type":"manual_stop","n":1e999}"#.to_owned()),
+            Some(r#"{"type":"manual_stop","blocked_by":"\ud800"}"#.to_owned()),
+            Some(format!(
+                "{{\"type\":\"manual_stop\",\"deep\":{}1{}}}",
+                "[".repeat(200),
+                "]".repeat(200)
+            )),
+            Some("{bad".to_owned()),
+            Some("null".to_owned()),
+            Some("[]".to_owned()),
+            Some("\"manual_stop\"".to_owned()),
+            Some(String::new()),
+        ]);
+        let interruptions: [(Option<&str>, Option<&str>); 5] = [
+            (None, None),
+            (Some(r#"{"kind":"ci_failed"}"#), None),
+            (Some("{}"), None),
+            (None, Some(r#"{"kind":"executor_failed"}"#)),
+            (None, Some("{bad")),
+        ];
+        let mut blocked = 0;
+        for annotation in &annotations {
+            for (blocked_json, failed_json) in interruptions {
+                let mut legacy = template.clone();
+                legacy.error_annotation = annotation.clone();
+                legacy.blocked_json = blocked_json.map(str::to_owned);
+                legacy.failed_json = failed_json.map(str::to_owned);
+                let dispatcher_blocks = helpers::has_blocking_annotation(&legacy);
+                let condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&legacy));
+                assert_eq!(
+                    condition.is_blocked(),
+                    dispatcher_blocks,
+                    "annotation {annotation:?} blocked {blocked_json:?} failed {failed_json:?}: {condition:?}"
+                );
+                if !dispatcher_blocks {
+                    assert!(matches!(condition, db::TaskCondition::Clear { .. }));
+                }
+                blocked += usize::from(dispatcher_blocks);
+            }
+            assert_eq!(
+                db::legacy_annotation_blocks(annotation.as_deref()),
+                helpers::has_blocking_annotation(&db::Task {
+                    error_annotation: annotation.clone(),
+                    ..template.clone()
+                }),
+                "{annotation:?}"
+            );
+        }
+        // 12 blocking kinds plus one duplicate-key case block on the
+        // annotation alone; every row with blocked/failed set blocks.
+        assert_eq!(blocked, annotations.len() * 4 + 13);
+    }
     #[tokio::test]
     async fn environment_waiters_are_parked_and_invalidate_list_revision() {
         let (db, mut project) = fixture().await;

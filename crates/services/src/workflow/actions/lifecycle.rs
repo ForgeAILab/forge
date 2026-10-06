@@ -362,6 +362,9 @@ async fn persist_before_work_annotation(
     if update.rows_affected() != 1 {
         return Err(db::DbError::NotFound);
     }
+    ctx.db
+        .sync_condition_in_tx(&mut transaction, &task.id)
+        .await?;
     let mut interruption_snapshot = task.clone();
     interruption_snapshot.error_annotation = Some(annotation);
     interruption_snapshot.updated_at = updated_at;

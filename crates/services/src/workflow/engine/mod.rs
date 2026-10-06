@@ -1537,6 +1537,9 @@ impl WorkflowExecution<'_> {
                     // durable successful merge consumes this marker.
                     sqlx::query("UPDATE task SET metadata_json=json_set(metadata_json,'$.paused_integration.state',?) WHERE id=? AND CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json,'$.paused_integration.state') END=?")
                         .bind(&target_state).bind(&task_id).bind(&current_status).execute(&mut *transaction).await?;
+                    // The three writes above are SQL-computed legacy condition
+                    // changes; one shadow sync covers them.
+                    self.db.sync_condition_in_tx(&mut transaction, &task_id).await?;
                     if reopens_visible_work {
                         ProjectRepo::increment_project_work_epoch(
                             &*self.db,

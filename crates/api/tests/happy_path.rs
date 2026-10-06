@@ -264,6 +264,19 @@ PY"# }
             .all(|event| event.event_type != PROJECT_HOOK_RUN_CHANGED_EVENT),
         "no project_hook.run_changed events are emitted when no hooks are configured"
     );
+    assert_task_conditions_match_legacy(&harness.state.db).await;
+}
+
+/// Refactor 3.1 stage 1: every writer the end-to-end flow went through kept
+/// the Task condition shadow equal to the mapping of its legacy fields.
+async fn assert_task_conditions_match_legacy(db: &db::SqliteDb) {
+    assert_eq!(
+        db.task_condition_violations()
+            .await
+            .expect("condition sweep runs"),
+        Vec::<String>::new(),
+        "a Task writer skipped the condition dual-write seam"
+    );
 }
 
 #[tokio::test]
@@ -516,6 +529,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     );
     dispatcher.stop();
     dispatch_loop.await.expect("dispatcher exits");
+    assert_task_conditions_match_legacy(&harness.state.db).await;
 }
 
 struct TestHarness {
@@ -1266,4 +1280,5 @@ async fn single_machine_environment_recheck_resumes_task_dispatch() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert_task_conditions_match_legacy(&harness.state.db).await;
 }

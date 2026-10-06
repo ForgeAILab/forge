@@ -3759,6 +3759,120 @@ Project deletion; shared retries/dead letters and existing wake budgets apply.
 The Project Agent proposes one splitting Task; the user resolves the incident
 in Mission Control.
 
+### Task condition dual-write foundation
+
+`V202610060030__task_condition` adds one private, non-null `condition_json`
+column and an expression index on its tagged enum kind. Stage one is a shadow:
+`error_annotation`, `blocked_json`, `failed_json`, `entry_barrier_json` and
+condition metadata stay authoritative. Task serialization, admission, dispatch,
+actions, health, human-readiness, flow-control slot counts, events and Attention
+continue to read those legacy inputs. The migration does not change their bytes,
+Task versions/timestamps, retained queue intents, publication claims or budget
+receipts, including archived/deleted Tasks and malformed historical JSON.
+
+The internal `db::TaskCondition` variants are `Clear`, `Entering`, `Running`,
+`Deferred`, `Parked`, `Failed` and `Settled`. Parks carry one primary typed reason,
+ordered secondary reasons, a continuation and bounded legacy evidence. The
+stage-one mapper derives only `Clear`, `Deferred`, `Parked` and `Failed` from the
+five legacy inputs. `Entering`, `Running` and `Settled` need durable
+ownership/workflow witnesses, which this import does not have: an old `running`
+entry barrier becomes `UnknownCondition(UnownedEntry)` rather than a fabricated
+step owner. No custom workflow hooks are retried by this stage.
+
+**One mapping, in Rust.** `db::map_legacy_condition` is a pure function of the
+five legacy values. The migration's backfill (a Rust post-step in the migration
+transaction), every writer seam and the invariant check call it. There is no
+mapping view and no trigger: an earlier draft compiled the mapping into every
+Task write statement through triggers, which cost about 110 ms per statement
+prepare and 0.6 to 1.2 ms per write. The column default is the stored form of the
+empty mapping, so a row no writer has touched is already correct.
+
+**The mapping parks only what legacy blocks on.** A Task is `Parked`/`Failed`
+only where today's dispatcher and readers treat it as blocked:
+
+- `blocked_json` or `failed_json` present (any value, including malformed);
+- an `error_annotation` whose `type` is one of
+  `db::LEGACY_BLOCKING_ANNOTATION_KINDS`, the same list
+  `task_dispatcher::helpers` uses, parsed the way the dispatcher parses it;
+- a blocked or unowned entry barrier, a hold, or a wait recorded in metadata
+  (owner, environment, placement, upgrade, pause, approval, capacity, dispatch
+  refusal, plan settlement).
+
+Any other annotation (`merge_conflict`, `ci_failed`, `executor_failed`,
+`retry_exhausted`, `{}`, untyped or unreadable text) is evidence on a
+non-parking condition, as is a `deferred_dispatch` object that is not a usable
+timer. `agent_timeout` maps to its own typed reason. Explicit failed-process
+metadata keeps precedence; holds and exhausted budgets precede ordinary
+failures. Same-cause annotation/block rows deduplicate. Generic
+`retry_exhausted` keeps an unresolved budget kind until a producer supplies the
+ledger witness. A BLOB or invalid UTF-8 in a legacy column, malformed or
+non-object `blocked_json`/`failed_json`/barrier/metadata, and wrongly typed wait
+keys become named `UnknownCondition` reasons; none of them fails a write or the
+backfill. Unrelated metadata keys stay with their owner and invent no park.
+
+**Evidence is bounded.** Each copied legacy value, and each of the 24 condition
+metadata fragments, is capped at `db::EVIDENCE_VALUE_LIMIT` (4 KiB) with a
+truncation marker; the legacy columns keep the full data. Metadata is scanned
+one level deep with values left as raw text, so an unrelated large key is
+skipped, never decoded or re-serialized, and large numbers, lone escapes and
+deep nesting survive in their fragment. Mapping cost is linear in the size of
+the five legacy values.
+
+**Dual write at the writer seams.** Each writer of a legacy condition column
+writes the shadow in the same transaction as its legacy write. A stored
+condition is compared as text and never decoded on the write path, so one that
+no longer decodes is recomputed and overwritten. Shadow writes change only
+`condition_json`: no version, timestamp, list/board revision, event, Attention
+incident or wake.
+
+| Writer family | How it syncs |
+|---|---|
+| Repository update, status CAS, annotation, recovery metadata and queued-recovery restore, the six metadata mutators, wake, claim, sub-task and create-time metadata | `condition_json = ?` folded into the legacy `UPDATE`, mapped from the Task the writer already holds. No extra statement. |
+| Entry barrier setters, board move, Review entry budget | One conditional `UPDATE` from the Task re-read in that transaction. |
+| `TaskQuery`, `BulkTaskQuery` and queued `TaskMutation::Sql` (placement, environment, owner wait, plan transport, reconnect, bulk clears, remote-cancel ack) | After a statement that names a legacy column and changed a row: read the five values, map, write if changed. |
+| Direct SQL: execution admission, workflow transition, queue settlement and loop park, lifecycle hook annotation, reconnect barrier reset | The same read-map-write through `SqliteDb::sync_condition_in_tx`, called after the legacy write. |
+| Task insert | The column default (an insert sets no condition column). |
+
+`SqliteDb::set_condition` is the strict entry for a producer that states a
+condition: it requires the Task's claimed step and live lease, rejects an
+expected-version mismatch, compares all five source values (metadata can change
+without advancing `Task.version`) and, in stage one, refuses a condition other
+than the legacy mapping. The writer seams above are not lease-fenced, so they
+add no rejection to a legacy write. A new direct SQL writer of a legacy column
+must call the seam; nothing in the schema enforces it. The safety net for now is
+test-only: `SqliteDb::task_condition_violations()` sweeps every Task, the
+writer-family test and the end-to-end happy path assert it is empty, and
+`check_task_condition_invariant(task)` checks one Task.
+
+Cost, measured with `crates/db/tests/task_condition_write_cost.rs` on this
+change and its base: a raw cached Task statement is unchanged (the triggers are
+gone); the repository metadata writer costs about 10% more in a release build;
+a SQL-computed `TaskQuery` write costs about 26 µs more (one read and one
+conditional write).
+
+Queue intent/claim/receipt **bodies** stay out of condition evidence. A queued
+recovery continuation retains only its intent id; the original command remains
+its execution/rollback authority. Raw legacy annotations are kept only as
+private import evidence, not advertised action lists or new public aliases. No
+condition payload is fed to Attention in stage one, so incident digests and
+consumed wake decisions are unchanged.
+
+Stage two must:
+
+- move each producer to typed facts through `set_condition`, with ledger, entry
+  and operation witnesses, and keep existing material blocker identity before
+  any reader switches;
+- give `coordination_review_pending` a child witness. It maps to `Clear` today
+  (legacy uses the key as an advance trigger, not a dispatch block); the target
+  is `Park(Children)` while children remain;
+- decide advisory merge annotations (`merge_conflict`, `ci_failed`, dirty
+  worktree) per bridge: manual park or automatic repair. They are `Clear` with
+  evidence today because the dispatcher dispatches through them;
+- type the environment deferral shape (`deferred_dispatch` with `kind`/`reason`
+  and no deadline), which is evidence only today;
+- replace the test-only sweep with the stage-three production sweep, and add
+  a startup check before any reader depends on the shadow.
+
 ### Task condition actions
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, existing interruption columns, entry-barrier/flow-control metadata, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.

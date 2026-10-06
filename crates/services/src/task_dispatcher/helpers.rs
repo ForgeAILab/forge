@@ -66,20 +66,12 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
     }
 }
 
-pub(super) const BLOCKING_ANNOTATION_KINDS: &[&str] = &[
-    "manual_stop",
-    "workflow_loop",
-    "cascade_failed",
-    "workspace_error",
-    "agent_timeout",
-    "recovery_required",
-    "workspace_reset_required",
-    "max_turns_exceeded",
-    "before_work_hook_failed",
-    "before_work_hook_timeout",
-    "review_needs_owner",
-    crate::workflow::engine::DISPATCH_FAILED_ANNOTATION,
-];
+/// One list with the Task condition mapping, so the two cannot drift.
+pub(super) const BLOCKING_ANNOTATION_KINDS: &[&str] = db::LEGACY_BLOCKING_ANNOTATION_KINDS;
+const _: () = assert!(matches!(
+    crate::workflow::engine::DISPATCH_FAILED_ANNOTATION.as_bytes(),
+    b"dispatch_failed"
+));
 
 pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     if task.blocked_json.is_some() || task.failed_json.is_some() {

@@ -1615,9 +1615,15 @@ impl ProjectOrchestrationRepo for SqliteDb {
             // metadata writer until commit. Keep the caller's complete
             // initial document here; existing Tasks use `mutate_metadata`.
             sqlx::query(
-                "UPDATE task SET metadata_json = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+                "UPDATE task SET metadata_json = ?, condition_json = ?, updated_at = ? WHERE id = ? AND project_id = ?",
             )
             .bind(metadata_json)
+            .bind(crate::task_condition::condition_json(
+                crate::task_condition::LegacyView {
+                    metadata_json: Some(metadata_json),
+                    ..(&task).into()
+                },
+            ))
             .bind(&task.updated_at)
             .bind(&task.id)
             .bind(&task.project_id)
