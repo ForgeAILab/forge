@@ -122,10 +122,12 @@ mod repo;
 mod repo_location;
 mod review;
 mod runtime;
+mod schedule;
 mod shared_media;
 mod skill;
 mod system_setting;
 mod task;
+pub use schedule::ScheduleRead;
 mod task_adaptive;
 mod task_comment;
 mod task_dependency;
@@ -262,28 +264,9 @@ pub(crate) async fn wake_dispatch_for_project_in_tx(
     project_id: &str,
     updated_at: &str,
 ) -> Result<u64> {
-    let result = crate::task_writer::BulkTaskQuery::new(
-        db,
-        "UPDATE task
-         SET metadata_json = NULLIF(
-                 json_remove(metadata_json, '$.dispatch_disposition', '$.deferred_dispatch'),
-                 '{}'
-             ),
-             updated_at = ?,
-             version = version + 1
-         WHERE project_id = ?
-           AND deleted_at IS NULL
-           AND json_valid(metadata_json)
-           AND (
-               json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-               OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL
-           )",
-    )
-    .bind(updated_at)
-    .bind(project_id)
-    .execute_in_tx(transaction)
-    .await?;
-    Ok(result.tasks())
+    let _ = (db, updated_at);
+    Ok(sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) SELECT id,1 FROM task WHERE project_id=? AND deleted_at IS NULL ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1")
+        .bind(project_id).execute(&mut **transaction).await?.rows_affected())
 }
 
 fn limit(page: &PageRequest) -> i64 {

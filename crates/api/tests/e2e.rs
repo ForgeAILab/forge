@@ -228,6 +228,7 @@ async fn forge_mvp_rest_api_flow() {
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -250,6 +251,7 @@ async fn add_dependency_succeeds() {
         Vec::<String>::new(),
         "condition producer invariant"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -280,6 +282,7 @@ async fn add_dependency_cycle_returns_unprocessable_entity() {
         Vec::<String>::new(),
         "condition producer invariant"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -318,6 +321,7 @@ async fn remove_dependency_succeeds() {
         Vec::<String>::new(),
         "condition producer invariant"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -509,6 +513,7 @@ async fn move_task_endpoint_updates_board_order_replays_and_reports_conflicts() 
         Vec::<String>::new(),
         "condition producer invariant"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -565,6 +570,7 @@ async fn project_task_pages_include_revision_tokens_for_pagination() {
         Vec::<String>::new(),
         "condition producer invariant"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -597,6 +603,7 @@ async fn list_dependencies_returns_task_dependencies() {
         Vec::<String>::new(),
         "condition producer invariant"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -637,6 +644,7 @@ async fn claim_blocked_by_dependency_gate_returns_conflict() {
         Vec::<String>::new(),
         "condition producer invariant"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -689,6 +697,7 @@ async fn agent_claim_succeeds() {
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -718,6 +727,7 @@ async fn shell_agent_availability_returns_active() {
         Vec::<String>::new(),
         "condition producer invariant"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 #[tokio::test]
@@ -767,6 +777,7 @@ async fn scoped_mcp_endpoint_creates_task_without_project_id_argument() {
         Vec::<String>::new(),
         "condition producer invariant"
     );
+    common::assert_scheduler_clean(&state).await;
 }
 
 async fn test_app_with_state() -> (Router, AppState) {

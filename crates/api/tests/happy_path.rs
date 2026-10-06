@@ -265,6 +265,7 @@ PY"# }
         "no project_hook.run_changed events are emitted when no hooks are configured"
     );
     assert_task_conditions_match_legacy(&harness.state.db).await;
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 /// Every producer in the end-to-end flow agrees with its legacy fields and
@@ -530,6 +531,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     dispatcher.stop();
     dispatch_loop.await.expect("dispatcher exits");
     assert_task_conditions_match_legacy(&harness.state.db).await;
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 struct TestHarness {
@@ -1281,4 +1283,5 @@ async fn single_machine_environment_recheck_resumes_task_dispatch() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_task_conditions_match_legacy(&harness.state.db).await;
+    common::assert_scheduler_clean(&harness.state).await;
 }

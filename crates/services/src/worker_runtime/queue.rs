@@ -152,6 +152,7 @@ impl TaskStepWorker {
                 | "follow_up_execution"
                 | "follow_up_interactive_execution"
                 | "dispatch_queued_recovery"
+                | "reconcile_role"
                 | "dispatch_recovery_role"
                 | "dispatch_initial_role_execution_with_metadata_and_admission"
                 | "dispatch_initial_role_execution_with_optional_admission"
@@ -655,7 +656,8 @@ impl TaskStepWorker {
             if !command.preempt
                 && matches!(
                     command.operation.as_str(),
-                    "transition"
+                    "reconcile_role"
+                        | "transition"
                         | "transition_with_plan_publication"
                         | "engine_transition"
                         | "perform_task_action_as"

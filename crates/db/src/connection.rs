@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, OnceLock, Weak,
     },
     time::Duration,
@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 pub(crate) struct EventHooks {
     committed: Mutex<HashSet<usize>>,
     pending: AtomicUsize,
+    generation: AtomicU64,
     notify: Arc<Notify>,
     #[cfg(test)]
     release_inspections: AtomicUsize,
@@ -49,6 +50,12 @@ impl EventHooks {
         let removed = committed.remove(&key);
         self.pending.store(committed.len(), Ordering::Release);
         removed
+    }
+    pub(crate) fn pending_commit(&self) -> bool {
+        self.pending.load(Ordering::Acquire) > 0
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
     pub(crate) fn notify(&self) -> Arc<Notify> {
         Arc::clone(&self.notify)
@@ -132,7 +139,7 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
                 hooks.take(key);
                 let updated = Arc::clone(&dirty);
                 handle.set_update_hook(move |update| {
-                    if update.table == "domain_event" && update.operation == sqlx::sqlite::SqliteOperation::Insert {
+                    if (update.table == "domain_event" && update.operation == sqlx::sqlite::SqliteOperation::Insert) || ((update.table == "task_schedule_dirty" || update.table == "project_schedule_dirty") && update.operation != sqlx::sqlite::SqliteOperation::Delete) {
                         updated.store(true, Ordering::Relaxed);
                     }
                 });
@@ -164,6 +171,7 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
                 // SQLx's own release check subsequently pings the connection.
                 let key = connection.lock_handle().await?.as_raw_handle().as_ptr() as usize;
                 if hooks.take(key) {
+                    hooks.generation.fetch_add(1, Ordering::Release);
                     hooks.notify.notify_waiters();
                     #[cfg(test)] hooks.deliveries.fetch_add(1, Ordering::Release);
                 }

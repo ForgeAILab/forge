@@ -966,12 +966,7 @@ impl RuntimeSupervisor {
         }
         // Integration entries whose hooks were lost (before the durable-hooks
         // upgrade) get their hooks row before the step worker starts.
-        match self
-            .runtime
-            .task_dispatcher
-            .recover_stranded_hook_entries()
-            .await
-        {
+        match self.runtime.task_dispatcher.startup_reconcile().await {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "re-enqueued stranded integration hooks"),
             Err(error) => tracing::warn!(%error, "stranded hook recovery failed during startup"),

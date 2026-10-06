@@ -91,7 +91,7 @@ impl TaskService {
                 )
                 .await?;
                 let current_parent_id = current_parent.id.clone();
-                crate::wake_task_dispatch(
+                crate::kick_task_reconciliation(
                     &self.db,
                     &current_parent_id,
                     "coordination root role assignment removed",

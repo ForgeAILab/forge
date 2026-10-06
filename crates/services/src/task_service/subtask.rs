@@ -51,7 +51,7 @@ impl TaskService {
         let Some(next) = crate::task_hierarchy::next_incomplete_child(&subtasks, &workflow) else {
             return Ok(false);
         };
-        crate::wake_task_dispatch(&self.db, &next.id, reason).await?;
+        crate::kick_task_reconciliation(&self.db, &next.id, reason).await?;
         Ok(true)
     }
 
@@ -69,7 +69,7 @@ impl TaskService {
         }
         self.set_coordination_review_pending(parent_task_id, true)
             .await?;
-        crate::wake_task_dispatch(
+        crate::kick_task_reconciliation(
             &self.db,
             parent_task_id,
             "ordered subtask sequence ready for aggregate review",
@@ -260,7 +260,7 @@ impl TaskService {
         self.set_coordination_review_pending(parent_task_id, false)
             .await?;
 
-        crate::wake_task_dispatch(
+        crate::kick_task_reconciliation(
             &self.db,
             parent_task_id,
             "ordered subtask sequence completed",

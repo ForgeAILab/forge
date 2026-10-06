@@ -5483,3 +5483,84 @@ column `task_step.workflow_ref_id`, not a JSON scan.
 Initial dispatcher admission only commits/enqueues and kicks the worker. A queued rollback to the initial state finalizes the existing placement-refusal bookkeeping; the dispatcher does not drain chains inline.
 
 Board reorders and recovery markers remain audit rows only; neither changes the status epoch. expected_version remains a diagnostic stamp and is never rebound. Replay-marker cleanup is a queued Task mutation. Queued role-entry agent references reserve admission capacity only for the short window before the entry takes its slot: a Task's available fast-lane head step, a claimed fast cascade or hook step whose dispatch has no recorded result. Steps behind another step, in retry back-off, or waiting for or inside a long-lane merge/CI hook hold no agent or server capacity; if their later dispatch finds the agent full it is skipped and the dispatcher's active-task recovery re-drives it. The dispatcher kicks and continues rather than running the queue. Lane classification is checked again against the resolved workflow at execution and requeues a changed lane before any transition starts.
+
+### Task condition scheduler and owner matrix
+
+Stage three switches the dispatcher to `next_step(snapshot)`. Public health,
+awaiting-human, exceptions, actions, operator Task status, MCP, Attention and web
+projections still read the dual-written legacy fields. The new resolver is pure
+and total over effective default and custom workflow states. A batched reader
+loads condition, entry epoch, queue ownership, role assignments, latest role
+executions, Reviews, hierarchy, dependencies and placement; admission retains
+its existing authority, capacity and optimistic-concurrency checks. Every
+resolver result is either a payload for the existing `task_step` command/hooks
+adapter or a typed park with an owner and recovery action. Unsafe custom hooks
+are never replayed. Missing merge-entry or publication ownership parks for
+inspection rather than inventing an owner.
+
+`task_schedule_dirty` deduplicates committed invalidations by Task ID and
+monotonic generation. Relationship, dependency, shared-workspace, role,
+Project/repository, readiness, remote-cancellation and capacity changes select
+their affected Tasks. SQLite's update/commit hooks collect hints; SQLx release
+announces them after commit. Rollback cannot deliver a durable invalidation.
+Acknowledgement clears only the observed dirty generation; the counter persists
+so command causation identities cannot repeat. `project_schedule_dirty`
+keeps repository maintenance working for Projects that have no Tasks.
+Automatic invalidation changes no Task version, board revision, retry intent or
+Attention material. Authorized process continuation retains its semantic clear.
+
+The supervised dispatcher owns one 120-second sweep and the stage-two condition
+checker, with one persisted keyset cursor (`task_schedule_sweep`). Startup proves
+the entire current set; cancellation retains the cursor for the next pass.
+Condition reads remain off the writer and stale condition repair remains fenced
+on the read version and bytes. Mapping revision changes still complete a
+background backfill. The sweep also reconciles any visible non-terminal Task
+without a valid queued step, execution owner or typed park. It independently
+rechecks cached dispatch refusals even if their delivery hint was lost, while
+preserving owned retry timers. It logs the responsible
+owner/action and counts the repair in the existing invariant report. Derived
+parks live in `task_schedule_park`, fenced by status epoch; they are not a second
+execution queue or authority for replaying effects. The queue remains per-Task
+FIFO, with stable reconciliation causation keys and entry fences.
+
+Retry, owner grace, failed-Review grace, readiness, reservation and lease deadlines
+wake independently of the sweep. Readiness jobs and owner/step-worker timers
+retain their existing owners. Negative repository readiness retains its probe
+cadence because a filesystem commit does not produce a database invalidation.
+An idle dispatcher tick returns without database work. The running-execution
+Task index replaces the producer's pinned Agent usage index; the condition-kind
+index is removed because reconciliation seeks by Task ID, not condition kind.
+
+| Park reason | Responsible owner | Recovery action |
+|---|---|---|
+| Held | User who held the Task | Release the hold |
+| Failure, AgentTimeout, BudgetExhausted | User / Project Agent | Repair the cause, authorize recovery or a new budget window |
+| EntryBlocked, UnknownCondition | Workflow / named missing entry or cleanup owner | Inspect the durable witness and explicitly repair/retry |
+| WorkflowInvalid | Project Agent / user | Supply a valid workflow, assignment or explicit continuation |
+| HumanDecision, HumanWork | User / assigned human | Approve, perform the work, assign a role or move the Task |
+| Capacity | Scheduler; machine/Project owner supplies capacity | Release capacity; committed changes kick matching waiters |
+| DispatchRefusal | User / Project Agent | Correct the governing Task, Project or execution setup |
+| ProjectPaused | User / repository or readiness owner | Fix setup and resume the Project |
+| OwnerOffline, DaemonUpgradeRequired, AgentUnavailable | Machine or Agent owner | Reconnect/upgrade, enable the Agent or select another owner |
+| Environment, PlacementDenied | Machine / Project execution-setup owner | Check, provision or repair the selected environment/placement |
+| RemoteCancelPending | Exact remote operation owner | Acknowledge the matching operation, placement and generation |
+| Dependencies | Project Agent / dependency owner | Complete or explicitly resolve the dependency |
+| Children | Project Agent / child workers | Settle the ordered child sequence |
+| PlanSettlementWait | Publication worker | Settle the identity-fenced publication/cleanup |
+| QueueOwned, InFlight | Task-step / execution worker | Wait for the live owner; its lease timer owns recovery |
+| RetryDeadline, ReviewGrace | Scheduler / identity-fenced publication worker | Reconcile at the exact deadline; failed private cleanup retries after 10 seconds |
+| ExecutionStopped | User / assigned role owner | Explicitly confirm, repair or resume the stopped attempt |
+| ReviewChecks | Workflow/check owner | Complete or explicitly retry the required checks |
+
+Slot accounting remains the existing legacy projection: an admitted
+`OwnerOffline` wait retains an active slot, while `ReviewNeedsOwner` retains a
+parked slot. A generic park tag does not change counting classification. Active
+recovery precedes new admission; initial candidates retain priority, creation
+and ID order. Machine and Agent admission limits remain transactionally fenced. Due role
+admissions keep their enqueue order across Agents and machines; later admission
+commands wait behind an earlier live role command. Backoff and stale epochs do
+not block that order. Releasing a fast queued admission also kicks its matching
+capacity waiters, even when no execution was created.
+Stage four must compose these owner results into the public condition DTO and
+switch all projections together, preserve the material-blocker digest and slot
+classification, regenerate bindings and document the single public beta break.

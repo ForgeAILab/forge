@@ -1,18 +1,24 @@
+#[cfg(test)]
 use std::collections::HashSet;
 
-use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
-use db::{AgentRepo, DbError, Project, Task, TaskRoleAssignmentRepo};
+use api_types::{Actor, SystemComponent};
+#[cfg(test)]
+use api_types::{StateKind, WorkflowDefinition};
+use db::{AgentRepo, DbError, Task};
+#[cfg(test)]
+use db::{Project, TaskRoleAssignmentRepo};
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
     deferred_dispatch,
     task_service::TransitionOptions,
-    workflow::engine::WorkflowEngine,
     Result, ServiceError,
 };
 
 use super::{helpers, TaskDispatcher};
+#[cfg(test)]
+use crate::workflow::engine::WorkflowEngine;
 
 /// Dispatch-disposition capability for the coordination-root aggregate review
 /// advance. A root never takes an ordinary role dispatch — both scans `continue`
@@ -64,7 +70,7 @@ impl TaskDispatcher {
     /// 19 consecutive scans until a user recovered the Task by hand.
     ///
     /// Parking is safe here because every event that can change the answer also
-    /// wakes the root: `advance_subtask_sequence` calls `wake_task_dispatch` on
+    /// wakes the root: `advance_subtask_sequence` calls `kick_task_reconciliation` on
     /// the parent before advancing it, and any recovery action that clears the
     /// root's blocker bumps its `version`. Either invalidates the disposition.
     ///
@@ -114,6 +120,7 @@ impl TaskDispatcher {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn dispatch_initial_tasks(
         &self,
         project: &Project,
@@ -227,7 +234,7 @@ impl TaskDispatcher {
                     // and its warning — entirely rather than re-deriving and
                     // re-logging the identical denial every scan (F11). Nothing
                     // schedules this Task again until its version changes or an
-                    // explicit `wake_task_dispatch` clears the disposition.
+                    // explicit `kick_task_reconciliation` clears the disposition.
                     return Ok(());
                 }
                 // Only an actual admission candidate needs the capacity query.
@@ -469,6 +476,7 @@ impl TaskDispatcher {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_initial_schedule_target(
         &self,
         workflow: &WorkflowDefinition,

@@ -808,3 +808,17 @@ pub async fn task_action_version(app: &Router, uri: &str) -> i64 {
     let offers: api_types::TaskActionsResponse = parse_response(response, StatusCode::OK).await;
     offers.version
 }
+
+/// The scheduler proof shares the production condition cursor and also catches
+/// a Task whose mutation committed before its dirty notification was delivered.
+pub async fn assert_scheduler_clean(state: &api::AppState) {
+    let dispatcher = services::TaskDispatcher::new(
+        state.db.clone(),
+        state.event_bus.clone(),
+        state.task_service.clone(),
+    );
+    dispatcher
+        .sweep_and_assert()
+        .await
+        .expect("scheduler sweep leaves every Task owned or parked");
+}

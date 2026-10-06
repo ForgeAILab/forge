@@ -903,7 +903,7 @@ async fn each_writer_family_keeps_condition_invariant_and_legacy_observability()
             let current=TaskRepo::get_by_id(&db,&t.id,true).await.unwrap().unwrap();
             db.check_task_condition_invariant(&current).await.unwrap_or_else(|e|panic!("{family}: {e}"));
             let condition=db.task_condition(&t.id).await.unwrap();
-            assert_eq!(condition.is_blocked(),!matches!(family,"wake"|"wake_project"|"removed_machine_cancel_clear"|"removed_machine_owner_wait_clear"|"preempt_supersede"|"workspace_delete"|"workflow_edit"),"{family}: {condition:?}");
+            assert_eq!(condition.is_blocked(),!matches!(family,"wake"|"removed_machine_cancel_clear"|"removed_machine_owner_wait_clear"|"preempt_supersede"|"workspace_delete"|"workflow_edit"),"{family}: {condition:?}");
             // A shadow-only sync must leave legacy versions/revisions/events alone.
             let before:(i64,i64,i64,i64)=sqlx::query_as("SELECT t.version,p.board_revision,p.list_revision,(SELECT COUNT(*) FROM domain_event) FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=?").bind(&t.id).fetch_one(db.pool()).await.unwrap();
             let mut tx=crate::begin_immediate(db.pool()).await.unwrap();db.sync_condition_in_tx(&mut tx,&t.id).await.unwrap();tx.commit().await.unwrap();
@@ -1471,7 +1471,7 @@ async fn clone_tasks(db: &SqliteDb, template: &str, n: usize, prefix: &str) {
 /// Back to the pre-stage-one schema, keeping every other table and trigger.
 async fn unmigrate(db: &SqliteDb) {
     sqlx::raw_sql(
-        "DROP INDEX idx_task_condition_kind; ALTER TABLE task DROP COLUMN condition_json;",
+        "DROP TRIGGER task_schedule_update; DROP TRIGGER task_schedule_relationship; DROP INDEX IF EXISTS idx_task_condition_kind; ALTER TABLE task DROP COLUMN condition_json;",
     )
     .execute(db.pool())
     .await

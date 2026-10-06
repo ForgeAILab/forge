@@ -3287,7 +3287,7 @@ Relay read errors or a stopped/restarting enabled relay raise attention.
 
 `recent_errors` carries a `task_condition_invariant` entry (`entity_id:
 "task-dispatcher"`, `severity: "attention"`) only while the last completed
-pass of the internal Task condition check had to repair at least one Task. Its
+pass of the combined Task condition and scheduler invariant sweep had to repair at least one Task. Repairs include a missed condition write or a Task that lacked queued work, a live owner and a named park. Its
 `error` reads "The last Task condition check repaired N of M Tasks" and
 `occurred_at` is when that pass completed. The next clean pass removes it. A
 healthy server never shows this entry; the check's counts go to the server

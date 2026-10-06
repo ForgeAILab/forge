@@ -529,7 +529,7 @@ impl TaskService {
     /// coder depends on that row. Children with an own coder are independent
     /// overrides and keep any parked disposition they own.
     async fn wake_role_dispatch(&self, task_id: &str, role_name: &str, reason: &str) -> Result<()> {
-        crate::wake_task_dispatch(&self.db, task_id, reason).await?;
+        crate::kick_task_reconciliation(&self.db, task_id, reason).await?;
         if role_name != crate::workflow::default_roles::CODER {
             return Ok(());
         }
@@ -547,7 +547,7 @@ impl TaskService {
             )
             .await?;
             if own_coder.is_none() {
-                crate::wake_task_dispatch(
+                crate::kick_task_reconciliation(
                     &self.db,
                     &child.id,
                     "root default worker assignment changed",

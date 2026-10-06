@@ -2839,7 +2839,7 @@ mod tests {
                 // that read `workspace_placement` are applied with it below.
                 (!matches!(
                     version,
-                    202610010400 | 202610010530 | 202610020600 | 202610021500
+                    202610010400 | 202610010530 | 202610020600 | 202610021500 | 202610060838
                 ))
                 .then_some((version, path))
             })
@@ -2851,6 +2851,13 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Scheduler tables are needed by current writers. Its placement
+        // triggers wait until the historical placement backfill below.
+        let scheduler = include_str!("../../../db/migrations/V202610060838__task_schedule.sql");
+        sqlx::raw_sql(scheduler.split("\nCREATE TRIGGER").next().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
         let db = Arc::new(SqliteDb::new(pool));
         let remote = TempDir::new().unwrap();
         let root = TempDir::new().unwrap();
@@ -2951,6 +2958,11 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        let triggers = format!(
+            "CREATE TRIGGER{}",
+            scheduler.split_once("\nCREATE TRIGGER").unwrap().1
+        );
+        sqlx::raw_sql(&triggers).execute(db.pool()).await.unwrap();
         let status: String =
             sqlx::query_scalar("SELECT status FROM repo_location WHERE repo_id = ?")
                 .bind(&repo_id)

@@ -28,7 +28,7 @@ pub(super) fn is_io_or_workspace_error(error: &ServiceError) -> bool {
 /// Only a deterministic refusal earns a dispatch disposition. Quiescing on a
 /// transient failure — a busy database, an unreachable daemon, a rate limit —
 /// would park the Task until its `version` happened to change or someone
-/// called `wake_task_dispatch`, turning a momentary blip into a permanent
+/// called `kick_task_reconciliation`, turning a momentary blip into a permanent
 /// stall. Those keep the previous behavior of being retried next scan.
 ///
 /// Classification is by typed variant, never by matching refusal text: the
@@ -265,6 +265,7 @@ fn review_ci_steps_finished(step_results_json: &str) -> bool {
 /// - `Failed`/`Cancelled` with `resume_policy: Some(ResumePolicy::Auto)` —
 ///   the executor already opted this attempt into automatic retry.
 /// - Environment pre-dispatch failures — the Project pause owns recovery.
+#[cfg(test)]
 pub(super) async fn latest_stopped_execution_blocks_dispatch(
     db: &db::SqliteDb,
     task_id: &str,

@@ -209,7 +209,7 @@ async fn key_mutations_preserve_independent_markers_from_a_stale_snapshot() {
 }
 
 #[tokio::test]
-async fn project_wake_clears_dispatch_markers_atomically_but_keeps_pause_marker() {
+async fn project_wake_invalidates_atomically_without_clearing_owned_markers() {
     let db = database().await;
     let project_id = new_uuid_v4();
     let task_id = new_uuid_v4();
@@ -238,13 +238,13 @@ async fn project_wake_clears_dispatch_markers_atomically_but_keeps_pause_marker(
         .await
         .expect("task reloads")
         .expect("task exists");
-    assert_eq!(current.version, stale_snapshot.version + 1);
+    assert_eq!(current.version, stale_snapshot.version);
     let metadata: serde_json::Value =
         serde_json::from_str(current.metadata_json.as_deref().expect("metadata exists"))
             .expect("metadata parses");
     assert_eq!(metadata["custom"], "kept");
-    assert!(metadata.get("dispatch_disposition").is_none());
-    assert!(metadata.get("deferred_dispatch").is_none());
+    assert!(metadata.get("dispatch_disposition").is_some());
+    assert!(metadata.get("deferred_dispatch").is_some());
     assert_eq!(metadata["paused_integration"]["state"], "review");
 
     let stale_record = TaskRepo::mutate_metadata(
@@ -258,7 +258,12 @@ async fn project_wake_clears_dispatch_markers_atomically_but_keeps_pause_marker(
         &now_rfc3339(),
     )
     .await;
-    assert!(matches!(stale_record, Err(DbError::VersionConflict)));
+    assert!(stale_record.is_ok());
+    assert!(db
+        .dirty_schedule_tasks(100)
+        .await
+        .unwrap()
+        .contains(&task_id));
 }
 
 #[tokio::test]
@@ -406,11 +411,17 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
         .await
         .expect("task reloads")
         .expect("task exists");
-    assert!(!task_after_settings
+    assert!(task_after_settings
         .metadata_json
         .as_deref()
         .expect("metadata exists")
         .contains("dispatch_disposition"));
+
+    assert!(db
+        .dirty_schedule_tasks(100)
+        .await
+        .unwrap()
+        .contains(&task_id));
 
     // A stale Project CAS aborts before either the Project row or Task cache is
     // changed. This is the rollback half of the same-transaction boundary.
@@ -461,7 +472,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
         .await
         .expect("task reloads after workflow")
         .expect("task exists");
-    assert!(!task_after_workflow
+    assert!(task_after_workflow
         .metadata_json
         .as_deref()
         .expect("metadata exists")
@@ -480,7 +491,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
         .await
         .expect("task reloads after pause")
         .expect("task exists");
-    assert!(!task_after_pause
+    assert!(task_after_pause
         .metadata_json
         .as_deref()
         .expect("metadata exists")
@@ -495,7 +506,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
         .await
         .expect("task reloads after resume")
         .expect("task exists");
-    assert!(!task_after_resume
+    assert!(task_after_resume
         .metadata_json
         .as_deref()
         .expect("metadata exists")
@@ -565,7 +576,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
         .await
         .expect("task reloads after repo create")
         .expect("task exists");
-    assert!(!task_after_repo_create
+    assert!(task_after_repo_create
         .metadata_json
         .as_deref()
         .expect("metadata exists")
@@ -590,7 +601,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
         .await
         .expect("task reloads after repo update")
         .expect("task exists");
-    assert!(!task_after_repo_update
+    assert!(task_after_repo_update
         .metadata_json
         .as_deref()
         .expect("metadata exists")
@@ -618,7 +629,7 @@ async fn project_and_repository_authority_wakes_are_atomic_with_rollback() {
         .await
         .expect("task reloads after repo delete")
         .expect("task exists");
-    assert!(!task_after_repo_delete
+    assert!(task_after_repo_delete
         .metadata_json
         .as_deref()
         .expect("metadata exists")

@@ -950,6 +950,7 @@ pub(super) async fn set_planning_awaiting_review_metadata(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) async fn planning_review_matches_current_state_entry(
     db: &SqliteDb,
     task: &Task,

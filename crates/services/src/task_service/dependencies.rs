@@ -66,7 +66,7 @@ impl TaskService {
         self.clear_resolved_dependency_block(task_id).await?;
 
         let wake_reason = format!("dependency {depends_on_id} removed");
-        if let Err(error) = crate::wake_task_dispatch(&self.db, task_id, &wake_reason).await {
+        if let Err(error) = crate::kick_task_reconciliation(&self.db, task_id, &wake_reason).await {
             tracing::warn!(
                 task_id = %task_id,
                 depends_on_id = %depends_on_id,
@@ -346,7 +346,7 @@ impl TaskService {
             // Already finished or cancelled; nothing to wake.
             return Ok(());
         }
-        crate::wake_task_dispatch(
+        crate::kick_task_reconciliation(
             &self.db,
             &dependent.id,
             &format!("dependency {} reached a terminal success state", task.id),

@@ -203,12 +203,14 @@ async fn attach_primary_repository_wakes_parked_tasks_at_the_command_boundary() 
     let metadata = metadata.map(|metadata| {
         serde_json::from_str::<serde_json::Value>(&metadata).expect("metadata parses")
     });
-    assert!(metadata
-        .as_ref()
-        .is_none_or(|metadata| metadata.get("dispatch_disposition").is_none()));
-    assert!(metadata
-        .as_ref()
-        .is_none_or(|metadata| metadata.get("deferred_dispatch").is_none()));
+    let metadata = metadata.expect("owned dispatch metadata stays visible");
+    assert!(metadata.get("dispatch_disposition").is_some());
+    assert!(metadata.get("deferred_dispatch").is_some());
+    assert!(db
+        .dirty_schedule_tasks(100)
+        .await
+        .unwrap()
+        .contains(&task_id));
 }
 
 #[tokio::test]

@@ -681,6 +681,10 @@ impl TaskService {
         self
     }
 
+    pub(crate) fn owner_wait_timeout(&self) -> Duration {
+        self.workspace_max_disconnect
+    }
+
     pub fn with_workspace_max_disconnect(mut self, timeout: Duration) -> Self {
         self.workspace_max_disconnect = timeout;
         self.task_step_driver = Arc::default();

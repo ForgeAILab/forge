@@ -437,6 +437,7 @@ async fn remote_execution_completes_and_transitions_task() {
         .collect();
     assert!(lines.iter().any(|line| line.contains("remote line one")));
     assert!(lines.iter().any(|line| line.contains("remote line three")));
+    common::assert_scheduler_clean(&fixture.harness.state).await;
 }
 
 #[tokio::test]
@@ -490,6 +491,7 @@ async fn remote_execution_failure_takes_failure_path() {
         task.error_annotation.is_some(),
         "failed remote execution should expose error annotation"
     );
+    common::assert_scheduler_clean(&fixture.harness.state).await;
 }
 
 #[tokio::test]
@@ -657,6 +659,7 @@ async fn remote_daemon_disconnect_suspends_server_workspace_until_expiry() {
         .unwrap();
     assert_eq!(ready.state, db::PlacementState::Ready);
     assert_eq!(ready.execution_daemon_id, placement.execution_daemon_id);
+    common::assert_scheduler_clean(&fixture.harness.state).await;
 }
 
 /// Fallback-chain round-trip over the daemon protocol: the snapshot carries
@@ -854,4 +857,5 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
         snapshot["routing"]["disposition"]["failure_class"],
         "executor_unavailable"
     );
+    common::assert_scheduler_clean(&fixture.harness.state).await;
 }

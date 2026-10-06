@@ -59,7 +59,8 @@ pub use repository::*;
 pub use review_conformance::*;
 pub use sqlite::{
     supported_main_baseline_revision, DeadLetter, DeadLetterAction, DeadLetterPage,
-    EventSubscription, SqliteDb, TaskListRead, WorkerDeadLetterIssue, WorkerDiagnostic,
+    EventSubscription, ScheduleRead, SqliteDb, TaskListRead, WorkerDeadLetterIssue,
+    WorkerDiagnostic,
 };
 pub use sqlx::{Sqlite, SqlitePool};
 pub use task_metadata::TaskMetadata;

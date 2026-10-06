@@ -10,9 +10,9 @@ const METADATA_KEY: &str = "deferred_dispatch";
 pub(crate) const QUEUED_RECOVERY_KEY: &str = "queued_recovery";
 const PAUSED_INTEGRATION_METADATA_KEY: &str = "paused_integration";
 // Ordinary metadata mutations intentionally do not advance Task.version.
-// Project-level dispatch wakes do advance it for affected rows, forming a
-// causal fence against stale disposition writers. This separate generation
-// is the paused-integration marker's own fence: clear increments it, and a
+// Project-level kicks advance a persistent scheduler generation, forming a
+// causation fence for reconciled queue commands.
+// The separate generation below is the paused-integration marker's own fence: clear increments it, and a
 // stale producer/retainer carrying the prior generation becomes a no-op.
 const PAUSED_INTEGRATION_GENERATION_KEY: &str = "paused_integration_generation";
 
@@ -336,7 +336,7 @@ pub(crate) async fn clear_paused_integration(
 // through the normal `version`-incrementing path. It does *not* self-
 // invalidate for governance state on other tables
 // (`project_execution_baseline*`, `project_reconciliation_record`, ...);
-// whatever commits one of those changes must call `wake_task_dispatch`.
+// whatever commits one of those changes invalidates the affected Task through `kick_task_reconciliation`.
 const DISPOSITION_METADATA_KEY: &str = "dispatch_disposition";
 
 /// The stored record of one dispatch attempt's deterministic refusal. See the
@@ -511,7 +511,7 @@ fn bounded_safe_message(message: &str) -> String {
 /// — does not touch `version`. Whatever
 /// commits one of those must call this afterward, or the previously observed
 /// denial keeps the Task quiesced forever.
-pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) -> Result<()> {
+pub async fn resume_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) -> Result<()> {
     if !db::task_writer::owns_task(task_id) {
         if TaskRepo::get_by_id(db, task_id, false).await?.is_none() {
             return Ok(());
@@ -535,6 +535,18 @@ pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) 
     }
     result?;
     tracing::info!(task_id = %task_id, %reason, "task dispatch woken");
+    Ok(())
+}
+
+/// Invalidate one Task after a relevant external fact committed. No legacy
+/// metadata, Task version, board revision or attention material changes.
+pub async fn kick_task_reconciliation(
+    db: &db::SqliteDb,
+    task_id: &str,
+    reason: &str,
+) -> Result<()> {
+    db.kick_schedule(task_id).await?;
+    tracing::debug!(task_id, reason, "Task reconciliation kicked");
     Ok(())
 }
 

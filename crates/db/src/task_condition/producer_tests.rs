@@ -779,7 +779,7 @@ async fn producer_fact_queries_use_indexes() {
         for (_, _, _, step) in &plan {
             // The one scan and sort allowed are over the executions running
             // right now, read from the running-only partial index.
-            let running = "idx_execution_usage_running_agent";
+            let running = "idx_execution_running_task";
             assert!(
                 !step.starts_with("SCAN") || step.contains(running),
                 "{name}: {step}"

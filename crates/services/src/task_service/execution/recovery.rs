@@ -1530,7 +1530,7 @@ impl TaskService {
             let updated = self
                 .clear_retry_exhausted_blocking_metadata_with_marker(&task, transition_log.clone())
                 .await?;
-            crate::wake_task_dispatch(
+            crate::deferred_dispatch::resume_task_dispatch(
                 &self.db,
                 &updated.id,
                 "one retry cleared an exhausted gate blocker",

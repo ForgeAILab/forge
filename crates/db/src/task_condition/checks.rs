@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 /// Rows recomputed per supervised tick.
 pub const CONDITION_CHECK_PAGE: usize = 50;
 /// Cadence of the steady-state check.
-const CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const CHECK_INTERVAL: Duration = Duration::from_secs(120);
 /// Work one tick may spend re-running the backfill after a mapping change.
 const BACKFILL_SLICE: Duration = Duration::from_millis(250);
 
@@ -40,6 +40,8 @@ pub struct ConditionCheckState {
     /// Whether the recorded mapping revision is stale: unknown until the
     /// first tick reads it, then true until one pass completes.
     backfill: Option<bool>,
+    cursor_loaded: bool,
+    page_ids: Vec<String>,
 }
 // Supervised loop cancellation must not disable subsequent checks.
 struct CheckGuard(std::sync::Arc<std::sync::Mutex<ConditionCheckState>>);
@@ -49,12 +51,64 @@ impl Drop for CheckGuard {
     }
 }
 struct Page {
+    ids: Vec<String>,
     checked: u64,
     repaired: u64,
     /// The cursor after this page; `None` once the last Task was read.
     next: Option<String>,
 }
 impl SqliteDb {
+    pub async fn begin_condition_sweep(&self, startup: bool) -> Result<()> {
+        let unknown = self
+            .condition_checks
+            .lock()
+            .expect("condition checks")
+            .backfill
+            .is_none();
+        if unknown {
+            let recorded =
+                crate::SystemSettingRepo::get_setting(self, MAPPING_REVISION_KEY).await?;
+            let mut state = self.condition_checks.lock().expect("condition checks");
+            state.backfill =
+                Some(recorded.as_deref() != Some(MAPPING_REVISION.to_string().as_str()));
+        }
+        if startup {
+            // Startup proves the entire current set, even when a previous
+            // process persisted a partial pass's cursor.
+            let mut state = self.condition_checks.lock().expect("condition checks");
+            state.after = None;
+            state.cursor_loaded = true;
+            state.pass = ConditionCheckPass::default();
+        }
+        Ok(())
+    }
+    pub async fn persist_condition_cursor(&self) -> Result<()> {
+        let cursor = self
+            .condition_checks
+            .lock()
+            .expect("condition checks")
+            .after
+            .clone();
+        sqlx::query(
+            "UPDATE task_schedule_sweep SET cursor=? WHERE singleton=1 AND cursor IS NOT ?",
+        )
+        .bind(&cursor)
+        .bind(&cursor)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+    pub fn condition_check_page_ids(&self) -> (Vec<String>, Option<String>) {
+        let state = self.condition_checks.lock().expect("condition checks");
+        (state.page_ids.clone(), state.after.clone())
+    }
+    pub fn count_schedule_repairs(&self, repairs: u64) {
+        let mut state = self.condition_checks.lock().expect("condition checks");
+        state.status.repaired += repairs;
+        if let Some(pass) = state.status.last_pass.as_mut() {
+            pass.repaired += repairs;
+        }
+    }
     pub fn condition_check_status(&self) -> ConditionCheckStatus {
         self.condition_checks
             .lock()
@@ -67,6 +121,20 @@ impl SqliteDb {
     /// keeps its cursor for a later supervised tick; a row that cannot be
     /// recomputed is logged and passed over.
     pub async fn check_task_conditions(&self, budget: usize) -> Result<ConditionCheckStatus> {
+        let loaded = self
+            .condition_checks
+            .lock()
+            .expect("condition checks")
+            .cursor_loaded;
+        if !loaded {
+            let cursor: Option<String> =
+                sqlx::query_scalar("SELECT cursor FROM task_schedule_sweep WHERE singleton=1")
+                    .fetch_one(self.pool())
+                    .await?;
+            let mut state = self.condition_checks.lock().expect("condition checks");
+            state.after = cursor;
+            state.cursor_loaded = true;
+        }
         let (after, limit) = {
             let mut state = self.condition_checks.lock().expect("condition checks");
             if state.in_progress {
@@ -87,6 +155,7 @@ impl SqliteDb {
             state.pass.checked += page.checked;
             state.pass.repaired += page.repaired;
             state.after = page.next.clone();
+            state.page_ids = page.ids.clone();
             let backfilling = state.backfill == Some(true);
             let completed = (limit != 0 && page.next.is_none()).then(|| {
                 let mut pass = std::mem::take(&mut state.pass);
@@ -203,6 +272,7 @@ impl SqliteDb {
     async fn check_condition_page(&self, after: Option<&str>, limit: usize) -> Result<Page> {
         if limit == 0 {
             return Ok(Page {
+                ids: Vec::new(),
                 checked: 0,
                 repaired: 0,
                 next: after.map(str::to_owned),
@@ -247,6 +317,10 @@ impl SqliteDb {
                 .await?;
         }
         Ok(Page {
+            ids: rows
+                .iter()
+                .map(|r| r.try_get(6))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
             checked: rows.len() as u64,
             repaired,
             next: (rows.len() == limit)

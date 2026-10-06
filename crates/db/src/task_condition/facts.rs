@@ -308,7 +308,7 @@ impl Families {
                         // The partial index holds only running executions, so
                         // this never walks the Task's execution history.
                         columns.push_str(",e.id AS execution_id,e.role AS execution_role,e.created_at AS execution_at,e.executor_config_snapshot_json AS execution_snapshot");
-                        joins.push_str(" LEFT JOIN execution e ON e.id=(SELECT id FROM execution INDEXED BY idx_execution_usage_running_agent WHERE status='running' AND task_id=t.id AND role!='interactive' ORDER BY created_at DESC,id DESC LIMIT 1)");
+                        joins.push_str(" LEFT JOIN execution e ON e.id=(SELECT id FROM execution WHERE status='running' AND task_id=t.id AND role!='interactive' ORDER BY created_at DESC,id DESC LIMIT 1)");
                     }
                     format!("SELECT {columns} FROM task t{joins} WHERE t.id=?")
                 })

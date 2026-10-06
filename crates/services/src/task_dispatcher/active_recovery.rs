@@ -1,30 +1,32 @@
 use std::sync::Arc;
 
-use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
+use api_types::WorkflowDefinition;
+#[cfg(test)]
+use api_types::{Actor, StateKind, SystemComponent};
 use db::{
-    AgentRepo, DbError, ExecutionRepo, ExecutionStatus, PageRequest, Project, ReviewRepo, SortBy,
-    SortOrder, Task, TaskRepo, TransitionLogRepo,
+    AgentRepo, ExecutionRepo, ExecutionStatus, PageRequest, Project, ReviewRepo, SortBy, SortOrder,
+    Task, TaskRepo, TransitionLogRepo,
 };
 
 use crate::{
     agent_capacity::has_execution_capacity,
     agent_service::{compute_effective_status, EffectiveStatus},
     deferred_dispatch,
-    workflow::{
-        dispatch::{
-            build_effective_prompt, dispatch_intent_from_workflow_dispatch,
-            effective_prompt_selection, loader::load_agent_dispatch_context,
-        },
-        effective_role,
-        engine::WorkflowEngine,
+    workflow::dispatch::{
+        build_effective_prompt, dispatch_intent_from_workflow_dispatch, effective_prompt_selection,
+        loader::load_agent_dispatch_context,
     },
     Result, ServiceError,
 };
 
 use super::{helpers, TaskDispatcher};
+#[cfg(test)]
+use crate::workflow::{effective_role, engine::WorkflowEngine};
+#[cfg(test)]
+use db::DbError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewerReconciliation {
+pub(super) enum ReviewerReconciliation {
     None,
     Reconciled,
     NoExactReviewBinding,
@@ -33,6 +35,7 @@ enum ReviewerReconciliation {
 impl TaskDispatcher {
     const FAILED_REVIEW_RECOVERY_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 
+    #[cfg(test)]
     pub(super) async fn recover_active_tasks(
         &self,
         project: &Project,
@@ -539,7 +542,7 @@ impl TaskDispatcher {
     /// Reconcile a completed non-reviewer before considering a fresh attempt.
     /// This closes the crash window between terminal settlement and the
     /// workflow cascade, including publication of a frozen plan candidate.
-    async fn reconcile_terminal_role_execution(
+    pub(super) async fn reconcile_terminal_role_execution(
         &self,
         task: &Task,
         role_name: &str,
@@ -706,7 +709,8 @@ impl TaskDispatcher {
         Ok(ReviewerReconciliation::Reconciled)
     }
 
-    async fn recover_active_task(
+    #[cfg(test)]
+    pub(super) async fn recover_active_task(
         &self,
         project: &Project,
         workflow: &WorkflowDefinition,
@@ -1015,6 +1019,209 @@ impl TaskDispatcher {
         Ok(true)
     }
 
+    pub(super) async fn dispatch_resolved_role(
+        &self,
+        project: &Project,
+        workflow: &WorkflowDefinition,
+        task: &Task,
+        role_name: &str,
+        agent_id: &str,
+    ) -> Result<bool> {
+        let Some(state) = workflow.states.iter().find(|s| s.name == task.status) else {
+            return Ok(false);
+        };
+        // Admission rechecks mutable authority, capacity and owner fences.
+        if role_name == crate::workflow::default_roles::REVIEWER {
+            self.task_service.ensure_task_reviewable(task).await?;
+        } else {
+            self.task_service.ensure_task_runnable(task).await?;
+        }
+        let wait_agent = AgentRepo::get_by_id(&*self.db, agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id))?;
+        if crate::placement::machine_precheck::wait_before_dispatch(
+            &self.db,
+            &self.task_service,
+            task,
+            &wait_agent,
+            Some(role_name),
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        if helpers::has_running_execution_for_roles(
+            &self.db,
+            &task.id,
+            &helpers::execution_guard_roles(role_name),
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+
+        let workspace = db::WorkspaceRepo::get_by_task_id(
+            &*self.db,
+            task.parent_task_id.as_deref().unwrap_or(&task.id),
+        )
+        .await?;
+        if let Some(workspace) = workspace.as_ref() {
+            if db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, &workspace.id)
+                .await?
+                .is_some_and(|placement| {
+                    matches!(
+                        placement.state,
+                        db::PlacementState::Disconnected
+                            | db::PlacementState::Cleaning
+                            | db::PlacementState::Reserved
+                            | db::PlacementState::Preparing
+                    )
+                })
+            {
+                return Ok(false);
+            }
+        }
+        let state_config =
+            helpers::merged_state_config(state, project, task.task_state_config.as_deref());
+        if task.entry_barrier_json.is_some() {
+            return Ok(false);
+        }
+        if role_name == crate::workflow::default_roles::REVIEWER
+            && !helpers::reviewer_dispatch_ready(&self.db, task, &state_config).await?
+        {
+            return Ok(false);
+        }
+
+        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+        if !matches!(
+            compute_effective_status(&self.db, &agent, None).await?,
+            EffectiveStatus::Active | EffectiveStatus::Busy
+        ) {
+            return Ok(false);
+        }
+        if !has_execution_capacity(&self.db, &agent).await? {
+            return Ok(false);
+        }
+        if deferred_dispatch::pending_until(task).is_some() {
+            deferred_dispatch::clear(&self.db, task).await?;
+        }
+
+        let state_dispatch = dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
+        let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
+        // A reviewer execution is bound to its Review attempt inside the
+        // admitting transaction, so recovery has to establish that attempt
+        // the same way a transition into review does. Without it the bind
+        // step fails closed as a bare version conflict, which this scan then
+        // logs as a lost race and retries forever: a Task parked in review
+        // with no Review row -- a read-only Task whose CI hook skipped, or
+        // any Task whose reviewer never launched -- could never be recovered.
+        if role_name == crate::workflow::default_roles::REVIEWER {
+            self.ensure_review_attempt_for_recovery(project, task, &state.name)
+                .await?;
+        }
+        let dispatch_ctx =
+            load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.task_service.workspace_backend_router(),
+                task_id: &task.id,
+                role: role_name,
+                state_name: &state.name,
+                state_config,
+                execution_policy: Some(selection.execution_policy.as_str()),
+                workflow,
+            })
+            .await?;
+        let (prompt, selection) =
+            build_effective_prompt(&dispatch_ctx, None, state_dispatch.as_ref());
+        let reviewer_snapshot = if role_name == crate::workflow::default_roles::REVIEWER {
+            dispatch_ctx
+                .prior_reviews
+                .iter()
+                .max_by_key(|review| (review.attempt_number, review.id.clone()))
+                .map(|review| {
+                    (
+                        review.id.clone(),
+                        review.execution_id.clone(),
+                        review.attempt_number,
+                        review.status.to_string(),
+                        review.updated_at.clone(),
+                        review.reviewer_execution_id.clone(),
+                        review.auditor_execution_id.clone(),
+                    )
+                })
+        } else {
+            None
+        };
+        let dispatch_metadata = serde_json::json!({
+            "target_role": role_name,
+            "builder_id": selection.builder_id,
+            "execution_policy": selection.execution_policy,
+        });
+        if self.is_stopped() {
+            return Ok(false);
+        }
+        // Everything above was decided from the snapshot this scan listed. A
+        // Task that has moved since then — most often because its own
+        // execution finished and cascaded into the next state — must not
+        // receive a role execution chosen for the state it has left: that
+        // launches a second implementation attempt into the state's workspace
+        // and blocks the role the Task now actually wants.
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        if current.version != task.version || current.status != task.status {
+            tracing::debug!(
+                task_id = %task.id,
+                from_state = %task.status,
+                to_state = %current.status,
+                target_role = role_name,
+                "task changed while dispatch was being prepared; leaving it to the next scan"
+            );
+            return Ok(false);
+        }
+        let mut admission = crate::task_service::execution_admission_for_task(
+            &self.db,
+            &current,
+            &project.workflow_definition,
+            role_name,
+            Some(&agent),
+            project.version,
+        )
+        .await?;
+        if let Some((
+            id,
+            execution_id,
+            attempt_number,
+            status,
+            updated_at,
+            reviewer_execution_id,
+            auditor_execution_id,
+        )) = reviewer_snapshot
+        {
+            admission.expected_reviewer_parent_execution_id = Some(execution_id.clone());
+            admission.expected_latest_review_candidate_execution_id = Some(execution_id);
+            admission.expected_reviewer_id = Some(id);
+            admission.expected_reviewer_attempt_number = Some(attempt_number);
+            admission.expected_reviewer_status = Some(status);
+            admission.expected_reviewer_updated_at = Some(updated_at);
+            admission.expected_reviewer_execution_id = reviewer_execution_id;
+            admission.expected_auditor_execution_id = auditor_execution_id;
+        }
+        self.task_service
+            .dispatch_initial_role_execution_with_metadata_and_admission(
+                &task.id,
+                &agent.id,
+                role_name,
+                prompt.execution_input(None),
+                Some(dispatch_metadata),
+                admission,
+            )
+            .await?;
+        Ok(true)
+    }
+
     /// Establish the Review attempt a recovered reviewer dispatch binds to.
     ///
     /// Mirrors the transition-time helper: an attempt already Running or
@@ -1082,7 +1289,7 @@ impl TaskDispatcher {
     /// Settle a reviewer execution whose terminal event was lost before it
     /// reached the review cascade. A retry that was already scheduled is left
     /// alone so normal deferred dispatch can launch its replacement once due.
-    async fn reconcile_terminal_reviewer_execution(
+    pub(super) async fn reconcile_terminal_reviewer_execution(
         &self,
         task_id: &str,
         project_version: i64,
