@@ -758,6 +758,16 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
     }
 
     async fn cleanup(&self, placement: &WorkspacePlacement) -> Result<CleanupAck> {
+        if self
+            .db
+            .daemon_removed(self.owner(placement)?.0)
+            .await
+            .map_err(ServiceError::from)?
+        {
+            // Owner removal abandons its physical files. The normal cleanup
+            // path can retire the server's bookkeeping without an owner RPC.
+            return Ok(CleanupAck { removed: false });
+        }
         // Cleaning is the durable cleanup intent. A replayed, acknowledged
         // cleanup may already have retired the owner's handle.
         let unknown_handle = |error: &WorkspaceBackendError| {

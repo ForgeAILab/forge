@@ -211,6 +211,7 @@ capacity is a placement wait, independent of Agent availability.
 
 | GET / PUT | `/api/v1/settings` | Read/update administrator Forge settings; the server run cap and usage index budget apply live |
 | PATCH | `/api/v1/daemons/{id}` | Set or clear a version-checked administrator run limit |
+| DELETE | `/api/v1/daemons/{id}` | Remove a disconnected machine as its registration owner; an administrator may remove an unclaimed registration |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
@@ -5111,7 +5112,45 @@ recovery with a `pending_remote_cancel` blocking annotation whose message names
 the machine it is waiting on. Operations status exposes `pending_remote_cancels`.
 The records are daemon-scoped cleanup records: deleting the Project, Task,
 workspace or placement never fails on them, and reconnect still sends
-`workspace.cancel` for each.
+`workspace.cancel` for each. Owner-requested [machine removal](#removing-a-machine)
+clears these records when the machine will not return.
+
+### Removing a machine
+
+`DELETE /api/v1/daemons/{id}` uses the existing daemon registration ID and user
+JWT/PAT authentication. Only its registration owner may remove it; an
+administrator may remove an unclaimed registration. Other owners and missing or
+already removed IDs return 404. A connected machine returns HTTP 409 with
+`code: machine_connected` and a stop-daemon instruction. The embedded server
+machine always returns HTTP 409 with `code: local_machine`, even while offline.
+
+HTTP 200 returns `RemoveDaemonResponse`: `id`, `hostname`,
+`pending_remote_cancels_cleared`, `cleanup_records_cleared`,
+`provisioning_attempts_cleared`, `readiness_records_cleared`, `placements_failed`,
+and `tasks_queued`. Revocation, cleanup removal, unavailable locations/runtimes,
+owner-loss placement fencing, Task step enqueues, and the durable
+`machine.removed` event commit in one transaction. The event records the actor,
+original machine identity/name, and these counts. Task completion is asynchronous;
+observe Task GET/SSE after removal rather than resubmitting its accepted action.
+
+Pending remote cancellations, including orphan records from deleted Tasks, and
+daemon workspace cleanup receipts are cleared. Parked Restart/Retry/Release
+continues through the existing leased Task recovery path when no remaining owner
+cancellation fences it. Running executions settle through disconnect settlement
+with `owner_disconnected_timeout`, without consuming workflow retries. A retained
+workspace keeps its original owner and follows existing typed owner-loss recovery;
+a Task without a retained placement can select another eligible machine.
+
+The registration is tombstoned and its credential revoked. Active machine and
+runtime lists, placement candidates, machine-pressure and offline-issue projections
+exclude it. Historical execution, usage and transition records and the machine's
+hostname remain. Its unique registration key is retired so registering the same
+physical machine creates a fresh daemon ID; the old ID/token cannot report or
+reconnect. Removal abandons physical files on the unavailable machine. Later
+workspace cleanup retires server bookkeeping without claiming to have deleted
+those files. The web machine settings offer a confirmation dialog; Remove is
+disabled with a hint while connected or for the embedded machine.
+`forge-ctl daemon remove <id>` exposes the same action. There is no MCP tool.
 
 ### Task budget projections
 

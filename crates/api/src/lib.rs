@@ -1009,7 +1009,7 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/daemons/register",
             post(routes::daemons::register_daemon),
         )
-        .route("/api/v1/daemons/{id}", get(routes::daemons::get_daemon).patch(routes::daemons::update_daemon))
+        .route("/api/v1/daemons/{id}", get(routes::daemons::get_daemon).patch(routes::daemons::update_daemon).delete(routes::daemons::remove_daemon))
         .route(
             "/api/v1/daemons/{id}/connect",
             get(routes::daemons::connect_daemon),

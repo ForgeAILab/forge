@@ -64,6 +64,11 @@ pub enum DbError {
 
     #[error("agent at capacity")]
     AgentAtCapacity,
+    #[error("Stop the daemon before removing this connected machine")]
+    MachineConnected,
+    #[error("The embedded server machine cannot be removed")]
+    LocalMachine,
+
     #[error("machine has no available run capacity")]
     MachineAtCapacity,
 

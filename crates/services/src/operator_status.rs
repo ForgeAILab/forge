@@ -546,6 +546,7 @@ impl OperatorStatusService {
         let rows = sqlx::query(
             "SELECT id, hostname, status, last_report_at, updated_at
              FROM daemon
+             WHERE removed_at IS NULL
              ORDER BY updated_at DESC, id ASC",
         )
         .fetch_all(self.db.pool())
@@ -1144,12 +1145,12 @@ mod tests {
     #[tokio::test]
     async fn machine_capacity_operations_uses_handle_identity() {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
-        sqlx::raw_sql(r#"CREATE TABLE daemon (id TEXT, hostname TEXT, machine_id TEXT, max_concurrent_runs INTEGER, run_limit INTEGER);
+        sqlx::raw_sql(r#"CREATE TABLE daemon (id TEXT, hostname TEXT, machine_id TEXT, max_concurrent_runs INTEGER, run_limit INTEGER, removed_at TEXT);
             CREATE TABLE workspace_placement (workspace_id TEXT, agent_id TEXT, daemon_id TEXT, execution_daemon_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT);
             CREATE TABLE execution (workspace_id TEXT, agent_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
             CREATE TABLE agent_current (id TEXT, daemon_id TEXT);
             CREATE TABLE agent_chat_turn_job (responder_identity_id TEXT, status TEXT);
-            INSERT INTO daemon VALUES ('provider','Host','capacity-test-host',100,NULL);
+            INSERT INTO daemon VALUES ('provider','Host','capacity-test-host',100,NULL,NULL);
             INSERT INTO execution VALUES (NULL,NULL,'running','{"daemon_id":"provider"}');"#)
             .execute(&pool).await.unwrap();
         let db = Arc::new(SqliteDb::new(pool));

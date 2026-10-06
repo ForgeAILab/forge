@@ -721,6 +721,16 @@ impl DaemonWorkspaceClient {
         let mut transaction = db::begin_immediate(db.pool())
             .await
             .map_err(ServiceError::from)?;
+        let removed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM daemon WHERE id=? AND removed_at IS NOT NULL)",
+        )
+        .bind(daemon_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(ServiceError::from)?;
+        if removed {
+            return Err(ServiceError::not_found("daemon", daemon_id).into());
+        }
         if let Some(existing) = CommandReceiptRepo::get_command_receipt_in_tx(
             &**db,
             &mut transaction,

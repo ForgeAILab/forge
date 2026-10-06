@@ -660,3 +660,23 @@ pub struct TaskPlacementDiagnostic {
     pub filter_codes: Vec<String>,
     pub failing_checks: Vec<String>,
 }
+
+/// Removal commits revocation and queues Task settlement; observe Tasks for completion.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoveDaemonResponse {
+    pub id: String,
+    pub hostname: String,
+    #[ts(type = "number")]
+    pub pending_remote_cancels_cleared: u64,
+    #[ts(type = "number")]
+    pub cleanup_records_cleared: u64,
+    #[ts(type = "number")]
+    pub provisioning_attempts_cleared: u64,
+    #[ts(type = "number")]
+    pub readiness_records_cleared: u64,
+    #[ts(type = "number")]
+    pub placements_failed: u64,
+    #[ts(type = "number")]
+    pub tasks_queued: u64,
+}

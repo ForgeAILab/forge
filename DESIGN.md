@@ -135,6 +135,14 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - **Accessibility:** icon-only controls require an accessible name; disabled state uses native `disabled` where possible.
 - **Motion:** color/opacity/transform only, using the micro timing token.
 
+### Machine removal confirmation
+
+- Use the existing destructive Button and Dialog primitives on machine settings.
+- Connected and embedded machines disable Remove and expose a visible, described hint.
+- The dialog names the machine, explains credential revocation, Task recovery, retained history, and abandoned owner-local files.
+- Cancel restores focus; pending disables both actions; a racing conflict stays visible in the dialog and refreshes machine status.
+- Only the registration owner (or administrator of an unclaimed machine) sees the action.
+
 ### Form controls
 
 - **Structure:** label plus input/select/textarea/checkbox/switch, supporting help and error text.

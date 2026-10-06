@@ -8855,3 +8855,200 @@ pub(crate) mod tests {
             .any(|s| s.kind == "command" && s.status == "done"));
     }
 }
+
+/// Runs under the affected Task's normal lease, including after a restart.
+/// Owner-loss terminalization and annotations use the same disconnect settlement
+/// as the heartbeat monitor; no Task state is changed by the removal transaction.
+pub(crate) async fn settle_removed_machine_task(
+    db: &SqliteDb,
+    event_bus: &EventBus,
+    task_id: &str,
+    daemon_id: &str,
+) -> Result<()> {
+    db::task_writer::debug_assert_task_lease(task_id, "machine removal settlement");
+    if !db.daemon_removed(daemon_id).await? {
+        return Ok(());
+    }
+    db::task_writer::TaskQuery::new(db,task_id,
+        "UPDATE task SET error_annotation=NULL, metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.dispatch_disposition','$.deferred_dispatch') ELSE metadata_json END, version=version+1,updated_at=? WHERE id=? AND deleted_at IS NULL AND json_valid(error_annotation) AND json_extract(error_annotation,'$.blocking_reason')='pending_remote_cancel' AND NOT EXISTS(SELECT 1 FROM pending_remote_cancel c LEFT JOIN workspace w ON w.id=c.workspace_id LEFT JOIN task_step s ON s.id=c.step_id WHERE w.task_id=? OR s.task_id=? OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=? AND e.workspace_id=c.workspace_id))")
+        .bind(now_rfc3339()).bind(task_id).bind(task_id).bind(task_id).bind(task_id)
+        .identity_fenced().execute(db.pool()).await?;
+    let remaining = db.task_pending_remote_cancel_machines(task_id).await?;
+    if !remaining.is_empty() {
+        if let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? {
+            if let Some(raw) = task.error_annotation.as_deref() {
+                if let Ok(mut annotation) = serde_json::from_str::<serde_json::Value>(raw) {
+                    if annotation["blocking_reason"] == "pending_remote_cancel" {
+                        let machines = remaining.join(", ");
+                        annotation["blocked_by"] = json!(format!("machine:{machines}"));
+                        annotation["message"] = json!(format!("Waiting for machine {machines} to confirm its remote work has stopped. Reconnect that machine to finish cleanup."));
+                        db::task_writer::TaskQuery::new(db, task_id,
+                            "UPDATE task SET error_annotation=?,version=version+1,updated_at=? WHERE id=? AND error_annotation=?")
+                            .bind(annotation.to_string()).bind(now_rfc3339()).bind(task_id).bind(raw)
+                            .identity_fenced().execute(db.pool()).await?;
+                    }
+                }
+            }
+        }
+    }
+    // An unplaced Task may be waiting on this owner's environment/provisioning
+    // attempt. Wake its existing scheduler path instead of leaving a stale delay.
+    db::task_writer::TaskQuery::new(db,task_id,
+        "UPDATE task SET metadata_json=json_remove(metadata_json,'$.environment_wait','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine.daemon_id')=?")
+        .bind(task_id).bind(daemon_id).identity_fenced().execute(db.pool()).await?;
+    for execution in ExecutionRepo::list_running_by_task(db, task_id).await? {
+        let Some((owner, _)) = resolve_execution_daemon(db, &execution).await? else {
+            continue;
+        };
+        if owner != daemon_id {
+            continue;
+        }
+        let placement = match execution.workspace_id.as_deref() {
+            Some(id) => WorkspacePlacementRepo::get_by_workspace_id(db, id).await?,
+            None => None,
+        };
+        if let Some(placement) = placement {
+            fail_owned_execution(
+                db,
+                event_bus,
+                &placement,
+                &execution,
+                PlacementFailureCause::OwnerDisconnectedTimeout,
+            )
+            .await?;
+        } else if let Some(failed) = fail_execution_daemon_disconnected(
+            db,
+            event_bus,
+            None,
+            FailDaemonDisconnectedExecution {
+                execution: &execution,
+                daemon_id,
+                error_message: json!({"cause":"owner_disconnected_timeout","daemon_id":daemon_id})
+                    .to_string(),
+                stopped_by: &api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor)
+                    .display(),
+                reconciliation_reason: "owner_disconnected_timeout",
+            },
+        )
+        .await?
+        {
+            annotate_owner_recovery(
+                db,
+                &failed,
+                &PlacementFailureCause::OwnerDisconnectedTimeout,
+            )
+            .await?;
+        }
+    }
+    // Repair an interrupted terminal -> annotation window through the existing
+    // owner-loss repair path, without undoing a subsequent explicit user action.
+    let placement_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM workspace_placement WHERE task_id=?")
+            .bind(task_id)
+            .fetch_all(db.pool())
+            .await?;
+    for id in placement_ids {
+        let Some(placement) = WorkspacePlacementRepo::get_by_id(db, &id).await? else {
+            continue;
+        };
+        if placement_execution_daemon_id(&placement) == Some(daemon_id) {
+            repair_owner_recovery(db, &placement).await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod removed_machine_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn removed_owner_settles_running_execution_and_parks_pinned_workspace() {
+        use crate::workspace_backend::WorkspaceBackend;
+        let db = Arc::new(SqliteDb::new(
+            db::create_sqlite_pool("sqlite::memory:").await.unwrap(),
+        ));
+        db::run_migrations(db.pool()).await.unwrap();
+        let (task, placement, execution) = tests::daemon_owned_fixture(&db).await;
+        let daemon_id = placement.daemon_id.as_deref().unwrap();
+        DaemonRepo::mark_offline(&*db, daemon_id, &now_rfc3339())
+            .await
+            .unwrap();
+        let bus = Arc::new(EventBus::new(64));
+        let service = TaskService::new(db.clone(), bus.clone());
+        let original_name = DaemonRepo::get_by_id(&*db, daemon_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .hostname;
+        sqlx::query("INSERT INTO repo_provision_retry(repo_id,runtime_id,next_attempt_at) SELECT w.repo_id,p.runtime_id,? FROM workspace w JOIN workspace_placement p ON p.workspace_id=w.id WHERE p.id=?")
+            .bind(now_rfc3339()).bind(&placement.id).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO project_machine_readiness(project_id,owner_kind,daemon_id,runtime_id,status,checks_digest) VALUES (?,'daemon',?,?,'not_ready','old-digest')")
+            .bind(&task.project_id).bind(daemon_id).bind(&placement.runtime_id).execute(db.pool()).await.unwrap();
+        let result = db
+            .remove_daemon(daemon_id, "admin", true, "local", false)
+            .await
+            .unwrap();
+        assert_eq!(result.provisioning_attempts_cleared, 1);
+        assert_eq!(result.readiness_records_cleared, 1);
+        assert_eq!(result.placements_failed, 1);
+        assert_eq!(result.tasks_queued, 1);
+        assert_eq!(
+            ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionStatus::Running
+        );
+        let settled = service.drain(&task.id).await.unwrap();
+        let failed = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        assert_eq!(failed.stop_reason, Some(StopReason::DaemonDisconnected));
+        assert_eq!(failed.resume_policy, Some(ResumePolicy::Manual));
+        assert_eq!(
+            settled.status, task.status,
+            "owner loss does not spend workflow retries"
+        );
+        let annotation: serde_json::Value =
+            serde_json::from_str(settled.error_annotation.as_deref().unwrap()).unwrap();
+        assert_eq!(annotation["blocking_reason"], "owner_disconnected_timeout");
+        let current = WorkspacePlacementRepo::get_by_id(&*db, &placement.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, PlacementState::Failed);
+        assert_eq!(
+            current.daemon_id, placement.daemon_id,
+            "existing owner pin is preserved"
+        );
+        assert_eq!(
+            current.failure_cause,
+            Some(PlacementFailureCause::OwnerDisconnectedTimeout)
+        );
+        let name:String=sqlx::query_scalar("SELECT d.hostname FROM execution e JOIN workspace_placement p ON p.workspace_id=e.workspace_id JOIN daemon d ON d.id=p.daemon_id WHERE e.id=?")
+            .bind(&execution.id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(name, original_name);
+        let backend = crate::workspace_backend::DaemonWorkspaceBackend::new(
+            db.clone(),
+            Arc::new(DaemonConnectionRegistry::without_handlers()),
+        );
+        assert!(
+            !backend.cleanup(&current).await.unwrap().removed,
+            "removal abandons physical files without an RPC"
+        );
+        let status = crate::OperatorStatusService::new_for_test(db.clone());
+        let status = status.compute_status().await.unwrap();
+        assert!(!status
+            .daemon_issues
+            .iter()
+            .any(|row| row.daemon_id == daemon_id));
+        assert!(!status
+            .daemon_pressure
+            .iter()
+            .any(|row| row.daemon_id == daemon_id));
+    }
+}

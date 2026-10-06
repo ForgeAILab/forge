@@ -21,7 +21,8 @@ impl TaskCommand {
         match operation {
             "maybe_cascade_executor_completion"
             | "block_cancelled_dependencies"
-            | "advance_coordination_root" => db::task_writer::EffectFence::Identity,
+            | "advance_coordination_root"
+            | "settle_removed_machine" => db::task_writer::EffectFence::Identity,
             _ => db::task_writer::EffectFence::Entry,
         }
     }
@@ -146,6 +147,40 @@ impl TaskService {
     ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
         Box::pin(async move {
             match command.operation.as_str() {
+                "settle_removed_machine" => {
+                    let (task_id, daemon_id): (String, String) =
+                        serde_json::from_value(command.arguments.clone())
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    let before = self.command_task(&task_id).await?;
+                    crate::recovery::settle_removed_machine_task(
+                        &self.db,
+                        &self.event_bus,
+                        &task_id,
+                        &daemon_id,
+                    )
+                    .await?;
+                    let task = self.command_task(&task_id).await?;
+                    if before.version != task.version {
+                        self.publish(events::ForgeEvent {
+                            event_type: "task.updated".to_owned(),
+                            entity_id: task.id.clone(),
+                            timestamp: events::event_timestamp(),
+                            context: events::EventContext::TaskUpdated {
+                                project_id: task.project_id.clone(),
+                            },
+                        });
+                    }
+                    if let Err(error) = Box::pin(self.dispatch_queued_recovery(&task)).await {
+                        // The existing replay boundary has already restored or
+                        // parked a deterministic placement refusal. Persistence
+                        // failures must still fail the command visibly.
+                        if matches!(error, ServiceError::Db(_)) {
+                            return Err(error);
+                        }
+                        tracing::info!(%task_id, %daemon_id, %error, "removed machine Task recovery remains parked");
+                    }
+                    encode(())
+                }
                 "dispatch_role_follow_up_with_admission" => {
                     let (id, role, parent, prompt, trigger, admission): (
                         String,

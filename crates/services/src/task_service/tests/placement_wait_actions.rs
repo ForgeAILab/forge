@@ -446,3 +446,124 @@ async fn waiting_task_held_without_an_agent_can_be_released_to_the_queue() {
         .unwrap();
     assert!(verbs(&after).contains(&"hold[dispatch_wait]".to_owned()));
 }
+
+async fn parked_restart_fixture(other_owner: bool) -> (Fixture, Task) {
+    let fixture = fixture().await;
+    let repo_id: String = sqlx::query_scalar("SELECT id FROM repo WHERE project_id=?")
+        .bind(&fixture.project)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    sqlx::query("INSERT INTO daemon(id,machine_id,hostname,os,arch,status,registration_token_hash,created_at,updated_at) VALUES ('dead-machine','dead-machine','Lost workstation','linux','x86_64','offline','hash',?,?)")
+        .bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    // A cleaned historical workspace can still have FK-free daemon cleanup.
+    // Restart must proceed without resetting that retired owner's workspace.
+    db::WorkspaceRepo::create(
+        &*fixture.db,
+        db::CreateWorkspace {
+            id: "historical-workspace".into(),
+            task_id: fixture.task.id.clone(),
+            repo_id,
+            worktree_path: fixture
+                ._repo
+                .path()
+                .join("old-worktree")
+                .to_string_lossy()
+                .into_owned(),
+            branch: "old-branch".into(),
+            status: db::WorkspaceStatus::Cleaned,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO pending_remote_cancel VALUES ('lost-operation','lost-step','historical-workspace','lost-placement','dead-machine','lost-runtime',1,0,?)")
+        .bind(&now).execute(fixture.db.pool()).await.unwrap();
+    if other_owner {
+        sqlx::query("INSERT INTO daemon(id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES ('other-machine','other-machine','Other workstation','linux','x86_64','offline',?,?)")
+            .bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO pending_remote_cancel VALUES ('other-operation','other-step','historical-workspace','other-placement','other-machine','other-runtime',1,0,?)")
+            .bind(&now).execute(fixture.db.pool()).await.unwrap();
+    }
+    sqlx::query("UPDATE task SET error_annotation=? WHERE id=?")
+        .bind(json!({"type":"executor_failed","blocking_reason":"original failure"}).to_string())
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let parked = fixture
+        .service
+        .perform_task_action(
+            &fixture.task.id,
+            TaskAction::Restart { reason: None },
+            fixture.task.version,
+        )
+        .await
+        .unwrap()
+        .task;
+    assert_eq!(parked.status, "in_progress");
+    assert!(crate::deferred_dispatch::queued_recovery(&parked).is_some());
+    assert!(parked
+        .error_annotation
+        .as_deref()
+        .unwrap()
+        .contains("Lost workstation"));
+    (fixture, parked)
+}
+
+#[tokio::test]
+async fn remove_machine_clears_pending_cancel_and_replays_parked_restart() {
+    let (fixture, parked) = parked_restart_fixture(false).await;
+    fixture
+        .db
+        .remove_daemon("dead-machine", "admin", true, "local", false)
+        .await
+        .unwrap();
+    assert!(!fixture
+        .db
+        .task_has_pending_remote_cancel(&fixture.task.id)
+        .await
+        .unwrap());
+    assert_eq!(
+        reload(&fixture).await,
+        parked,
+        "removal queues every Task change"
+    );
+    let current = fixture.service.drain(&fixture.task.id).await.unwrap();
+    assert_eq!(current.status, "todo");
+    assert!(current.error_annotation.is_none());
+    assert!(crate::deferred_dispatch::queued_recovery(&current).is_none());
+    assert!(db::TaskStepRepo::task_steps(&*fixture.db, &current.id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|step| step.kind == "command"
+            && step.payload_json.contains("settle_removed_machine")
+            && step.status == "done"
+            && !step.entry_fenced));
+}
+
+#[tokio::test]
+async fn remove_machine_keeps_another_owners_fence_and_refreshes_the_machine_hint() {
+    let (fixture, _) = parked_restart_fixture(true).await;
+    fixture
+        .db
+        .remove_daemon("dead-machine", "admin", true, "local", false)
+        .await
+        .unwrap();
+    let current = fixture.service.drain(&fixture.task.id).await.unwrap();
+    assert_eq!(current.status, "in_progress");
+    assert!(crate::deferred_dispatch::queued_recovery(&current).is_some());
+    let annotation: Value =
+        serde_json::from_str(current.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["blocking_reason"], "pending_remote_cancel");
+    let message = annotation["message"].as_str().unwrap();
+    assert!(message.contains("Other workstation"));
+    assert!(!message.contains("Lost workstation"));
+    let pending = fixture.db.pending_remote_cancels(None, None).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].daemon_id, "other-machine");
+}

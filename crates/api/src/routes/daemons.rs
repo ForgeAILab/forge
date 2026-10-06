@@ -441,6 +441,20 @@ pub async fn get_daemon(
     Ok(Json(daemon_response(&state.db, daemon)))
 }
 
+pub async fn remove_daemon(
+    State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<api_types::RemoveDaemonResponse>> {
+    // Database ownership/connection checks are atomic with credential revocation.
+    Ok(Json(
+        state
+            .daemon_service
+            .remove(&id, &user.user_id, user.is_admin)
+            .await?,
+    ))
+}
+
 pub async fn update_daemon(
     _admin: RequireAdmin,
     State(state): State<AppState>,

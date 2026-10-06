@@ -137,6 +137,9 @@ impl DaemonService {
         let daemon = DaemonRepo::get_by_id(&*self.db, daemon_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("daemon", daemon_id.to_owned()))?;
+        if self.db.daemon_removed(daemon_id).await? {
+            return Err(ServiceError::not_found("daemon", daemon_id));
+        }
         let Some(expected_hash) = daemon.registration_token_hash.as_deref() else {
             return Err(ServiceError::invalid_operation(
                 "daemon has no registration token",
@@ -421,6 +424,30 @@ impl DaemonService {
             .map_err(Into::into)
     }
 
+    pub async fn remove(
+        &self,
+        id: &str,
+        actor_id: &str,
+        is_admin: bool,
+    ) -> Result<api_types::RemoveDaemonResponse> {
+        let connected = self
+            .task_service
+            .as_ref()
+            .and_then(|service| service.daemon_connections.as_ref())
+            .and_then(|registry| registry.get(id))
+            .is_some_and(|connection| !connection.is_stale());
+        self.db
+            .remove_daemon(
+                id,
+                actor_id,
+                is_admin,
+                &crate::embedded_daemon::embedded_machine_id(),
+                connected,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn update_run_limit(
         &self,
         id: &str,
@@ -440,6 +467,9 @@ impl DaemonService {
     #[tracing::instrument(skip(self), fields(daemon_id = %id))]
     pub async fn get(&self, id: &str) -> Result<Option<Daemon>> {
         validate_required("daemon_id", id)?;
+        if self.db.daemon_removed(id).await? {
+            return Ok(None);
+        }
         DaemonRepo::get_by_id(&*self.db, id)
             .await
             .map_err(Into::into)
@@ -721,5 +751,48 @@ mod tests {
             .expect("embedded daemon exists");
         assert_eq!(external.status, DaemonStatus::Offline);
         assert_eq!(embedded.status, DaemonStatus::Online);
+    }
+    #[tokio::test]
+    async fn removed_credential_cannot_authenticate_or_revive_on_registration() {
+        let service = service().await;
+        let original = service
+            .register(register_input("removed-host"))
+            .await
+            .unwrap();
+        service
+            .mark_disconnected(&original.daemon_id)
+            .await
+            .unwrap();
+        service
+            .remove(&original.daemon_id, "admin", true)
+            .await
+            .unwrap();
+        assert!(service
+            .authenticate(&original.daemon_id, &original.plaintext_token)
+            .await
+            .is_err());
+        assert!(service.mark_connected(&original.daemon_id).await.is_err());
+        assert!(service.get(&original.daemon_id).await.unwrap().is_none());
+        let fresh = service
+            .register(register_input("removed-host"))
+            .await
+            .unwrap();
+        assert_ne!(original.daemon_id, fresh.daemon_id);
+        service
+            .authenticate(&fresh.daemon_id, &fresh.plaintext_token)
+            .await
+            .unwrap();
+        assert!(service
+            .authenticate(&original.daemon_id, &fresh.plaintext_token)
+            .await
+            .is_err());
+        assert!(service
+            .authenticate(&fresh.daemon_id, &original.plaintext_token)
+            .await
+            .is_err());
+        assert!(service
+            .remove(&original.daemon_id, "admin", true)
+            .await
+            .is_err());
     }
 }
