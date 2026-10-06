@@ -3551,21 +3551,36 @@ terminal condition; the hard deadline is not extended by heartbeat renewal.
 
 ### Owner-requested machine removal
 
-Disconnected external daemon registrations can be removed by their owner (or an
-administrator for an unclaimed registration). The removal transaction retains the
+Disconnected external daemon registrations can be removed by their owner or an
+administrator. The removal transaction retains the
 UUID/hostname as a tombstone, retires the unique registration key, revokes the
 bearer credential, clears daemon cancellation/cleanup/provisioning/readiness
 records, and makes locations/runtimes unavailable. Operational queries exclude
 tombstones; historical joins retain names and execution/usage/transition evidence.
 Conditional report, online, runtime and remote-operation writes fence late work.
 
-Owned placements take the existing `owner_disconnected_timeout` failure path.
-Identity-fenced Task command steps settle remaining executions with the existing
-disconnect terminal CAS and usage ledger, clear only their pending-cancel marker
-when no other owner fences the Task, and replay accepted actions through the normal
-recovery command. No Task workflow fields are written by the removal transaction.
-Retained worktrees stay pinned and may park with existing recovery reasons;
-unplaced work may select another eligible machine. Cleanup after revocation
+Removal is permanent owner loss, so nothing waits for the machine. The
+transaction releases every live placement the machine owns (`cleaned`, no handle,
+workspace `cleaned` with a `machine_removed:` error, an earlier failure cause
+kept): that is the existing "nothing exists, reselect" state, so the Task's next
+admission rewrites the owner through ordinary selection and prepares a fresh
+workspace elsewhere. A server-owned placement that only executed there keeps its
+state and just drops `execution_daemon_id`. Agents pinned to the machine are
+archived in the same transaction. The facts each Task needs (its live runs on the
+machine, whether its workspace was lost, the removing user) travel in the
+identity-fenced `settle_removed_machine` step, because the released rows can no
+longer answer them.
+
+That step runs under the Task lease. It fails the recorded runs through the
+owner-loss terminal CAS and usage ledger as the removing user, clears the
+pending-cancel marker when no other owner fences the Task, ends an owner or
+environment wait on that machine, replaces an owner-recovery annotation with
+`machine_removed`, and unassigns a retired Agent through the archive role sweep.
+It then admits the Task again: an accepted action is replayed through the normal
+recovery command, an accepted `owner_reconcile` retry is replaced by the ordinary
+Retry the Task now offers, and lost work queues that same Retry. Placement then
+selects another machine or parks with the ordinary placement wait. No Task
+workflow field is written by the removal transaction. Cleanup after revocation
 abandons owner-local files and retires server bookkeeping without an owner RPC.
 A durable `machine.removed` event records the user actor and removal counts in the
 same transaction. The immutable command-receipt delete guard permits only daemon

@@ -2369,7 +2369,17 @@ pub(super) async fn reset_workspace(
     let mut daemon_reset = None;
     if let Some(workspace) = WorkspaceRepo::get_by_task_id(db, &task.id).await? {
         let resolved = resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
-        if resolved.placement.owner_kind == PlacementOwnerKind::Daemon {
+        let owner_removed = match resolved.placement.daemon_id.as_deref() {
+            Some(daemon_id) if resolved.placement.owner_kind == PlacementOwnerKind::Daemon => {
+                db.daemon_removed(daemon_id).await?
+            }
+            _ => false,
+        };
+        if owner_removed {
+            // Already released by machine removal: the next admission selects
+            // another machine and prepares the replacement there.
+            daemon_reset = Some(workspace.clone());
+        } else if resolved.placement.owner_kind == PlacementOwnerKind::Daemon {
             if workspace.repo_id != authority.repo.id {
                 return Err(ServiceError::invalid_operation(
                     "cannot reset a daemon placement onto a different repository",

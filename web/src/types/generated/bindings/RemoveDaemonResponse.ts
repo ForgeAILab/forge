@@ -3,4 +3,16 @@
 /**
  * Removal commits revocation and queues Task settlement; observe Tasks for completion.
  */
-export type RemoveDaemonResponse = { id: string, hostname: string, pending_remote_cancels_cleared: number, cleanup_records_cleared: number, provisioning_attempts_cleared: number, readiness_records_cleared: number, placements_failed: number, tasks_queued: number, };
+export type RemoveDaemonResponse = { id: string, hostname: string, pending_remote_cancels_cleared: number, cleanup_records_cleared: number, provisioning_attempts_cleared: number, readiness_records_cleared: number, 
+/**
+ * Workspaces the machine owned, released as lost.
+ */
+placements_failed: number, 
+/**
+ * Tasks whose workspace was on the machine; each re-places on another one.
+ */
+tasks_to_replace: number, 
+/**
+ * Agents pinned to the machine, now archived.
+ */
+agents_retired: number, tasks_queued: number, };

@@ -148,18 +148,23 @@ impl TaskService {
         Box::pin(async move {
             match command.operation.as_str() {
                 "settle_removed_machine" => {
-                    let (task_id, daemon_id): (String, String) =
-                        serde_json::from_value(command.arguments.clone())
-                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    let (task_id, daemon_id, facts): (
+                        String,
+                        String,
+                        crate::recovery::RemovedMachineFacts,
+                    ) = serde_json::from_value(command.arguments.clone())
+                        .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
                     let before = self.command_task(&task_id).await?;
-                    crate::recovery::settle_removed_machine_task(
+                    let settlement = crate::recovery::settle_removed_machine_task(
                         &self.db,
                         &self.event_bus,
                         &task_id,
                         &daemon_id,
+                        &facts,
                     )
                     .await?;
-                    let task = self.command_task(&task_id).await?;
+                    TaskService::publish_role_sweep_events(&self.event_bus, settlement.role_events);
+                    let mut task = self.command_task(&task_id).await?;
                     if before.version != task.version {
                         self.publish(events::ForgeEvent {
                             event_type: "task.updated".to_owned(),
@@ -169,6 +174,31 @@ impl TaskService {
                                 project_id: task.project_id.clone(),
                             },
                         });
+                    }
+                    // Lost work is admitted again as the ordinary retry the
+                    // Task now offers. A Task left without an Agent offers
+                    // none and waits, annotated, for an assignment.
+                    if settlement.lost_work
+                        && crate::deferred_dispatch::queued_recovery(&task).is_none()
+                    {
+                        let actor = facts.actor();
+                        let snapshot = self.task_action_snapshot(&task_id, &actor).await?;
+                        if let Some(offer) = crate::available_actions(&snapshot)
+                            .into_iter()
+                            .find(|offer| offer.action.verb() == "retry")
+                        {
+                            let action = offer.action.clone();
+                            match self
+                                .queue_task_action(&snapshot, offer, action, actor)
+                                .await
+                            {
+                                Ok(queued) => task = queued,
+                                Err(error @ ServiceError::Db(_)) => return Err(error),
+                                Err(error) => {
+                                    tracing::info!(%task_id, %daemon_id, %error, "removed machine Task stays annotated")
+                                }
+                            }
+                        }
                     }
                     if let Err(error) = Box::pin(self.dispatch_queued_recovery(&task)).await {
                         // The existing replay boundary has already restored or

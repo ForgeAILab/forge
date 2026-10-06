@@ -171,6 +171,16 @@ async fn another_owner_gets_not_found_without_machine_state_disclosure() {
     let dir = tempfile::tempdir().unwrap();
     let harness = common::test_app(dir.path(), "remove-owner").await;
     let registration = register(&harness, "owner-host").await;
+    // The first account to register is the bootstrap administrator, who may
+    // remove any machine; the bystander below must be an ordinary user.
+    let _admin: AuthResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/auth/register",
+        json!({"email":"first-admin@example.com","password":"password123"}),
+        StatusCode::CREATED,
+    )
+    .await;
     let auth: AuthResponse = common::json_request(
         &harness.app,
         Method::POST,
@@ -265,4 +275,193 @@ async fn removed_machine_rejects_old_report_and_websocket_credential_after_fresh
         .await
         .unwrap();
     job.abort();
+}
+
+/// A second user re-registering the first user's `machine_id` is refused, so
+/// they never become its owner and cannot remove it.
+#[tokio::test]
+async fn other_user_cannot_take_over_by_reregistering_then_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = common::test_app(dir.path(), "remove-takeover").await;
+    let victim = register(&harness, "owner-host").await;
+    // Consume the first-account administrator bootstrap: the intruder is an
+    // ordinary user, who must get 404 on the removal below.
+    let _admin: AuthResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/auth/register",
+        json!({"email":"first-admin@example.com","password":"password123"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let auth: AuthResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/auth/register",
+        json!({"email":"other-owner@example.com","password":"password123"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let body = json!({"machine_id":"owner-host","hostname":"x","os":"linux","arch":"x86_64"});
+    let refused: Value = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/daemons/register",
+        &auth.access_token,
+        body.clone(),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(refused["code"], "machine_owned");
+    // An unauthenticated registration cannot clear the owner either.
+    use tower::ServiceExt;
+    let anonymous = harness
+        .app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/daemons/register")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::CONFLICT);
+    let daemon = DaemonRepo::get_by_id(&*harness.state.db, &victim.daemon_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(daemon.owner_id.as_deref(), Some("test-user-id"));
+    assert_eq!(daemon.hostname, "Retired workstation");
+    harness
+        .state
+        .daemon_service
+        .authenticate(&victim.daemon_id, &victim.registration_token)
+        .await
+        .expect("the owner's credential was not rotated");
+    harness
+        .state
+        .daemon_service
+        .mark_disconnected(&victim.daemon_id)
+        .await
+        .unwrap();
+    remove(
+        &harness,
+        &victim.daemon_id,
+        &auth.access_token,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    // The same owner re-registering keeps working, on the same registration.
+    let again = register(&harness, "owner-host").await;
+    assert_eq!(again.daemon_id, victim.daemon_id);
+}
+
+#[tokio::test]
+async fn reserved_machine_ids_are_refused_at_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = common::test_app(dir.path(), "remove-reserved").await;
+    for machine_id in ["embedded:someone-elses-server", "removed:any-id"] {
+        let refused: Value = common::json_request_with_bearer(
+            &harness.app,
+            Method::POST,
+            "/api/v1/daemons/register",
+            &common::test_jwt(),
+            json!({"machine_id":machine_id,"hostname":"x","os":"linux","arch":"x86_64"}),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_eq!(refused["code"], "machine_id_reserved", "{machine_id}");
+    }
+}
+
+/// The machine list is admin-only, so an admin can remove a departed user's
+/// machine. Anyone else gets 404. The preview reports what the confirmation
+/// must state.
+#[tokio::test]
+async fn admin_can_preview_and_remove_another_users_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = common::test_app(dir.path(), "remove-admin").await;
+    let departed: AuthResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/auth/register",
+        json!({"email":"departed@example.com","password":"password123"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let registration: DaemonRegisterResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/daemons/register",
+        &departed.access_token,
+        json!({"machine_id":"departed-host","hostname":"Departed workstation","os":"linux","arch":"x86_64"}),
+        StatusCode::OK,
+    )
+    .await;
+    harness
+        .state
+        .daemon_service
+        .mark_disconnected(&registration.daemon_id)
+        .await
+        .unwrap();
+    let owner = DaemonRepo::get_by_id(&*harness.state.db, &registration.daemon_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_id
+        .expect("the registering user owns the machine");
+    assert_ne!(owner, "test-user-id");
+    let uri = format!("/api/v1/daemons/{}/removal", registration.daemon_id);
+    // Neither the owner nor an admin: no disclosure, no removal.
+    let hidden: Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &uri,
+        &common::test_jwt(),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(hidden["code"], "not_found");
+    remove(
+        &harness,
+        &registration.daemon_id,
+        &common::test_jwt(),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let preview: api_types::RemoveDaemonPreview = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &uri,
+        &common::admin_jwt(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(preview.id, registration.daemon_id);
+    assert_eq!((preview.tasks_to_replace, preview.agents_to_retire), (0, 0));
+    let result: RemoveDaemonResponse = serde_json::from_value(
+        remove(
+            &harness,
+            &registration.daemon_id,
+            &common::admin_jwt(),
+            StatusCode::OK,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(result.hostname, "Departed workstation");
+    assert_eq!((result.tasks_to_replace, result.agents_retired), (0, 0));
+    let actor: Option<String> =
+        sqlx::query_scalar("SELECT actor_id FROM domain_event WHERE event_type='machine.removed'")
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        actor.as_deref(),
+        Some("test-user-id"),
+        "the removing admin is the actor"
+    );
 }

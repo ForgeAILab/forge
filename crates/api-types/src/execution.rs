@@ -675,8 +675,26 @@ pub struct RemoveDaemonResponse {
     pub provisioning_attempts_cleared: u64,
     #[ts(type = "number")]
     pub readiness_records_cleared: u64,
+    /// Workspaces the machine owned, released as lost.
     #[ts(type = "number")]
     pub placements_failed: u64,
+    /// Tasks whose workspace was on the machine; each re-places on another one.
+    #[ts(type = "number")]
+    pub tasks_to_replace: u64,
+    /// Agents pinned to the machine, now archived.
+    #[ts(type = "number")]
+    pub agents_retired: u64,
     #[ts(type = "number")]
     pub tasks_queued: u64,
+}
+
+/// What removing a machine would change. Read before confirming removal.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RemoveDaemonPreview {
+    pub id: String,
+    #[ts(type = "number")]
+    pub tasks_to_replace: u64,
+    #[ts(type = "number")]
+    pub agents_to_retire: u64,
 }

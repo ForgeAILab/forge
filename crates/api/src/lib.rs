@@ -1011,6 +1011,10 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route("/api/v1/daemons/{id}", get(routes::daemons::get_daemon).patch(routes::daemons::update_daemon).delete(routes::daemons::remove_daemon))
         .route(
+            "/api/v1/daemons/{id}/removal",
+            get(routes::daemons::preview_daemon_removal),
+        )
+        .route(
             "/api/v1/daemons/{id}/connect",
             get(routes::daemons::connect_daemon),
         )

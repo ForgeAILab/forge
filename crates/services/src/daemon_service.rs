@@ -448,6 +448,19 @@ impl DaemonService {
             .map_err(Into::into)
     }
 
+    /// What removal would change; same visibility as the removal itself.
+    pub async fn removal_preview(
+        &self,
+        id: &str,
+        actor_id: &str,
+        is_admin: bool,
+    ) -> Result<api_types::RemoveDaemonPreview> {
+        self.db
+            .daemon_removal_preview(id, actor_id, is_admin)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn update_run_limit(
         &self,
         id: &str,

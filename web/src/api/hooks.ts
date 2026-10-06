@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import type { RemoveDaemonPreview } from '@/types/generated/bindings/RemoveDaemonPreview'
 import type { RemoveDaemonResponse } from '@/types/generated/bindings/RemoveDaemonResponse'
 import {
   type InfiniteData,
@@ -1184,6 +1185,16 @@ export function useUpdateDaemonRunLimit() {
       void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
     },
     onError: async () => { await queryClient.invalidateQueries({ queryKey: qk.daemons }) },
+  })
+}
+
+/** What removing a machine would change; read while its confirmation is open. */
+export function useDaemonRemovalPreview(id: string, enabled: boolean) {
+  return useQuery({
+    queryKey: [...qk.daemons, id, 'removal'],
+    queryFn: () => apiFetch<RemoveDaemonPreview>(`/daemons/${id}/removal`),
+    enabled,
+    staleTime: 0,
   })
 }
 

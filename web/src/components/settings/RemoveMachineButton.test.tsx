@@ -36,9 +36,14 @@ const result = {
   cleanup_records_cleared: 0,
   provisioning_attempts_cleared: 0,
   readiness_records_cleared: 0,
-  placements_failed: 0,
-  tasks_queued: 1,
+  placements_failed: 2,
+  tasks_to_replace: 2,
+  agents_retired: 1,
+  tasks_queued: 3,
 }
+const preview = { id: 'dead', tasks_to_replace: 2, agents_to_retire: 1 }
+const removalCalls = () =>
+  vi.mocked(apiFetch).mock.calls.filter(([, init]) => init?.method === 'DELETE')
 
 function mount(machine = daemon, onRemoved = vi.fn()) {
   const client = new QueryClient({
@@ -64,7 +69,9 @@ beforeEach(() => {
       created_at: '2026-10-05T00:00:00Z',
     },
   })
-  vi.mocked(apiFetch).mockResolvedValue(result)
+  vi.mocked(apiFetch).mockImplementation(async (path: string) =>
+    path.endsWith('/removal') ? preview : result,
+  )
 })
 
 describe('machine removal', () => {
@@ -73,10 +80,10 @@ describe('machine removal', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
     expect(screen.getByRole('dialog')).toBeTruthy()
     expect(screen.getByRole('heading', { name: 'Remove Lost workstation?' })).toBeTruthy()
-    expect(screen.getByText(/Execution history keeps/)).toBeTruthy()
-    expect(apiFetch).not.toHaveBeenCalled()
+    expect(screen.getByText(/Execution\s+history keeps/)).toBeTruthy()
+    expect(removalCalls()).toHaveLength(0)
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    expect(apiFetch).not.toHaveBeenCalled()
+    expect(removalCalls()).toHaveLength(0)
     fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
     fireEvent.click(screen.getByRole('button', { name: 'Remove machine' }))
     await waitFor(() => expect(onRemoved).toHaveBeenCalledOnce())
@@ -103,22 +110,41 @@ describe('machine removal', () => {
     expect(screen.getByText('The embedded server machine cannot be removed.')).toBeTruthy()
   })
 
-  it('hides removal from a different owner, including an administrator', () => {
-    useAuthStore.setState({
-      user: {
-        id: 'other',
-        email: 'other@example.com',
-        display_name: null,
-        is_admin: true,
-        created_at: '2026-10-05T00:00:00Z',
-      },
-    })
+  it('states how many Tasks will be re-placed and that unpushed work is abandoned', async () => {
     mount()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    expect(apiFetch).toHaveBeenCalledWith('/daemons/dead/removal')
+    await waitFor(() =>
+      expect(screen.getByRole('status').textContent).toBe(
+        '2 Tasks have a workspace on this machine and will be re-placed on another machine. 1 Agent pinned to it will be retired.',
+      ),
+    )
+    expect(screen.getByText(/that was not pushed is abandoned/)).toBeTruthy()
+    expect(removalCalls()).toHaveLength(0)
+  })
+
+  it('offers removal to an administrator and hides it from any other user', () => {
+    const other = {
+      id: 'other',
+      email: 'other@example.com',
+      display_name: null,
+      is_admin: false,
+      created_at: '2026-10-05T00:00:00Z',
+    }
+    useAuthStore.setState({ user: other })
+    const first = mount()
     expect(screen.queryByRole('button', { name: 'Remove' })).toBeNull()
+    first.unmount()
+    useAuthStore.setState({ user: { ...other, is_admin: true } })
+    mount()
+    expect(screen.getByRole('button', { name: 'Remove' })).toHaveProperty('disabled', false)
   })
 
   it('shows a racing connected conflict and refreshes the machine query', async () => {
-    vi.mocked(apiFetch).mockRejectedValue(new ApiError('Stop the daemon first', 409))
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.endsWith('/removal')) return preview
+      throw new ApiError('Stop the daemon first', 409)
+    })
     const { onRemoved, invalidate } = mount()
     fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
     fireEvent.click(screen.getByRole('button', { name: 'Remove machine' }))
@@ -130,10 +156,12 @@ describe('machine removal', () => {
 
   it('disables both dialog actions while removal is pending', async () => {
     let resolve: (value: typeof result) => void = () => {}
-    vi.mocked(apiFetch).mockReturnValue(
-      new Promise((done) => {
-        resolve = done
-      }),
+    vi.mocked(apiFetch).mockImplementation((path: string) =>
+      path.endsWith('/removal')
+        ? Promise.resolve(preview)
+        : new Promise((done) => {
+            resolve = done
+          }),
     )
     mount()
     fireEvent.click(screen.getByRole('button', { name: 'Remove' }))

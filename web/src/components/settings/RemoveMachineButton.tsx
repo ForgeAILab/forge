@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { useRemoveDaemon } from '@/api/hooks'
+import { useDaemonRemovalPreview, useRemoveDaemon } from '@/api/hooks'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -14,6 +14,10 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import type { Daemon } from '@/types/generated'
 
+function count(value: number, one: string, many: string) {
+  return `${value} ${value === 1 ? one : many}`
+}
+
 export function RemoveMachineButton({
   daemon,
   onRemoved,
@@ -25,8 +29,9 @@ export function RemoveMachineButton({
   const mutation = useRemoveDaemon()
   const [open, setOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const ownsMachine = daemon.owner_id ? daemon.owner_id === user?.id : user?.is_admin
-  if (!ownsMachine) return null
+  const preview = useDaemonRemovalPreview(daemon.id, open)
+  const mayRemove = user?.is_admin || (daemon.owner_id != null && daemon.owner_id === user?.id)
+  if (!mayRemove) return null
   const local = daemon.machine_id.startsWith('embedded:')
   const connected = daemon.status === 'online'
   const hint = local
@@ -73,12 +78,21 @@ export function RemoveMachineButton({
           <DialogHeader>
             <DialogTitle>Remove {daemon.hostname}?</DialogTitle>
             <DialogDescription>
-              This revokes the machine’s credential and clears pending remote cleanup. Waiting Tasks
-              resume recovery or remain parked if their workspace is unavailable. Execution history
-              keeps the machine’s name. Files on the machine remain there. Connecting again requires
-              a new registration.
+              This revokes the machine’s credential and clears pending remote cleanup. Execution
+              history keeps the machine’s name. Connecting again requires a new registration.
             </DialogDescription>
           </DialogHeader>
+          <p role="status" className="text-sm">
+            {preview.data
+              ? `${count(preview.data.tasks_to_replace, 'Task has', 'Tasks have')} a workspace on this machine and will be re-placed on another machine. ${count(preview.data.agents_to_retire, 'Agent', 'Agents')} pinned to it will be retired.`
+              : preview.isError
+                ? 'Could not count the affected Tasks. Every Task with a workspace on this machine will be re-placed on another machine.'
+                : 'Counting affected Tasks…'}
+          </p>
+          <p className="text-sm font-medium text-destructive">
+            Work on this machine that was not pushed is abandoned. Re-placed Tasks continue from
+            their last server-known branch.
+          </p>
           {connected && (
             <p role="status" className="text-sm">
               {hint}

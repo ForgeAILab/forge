@@ -68,6 +68,8 @@ pub enum DbError {
     MachineConnected,
     #[error("The embedded server machine cannot be removed")]
     LocalMachine,
+    #[error("This machine is registered to another user")]
+    MachineOwnedByAnotherUser,
 
     #[error("machine has no available run capacity")]
     MachineAtCapacity,

@@ -211,7 +211,8 @@ capacity is a placement wait, independent of Agent availability.
 
 | GET / PUT | `/api/v1/settings` | Read/update administrator Forge settings; the server run cap and usage index budget apply live |
 | PATCH | `/api/v1/daemons/{id}` | Set or clear a version-checked administrator run limit |
-| DELETE | `/api/v1/daemons/{id}` | Remove a disconnected machine as its registration owner; an administrator may remove an unclaimed registration |
+| DELETE | `/api/v1/daemons/{id}` | Remove a disconnected machine as its registration owner or an administrator |
+| GET    | `/api/v1/daemons/{id}/removal` | Preview a removal for its owner or an administrator: Tasks to re-place and Agents to retire |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
@@ -5118,28 +5119,60 @@ clears these records when the machine will not return.
 ### Removing a machine
 
 `DELETE /api/v1/daemons/{id}` uses the existing daemon registration ID and user
-JWT/PAT authentication. Only its registration owner may remove it; an
-administrator may remove an unclaimed registration. Other owners and missing or
-already removed IDs return 404. A connected machine returns HTTP 409 with
-`code: machine_connected` and a stop-daemon instruction. The embedded server
-machine always returns HTTP 409 with `code: local_machine`, even while offline.
+JWT/PAT authentication. The registration owner or an administrator may remove a
+machine; the machine list is administrator-only, so an administrator can remove
+a departed user's machine. Anyone else, and a missing or already removed ID, gets
+404. A connected machine returns HTTP 409 with `code: machine_connected` and a
+stop-daemon instruction. The embedded server machine always returns HTTP 409
+with `code: local_machine`, even while offline.
+
+`GET /api/v1/daemons/{id}/removal` has the same authorization and returns
+`RemoveDaemonPreview`: `id`, `tasks_to_replace` (Tasks with a live workspace the
+machine owns) and `agents_to_retire` (Agents pinned to it). It changes nothing;
+the web confirmation reads it before the owner confirms.
 
 HTTP 200 returns `RemoveDaemonResponse`: `id`, `hostname`,
 `pending_remote_cancels_cleared`, `cleanup_records_cleared`,
-`provisioning_attempts_cleared`, `readiness_records_cleared`, `placements_failed`,
-and `tasks_queued`. Revocation, cleanup removal, unavailable locations/runtimes,
-owner-loss placement fencing, Task step enqueues, and the durable
-`machine.removed` event commit in one transaction. The event records the actor,
-original machine identity/name, and these counts. Task completion is asynchronous;
-observe Task GET/SSE after removal rather than resubmitting its accepted action.
+`provisioning_attempts_cleared`, `readiness_records_cleared`, `placements_failed`
+(workspaces the machine owned, released as lost), `tasks_to_replace` (the Tasks
+those workspaces belonged to), `agents_retired` and `tasks_queued`. Revocation,
+cleanup removal, unavailable locations/runtimes, workspace release, Agent
+retirement, Task step enqueues, and the durable `machine.removed` event commit
+in one transaction. The event records the removing user, the original machine
+identity/name, and these counts. Task completion is asynchronous; observe Task
+GET/SSE after removal rather than resubmitting its accepted action.
+
+A removed machine is permanent loss: no Task stays pinned to it.
+
+- **Workspaces it owned are released.** Each placement becomes `cleaned` with no
+  handle and its workspace `cleaned` with a `machine_removed:` error, keeping an
+  earlier failure cause. The Task's next admission goes through ordinary
+  placement, selects another eligible machine and prepares a fresh workspace
+  from the Task's last server-known branch. **Work that existed only on the
+  removed machine is abandoned.** If no machine is eligible the Task parks with
+  the ordinary placement-unavailable wait, never on the removed owner.
+- **A server-owned workspace that only executed there is kept.** It stops
+  routing to the removed machine, keeps its files and any unrelated failure, and
+  a wait for that executor ends.
+- **Live runs settle once**, as `failed` / `daemon_disconnected` with
+  `error.cause: "machine_removed"`, attributed to the removing user
+  (`stopped_by: user:api`), without consuming workflow retries.
+- **The Task is admitted again.** A parked Restart/Retry/Release proceeds through
+  the existing leased recovery path once no other machine's cancellation fences
+  it. A Task that lost a run or was waiting on the owner gets a
+  `recovery_required` annotation with `blocking_reason: "machine_removed"` and
+  its ordinary Retry is queued for it. "Retry on Workspace Owner"
+  (`owner_reconcile`) is never offered for a removed owner; one that was already
+  accepted is replaced by that ordinary Retry.
+- **Agents pinned to the machine are archived** (paused, never default, hidden
+  from Agent lists and assignment), keeping their rows and execution history; an
+  Agent without a description gets "Retired: machine … was removed". Tasks
+  assigned to them are unassigned through the same sweep as any archived Agent
+  and wait for a new assignee. Registering the host again creates new Agents
+  under the new daemon ID, so there is never a second live copy.
 
 Pending remote cancellations, including orphan records from deleted Tasks, and
-daemon workspace cleanup receipts are cleared. Parked Restart/Retry/Release
-continues through the existing leased Task recovery path when no remaining owner
-cancellation fences it. Running executions settle through disconnect settlement
-with `owner_disconnected_timeout`, without consuming workflow retries. A retained
-workspace keeps its original owner and follows existing typed owner-loss recovery;
-a Task without a retained placement can select another eligible machine.
+daemon workspace cleanup receipts are cleared.
 
 The registration is tombstoned and its credential revoked. Active machine and
 runtime lists, placement candidates, machine-pressure and offline-issue projections
@@ -5148,9 +5181,22 @@ hostname remain. Its unique registration key is retired so registering the same
 physical machine creates a fresh daemon ID; the old ID/token cannot report or
 reconnect. Removal abandons physical files on the unavailable machine. Later
 workspace cleanup retires server bookkeeping without claiming to have deleted
-those files. The web machine settings offer a confirmation dialog; Remove is
+those files. The web machine settings offer a confirmation dialog that states
+how many Tasks will be re-placed and that work not pushed is abandoned; Remove is
 disabled with a hint while connected or for the embedded machine.
-`forge-ctl daemon remove <id>` exposes the same action. There is no MCP tool.
+`forge-ctl daemon remove <id>` exposes the same action and prints the same
+counts. There is no MCP tool.
+
+### Machine registration ownership
+
+`POST /api/v1/daemons/register` never changes the owner of an existing
+registration. Registering a `machine_id` that belongs to a different user, or
+without authentication when it has an owner, returns HTTP 409 with
+`code: machine_owned` and leaves the owner, credential and hostname untouched.
+The same owner re-registering rotates the credential as before, and an unclaimed
+registration can still be claimed by the first authenticated user. A
+`machine_id` starting with `removed:`, or starting with `embedded:` and not this
+server's own embedded identity, returns HTTP 409 with `code: machine_id_reserved`.
 
 ### Task budget projections
 

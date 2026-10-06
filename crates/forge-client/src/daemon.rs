@@ -132,12 +132,21 @@ impl DaemonArgs {
                     print_json(&result)?;
                 } else {
                     println!(
-                        "Removed machine {} ({}); cleared {} remote cancellations; queued {} Tasks",
+                        "Removed machine {} ({}); cleared {} remote cancellations; released {} workspaces; {} Tasks will re-place on another machine; retired {} Agents; queued {} Tasks",
                         result.hostname,
                         result.id,
                         result.pending_remote_cancels_cleared,
+                        result.placements_failed,
+                        result.tasks_to_replace,
+                        result.agents_retired,
                         result.tasks_queued
                     );
+                    if result.tasks_to_replace > 0 {
+                        println!(
+                            "Work on {} that was not pushed is abandoned.",
+                            result.hostname
+                        );
+                    }
                 }
                 Ok(())
             }

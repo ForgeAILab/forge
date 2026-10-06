@@ -4,7 +4,21 @@ use crate::DaemonStatus;
 #[async_trait]
 impl DaemonRepo for SqliteDb {
     async fn upsert_by_machine_id(&self, input: UpsertDaemon) -> Result<Daemon> {
-        sqlx::query("INSERT INTO daemon (id, machine_id, hostname, os, arch, agent_version, labels_json, status, registration_token_hash, owner_id, visibility, created_at, updated_at, max_concurrent_runs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET hostname = excluded.hostname, os = excluded.os, arch = excluded.arch, agent_version = excluded.agent_version, labels_json = excluded.labels_json, status = excluded.status, registration_token_hash = excluded.registration_token_hash, owner_id = excluded.owner_id, visibility = excluded.visibility, updated_at = excluded.updated_at, max_concurrent_runs = COALESCE(excluded.max_concurrent_runs, daemon.max_concurrent_runs), version = daemon.version + 1 WHERE daemon.removed_at IS NULL")
+        // The existence check and the write share one writer transaction, so a
+        // registration can never replace another owner's identity or token.
+        let mut tx = crate::begin_immediate(&self.pool).await?;
+        let existing_owner: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT owner_id FROM daemon WHERE machine_id = ? AND removed_at IS NULL",
+        )
+        .bind(&input.machine_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(Some(owner)) = existing_owner.as_ref() {
+            if input.owner_id.as_deref() != Some(owner.as_str()) {
+                return Err(DbError::MachineOwnedByAnotherUser);
+            }
+        }
+        sqlx::query("INSERT INTO daemon (id, machine_id, hostname, os, arch, agent_version, labels_json, status, registration_token_hash, owner_id, visibility, created_at, updated_at, max_concurrent_runs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET hostname = excluded.hostname, os = excluded.os, arch = excluded.arch, agent_version = excluded.agent_version, labels_json = excluded.labels_json, status = excluded.status, registration_token_hash = excluded.registration_token_hash, owner_id = COALESCE(daemon.owner_id, excluded.owner_id), visibility = excluded.visibility, updated_at = excluded.updated_at, max_concurrent_runs = COALESCE(excluded.max_concurrent_runs, daemon.max_concurrent_runs), version = daemon.version + 1 WHERE daemon.removed_at IS NULL")
             .bind(&input.id)
             .bind(&input.machine_id)
             .bind(&input.hostname)
@@ -19,8 +33,9 @@ impl DaemonRepo for SqliteDb {
             .bind(&input.created_at)
             .bind(&input.updated_at)
             .bind(input.max_concurrent_runs.map(i64::from))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         sqlx::query("SELECT * FROM daemon WHERE machine_id = ? AND removed_at IS NULL")
             .bind(&input.machine_id)
             .fetch_optional(&self.pool)
@@ -257,7 +272,51 @@ fn daemon_supports_executor(daemon: &Daemon, executor_type: &str) -> bool {
     })
 }
 
+/// A live workspace the machine owns. A workspace it only executed in is
+/// server-owned and is never released by removal.
+const OWNED_PLACEMENT: &str =
+    "p.owner_kind='daemon' AND p.daemon_id=? AND p.state NOT IN ('cleaning','cleaned')";
+/// A live Agent whose selected profile is pinned to the machine.
+const PINNED_AGENT: &str = "i.archived_at IS NULL AND i.selected_profile_id IN (SELECT id FROM agent_profile WHERE daemon_id=?)";
+/// Marks a workspace released by machine removal.
+pub const WORKSPACE_LOST_PREFIX: &str = "machine_removed:";
+
 impl SqliteDb {
+    /// What removal would change, for the confirmation shown before it.
+    pub async fn daemon_removal_preview(
+        &self,
+        id: &str,
+        actor_id: &str,
+        is_admin: bool,
+    ) -> Result<api_types::RemoveDaemonPreview> {
+        let owner: Option<Option<String>> =
+            sqlx::query_scalar("SELECT owner_id FROM daemon WHERE id=? AND removed_at IS NULL")
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?;
+        let owner = owner.ok_or(DbError::NotFound)?;
+        if !(is_admin || owner.as_deref() == Some(actor_id)) {
+            return Err(DbError::NotFound);
+        }
+        let tasks_to_replace: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(DISTINCT p.task_id) FROM workspace_placement p JOIN task t ON t.id=p.task_id AND t.deleted_at IS NULL WHERE {OWNED_PLACEMENT}"
+        ))
+        .bind(id)
+        .fetch_one(self.pool())
+        .await?;
+        let agents_to_retire: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM agent_identity i WHERE {PINNED_AGENT}"
+        ))
+        .bind(id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(api_types::RemoveDaemonPreview {
+            id: id.to_owned(),
+            tasks_to_replace: tasks_to_replace as u64,
+            agents_to_retire: agents_to_retire as u64,
+        })
+    }
+
     pub async fn daemon_removed(&self, id: &str) -> Result<bool> {
         Ok(sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM daemon WHERE id=? AND removed_at IS NOT NULL)",
@@ -285,27 +344,47 @@ impl SqliteDb {
             .await?
             .ok_or(DbError::NotFound)?;
         let daemon = map_daemon(row)?;
-        if !match daemon.owner_id.as_deref() {
-            Some(owner) => owner == actor_id,
-            None => is_admin,
-        } {
+        if !(is_admin || daemon.owner_id.as_deref() == Some(actor_id)) {
             return Err(DbError::NotFound);
         }
         if daemon.machine_id == local_machine_id || daemon.machine_id.starts_with("embedded:") {
             return Err(DbError::LocalMachine);
         }
-        if transport_connected || daemon.status == DaemonStatus::Online {
+        // Same predicate as the tombstone UPDATE below: only `offline` is removable.
+        if transport_connected || daemon.status != DaemonStatus::Offline {
             return Err(DbError::MachineConnected);
         }
         let now = crate::now_rfc3339();
-        let tasks: Vec<String> = sqlx::query_scalar(
+        // Facts are read before any row changes: settlement must not re-derive
+        // them from the released placements and retired Agents written below.
+        let running: Vec<(String, String)> = sqlx::query_as(
+            "SELECT e.task_id, e.id FROM execution e LEFT JOIN workspace_placement p ON p.workspace_id=e.workspace_id LEFT JOIN agent_current a ON a.id=e.agent_id WHERE e.status='running' AND CASE WHEN e.workspace_id IS NOT NULL THEN CASE p.owner_kind WHEN 'daemon' THEN p.daemon_id ELSE p.execution_daemon_id END ELSE COALESCE(CASE WHEN json_valid(e.executor_config_snapshot_json) THEN json_extract(e.executor_config_snapshot_json,'$.daemon_id') END,a.daemon_id) END=? ORDER BY e.id")
+            .bind(id).fetch_all(&mut *tx).await?;
+        let lost: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT DISTINCT p.task_id FROM workspace_placement p JOIN task t ON t.id=p.task_id AND t.deleted_at IS NULL WHERE {OWNED_PLACEMENT} ORDER BY p.task_id"
+        ))
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let placed: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT task_id FROM workspace_placement WHERE (daemon_id=? OR execution_daemon_id=?) AND state NOT IN ('cleaning','cleaned')",
+        )
+        .bind(id)
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let tasks: Vec<String> = sqlx::query_scalar(&format!(
             "SELECT DISTINCT t.id FROM task t WHERE t.deleted_at IS NULL AND (
                 EXISTS(SELECT 1 FROM workspace_placement p WHERE p.task_id=t.id AND (p.daemon_id=? OR p.execution_daemon_id=?))
                 OR EXISTS(SELECT 1 FROM pending_remote_cancel c LEFT JOIN workspace w ON w.id=c.workspace_id LEFT JOIN task_step s ON s.id=c.step_id WHERE c.daemon_id=? AND (w.task_id=t.id OR s.task_id=t.id OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=t.id AND e.workspace_id=c.workspace_id)))
-                OR EXISTS(SELECT 1 FROM execution e LEFT JOIN workspace_placement p ON p.workspace_id=e.workspace_id LEFT JOIN agent_current a ON a.id=e.agent_id WHERE e.task_id=t.id AND e.status='running' AND CASE WHEN e.workspace_id IS NOT NULL THEN CASE p.owner_kind WHEN 'daemon' THEN p.daemon_id ELSE p.execution_daemon_id END ELSE COALESCE(CASE WHEN json_valid(e.executor_config_snapshot_json) THEN json_extract(e.executor_config_snapshot_json,'$.daemon_id') END,a.daemon_id) END=?)
+                OR t.id IN (SELECT value FROM json_each(?))
                 OR (json_valid(t.metadata_json) AND json_extract(t.metadata_json,'$.environment_wait.machine.daemon_id')=?)
-            ) ORDER BY t.id")
-            .bind(id).bind(id).bind(id).bind(id).bind(id).fetch_all(&mut *tx).await?;
+                OR (json_valid(t.metadata_json) AND json_extract(t.metadata_json,'$.owner_wait.daemon_id')=?)
+                OR EXISTS(SELECT 1 FROM agent_identity i WHERE {PINNED_AGENT} AND ((t.assignee_type='agent' AND t.assignee_id=i.id) OR EXISTS(SELECT 1 FROM task_role_assignment r WHERE r.task_id=t.id AND r.assignee_type='agent' AND r.assignee_id=i.id)))
+            ) ORDER BY t.id"))
+            .bind(id).bind(id).bind(id)
+            .bind(serde_json::json!(running.iter().map(|(task, _)| task).collect::<Vec<_>>()).to_string())
+            .bind(id).bind(id).bind(id).fetch_all(&mut *tx).await?;
         let changed = sqlx::query("UPDATE daemon SET removed_at=?, registration_token_hash=NULL, machine_id=?, run_limit=NULL, updated_at=?, version=version+1 WHERE id=? AND version=? AND status='offline' AND removed_at IS NULL")
             .bind(&now).bind(format!("removed:{id}")).bind(&now).bind(id).bind(daemon.version).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
@@ -336,19 +415,44 @@ impl SqliteDb {
             .await?;
         sqlx::query("UPDATE repo_location SET status='unavailable',version=version+1,updated_at=? WHERE daemon_id=?")
             .bind(&now).bind(id).execute(&mut *tx).await?;
-        // The missing owner's worktree stays pinned. Existing owner-loss
-        // settlement parks it; only an unplaced Task selects a different owner.
-        let placements_failed = sqlx::query("UPDATE workspace_placement SET state='failed',failure_cause='owner_disconnected_timeout',disconnected_at=COALESCE(disconnected_at,?),reserved_until=NULL,updated_at=?,version=version+1 WHERE (daemon_id=? OR execution_daemon_id=?) AND state NOT IN ('cleaning','cleaned')")
-            .bind(&now).bind(&now).bind(id).bind(id).execute(&mut *tx).await?.rows_affected();
+        // A removed owner is permanent loss: release every workspace it owned so
+        // the Task's next admission selects another machine and prepares a fresh
+        // workspace. `cleaned` is the existing "nothing exists, reselect" state;
+        // an earlier failure cause is kept. Work only that machine held is gone.
+        sqlx::query(&format!("UPDATE workspace SET status='cleaned',error=?,cleanup_after=NULL,updated_at=? WHERE id IN (SELECT p.workspace_id FROM workspace_placement p WHERE {OWNED_PLACEMENT})"))
+            .bind(format!("{WORKSPACE_LOST_PREFIX} machine {} was removed; its workspace was abandoned", daemon.hostname))
+            .bind(&now).bind(id).execute(&mut *tx).await?;
+        let placements_failed = sqlx::query(&format!("UPDATE workspace_placement AS p SET state='cleaned',workspace_handle=NULL,failure_cause=COALESCE(failure_cause,'owner_disconnected_timeout'),disconnected_at=COALESCE(disconnected_at,?),reserved_until=NULL,updated_at=?,version=version+1 WHERE {OWNED_PLACEMENT}"))
+            .bind(&now).bind(&now).bind(id).execute(&mut *tx).await?.rows_affected();
+        // A server-owned workspace that only executed there keeps its files and
+        // an unrelated failure. It stops routing work to the removed machine, and
+        // a wait for that executor ends: the workspace itself was never lost.
+        const EXECUTOR_WAIT: &str = "workspace_handle IS NOT NULL AND (state='disconnected' OR (state='failed' AND failure_cause IN ('owner_disconnected','owner_disconnected_timeout','owner_lost_execution')))";
+        sqlx::query(&format!("UPDATE workspace_placement SET state=CASE WHEN {EXECUTOR_WAIT} THEN 'ready' ELSE state END,failure_cause=CASE WHEN {EXECUTOR_WAIT} THEN NULL ELSE failure_cause END,disconnected_at=CASE WHEN {EXECUTOR_WAIT} THEN NULL ELSE disconnected_at END,execution_daemon_id=NULL,updated_at=?,version=version+1 WHERE execution_daemon_id=? AND owner_kind='server'"))
+            .bind(&now).bind(id).execute(&mut *tx).await?;
+        // Agents pinned to the machine are archived, the existing retirement:
+        // paused, never default, hidden from `agent_current` and so from every
+        // assignment and selection path. A fresh registration creates new ones.
+        let agents_retired = sqlx::query(&format!("UPDATE agent_identity AS i SET archived_at=?,paused=1,is_default=0,status='offline',description=COALESCE(description,?),version=version+1,updated_at=? WHERE {PINNED_AGENT}"))
+            .bind(&now)
+            .bind(format!("Retired: machine {} was removed", daemon.hostname))
+            .bind(&now).bind(id).execute(&mut *tx).await?.rows_affected();
         for task_id in &tasks {
             let step_id = crate::new_uuid_v4();
             let task = sqlx::query("SELECT status,version FROM task WHERE id=?")
                 .bind(task_id)
                 .fetch_one(&mut *tx)
                 .await?;
+            let facts = serde_json::json!({
+                "actor_id": actor_id,
+                "hostname": daemon.hostname,
+                "executions": running.iter().filter(|(task, _)| task == task_id).map(|(_, execution)| execution).collect::<Vec<_>>(),
+                "workspace_lost": lost.contains(task_id),
+                "placed": placed.contains(task_id),
+            });
             let queued=self.enqueue_step_in_tx(&mut tx,&crate::EnqueueTaskStep {
                 id:step_id.clone(),task_id:task_id.clone(),kind:"command".to_owned(),
-                payload_json:serde_json::json!({"operation":"settle_removed_machine","arguments":[task_id,id],"preempt":false}).to_string(),
+                payload_json:serde_json::json!({"operation":"settle_removed_machine","arguments":[task_id,id,facts],"preempt":false}).to_string(),
                 causation_step_id:None,causation_key:format!("machine-removed:{id}"),chain_id:step_id,chain_position:1,
                 expected_status:task.get("status"),expected_version:task.get("version"),expected_epoch:None,
                 lane:"fast".to_owned(),available_at:now.clone(),
@@ -364,6 +468,8 @@ impl SqliteDb {
             provisioning_attempts_cleared,
             readiness_records_cleared,
             placements_failed,
+            tasks_to_replace: lost.len() as u64,
+            agents_retired,
             tasks_queued: tasks.len() as u64,
         };
         DomainEventRepo::append_event_in_tx(self,&mut tx,&crate::CreateDomainEvent {
@@ -637,5 +743,101 @@ mod tests {
             1
         );
         assert!(!db.daemon_removed(&daemon.id).await.unwrap());
+    }
+
+    fn registration(machine_id: &str, owner: Option<&str>, token: &str) -> UpsertDaemon {
+        let now = now_rfc3339();
+        UpsertDaemon {
+            id: new_uuid_v4(),
+            machine_id: machine_id.into(),
+            hostname: format!("host-of-{}", owner.unwrap_or("nobody")),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            agent_version: None,
+            labels_json: "{}".into(),
+            status: DaemonStatus::Offline,
+            registration_token_hash: Some(token.into()),
+            owner_id: owner.map(str::to_owned),
+            visibility: "account".into(),
+            max_concurrent_runs: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    async fn user(db: &SqliteDb, id: &str) {
+        sqlx::query("INSERT INTO user(id,email,password_hash,is_admin,created_at,updated_at) VALUES (?,?,'hash',0,?,?)")
+            .bind(id).bind(format!("{id}@example.com")).bind(now_rfc3339()).bind(now_rfc3339())
+            .execute(db.pool()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn registration_never_changes_another_owners_machine() {
+        let db = SqliteDb::new(create_sqlite_pool("sqlite::memory:").await.unwrap());
+        run_migrations(db.pool()).await.unwrap();
+        user(&db, "alice").await;
+        user(&db, "bob").await;
+        let owned =
+            DaemonRepo::upsert_by_machine_id(&db, registration("shared", Some("alice"), "a1"))
+                .await
+                .unwrap();
+        for intruder in [Some("bob"), None] {
+            assert!(matches!(
+                DaemonRepo::upsert_by_machine_id(&db, registration("shared", intruder, "stolen"))
+                    .await,
+                Err(DbError::MachineOwnedByAnotherUser)
+            ));
+        }
+        let unchanged = DaemonRepo::get_by_id(&db, &owned.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged, owned, "owner, token and hostname are untouched");
+        let again =
+            DaemonRepo::upsert_by_machine_id(&db, registration("shared", Some("alice"), "a2"))
+                .await
+                .unwrap();
+        assert_eq!(again.id, owned.id);
+        assert_eq!(again.owner_id.as_deref(), Some("alice"));
+        assert_eq!(again.registration_token_hash.as_deref(), Some("a2"));
+        // An unclaimed registration can still be claimed by its first owner.
+        let unclaimed = DaemonRepo::upsert_by_machine_id(&db, registration("open", None, "o1"))
+            .await
+            .unwrap();
+        let claimed =
+            DaemonRepo::upsert_by_machine_id(&db, registration("open", Some("bob"), "o2"))
+                .await
+                .unwrap();
+        assert_eq!(claimed.id, unclaimed.id);
+        assert_eq!(claimed.owner_id.as_deref(), Some("bob"));
+    }
+
+    #[tokio::test]
+    async fn owner_or_admin_removes_an_owned_machine_and_anyone_else_gets_not_found() {
+        let db = SqliteDb::new(create_sqlite_pool("sqlite::memory:").await.unwrap());
+        run_migrations(db.pool()).await.unwrap();
+        user(&db, "alice").await;
+        for (actor, is_admin, allowed) in [
+            ("bob", false, false),
+            ("alice", false, true),
+            ("root", true, true),
+        ] {
+            let daemon =
+                DaemonRepo::upsert_by_machine_id(&db, registration(actor, Some("alice"), "t"))
+                    .await
+                    .unwrap();
+            let preview = db.daemon_removal_preview(&daemon.id, actor, is_admin).await;
+            let removal = db
+                .remove_daemon(&daemon.id, actor, is_admin, "local", false)
+                .await;
+            if allowed {
+                assert_eq!(preview.unwrap().tasks_to_replace, 0);
+                removal.unwrap();
+            } else {
+                assert!(matches!(preview, Err(DbError::NotFound)));
+                assert!(matches!(removal, Err(DbError::NotFound)));
+            }
+            assert_eq!(db.daemon_removed(&daemon.id).await.unwrap(), allowed);
+        }
     }
 }

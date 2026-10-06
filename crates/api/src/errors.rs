@@ -522,6 +522,7 @@ impl From<DbError> for ApiError {
             },
             DbError::MachineConnected => Self::conflict_with_code("machine_connected", "Stop the daemon before removing this connected machine"),
             DbError::LocalMachine => Self::conflict_with_code("local_machine", "The embedded server machine cannot be removed"),
+            DbError::MachineOwnedByAnotherUser => Self::conflict_with_code("machine_owned", "This machine is registered to another user"),
             DbError::MachineAtCapacity => Self::conflict_with_code("machine_capacity", "Machine has no available run capacity"),
             DbError::AgentAtCapacity => Self {
                 status: StatusCode::CONFLICT,
