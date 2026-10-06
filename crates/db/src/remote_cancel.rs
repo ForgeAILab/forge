@@ -17,6 +17,25 @@ pub struct RemoteTaskOperation {
     pub created_at: String,
 }
 
+/// The workspace fence of one Task (`?1`): every unconfirmed cancellation in
+/// a workspace the Task owns or has run an execution in. Children run in
+/// their root's shared workspace, so a sibling is fenced too. The dispatcher
+/// refusal, the owner-facing machine list and the Task condition all read
+/// this one predicate.
+pub(crate) const TASK_FENCE: &str = "FROM pending_remote_cancel r JOIN workspace w ON w.id=r.workspace_id WHERE (w.task_id=?1 OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=?1 AND e.workspace_id=w.id))";
+
+/// The inverse of [`TASK_FENCE`]: every Task a cancellation in this workspace
+/// fences, deleted or not.
+pub(crate) async fn fenced_tasks(
+    c: &mut sqlx::SqliteConnection,
+    workspace_id: &str,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar("SELECT id FROM task WHERE id=(SELECT task_id FROM workspace WHERE id=?1) OR id IN (SELECT task_id FROM execution WHERE workspace_id=?1)")
+        .bind(workspace_id)
+        .fetch_all(c)
+        .await?)
+}
+
 fn row_operation(row: sqlx::sqlite::SqliteRow) -> RemoteTaskOperation {
     RemoteTaskOperation {
         operation_id: row.get("operation_id"),
@@ -96,22 +115,45 @@ impl SqliteDb {
             .bind(task_id).fetch_all(self.pool()).await?.into_iter().map(row_operation).collect())
     }
     pub async fn task_has_pending_remote_cancel(&self, task_id: &str) -> Result<bool> {
-        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pending_remote_cancel r JOIN workspace w ON w.id=r.workspace_id WHERE w.task_id=? OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=? AND e.workspace_id=w.id))")
-            .bind(task_id).bind(task_id).fetch_one(self.pool()).await?)
+        Ok(
+            sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 {TASK_FENCE})"))
+                .bind(task_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
     }
 
     /// Machines whose unconfirmed cancellation still fences this Task's
     /// workspace: the hostname, or the daemon id if the registration is gone.
     pub async fn task_pending_remote_cancel_machines(&self, task_id: &str) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar("SELECT DISTINCT COALESCE(d.hostname,r.daemon_id) FROM pending_remote_cancel r JOIN workspace w ON w.id=r.workspace_id LEFT JOIN daemon d ON d.id=r.daemon_id WHERE w.task_id=? OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=? AND e.workspace_id=w.id) ORDER BY 1")
-            .bind(task_id).bind(task_id).fetch_all(self.pool()).await?)
+        Ok(sqlx::query_scalar(&format!("SELECT DISTINCT COALESCE((SELECT d.hostname FROM daemon d WHERE d.id=r.daemon_id),r.daemon_id) {TASK_FENCE} ORDER BY 1"))
+            .bind(task_id).fetch_all(self.pool()).await?)
     }
 
     pub async fn mark_pending_remote_cancel(&self, operation: &RemoteTaskOperation) -> Result<()> {
         // Orphan cleanup intentionally has no registration FK. Only explicit
         // revocation may suppress a marker for still-running remote work.
+        let mut tx = begin_immediate(self.pool()).await?;
         sqlx::query("INSERT INTO pending_remote_cancel(operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at) SELECT operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,created_at FROM task_remote_operation WHERE operation_id=? AND step_id=? AND state='running' AND NOT EXISTS(SELECT 1 FROM daemon d WHERE d.id=task_remote_operation.daemon_id AND d.removed_at IS NOT NULL) ON CONFLICT DO NOTHING")
-            .bind(&operation.operation_id).bind(&operation.step_id).execute(self.pool()).await?;
+            .bind(&operation.operation_id).bind(&operation.step_id).execute(&mut *tx).await?;
+        // The marker is authoritative. Every Task it fences states the park;
+        // a failed shadow write is left to the invariant check.
+        match fenced_tasks(&mut tx, &operation.workspace_id).await {
+            Ok(tasks) => {
+                for task in tasks {
+                    crate::task_condition::produce_best_effort(
+                        &mut tx,
+                        &task,
+                        crate::ConditionChange::Operations,
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(workspace_id = %operation.workspace_id, %error, "Task conditions not updated for a pending remote cancellation")
+            }
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -127,6 +169,11 @@ impl SqliteDb {
         .bind(&operation.step_id)
         .execute(&mut *tx)
         .await?;
+        let fenced = fenced_tasks(&mut tx, &operation.workspace_id).await?;
+        for task_id in &fenced {
+            crate::task_condition::produce(&mut tx, task_id, crate::ConditionChange::Operations)
+                .await?;
+        }
         let tasks:Vec<String>=sqlx::query_scalar("SELECT id FROM task WHERE deleted_at IS NULL AND (id=(SELECT task_id FROM workspace WHERE id=?) OR id IN (SELECT task_id FROM execution WHERE workspace_id=?))")
             .bind(&operation.workspace_id).bind(&operation.workspace_id).fetch_all(&mut *tx).await?;
         for task_id in tasks {

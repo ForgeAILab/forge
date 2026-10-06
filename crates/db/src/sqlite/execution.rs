@@ -502,6 +502,7 @@ impl ExecutionRepo for SqliteDb {
         if input.status.is_some() {
             return Err(DbError::InvalidTransition);
         }
+        let changes_binding = input.executor_config_snapshot_json.is_some();
 
         let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE execution SET ");
         let mut needs_comma = false;
@@ -573,6 +574,14 @@ impl ExecutionRepo for SqliteDb {
             .map(map_execution)
             .transpose()?
             .ok_or(DbError::NotFound)?;
+        if changes_binding && updated.role != "interactive" {
+            crate::task_condition::produce(
+                &mut transaction,
+                &updated.task_id,
+                crate::ConditionChange::Execution,
+            )
+            .await?;
+        }
         transaction.commit().await?;
         Ok(updated)
     }
@@ -1145,6 +1154,15 @@ impl ExecutionRepo for SqliteDb {
             created_at: input.updated_at,
         };
         let event = DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        // The terminal result is authoritative; the shadow never refuses it.
+        if updated.role != "interactive" {
+            crate::task_condition::produce_best_effort(
+                &mut transaction,
+                &updated.task_id,
+                crate::ConditionChange::Execution,
+            )
+            .await;
+        }
         transaction.commit().await?;
         Ok(ExecutionTerminalOutcome::Committed {
             execution: updated,
@@ -1826,6 +1844,15 @@ impl ExecutionRepo for SqliteDb {
                 .bind(&terminal.execution_id).bind(&plan.content).bind(&plan.error).bind(plan.size)
                 .bind(&input.terminal_report_id).bind(&terminal.updated_at)
                 .execute(&mut *transaction).await?;
+        }
+        // The terminal result is authoritative; the shadow never refuses it.
+        if updated.role != "interactive" {
+            crate::task_condition::produce_best_effort(
+                &mut transaction,
+                &updated.task_id,
+                crate::ConditionChange::Execution,
+            )
+            .await;
         }
         transaction.commit().await?;
         Ok(ExecutionTerminalOutcome::Committed {

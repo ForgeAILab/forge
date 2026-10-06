@@ -4755,6 +4755,207 @@ mod tests {
             .await
             .unwrap()
     }
+    /// m2: the Task condition's `material_blocker` against the real incident
+    /// digest inputs. Each blocker shape is written to a Task, its
+    /// `task.interruption_changed` event is projected by the Attention
+    /// service, and the incident it materializes (Task context, failure
+    /// class, action offers and all) must keep its canonical digest when the
+    /// interruption and intervention flag are replaced by the condition's
+    /// material blocker. Stage 4 hashes through this digest, not the struct.
+    #[tokio::test]
+    async fn material_blocker_keeps_the_real_incident_digest() {
+        let service = health_service().await;
+        let db = &service.db;
+        let now = now_rfc3339();
+        db::ProjectRepo::create(
+            &**db,
+            db::CreateProject {
+                id: "material".into(),
+                owner_id: None,
+                name: "Material".into(),
+                primary_repo_id: None,
+                updated_at: now.clone(),
+                settings: "{}".into(),
+                workflow_definition: "{}".into(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        service.project_once(1).await.unwrap(); // one-time worker initialization
+        let text = |value: Value| Some(value.to_string());
+        let mut shapes = vec![
+            (
+                text(json!({"type":"manual_stop","blocking_reason":"held"})),
+                None,
+                None,
+            ),
+            (
+                text(
+                    json!({"type":"review_needs_owner","blocking_reason":"finding","blocked_execution_id":"e"}),
+                ),
+                text(json!({"kind":"review_needs_owner","reason":"owner","execution_id":"e"})),
+                None,
+            ),
+            (
+                text(json!({"type":"merge_conflict","message":"advisory"})),
+                None,
+                None,
+            ),
+            (
+                text(json!({"type":"retry_exhausted","message":"spent"})),
+                text(json!({"kind":"retry_exhausted","reason":"spent"})),
+                None,
+            ),
+            (
+                None,
+                None,
+                text(json!({"kind":"executor_failed","reason":"failure","execution_id":"e"})),
+            ),
+            (
+                text(json!({"type":"unknown","message":"retained"})),
+                None,
+                None,
+            ),
+            (
+                None,
+                text(json!({"kind":"manual_stop","reason":"manual"})),
+                None,
+            ),
+            (
+                text(json!({"type":"workspace_error","message":"m".repeat(10000)})),
+                None,
+                None,
+            ),
+            // Malformed and non-object values in each column.
+            (Some("not json".into()), None, None),
+            (Some("[1,2]".into()), None, None),
+            (None, Some("not json".into()), None),
+            (None, Some("42".into()), None),
+            (None, None, Some("{".into())),
+            (None, None, Some("[]".into())),
+            (
+                Some("not json".into()),
+                text(json!({"kind":"workspace_error","reason":"real","execution_id":"e"})),
+                None,
+            ),
+        ];
+        for kind in db::LEGACY_BLOCKING_ANNOTATION_KINDS {
+            let annotation = json!({"type":kind,"message":"detail","blocking_reason":"reason","blocked_by":"owner","blocked_execution_id":"execution"});
+            let interruption = json!({"kind":kind,"reason":"reason","execution_id":"execution","details":{"key":"detail"}});
+            shapes.push((text(annotation.clone()), None, None));
+            shapes.push((text(annotation.clone()), text(interruption.clone()), None));
+            shapes.push((
+                text(annotation),
+                text(interruption.clone()),
+                text(interruption),
+            ));
+        }
+        let mut incidents = 0;
+        for (index, (annotation, blocked, failed)) in shapes.into_iter().enumerate() {
+            let id = format!("material-{index}");
+            let mut task = db::TaskRepo::create(
+                &**db,
+                db::CreateTask {
+                    id: id.clone(),
+                    project_id: "material".into(),
+                    parent_task_id: None,
+                    assignee_type: None,
+                    assignee_id: None,
+                    title: id.clone(),
+                    description: None,
+                    task_type: "task".into(),
+                    status: "in_progress".into(),
+                    is_automation: false,
+                    priority: 0,
+                    task_state_config: None,
+                    merge_config: None,
+                    subtask_order: None,
+                    plan: None,
+                    updated_at: now.clone(),
+                    created_at: now.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            // The writer's own event, appended with the legacy columns.
+            let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
+            sqlx::query(
+                "UPDATE task SET error_annotation=?,blocked_json=?,failed_json=? WHERE id=?",
+            )
+            .bind(&annotation)
+            .bind(&blocked)
+            .bind(&failed)
+            .bind(&id)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+            db.sync_condition_in_tx(&mut transaction, &id)
+                .await
+                .unwrap();
+            task.error_annotation = annotation;
+            task.blocked_json = blocked;
+            task.failed_json = failed;
+            let event = CreateDomainEvent::task_interruption_changed(&task);
+            db::DomainEventRepo::append_event_in_tx(&**db, &mut transaction, &event)
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap();
+            service.project_once(100).await.unwrap();
+
+            let material = db::material_blocker(&db.task_condition(&id).await.unwrap());
+            let payload: Value = serde_json::from_str(&event.payload_json).unwrap();
+            assert_eq!(
+                json!(material.requires_intervention),
+                payload["requires_intervention"],
+                "{id}"
+            );
+            let incident: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM attention_projection WHERE json_extract(details_json,'$.entity_id')=?",
+            )
+            .bind(&id)
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+            let Some(incident) = incident else {
+                assert!(
+                    !material.requires_intervention,
+                    "{id}: a blocker that needs intervention has an incident"
+                );
+                continue;
+            };
+            incidents += 1;
+            let mut attention = db::AttentionRepo::get_attention(&**db, &incident)
+                .await
+                .unwrap()
+                .unwrap();
+            let real = db::canonical_attention_incident_digest(&attention);
+            let mut details: Value = serde_json::from_str(&attention.details_json).unwrap();
+            // The real details carry far more than the interruption.
+            assert!(details["task"].is_object(), "{id}: {details}");
+            assert!(details.get("failure_class").is_some());
+            let mut stated = details["interruption"].clone();
+            db::strip_attention_delivery_metadata(&mut stated);
+            assert_eq!(json!(material.interruption), stated, "{id}");
+            details["interruption"] = json!(material.interruption);
+            details["recovery"]["requires_intervention"] = json!(material.requires_intervention);
+            attention.details_json = details.to_string();
+            assert_eq!(
+                real,
+                db::canonical_attention_incident_digest(&attention),
+                "{id}: the material blocker re-arms a consumed incident"
+            );
+            // A different blocker does change it: the digest is not vacuous.
+            details["interruption"] = json!({"source":"blocked","kind":"another","reason":"cause"});
+            attention.details_json = details.to_string();
+            assert_ne!(real, db::canonical_attention_incident_digest(&attention));
+        }
+        assert!(
+            incidents >= 20,
+            "only {incidents} shapes raised an incident"
+        );
+    }
+
     #[tokio::test]
     async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_projects_once() {
         let service = health_service().await;

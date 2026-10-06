@@ -1209,20 +1209,42 @@ impl TaskService {
             // Delete only our workspace row and only while no execution has
             // acquired it. This protects a concurrent launch which reused
             // the same Task workspace after this attempt lost admission.
-            match sqlx::query(
-                "DELETE FROM workspace
-                 WHERE id = ? AND task_id = ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM execution
-                       WHERE execution.workspace_id = workspace.id
-                   )",
-            )
-            .bind(workspace_id)
-            .bind(task_id)
-            .execute(self.db.pool())
-            .await
-            {
-                Ok(result) => removed_workspace = result.rows_affected() == 1,
+            let deleted: std::result::Result<bool, db::DbError> = async {
+                let mut transaction = db::begin_immediate(self.db.pool()).await?;
+                let removed = sqlx::query(
+                    "DELETE FROM workspace
+                     WHERE id = ? AND task_id = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM execution
+                           WHERE execution.workspace_id = workspace.id
+                       )",
+                )
+                .bind(workspace_id)
+                .bind(task_id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                    == 1;
+                if removed {
+                    // A cancellation fences its Task through this row.
+                    if let Err(error) = self
+                        .db
+                        .produce_condition_in_tx(
+                            &mut transaction,
+                            task_id,
+                            db::ConditionChange::Operations,
+                        )
+                        .await
+                    {
+                        tracing::warn!(task_id, %error, "Task condition not updated after workspace removal");
+                    }
+                }
+                transaction.commit().await?;
+                Ok(removed)
+            }
+            .await;
+            match deleted {
+                Ok(removed) => removed_workspace = removed,
                 Err(cleanup_error) => tracing::warn!(
                     task_id,
                     workspace_id,

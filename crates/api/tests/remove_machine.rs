@@ -88,6 +88,16 @@ async fn disconnected_owner_can_remove_and_audit_orphan_cancellations() {
         StatusCode::NOT_FOUND,
     )
     .await;
+    assert!(
+        harness
+            .state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
+    );
 }
 
 #[tokio::test]
@@ -135,6 +145,16 @@ async fn connected_machine_returns_typed_conflict_without_revoking_token() {
         .await["code"],
         "machine_connected"
     );
+    assert!(
+        harness
+            .state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
+    );
 }
 
 #[tokio::test]
@@ -164,6 +184,16 @@ async fn embedded_machine_returns_typed_conflict_even_while_offline() {
         .daemon_removed(&registration.daemon_id)
         .await
         .unwrap());
+    assert!(
+        harness
+            .state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
+    );
 }
 
 #[tokio::test]
@@ -218,6 +248,16 @@ async fn another_owner_gets_not_found_without_machine_state_disclosure() {
         StatusCode::NOT_FOUND,
     )
     .await;
+    assert!(
+        harness
+            .state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
+    );
 }
 
 #[tokio::test]
@@ -275,6 +315,16 @@ async fn removed_machine_rejects_old_report_and_websocket_credential_after_fresh
         .await
         .unwrap();
     job.abort();
+    assert!(
+        harness
+            .state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
+    );
 }
 
 /// A second user re-registering the first user's `machine_id` is refused, so
@@ -357,6 +407,16 @@ async fn other_user_cannot_take_over_by_reregistering_then_remove() {
     // The same owner re-registering keeps working, on the same registration.
     let again = register(&harness, "owner-host").await;
     assert_eq!(again.daemon_id, victim.daemon_id);
+    assert!(
+        harness
+            .state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
+    );
 }
 
 #[tokio::test]
@@ -375,6 +435,16 @@ async fn reserved_machine_ids_are_refused_at_registration() {
         .await;
         assert_eq!(refused["code"], "machine_id_reserved", "{machine_id}");
     }
+    assert!(
+        harness
+            .state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
+    );
 }
 
 /// The machine list is admin-only, so an admin can remove a departed user's
@@ -463,5 +533,15 @@ async fn admin_can_preview_and_remove_another_users_machine() {
         actor.as_deref(),
         Some("test-user-id"),
         "the removing admin is the actor"
+    );
+    assert!(
+        harness
+            .state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .is_empty(),
+        "condition producers agree with durable facts"
     );
 }

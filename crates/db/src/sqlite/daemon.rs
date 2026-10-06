@@ -390,12 +390,21 @@ impl SqliteDb {
         if changed.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
+        // Every Task these cancellations fence, deleted ones included.
+        let fenced: Vec<String> = sqlx::query_scalar("SELECT id FROM task WHERE id IN (SELECT w.task_id FROM pending_remote_cancel c JOIN workspace w ON w.id=c.workspace_id WHERE c.daemon_id=?1) OR id IN (SELECT e.task_id FROM pending_remote_cancel c JOIN execution e ON e.workspace_id=c.workspace_id WHERE c.daemon_id=?1)")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
         let pending_remote_cancels_cleared =
             sqlx::query("DELETE FROM pending_remote_cancel WHERE daemon_id=?")
                 .bind(id)
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
+        for task_id in &fenced {
+            crate::task_condition::produce(&mut tx, task_id, crate::ConditionChange::Operations)
+                .await?;
+        }
         sqlx::query("UPDATE task_remote_operation SET state='cancelled' WHERE daemon_id=? AND state='running'").bind(id).execute(&mut *tx).await?;
         let cleanup_records_cleared = sqlx::query("DELETE FROM command_receipt WHERE principal_id='workspace-backend' AND operation LIKE 'daemon.workspace.%' AND json_valid(outcome_json) AND json_extract(outcome_json,'$.metadata.daemon_id')=?")
             .bind(id).execute(&mut *tx).await?.rows_affected();

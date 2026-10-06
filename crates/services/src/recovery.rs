@@ -3094,7 +3094,8 @@ async fn complete_workspace_reconciliation(
         )
         .await?;
         sqlx::query("UPDATE task SET entry_barrier_json=json_set(entry_barrier_json,'$.started_at',?) WHERE id=?").bind(&window).bind(&task).execute(&mut *transaction).await?;
-        db.sync_condition_in_tx(&mut transaction, &task).await?;
+        db.produce_condition_in_tx(&mut transaction, &task, db::ConditionChange::Legacy)
+            .await?;
     }
     db::task_writer::BulkTaskQuery::new(db,"UPDATE task SET blocked_json = NULL,
         entry_barrier_json = entry_barrier_json,

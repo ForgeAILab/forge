@@ -363,7 +363,7 @@ async fn persist_before_work_annotation(
         return Err(db::DbError::NotFound);
     }
     ctx.db
-        .sync_condition_in_tx(&mut transaction, &task.id)
+        .produce_condition_in_tx(&mut transaction, &task.id, db::ConditionChange::Legacy)
         .await?;
     let mut interruption_snapshot = task.clone();
     interruption_snapshot.error_annotation = Some(annotation);

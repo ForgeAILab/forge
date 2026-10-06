@@ -836,7 +836,9 @@ impl TaskStepWorker {
                 {
                     sqlx::query("UPDATE task SET metadata_json=json_set(json_remove(COALESCE(metadata_json,'{}'),'$.paused_integration'),'$.paused_integration_generation',COALESCE(json_extract(metadata_json,'$.paused_integration_generation'),0)+1),updated_at=? WHERE id=? AND version=?")
                         .bind(db::now_rfc3339()).bind(&task.id).bind(task.version).execute(&mut *tx).await?;
-                    self.db.sync_condition_in_tx(&mut tx, &task.id).await?;
+                    self.db
+                        .state_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Legacy)
+                        .await?;
                 }
             }
             let status = if result.failure.is_some() {
@@ -1168,7 +1170,9 @@ impl TaskStepWorker {
         if written != 1 {
             return Err(db::DbError::VersionConflict.into());
         }
-        self.db.sync_condition_in_tx(tx, &step.task_id).await?;
+        self.db
+            .state_condition_in_tx(tx, &step.task_id, db::ConditionChange::Legacy)
+            .await?;
         task.error_annotation = Some(annotation.to_string());
         if blocked.is_some() {
             task.blocked_json = blocked;

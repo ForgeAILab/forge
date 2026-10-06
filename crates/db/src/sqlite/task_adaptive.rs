@@ -266,20 +266,20 @@ pub(super) async fn apply_adaptive_task_command(
                     // not visible before commit, so this complete default
                     // document cannot race an independent marker writer.
                     sqlx::query(
-                        "UPDATE task SET metadata_json = ?, condition_json = ?, updated_at = ?
+                        "UPDATE task SET metadata_json = ?, updated_at = ?
                          WHERE id = ? AND project_id = ?",
                     )
                     .bind(&metadata)
-                    .bind(crate::task_condition::condition_json(
-                        crate::task_condition::LegacyView {
-                            metadata_json: Some(metadata.as_str()),
-                            ..(&task).into()
-                        },
-                    ))
                     .bind(&now)
                     .bind(&task.id)
                     .bind(&source.project_id)
                     .execute(&mut *tx)
+                    .await?;
+                    crate::task_condition::produce(
+                        &mut tx,
+                        &task.id,
+                        crate::ConditionChange::Legacy,
+                    )
                     .await?;
                 }
                 if let Some(agent_id) = item.assignee_id.as_deref() {
@@ -334,6 +334,8 @@ pub(super) async fn apply_adaptive_task_command(
                 .execute(&mut *tx)
                 .await?;
             }
+            // Child witnesses follow the sequence order.
+            crate::task_condition::produce_children(&mut tx, &source.id).await?;
             // `subtask_order` is part of the Task board's sibling ordering but
             // predates the board trigger. Bump the revision explicitly so a
             // stale sequence command cannot overwrite a newer ordering.

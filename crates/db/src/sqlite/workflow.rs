@@ -518,6 +518,13 @@ impl TransitionLogRepo for SqliteDb {
         .map_err(map_workflow_sqlx_error)?;
 
         let result = map_transition_log_row(row)?;
+        // A pre-epoch Task reads its entry from unstamped receipts.
+        crate::task_condition::produce(
+            &mut transaction,
+            &input.task_id,
+            crate::ConditionChange::Entry,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(result)
     }

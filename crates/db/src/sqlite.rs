@@ -142,6 +142,7 @@ mod workspace_placement;
 
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
+    pub(crate) condition_checks: Arc<std::sync::Mutex<crate::ConditionCheckState>>,
     pub(crate) task_step_controls: Arc<
         std::sync::Mutex<
             std::collections::HashMap<String, Arc<crate::task_writer::TaskStepControl>>,
@@ -167,6 +168,7 @@ impl SqliteDb {
         let domain_event_hooks = crate::connection::domain_event_hooks(&pool);
         Self {
             pool,
+            condition_checks: Default::default(),
             task_step_controls: Default::default(),
             task_step_executor: Default::default(),
             task_step_activity: Default::default(),
@@ -1080,8 +1082,25 @@ impl SqliteDb {
             .execute(&mut **transaction)
             .await?;
         }
+        // Only a Running admission changes a condition: it may become the
+        // Task's running owner, and its metadata clears above are legacy
+        // writes. An interactive session is never the witnessed execution,
+        // and an execution inserted already settled is history.
         if input.status == ExecutionStatus::Running {
-            crate::task_condition::sync_condition(transaction, &input.task_id).await?;
+            let change = if input.role == "interactive" {
+                crate::ConditionChange::Legacy
+            } else {
+                crate::ConditionChange::Execution
+            };
+            crate::task_condition::produce(transaction, &input.task_id, change).await?;
+        }
+        if let Some(workspace_id) = input.workspace_id.as_deref() {
+            crate::task_condition::execution_joined_workspace(
+                transaction,
+                &input.task_id,
+                workspace_id,
+            )
+            .await?;
         }
 
         let row = sqlx::query("SELECT * FROM execution WHERE id = ?")

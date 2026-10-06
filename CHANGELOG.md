@@ -471,6 +471,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   fields and every reader remain authoritative; no public, event or behaviour
   change.
 
+- **Task condition producers and a background check, still shadow only (plan
+  3.1 stage 2).** The internal Task condition now records what a Task is doing
+  as well as what blocks it: entering a state, running an execution, waiting
+  on its subtasks or on a machine to confirm a cancelled operation, or
+  settled. The existing condition fields stay authoritative and every reader,
+  the dispatcher, recovery and Attention behave as before.
+  - The dispatcher checks the stored conditions in the background, 50 Tasks a
+    minute, after its dispatch pass. It reads without holding the database
+    write lock and takes it only to repair a Task whose condition is wrong.
+    After an upgrade that changes how conditions are derived it recomputes
+    every Task once, in small slices that never delay startup.
+  - `GET /api/v1/operations/status`: `recent_errors` gains an entry with
+    `entity_type: "task_condition_invariant"` and severity `attention` only
+    while the last completed check had to repair at least one Task. A healthy
+    server never shows it, so the Operations page keeps its empty state.
+  - A new internal `system_setting` key, `task_condition_mapping_revision`,
+    records which derivation the stored conditions were computed with. The
+    admin settings API does not list it and refuses to write it.
+  - Writing a Task costs a little more where the write changes its condition:
+    a status change, a budget charge and a condition metadata write take
+    about 10 to 12% longer (10 to 25 µs each), and an entry hooks step 13 to
+    17% over its three transactions. Ordinary metadata updates and recording
+    an execution are unchanged.
+
 - **Operator status reports the Task's Execution limit (refactor 2.5).**
   `retry_pressure[].max_attempts` is the Task's resolved Execution retry limit
   (Task override, then workflow state, then 3) instead of a constant 3.

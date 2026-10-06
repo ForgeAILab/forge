@@ -408,8 +408,8 @@ impl SqliteDb {
             .execute(&mut *tx)
             .await?
             .rows_affected();
-        if result != 0 && crate::task_condition::writes_legacy_condition(query) {
-            crate::task_condition::sync_condition(&mut tx, task_id).await?;
+        if let Some(change) = crate::task_condition::sql_change(query).filter(|_| result != 0) {
+            crate::task_condition::produce(&mut tx, task_id, change).await?;
         }
         self.record_mutation_reply_in_tx(&mut tx, &result).await?;
         tx.commit().await?;
@@ -737,8 +737,10 @@ impl TaskQuery {
                 .execute(&mut **tx)
                 .await?
                 .rows_affected();
-            if rows != 0 && crate::task_condition::writes_legacy_condition(&self.query) {
-                crate::task_condition::sync_condition(tx, &self.task_id).await?;
+            if let Some(change) =
+                crate::task_condition::sql_change(&self.query).filter(|_| rows != 0)
+            {
+                crate::task_condition::produce(tx, &self.task_id, change).await?;
             }
             return Ok(TaskQueryResult::Applied(rows));
         }
@@ -822,8 +824,10 @@ impl BulkTaskQuery {
                     .execute(&mut **tx)
                     .await?
                     .rows_affected();
-                if rows != 0 && crate::task_condition::writes_legacy_condition(&query) {
-                    crate::task_condition::sync_condition(tx, &task_id).await?;
+                if let Some(change) =
+                    crate::task_condition::sql_change(&query).filter(|_| rows != 0)
+                {
+                    crate::task_condition::produce(tx, &task_id, change).await?;
                 }
                 result.applied += 1;
             } else {
