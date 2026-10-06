@@ -976,7 +976,7 @@ pub async fn load_selection_context(
         })
         && inherited_root_placement.is_none()
     {
-        let runtimes = sqlx::query("SELECT r.*, j.runtime_id AS retry_runtime, j.location_id AS retry_location, j.attempts AS retry_attempts, j.checks_digest AS retry_digest, j.connection_id AS retry_connection FROM runtime r JOIN daemon d ON d.id = r.daemon_id LEFT JOIN repo_provision_retry j ON j.runtime_id = r.id AND j.repo_id = ? WHERE d.machine_id <> ? ORDER BY d.created_at, d.id, r.id")
+        let runtimes = sqlx::query("SELECT r.*, j.runtime_id AS retry_runtime, j.location_id AS retry_location, j.attempts AS retry_attempts, j.checks_digest AS retry_digest, j.connection_id AS retry_connection FROM runtime r JOIN daemon d ON d.id = r.daemon_id LEFT JOIN repo_provision_retry j ON j.runtime_id = r.id AND j.repo_id = ? WHERE d.removed_at IS NULL AND d.machine_id <> ? ORDER BY d.created_at, d.id, r.id")
             .bind(&input.repo.id).bind(db.server_run_cap.embedded_machine_id()).fetch_all(&mut **transaction).await?;
         for runtime in runtimes {
             let id: String = runtime.try_get("id")?;
@@ -1093,7 +1093,7 @@ pub async fn load_selection_context(
             input.server.execution_daemon_id.clone()
         };
         let daemon = match execution_daemon_id.as_deref() {
-            Some(id) => sqlx::query("SELECT machine_id, owner_id, visibility, max_concurrent_runs, run_limit, detected_clis_json FROM daemon WHERE id = ?")
+            Some(id) => sqlx::query("SELECT machine_id, owner_id, visibility, max_concurrent_runs, run_limit, detected_clis_json FROM daemon WHERE id = ? AND removed_at IS NULL")
                 .bind(id)
                 .fetch_optional(&mut **transaction)
                 .await?,

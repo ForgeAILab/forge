@@ -186,7 +186,7 @@ pub async fn list_machine_capacity(
     let sql = format!("{}, machines AS (
         SELECT 'server_host' AS machine_key, NULL AS daemon_id, 'Server host' AS hostname,
             ? AS reported, MIN(run_limit) AS admin FROM daemon WHERE id IN (SELECT id FROM embedded)
-        UNION ALL SELECT id, id, hostname, max_concurrent_runs, run_limit FROM daemon WHERE id NOT IN (SELECT id FROM embedded)
+        UNION ALL SELECT id, id, hostname, max_concurrent_runs, run_limit FROM daemon WHERE removed_at IS NULL AND id NOT IN (SELECT id FROM embedded)
     ) SELECT m.*, COALESCE(o.running_executions, 0) AS running_executions,
         COALESCE(o.reservations, 0) AS reservations, COALESCE(o.active_chat_turns, 0) AS active_chat_turns
         FROM machines m LEFT JOIN occupancy o USING(machine_key)", include_str!("machine_occupancy.sql"));

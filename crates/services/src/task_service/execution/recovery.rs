@@ -2042,6 +2042,13 @@ impl TaskService {
         if placement.owner_kind != db::PlacementOwnerKind::Daemon {
             return Ok(());
         }
+        // A removed owner's workspace is already released; the next admission
+        // prepares a fresh one on another machine, so there is nothing to reset.
+        if let Some(daemon_id) = placement.daemon_id.as_deref() {
+            if self.db.daemon_removed(daemon_id).await? {
+                return Ok(());
+            }
+        }
         if placement.task_id != task.id {
             return Err(ServiceError::invalid_operation(
                 "reset the root's shared workspace instead",

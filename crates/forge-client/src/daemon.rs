@@ -37,6 +37,8 @@ pub struct DaemonArgs {
 
 #[derive(Subcommand)]
 enum DaemonCmd {
+    /// Remove a disconnected machine and revoke its saved daemon credential.
+    Remove { id: String },
     /// Register this machine as a daemon and keep reporting local CLI availability.
     Link {
         /// Directory this daemon should advertise as its workspace root.
@@ -123,6 +125,31 @@ struct DaemonCredentials {
 impl DaemonArgs {
     pub async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
         match &self.cmd {
+            DaemonCmd::Remove { id } => {
+                let result: api_types::RemoveDaemonResponse =
+                    client.delete_json(&format!("/api/v1/daemons/{id}")).await?;
+                if matches!(output, OutputFormat::Json) {
+                    print_json(&result)?;
+                } else {
+                    println!(
+                        "Removed machine {} ({}); cleared {} remote cancellations; released {} workspaces; {} Tasks will re-place on another machine; retired {} Agents; queued {} Tasks",
+                        result.hostname,
+                        result.id,
+                        result.pending_remote_cancels_cleared,
+                        result.placements_failed,
+                        result.tasks_to_replace,
+                        result.agents_retired,
+                        result.tasks_queued
+                    );
+                    if result.tasks_to_replace > 0 {
+                        println!(
+                            "Work on {} that was not pushed is abandoned.",
+                            result.hostname
+                        );
+                    }
+                }
+                Ok(())
+            }
             DaemonCmd::Link {
                 workspace_root,
                 max_concurrent_runs,

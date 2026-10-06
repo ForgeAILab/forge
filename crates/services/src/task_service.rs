@@ -72,6 +72,7 @@ mod repository_authority;
 mod review;
 mod review_config;
 mod roles;
+pub(crate) use roles::RoleSweepEvent;
 mod subtask;
 mod transition;
 pub(crate) use transition::next_workflow_state;

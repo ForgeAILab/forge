@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link } from '@tanstack/react-router'
+import { Link, useNavigate } from '@tanstack/react-router'
+import { RemoveMachineButton } from '@/components/settings/RemoveMachineButton'
 import { Check, Copy, Desktop, PencilSimple, Plus, X } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import {
@@ -79,6 +80,7 @@ function shellQuote(value: string): string {
 }
 
 export function DaemonsPage({ selectedDaemonId }: { selectedDaemonId?: string }) {
+  const navigate = useNavigate()
   const daemonsQuery = useDaemonsQuery()
   const agentsQuery = useAgentsQuery()
   const [linkDialogOpen, setLinkDialogOpen] = useState(false)
@@ -215,6 +217,7 @@ export function DaemonsPage({ selectedDaemonId }: { selectedDaemonId?: string })
         {selectedDaemon ? (
           <DaemonDetail
             daemon={selectedDaemon}
+            onRemoved={() => void navigate({ to: "/daemons" })}
             agents={agentsByDaemon.get(selectedDaemon.id) ?? []}
           />
         ) : (
@@ -549,7 +552,7 @@ function WorkspaceSection() {
   )
 }
 
-function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
+function DaemonDetail({ daemon, agents, onRemoved }: { daemon: Daemon; agents: Agent[]; onRemoved: () => void }) {
   const online = daemon.status === 'online'
   const labels = daemon.labels ?? {}
   const hasLabels = Object.keys(labels).length > 0
@@ -625,6 +628,7 @@ function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
         </section>
 
         <MachineRunCapacity daemon={daemon} />
+        <RemoveMachineButton key={daemon.id} daemon={daemon} onRemoved={onRemoved} />
 
         {/* Workspace */}
         <WorkspaceSection />

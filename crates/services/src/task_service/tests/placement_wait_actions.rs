@@ -446,3 +446,358 @@ async fn waiting_task_held_without_an_agent_can_be_released_to_the_queue() {
         .unwrap();
     assert!(verbs(&after).contains(&"hold[dispatch_wait]".to_owned()));
 }
+
+async fn parked_restart_fixture(other_owner: bool) -> (Fixture, Task) {
+    let fixture = fixture().await;
+    let repo_id: String = sqlx::query_scalar("SELECT id FROM repo WHERE project_id=?")
+        .bind(&fixture.project)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    sqlx::query("INSERT INTO daemon(id,machine_id,hostname,os,arch,status,registration_token_hash,created_at,updated_at) VALUES ('dead-machine','dead-machine','Lost workstation','linux','x86_64','offline','hash',?,?)")
+        .bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    // A cleaned historical workspace can still have FK-free daemon cleanup.
+    // Restart must proceed without resetting that retired owner's workspace.
+    db::WorkspaceRepo::create(
+        &*fixture.db,
+        db::CreateWorkspace {
+            id: "historical-workspace".into(),
+            task_id: fixture.task.id.clone(),
+            repo_id,
+            worktree_path: fixture
+                ._repo
+                .path()
+                .join("old-worktree")
+                .to_string_lossy()
+                .into_owned(),
+            branch: "old-branch".into(),
+            status: db::WorkspaceStatus::Cleaned,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO pending_remote_cancel VALUES ('lost-operation','lost-step','historical-workspace','lost-placement','dead-machine','lost-runtime',1,0,?)")
+        .bind(&now).execute(fixture.db.pool()).await.unwrap();
+    if other_owner {
+        sqlx::query("INSERT INTO daemon(id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES ('other-machine','other-machine','Other workstation','linux','x86_64','offline',?,?)")
+            .bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO pending_remote_cancel VALUES ('other-operation','other-step','historical-workspace','other-placement','other-machine','other-runtime',1,0,?)")
+            .bind(&now).execute(fixture.db.pool()).await.unwrap();
+    }
+    sqlx::query("UPDATE task SET error_annotation=? WHERE id=?")
+        .bind(json!({"type":"executor_failed","blocking_reason":"original failure"}).to_string())
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let parked = fixture
+        .service
+        .perform_task_action(
+            &fixture.task.id,
+            TaskAction::Restart { reason: None },
+            fixture.task.version,
+        )
+        .await
+        .unwrap()
+        .task;
+    assert_eq!(parked.status, "in_progress");
+    assert!(crate::deferred_dispatch::queued_recovery(&parked).is_some());
+    assert!(parked
+        .error_annotation
+        .as_deref()
+        .unwrap()
+        .contains("Lost workstation"));
+    (fixture, parked)
+}
+
+#[tokio::test]
+async fn remove_machine_clears_pending_cancel_and_replays_parked_restart() {
+    let (fixture, parked) = parked_restart_fixture(false).await;
+    fixture
+        .db
+        .remove_daemon("dead-machine", "admin", true, "local", false)
+        .await
+        .unwrap();
+    assert!(!fixture
+        .db
+        .task_has_pending_remote_cancel(&fixture.task.id)
+        .await
+        .unwrap());
+    assert_eq!(
+        reload(&fixture).await,
+        parked,
+        "removal queues every Task change"
+    );
+    let current = fixture.service.drain(&fixture.task.id).await.unwrap();
+    assert_eq!(current.status, "todo");
+    assert!(current.error_annotation.is_none());
+    assert!(crate::deferred_dispatch::queued_recovery(&current).is_none());
+    assert!(db::TaskStepRepo::task_steps(&*fixture.db, &current.id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|step| step.kind == "command"
+            && step.payload_json.contains("settle_removed_machine")
+            && step.status == "done"
+            && !step.entry_fenced));
+}
+
+#[tokio::test]
+async fn remove_machine_keeps_another_owners_fence_and_refreshes_the_machine_hint() {
+    let (fixture, _) = parked_restart_fixture(true).await;
+    fixture
+        .db
+        .remove_daemon("dead-machine", "admin", true, "local", false)
+        .await
+        .unwrap();
+    let current = fixture.service.drain(&fixture.task.id).await.unwrap();
+    assert_eq!(current.status, "in_progress");
+    assert!(crate::deferred_dispatch::queued_recovery(&current).is_some());
+    let annotation: Value =
+        serde_json::from_str(current.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["blocking_reason"], "pending_remote_cancel");
+    let message = annotation["message"].as_str().unwrap();
+    assert!(message.contains("Other workstation"));
+    assert!(!message.contains("Lost workstation"));
+    let pending = fixture.db.pending_remote_cancels(None, None).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].daemon_id, "other-machine");
+}
+
+/// The Task's own live workspace on a machine that will never return.
+async fn live_workspace_on_dead_machine(fixture: &Fixture, state: db::PlacementState) -> String {
+    let repo_id: String = sqlx::query_scalar("SELECT id FROM repo WHERE project_id=?")
+        .bind(&fixture.project)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    sqlx::query("INSERT INTO daemon(id,machine_id,hostname,os,arch,status,registration_token_hash,created_at,updated_at) VALUES ('dead-machine','dead-machine','Lost workstation','linux','x86_64','offline','hash',?,?)")
+        .bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO runtime(id,daemon_id,kind,workspace_root,status,created_at,updated_at) VALUES ('dead-runtime','dead-machine','local','/owner-only','ready',?,?)")
+        .bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,daemon_id,runtime_id,path,kind,is_default,status,created_at,updated_at) VALUES ('dead-location',?,'daemon','dead-machine','dead-runtime','/owner-only/repo','managed_clone',0,'ready',?,?)")
+        .bind(&repo_id).bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    db::WorkspaceRepo::create(
+        &*fixture.db,
+        db::CreateWorkspace {
+            id: "live-workspace".into(),
+            task_id: fixture.task.id.clone(),
+            repo_id,
+            worktree_path: String::new(),
+            branch: ::workspace::task_branch_name(&fixture.task.id),
+            status: db::WorkspaceStatus::Ready,
+            before_sha: Some("base-head".into()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    db::WorkspacePlacementRepo::create(
+        &*fixture.db,
+        db::CreateWorkspacePlacement {
+            id: "live-placement".into(),
+            workspace_id: "live-workspace".into(),
+            task_id: fixture.task.id.clone(),
+            agent_id: None,
+            owner_kind: db::PlacementOwnerKind::Daemon,
+            daemon_id: Some("dead-machine".into()),
+            runtime_id: Some("dead-runtime".into()),
+            repo_location_id: "dead-location".into(),
+            execution_daemon_id: Some("dead-machine".into()),
+            workspace_handle: Some("opaque-owner-handle".into()),
+            generation: 1,
+            disconnected_at: (state == db::PlacementState::Disconnected).then(|| now.clone()),
+            failure_cause: None,
+            state,
+            selected_by: db::PlacementSelectedBy::Scheduler,
+            selection_reason: "{}".into(),
+            reserved_until: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    "live-placement".to_owned()
+}
+
+async fn coder(fixture: &Fixture) -> Agent {
+    let id: String = sqlx::query_scalar(
+        "SELECT assignee_id FROM task_role_assignment WHERE task_id=? AND role_name='coder'",
+    )
+    .bind(&fixture.task.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    AgentRepo::get_by_id(&*fixture.db, &id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn offer_reasons(fixture: &Fixture) -> Vec<String> {
+    let snapshot = fixture
+        .service
+        .task_action_snapshot(&fixture.task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap();
+    crate::available_actions(&snapshot)
+        .into_iter()
+        .map(|offer| format!("{}[{}]", offer.action.verb(), offer.reason))
+        .collect()
+}
+
+/// The brief's primary case on the Task's own live workspace: a Restart parked
+/// behind a remote cancel the removed machine can never confirm.
+#[tokio::test]
+async fn remove_machine_replays_a_restart_parked_on_the_tasks_live_workspace_and_re_places_it() {
+    let fixture = fixture().await;
+    let agent = coder(&fixture).await;
+    let placement_id =
+        live_workspace_on_dead_machine(&fixture, db::PlacementState::Disconnected).await;
+    sqlx::query("INSERT INTO pending_remote_cancel VALUES ('lost-operation','lost-step','live-workspace',?,'dead-machine','dead-runtime',1,0,?)")
+        .bind(&placement_id).bind(now_rfc3339()).execute(fixture.db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET error_annotation=? WHERE id=?")
+        .bind(
+            json!({"type":"workspace_reset_required","blocking_reason":"original failure"})
+                .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let parked = fixture
+        .service
+        .perform_task_action(
+            &fixture.task.id,
+            TaskAction::Restart { reason: None },
+            fixture.task.version,
+        )
+        .await
+        .unwrap()
+        .task;
+    assert!(crate::deferred_dispatch::queued_recovery(&parked).is_some());
+    assert!(parked
+        .error_annotation
+        .as_deref()
+        .unwrap()
+        .contains("Lost workstation"));
+
+    let result = fixture
+        .db
+        .remove_daemon("dead-machine", "admin", true, "local", false)
+        .await
+        .unwrap();
+    assert_eq!(result.pending_remote_cancels_cleared, 1);
+    assert_eq!(result.placements_failed, 1);
+    assert_eq!(result.tasks_to_replace, 1);
+    assert_eq!(
+        reload(&fixture).await,
+        parked,
+        "removal queues every Task change"
+    );
+
+    let current = fixture.service.drain(&fixture.task.id).await.unwrap();
+    assert_eq!(current.status, "todo", "the parked Restart proceeded");
+    assert!(current.error_annotation.is_none());
+    assert!(crate::deferred_dispatch::queued_recovery(&current).is_none());
+    let released = db::WorkspacePlacementRepo::get_by_id(&*fixture.db, &placement_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.state, db::PlacementState::Cleaned);
+    assert!(released.workspace_handle.is_none());
+    let offers = offer_reasons(&fixture).await;
+    assert!(
+        !offers.iter().any(|offer| offer.contains("owner_reconcile")),
+        "no retry on a removed owner: {offers:?}"
+    );
+
+    // The next admission selects another owner for the same Task workspace.
+    let admission = fixture
+        .service
+        .reserve_claim_workspace(&current, Some(&agent), "coder")
+        .await
+        .unwrap();
+    assert_eq!(admission.placement.id, placement_id);
+    assert_eq!(
+        admission.placement.owner_kind,
+        db::PlacementOwnerKind::Server
+    );
+    assert_eq!(admission.placement.daemon_id, None);
+    assert_eq!(admission.placement.state, db::PlacementState::Reserved);
+    assert_eq!(admission.placement.generation, 2);
+}
+
+/// A run that was live on the removed machine fails once, attributed to the
+/// removing user, and the Task is admitted again on another machine.
+#[tokio::test]
+async fn remove_machine_fails_the_live_run_and_retries_the_task_on_another_machine() {
+    let fixture = fixture().await;
+    let agent = coder(&fixture).await;
+    let placement_id = live_workspace_on_dead_machine(&fixture, db::PlacementState::Ready).await;
+    let lost = seed_execution(
+        &fixture.db,
+        &fixture.task.id,
+        Some(&agent.id),
+        "coder",
+        ExecutionStatus::Running,
+        None,
+        &now_rfc3339(),
+    )
+    .await;
+    sqlx::query("UPDATE execution SET workspace_id='live-workspace' WHERE id=?")
+        .bind(&lost.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
+    let result = fixture
+        .db
+        .remove_daemon("dead-machine", "owner-user", true, "local", false)
+        .await
+        .unwrap();
+    assert_eq!(result.tasks_to_replace, 1);
+    assert_eq!(result.agents_retired, 0);
+    let current = fixture.service.drain(&fixture.task.id).await.unwrap();
+
+    let failed = ExecutionRepo::get_by_id(&*fixture.db, &lost.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    assert_eq!(failed.stop_reason, Some(db::StopReason::DaemonDisconnected));
+    assert_eq!(failed.stopped_by.as_deref(), Some("user:api"));
+    assert!(failed.error.as_deref().unwrap().contains("machine_removed"));
+
+    let offers = offer_reasons(&fixture).await;
+    assert!(
+        !offers.iter().any(|offer| offer.contains("owner_reconcile")),
+        "no retry on a removed owner: {offers:?}"
+    );
+    let placement = db::WorkspacePlacementRepo::get_by_id(&*fixture.db, &placement_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (placement.owner_kind.clone(), placement.daemon_id.clone()),
+        (db::PlacementOwnerKind::Server, None),
+        "status={} annotation={:?} placement={:?}/{:?} offers={offers:?}",
+        current.status,
+        current.error_annotation,
+        placement.state,
+        placement.failure_cause
+    );
+    let running = ExecutionRepo::list_running_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(running.len(), 1, "the Task restarted");
+    assert_ne!(running[0].id, lost.id);
+    assert_eq!(running[0].workspace_id.as_deref(), Some("live-workspace"));
+}

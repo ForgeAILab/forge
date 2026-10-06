@@ -1193,6 +1193,7 @@ export interface Workspace {
 }
 
 export interface Daemon {
+  owner_id: string | null
   max_concurrent_runs: number | null
   run_limit: number | null
   effective_max_concurrent_runs: number | null

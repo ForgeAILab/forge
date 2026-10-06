@@ -1,4 +1,6 @@
 import { useEffect, useRef } from 'react'
+import type { RemoveDaemonPreview } from '@/types/generated/bindings/RemoveDaemonPreview'
+import type { RemoveDaemonResponse } from '@/types/generated/bindings/RemoveDaemonResponse'
 import {
   type InfiniteData,
   replaceEqualDeep,
@@ -1181,6 +1183,29 @@ export function useUpdateDaemonRunLimit() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.daemons })
       void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
+    },
+    onError: async () => { await queryClient.invalidateQueries({ queryKey: qk.daemons }) },
+  })
+}
+
+/** What removing a machine would change; read while its confirmation is open. */
+export function useDaemonRemovalPreview(id: string, enabled: boolean) {
+  return useQuery({
+    queryKey: [...qk.daemons, id, 'removal'],
+    queryFn: () => apiFetch<RemoveDaemonPreview>(`/daemons/${id}/removal`),
+    enabled,
+    staleTime: 0,
+  })
+}
+
+export function useRemoveDaemon() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => apiFetch<RemoveDaemonResponse>(`/daemons/${id}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      for (const queryKey of [qk.daemons, qk.agents, qk.projects, ['tasks'], ['providers'], qk.operationsStatus]) {
+        void queryClient.invalidateQueries({ queryKey })
+      }
     },
     onError: async () => { await queryClient.invalidateQueries({ queryKey: qk.daemons }) },
   })
