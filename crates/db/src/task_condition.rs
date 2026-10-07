@@ -1142,6 +1142,23 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
 pub fn decode(raw: &str) -> Result<TaskCondition> {
     serde_json::from_str(raw).map_err(|e| DbError::Check(format!("invalid Task condition: {e}")))
 }
+/// The stored condition as every row reader sees it: a value that cannot be
+/// decoded is a typed unknown park, never a silent `Clear`.
+pub fn decode_or_unknown(raw: &str) -> TaskCondition {
+    decode(raw).unwrap_or_else(|_| TaskCondition::Parked {
+        primary: ParkReason::UnknownCondition {
+            source: ConditionSource {
+                field: LegacyConditionField::ConditionJson,
+                key: None,
+            },
+            problem: UnknownConditionProblem::UnknownKind,
+        },
+        additional: Vec::new(),
+        resume: ConditionContinuation::Reconcile,
+        since: None,
+        evidence: Default::default(),
+    })
+}
 fn encode(condition: &TaskCondition) -> String {
     serde_json::to_string(condition).expect("Task condition serializes")
 }
@@ -1452,4 +1469,7 @@ pub(crate) fn metadata_changes_condition(mutations: &[crate::TaskMetadataMutatio
 }
 
 pub(crate) mod readers;
-pub use readers::{ConditionRead, ConditionRefusal, ConditionRetry};
+pub use readers::{
+    ConditionRead, ConditionRefusal, ConditionRetry, PRESENTATION_TEXT_LIMIT,
+    PRESENTATION_TRUNCATION_MARKER,
+};

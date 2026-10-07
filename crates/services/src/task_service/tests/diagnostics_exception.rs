@@ -59,6 +59,9 @@ async fn projection_fixture(
     }
     if let Some(kind) = kind {
         sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?").bind(json!({"type":kind,"blocking_reason":"fixture","blocked_execution_id":execution.id,"recovery_actions":["return_to_implementation","retry_pr_publication"]}).to_string()).bind(&task.id).execute(db.pool()).await.unwrap();
+        db.check_task_conditions_of(std::slice::from_ref(&task.id))
+            .await
+            .unwrap();
     }
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
     let snapshot = service
@@ -75,6 +78,28 @@ async fn projection_fixture(
         assert_eq!(exception.actions, offers);
     }
     (db, service, snapshot)
+}
+
+/// Store one legacy field as an old writer left it, produce the Task's
+/// condition from the stored row, and read the Task back as every reader does.
+async fn stored(
+    (db, service, snapshot): &(Arc<SqliteDb>, TaskService, crate::TaskSnapshot),
+    column: &str,
+    value: String,
+) -> crate::TaskSnapshot {
+    sqlx::query(&format!("UPDATE task SET {column} = ? WHERE id = ?"))
+        .bind(value)
+        .bind(&snapshot.task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.check_task_conditions_of(std::slice::from_ref(&snapshot.task.id))
+        .await
+        .unwrap();
+    service
+        .task_action_snapshot(&snapshot.task.id, &Actor::user(UserActionSource::Test))
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -116,9 +141,13 @@ async fn test_derive_workflow_exception_infers_actions_for_empty_exhausted_annot
 
 #[tokio::test]
 async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error_annotation() {
-    let mut snapshot = check_projection("review", Some(FailureKind::Unknown), true).await;
-    snapshot.task.blocked_json =
-        Some(json!({"kind":"retry_exhausted","reason":"exhausted"}).to_string());
+    let fixture = projection_fixture("review", Some(FailureKind::Unknown), true).await;
+    let snapshot = stored(
+        &fixture,
+        "blocked_json",
+        json!({"kind":"retry_exhausted","reason":"exhausted"}).to_string(),
+    )
+    .await;
     assert_action_set(&snapshot, &["cancel", "retry", "restart", "approve"]);
     let exception =
         crate::task_diagnostics::task_exception(&snapshot, crate::available_actions(&snapshot))
@@ -131,13 +160,14 @@ async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error
 
 #[tokio::test]
 async fn stored_action_lists_do_not_control_projection() {
-    let snapshot = check_projection("review", Some(FailureKind::ReviewBudgetExhausted), true).await;
+    let fixture =
+        projection_fixture("review", Some(FailureKind::ReviewBudgetExhausted), true).await;
+    let snapshot = fixture.2.clone();
     assert_action_set(&snapshot, &["cancel", "retry", "approve"]);
-    let mut changed = snapshot.clone();
     let mut annotation: Value =
-        serde_json::from_str(changed.task.error_annotation.as_deref().unwrap()).unwrap();
+        serde_json::from_str(snapshot.task.error_annotation.as_deref().unwrap()).unwrap();
     annotation["recovery_actions"] = json!(["cancel_task"]);
-    changed.task.error_annotation = Some(annotation.to_string());
+    let changed = stored(&fixture, "error_annotation", annotation.to_string()).await;
     assert_eq!(
         crate::available_actions(&snapshot),
         crate::available_actions(&changed)
@@ -219,14 +249,18 @@ async fn review_blocked_annotation_routes_guidance_and_offers_manual_pass() {
 
 #[tokio::test]
 async fn test_failed_task_supersedes_blocking_annotation() {
-    let mut snapshot = check_projection(
+    let fixture = projection_fixture(
         "in_progress",
         Some(FailureKind::BeforeWorkHookFailed),
         false,
     )
     .await;
-    snapshot.task.failed_json =
-        Some(json!({"kind":"executor_failed","reason":"hard failure"}).to_string());
+    let snapshot = stored(
+        &fixture,
+        "failed_json",
+        json!({"kind":"executor_failed","reason":"hard failure"}).to_string(),
+    )
+    .await;
     let verbs = crate::available_actions(&snapshot)
         .into_iter()
         .map(|offer| offer.action.verb())
@@ -240,15 +274,20 @@ async fn test_failed_task_supersedes_blocking_annotation() {
 
 #[tokio::test]
 async fn test_annotation_hook_details_surface_as_failing_step() {
-    let mut snapshot = check_projection(
+    let fixture = projection_fixture(
         "in_progress",
         Some(FailureKind::BeforeWorkHookFailed),
         false,
     )
     .await;
-    let mut annotation = snapshot.annotation().unwrap();
+    let mut annotation = fixture.2.annotation().unwrap();
     annotation.hook = Some(json!({"command":"check","exit_code":7,"stderr":"failure"}));
-    snapshot.task.error_annotation = Some(serde_json::to_string(&annotation).unwrap());
+    let snapshot = stored(
+        &fixture,
+        "error_annotation",
+        serde_json::to_string(&annotation).unwrap(),
+    )
+    .await;
     let exception =
         crate::task_diagnostics::task_exception(&snapshot, crate::available_actions(&snapshot))
             .unwrap();
@@ -261,12 +300,17 @@ async fn test_annotation_hook_details_surface_as_failing_step() {
 
 #[tokio::test]
 async fn test_reworded_reason_does_not_change_offered_actions() {
-    let snapshot = check_projection("in_progress", Some(FailureKind::ExecutorFailed), false).await;
+    let fixture = projection_fixture("in_progress", Some(FailureKind::ExecutorFailed), false).await;
+    let snapshot = fixture.2.clone();
     assert_action_set(&snapshot, &["cancel", "retry", "restart", "approve"]);
-    let mut changed = snapshot.clone();
     let mut annotation = snapshot.annotation().unwrap();
     annotation.blocking_reason = "different prose".to_owned();
-    changed.task.error_annotation = Some(serde_json::to_string(&annotation).unwrap());
+    let changed = stored(
+        &fixture,
+        "error_annotation",
+        serde_json::to_string(&annotation).unwrap(),
+    )
+    .await;
     assert_eq!(
         crate::available_actions(&snapshot),
         crate::available_actions(&changed)
@@ -424,6 +468,11 @@ async fn decisions_require_operator_reason_and_guidance_and_reject_other_states(
     )
     .await;
     seed_failed_review(&db, &task.id, &candidate.id, 1, json!({"ci_steps":[]})).await;
+    // The Task as stored once its failed Review exists.
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
     let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(32)));
     for reason in [None, Some("   ".to_owned())] {
         let error = service
@@ -466,6 +515,9 @@ async fn decisions_require_operator_reason_and_guidance_and_reject_other_states(
         .bind(json!({"type":"review_needs_owner","blocking_reason":"needs input"}).to_string())
         .bind(&other.id)
         .execute(db.pool())
+        .await
+        .unwrap();
+    db.check_task_conditions_of(std::slice::from_ref(&other.id))
         .await
         .unwrap();
     let offers = annotated

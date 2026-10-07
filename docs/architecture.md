@@ -2718,7 +2718,7 @@ the bounded settlement grace, the orphan safety net promotes it to an
 actionable Attention item; the retained `execution_failed` category remains
 available for that diagnostic path and historical projections.
 User Pause/Stop retains its manual-stop annotation and recovery controls, but
-records `requires_intervention: false`: an Agent must not undo an intentional
+records `material_blocker.requires_intervention: false`: an Agent must not undo an intentional
 stop. A running, newer, or explicitly linked successor excludes the stopped
 attempt from orphan recovery, even if that successor has already finished.
 Wake admission rechecks the attempt, Task disposition, deferred recovery, and
@@ -4575,7 +4575,8 @@ cascade's intentional no-op into a reconciliation receipt.
 (`dispatch_role_agent` / `dispatch_fix_agent` / `dispatch_executor`) fails
 `on_enter` of an `active` state and the task has no running execution, the
 engine does not leave the task there looking in-flight. It records the
-dispatch error on `task.error_annotation` (type `dispatch_failed`) and
+dispatch error as the Task's diagnostic (`condition.details.diagnostic`, type
+`dispatch_failed`; stored in `error_annotation` until stage 5) and
 cascades the task back to the workflow's initial state, skipping the active
 state's exit guards (the `restart` allowance). Both the failed hook
 and the rollback transition land in `transition_log`. The task dispatcher

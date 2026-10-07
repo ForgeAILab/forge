@@ -7406,6 +7406,9 @@ async fn dispatcher_parked_guard_rechecks_when_owner_clears_a_park() {
         .execute(db.pool())
         .await
         .unwrap();
+    db.check_task_conditions_of(std::slice::from_ref(&parked_tasks[0].id))
+        .await
+        .unwrap();
     assert_eq!(
         dispatcher
             .dispatch_initial_tasks_and_drain(&project, &workflow)

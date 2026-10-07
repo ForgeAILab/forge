@@ -47,7 +47,7 @@ type TaskAnnotationSummary = Pick<TaskResponse, 'condition'> & {
 }
 
 export function taskHasError(task: TaskAnnotationSummary): boolean {
-  if (task.condition.kind === 'failed' || task.condition.details.interruption) return true
+  if (task.condition.details.failed || task.condition.details.blocked) return true
   if (!task.condition.details.diagnostic) return false
   return !isStaleBlockingAnnotation(task)
 }
@@ -73,8 +73,13 @@ export function getTaskWorkflowWarning(
   }
 }
 
+/** The Task's blocked record. A failure record alone is not a block. */
+export function blockedInterruption(task: TaskAnnotationSummary) {
+  return task.condition.details.blocked ? task.condition.details.interruption : null
+}
+
 export function isTaskBlocked(task: TaskAnnotationSummary): boolean {
-  if (task.condition.details.interruption) return true
+  if (task.condition.details.blocked) return true
   return Boolean(getBlockingAnnotation(task))
 }
 
@@ -103,7 +108,7 @@ export function matchesFilters(
   task: Task,
   filters: { priorityMax?: number; priorityMin?: number; types: string[]; blockedOnly?: boolean },
 ): boolean {
-  if (filters.blockedOnly && !task.condition.details.interruption) return false
+  if (filters.blockedOnly && !task.condition.details.blocked) return false
   if (filters.priorityMin !== undefined && task.priority < filters.priorityMin) return false
   if (filters.priorityMax !== undefined && task.priority > filters.priorityMax) return false
   if (filters.types.length > 0 && !filters.types.includes(task.task_type)) return false

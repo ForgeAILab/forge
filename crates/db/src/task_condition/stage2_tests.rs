@@ -3,38 +3,142 @@ use super::*;
 use crate::{CreateDomainEvent, TaskRepo, TaskStepRepo};
 use serde_json::{json, Value};
 
-/// `material_blocker(condition)` is the interruption the
-/// `task.interruption_changed` event states, minus what the incident digest
-/// strips. The digest half, against incidents the Attention service really
-/// materializes, is
+/// The `task.interruption_changed` payload exactly as `777b5f1f` wrote it: a
+/// port of that constructor, reading the three legacy columns and nothing of
+/// the condition. These are the events already stored in every database.
+fn pre_condition_payload(t: &Task) -> Value {
+    let object = |raw: &Option<String>| {
+        raw.as_deref()
+            .map(crate::repository::parse_event_json_object)
+            .unwrap_or_default()
+    };
+    let interruption = if t.failed_json.is_some() {
+        Some(crate::repository::event_interruption_details(
+            "failed",
+            &object(&t.failed_json),
+        ))
+    } else if t.blocked_json.is_some() {
+        Some(crate::repository::event_interruption_details(
+            "blocked",
+            &object(&t.blocked_json),
+        ))
+    } else if t.error_annotation.is_some() {
+        Some(crate::repository::event_interruption_details(
+            "annotation",
+            &object(&t.error_annotation),
+        ))
+    } else {
+        None
+    };
+    json!({
+        "task_id": t.id,
+        "task_version": t.version,
+        "task_status": t.status,
+        "requires_intervention": crate::task_interruption_requires_intervention(
+            t.error_annotation.as_deref(),
+            t.blocked_json.as_deref(),
+            t.failed_json.as_deref(),
+        ),
+        "interruption": interruption,
+    })
+}
+fn stored_event(payload: &Value) -> crate::DomainEvent {
+    crate::DomainEvent {
+        sequence: 1,
+        id: "event".into(),
+        event_type: "task.interruption_changed".into(),
+        entity_type: "task".into(),
+        entity_id: "material".into(),
+        actor_type: "system".into(),
+        actor_id: None,
+        scope_type: "task".into(),
+        scope_id: "material".into(),
+        correlation_id: "event".into(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: None,
+        payload_json: payload.to_string(),
+        created_at: crate::now_rfc3339(),
+    }
+}
+
+/// A blocker stored by a real writer reads, from its condition, as the same
+/// material blocker an already stored pre-condition event decodes to, and the
+/// event written today carries that blocker. The digest half, against
+/// incidents the Attention service really materializes, is
 /// `services::attention_service::tests::material_blocker_keeps_the_real_incident_digest`.
 #[tokio::test]
 async fn material_blocker_matches_the_interruption_event() {
     let db = db().await;
-    let mut t = task(&db, "material").await;
+    let created = task(&db, "material").await;
+    let (mut holds, mut compared) = (0, 0);
     for (a, b, f) in material_shapes() {
-        t.error_annotation = a.clone();
-        t.blocked_json = b.clone();
-        t.failed_json = f.clone();
-        t.condition = map_legacy_condition(&LegacyConditionInput::from(&t));
-        let old: Value =
-            serde_json::from_str(&CreateDomainEvent::task_interruption_changed(&t).payload_json)
-                .unwrap();
-        let condition = map_legacy_condition(&LegacyConditionInput::from(&t));
-        let projected = material_blocker(&condition);
+        // The row as stored (the table includes shapes only an older writer
+        // or a hand edit leaves), with its condition recomputed from it.
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        sqlx::query("UPDATE task SET error_annotation=?,blocked_json=?,failed_json=? WHERE id=?")
+            .bind(&a)
+            .bind(&b)
+            .bind(&f)
+            .bind(&created.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        db.sync_condition_in_tx(&mut tx, &created.id).await.unwrap();
+        tx.commit().await.unwrap();
+        let t = TaskRepo::get_by_id(&db, &created.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let old = pre_condition_payload(&t);
+        let from_stored_event = stored_event(&old).task_material_blocker().unwrap();
+        let projected = material_blocker(&t.condition);
+        // The one deliberate difference (`transient_incident_exclusion`): a
+        // hold is nobody's blocker to repair, whichever column stores it. A
+        // stored event may say otherwise for a hold kept in `blocked_json`;
+        // the condition never invites a repair of a deliberate stop.
+        if matches!(
+            t.condition,
+            TaskCondition::Parked {
+                primary: ParkReason::Held { .. },
+                ..
+            }
+        ) {
+            assert_eq!(
+                projected,
+                MaterialBlocker {
+                    requires_intervention: false,
+                    interruption: None
+                },
+                "{a:?} {b:?} {f:?}"
+            );
+            holds += 1;
+            continue;
+        }
+        compared += 1;
+        assert_eq!(projected, from_stored_event, "{a:?} {b:?} {f:?}");
         assert_eq!(
             json!(projected.requires_intervention),
-            old["material_blocker"]["requires_intervention"],
+            old["requires_intervention"],
             "{a:?} {b:?} {f:?}"
         );
-        let mut interruption = old["material_blocker"]["interruption"].clone();
+        let mut interruption = old["interruption"].clone();
         crate::strip_attention_delivery_metadata(&mut interruption);
         assert_eq!(json!(projected.interruption), interruption);
+        // The event written today states the same blocker.
+        let new: Value =
+            serde_json::from_str(&CreateDomainEvent::task_interruption_changed(&t).payload_json)
+                .unwrap();
+        assert_eq!(new["material_blocker"], json!(projected));
         // The reporting execution is delivery metadata, not blocker identity.
         assert!(!json!(projected.interruption)
             .to_string()
             .contains("execution_id"));
     }
+    assert!(
+        holds >= 1 && compared > holds,
+        "{holds} holds, {compared} compared"
+    );
 }
 /// Every blocker shape today's writers produce, plus malformed and
 /// non-object values in each column.

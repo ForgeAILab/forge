@@ -61,6 +61,91 @@ async fn project_overview_returns_truthful_setup_projection() {
     assert_eq!(overview.check_summary.required_total, 0);
 }
 
+/// One Task whose stored condition cannot be decoded is the typed unknown
+/// park every other reader shows, not a failed Overview; a blank blocked
+/// record is not a blocked Task.
+#[tokio::test]
+async fn project_overview_counts_tasks_with_unreadable_or_blank_blocked_conditions() {
+    let workspace = common::TestDir::new("project-overview-unreadable");
+    let harness = common::test_app(workspace.path(), "project-overview-unreadable").await;
+    let token = common::test_jwt();
+    let project: ProjectResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        &token,
+        json!({"name": "Overview unreadable condition"}),
+        StatusCode::OK,
+    )
+    .await;
+    let db = &harness.state.db;
+    let mut ids = Vec::new();
+    for title in ["unreadable", "blank", "blocked", "plain"] {
+        let now = db::now_rfc3339();
+        let task = db::TaskRepo::create(
+            &**db,
+            db::CreateTask {
+                id: db::new_uuid_v4(),
+                project_id: project.id.clone(),
+                parent_task_id: None,
+                subtask_order: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: title.to_owned(),
+                description: None,
+                task_type: "task".to_owned(),
+                status: "in_progress".to_owned(),
+                is_automation: false,
+                priority: 0,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        ids.push(task.id);
+    }
+    sqlx::query("UPDATE task SET blocked_json = '' WHERE id = ?")
+        .bind(&ids[1])
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task SET blocked_json = ? WHERE id = ?")
+        .bind(json!({"kind":"workspace_error","reason":"held"}).to_string())
+        .bind(&ids[2])
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.check_task_conditions_of(&ids[1..3]).await.unwrap();
+    sqlx::query(
+        "UPDATE task SET condition_json = '{\"kind\":\"from_a_newer_server\"}' WHERE id = ?",
+    )
+    .bind(&ids[0])
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let overview: ProjectOverview = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/overview", project.id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        (
+            overview.task_counts.total,
+            overview.task_counts.active,
+            overview.task_counts.blocked
+        ),
+        (4, 3, 1)
+    );
+}
+
 #[tokio::test]
 async fn project_owner_can_list_and_get_without_membership_row() {
     let workspace = common::TestDir::new("project-owner-visibility");

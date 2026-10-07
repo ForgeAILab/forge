@@ -263,6 +263,26 @@ pub(crate) async fn produce_best_effort(
 /// seam for writes that cannot change a condition.
 pub(crate) fn sql_change(query: &str) -> Option<ConditionChange> {
     let lower = query.to_ascii_lowercase();
+    // A role or Review row moves the human decision/work boundary whatever
+    // columns it names.
+    let statement = lower.trim_start();
+    if ["task_role_assignment", "review"].iter().any(|table| {
+        [
+            "update ",
+            "delete from ",
+            "insert into ",
+            "insert or replace into ",
+        ]
+        .iter()
+        .any(|verb| {
+            statement
+                .strip_prefix(verb)
+                .and_then(|rest| rest.trim_start().strip_prefix(table))
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+        })
+    }) {
+        return Some(ConditionChange::Human);
+    }
     let assignments = lower.split(" where ").next().unwrap_or(&lower);
     let assigns = |columns: &[&str]| columns.iter().any(|column| assignments.contains(column));
     if assigns(&[

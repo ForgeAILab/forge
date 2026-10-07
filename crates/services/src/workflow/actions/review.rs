@@ -158,12 +158,7 @@ impl HookAction for RunCiSteps {
                 let reason = failure.error.to_string();
                 if retry && failure.completed_steps == 0 {
                     // No command ran; this is not a Review attempt.
-                    if let Err(error) =
-                        sqlx::query("DELETE FROM review WHERE id = ? AND status = 'running'")
-                            .bind(&review.id)
-                            .execute(ctx.db.pool())
-                            .await
-                    {
+                    if let Err(error) = ctx.db.discard_unstarted_review(&review.id).await {
                         return HookResult::Failed {
                             reason: error.to_string(),
                         };

@@ -2086,6 +2086,23 @@ fn seam_is_skipped_for_sql_that_cannot_change_a_condition() {
         sql_change("UPDATE task\n SET error_annotation=NULL\n WHERE id=?"),
         Some(ConditionChange::Legacy)
     );
+    // The statements the services queue for role rows, as they write them.
+    for role_write in [
+        "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?",
+        "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        "DELETE FROM review WHERE id = ? AND status = 'running'",
+    ] {
+        assert_eq!(sql_change(role_write), Some(ConditionChange::Human), "{role_write}");
+    }
+    // A Task statement that only reads the role table keeps its own family.
+    assert_eq!(
+        sql_change("UPDATE task SET title=? WHERE id IN (SELECT task_id FROM task_role_assignment WHERE assignee_id=?)"),
+        None
+    );
+    assert_eq!(
+        sql_change("UPDATE review_requirement SET x=? WHERE id=?"),
+        None
+    );
 }
 
 /// Port of `audit_backfill_timing_5k` (measurement, not a correctness check).

@@ -30,24 +30,47 @@ BEGIN
     WHERE id IN (OLD.project_id, NEW.project_id);
 END;
 
--- A crash could leave the bridge annotation committed before its park row.
--- Capture that diagnosis in the durable park before removing the bridge.
+-- The bridge annotation was the visible half of an owner park. Its diagnosis
+-- (message and blocked_at) moves into the durable park before the bridge is
+-- removed: saved beside the park the dispatcher already recorded for this
+-- entry, or, when a crash left the annotation committed without its park row
+-- (or with one from an earlier entry), as that park. The stored message is
+-- "Nothing can continue this Task from `<state>`: <cause>. Owner: ...", so the
+-- cause is cut back out of it rather than stored as the whole sentence.
 INSERT INTO task_schedule_park(task_id,epoch,reason_json)
 SELECT id,status_epoch,json_object(
-  'reason', CASE json_extract(error_annotation,'$.blocking_reason')
-    WHEN 'workflow_invalid' THEN json_object('WorkflowInvalid',json_object('state',status,'cause',COALESCE(json_extract(error_annotation,'$.message'),'state has no safe continuation')))
-    ELSE json_object('UnknownCondition',json_object('owner',CASE WHEN instr(COALESCE(json_extract(error_annotation,'$.message'),''),'plan publication cleanup')>0 THEN 'plan publication cleanup' ELSE 'entry hooks' END)) END,
-  'owner',CASE json_extract(error_annotation,'$.blocking_reason') WHEN 'workflow_invalid' THEN 'ProjectAgent' ELSE 'Workflow' END,
-  'recovery',CASE json_extract(error_annotation,'$.blocking_reason') WHEN 'workflow_invalid' THEN 'EditWorkflow' ELSE 'ReconcileEntry' END,
+  'reason', CASE reason
+    WHEN 'workflow_invalid' THEN json_object('WorkflowInvalid',json_object('state',status,'cause',
+      CASE WHEN message IS NULL THEN 'state has no safe continuation'
+           WHEN instr(message,'`: ')>0 AND instr(message,'. Owner: ')>instr(message,'`: ')
+             THEN substr(message,instr(message,'`: ')+3,instr(message,'. Owner: ')-instr(message,'`: ')-3)
+           ELSE message END))
+    ELSE json_object('UnknownCondition',json_object('owner',CASE WHEN instr(COALESCE(message,''),'plan publication cleanup')>0 THEN 'plan publication cleanup' ELSE 'entry hooks' END)) END,
+  'owner',CASE reason WHEN 'workflow_invalid' THEN 'ProjectAgent' ELSE 'Workflow' END,
+  'recovery',CASE reason WHEN 'workflow_invalid' THEN 'EditWorkflow' ELSE 'ReconcileEntry' END,
   'diagnostic',json(error_annotation)
 )
-FROM task
-WHERE json_valid(error_annotation)
-  AND json_extract(error_annotation,'$.type')='workflow_guard_rejected'
-  AND json_extract(error_annotation,'$.blocked_by')='system:task_dispatcher'
-  AND json_extract(error_annotation,'$.blocking_reason') IN ('workflow_invalid','unknown_condition')
-ON CONFLICT(task_id) DO UPDATE SET epoch=excluded.epoch,reason_json=excluded.reason_json
-WHERE task_schedule_park.epoch IS NOT excluded.epoch;
+FROM (
+  SELECT id,status,status_epoch,error_annotation,
+         json_extract(error_annotation,'$.blocking_reason') AS reason,
+         json_extract(error_annotation,'$.message') AS message
+  FROM task
+  WHERE json_valid(error_annotation)
+    AND json_extract(error_annotation,'$.type')='workflow_guard_rejected'
+    AND json_extract(error_annotation,'$.blocked_by')='system:task_dispatcher'
+    AND json_extract(error_annotation,'$.blocking_reason') IN ('workflow_invalid','unknown_condition')
+    AND deleted_at IS NULL
+)
+WHERE true
+ON CONFLICT(task_id) DO UPDATE SET
+  epoch=excluded.epoch,
+  reason_json=CASE
+    WHEN task_schedule_park.epoch IS NOT excluded.epoch OR NOT json_valid(task_schedule_park.reason_json)
+      THEN excluded.reason_json
+    WHEN json_type(task_schedule_park.reason_json,'$.reason.WorkflowInvalid') IS NOT NULL
+      OR json_type(task_schedule_park.reason_json,'$.reason.UnknownCondition') IS NOT NULL
+      THEN json_set(task_schedule_park.reason_json,'$.diagnostic',json(json_extract(excluded.reason_json,'$.diagnostic')))
+    ELSE task_schedule_park.reason_json END;
 
 UPDATE task SET error_annotation=NULL
 WHERE json_valid(error_annotation)

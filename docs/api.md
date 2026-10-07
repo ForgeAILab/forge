@@ -902,6 +902,8 @@ value, alongside its stable material blocker:
         "created_at": "2026-10-07T05:00:00Z",
         "execution_id": "execution-uuid"
       },
+      "failed": true,
+      "blocked": false,
       "human_wait": false,
       "entry_wait": false
     }
@@ -2974,15 +2976,28 @@ closed discriminated union. REST removes `error_annotation`, `blocked` and
 | `settled` | `outcome`, `details` |
 
 `details` contains `failure_kind`, a typed `diagnostic`, typed `interruption`,
-`human_wait` and `entry_wait`, plus an optional `execution_id` reference. Explicit owner parks additionally name typed
+the `failed` and `blocked` flags, `human_wait` and `entry_wait`, plus an optional
+`execution_id` reference. `interruption` is the Task's failure record when one
+is stored, otherwise its blocked record: `failed` says a failure record is stored
+(and is the `interruption`), `blocked` says a blocked record is stored (it is the
+`interruption` unless `failed`). A failure record alone is not a block, and a
+failure record can outlive the `failed` kind (a retry that is running), so
+read the flags rather than the kind. An annotation stored before annotations
+were typed is shown as a `diagnostic` of type `unknown`. Explicit owner parks additionally name typed
 `owner` and `recovery` guidance. Guidance is not an action authorization: use the
 current action offers. Import evidence, migrated metadata and ownership witnesses
-are private. Diagnostic strings are bounded to 1,024 bytes and arrays to 16 entries;
-legacy columns retain the complete original data during dual-write.
+are private. Every presented text (diagnostic and interruption strings, and the
+messages of `workflow_health` and `workflow_exception` derived from them) is at
+most 1,024 bytes: a longer text is cut on a character boundary and ends with
+the marker `… [truncated]`, which counts toward the 1,024 bytes. Arrays are cut
+to 16 entries. The Operations `blocked_reason` stays valid JSON when the stored
+annotation is JSON, with each text inside it bounded the same way.
+Legacy columns retain the complete original data during dual-write.
 `awaiting_human`, `workflow_health`, `workflow_exception` and offers retain their
 names. The first now agrees between list and detail; entry ownership and waits
-are explicit. A historical failed Review after a newer entry or live continuation
-is evidence, not a current exception. Unsupported stored condition encodings
+are explicit. A failed Review from before the Task's current state entry, or on
+a settled Task, is evidence, not a current exception; a reviewer run that is
+merely live does not clear it. Unsupported stored condition encodings
 project an unknown diagnosis while invariant repair rebuilds them. Legacy
 metadata remains private and does not need to be parsed by public wait readers.
 

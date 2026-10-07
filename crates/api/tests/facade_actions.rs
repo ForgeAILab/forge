@@ -949,6 +949,12 @@ async fn paused_task_action_refusals_keep_wait_cause_without_erasing_the_conditi
         .execute(harness.state.db.pool())
         .await
         .unwrap();
+    harness
+        .state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&task.id))
+        .await
+        .unwrap();
     for cause in [
         "target_agent_paused",
         "project_paused(environment_not_ready)",

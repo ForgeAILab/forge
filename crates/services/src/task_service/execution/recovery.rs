@@ -104,6 +104,10 @@ impl TaskService {
             serde_json::to_string(&projection)
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
         );
+        // The offers below are read from the condition: project it from the
+        // fields as they were before the intent was queued.
+        snapshot.task.condition =
+            db::map_legacy_condition(&db::LegacyConditionInput::from(&snapshot.task));
         let action = match name {
             "reset_to_initial" => Some(api_types::TaskAction::Restart {
                 reason: saved_reason.clone(),

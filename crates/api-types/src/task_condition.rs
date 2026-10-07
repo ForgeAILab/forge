@@ -186,7 +186,13 @@ pub struct ConditionDetails {
     pub recovery: Option<ConditionRecovery>,
     pub failure_kind: Option<crate::FailureKind>,
     pub diagnostic: Option<crate::TaskBlockingAnnotation>,
+    /// The Task's failure record when one is stored, otherwise its blocked
+    /// record. `failed` and `blocked` say which records are stored.
     pub interruption: Option<crate::InterruptionMetadata>,
+    /// A failure record is stored; `interruption` is that record.
+    pub failed: bool,
+    /// A blocked record is stored; it is `interruption` unless `failed`.
+    pub blocked: bool,
     pub human_wait: bool,
     pub entry_wait: bool,
 }

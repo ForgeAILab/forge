@@ -27,7 +27,7 @@ import { Funnel, Plus, UserCircle, X } from '@phosphor-icons/react'
 import { cn } from '@/lib/cn'
 import { toastApiError } from '@/lib/api-error'
 import { productTerm } from '@/lib/i18n'
-import { getBlockingAnnotation } from '@/lib/workflow-utils'
+import { blockedInterruption, getBlockingAnnotation } from '@/lib/workflow-utils'
 import type { TaskStatus } from '@/types/generated'
 import type { TaskListItem as Task } from '@/types/generated'
 
@@ -112,7 +112,7 @@ export function TaskListPage({
   const visibleTasks = useMemo(
     () =>
       tasks.filter((task) => {
-        if (blockedOnly && !task.condition.details.interruption) return false
+        if (blockedOnly && !task.condition.details.blocked) return false
         if (priorityMin !== undefined && task.priority < priorityMin) return false
         if (priorityMax !== undefined && task.priority > priorityMax) return false
         return true
@@ -526,7 +526,7 @@ export function TaskListPage({
                           {(() => {
                             const blockingAnnotation = getBlockingAnnotation(task)
                             const blockedReason =
-                              task.condition.details.interruption?.reason ?? blockingAnnotation?.blocking_reason
+                              blockedInterruption(task)?.reason ?? blockingAnnotation?.blocking_reason
                             if (!blockedReason || task.status === 'cancelled') return null
                             return (
                               <span className="inline-flex items-center rounded bg-red-500/10 px-2 py-[3px] text-micro font-medium text-red-300">

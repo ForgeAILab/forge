@@ -547,21 +547,7 @@ fn map_task(row: SqliteRow) -> Result<Task> {
         merge_config: row.try_get("merge_config")?,
         metadata_json: row.try_get("metadata_json")?,
         plan: row.try_get("plan")?,
-        condition: crate::task_condition::decode(row.try_get("condition_json")?).unwrap_or_else(
-            |_| crate::TaskCondition::Parked {
-                primary: crate::ParkReason::UnknownCondition {
-                    source: crate::ConditionSource {
-                        field: crate::LegacyConditionField::ConditionJson,
-                        key: None,
-                    },
-                    problem: crate::UnknownConditionProblem::UnknownKind,
-                },
-                additional: Vec::new(),
-                resume: crate::ConditionContinuation::Reconcile,
-                since: None,
-                evidence: Default::default(),
-            },
-        ),
+        condition: crate::task_condition::decode_or_unknown(row.try_get("condition_json")?),
         error_annotation: row.try_get("error_annotation")?,
         blocked_json: row.try_get("blocked_json")?,
         failed_json: row.try_get("failed_json")?,

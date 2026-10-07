@@ -61,6 +61,12 @@ async fn project_get_and_list_report_slots_and_task_capacity_reason() {
         .execute(harness.state.db.pool())
         .await
         .unwrap();
+    harness
+        .state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&parked.id))
+        .await
+        .unwrap();
     let queued = slot_task(&harness, &project.id, "todo").await;
     sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
         .bind(
@@ -75,6 +81,12 @@ async fn project_get_and_list_report_slots_and_task_capacity_reason() {
         )
         .bind(&queued.id)
         .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    harness
+        .state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&queued.id))
         .await
         .unwrap();
     let expected = ProjectSlots {
@@ -142,6 +154,12 @@ async fn project_get_and_list_report_slots_and_task_capacity_reason() {
     sqlx::query("UPDATE task SET metadata_json = json_set(metadata_json, '$.dispatch_disposition.safe_message', ?) WHERE id = ?")
         .bind("project_waiting_on_owner: 10 parked tasks waiting on the owner")
         .bind(&queued.id).execute(harness.state.db.pool()).await.unwrap();
+    harness
+        .state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&queued.id))
+        .await
+        .unwrap();
     let owner_wait: Value = common::empty_request(
         &harness.app,
         Method::GET,
@@ -262,6 +280,12 @@ async fn recovery_queue_and_project_slot_queue_count_once_and_have_distinct_comp
             .execute(harness.state.db.pool())
             .await
             .unwrap();
+        harness
+            .state
+            .db
+            .check_task_conditions_of(std::slice::from_ref(&task.id))
+            .await
+            .unwrap();
     }
     let response: ProjectResponse = common::empty_request(
         &harness.app,
@@ -283,6 +307,12 @@ async fn recovery_queue_and_project_slot_queue_count_once_and_have_distinct_comp
     // queue still owns a Project slot once that separate wait is removed.
     sqlx::query("UPDATE task SET metadata_json = json_remove(metadata_json, '$.dispatch_disposition') WHERE id = ?")
         .bind(&recovery.id).execute(harness.state.db.pool()).await.unwrap();
+    harness
+        .state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&recovery.id))
+        .await
+        .unwrap();
     let agent_only: ProjectResponse = common::empty_request(
         &harness.app,
         Method::GET,

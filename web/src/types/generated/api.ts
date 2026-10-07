@@ -162,8 +162,6 @@ export interface TaskBlockingAnnotation {
   hook?: Record<string, unknown> | null
 }
 
-export type TaskAnnotation = TaskBlockingAnnotation | Record<string, unknown>
-
 export interface ReviewConfig {
   conformance_checks?: import('./bindings/ConformanceCheck').ConformanceCheck[]
   requirement_ids?: string[]

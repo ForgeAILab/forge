@@ -14,8 +14,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     `condition`: `clear`, `entering`, `running`, `deferred`, `parked`, `failed`
     or `settled`, with typed reasons, continuation and normalized details.
     Use `condition.details.diagnostic` for the former annotation and
-    `condition.details.interruption` for interruption evidence; use the kind
-    to distinguish a hard failure. Private import evidence is not exposed.
+    `condition.details.interruption` for interruption evidence. `interruption`
+    is the former `failed` record when one is stored, otherwise the former
+    `blocked` record; `condition.details.failed` and `condition.details.blocked`
+    say which records are stored, so a failed-only Task is still not a blocked
+    one. An annotation with no recognised `type` is shown as a diagnostic of
+    type `unknown`. Private import evidence is not exposed.
   - MCP Task values remove `error_annotation` and add the same `condition`.
     Native `work.read` removes its raw `blocked`, `error` and `failed` strings;
     dependency-command receipts replace their `blocked` flag with `condition`.
@@ -30,10 +34,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     keep their names and now derive their condition inputs from one source.
     List `awaiting_human` agrees with detail. Entry owners are shown as
     `Entering`; explicit owner parks show `Needs Owner` with the same owner and
-    recovery guidance. Historical failed Reviews after a newer entry or live
-    continuation no longer create a current exception. Normalized diagnostic
-    strings are bounded to 1,024 bytes and diagnostic arrays to 16 entries;
-    full legacy data remains stored for the final storage-removal stage.
+    recovery guidance. A failed Review from before the Task's current state
+    entry, or on a settled Task, no longer creates a current exception; a
+    reviewer run that is merely live does not clear one. Presented diagnostic
+    and interruption text is at most 1,024 bytes: longer text is cut on a
+    character boundary and ends with `… [truncated]`. Diagnostic arrays are
+    cut to 16 entries. Full legacy data remains stored for the final
+    storage-removal stage.
     Unsupported stored condition encodings project a typed unknown diagnosis
     while invariant repair rebuilds them; arbitrary legacy metadata no longer
     makes the human-wait reader fail.
@@ -42,7 +49,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     autonomous repair. Admitted `OwnerOffline` still holds an active Project
     slot; `ReviewNeedsOwner` still holds a parked slot. Legacy columns and
     dual-write adapters remain until stage 5; the dispatcher no longer writes
-    its temporary owner-park annotation bridge.
+    its temporary owner-park annotation bridge. The upgrade moves each such
+    annotation into the Task's condition with its message and `blocked_at`
+    unchanged.
 
 - **Machine registration can no longer change owners.**
   `POST /api/v1/daemons/register` for a `machine_id` that belongs to another

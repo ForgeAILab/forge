@@ -459,6 +459,9 @@ async fn obsolete_orphan_wakes_recheck_task_and_attempt_before_spending_budget()
                 .execute(db.pool())
                 .await
                 .unwrap();
+                db.check_task_conditions_of(std::slice::from_ref(&task.id))
+                    .await
+                    .unwrap();
             }
             _ => unreachable!(),
         }
@@ -2697,6 +2700,25 @@ async fn condition_reader_upgrade_keeps_open_incident_and_wake_identity() {
     let service = AttentionService::new(Arc::clone(&db));
     service.project_once(100).await.unwrap();
     let incident_id: String = sqlx::query_scalar("SELECT id FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?").bind(&project_id).fetch_one(db.pool()).await.unwrap();
+    // The incident row as `777b5f1f` stored it. That server copied the
+    // event's `interruption` into the incident as written, reporting
+    // execution included; this build strips delivery metadata on the way in.
+    // That one field is the only part of the stored incident the two builds
+    // write differently for this event, so put it back as the old server
+    // left it and take the digest from that row.
+    sqlx::query("UPDATE attention_projection SET details_json=json_set(details_json,'$.interruption',json(?)) WHERE id=?")
+        .bind(serde_json::json!({"source":"blocked","kind":"workspace_error","reason":reason,"execution_id":"historical-reporter"}).to_string())
+        .bind(&incident_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let stored_details: String =
+        sqlx::query_scalar("SELECT details_json FROM attention_projection WHERE id=?")
+            .bind(&incident_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(stored_details.contains("historical-reporter"));
     let before = AttentionRepo::get_attention(&*db, &incident_id)
         .await
         .unwrap()

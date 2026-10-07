@@ -2468,7 +2468,7 @@ impl CoordinationToolProvider {
                 let id = row.try_get::<String, _>("id").unwrap_or_default();
                 let depends_on = dependencies.remove(&id).unwrap_or_default();
                 let condition = row.try_get::<String, _>("condition_json").ok()
-                    .and_then(|raw| db::task_condition::decode(&raw).ok()).map(|c| c.public());
+                    .map(|raw| db::task_condition::decode_or_unknown(&raw).public());
                 json!({
                     "id": id,
                     "parent_task_id": row.try_get::<Option<String>, _>("parent_task_id").ok().flatten(),

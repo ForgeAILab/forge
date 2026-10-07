@@ -427,7 +427,9 @@ impl SqliteDb {
 
 fn map_schedule_task(row: SqliteRow) -> Result<Task> {
     Ok(Task {
-        condition: Default::default(),
+        // The same stored condition every other row reader gets. A read that
+        // does not project the column is an error, never a silent `Clear`.
+        condition: crate::task_condition::decode_or_unknown(row.try_get("condition_json")?),
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
         parent_task_id: row.try_get("parent_task_id")?,

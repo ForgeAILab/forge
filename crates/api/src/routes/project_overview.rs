@@ -619,13 +619,19 @@ async fn load_task_counts(
         // A Task keeps its workflow status when an execution fails, so status
         // alone reports stalled work as active. The blocked record is what the
         // user is actually waiting on, and a terminal Task has moved past it.
-        let blocked = db::task_condition::decode(
+        // An unreadable condition is the same typed unknown park every row
+        // reader shows; one such Task never fails the whole overview.
+        let condition = db::task_condition::decode_or_unknown(
             &row.try_get::<String, _>("condition_json")
                 .map_err(sql_error)?,
-        )
-        .map_err(ApiError::from)?
-        .read()
-        .interruption_present;
+        );
+        // A blank blocked record was never counted as blocked.
+        let blocked = condition.read().interruption_present
+            && !condition
+                .evidence()
+                .blocked_json
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty());
         match classify_status(&status) {
             TaskBucket::Terminal => counts.terminal += 1,
             _ if blocked => counts.blocked += 1,

@@ -536,6 +536,25 @@ async fn update_status_with_review_authority_inner(
     Ok((updated_review, updated_task))
 }
 
+impl SqliteDb {
+    /// Remove a Review attempt that never ran a command, and restate the
+    /// Task's condition from the Review now in front, in one transaction.
+    pub async fn discard_unstarted_review(&self, review_id: &str) -> Result<bool> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let task_id: Option<String> = sqlx::query_scalar(
+            "DELETE FROM review WHERE id = ? AND status = 'running' RETURNING task_id",
+        )
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(task_id) = &task_id {
+            crate::task_condition::produce(&mut tx, task_id, crate::ConditionChange::Human).await?;
+        }
+        tx.commit().await?;
+        Ok(task_id.is_some())
+    }
+}
+
 #[async_trait]
 impl ReviewRepo for SqliteDb {
     async fn create(&self, input: CreateReview) -> Result<Review> {

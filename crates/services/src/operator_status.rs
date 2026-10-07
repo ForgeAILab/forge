@@ -545,8 +545,9 @@ impl OperatorStatusService {
 
         rows.into_iter()
             .map(|row| {
-                let condition =
-                    db::task_condition::decode(&row.try_get::<String, _>("condition_json")?)?;
+                let condition = db::task_condition::decode_or_unknown(
+                    &row.try_get::<String, _>("condition_json")?,
+                );
                 Ok(BlockedTaskSummary {
                     task_id: row.try_get("id")?,
                     title: row.try_get("title")?,
@@ -806,7 +807,7 @@ impl OperatorStatusService {
         for row in rows {
             let attempt_count: i64 = row.try_get("attempt_count")?;
             let condition =
-                db::task_condition::decode(&row.try_get::<String, _>("condition_json")?)?;
+                db::task_condition::decode_or_unknown(&row.try_get::<String, _>("condition_json")?);
             let task_id: String = row.try_get("task_id")?;
             let execution_retry_count = row.try_get::<i64, _>("execution_spent")?.max(0) as u32;
             let deferred = condition.read().retry_display;

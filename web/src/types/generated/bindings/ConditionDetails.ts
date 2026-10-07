@@ -5,4 +5,17 @@ import type { FailureKind } from "./FailureKind";
 import type { InterruptionMetadata } from "./InterruptionMetadata";
 import type { TaskBlockingAnnotation } from "./TaskBlockingAnnotation";
 
-export type ConditionDetails = { execution_id?: string, owner?: ConditionOwner, recovery?: ConditionRecovery, failure_kind: FailureKind | null, diagnostic: TaskBlockingAnnotation | null, interruption: InterruptionMetadata | null, human_wait: boolean, entry_wait: boolean, };
+export type ConditionDetails = { execution_id?: string, owner?: ConditionOwner, recovery?: ConditionRecovery, failure_kind: FailureKind | null, diagnostic: TaskBlockingAnnotation | null, 
+/**
+ * The Task's failure record when one is stored, otherwise its blocked
+ * record. `failed` and `blocked` say which records are stored.
+ */
+interruption: InterruptionMetadata | null, 
+/**
+ * A failure record is stored; `interruption` is that record.
+ */
+failed: boolean, 
+/**
+ * A blocked record is stored; it is `interruption` unless `failed`.
+ */
+blocked: boolean, human_wait: boolean, entry_wait: boolean, };

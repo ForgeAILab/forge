@@ -33,6 +33,7 @@ describe('Needs owner review', () => {
           related_evidence: [],
           actions,
         },
+        condition: { kind: 'clear', details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false } },
       } as unknown as Task
       const review: Review = {
         id: 'review-1',

@@ -78,6 +78,11 @@ async fn queued(fixture: &Fixture) -> Task {
         .await
         .unwrap();
     fixture
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&fixture.task.id))
+        .await
+        .unwrap();
+    fixture
         .service
         .perform_task_action(&fixture.task.id, TaskAction::retry(), fixture.task.version)
         .await
@@ -120,6 +125,11 @@ async fn scheduling_waits_offer_hold_cancel_and_hold_parks_without_launching() {
                     .bind(value.to_string())
                     .bind(&fixture.task.id)
                     .execute(fixture.db.pool())
+                    .await
+                    .unwrap();
+                fixture
+                    .db
+                    .check_task_conditions_of(std::slice::from_ref(&fixture.task.id))
                     .await
                     .unwrap();
             }
@@ -296,6 +306,11 @@ async fn expired_environment_probe_deferral_is_claimed_without_losing_its_extra_
         "not_before":(chrono::Utc::now()-chrono::Duration::seconds(1)).to_rfc3339()});
     sqlx::query("UPDATE task SET metadata_json = json_set(metadata_json, '$.deferred_dispatch', json(?)) WHERE id = ?")
         .bind(deferred.to_string()).bind(&task.id).execute(fixture.db.pool()).await.unwrap();
+    fixture
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&task.id))
+        .await
+        .unwrap();
     let task = reload(&fixture).await;
     assert!(fixture
         .service
@@ -494,6 +509,11 @@ async fn parked_restart_fixture(other_owner: bool) -> (Fixture, Task) {
         .execute(fixture.db.pool())
         .await
         .unwrap();
+    fixture
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&fixture.task.id))
+        .await
+        .unwrap();
     let parked = fixture
         .service
         .perform_task_action(
@@ -514,6 +534,24 @@ async fn parked_restart_fixture(other_owner: bool) -> (Fixture, Task) {
     (fixture, parked)
 }
 
+/// Removal queues every Task change: the row is untouched. Only the stored
+/// condition's internal witness of the cancellation leaves with the pending
+/// row it witnessed, and what the condition says publicly does not move.
+fn assert_unchanged_but_for_the_cancel_witness(after: &Task, parked: &Task) {
+    assert_eq!(
+        Task {
+            condition: parked.condition.clone(),
+            ..after.clone()
+        },
+        *parked,
+        "removal queues every Task change"
+    );
+    assert_eq!(
+        serde_json::to_value(after.condition.public()).unwrap(),
+        serde_json::to_value(parked.condition.public()).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn remove_machine_clears_pending_cancel_and_replays_parked_restart() {
     let (fixture, parked) = parked_restart_fixture(false).await;
@@ -527,11 +565,7 @@ async fn remove_machine_clears_pending_cancel_and_replays_parked_restart() {
         .task_has_pending_remote_cancel(&fixture.task.id)
         .await
         .unwrap());
-    assert_eq!(
-        reload(&fixture).await,
-        parked,
-        "removal queues every Task change"
-    );
+    assert_unchanged_but_for_the_cancel_witness(&reload(&fixture).await, &parked);
     let current = fixture.service.drain(&fixture.task.id).await.unwrap();
     assert_eq!(current.status, "todo");
     assert!(current.error_annotation.is_none());
@@ -672,6 +706,11 @@ async fn remove_machine_replays_a_restart_parked_on_the_tasks_live_workspace_and
         .execute(fixture.db.pool())
         .await
         .unwrap();
+    fixture
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&fixture.task.id))
+        .await
+        .unwrap();
     let parked = fixture
         .service
         .perform_task_action(
@@ -697,11 +736,7 @@ async fn remove_machine_replays_a_restart_parked_on_the_tasks_live_workspace_and
     assert_eq!(result.pending_remote_cancels_cleared, 1);
     assert_eq!(result.placements_failed, 1);
     assert_eq!(result.tasks_to_replace, 1);
-    assert_eq!(
-        reload(&fixture).await,
-        parked,
-        "removal queues every Task change"
-    );
+    assert_unchanged_but_for_the_cancel_witness(&reload(&fixture).await, &parked);
 
     let current = fixture.service.drain(&fixture.task.id).await.unwrap();
     assert_eq!(current.status, "todo", "the parked Restart proceeded");

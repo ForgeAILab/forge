@@ -1,6 +1,6 @@
 //! Replay the scheduler migration on a database written before it, with
 //! queued and claimed steps and running executions in flight: every legacy
-//! row is byte-identical afterwards, nothing is marked dirty by the upgrade
+//! row is byte-identical afterwards (but for the two rederived columns), nothing is marked dirty by the upgrade
 //! itself, and a second run is a no-op.
 use db::{create_sqlite_pool, new_uuid_v4, run_migrations_from};
 use std::path::PathBuf;
@@ -22,7 +22,12 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// A fingerprint of every column of every row, in rowid order.
+/// The two derived columns the later reader migration recomputes by design:
+/// the stored condition is rederived from the legacy fields (which stay in
+/// the fingerprint), and each rewrite moves the Project's list revision.
+const REDERIVED: &[(&str, &str)] = &[("task", "condition_json"), ("project", "list_revision")];
+
+/// A fingerprint of every other column of every row, in rowid order.
 async fn digest(pool: &db::SqlitePool) -> Vec<(String, i64, String)> {
     let mut out = Vec::new();
     for table in TABLES {
@@ -34,6 +39,7 @@ async fn digest(pool: &db::SqlitePool) -> Vec<(String, i64, String)> {
         .unwrap();
         let expr = columns
             .iter()
+            .filter(|c| !REDERIVED.contains(&(*table, c.as_str())))
             .map(|c| format!("quote({c})"))
             .collect::<Vec<_>>()
             .join("||'|'||");
@@ -175,11 +181,9 @@ async fn upgrade_keeps_every_legacy_row_and_marks_nothing() {
         .open_schedule_tasks(None, 100)
         .await
         .unwrap();
-    assert_eq!(
-        open.len(),
-        6,
-        "every Task is still to be classified: {open:?}"
-    );
+    // The reader migration rederives each condition, so the `done` Task
+    // (`t4`) is already settled; every other Task is still to be classified.
+    assert_eq!(open, ["t0", "t1", "t2", "t3", "t5"]);
     let violations: Vec<String> =
         sqlx::query_scalar("SELECT \"table\" FROM pragma_foreign_key_check")
             .fetch_all(&pool)

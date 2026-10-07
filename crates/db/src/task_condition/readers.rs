@@ -66,7 +66,14 @@ impl TaskCondition {
         // Typed producer conditions need no imported evidence to be readable.
         for reason in self.reasons().chain(e.observations.iter()) {
             match reason {
-                ParkReason::Held { actor } if !read.diagnostic_present => {
+                // A hold stored with its own reason (an interruption, or the
+                // failure it sits beside) is shown as stored: only a hold
+                // that carries nothing else gets the generic diagnostic.
+                ParkReason::Held { actor }
+                    if !read.diagnostic_present
+                        && !read.interruption_present
+                        && !read.hard_failure =>
+                {
                     read.failure_kind = Some(FailureKind::ManualStop);
                     read.diagnostic = Some(TaskBlockingAnnotation {
                         annotation_type: FailureKind::ManualStop,
@@ -89,7 +96,11 @@ impl TaskCondition {
                 ParkReason::EntryBlocked { state, .. } if read.entry.is_none() => {
                     read.entry = Some(serde_json::json!({"state":state,"status":"blocked"}))
                 }
-                ParkReason::WorkflowInvalid { state, cause, .. } if !read.diagnostic_present => {
+                // A park migrated from its visible annotation keeps that
+                // diagnostic (its message and `blocked_at`) as saved.
+                ParkReason::WorkflowInvalid { state, cause, .. }
+                    if !read.diagnostic_present && read.diagnostic.is_none() =>
+                {
                     read.diagnostic = Some(park_diagnostic("workflow_invalid", &format!("Nothing can continue this Task from `{state}`: {cause}. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defines.")));
                     read.failure_kind = Some(FailureKind::WorkflowGuardRejected);
                 }
@@ -120,10 +131,10 @@ impl TaskCondition {
                 _ => {}
             }
         }
-        if matches!(
-            self,
-            TaskCondition::Running { .. } | TaskCondition::Settled { .. }
-        ) {
+        // A failed Review is history only once the Task has moved past it.
+        // A run that is merely live (a reviewer retrying) has not: the
+        // failure stays the Task's exception until that run succeeds.
+        if matches!(self, TaskCondition::Settled { .. }) {
             read.review_failure = false;
         }
         read.human_wait |= read.interruption_present;
@@ -169,7 +180,14 @@ impl TaskCondition {
     /// Omit private evidence, ownership witnesses and migrated metadata from live values.
     pub fn public(&self) -> api_types::TaskCondition {
         let read = self.read();
+        // Which stored record the one public `interruption` is: the failure
+        // record wins, and a blocked record beside it is still reported.
+        let evidence = self.evidence();
+        let failed = read.interruption.is_some() && evidence.failed_json.is_some();
+        let blocked = evidence.blocked_json.is_some() && (failed || read.interruption.is_some());
         let details = api_types::ConditionDetails {
+            failed,
+            blocked,
             execution_id: read.interruption_execution_id.clone().or_else(|| {
                 read.diagnostic
                     .as_ref()
@@ -178,7 +196,13 @@ impl TaskCondition {
             owner: read.owner,
             recovery: read.recovery,
             failure_kind: read.failure_kind,
-            diagnostic: read.diagnostic,
+            // An annotation stored before annotations were typed has no
+            // typed reading; it stays visible as an unknown diagnostic.
+            diagnostic: read.diagnostic.or_else(|| {
+                read.diagnostic_present
+                    .then(|| untyped_diagnostic(evidence.error_annotation.as_deref()?))
+                    .flatten()
+            }),
             interruption: read.interruption,
             human_wait: read.human_wait,
             entry_wait: matches!(self, TaskCondition::Entering { .. })
@@ -234,6 +258,37 @@ impl TaskCondition {
         }
         serde_json::from_value(value).expect("private and public condition variants agree")
     }
+}
+
+/// The public reading of an annotation that is not a typed blocking
+/// annotation: its own text fields where it has them, otherwise its text.
+fn untyped_diagnostic(raw: &str) -> Option<TaskBlockingAnnotation> {
+    let value = serde_json::from_str::<Value>(raw).ok();
+    let text = |key: &str| {
+        value
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(Value::as_str)
+            .map(|text| {
+                let mut text = text.to_owned();
+                bound_text(&mut text);
+                text
+            })
+    };
+    let mut whole = raw.to_owned();
+    bound_text(&mut whole);
+    Some(TaskBlockingAnnotation {
+        annotation_type: FailureKind::Unknown,
+        blocking_reason: text("blocking_reason")
+            .or_else(|| text("reason"))
+            .unwrap_or_default(),
+        blocked_by: text("blocked_by"),
+        blocked_at: text("blocked_at"),
+        blocked_execution_id: text("blocked_execution_id"),
+        artifact: None,
+        message: text("message").or(Some(whole)),
+        hook: None,
+    })
 }
 
 impl ConditionRead {
@@ -362,11 +417,7 @@ impl ConditionRead {
                         .and_then(|s| serde_json::from_str::<Value>(s).ok())
                         .unwrap_or_default()
             }),
-            operator_reason: view.error_annotation.map(str::to_owned).or_else(|| {
-                blocked
-                    .as_ref()
-                    .and_then(|v| v["reason"].as_str().map(str::to_owned))
-            }),
+            operator_reason: None,
             failed_step_id: view
                 .error_annotation
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -376,7 +427,22 @@ impl ConditionRead {
         // remains in the legacy columns until the storage-removal stage.
         let mut value = serde_json::to_value(read).expect("reader projection serializes");
         bound(&mut value);
-        serde_json::from_value(value).expect("bounded projection retains its types")
+        let mut read: ConditionRead =
+            serde_json::from_value(value).expect("bounded projection retains its types");
+        read.operator_reason = view
+            .error_annotation
+            .map(bound_operator_reason)
+            .or_else(|| {
+                blocked
+                    .as_ref()
+                    .and_then(|v| v["reason"].as_str())
+                    .map(|reason| {
+                        let mut reason = reason.to_owned();
+                        bound_text(&mut reason);
+                        reason
+                    })
+            });
+        read
     }
 }
 
@@ -464,15 +530,50 @@ pub(super) fn apply_owner_park(mut condition: TaskCondition, raw: Option<&Value>
     }
 }
 
+/// The most bytes of any one text a condition presents, marker included.
+pub const PRESENTATION_TEXT_LIMIT: usize = 1024;
+/// Ends every presented text that was cut to [`PRESENTATION_TEXT_LIMIT`].
+pub const PRESENTATION_TRUNCATION_MARKER: &str = "… [truncated]";
+
+fn bound_text(text: &mut String) {
+    if text.len() <= PRESENTATION_TEXT_LIMIT {
+        return;
+    }
+    let mut end = PRESENTATION_TEXT_LIMIT - PRESENTATION_TRUNCATION_MARKER.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(PRESENTATION_TRUNCATION_MARKER);
+}
+
+/// The operator's copy of the stored annotation stays what it was: valid
+/// JSON when the annotation is JSON, with each text inside it bounded.
+fn bound_operator_reason(raw: &str) -> String {
+    const WHOLE_LIMIT: usize = 16 * PRESENTATION_TEXT_LIMIT;
+    if raw.len() <= PRESENTATION_TEXT_LIMIT {
+        // The stored text, byte for byte.
+        return raw.to_owned();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+        let mut text = raw.to_owned();
+        bound_text(&mut text);
+        return text;
+    };
+    bound(&mut value);
+    let encoded = value.to_string();
+    if encoded.len() <= WHOLE_LIMIT {
+        return encoded;
+    }
+    // Too many fields to present: one bounded JSON string, still valid JSON.
+    let mut text = encoded;
+    bound_text(&mut text);
+    Value::String(text).to_string()
+}
+
 fn bound(value: &mut Value) {
     match value {
-        Value::String(text) if text.len() > 1024 => {
-            let mut end = 1024;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-        }
+        Value::String(text) => bound_text(text),
         Value::Object(fields) => {
             for value in fields.values_mut() {
                 bound(value);

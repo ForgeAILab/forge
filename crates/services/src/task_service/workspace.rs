@@ -2839,7 +2839,12 @@ mod tests {
                 // that read `workspace_placement` are applied with it below.
                 (!matches!(
                     version,
-                    202610010400 | 202610010530 | 202610020600 | 202610021500 | 202610060838
+                    202610010400
+                        | 202610010530
+                        | 202610020600
+                        | 202610021500
+                        | 202610060838
+                        | 202610070507
                 ))
                 .then_some((version, path))
             })
@@ -2858,6 +2863,15 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // The reader migration moves bridge annotations into the park table
+        // the scheduler migration creates, so it follows it here as it does
+        // in version order.
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610070507__task_condition_readers.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let db = Arc::new(SqliteDb::new(pool));
         let remote = TempDir::new().unwrap();
         let root = TempDir::new().unwrap();
