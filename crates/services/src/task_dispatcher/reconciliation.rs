@@ -533,7 +533,9 @@ impl TaskDispatcher {
         let mut refused = false;
         for _ in 0..4 {
             let machine_wait = p.machine_wait;
-            refused |= Box::pin(self.observe_admission(p, project, agents, gate)).await;
+            if p.read.condition.integration_wait().is_none() {
+                refused |= Box::pin(self.observe_admission(p, project, agents, gate)).await;
+            }
             p.machine_wait |= machine_wait;
             gate = false;
             let initial = p.workflow.state_kind(&p.read.task.status) == Some(StateKind::Initial);
@@ -918,6 +920,7 @@ impl TaskDispatcher {
                 let owned = p.read.queue_owned
                     || p.read.park_json.is_some()
                     || p.read.condition.is_blocked()
+                    || p.read.condition.integration_wait().is_some()
                     || p.read.executions.iter().any(|e| {
                         e.status == db::ExecutionStatus::Running && e.role != "interactive"
                     });

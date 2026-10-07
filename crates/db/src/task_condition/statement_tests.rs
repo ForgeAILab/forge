@@ -48,7 +48,7 @@ async fn given(
 }
 
 /// The owner's hold, exactly as `TaskService::hold_waiting_task` writes it.
-async fn hold(db: &SqliteDb, id: &str, reason: &str) -> Task {
+pub(super) async fn hold(db: &SqliteDb, id: &str, reason: &str) -> Task {
     let version = TaskRepo::get_by_id(db, id, false)
         .await
         .unwrap()
@@ -86,7 +86,7 @@ async fn hold(db: &SqliteDb, id: &str, reason: &str) -> Task {
 
 /// The owner's release, exactly as `TaskService::release_to_dispatch_queue`
 /// writes it.
-async fn release(db: &SqliteDb, id: &str) -> Task {
+pub(super) async fn release(db: &SqliteDb, id: &str) -> Task {
     let version = TaskRepo::get_by_id(db, id, false)
         .await
         .unwrap()
@@ -380,49 +380,32 @@ async fn a_200_000_byte_reason_keeps_the_stored_condition_small() {
     println!("condition_json bytes: stated hold {stated}, mapped failure {mapped}");
 }
 
-/// Item 6: a stored condition that cannot be read is not edited by a
-/// statement. The writer's write still lands and the condition is restated
-/// whole, so an ordinary hold or release never leaves the Task unreadable.
+/// Unsupported stored state is quarantined even when a legacy hold/release
+/// succeeds. Neither statement may guess away another version's ownership.
 #[tokio::test]
-async fn a_statement_over_an_unreadable_condition_restates_it() {
+async fn a_statement_over_an_unreadable_condition_quarantines_it() {
     let db = db().await;
     task(&db, "broken").await;
-    // The column only admits JSON, so "unreadable" is JSON no decoder accepts.
     for corrupt in ["{\"kind\":\"nope\",\"evidence\":{}}", "{}", "[]", "7"] {
         sqlx::query("UPDATE task SET condition_json=? WHERE id='broken'")
             .bind(corrupt)
             .execute(db.pool())
             .await
             .unwrap();
-        let held = hold(&db, "broken", "hold").await;
-        assert!(
-            matches!(
-                &held.condition,
-                TaskCondition::Parked {
-                    primary: ParkReason::Held { .. },
-                    ..
-                }
-            ),
-            "{corrupt:?}: {:?}",
-            held.condition
-        );
-        assert_eq!(
-            db.task_condition_violations().await.unwrap(),
-            Vec::<String>::new()
-        );
-        sqlx::query("UPDATE task SET condition_json=? WHERE id='broken'")
-            .bind(corrupt)
-            .execute(db.pool())
+        hold(&db, "broken", "hold").await;
+        release(&db, "broken").await;
+        db.check_task_conditions(CONDITION_CHECK_PAGE)
             .await
             .unwrap();
-        let released = release(&db, "broken").await;
-        assert!(
-            matches!(released.condition, TaskCondition::Clear { .. }),
-            "{corrupt:?}"
-        );
+        let stored: String =
+            sqlx::query_scalar("SELECT condition_json FROM task WHERE id='broken'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(stored, corrupt);
         assert_eq!(
             db.task_condition_violations().await.unwrap(),
-            Vec::<String>::new()
+            vec!["broken"]
         );
     }
 }

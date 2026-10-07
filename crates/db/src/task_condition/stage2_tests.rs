@@ -306,7 +306,7 @@ async fn bounded_repair_changes_only_shadow_and_reports_counts() {
     for i in 0..12 {
         task(&db, &format!("r{i:02}")).await;
     }
-    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"corrupt\"}'")
+    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"clear\",\"evidence\":{\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{},\"unparsed_metadata\":null}}'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -602,7 +602,7 @@ async fn check_reads_without_the_writer_and_survives_a_cancelled_repair() {
     assert_eq!((status.checked, status.repaired, status.ticks), (1, 0, 1));
     lock.rollback().await.unwrap();
 
-    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"corrupt\"}'")
+    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"clear\",\"evidence\":{\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{},\"unparsed_metadata\":null}}'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -676,7 +676,7 @@ async fn completed_pass_is_recorded_with_its_own_counts() {
     db.check_task_conditions(2).await.unwrap();
     let pass = db.condition_check_status().last_pass.unwrap();
     assert_eq!((pass.checked, pass.repaired), (3, 0));
-    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"corrupt\"}' WHERE id='pass1'")
+    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"clear\",\"evidence\":{\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{},\"unparsed_metadata\":null}}' WHERE id='pass1'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -810,7 +810,16 @@ async fn opaque_metadata_values_preserve_shadow_until_the_bounded_check() {
         "an opaque value is not a condition producer"
     );
     db.check_task_conditions(1).await.unwrap();
-    assert!(db.task_condition_violations().await.unwrap().is_empty());
+    assert_eq!(
+        db.task_condition_violations().await.unwrap(),
+        vec![t.id.clone()]
+    );
+    let after: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
+        .bind(&t.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(after, corrupt, "unsupported state remains quarantined");
 }
 
 /// The scheduler admits a Task from an initial state without reading its

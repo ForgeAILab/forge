@@ -1,4 +1,5 @@
-//! Stage-one shadow condition. Legacy columns still own runtime decisions.
+//! Typed Task conditions. Legacy mapping remains authoritative for legacy
+//! writers; integration ownership is stated directly under the Task-step lease.
 //!
 //! [`map_legacy_condition`] is the single deterministic mapping: a pure Rust
 //! function used by the migration backfill, the writer seams and the invariant
@@ -6,6 +7,9 @@
 //! carries the mapping. No queue intent, publication claim or settlement
 //! receipt is moved here.
 use crate::{DbError, Result, SqliteDb, Task};
+pub use api_types::{
+    IntegrationAttemptId, IntegrationDeferralCause, IntegrationPhase, IntegrationReason,
+};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
@@ -144,6 +148,9 @@ pub enum ConditionEnvironmentKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParkReason {
+    Integration {
+        reason: IntegrationReason,
+    },
     Held {
         actor: String,
     },
@@ -229,6 +236,7 @@ pub enum RetryCause {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConditionContinuation {
+    Integration { attempt_id: IntegrationAttemptId },
     Reconcile,
     AdvanceAggregateReview { child_ids: Vec<String> },
     Dispatch { target_state: String },
@@ -256,7 +264,11 @@ impl TaskCondition {
     /// Whether the condition holds the Task out of dispatch. For a legacy-only
     /// mapping this agrees with what the dispatcher and readers block on.
     pub fn is_blocked(&self) -> bool {
-        matches!(self, Self::Parked { .. } | Self::Failed { .. })
+        matches!(self, Self::Failed { .. })
+            || self.reasons().any(|r| match r {
+                ParkReason::Integration { reason } => reason.requires_intervention(),
+                _ => true,
+            })
     }
     /// The condition without the marks of how it was produced: the legacy
     /// copies a mapped condition carries and the mark a stated one carries.
@@ -305,7 +317,7 @@ pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
 /// Revision of the mapping and of the stored encoding. A database whose
 /// recorded revision differs is recomputed once in the background, off the
 /// startup path. Bump it with every change to either.
-pub const MAPPING_REVISION: i64 = 4;
+pub const MAPPING_REVISION: i64 = 5;
 /// Protected `system_setting` key recording the revision last backfilled.
 pub const MAPPING_REVISION_KEY: &str = "task_condition_mapping_revision";
 
@@ -1169,7 +1181,10 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
 }
 
 pub fn decode(raw: &str) -> Result<TaskCondition> {
-    serde_json::from_str(raw).map_err(|e| DbError::Check(format!("invalid Task condition: {e}")))
+    let condition: TaskCondition = serde_json::from_str(raw)
+        .map_err(|e| DbError::Check(format!("invalid Task condition: {e}")))?;
+    integration::validate(&condition)?;
+    Ok(condition)
 }
 /// The stored condition as every row reader sees it: a value that cannot be
 /// decoded is a typed unknown park, never a silent `Clear`.
@@ -1217,8 +1232,8 @@ async fn set_condition(
 }
 
 /// The full recompute of one row: the mapping fallback, used by the backfill,
-/// the invariant check and a writer with no narrower claim. A stored condition
-/// is compared as text and never decoded, so an undecodable one is overwritten.
+/// the invariant check and a writer with no narrower claim. Supported
+/// integration witnesses survive; unsupported stored state is quarantined.
 pub(crate) async fn sync_condition(connection: &mut SqliteConnection, task_id: &str) -> Result<()> {
     produce(connection, task_id, ConditionChange::Full).await
 }
@@ -1242,6 +1257,15 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
         };
         after = Some(last.try_get(6)?);
         for row in &rows {
+            let stored: Vec<u8> = row.try_get(5)?;
+            if std::str::from_utf8(&stored)
+                .ok()
+                .and_then(|raw| decode(raw).ok())
+                .is_none()
+            {
+                tracing::warn!("unsupported Task condition quarantined during backfill");
+                continue;
+            }
             let input = LegacyConditionInput::from_row(row)?;
             let mapped = map_legacy_condition(&input);
             let id: String = row.try_get(6)?;
@@ -1259,7 +1283,7 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
             }
         }
     }
-    // Every row now holds this revision's encoding: record it, so the first
+    // Every supported row now holds this revision's encoding: record it, so the first
     // dispatcher tick after a clean upgrade does not walk the table again.
     let settings: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='system_setting'",
@@ -1288,11 +1312,59 @@ impl SqliteDb {
         decode(&raw)
     }
 
+    /// State integration ownership under the live Task-step lease. No legacy
+    /// field, version, event, budget or queue row is written by this seam.
+    pub async fn state_integration_condition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+        statement: &ConditionStatement,
+    ) -> Result<()> {
+        if !matches!(
+            statement,
+            ConditionStatement::Integration { .. }
+                | ConditionStatement::IntegrationHandedOff { .. }
+                | ConditionStatement::IntegrationCleared { .. }
+        ) {
+            return Err(DbError::Check("expected an integration statement".into()));
+        }
+        if !crate::task_writer::owns_task(task_id) {
+            return Err(DbError::Check(
+                "integration statement requires the Task step lease".into(),
+            ));
+        }
+        // The generic hook fence permits completed command bookkeeping.
+        // An integration statement needs a currently claimed Task step.
+        let step = crate::task_writer::current_task_step().expect("owns_task checked");
+        let claimed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE id=? AND task_id=? AND status='claimed' AND claimed_by=? AND (lease_until>? OR ?))")
+            .bind(&step.id).bind(task_id).bind(&step.claimed_by)
+            .bind(crate::now_rfc3339()).bind(self.step_is_active(&step))
+            .fetch_one(&mut **tx).await?;
+        if !claimed {
+            return Err(DbError::VersionConflict);
+        }
+        self.fence_task_lease_in_tx(tx, task_id, "integration statement")
+            .await?;
+        let produced =
+            producers::derive(tx, task_id, ConditionChange::Legacy, None, Some(statement))
+                .await?
+                .ok_or_else(|| DbError::Check("stored Task condition is quarantined".into()))?;
+        self.set_condition(
+            tx,
+            task_id,
+            produced.version,
+            &produced.legacy,
+            &produced.condition,
+        )
+        .await
+    }
+
     /// Strict single-writer seam for a producer that states a condition. It
     /// requires the Task's claimed step and its live lease, never rebinds a
     /// stale version, and compares all five source values (metadata changes
-    /// without advancing Task.version). The legacy fields are authoritative,
-    /// so a condition is refused unless it is their mapping under the
+    /// without advancing Task.version). Legacy-derived reasons must agree
+    /// with their mapping; integration is validated from its typed witness.
+    /// A condition is refused unless those owners agree under the
     /// witnesses it states itself. Those witnesses are the producer's claim:
     /// they are not re-read here (the invariant check does that), so stating a
     /// condition costs no fact query.
@@ -1305,6 +1377,7 @@ impl SqliteDb {
         expected_legacy: &LegacyConditionInput,
         condition: &TaskCondition,
     ) -> Result<()> {
+        integration::validate(condition)?;
         if !crate::task_writer::owns_task(task_id) {
             return Err(DbError::Check(
                 "set_condition requires the Task step lease".into(),
@@ -1319,6 +1392,23 @@ impl SqliteDb {
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(DbError::NotFound)?;
+        let stored: Vec<u8> = row.try_get(5)?;
+        let stored_condition = std::str::from_utf8(&stored)
+            .ok()
+            .and_then(|raw| decode(raw).ok())
+            .ok_or_else(|| DbError::Check("stored Task condition is quarantined".into()))?;
+        if stored_condition.integration_reason() != condition.integration_reason()
+            || stored_condition.integration_handoff_ready() != condition.integration_handoff_ready()
+        {
+            // Completed command bookkeeping may carry integration, never
+            // introduce, replace or clear its independently owned statement.
+            let step = crate::task_writer::current_task_step().expect("owns_task checked");
+            let claimed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE id=? AND task_id=? AND status='claimed')")
+                .bind(&step.id).bind(task_id).fetch_one(&mut **tx).await?;
+            if !claimed {
+                return Err(DbError::VersionConflict);
+            }
+        }
         let mut bare = expected_legacy.clone();
         bare.facts = None;
         if row.try_get::<i64, _>(6)? != expected_version
@@ -1335,9 +1425,9 @@ impl SqliteDb {
                 facts
             })
             .filter(|facts| facts.epoch == row.get::<i64, _>(8));
-        if stated.is_none_or(|facts| facts.condition(&bare) != *condition) {
+        if stated.is_none_or(|facts| facts.condition(&bare).typed() != condition.typed()) {
             return Err(DbError::Check(
-                "Task condition differs from legacy fields".into(),
+                "Task condition differs from its legacy and owner witnesses".into(),
             ));
         }
         set_condition(tx, task_id, &encode(condition), Some(expected_version)).await
@@ -1430,6 +1520,7 @@ impl SqliteDb {
             .bind(&task.id)
             .fetch_one(&mut *connection)
             .await?;
+        decode(&actual)?;
         let facts = ConditionFacts::load(&mut connection, &task.id).await?;
         let expected = facts.condition(&LegacyConditionInput::from(task));
         if !TaskCondition::stored_agrees(actual.as_bytes(), &expected, &encode(&expected)) {
@@ -1466,6 +1557,7 @@ impl SqliteDb {
 }
 
 mod checks;
+mod integration;
 pub use checks::{
     ConditionCheckPass, ConditionCheckState, ConditionCheckStatus, CONDITION_CHECK_PAGE,
 };
@@ -1480,6 +1572,8 @@ pub(crate) use producers::{
     sql_change, state, workflow_changed,
 };
 pub use statements::ConditionStatement;
+#[cfg(test)]
+mod integration_tests;
 #[cfg(test)]
 mod producer_tests;
 #[cfg(test)]

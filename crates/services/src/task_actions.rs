@@ -426,6 +426,25 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             "Cancel Task",
         );
     }
+    if matches!(
+        &task.condition,
+        db::TaskCondition::Parked {
+            primary: db::ParkReason::Integration { .. },
+            ..
+        }
+    ) {
+        // A queue/phase wait is owned work, never an agent retry or a manual
+        // decision. Genuine owner blockers expose typed recovery guidance;
+        // their consumer arrives with the integration worker in stage D.
+        offer(
+            TaskAction::Hold { reason: None },
+            &[],
+            &[Owner],
+            "integration_wait",
+            "Hold Task",
+        );
+        return offers;
+    }
     // A running Task is held through its execution (below); a dispatch-wait
     // Hold only applies to work that is waiting to be dispatched.
     let running_live = running && !snapshot.owner_disconnected;
@@ -1819,6 +1838,114 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn integration_conditions() -> Vec<db::TaskCondition> {
+        use api_types::{
+            IntegrationAttemptId, IntegrationDeferralCause, IntegrationPhase, IntegrationReason,
+        };
+        let id = || IntegrationAttemptId::new("attempt");
+        let reasons = vec![
+            IntegrationReason::Waiting {
+                attempt_id: id(),
+                blocked_by: vec![],
+            },
+            IntegrationReason::Owned {
+                attempt_id: id(),
+                phase: IntegrationPhase::Checking,
+            },
+            IntegrationReason::Repair {
+                attempt_id: id(),
+                conflict_paths: Some(vec!["src/a.rs".into()]),
+                repair_paths: vec![],
+                predecessor_attempt_id: None,
+            },
+            IntegrationReason::ReviewRequired {
+                attempt_id: id(),
+                authority_reason: "authority changed".into(),
+            },
+            IntegrationReason::CandidateCheckFailed {
+                attempt_id: id(),
+                check: "unit".into(),
+                message: "exit 1".into(),
+            },
+            IntegrationReason::Deferred {
+                attempt_id: id(),
+                cause: IntegrationDeferralCause::Infrastructure,
+                owner_id: Some("owner".into()),
+                message: "transport down".into(),
+                retry_at: Some("2099-01-01T00:00:00Z".into()),
+            },
+            IntegrationReason::Applied { attempt_id: id() },
+            IntegrationReason::Deferred {
+                attempt_id: id(),
+                cause: IntegrationDeferralCause::TargetDirty,
+                owner_id: Some("owner".into()),
+                message: "target dirty".into(),
+                retry_at: None,
+            },
+        ];
+        reasons
+            .into_iter()
+            .map(|reason| {
+                db::ConditionFacts {
+                    task_id: "task".into(),
+                    state: "merging".into(),
+                    integration: Some(reason),
+                    ..Default::default()
+                }
+                .condition(&db::LegacyConditionInput::default())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn integration_waits_offer_hold_and_cancel_without_agent_recovery() {
+        for condition in integration_conditions() {
+            let mut snapshot = snapshot("merging", None);
+            snapshot.task.condition = condition.clone();
+            let offers = available_actions(&snapshot);
+            let verbs: Vec<_> = offers.iter().map(|offer| offer.action.verb()).collect();
+            assert_eq!(verbs, vec!["cancel", "hold"], "{condition:?}");
+            assert_eq!(
+                condition.read().failure_kind.is_some(),
+                condition
+                    .integration_reason()
+                    .unwrap()
+                    .requires_intervention()
+            );
+            // A user hold remains an ordinary releaseable primary, with
+            // integration waiting as an independent secondary reason.
+            let mut held = db::map_legacy_condition(&db::LegacyConditionInput {
+                error_annotation: Some(
+                    json!({"type":"manual_stop","blocking_reason":"held","blocked_by":"user"})
+                        .to_string(),
+                ),
+                ..Default::default()
+            });
+            if let db::TaskCondition::Parked { additional, .. } = &mut held {
+                additional.push(db::ParkReason::Integration {
+                    reason: condition.integration_reason().unwrap().clone(),
+                });
+            }
+            snapshot.task.condition = held;
+            let offers = available_actions(&snapshot);
+            assert!(offers.iter().any(|offer| offer.action.verb() == "release"));
+            assert!(!offers.iter().any(|offer| offer.action.verb() == "retry"));
+            // Integration is secondary to an entry blocker, whose offers
+            // remain exactly the same as without integration ownership.
+            let input = db::LegacyConditionInput {
+                entry_barrier_json: Some(
+                    json!({"state":"merging","status":"blocked","blocking_reason":"other owner"})
+                        .to_string(),
+                ),
+                ..Default::default()
+            };
+            snapshot.task.condition = db::map_legacy_condition(&input);
+            let expected = available_actions(&snapshot);
+            snapshot.task.condition = condition.restate_legacy(&input);
+            assert_eq!(available_actions(&snapshot), expected);
+        }
+    }
+
     #[test]
     fn review_condition_wins_over_generic_decision_for_owner_and_project_agent() {
         for caller in [
@@ -2603,7 +2730,7 @@ mod condition_reader_parity {
     use super::*;
     use serde_json::{json, Value};
     #[test]
-    fn all_condition_kinds_and_actions_match_the_legacy_reader() {
+    fn legacy_conditions_keep_parity_and_integration_waits_have_owned_offers() {
         let conditions = [
             ("clear", None, None, None, None),
             ("entering", None, None, None, None),
@@ -2636,6 +2763,8 @@ mod condition_reader_parity {
                 None,
             ),
             ("settled", None, None, None, None),
+            ("integration_wait", None, None, None, None),
+            ("integration_owner", None, None, None, None),
         ];
         for (kind, a, b, f, m) in conditions {
             let mut s = super::tests::snapshot("in_progress", None);
@@ -2669,14 +2798,37 @@ mod condition_reader_parity {
                     evidence: condition.evidence().clone(),
                 };
             }
+            if kind == "integration_wait" {
+                condition = super::tests::integration_conditions().remove(0);
+            }
+            if kind == "integration_owner" {
+                condition = super::tests::integration_conditions().pop().unwrap();
+            }
             s.task.condition = condition;
-            assert_eq!(
-                serde_json::to_value(available_actions(&s)).unwrap(),
-                serde_json::to_value(legacy::available_actions(&legacy::TaskSnapshot::from(&s)))
+            if s.task.condition.integration_reason().is_none() {
+                assert_eq!(
+                    serde_json::to_value(available_actions(&s)).unwrap(),
+                    serde_json::to_value(legacy::available_actions(&legacy::TaskSnapshot::from(
+                        &s
+                    )))
                     .unwrap(),
-                "{kind}"
-            );
-            assert_eq!(s.condition(), legacy_task_condition(&s.task), "{kind}");
+                    "{kind}"
+                );
+                assert_eq!(s.condition(), legacy_task_condition(&s.task), "{kind}");
+            } else {
+                // Legacy fields cannot express direct integration ownership.
+                // Retain the old parity assertions for every legacy fixture,
+                // and assert the owner contract for these two new fixtures.
+                let offers = available_actions(&s);
+                assert_eq!(
+                    offers
+                        .iter()
+                        .map(|offer| offer.action.verb())
+                        .collect::<Vec<_>>(),
+                    vec!["cancel", "hold"]
+                );
+                assert_eq!(s.condition().is_some(), kind == "integration_owner");
+            }
             let expected = available_actions(&s);
             s.task.error_annotation =
                 Some(json!({"type":"workspace_error","blocking_reason":"poison"}).to_string());

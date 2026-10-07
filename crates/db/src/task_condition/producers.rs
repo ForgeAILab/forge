@@ -66,6 +66,21 @@ pub(crate) async fn derive(
     let Some(mut snapshot) = Snapshot::read(c, task_id, families).await? else {
         return Ok(None);
     };
+    // Unsupported stored state is quarantined. A legacy write still lands,
+    // but no producer or statement guesses away a future owner's reason.
+    let stored = match std::str::from_utf8(&snapshot.stored)
+        .ok()
+        .and_then(|raw| decode(raw).ok())
+    {
+        Some(stored) => stored,
+        None => {
+            tracing::warn!(
+                task_id,
+                "stored Task condition quarantined; producer skipped"
+            );
+            return Ok(None);
+        }
+    };
     if let Some(metadata) = metadata {
         snapshot.input.metadata_json = metadata.map(str::to_owned);
         snapshot
@@ -73,12 +88,10 @@ pub(crate) async fn derive(
             .non_text
             .retain(|field| *field != LegacyConditionField::MetadataJson);
     }
-    // A writer that states its condition edits the stored one. Only a stored
-    // condition that cannot be read falls back to the mapping.
-    let stated = stated.and_then(|statement| {
-        let stored = decode(std::str::from_utf8(&snapshot.stored).ok()?).ok()?;
-        Some(statement.apply(&stored))
-    });
+    // A writer that states its condition edits the supported stored one.
+    // Unsupported state was quarantined above.
+    let statement = stated;
+    let stated = statement.map(|statement| statement.apply(&stored));
     let from_statement = stated.is_some();
     let mapped = stated.unwrap_or_else(|| map_view(&snapshot.input.view()));
     let exhausted = mapped.budget_exhausted();
@@ -92,7 +105,7 @@ pub(crate) async fn derive(
         // A status epoch the stored condition never saw: nothing is carried.
         .filter(|prior| change == Change::Entry || prior.epoch == snapshot.epoch);
     let pending = snapshot.children_pending();
-    let facts = match prior {
+    let mut facts = match prior {
         Some(mut facts) => {
             snapshot.refresh(c, &mut facts).await?;
             if change == Change::Operations {
@@ -123,13 +136,58 @@ pub(crate) async fn derive(
             ConditionFacts::load_all(c, &snapshot).await?
         }
     };
+    if let Some(statement) = statement {
+        match statement {
+            ConditionStatement::Integration { reason } => {
+                // Updating a delegated repair's paths keeps its role ready;
+                // a new phase or attempt returns ownership to integration.
+                facts.integration_handoff_ready &=
+                    facts.integration.as_ref().is_some_and(|prior| {
+                        prior.attempt_id() == reason.attempt_id()
+                            && std::mem::discriminant(prior) == std::mem::discriminant(reason)
+                    });
+                facts.integration = Some(reason.clone());
+            }
+            ConditionStatement::IntegrationHandedOff { attempt_id } => {
+                let reason = facts.integration.as_ref().ok_or(DbError::VersionConflict)?;
+                if reason.attempt_id() != attempt_id {
+                    return Err(DbError::VersionConflict);
+                }
+                if !reason.hands_off() {
+                    return Err(DbError::Check(
+                        "integration reason cannot hand off to a role".into(),
+                    ));
+                }
+                facts.integration_handoff_ready = true;
+            }
+            ConditionStatement::IntegrationCleared { attempt_id } => {
+                if facts
+                    .integration
+                    .as_ref()
+                    .is_none_or(|reason| reason.attempt_id() != attempt_id)
+                {
+                    return Err(DbError::VersionConflict);
+                }
+                facts.integration = None;
+                facts.integration_handoff_ready = false;
+            }
+            _ => {}
+        }
+    }
     // An initial state reads the entry barrier differently; only then is the
     // mapping taken again, from the same snapshot.
-    let condition = if facts.initial && !from_statement {
+    let condition = if (facts.initial && !from_statement)
+        || matches!(
+            statement,
+            Some(ConditionStatement::IntegrationCleared { .. })
+        ) {
+        // Clearing integration restores the other owners' current mapping,
+        // including a Deferred timer whose continuation integration stood over.
         facts.condition_of(&snapshot.input.view())
     } else {
         facts.apply(mapped)
     };
+    integration::validate(&condition)?;
     let encoded = encode(&condition);
     Ok(Some(Produced {
         version: snapshot.version,
@@ -170,6 +228,16 @@ pub(crate) async fn state(
     task_id: &str,
     statement: &ConditionStatement,
 ) -> Result<()> {
+    if matches!(
+        statement,
+        ConditionStatement::Integration { .. }
+            | ConditionStatement::IntegrationHandedOff { .. }
+            | ConditionStatement::IntegrationCleared { .. }
+    ) {
+        return Err(DbError::Check(
+            "integration statements require state_integration_condition_in_tx".into(),
+        ));
+    }
     let Some(produced) = derive(c, task_id, ConditionChange::Legacy, None, Some(statement)).await?
     else {
         return Ok(());

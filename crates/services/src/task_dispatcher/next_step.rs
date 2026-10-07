@@ -66,6 +66,7 @@ pub enum Reason {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Owner {
+    IntegrationWorker,
     User,
     ProjectAgent,
     Worker,
@@ -183,6 +184,7 @@ fn condition_park(condition: &TaskCondition) -> Next {
         }
     };
     let (owner, action) = match reason {
+        ParkReason::Integration { .. } => (Owner::IntegrationWorker, Action::WaitForOwner),
         ParkReason::Held { .. } => (Owner::User, Action::ReleaseHold),
         ParkReason::HumanDecision { .. } => (Owner::User, Action::ApproveOrMove),
         ParkReason::Capacity { .. } => (Owner::Scheduler, Action::FreeCapacity),
@@ -230,6 +232,11 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     }
     if f.paused {
         return park(Reason::ProjectPaused, Owner::User, Action::ResumeProject);
+    }
+    // Integration owns this wait, with other owners' primary reasons intact.
+    // It is never an execution, entry-hooks lease or paused-integration retry.
+    if s.condition.integration_wait().is_some() {
+        return condition_park(s.condition);
     }
     if f.queue_owned {
         return park(Reason::QueueOwned, Owner::Worker, Action::WaitForOwner);
@@ -554,6 +561,113 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn handed_off_integration_lineage_allows_idle_role_dispatch() {
+        let workflow = WorkflowEngine::resolve_workflow("{}");
+        for condition in crate::task_actions::tests::integration_conditions()
+            .into_iter()
+            .filter(|condition| condition.integration_reason().unwrap().hands_off())
+        {
+            let reason = condition.integration_reason().unwrap().clone();
+            let state = if matches!(reason, api_types::IntegrationReason::ReviewRequired { .. }) {
+                "review"
+            } else {
+                "merge_failed"
+            };
+            let condition = db::ConditionFacts {
+                task_id: "task".into(),
+                state: state.into(),
+                integration: Some(reason),
+                integration_handoff_ready: true,
+                ..Default::default()
+            }
+            .condition(&db::LegacyConditionInput::default());
+            let f = Facts {
+                role_target: Some(("assigned_role".into(), "agent".into())),
+                child_ready: true,
+                root_role_allowed: true,
+                reviewer_ready: true,
+                ..Default::default()
+            };
+            assert!(matches!(
+                next_step(&Snapshot {
+                    state,
+                    condition: &condition,
+                    workflow: &workflow,
+                    facts: &f
+                }),
+                Next::Step(Step::Role { .. })
+            ));
+            assert!(matches!(condition, TaskCondition::Clear { .. }));
+        }
+    }
+
+    #[test]
+    fn integration_waits_have_an_integration_owner_in_every_custom_state() {
+        let default = WorkflowEngine::resolve_workflow("{}");
+        let mut custom = default.clone();
+        for state in &mut custom.states {
+            if state.kind != StateKind::Terminal {
+                state.name = format!("custom_{}", state.name);
+            }
+        }
+        for workflow in [&default, &custom] {
+            for state in workflow
+                .states
+                .iter()
+                .filter(|state| state.kind != StateKind::Terminal)
+            {
+                for condition in crate::task_actions::tests::integration_conditions() {
+                    let f = Facts {
+                        integrate: true,
+                        queued_recovery: true,
+                        missing_merge_entry: true,
+                        role_target: Some(("coder".into(), "agent".into())),
+                        ..Default::default()
+                    };
+                    assert!(matches!(
+                        next_step(&Snapshot {
+                            state: &state.name,
+                            condition: &condition,
+                            workflow,
+                            facts: &f
+                        }),
+                        Next::Park(Park {
+                            owner: Owner::IntegrationWorker,
+                            recovery: Action::WaitForOwner,
+                            ..
+                        })
+                    ));
+                    let mut held = condition.clone();
+                    if let TaskCondition::Parked {
+                        primary,
+                        additional,
+                        ..
+                    } = &mut held
+                    {
+                        additional.insert(0, primary.clone());
+                        *primary = ParkReason::Held {
+                            actor: "user".into(),
+                        };
+                    }
+                    assert!(matches!(
+                        next_step(&Snapshot {
+                            state: &state.name,
+                            condition: &held,
+                            workflow,
+                            facts: &f
+                        }),
+                        Next::Park(Park {
+                            owner: Owner::User,
+                            recovery: Action::ReleaseHold,
+                            ..
+                        })
+                    ));
+                }
+            }
+        }
+    }
+
     #[test]
     fn missing_merge_owner_parks_without_replaying_custom_hooks() {
         let workflow = WorkflowEngine::resolve_workflow("{}");

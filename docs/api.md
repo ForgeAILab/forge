@@ -2998,8 +2998,42 @@ names. The first now agrees between list and detail; entry ownership and waits
 are explicit. A failed Review from before the Task's current state entry, or on
 a settled Task, is evidence, not a current exception; a reviewer run that is
 merely live does not clear it. Unsupported stored condition encodings
-project an unknown diagnosis while invariant repair rebuilds them. Legacy
+project an unknown diagnosis and remain quarantined; producers and invariant
+repair preserve their original stored encoding. Legacy
 metadata remains private and does not need to be parsed by public wait readers.
+
+Integration's condition foundation adds `ConditionReason::Integration`, serialized
+as `{ "kind": "integration", "reason": { ... } }`, and a distinct
+`resume: { "kind": "integration", "attempt_id": "opaque-id" }`. The top-level
+condition kinds are unchanged. `reason.kind` is one of:
+
+| Integration reason | Fields besides opaque `attempt_id` |
+|---|---|
+| `waiting` | `blocked_by` attempt IDs (including path-guard owners); no numeric position |
+| `owned` | typed `phase`: validating, rebasing, checking, awaiting_carry, awaiting_authorization, fast_forwarding, reconciling |
+| `repair` | optional `conflict_paths` (`null` means unknown), `repair_paths`, optional predecessor attempt ID |
+| `review_required` | `authority_reason` |
+| `candidate_check_failed` | `check`, `message` |
+| `deferred` | typed `cause`, optional `owner_id`, `message`, optional `retry_at` |
+| `applied` | awaiting identity-fenced consumption by the Task step |
+
+Integration path manifests retain the complete supplied set, bounded to 4,096
+paths and 64 KiB total (4,096 bytes per path), rather than the 16-entry
+presentation-array cap. Statement IDs and diagnostic text are bounded to 1,024
+bytes. Operational queue rank, revisions, leases, worker tokens and phase times
+are absent from the reason and material digest.
+
+Deferral causes are `infrastructure`, `owner_offline`, `target_dirty`,
+`budget_exhausted`, `owner_required`, and `unresolved_result`. Ordinary waits
+have `details.owner = integration_worker`, `recovery = wait_for_integration`,
+no diagnostic/interruption, and false blocked/failed/human/entry flags. Real
+owner-fixable causes (dirty target, exhausted budget, owner required) expose a
+blocked diagnostic and `repair_integration` guidance. Guidance does not authorize
+an action: stage A offers Hold/Cancel on integration waits, and preserves normal
+Release on an independent user hold. These variants are emitted only in tests
+until queue activation; there are no new routes, queue tables or worker yet.
+Private witnesses retain repair/review lineage through real running/entry states
+and settlement; those states keep their existing public shape.
 
 `items` contains `TaskListItemResponse` objects: identity, title/type/status,
 canonical phase, assignment and ordering fields, retry budgets, typed `condition`,

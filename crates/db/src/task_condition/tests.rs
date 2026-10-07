@@ -1008,9 +1008,9 @@ async fn stale_condition_version_source_and_lease_are_rejected() {
 }
 
 /// m1: a stored condition that no longer decodes must not fail a legitimate
-/// legacy write. The seam compares text and overwrites.
+/// legacy write. The seam leaves unsupported stored state quarantined.
 #[tokio::test]
-async fn undecodable_stored_condition_is_recomputed_not_fatal() {
+async fn undecodable_stored_condition_is_quarantined_not_fatal() {
     let db = db().await;
     let t = task(&db, "undecodable").await;
     sqlx::query("UPDATE task SET condition_json='{\"kind\":\"from_a_future_release\"}' WHERE id=?")
@@ -1033,7 +1033,7 @@ async fn undecodable_stored_condition_is_recomputed_not_fatal() {
         )
         .await
         .unwrap();
-        db.check_task_condition_invariant(&updated).await.unwrap();
+        assert!(db.check_task_condition_invariant(&updated).await.is_err());
         sqlx::query(
             "UPDATE task SET condition_json='{\"kind\":\"from_a_future_release\"}' WHERE id=?",
         )
@@ -1052,10 +1052,8 @@ async fn undecodable_stored_condition_is_recomputed_not_fatal() {
         .unwrap();
     })
     .await;
-    assert!(matches!(
-        db.task_condition(&t.id).await.unwrap(),
-        TaskCondition::Clear { .. }
-    ));
+    assert!(db.task_condition(&t.id).await.is_err());
+    assert_eq!(db.task_condition_violations().await.unwrap(), vec![t.id]);
 }
 
 #[tokio::test]

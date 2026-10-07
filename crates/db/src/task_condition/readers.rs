@@ -122,7 +122,7 @@ impl TaskCondition {
                         blocked_execution_id: None,
                         artifact: None,
                         message: Some(
-                            "Stored Task condition is unreadable; waiting for invariant repair"
+                            "Stored Task condition is unsupported and quarantined; upgrade the server or repair it explicitly"
                                 .into(),
                         ),
                         hook: None,
@@ -185,7 +185,17 @@ impl TaskCondition {
         let evidence = self.evidence();
         // A condition a writer stated carries no copy of the legacy records:
         // which record the interruption is comes from its typed presentation.
-        let stated = evidence.presentation.as_ref().filter(|_| evidence.stated);
+        let integration_primary = matches!(
+            self,
+            TaskCondition::Parked {
+                primary: ParkReason::Integration { .. },
+                ..
+            }
+        );
+        let stated = evidence
+            .presentation
+            .as_ref()
+            .filter(|_| evidence.stated || integration_primary);
         let failed = read.interruption.is_some()
             && (evidence.failed_json.is_some() || stated.is_some_and(|p| p.hard_failure));
         let blocked = (evidence.blocked_json.is_some()

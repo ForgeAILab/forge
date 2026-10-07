@@ -548,12 +548,12 @@ async fn update_task_inner(
         // A subtask's terminal states and both parents' child witnesses.
         crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Entry)
             .await?;
-        task.condition = crate::task_condition::decode(
+        task.condition = crate::task_condition::decode_or_unknown(
             &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
                 .bind(&task.id)
                 .fetch_one(&mut *transaction)
                 .await?,
-        )?;
+        );
         for parent in [&previous_parent, &task.parent_task_id]
             .into_iter()
             .flatten()
@@ -563,12 +563,12 @@ async fn update_task_inner(
     } else {
         crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
             .await?;
-        task.condition = crate::task_condition::decode(
+        task.condition = crate::task_condition::decode_or_unknown(
             &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
                 .bind(&task.id)
                 .fetch_one(&mut *transaction)
                 .await?,
-        )?;
+        );
     }
     if interruption_fields_changed(
         &previous_error_annotation,
@@ -807,12 +807,12 @@ async fn set_error_annotation_if_no_running_execution_inner(
     }
     crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
         .await?;
-    task.condition = crate::task_condition::decode(
+    task.condition = crate::task_condition::decode_or_unknown(
         &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
             .bind(&task.id)
             .fetch_one(&mut *transaction)
             .await?,
-    )?;
+    );
     if previous_error_annotation != task.error_annotation {
         append_task_interruption_event(db, &mut transaction, &task).await?;
     }
@@ -931,12 +931,12 @@ async fn update_recovery_metadata_inner(
             .await?
         }
     }
-    task.condition = crate::task_condition::decode(
+    task.condition = crate::task_condition::decode_or_unknown(
         &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
             .bind(&task.id)
             .fetch_one(&mut *transaction)
             .await?,
-    )?;
+    );
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,
@@ -1118,12 +1118,12 @@ impl TaskRepo for SqliteDb {
         let mut task = map_task(row)?;
         // A new row carries the column default: state every family once.
         crate::task_condition::produce(transaction, &task.id, crate::ConditionChange::Full).await?;
-        task.condition = crate::task_condition::decode(
+        task.condition = crate::task_condition::decode_or_unknown(
             &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
                 .bind(&task.id)
                 .fetch_one(&mut **transaction)
                 .await?,
-        )?;
+        );
         if let Some(parent) = &task.parent_task_id {
             crate::task_condition::produce_children(transaction, parent).await?;
         }
@@ -2240,12 +2240,12 @@ impl TaskRepo for SqliteDb {
             .ok_or(DbError::NotFound)?;
         crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
             .await?;
-        task.condition = crate::task_condition::decode(
+        task.condition = crate::task_condition::decode_or_unknown(
             &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
                 .bind(&task.id)
                 .fetch_one(&mut *transaction)
                 .await?,
-        )?;
+        );
         transaction.commit().await?;
         Ok(task)
     }
@@ -2312,12 +2312,12 @@ impl TaskRepo for SqliteDb {
         let mut task = map_task(row)?;
         crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
             .await?;
-        task.condition = crate::task_condition::decode(
+        task.condition = crate::task_condition::decode_or_unknown(
             &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
                 .bind(&task.id)
                 .fetch_one(&mut *transaction)
                 .await?,
-        )?;
+        );
         self.record_mutation_reply_in_tx(&mut transaction, &task)
             .await?;
 
@@ -2844,12 +2844,12 @@ async fn update_task_status_inner(
 
     crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Entry)
         .await?;
-    task.condition = crate::task_condition::decode(
+    task.condition = crate::task_condition::decode_or_unknown(
         &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
             .bind(&task.id)
             .fetch_one(&mut *transaction)
             .await?,
-    )?;
+    );
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,

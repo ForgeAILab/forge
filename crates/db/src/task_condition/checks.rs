@@ -280,6 +280,15 @@ impl SqliteDb {
         let mut stale = Vec::new();
         for row in &rows {
             let id: String = row.try_get(6)?;
+            let stored: Vec<u8> = row.try_get(5)?;
+            if std::str::from_utf8(&stored)
+                .ok()
+                .and_then(|raw| decode(raw).ok())
+                .is_none()
+            {
+                tracing::warn!(task_id = %id, "stored Task condition quarantined; invariant repair skipped");
+                continue;
+            }
             let expected = async {
                 let input = LegacyConditionInput::from_row(row)?;
                 let facts = ConditionFacts::load(&mut reader, &id).await?;

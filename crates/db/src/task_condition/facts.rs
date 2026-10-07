@@ -9,8 +9,13 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConditionWitness {
+    Integration {
+        reason: IntegrationReason,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        handoff_ready: bool,
+    },
     /// Always first. `since` is the entry's time, or the Task's creation.
     Entry {
         task_id: String,
@@ -236,6 +241,8 @@ impl Terminals {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConditionFacts {
+    pub integration: Option<IntegrationReason>,
+    pub integration_handoff_ready: bool,
     pub human_wait: bool,
     pub review_wait: bool,
     pub review_failure: bool,
@@ -282,6 +289,14 @@ impl TaskCondition {
             | Self::Parked { evidence, .. }
             | Self::Failed { evidence, .. }
             | Self::Settled { evidence, .. } => evidence,
+        }
+    }
+    /// Refresh a stale legacy projection while carrying supported typed owners.
+    /// Used by the scheduler's read snapshot before the repair sweep writes it.
+    pub fn restate_legacy(&self, input: &LegacyConditionInput) -> Self {
+        match ConditionFacts::recover(self) {
+            Some(facts) => facts.condition(input),
+            None => map_legacy_condition(input),
         }
     }
     pub fn reasons(&self) -> impl Iterator<Item = &ParkReason> {
@@ -541,7 +556,18 @@ impl ConditionFacts {
         Self::load_all(c, &snapshot).await
     }
     pub(super) async fn load_all(c: &mut SqliteConnection, snapshot: &Snapshot) -> Result<Self> {
-        let mut facts = Self::default();
+        let stored = std::str::from_utf8(&snapshot.stored)
+            .ok()
+            .and_then(|raw| decode(raw).ok());
+        let mut facts = Self {
+            integration: stored
+                .as_ref()
+                .and_then(|stored| stored.integration_reason().cloned()),
+            integration_handoff_ready: stored
+                .as_ref()
+                .is_some_and(TaskCondition::integration_handoff_ready),
+            ..Self::default()
+        };
         snapshot.refresh(c, &mut facts).await?;
         facts.load_budgets(c).await?;
         facts.load_operations(c).await?;
@@ -657,6 +683,15 @@ impl ConditionFacts {
         };
         for witness in witnesses {
             match witness {
+                ConditionWitness::Integration {
+                    reason,
+                    handoff_ready,
+                } => {
+                    facts.integration_handoff_ready = *handoff_ready;
+                    if facts.integration.replace(reason.clone()).is_some() {
+                        return None;
+                    }
+                }
                 ConditionWitness::Entry { .. } => return None,
                 ConditionWitness::Step { step_id, .. } => facts.hooks = Some(step_id.clone()),
                 ConditionWitness::Execution { execution_id, role } => {
@@ -693,6 +728,12 @@ impl ConditionFacts {
             review_wait: self.review_wait,
             review_failure: self.review_failure,
         }];
+        if let Some(reason) = &self.integration {
+            witnesses.push(ConditionWitness::Integration {
+                reason: reason.clone(),
+                handoff_ready: self.integration_handoff_ready,
+            });
+        }
         if let Some(step) = &self.hooks {
             witnesses.push(ConditionWitness::Step {
                 step_id: step.clone(),
@@ -741,10 +782,14 @@ impl ConditionFacts {
     /// Combine the legacy mapping with these facts. Legacy is authoritative:
     /// a condition parks exactly where today's readers hold the Task.
     pub fn apply(&self, condition: TaskCondition) -> TaskCondition {
-        self.apply_lifecycle(super::readers::apply_owner_park(
-            condition,
+        let condition = self.apply_lifecycle(super::readers::apply_owner_park(
+            integration::without_reason(condition),
             self.owner_park.as_ref(),
-        ))
+        ));
+        match &self.integration {
+            Some(reason) => integration::overlay(condition, reason, self.integration_handoff_ready),
+            None => condition,
+        }
     }
     fn apply_lifecycle(&self, mut condition: TaskCondition) -> TaskCondition {
         let exhausted = condition.budget_exhausted();

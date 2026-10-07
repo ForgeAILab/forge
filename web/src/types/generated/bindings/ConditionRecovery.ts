@@ -3,4 +3,4 @@
 /**
  * Recovery guidance for an owner park, separate from authorized Task offers.
  */
-export type ConditionRecovery = "edit_workflow" | "reconcile_entry";
+export type ConditionRecovery = "wait_for_integration" | "repair_integration" | "edit_workflow" | "reconcile_entry";

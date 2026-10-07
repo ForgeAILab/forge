@@ -4730,6 +4730,164 @@ mod tests {
     /// interruption and intervention flag are replaced by the condition's
     /// material blocker. Stage 4 hashes through this digest, not the struct.
     #[tokio::test]
+    async fn integration_progress_is_quiet_and_owner_blockers_have_stable_incidents() {
+        let service = health_service().await;
+        let db = &service.db;
+        let now = now_rfc3339();
+        db::ProjectRepo::create(
+            &**db,
+            db::CreateProject {
+                id: "integration".into(),
+                owner_id: None,
+                name: "Integration".into(),
+                primary_repo_id: None,
+                updated_at: now.clone(),
+                settings: "{}".into(),
+                workflow_definition: "{}".into(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut task = db::TaskRepo::create(
+            &**db,
+            db::CreateTask {
+                id: "integration-task".into(),
+                project_id: "integration".into(),
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Integration".into(),
+                description: None,
+                task_type: "task".into(),
+                status: "merging".into(),
+                is_automation: false,
+                priority: 0,
+                task_state_config: None,
+                merge_config: None,
+                subtask_order: None,
+                plan: None,
+                updated_at: now.clone(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        service.project_once(100).await.unwrap();
+        let baseline: i64 = sqlx::query_scalar("SELECT count(*) FROM attention_projection")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        for condition in crate::task_actions::tests::integration_conditions()
+            .into_iter()
+            .filter(|c| !db::material_blocker(c).requires_intervention)
+        {
+            task.condition = condition;
+            task.version += 1;
+            // interruption_changed is deduped by Task version. Model each
+            // synthetic consumer commit with its own version, as real writers do.
+            sqlx::query("UPDATE task SET condition_json=?,version=? WHERE id=?")
+                .bind(serde_json::to_string(&task.condition).unwrap())
+                .bind(task.version)
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let event = CreateDomainEvent::task_interruption_changed(&task);
+            db::DomainEventRepo::append_event(&**db, event)
+                .await
+                .unwrap();
+            service.project_once(100).await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM attention_projection")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap(),
+                baseline
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM domain_event WHERE event_type='attention.wake_requested'"
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+                0
+            );
+        }
+        task.condition = crate::task_actions::tests::integration_conditions()
+            .pop()
+            .unwrap();
+        sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+            .bind(serde_json::to_string(&task.condition).unwrap())
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let material = db::material_blocker(&task.condition);
+        assert!(material.requires_intervention);
+        let mut digests = Vec::new();
+        for (attempt, retry_at, message) in [
+            ("attempt", None, "target dirty"),
+            ("replacement", Some("2099-01-01T00:00:00Z"), "target dirty"),
+            (
+                "replacement",
+                Some("2099-01-02T00:00:00Z"),
+                "different owner failure",
+            ),
+            ("replacement", None, "different owner failure"),
+        ] {
+            let condition = db::ConditionFacts {
+                task_id: task.id.clone(),
+                state: task.status.clone(),
+                integration: Some(api_types::IntegrationReason::Deferred {
+                    attempt_id: api_types::IntegrationAttemptId::new(attempt),
+                    cause: api_types::IntegrationDeferralCause::TargetDirty,
+                    owner_id: Some("owner".into()),
+                    message: message.into(),
+                    retry_at: retry_at.map(str::to_owned),
+                }),
+                ..Default::default()
+            }
+            .condition(&db::LegacyConditionInput::default());
+            task.condition = condition;
+            task.version += 1;
+            sqlx::query("UPDATE task SET condition_json=?,version=? WHERE id=?")
+                .bind(serde_json::to_string(&task.condition).unwrap())
+                .bind(task.version)
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db::DomainEventRepo::append_event(
+                &**db,
+                CreateDomainEvent::task_interruption_changed(&task),
+            )
+            .await
+            .unwrap();
+            service.project_once(100).await.unwrap();
+            let raw: String = sqlx::query_scalar("SELECT id FROM attention_projection WHERE json_extract(details_json,'$.entity_id')=? ORDER BY updated_at DESC LIMIT 1").bind(&task.id).fetch_one(db.pool()).await.unwrap();
+            let attention = db::AttentionRepo::get_attention(&**db, &raw)
+                .await
+                .unwrap()
+                .unwrap();
+            digests.push(db::canonical_attention_incident_digest(&attention));
+        }
+        assert_eq!(
+            digests[0], digests[1],
+            "attempt and retry time are not material"
+        );
+        assert_ne!(
+            digests[1], digests[2],
+            "a changed owner failure changes the digest once"
+        );
+        assert_eq!(
+            digests[2], digests[3],
+            "unchanged failure stays the same incident"
+        );
+    }
+
+    #[tokio::test]
     async fn material_blocker_keeps_the_real_incident_digest() {
         let service = health_service().await;
         let db = &service.db;
