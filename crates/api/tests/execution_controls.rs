@@ -344,6 +344,7 @@ async fn mixed_running_roles_keep_interactive_health_and_disable_duplicate_inter
     .await
     .expect("reviewer execution creates");
 
+    let review_failed_at = db::now_rfc3339();
     ReviewRepo::create(
         &*harness.state.db,
         CreateReview {
@@ -353,9 +354,11 @@ async fn mixed_running_roles_keep_interactive_health_and_disable_duplicate_inter
             attempt_number: 1,
             status: ReviewStatus::Failed,
             step_results_json: "{}".to_owned(),
-            started_at: "2026-04-30T13:00:00+00:00".to_owned(),
-            created_at: "2026-04-30T13:00:00+00:00".to_owned(),
-            updated_at: "2026-04-30T13:00:00+00:00".to_owned(),
+            // The Review failed during the Task's current stay in `review`:
+            // one that predates the entry is history, not its exception.
+            started_at: review_failed_at.clone(),
+            created_at: review_failed_at.clone(),
+            updated_at: review_failed_at,
         },
     )
     .await

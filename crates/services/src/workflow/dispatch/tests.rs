@@ -361,6 +361,7 @@ fn coder_prompt_merge_failed_follow_up_contains_rereview_directive() {
     ctx.continuation_of_execution_id = Some("parent-exec".to_string());
     ctx.task.review_passed_at = Some("2026-04-17T10:00:00Z".to_string());
     ctx.task.error_annotation = Some(json!({"type": "merge_conflict"}).to_string());
+    ctx.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&ctx.task));
 
     let prompt = resolve_prompt_builder(BUILDER_ID_CODER_MERGE_FIX_V2).build(&ctx);
 
@@ -400,6 +401,7 @@ fn merge_fix_prompts_hand_a_committed_conflict_to_the_worker() {
         let mut ctx = fake_context(role);
         ctx.state_name = default_states::MERGE_FAILED.to_string();
         ctx.task.error_annotation = Some(json!({"type": "merge_conflict"}).to_string());
+        ctx.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&ctx.task));
         ctx.transition_log = vec![handoff.clone()];
 
         let prompt = resolve_prompt_builder(builder_id).build(&ctx);
@@ -450,6 +452,7 @@ fn coder_prompt_dirty_worktree_does_not_rebase_or_discard_changes() {
         })
         .to_string(),
     );
+    ctx.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&ctx.task));
 
     let prompt = resolve_prompt_builder(BUILDER_ID_CODER_MERGE_FIX_V2).build(&ctx);
 

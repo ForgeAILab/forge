@@ -6001,6 +6001,12 @@ pub(crate) mod tests {
         let db::ExecutionLeaseMutation::Updated(execution) = mutation else {
             panic!("lease fixture claims");
         };
+        // The Task as stored now: its condition witnesses the running
+        // execution seeded above.
+        let task = TaskRepo::get_by_id(db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
         (task, placement, execution)
     }
 

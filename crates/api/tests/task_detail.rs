@@ -130,6 +130,12 @@ async fn task_detail_bootstrap_matches_task_and_execution_page_semantics() {
         .execute(harness.state.db.pool())
         .await
         .expect("task is marked as waiting for a person");
+    harness
+        .state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&task.id))
+        .await
+        .expect("the stored condition follows the raw write");
 
     let older =
         create_completed_execution(&harness.state.db, &task.id, "2026-09-21T00:00:00Z").await;
