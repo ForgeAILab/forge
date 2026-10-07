@@ -78,6 +78,9 @@ async fn scenario_task(
             .execute(db.pool())
             .await
             .unwrap();
+        db.check_task_conditions_of(std::slice::from_ref(&task.id))
+            .await
+            .unwrap();
     }
     TaskRepo::get_by_id(db, &task.id, false)
         .await
@@ -267,6 +270,7 @@ async fn condition_queue_scenarios() {
         sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
             .bind(json!({"type":"executor_failed","blocking_reason":"executor_failed","blocked_execution_id":execution.id}).to_string())
             .bind(&task.id).execute(db.pool()).await.unwrap();
+db.check_task_conditions_of(std::slice::from_ref(&task.id)).await.unwrap();
         let task = reload(&db, &task.id).await;
         let before = service
             .task_action_offers(&task.id, &Actor::user(UserActionSource::Test))
@@ -467,6 +471,7 @@ async fn condition_queue_scenarios() {
             .bind(json!({"kind":"executor_failed","reason":"hard failure","created_at":now_rfc3339()}).to_string())
             .bind(json!({"kind":"executor_failed","reason":"blocked too","created_at":now_rfc3339()}).to_string())
             .bind(&task.id).execute(db.pool()).await.unwrap();
+db.check_task_conditions_of(std::slice::from_ref(&task.id)).await.unwrap();
         let task = reload(&db, &task.id).await;
         let mut events = bus.subscribe();
         let command = service
@@ -506,6 +511,7 @@ async fn condition_queue_scenarios() {
         sqlx::query("UPDATE task SET failed_json = ? WHERE id = ?")
             .bind(json!({"kind":"executor_failed","reason":"hard failure","created_at":now_rfc3339()}).to_string())
             .bind(&task.id).execute(db.pool()).await.unwrap();
+db.check_task_conditions_of(std::slice::from_ref(&task.id)).await.unwrap();
         sqlx::query("UPDATE project SET paused_at = ? WHERE id = ?")
             .bind(now_rfc3339())
             .bind(&paused_project)
@@ -719,6 +725,9 @@ async fn condition_queue_scenarios() {
                 "request":{"offer":{},"action":{"verb":"retry"}}, "error_annotation":executor_failed().to_string(),"blocked_json":null,
                 "failed_json":saved_failure}}).to_string())
             .bind(&task.id).execute(db.pool()).await.unwrap();
+        db.check_task_conditions_of(std::slice::from_ref(&task.id))
+            .await
+            .unwrap();
         let current = reload(&db, &task.id).await;
         let _ = service.dispatch_queued_recovery(&current).await;
         let after = reload(&db, &task.id).await;
@@ -970,6 +979,9 @@ async fn condition_stored_data_scenarios() {
         sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
             .bind(json!({"queued_recovery":payload,"deferred_dispatch":{"not_before":"2026-09-30T00:00:00Z","reason":"recovery queued: waiting for execution capacity or workspace owner","target_state":state}}).to_string())
             .bind(&task.id).execute(db.pool()).await.unwrap();
+        db.check_task_conditions_of(std::slice::from_ref(&task.id))
+            .await
+            .unwrap();
         let offers_before = offers_text(&service, &task.id).await;
         let mut rounds = Vec::new();
         for _ in 0..3 {
@@ -1028,6 +1040,9 @@ async fn condition_stored_data_scenarios() {
                     .bind(annotation.to_string())
                     .bind(&task.id)
                     .execute(db2.pool())
+                    .await
+                    .unwrap();
+                db2.check_task_conditions_of(std::slice::from_ref(&task.id))
                     .await
                     .unwrap();
             }

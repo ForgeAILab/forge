@@ -25,11 +25,12 @@ Task lifecycle, API response, or execution-log schema changes are required.
   semantic-progress callback is now bounded to at most once per second during
   text/reasoning streams. Tool-call boundaries and explicit progress requests
   force an immediate update.
-- Operations recognizes `blocked_json` independently of workflow phase.
+- Operations recognizes a blocked Task from its condition, independently of
+  workflow phase.
   Deleted, archived, `done`, and `cancelled` tasks are excluded from this
-  blocker list. The existing display priority is preserved: `error_annotation`
-  takes precedence, with the structured blocker reason used only when it is
-  absent. The query never changes a Task's phase.
+  blocker list. The existing display priority is preserved: the stored
+  annotation takes precedence, with the structured blocker reason used only
+  when it is absent. The query never changes a Task's phase.
 - The unused queued-task scan is removed from Operations status computation.
 
 The cache is a rebuildable display optimization. It is not used to authorize

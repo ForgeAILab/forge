@@ -122,7 +122,7 @@ async fn auditor_failure_exhausts_review_retry_budget_and_blocks_task() {
             StatusCode::OK,
         )
         .await;
-        if t.blocked.is_some() {
+        if t.condition.details().interruption.is_some() {
             break t;
         }
     };
@@ -149,7 +149,9 @@ async fn auditor_failure_exhausts_review_retry_budget_and_blocks_task() {
         "no coder follow-up should dispatch after the review budget is exhausted"
     );
     let blocked = task
-        .blocked
+        .condition
+        .details()
+        .interruption
         .as_ref()
         .expect("task should have blocked metadata");
     assert!(
@@ -271,7 +273,7 @@ async fn three_auditor_failures_exhaust_review_budget_three_and_block_task() {
             StatusCode::OK,
         )
         .await;
-        if t.blocked.is_some() {
+        if t.condition.details().interruption.is_some() {
             break t;
         }
     };
@@ -295,7 +297,9 @@ async fn three_auditor_failures_exhaust_review_budget_three_and_block_task() {
         "budget = 3: two review rejections each produce a coder follow-up with parent_execution_id set for session continuity"
     );
     let blocked = task
-        .blocked
+        .condition
+        .details()
+        .interruption
         .as_ref()
         .expect("task should have blocked metadata");
     assert!(

@@ -5,6 +5,7 @@ use db::{Project, TaskRepo};
 
 use crate::{workflow::engine::WorkflowEngine, Result, ServiceError};
 
+#[cfg(test)]
 use super::helpers;
 
 fn slot_states(workflow: &WorkflowDefinition) -> String {
@@ -36,14 +37,8 @@ pub async fn load_project_slots(db: &db::SqliteDb, project: &Project) -> Result<
         &project.workflow_definition,
     ));
     let subtask_states = slot_states(&WorkflowEngine::resolve_subtask_workflow());
-    let (active, parked, queued) = TaskRepo::count_project_slots(
-        db,
-        &project.id,
-        &project_states,
-        &subtask_states,
-        &serde_json::json!(helpers::BLOCKING_ANNOTATION_KINDS).to_string(),
-    )
-    .await?;
+    let (active, parked, queued) =
+        TaskRepo::count_project_slots(db, &project.id, &project_states, &subtask_states).await?;
     slots.active = u32::try_from(active).unwrap_or(u32::MAX);
     slots.parked = u32::try_from(parked).unwrap_or(u32::MAX);
     slots.queued = u32::try_from(queued).unwrap_or(u32::MAX);
@@ -98,7 +93,6 @@ pub async fn load_projects_slots(
         db,
         &serde_json::Value::Object(states).to_string(),
         &slot_states(&WorkflowEngine::resolve_subtask_workflow()),
-        &serde_json::json!(helpers::BLOCKING_ANNOTATION_KINDS).to_string(),
     )
     .await?
     {
@@ -117,6 +111,38 @@ pub async fn load_projects_slots(
 
 #[cfg(test)]
 mod tests {
+    async fn sync_fixture(db: &db::SqliteDb, project: &db::Project) {
+        if serde_json::from_str::<api_types::ProjectSettings>(&project.settings)
+            .unwrap()
+            .max_active_tasks
+            == 0
+        {
+            return;
+        }
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM task WHERE project_id=?")
+            .bind(&project.id)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        db.check_task_conditions_of(&ids).await.unwrap();
+    }
+    async fn load_project_slots(
+        db: &db::SqliteDb,
+        project: &db::Project,
+    ) -> crate::Result<api_types::ProjectSlots> {
+        sync_fixture(db, project).await;
+        super::load_project_slots(db, project).await
+    }
+    async fn load_projects_slots(
+        db: &db::SqliteDb,
+        projects: &[db::Project],
+    ) -> crate::Result<std::collections::HashMap<String, super::ProjectSlotsRead>> {
+        for project in projects {
+            sync_fixture(db, project).await;
+        }
+        super::load_projects_slots(db, projects).await
+    }
+
     use db::{CreateProject, CreateTask, ExecutionRepo, ProjectRepo, ReviewRepo, ReviewStatus};
 
     use super::*;
@@ -808,6 +834,7 @@ mod tests {
             assert_eq!(
                 db::legacy_annotation_blocks(annotation.as_deref()),
                 helpers::has_blocking_annotation(&db::Task {
+                    condition: Default::default(),
                     error_annotation: annotation.clone(),
                     ..template.clone()
                 }),
@@ -842,6 +869,7 @@ mod tests {
             sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.environment_wait',json(?)) WHERE id=?")
                 .bind(serde_json::json!({"machine":{"owner_kind":"daemon","daemon_id":"offline","runtime_id":"one"},"checks":["cargo"]}).to_string())
                 .bind(&waiter.id).execute(db.pool()).await.unwrap();
+            sync_fixture(&db, &project).await;
             let after =
                 sqlx::query_scalar::<_, i64>("SELECT list_revision FROM project WHERE id=?")
                     .bind(&project.id)
@@ -873,6 +901,7 @@ mod tests {
             .unwrap();
         sqlx::query("UPDATE task SET metadata_json=json_remove(metadata_json,'$.environment_wait') WHERE id=?")
             .bind(&ids[0]).execute(db.pool()).await.unwrap();
+        sync_fixture(&db, &project).await;
         assert!(
             sqlx::query_scalar::<_, i64>("SELECT list_revision FROM project WHERE id=?")
                 .bind(&project.id)

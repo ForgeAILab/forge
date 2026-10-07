@@ -1,11 +1,12 @@
+#[cfg(test)]
+use api_types::TaskBlockingAnnotation;
 use std::{collections::HashMap, str::FromStr};
 
 use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse,
     ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, ReviewDetails,
-    ReviewResponse, StepResultEntry, StepResultResponse, TaskAnnotation, TaskBlockingAnnotation,
-    TaskResponse, TaskRoleAssignmentResponse, TaskType, UsageAggregate, WorkspacePlacementResponse,
-    WorkspaceResponse,
+    ReviewResponse, StepResultEntry, StepResultResponse, TaskResponse, TaskRoleAssignmentResponse,
+    TaskType, UsageAggregate, WorkspacePlacementResponse, WorkspaceResponse,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -426,7 +427,7 @@ async fn task_response_inner(
         canonical_phase,
         remaining_retries,
         retry_limits,
-        error_annotation,
+        condition,
         workflow_health,
         workflow_exception,
     } = task_projection::task_diagnostic_projection(
@@ -494,15 +495,7 @@ async fn task_response_inner(
         remaining_retries,
         retry_limits,
         available_actions: offers,
-        error_annotation,
-        blocked: task
-            .blocked_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        failed: task
-            .failed_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
+        condition,
         workflow_health,
         workflow_exception,
         execution_observability,
@@ -526,23 +519,20 @@ async fn task_response_inner(
 }
 
 fn task_list_blocking_execution_id(task: &Task) -> Option<String> {
-    let error_annotation = task
-        .error_annotation
-        .as_deref()
-        .and_then(|json| serde_json::from_str::<TaskAnnotation>(json).ok());
-    let blocked_metadata = blocked_metadata_annotation(task);
-    let error_blocking = match error_annotation.as_ref() {
-        Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
-        _ => None,
-    };
-    blocking_annotation_for_projection(task, blocked_metadata.as_ref(), error_blocking)
-        .and_then(|annotation| annotation.blocked_execution_id.clone())
+    let read = task.condition.read();
+    if read.hard_failure {
+        return None;
+    }
+    read.diagnostic
+        .and_then(|a| a.blocked_execution_id)
+        .or_else(|| read.interruption.and_then(|i| i.execution_id))
 }
 
 /// Resolve the blocker authority shared by the Task response projections.
 /// RecoveryService and `derive_workflow_exception` both treat a non-empty
 /// typed annotation as authoritative; blocked metadata is only a legacy
 /// fallback when that annotation is absent or empty.
+#[cfg(test)]
 fn blocking_annotation_for_projection<'a>(
     task: &Task,
     blocked_metadata: Option<&'a TaskBlockingAnnotation>,
@@ -611,6 +601,7 @@ mod retry_projection_tests {
         ] {
             let mut task = test_task();
             task.blocked_json = Some(serde_json::json!({"reason":"owner unavailable", "created_at":"2026-10-01T00:00:00Z", "kind":kind, "execution_id":null}).to_string());
+            task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
             let response = super::task_response_inner(
                 &db,
                 &service.workspace_backend_router(),
@@ -624,7 +615,10 @@ mod retry_projection_tests {
             .await
             .unwrap();
             let blocked = response
-                .blocked
+                .condition
+                .details()
+                .interruption
+                .clone()
                 .expect("public blocked field must survive projection");
             assert_eq!(blocked.kind, Some(kind));
             assert_eq!(blocked.reason, "owner unavailable");
@@ -743,6 +737,7 @@ mod retry_projection_tests {
 
     fn test_task() -> db::Task {
         db::Task {
+            condition: Default::default(),
             id: "task".to_owned(),
             project_id: "project".to_owned(),
             parent_task_id: None,
@@ -800,6 +795,7 @@ mod retry_projection_tests {
     }
 }
 
+#[cfg(test)]
 fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
     let metadata: Value = serde_json::from_str(task.blocked_json.as_deref()?).ok()?;
     let kind = metadata

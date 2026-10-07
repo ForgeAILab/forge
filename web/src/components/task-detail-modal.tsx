@@ -1,3 +1,4 @@
+import type { Task } from '@/types/generated'
 import { useEffect, useMemo, useState, type KeyboardEvent } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { toast } from 'sonner'
@@ -49,10 +50,10 @@ function getLatestReview(reviews: Review[]): Review | undefined {
 }
 
 function getErrorInfo(
-  task: { error_annotation?: unknown } | undefined,
+  task: Task | undefined,
 ): { tone: 'timeout' | 'crash' | 'workspace'; message: string } | undefined {
   if (!task) return undefined
-  const annotation = task.error_annotation as
+  const annotation = task.condition.details.diagnostic as
     | { blocking_reason?: unknown; kind?: unknown; type?: unknown; message?: unknown }
     | undefined
   if (!annotation) return undefined
@@ -312,7 +313,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                     <ModalWorkspaceErrorBanner
                       taskId={taskId}
                       errorInfo={errorInfo}
-                      needsReset={task.error_annotation?.type === 'workspace_reset_required'}
+                      needsReset={task.condition.details.diagnostic?.type === 'workspace_reset_required'}
                     />
                   ) : (
                     <div

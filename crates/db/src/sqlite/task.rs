@@ -548,6 +548,12 @@ async fn update_task_inner(
         // A subtask's terminal states and both parents' child witnesses.
         crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Entry)
             .await?;
+        task.condition = crate::task_condition::decode(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        )?;
         for parent in [&previous_parent, &task.parent_task_id]
             .into_iter()
             .flatten()
@@ -557,6 +563,12 @@ async fn update_task_inner(
     } else {
         crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
             .await?;
+        task.condition = crate::task_condition::decode(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        )?;
     }
     if interruption_fields_changed(
         &previous_error_annotation,
@@ -795,6 +807,12 @@ async fn set_error_annotation_if_no_running_execution_inner(
     }
     crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
         .await?;
+    task.condition = crate::task_condition::decode(
+        &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(&mut *transaction)
+            .await?,
+    )?;
     if previous_error_annotation != task.error_annotation {
         append_task_interruption_event(db, &mut transaction, &task).await?;
     }
@@ -899,6 +917,12 @@ async fn update_recovery_metadata_inner(
     }
     crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
         .await?;
+    task.condition = crate::task_condition::decode(
+        &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(&mut *transaction)
+            .await?,
+    )?;
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,
@@ -921,7 +945,6 @@ impl TaskRepo for SqliteDb {
         project_id: &str,
         project_states_json: &str,
         subtask_states_json: &str,
-        blocking_kinds_json: &str,
     ) -> Result<(i64, i64, i64)> {
         // Every term is 0 or 1, so each CASE equals the boolean it wraps. The
         // CASE is for evaluation order: SQLite stops a CASE condition at the
@@ -940,18 +963,13 @@ impl TaskRepo for SqliteDb {
                        COALESCE(s.kind, p.kind) AS kind,
                        COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
                        CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
-                       (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
-                        OR CASE WHEN json_valid(t.metadata_json) THEN
-                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
-                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
-                           ELSE 0 END
-                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
-                        OR CASE WHEN json_valid(t.error_annotation) THEN
-                            COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
-                           ELSE 0 END
-                        OR COALESCE((SELECT r.status = 'awaiting_human' FROM review r
-                                     WHERE r.task_id = t.id
-                                     ORDER BY r.attempt_number DESC, r.created_at DESC, r.id DESC LIMIT 1), 0))
+                       (json_extract(t.condition_json,'$.evidence.presentation.interruption_present') = 1
+                        OR json_extract(t.condition_json,'$.evidence.presentation.hard_failure') = 1
+                        OR (json_extract(t.condition_json,'$.evidence.presentation.refusal.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running'))
+                        OR json_extract(t.condition_json,'$.evidence.presentation.environment_recorded')=1
+                        OR COALESCE(json_extract(t.condition_json,'$.evidence.presentation.slot_blocker'),0)
+                        OR COALESCE(json_extract(t.condition_json,'$.evidence.presentation.review_wait'),0))
                        THEN 1 ELSE 0 END AS parked
                 FROM task t
                 LEFT JOIN subtask_states s ON t.parent_task_id IS NOT NULL AND s.name = t.status
@@ -971,7 +989,7 @@ impl TaskRepo for SqliteDb {
                COALESCE(SUM(kind = 'initial'), 0)
              FROM visible",
         )
-        .bind(project_states_json).bind(subtask_states_json).bind(blocking_kinds_json).bind(project_id)
+        .bind(project_states_json).bind(subtask_states_json).bind(project_id)
         .fetch_one(self.pool()).await?)
     }
 
@@ -979,7 +997,6 @@ impl TaskRepo for SqliteDb {
         &self,
         project_states_json: &str,
         subtask_states_json: &str,
-        blocking_kinds_json: &str,
     ) -> Result<Vec<ProjectSlotCounts>> {
         let rows = sqlx::query(
             "WITH projects AS MATERIALIZED (
@@ -995,18 +1012,13 @@ impl TaskRepo for SqliteDb {
                        COALESCE(s.kind, p.kind) AS kind,
                        COALESCE(s.owns_work, p.owns_work, 0) AS owns_work,
                        CASE WHEN COALESCE(s.kind, p.kind) IN ('active', 'gate') AND
-                       (t.blocked_json IS NOT NULL OR t.failed_json IS NOT NULL
-                        OR CASE WHEN json_valid(t.metadata_json) THEN
-                            json_extract(t.metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')
-                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running')
-                           ELSE 0 END
-                        OR CASE WHEN json_valid(t.metadata_json) THEN json_type(t.metadata_json, '$.environment_wait') IS NOT NULL ELSE 0 END
-                        OR CASE WHEN json_valid(t.error_annotation) THEN
-                            COALESCE(json_extract(t.error_annotation, '$.type') IN (SELECT value FROM json_each(?)), 0)
-                           ELSE 0 END
-                        OR COALESCE((SELECT r.status = 'awaiting_human' FROM review r
-                                     WHERE r.task_id = t.id
-                                     ORDER BY r.attempt_number DESC, r.created_at DESC, r.id DESC LIMIT 1), 0))
+                       (json_extract(t.condition_json,'$.evidence.presentation.interruption_present') = 1
+                        OR json_extract(t.condition_json,'$.evidence.presentation.hard_failure') = 1
+                        OR (json_extract(t.condition_json,'$.evidence.presentation.refusal.capability') IN ('machine_capacity', 'project_capacity')
+                            AND NOT EXISTS (SELECT 1 FROM execution e WHERE e.task_id = t.id AND e.status = 'running'))
+                        OR json_extract(t.condition_json,'$.evidence.presentation.environment_recorded')=1
+                        OR COALESCE(json_extract(t.condition_json,'$.evidence.presentation.slot_blocker'),0)
+                        OR COALESCE(json_extract(t.condition_json,'$.evidence.presentation.review_wait'),0))
                        THEN 1 ELSE 0 END AS parked
                 FROM projects JOIN task t ON t.project_id = projects.id
                 LEFT JOIN subtask_states s ON t.parent_task_id IS NOT NULL AND s.name = t.status
@@ -1031,7 +1043,6 @@ impl TaskRepo for SqliteDb {
         )
         .bind(project_states_json)
         .bind(subtask_states_json)
-        .bind(blocking_kinds_json)
         .fetch_all(self.pool())
         .await?;
         rows.into_iter()
@@ -1090,9 +1101,15 @@ impl TaskRepo for SqliteDb {
             .bind(&input.id)
             .fetch_one(&mut **transaction)
             .await?;
-        let task = map_task(row)?;
+        let mut task = map_task(row)?;
         // A new row carries the column default: state every family once.
         crate::task_condition::produce(transaction, &task.id, crate::ConditionChange::Full).await?;
+        task.condition = crate::task_condition::decode(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut **transaction)
+                .await?,
+        )?;
         if let Some(parent) = &task.parent_task_id {
             crate::task_condition::produce_children(transaction, parent).await?;
         }
@@ -2199,12 +2216,18 @@ impl TaskRepo for SqliteDb {
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
-        let task = self
+        let mut task = self
             .get_task_in_tx(&mut transaction, id)
             .await?
             .ok_or(DbError::NotFound)?;
         crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
             .await?;
+        task.condition = crate::task_condition::decode(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        )?;
         transaction.commit().await?;
         Ok(task)
     }
@@ -2268,9 +2291,15 @@ impl TaskRepo for SqliteDb {
             .bind(id)
             .fetch_one(&mut *transaction)
             .await?;
-        let task = map_task(row)?;
+        let mut task = map_task(row)?;
         crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
             .await?;
+        task.condition = crate::task_condition::decode(
+            &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&task.id)
+                .fetch_one(&mut *transaction)
+                .await?,
+        )?;
         self.record_mutation_reply_in_tx(&mut transaction, &task)
             .await?;
 
@@ -2797,6 +2826,12 @@ async fn update_task_status_inner(
 
     crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Entry)
         .await?;
+    task.condition = crate::task_condition::decode(
+        &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(&mut *transaction)
+            .await?,
+    )?;
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,
@@ -2852,7 +2887,11 @@ async fn append_task_interruption_event(
     transaction: &mut Transaction<'_, Sqlite>,
     task: &Task,
 ) -> Result<()> {
-    let event = CreateDomainEvent::task_interruption_changed(task);
+    let current = db
+        .get_task_in_tx(transaction, &task.id)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let event = CreateDomainEvent::task_interruption_changed(&current);
     DomainEventRepo::append_event_in_tx(db, transaction, &event).await?;
     Ok(())
 }

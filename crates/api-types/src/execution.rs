@@ -4,11 +4,10 @@ use ts_rs::TS;
 
 use crate::{
     AgentStatus, CanonicalPhase, ExecutionBehavior, ExecutionBlockerProjection,
-    ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, InterruptionMetadata,
-    PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason, TaskAnnotation,
-    TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate, UsageBreakdown,
-    WorkflowDefinition, WorkflowExceptionSummary, WorkflowHealthSummary,
-    WorkspacePlacementResponse, WorkspaceResponse,
+    ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, PlanArtifactDetail,
+    PlanProgressSummary, ResumePolicy, StopReason, TaskRoleAssignmentResponse, TaskStatus,
+    TaskType, UsageAggregate, UsageBreakdown, WorkflowDefinition, WorkflowExceptionSummary,
+    WorkflowHealthSummary, WorkspacePlacementResponse, WorkspaceResponse,
 };
 
 /// Public owner state for a running execution.  This is deliberately
@@ -220,9 +219,7 @@ pub struct TaskResponse {
     pub retry_limits: std::collections::HashMap<String, i64>,
     #[serde(default)]
     pub available_actions: Vec<Offer>,
-    pub error_annotation: Option<TaskAnnotation>,
-    pub blocked: Option<InterruptionMetadata>,
-    pub failed: Option<InterruptionMetadata>,
+    pub condition: crate::TaskCondition,
     pub workflow_health: Option<WorkflowHealthSummary>,
     pub workflow_exception: Option<WorkflowExceptionSummary>,
     pub execution_observability: TaskExecutionObservability,
@@ -278,9 +275,7 @@ pub struct TaskListItemResponse {
     #[serde(default)]
     #[ts(type = "Record<string, number>")]
     pub retry_limits: std::collections::HashMap<String, i64>,
-    pub error_annotation: Option<TaskAnnotation>,
-    pub blocked: Option<InterruptionMetadata>,
-    pub failed: Option<InterruptionMetadata>,
+    pub condition: crate::TaskCondition,
     pub workflow_health: Option<WorkflowHealthSummary>,
     pub workflow_exception: Option<WorkflowExceptionSummary>,
     pub review_passed_at: Option<String>,
@@ -318,9 +313,7 @@ impl From<TaskResponse> for TaskListItemResponse {
             role_assignments: task.role_assignments,
             remaining_retries: task.remaining_retries,
             retry_limits: task.retry_limits,
-            error_annotation: task.error_annotation,
-            blocked: task.blocked,
-            failed: task.failed,
+            condition: task.condition,
             workflow_health: task.workflow_health,
             workflow_exception: task.workflow_exception,
             review_passed_at: task.review_passed_at,

@@ -67,6 +67,9 @@ pub enum TaskCondition {
 pub struct ConditionEvidence {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observations: Vec<ParkReason>,
+    /// Authoritative typed reader inputs, captured before evidence truncation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<ConditionRead>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witnesses: Vec<ConditionWitness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +94,8 @@ pub enum LegacyConditionField {
     MetadataJson,
     /// Durable exclusion receipt rather than a Task column.
     PendingRemoteCancel,
+    SchedulePark,
+    ConditionJson,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConditionSource {
@@ -235,6 +240,14 @@ pub enum TerminalOutcome {
     Cancelled,
 }
 
+impl Default for TaskCondition {
+    fn default() -> Self {
+        Self::Clear {
+            evidence: ConditionEvidence::default(),
+        }
+    }
+}
+
 impl TaskCondition {
     /// Whether the condition holds the Task out of dispatch. For a legacy-only
     /// mapping this agrees with what the dispatcher and readers block on.
@@ -264,7 +277,7 @@ pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
 /// Revision of the mapping and of the stored encoding. A database whose
 /// recorded revision differs is recomputed once in the background, off the
 /// startup path. Bump it with every change to either.
-pub const MAPPING_REVISION: i64 = 3;
+pub const MAPPING_REVISION: i64 = 4;
 /// Protected `system_setting` key recording the revision last backfilled.
 pub const MAPPING_REVISION_KEY: &str = "task_condition_mapping_revision";
 
@@ -375,7 +388,9 @@ impl LegacyConditionInput {
                 LegacyConditionField::FailedJson => &mut input.failed_json,
                 LegacyConditionField::EntryBarrierJson => &mut input.entry_barrier_json,
                 LegacyConditionField::MetadataJson => &mut input.metadata_json,
-                LegacyConditionField::PendingRemoteCancel => {
+                LegacyConditionField::PendingRemoteCancel
+                | LegacyConditionField::SchedulePark
+                | LegacyConditionField::ConditionJson => {
                     unreachable!("durable sources are not legacy columns")
                 }
             } = value;
@@ -1005,6 +1020,7 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
     let mut reasons = reasons.into_iter().map(|(_, _, reason)| reason);
 
     let evidence = ConditionEvidence {
+        presentation: Some(ConditionRead::import(view)),
         observations,
         witnesses: Vec::new(),
         material: legacy_material_blocker(
@@ -1123,8 +1139,25 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
     }
 }
 
-fn decode(raw: &str) -> Result<TaskCondition> {
+pub fn decode(raw: &str) -> Result<TaskCondition> {
     serde_json::from_str(raw).map_err(|e| DbError::Check(format!("invalid Task condition: {e}")))
+}
+/// The stored condition as every row reader sees it: a value that cannot be
+/// decoded is a typed unknown park, never a silent `Clear`.
+pub fn decode_or_unknown(raw: &str) -> TaskCondition {
+    decode(raw).unwrap_or_else(|_| TaskCondition::Parked {
+        primary: ParkReason::UnknownCondition {
+            source: ConditionSource {
+                field: LegacyConditionField::ConditionJson,
+                key: None,
+            },
+            problem: UnknownConditionProblem::UnknownKind,
+        },
+        additional: Vec::new(),
+        resume: ConditionContinuation::Reconcile,
+        since: None,
+        evidence: Default::default(),
+    })
 }
 fn encode(condition: &TaskCondition) -> String {
     serde_json::to_string(condition).expect("Task condition serializes")
@@ -1434,3 +1467,9 @@ pub(crate) fn metadata_changes_condition(mutations: &[crate::TaskMetadataMutatio
         }
     })
 }
+
+pub(crate) mod readers;
+pub use readers::{
+    ConditionRead, ConditionRefusal, ConditionRetry, PRESENTATION_TEXT_LIMIT,
+    PRESENTATION_TRUNCATION_MARKER,
+};

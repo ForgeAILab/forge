@@ -810,6 +810,9 @@ async fn producers_do_not_rederive_unrelated_families() {
                 transition_id: Some("carried".into()),
                 since: "carried".into(),
                 initial: false,
+                human_wait: false,
+                review_wait: false,
+                review_failure: false,
             }],
             ..Default::default()
         },
@@ -858,6 +861,9 @@ async fn producers_do_not_rederive_unrelated_families() {
                 transition_id: Some("carried".into()),
                 since: "carried".into(),
                 initial: false,
+                human_wait: false,
+                review_wait: false,
+                review_failure: false,
             }));
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
         db.finish_step_in_tx(&mut tx, &step, "done", None)
@@ -992,4 +998,109 @@ async fn stated_condition_follows_the_legacy_write_with_or_without_a_live_lease(
     })
     .await;
     no_violations(&db, "stated").await;
+}
+
+async fn stored_read(db: &SqliteDb, id: &str) -> ConditionRead {
+    TaskRepo::get_by_id(db, id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .condition
+        .read()
+}
+
+/// A role row written through the Task SQL seam restates the human boundary
+/// in the same transaction, for both statement shapes the services use: the
+/// coordination root's role prune and the archived Agent's role clear.
+#[tokio::test]
+async fn role_assignment_sql_writers_restate_the_human_boundary() {
+    let db = db().await;
+    for (name, sql) in [
+        (
+            "prune",
+            "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        ),
+        (
+            "clear",
+            "UPDATE task_role_assignment SET assignee_type=NULL,assignee_id=NULL WHERE task_id=? AND role_name=?",
+        ),
+    ] {
+        let t = task(&db, name).await;
+        let now = crate::now_rfc3339();
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        sqlx::query("UPDATE task SET status='planning' WHERE id=?")
+            .bind(&t.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES(?,?,'planner','user','owner',?,?)")
+            .bind(crate::new_uuid_v4()).bind(&t.id).bind(&now).bind(&now)
+            .execute(&mut *tx).await.unwrap();
+        db.sync_condition_in_tx(&mut tx, &t.id).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(stored_read(&db, &t.id).await.human_wait, "{name}");
+        let step = claim(&db, &t.id).await;
+        crate::task_writer::in_task_step(step.clone(), async {
+            let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+            let applied = crate::task_writer::TaskQuery::new(&db, &t.id, sql)
+                .bind(&t.id)
+                .bind("planner")
+                .identity_fenced()
+                .execute_in_tx(&mut tx)
+                .await
+                .unwrap();
+            assert!(
+                matches!(applied, crate::task_writer::TaskQueryResult::Applied(1)),
+                "{name}"
+            );
+            tx.commit().await.unwrap();
+        })
+        .await;
+        assert!(!stored_read(&db, &t.id).await.human_wait, "{name}");
+        no_violations(&db, name).await;
+    }
+}
+
+/// Discarding a Review attempt that never ran a command puts the earlier
+/// failed Review back in front, in the same transaction.
+#[tokio::test]
+async fn discarding_an_unstarted_review_restates_the_review_facts() {
+    use crate::{CreateReview, ReviewRepo, ReviewStatus};
+    let db = db().await;
+    let t = task(&db, "review").await;
+    let now = crate::now_rfc3339();
+    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET status='review' WHERE id=?")
+        .bind(&t.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('run',?,'coder','completed',?,?)")
+        .bind(&t.id).bind(&now).bind(&now).execute(&mut *tx).await.unwrap();
+    db.sync_condition_in_tx(&mut tx, &t.id).await.unwrap();
+    tx.commit().await.unwrap();
+    let review = |attempt_number, status| CreateReview {
+        id: crate::new_uuid_v4(),
+        task_id: t.id.clone(),
+        execution_id: "run".into(),
+        attempt_number,
+        status,
+        step_results_json: "{}".into(),
+        started_at: crate::now_rfc3339(),
+        created_at: crate::now_rfc3339(),
+        updated_at: crate::now_rfc3339(),
+    };
+    ReviewRepo::create(&db, review(1, ReviewStatus::Failed))
+        .await
+        .unwrap();
+    assert!(stored_read(&db, &t.id).await.review_failure);
+    let running = ReviewRepo::create(&db, review(2, ReviewStatus::Running))
+        .await
+        .unwrap();
+    assert!(!stored_read(&db, &t.id).await.review_failure);
+    assert!(db.discard_unstarted_review(&running.id).await.unwrap());
+    assert!(stored_read(&db, &t.id).await.review_failure);
+    no_violations(&db, "discard").await;
+    // Only a running attempt is discarded.
+    assert!(!db.discard_unstarted_review(&running.id).await.unwrap());
 }

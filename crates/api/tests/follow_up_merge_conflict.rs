@@ -116,9 +116,9 @@ async fn merge_conflict_is_handed_back_to_the_coder() {
     )
     .await;
     assert!(
-        task.blocked.is_none(),
+        task.condition.details().interruption.is_none(),
         "a conflict must not park for a human: {:?}",
-        task.blocked
+        task.condition.details().interruption
     );
     let file = std::fs::read_to_string(worktree_path.join("file.txt")).expect("file reads");
     assert!(

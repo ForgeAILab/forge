@@ -1578,6 +1578,7 @@ mod tests {
             environment_digest: None,
             environment_checks: Vec::new(),
             task: Task {
+                condition: Default::default(),
                 id: "task".to_owned(),
                 project_id: "project".to_owned(),
                 parent_task_id: None,

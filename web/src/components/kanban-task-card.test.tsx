@@ -44,9 +44,7 @@ function queuedTask(reason = 'project_at_capacity'): TaskListItem {
     subtask_order: null,
     remaining_retries: {},
   retry_limits: {},
-    error_annotation: null,
-    blocked: null,
-    failed: null,
+    condition: { kind: 'clear', details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false } },
     workflow_exception: null,
     review_passed_at: null,
     archived_at: null,
@@ -86,11 +84,7 @@ describe('Project capacity waits on task surfaces', () => {
           effective_coder: null,
           effective_coder_source: null,
           status: 'review',
-          failed: {
-            kind: 'review_needs_owner',
-            reason: 'Needs macOS measurements',
-            created_at: '2026-09-30T12:00:00Z',
-          },
+          condition: { kind: 'failed', failure: {kind: 'failure',failure_kind: 'review_needs_owner'},additional: [],resume: {kind: 'reconcile'},since: null,details: {failure_kind: 'review_needs_owner',diagnostic: null,human_wait: true,entry_wait: false,failed: true,blocked: false,interruption: {kind: 'review_needs_owner',reason: 'Needs macOS measurements',created_at: '2026-09-30T12:00:00Z'}} },
         }}
       />,
     )

@@ -110,6 +110,27 @@ struct Outcome {
 fn encode(park: &Park) -> String {
     serde_json::to_string(park).expect("park serializes")
 }
+/// Whether the recorded park is this park. A park migrated from its visible
+/// annotation carries that diagnostic beside the same reason, owner and
+/// recovery: it is the same park, and is left as recorded.
+pub(super) fn same_park(recorded: Option<&str>, park: &str) -> bool {
+    let Some(recorded) = recorded else {
+        return false;
+    };
+    if recorded == park {
+        return true;
+    }
+    if !recorded.contains("\"diagnostic\"") {
+        return false;
+    }
+    let Ok(mut recorded) = serde_json::from_str::<serde_json::Value>(recorded) else {
+        return false;
+    };
+    if let Some(fields) = recorded.as_object_mut() {
+        fields.remove("diagnostic");
+    }
+    serde_json::from_str::<serde_json::Value>(park).is_ok_and(|park| park == recorded)
+}
 fn waits(reason: Reason, owner: Owner, recovery: Action) -> Park {
     Park {
         reason,
@@ -484,7 +505,7 @@ impl TaskDispatcher {
                 Owner::User,
                 Action::ResumeProject,
             ));
-            if p.read.park_json.as_deref() != Some(&park) {
+            if !same_park(p.read.park_json.as_deref(), &park) {
                 self.db
                     .record_schedule_park(&p.read.task.id, p.read.epoch, &park)
                     .await?;
@@ -522,14 +543,25 @@ impl TaskDispatcher {
                 workflow: &p.workflow,
                 facts: &p.facts,
             });
-            // The visible half of an owner park follows the resolution: it
-            // is written for a Task nothing owns and removed the moment the
-            // Task resolves to anything else, before that step is applied.
-            let park = match &next {
-                Next::Park(park) => Some(park),
-                Next::Step(_) => None,
-            };
-            if self.sync_legacy_park(&p.read.task, park).await? {
+            // Ownerless diagnoses now live in the condition; never write a legacy annotation.
+            let visible = matches!(&next, Next::Park(park) if matches!(&park.reason, Reason::WorkflowInvalid{..}) || matches!(&park.reason, Reason::UnknownCondition{owner} if owner == next_step::PUBLICATION_OWNER || owner == next_step::ENTRY_HOOKS_OWNER));
+            let current_visible = p.read.condition.reasons().any(|r| {
+                matches!(
+                    r,
+                    db::ParkReason::WorkflowInvalid { .. }
+                        | db::ParkReason::UnknownCondition {
+                            source: db::ConditionSource {
+                                field: db::LegacyConditionField::SchedulePark,
+                                ..
+                            },
+                            ..
+                        }
+                )
+            });
+            if !visible
+                && current_visible
+                && self.db.clear_visible_schedule_park(&p.read.task.id).await?
+            {
                 if self.reread(p, project).await? {
                     continue;
                 }
@@ -688,7 +720,7 @@ impl TaskDispatcher {
             }
             if let Some(park) = &parked {
                 let encoded = encode(park);
-                if p.read.park_json.as_deref() != Some(&encoded) {
+                if !same_park(p.read.park_json.as_deref(), &encoded) {
                     self.db
                         .record_schedule_park(&p.read.task.id, p.read.epoch, &encoded)
                         .await?;
@@ -904,7 +936,7 @@ impl TaskDispatcher {
                 let stale = match &next {
                     Next::Step(_) => true,
                     Next::Park(park) => {
-                        p.read.park_json.as_deref() != Some(encode(park).as_str())
+                        !same_park(p.read.park_json.as_deref(), &encode(park))
                             && !p.read.queue_owned
                     }
                 };

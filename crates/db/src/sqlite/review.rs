@@ -272,6 +272,12 @@ async fn update_status_inner(
         .fetch_one(&mut *transaction)
         .await?;
     let updated_review = map_review(updated_row)?;
+    crate::task_condition::produce(
+        &mut transaction,
+        &review.task_id,
+        crate::ConditionChange::Human,
+    )
+    .await?;
     let updated_task = if task_authority.is_some() {
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&review.task_id)
@@ -511,6 +517,12 @@ async fn update_status_with_review_authority_inner(
         .fetch_one(&mut *transaction)
         .await?;
     let updated_review = map_review(updated_row)?;
+    crate::task_condition::produce(
+        &mut transaction,
+        &review.task_id,
+        crate::ConditionChange::Human,
+    )
+    .await?;
     let updated_task = if task_projection.is_some() {
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&review.task_id)
@@ -524,9 +536,29 @@ async fn update_status_with_review_authority_inner(
     Ok((updated_review, updated_task))
 }
 
+impl SqliteDb {
+    /// Remove a Review attempt that never ran a command, and restate the
+    /// Task's condition from the Review now in front, in one transaction.
+    pub async fn discard_unstarted_review(&self, review_id: &str) -> Result<bool> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let task_id: Option<String> = sqlx::query_scalar(
+            "DELETE FROM review WHERE id = ? AND status = 'running' RETURNING task_id",
+        )
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(task_id) = &task_id {
+            crate::task_condition::produce(&mut tx, task_id, crate::ConditionChange::Human).await?;
+        }
+        tx.commit().await?;
+        Ok(task_id.is_some())
+    }
+}
+
 #[async_trait]
 impl ReviewRepo for SqliteDb {
     async fn create(&self, input: CreateReview) -> Result<Review> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         sqlx::query("INSERT INTO review (id, task_id, execution_id, attempt_number, status, step_results_json, started_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.task_id)
@@ -537,8 +569,11 @@ impl ReviewRepo for SqliteDb {
             .bind(&input.started_at)
             .bind(&input.created_at)
             .bind(&input.updated_at)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        crate::task_condition::produce(&mut tx, &input.task_id, crate::ConditionChange::Human)
+            .await?;
+        tx.commit().await?;
         ReviewRepo::get_by_id(self, &input.id)
             .await?
             .ok_or(DbError::NotFound)
@@ -628,6 +663,12 @@ impl ReviewRepo for SqliteDb {
             .bind(&input.updated_at)
             .execute(&mut *transaction)
             .await?;
+        crate::task_condition::produce(
+            &mut transaction,
+            &input.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         transaction.commit().await?;
         ReviewRepo::get_by_id(self, &input.id)
             .await?
@@ -805,11 +846,12 @@ impl ReviewRepo for SqliteDb {
             .fetch_one(&mut **transaction)
             .await?;
         let review = map_review(review_row)?;
-        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
-            .bind(&input.task_id)
-            .fetch_one(&mut **transaction)
+        crate::task_condition::produce(transaction, &input.task_id, crate::ConditionChange::Human)
             .await?;
-        let task = map_task(task_row)?;
+        let task = self
+            .get_task_in_tx(transaction, &input.task_id)
+            .await?
+            .ok_or(DbError::NotFound)?;
         let outcome = (review, task);
         self.record_mutation_reply_in_tx(transaction, &outcome)
             .await?;
@@ -924,6 +966,12 @@ impl ReviewRepo for SqliteDb {
         let outcome = (persisted_review, persisted_execution);
         self.record_mutation_reply_in_tx(&mut transaction, &outcome)
             .await?;
+        crate::task_condition::produce(
+            &mut transaction,
+            &review.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(outcome)
     }

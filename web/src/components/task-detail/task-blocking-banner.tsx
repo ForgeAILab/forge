@@ -55,12 +55,12 @@ export function TaskBlockingBanner({ task }: { task: Task }) {
   const workflowWarning = getTaskWorkflowWarning(task)
   if (task.status === 'cancelled') return null
 
-  if (task.failed) {
-    return <InterruptionBanner title="Task Failed" metadata={task.failed} tone="failed" />
+  if (task.condition.details.failed && task.condition.details.interruption) {
+    return <InterruptionBanner title="Task Failed" metadata={task.condition.details.interruption} tone="failed" />
   }
 
-  if (task.blocked && !getBlockingAnnotation(task)) {
-    return <InterruptionBanner title="Task Blocked" metadata={task.blocked} tone="blocked" />
+  if (task.condition.details.blocked && task.condition.details.interruption && !getBlockingAnnotation(task)) {
+    return <InterruptionBanner title="Task Blocked" metadata={task.condition.details.interruption} tone="blocked" />
   }
 
   if (staleAnnotation) {

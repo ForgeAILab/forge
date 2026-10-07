@@ -638,10 +638,9 @@ pub async fn task_placement_diagnostics(
     task: &db::Task,
     placement: Option<&api_types::WorkspacePlacementResponse>,
 ) -> Result<Vec<api_types::TaskPlacementDiagnostic>> {
-    let metadata = db::TaskMetadata::parse(task.metadata_json.as_deref())
-        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    let condition = task.condition.read();
     let mut diagnostics = Vec::new();
-    if let Some(wait) = metadata.extra.get("environment_wait") {
+    if let Some(wait) = condition.environment.as_ref() {
         if let Ok(machine) = serde_json::from_value::<EnvironmentMachine>(wait["machine"].clone()) {
             diagnostics.push(api_types::TaskPlacementDiagnostic {
                 machine: Some(machine_identity(db, &machine).await?),
@@ -653,13 +652,13 @@ pub async fn task_placement_diagnostics(
             });
         }
     }
-    if !metadata.extra.contains_key("environment_wait")
-        && metadata.extra.get("deferred_dispatch").is_some_and(|d| {
-            d["kind"] == "environment_probe_pending"
-                || d["reason"]
-                    .as_str()
-                    .is_some_and(|r| r.starts_with("environment_probe_pending:"))
-        })
+    if !condition.environment_recorded
+        && (condition.retry_kind.as_deref() == Some("environment_probe_pending")
+            || condition
+                .retry_display
+                .as_ref()
+                .and_then(|r| r.reason.as_deref())
+                .is_some_and(|r| r.starts_with("environment_probe_pending:")))
     {
         diagnostics.push(api_types::TaskPlacementDiagnostic {
             machine: Some(machine_identity(db, &EnvironmentMachine::Server).await?),
@@ -667,7 +666,8 @@ pub async fn task_placement_diagnostics(
             failing_checks: vec![],
         });
     }
-    if crate::deferred_dispatch::current_dispatch_disposition(task)
+    if condition
+        .current_refusal(task.version)
         .is_some_and(|disposition| disposition.capability == "machine_capacity")
     {
         diagnostics.push(api_types::TaskPlacementDiagnostic {
@@ -722,6 +722,9 @@ mod tests {
             sqlx::query("UPDATE task SET metadata_json=? WHERE id='wait-task'")
                 .bind(metadata.to_string())
                 .execute(db.pool())
+                .await
+                .unwrap();
+            db.check_task_conditions_of(&["wait-task".into()])
                 .await
                 .unwrap();
             let task = db::TaskRepo::get_by_id(&db, "wait-task", false)

@@ -746,7 +746,7 @@ fn task_outcome(event: &DomainEvent, task: &Task, payload: &Value) -> Option<Tas
     }
     if state == "blocked"
         || state.ends_with("_failed")
-        || task.failed_json.is_some()
+        || task.condition.read().hard_failure
         || event.event_type == "task.blocked"
         || event.event_type == "task.failed"
     {
@@ -756,16 +756,7 @@ fn task_outcome(event: &DomainEvent, task: &Task, payload: &Value) -> Option<Tas
 }
 
 fn task_reason(task: &Task) -> Option<String> {
-    [task.failed_json.as_deref(), task.blocked_json.as_deref()]
-        .into_iter()
-        .flatten()
-        .find_map(|raw| {
-            serde_json::from_str::<Value>(raw).ok().and_then(|value| {
-                ["reason", "message", "blocking_reason"]
-                    .into_iter()
-                    .find_map(|key| value.get(key).and_then(Value::as_str).map(str::to_owned))
-            })
-        })
+    task.condition.read().interruption.map(|i| i.reason)
 }
 
 pub fn coordination_consumer_name() -> &'static str {

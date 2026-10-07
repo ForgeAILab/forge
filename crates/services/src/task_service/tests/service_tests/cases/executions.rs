@@ -2625,9 +2625,12 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
     .expect("blocking annotation commits an interruption event");
     let interruption: serde_json::Value =
         serde_json::from_str(&interruption_payload).expect("interruption event parses");
-    assert_eq!(interruption["requires_intervention"], true);
     assert_eq!(
-        interruption["interruption"]["recovery_actions"],
+        interruption["material_blocker"]["requires_intervention"],
+        true
+    );
+    assert_eq!(
+        interruption["material_blocker"]["interruption"]["recovery_actions"],
         annotation["recovery_actions"]
     );
     let log_path = annotation["hook"]["log_path"]

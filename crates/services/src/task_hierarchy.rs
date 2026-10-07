@@ -157,10 +157,10 @@ pub async fn effective_role_assignment(
 
 /// Return whether any root-blocking or recovery field is present.
 pub(crate) fn root_blocked(task: &Task) -> bool {
-    task.blocked_json.is_some()
-        || task.failed_json.is_some()
-        || task.error_annotation.is_some()
-        || task.entry_barrier_json.is_some()
+    task.condition.read().interruption_present
+        || task.condition.read().hard_failure
+        || task.condition.read().diagnostic_present
+        || task.condition.read().entry_recorded
 }
 
 /// Return whether a child is terminal in either inherited or Project workflow.
@@ -425,6 +425,7 @@ mod tests {
 
     fn task(id: &str, status: &str, parent_task_id: Option<&str>) -> Task {
         Task {
+            condition: Default::default(),
             id: id.to_owned(),
             project_id: "project".to_owned(),
             parent_task_id: parent_task_id.map(str::to_owned),
@@ -507,15 +508,22 @@ mod tests {
         assert!(!root_blocked(&root));
 
         root.blocked_json = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.blocked_json = None;
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         root.failed_json = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.failed_json = None;
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         root.error_annotation = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(root_blocked(&root));
         root.error_annotation = None;
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         root.entry_barrier_json = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(root_blocked(&root));
     }
 
@@ -581,6 +589,7 @@ mod tests {
         assert!(!coordination_root_allows_child_dispatch(&root, &workflow));
         root.status = default_states::IN_PROGRESS.to_owned();
         root.error_annotation = Some("{}".to_owned());
+        root.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&root));
         assert!(!coordination_root_allows_child_dispatch(&root, &workflow));
     }
 }

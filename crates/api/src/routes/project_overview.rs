@@ -589,7 +589,7 @@ async fn load_task_counts(
 ) -> ApiResult<Value> {
     let rows = if let Some(milestone_id) = milestone_id {
         sqlx::query(
-            "SELECT t.status, t.blocked_json
+            "SELECT t.status, t.condition_json
              FROM task t
              JOIN project_task_governance g ON g.task_id = t.id
              WHERE t.project_id = ? AND g.project_id = ? AND g.milestone_id = ?
@@ -603,7 +603,7 @@ async fn load_task_counts(
         .map_err(sql_error)?
     } else {
         sqlx::query(
-            "SELECT status, blocked_json FROM task
+            "SELECT status, condition_json FROM task
              WHERE project_id = ? AND deleted_at IS NULL",
         )
         .bind(project_id)
@@ -619,10 +619,19 @@ async fn load_task_counts(
         // A Task keeps its workflow status when an execution fails, so status
         // alone reports stalled work as active. The blocked record is what the
         // user is actually waiting on, and a terminal Task has moved past it.
-        let blocked = row
-            .try_get::<Option<String>, _>("blocked_json")
-            .unwrap_or_default()
-            .is_some_and(|value| !value.trim().is_empty());
+        // An unreadable condition is the same typed unknown park every row
+        // reader shows; one such Task never fails the whole overview.
+        let condition = db::task_condition::decode_or_unknown(
+            &row.try_get::<String, _>("condition_json")
+                .map_err(sql_error)?,
+        );
+        // A blank blocked record was never counted as blocked.
+        let blocked = condition.read().interruption_present
+            && !condition
+                .evidence()
+                .blocked_json
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty());
         match classify_status(&status) {
             TaskBucket::Terminal => counts.terminal += 1,
             _ if blocked => counts.blocked += 1,
@@ -1565,7 +1574,7 @@ async fn load_failed_task_count(state: &AppState, project_id: &str) -> ApiResult
          WHERE project_id = ? AND deleted_at IS NULL
            AND (lower(status) LIKE '%failed%'
                 OR lower(status) LIKE '%error%'
-                OR failed_json IS NOT NULL)",
+                OR json_extract(condition_json, '$.evidence.presentation.hard_failure') = 1)",
     )
     .bind(project_id)
     .fetch_one(state.db.pool())

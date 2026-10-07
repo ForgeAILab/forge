@@ -421,24 +421,13 @@ impl ProjectEscalationService {
                 .get("entity_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let task = sqlx::query("SELECT error_annotation,blocked_json,failed_json FROM task WHERE id=? AND project_id=? AND deleted_at IS NULL AND status NOT IN ('done','cancelled')")
+            let raw = sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=? AND project_id=? AND deleted_at IS NULL AND json_extract(condition_json,'$.kind') != 'settled'")
                 .bind(task_id).bind(&current.scope_id).fetch_optional(&mut *tx).await?;
-            let persists = task.is_some_and(|row| {
-                db::task_interruption_requires_intervention(
-                    row.try_get::<Option<String>, _>("error_annotation")
-                        .ok()
-                        .flatten()
-                        .as_deref(),
-                    row.try_get::<Option<String>, _>("blocked_json")
-                        .ok()
-                        .flatten()
-                        .as_deref(),
-                    row.try_get::<Option<String>, _>("failed_json")
-                        .ok()
-                        .flatten()
-                        .as_deref(),
-                )
-            });
+            let persists = raw
+                .and_then(|raw| db::task_condition::decode(&raw).ok())
+                .is_some_and(|condition| {
+                    db::task_condition::material_blocker(&condition).requires_intervention
+                });
             if !persists {
                 self.db
                     .resolve_attention_by_dedupe_in_tx(

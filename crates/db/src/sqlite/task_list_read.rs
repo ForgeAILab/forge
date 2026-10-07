@@ -30,7 +30,7 @@ impl SqliteDb {
             project_settings: row.try_get("settings")?,
             list_revision: row.try_get("list_revision")?,
             conditional_safe: !sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM task WHERE project_id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL AND deleted_at IS NULL)",
+                "SELECT EXISTS (SELECT 1 FROM task WHERE project_id = ? AND json_extract(condition_json,'$.evidence.presentation.retry_recorded')=1 AND deleted_at IS NULL)",
             ).bind(project_id).fetch_one(&mut *transaction).await?,
             transaction,
         })

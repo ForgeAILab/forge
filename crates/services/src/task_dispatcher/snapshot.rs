@@ -97,7 +97,16 @@ fn blocking(c: &TaskCondition, barrier_holds: bool) -> bool {
             additional,
             ..
         } => std::iter::once(primary).chain(additional).any(|p| {
-            (barrier_holds || !from_barrier(p))
+            !matches!(
+                p,
+                ParkReason::UnknownCondition {
+                    source: db::ConditionSource {
+                        field: db::LegacyConditionField::SchedulePark,
+                        ..
+                    },
+                    ..
+                }
+            ) && (barrier_holds || !from_barrier(p))
                 && matches!(
                     p,
                     ParkReason::Held { .. }
@@ -137,18 +146,31 @@ impl TaskDispatcher {
         // authoritative. When a writer missed its sync the copy is stale but
         // the row read in this snapshot is not: hold exactly where the legacy
         // fields hold, and leave the stored copy to be repaired.
-        let legacy = db::map_legacy_condition(&db::LegacyConditionInput::from(&r.task));
-        let condition_stale = {
-            let (stored, fresh) = (r.condition.evidence(), legacy.evidence());
-            stored.error_annotation != fresh.error_annotation
+        let stale = |stored: &TaskCondition, task: &db::Task| {
+            let legacy = db::map_legacy_condition(&db::LegacyConditionInput::from(task));
+            let (stored, fresh) = (stored.evidence(), legacy.evidence());
+            (stored.error_annotation != fresh.error_annotation
                 || stored.blocked_json != fresh.blocked_json
                 || stored.failed_json != fresh.failed_json
                 || stored.entry_barrier_json != fresh.entry_barrier_json
                 || stored.metadata != fresh.metadata
-                || stored.unparsed_metadata != fresh.unparsed_metadata
+                || stored.unparsed_metadata != fresh.unparsed_metadata)
+                .then_some(legacy)
         };
-        if condition_stale {
+        let legacy = stale(&r.condition, &r.task);
+        let condition_stale = legacy.is_some();
+        if let Some(legacy) = legacy {
+            // Every callee handed this Task reads the same condition this
+            // pass resolved from.
+            r.task.condition = legacy.clone();
             r.condition = legacy;
+        }
+        // The coordination root gates its children by its condition: a root
+        // whose stored copy is stale holds exactly where its fields hold.
+        if let Some(parent) = &mut r.parent {
+            if let Some(legacy) = stale(&parent.condition, parent) {
+                parent.condition = legacy;
+            }
         }
         let t = &r.task;
         let w = WorkflowEngine::resolve_workflow_for_task(
@@ -435,7 +457,7 @@ impl TaskDispatcher {
                     let grace =
                         at(Some(&review.updated_at)).map(|at| at + chrono::Duration::minutes(2));
                     let eligible = !f.blocking
-                        && (t.error_annotation.is_none() || super::legacy_park::owns(t))
+                        && t.error_annotation.is_none()
                         && !helpers::awaiting_human(t)
                         && t.entry_barrier_json.is_none()
                         && !r

@@ -55,6 +55,9 @@ async fn condition_fixture(
             .execute(db.pool())
             .await
             .unwrap();
+        db.check_task_conditions_of(std::slice::from_ref(&task.id))
+            .await
+            .unwrap();
     }
     let work_role = if workflow == "std" { "coder" } else { "worker" };
     let reject_target = if workflow == "std" {
@@ -162,12 +165,18 @@ async fn condition_fixture(
                 .execute(db.pool())
                 .await
                 .unwrap();
+            db.check_task_conditions_of(std::slice::from_ref(&task.id))
+                .await
+                .unwrap();
         }
         "barrier_blocked" => {
             sqlx::query("UPDATE task SET entry_barrier_json = ? WHERE id = ?")
                 .bind(json!({"state":state,"status":"blocked","hook_results":[]}).to_string())
                 .bind(&task.id)
                 .execute(db.pool())
+                .await
+                .unwrap();
+            db.check_task_conditions_of(std::slice::from_ref(&task.id))
                 .await
                 .unwrap();
         }
@@ -179,6 +188,9 @@ async fn condition_fixture(
                 )
                 .bind(&task.id)
                 .execute(db.pool())
+                .await
+                .unwrap();
+            db.check_task_conditions_of(std::slice::from_ref(&task.id))
                 .await
                 .unwrap();
         }

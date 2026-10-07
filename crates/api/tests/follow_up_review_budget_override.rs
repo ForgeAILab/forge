@@ -144,7 +144,7 @@ async fn task_review_budget_override_wins_over_project_setting() {
             StatusCode::OK,
         )
         .await;
-        if t.blocked.is_some() {
+        if t.condition.details().interruption.is_some() {
             break t;
         }
     };
@@ -188,7 +188,9 @@ async fn task_review_budget_override_wins_over_project_setting() {
         "latest coder follow-up should carry the resumed thread"
     );
     let blocked = blocked_task
-        .blocked
+        .condition
+        .details()
+        .interruption
         .as_ref()
         .expect("task should have blocked metadata");
     assert!(

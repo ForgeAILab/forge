@@ -8,6 +8,51 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Task condition replaces raw interruption fields (3.1 stage 4).**
+  - REST Task detail, lists and mutation results, and `forge-ctl --output json`,
+    remove `error_annotation`, `blocked` and `failed`. They add the typed
+    `condition`: `clear`, `entering`, `running`, `deferred`, `parked`, `failed`
+    or `settled`, with typed reasons, continuation and normalized details.
+    Use `condition.details.diagnostic` for the former annotation and
+    `condition.details.interruption` for interruption evidence. `interruption`
+    is the former `failed` record when one is stored, otherwise the former
+    `blocked` record; `condition.details.failed` and `condition.details.blocked`
+    say which records are stored, so a failed-only Task is still not a blocked
+    one. An annotation with no recognised `type` is shown as a diagnostic of
+    type `unknown`. Private import evidence is not exposed.
+  - MCP Task values remove `error_annotation` and add the same `condition`.
+    Native `work.read` removes its raw `blocked`, `error` and `failed` strings;
+    dependency-command receipts replace their `blocked` flag with `condition`.
+    Tool names, Task action verbs and CLI flags are unchanged.
+  - `task.interruption_changed` keeps its type but removes payload-root
+    `requires_intervention` and `interruption`, adding `condition` and
+    `material_blocker`. The latter carries `requires_intervention` and the
+    stable interruption identity; reporting execution IDs live in condition
+    details, not in that identity. Stored events are unchanged and old payloads
+    decode only at the archive boundary.
+  - `workflow_health`, `workflow_exception`, `awaiting_human` and action offers
+    keep their names and now derive their condition inputs from one source.
+    List `awaiting_human` agrees with detail. Entry owners are shown as
+    `Entering`; explicit owner parks show `Needs Owner` with the same owner and
+    recovery guidance. A failed Review from before the Task's current state
+    entry, or on a settled Task, no longer creates a current exception; a
+    reviewer run that is merely live does not clear one. Presented diagnostic
+    and interruption text is at most 1,024 bytes: longer text is cut on a
+    character boundary and ends with `… [truncated]`. Diagnostic arrays are
+    cut to 16 entries. Full legacy data remains stored for the final
+    storage-removal stage.
+    Unsupported stored condition encodings project a typed unknown diagnosis
+    while invariant repair rebuilds them; arbitrary legacy metadata no longer
+    makes the human-wait reader fail.
+  - The cutover does not re-arm an unchanged Attention incident. Held,
+    in-flight, entry-owned, capacity and retry-timer conditions do not invite
+    autonomous repair. Admitted `OwnerOffline` still holds an active Project
+    slot; `ReviewNeedsOwner` still holds a parked slot. Legacy columns and
+    dual-write adapters remain until stage 5; the dispatcher no longer writes
+    its temporary owner-park annotation bridge. The upgrade moves each such
+    annotation into the Task's condition with its message and `blocked_at`
+    unchanged.
+
 - **Machine registration can no longer change owners.**
   `POST /api/v1/daemons/register` for a `machine_id` that belongs to another
   user, or without authentication when it has an owner, returns

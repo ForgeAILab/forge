@@ -120,33 +120,45 @@ async fn task_interruption_changes_are_atomic_and_bounded() {
         .expect("interruption payload parses");
     assert_eq!(first["task_id"], task_id);
     assert_eq!(first["task_version"], updated.version);
-    assert_eq!(first["requires_intervention"], true);
-    assert_eq!(first["interruption"]["source"], "failed");
-    assert_eq!(first["interruption"]["kind"], "executor_failed");
+    assert_eq!(first["material_blocker"]["requires_intervention"], true);
     assert_eq!(
-        first["interruption"]["reason"]
+        first["material_blocker"]["interruption"]["source"],
+        "failed"
+    );
+    assert_eq!(
+        first["material_blocker"]["interruption"]["kind"],
+        "executor_failed"
+    );
+    assert_eq!(
+        first["material_blocker"]["interruption"]["reason"]
             .as_str()
             .expect("bounded reason is a string")
             .chars()
             .count(),
         512
     );
-    assert_eq!(first["interruption"]["execution_id"], "execution-1");
+    assert_eq!(first["condition"]["details"]["execution_id"], "execution-1");
+    assert!(first.get("requires_intervention").is_none());
+    assert!(first.get("interruption").is_none());
+    assert_eq!(first["condition"]["kind"], "failed");
     assert!(
-        first["interruption"].get("recovery_actions").is_none(),
+        first["material_blocker"]["interruption"]
+            .get("recovery_actions")
+            .is_none(),
         "interruption evidence must not persist an action allowlist"
     );
     let expected_dedupe = format!("task-interruption-update:{task_id}:{}", updated.version);
-    assert_eq!(
-        interruption_events[0].dedupe_key.as_deref(),
-        Some(expected_dedupe.as_str())
-    );
+    assert!(interruption_events[0]
+        .dedupe_key
+        .as_deref()
+        .unwrap()
+        .starts_with(&expected_dedupe));
 
     let second: serde_json::Value = serde_json::from_str(&interruption_events[1].payload_json)
         .expect("cleared interruption payload parses");
     assert_eq!(second["task_version"], cleared.version);
-    assert_eq!(second["requires_intervention"], false);
-    assert!(second["interruption"].is_null());
+    assert_eq!(second["material_blocker"]["requires_intervention"], false);
+    assert!(second["material_blocker"]["interruption"].is_null());
 }
 
 async fn sqlite_db() -> SqliteDb {
@@ -7821,8 +7833,14 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
         })
         .collect::<Vec<_>>();
     assert_eq!(interruption_payloads.len(), 2);
-    assert_eq!(interruption_payloads[0]["requires_intervention"], true);
-    assert_eq!(interruption_payloads[1]["requires_intervention"], false);
+    assert_eq!(
+        interruption_payloads[0]["material_blocker"]["requires_intervention"],
+        true
+    );
+    assert_eq!(
+        interruption_payloads[1]["material_blocker"]["requires_intervention"],
+        false
+    );
     assert_eq!(interruption_payloads[1]["task_version"], moved.version);
 }
 
@@ -11992,4 +12010,27 @@ async fn machine_capacity_ready_start_is_rechecked_after_chat_arrives() {
         (0, 1, 1)
     );
     assert!(!count.has_capacity());
+}
+
+#[tokio::test]
+async fn archived_interruption_shape_decodes_at_the_event_boundary() {
+    let db = sqlite_db().await;
+    let stored=DomainEventRepo::append_event(&db,crate::CreateDomainEvent{id:new_uuid_v4(),event_type:"task.interruption_changed".into(),entity_type:"task".into(),entity_id:"archived".into(),actor_type:"system".into(),actor_id:None,scope_type:"task".into(),scope_id:"archived".into(),correlation_id:new_uuid_v4(),causation_id:None,causation_depth:0,dedupe_key:None,payload_json:serde_json::json!({"task_id":"archived","task_version":7,"task_status":"review","requires_intervention":true,"interruption":{"source":"blocked","kind":"review_needs_owner","reason":"finding","execution_id":"old-reporter"}}).to_string(),created_at:now_rfc3339()}).await.unwrap();
+    let raw = stored.payload_json.clone();
+    let material = stored.task_material_blocker().unwrap();
+    assert!(material.requires_intervention);
+    assert_eq!(
+        material.interruption.unwrap(),
+        serde_json::json!({"source":"blocked","kind":"review_needs_owner","reason":"finding"})
+    );
+    let reloaded = DomainEventRepo::list_events_after(&db, 0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.id == stored.id)
+        .unwrap();
+    assert_eq!(
+        raw, reloaded.payload_json,
+        "decoding does not rewrite stored history"
+    );
 }

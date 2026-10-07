@@ -612,7 +612,7 @@ async fn an_unavailable_agent_hold_is_rechecked_at_the_scan_interval() {
 /// changes neither the Task's slot nor its dispatch, and the dispatcher
 /// removes it on the pass that sees the Task repaired.
 #[tokio::test]
-async fn an_owner_park_is_visible_in_the_legacy_fields_and_clears_itself() {
+async fn an_owner_park_is_visible_in_the_condition_and_clears_itself() {
     let (db, project, agent, _repo, ws) = fixture().await;
     set_project_active_task_limit(&db, &project, 5).await;
     // A state the Project workflow does not define.
@@ -634,8 +634,15 @@ async fn an_owner_park_is_visible_in_the_legacy_fields_and_clears_itself() {
         dispatcher.check_once_and_drain().await.unwrap();
     }
     let parked = reload(&db, &stranded.id).await;
-    let annotation: api_types::TaskBlockingAnnotation =
-        serde_json::from_str(parked.error_annotation.as_deref().expect("visible park")).unwrap();
+    assert!(
+        parked.error_annotation.is_none(),
+        "the stage-three bridge is removed"
+    );
+    let annotation = parked
+        .condition
+        .read()
+        .diagnostic
+        .expect("visible condition park");
     assert_eq!(
         annotation.annotation_type,
         api_types::FailureKind::WorkflowGuardRejected
@@ -648,18 +655,21 @@ async fn an_owner_park_is_visible_in_the_legacy_fields_and_clears_itself() {
         "{message}"
     );
     assert!(parked.blocked_json.is_none() && parked.failed_json.is_none());
-    assert_eq!(parked.version, stranded.version + 1, "written once");
+    assert_eq!(
+        parked.version, stranded.version,
+        "condition-only diagnostics use the list revision"
+    );
     // Public readers show it today.
     let workflow = WorkflowEngine::resolve_workflow("{}");
     let exception =
         crate::task_diagnostics::task_exception_projection(&parked, &workflow, &[], None, vec![])
             .expect("the exception reader shows the park");
     assert_eq!(exception.message, message);
-    assert!(db::task_interruption_requires_intervention(
-        parked.error_annotation.as_deref(),
-        None,
-        None
-    ));
+    assert!(db::material_blocker(&parked.condition).requires_intervention);
+    let public = parked.condition.public();
+    let public = serde_json::to_value(public).unwrap();
+    assert_eq!(public["details"]["owner"], "project_agent");
+    assert_eq!(public["details"]["recovery"], "edit_workflow");
     // It neither blocks dispatch nor moves the Task to a parked slot.
     assert!(!helpers::has_blocking_annotation(&parked));
     assert_eq!(
@@ -832,4 +842,161 @@ async fn sweep_wall_time() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+/// A subtask whose coordination root is blocked, failed or annotated is held
+/// by an internal park only: no step, no refusal, no Task write.
+#[tokio::test]
+async fn a_subtask_of_a_held_coordination_root_is_parked_without_a_refusal() {
+    for variant in ["clean", "blocked", "failed", "annotation", "stale"] {
+        let (db, project, agent, _repo, workspace) = fixture().await;
+        let root = seed_task(&db, &project, "root", "todo", 1).await;
+        let child = seed_subtask(&db, &root, "child", "todo", 0).await;
+        assign_role(&db, &root.id, crate::workflow::default_roles::CODER, &agent).await;
+        let root = reload(&db, &root.id).await;
+        let interruption = serde_json::json!({"kind":"workspace_error","reason":"root is held","created_at":now_rfc3339()}).to_string();
+        let update = |annotation, blocked, failed| db::UpdateTaskStatus {
+            id: root.id.clone(),
+            expected_version: root.version,
+            status: root.status.clone(),
+            assignee_id: None,
+            error_annotation: annotation,
+            blocked_json: blocked,
+            failed_json: failed,
+            updated_at: now_rfc3339(),
+        };
+        // The real writer: the root's condition is produced with its fields.
+        let held = match variant {
+            "blocked" => Some(update(None, Some(Some(interruption)), None)),
+            "failed" => Some(update(None, None, Some(Some(interruption)))),
+            "annotation" => Some(update(
+                Some(Some(
+                    r#"{"type":"workspace_error","blocking_reason":"root annotated"}"#.to_owned(),
+                )),
+                None,
+                None,
+            )),
+            _ => None,
+        };
+        if let Some(held) = held {
+            TaskRepo::update_status(&*db, held).await.unwrap();
+        }
+        if variant == "stale" {
+            // A writer that missed its condition sync: the fields hold, the
+            // stored copy does not say so yet.
+            sqlx::query("UPDATE task SET blocked_json=? WHERE id=?")
+                .bind(r#"{"kind":"workspace_error","reason":"root is held"}"#)
+                .bind(&root.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            crate::task_hierarchy::root_blocked(&reload(&db, &root.id).await),
+            !matches!(variant, "clean" | "stale"),
+            "{variant}"
+        );
+        let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
+        for _ in 0..3 {
+            dispatcher.check_once_and_drain().await.unwrap();
+        }
+        let after = reload(&db, &child.id).await;
+        let steps: Vec<(String, String)> =
+            sqlx::query_as("SELECT kind, status FROM task_step WHERE task_id=? ORDER BY rowid")
+                .bind(&child.id)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let executions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id=?")
+            .bind(&child.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        if variant == "clean" {
+            assert_eq!((after.status.as_str(), executions), ("in_progress", 1));
+            continue;
+        }
+        assert_eq!(
+            (
+                after.status.as_str(),
+                after.version,
+                &after.metadata_json,
+                &after.error_annotation,
+                &after.blocked_json,
+                executions,
+                &steps
+            ),
+            ("todo", child.version, &None, &None, &None, 0, &Vec::new()),
+            "{variant}"
+        );
+        let park: String =
+            sqlx::query_scalar("SELECT reason_json FROM task_schedule_park WHERE task_id=?")
+                .bind(&child.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(
+            park.contains("Children") && park.contains("SettleChildren"),
+            "{variant}: {park}"
+        );
+    }
+}
+
+/// A park migrated from its visible annotation carries that diagnostic. The
+/// dispatcher sees the same park and leaves it alone, so the message and its
+/// `blocked_at` stay as they were shown; a different diagnosis replaces it.
+#[tokio::test]
+async fn a_migrated_owner_park_keeps_its_saved_diagnostic_across_passes() {
+    let (db, project, agent, _repo, ws) = fixture().await;
+    let stranded = seed_task(&db, &project, "stranded", "retired_state", 0).await;
+    assign_role(&db, &stranded.id, "coder", &agent).await;
+    let (dispatcher, _rx) = build_dispatcher(db.clone(), ws.path()).await;
+    dispatcher.check_once_and_drain().await.unwrap();
+    let park = |db: Arc<db::SqliteDb>, id: String| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT reason_json FROM task_schedule_park WHERE task_id=?",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    };
+    let own = park(db.clone(), stranded.id.clone()).await;
+    // What the reader migration leaves: the dispatcher's park plus the
+    // diagnostic the old annotation showed.
+    let saved = serde_json::json!({"type":"workflow_guard_rejected","blocking_reason":"workflow_invalid","blocked_by":"system:task_dispatcher","blocked_at":"2026-10-06T01:00:00Z","blocked_execution_id":null,"artifact":null,"message":"as it was shown"});
+    sqlx::query("UPDATE task_schedule_park SET reason_json=json_set(reason_json,'$.diagnostic',json(?)) WHERE task_id=?")
+        .bind(saved.to_string())
+        .bind(&stranded.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.check_task_conditions_of(std::slice::from_ref(&stranded.id))
+        .await
+        .unwrap();
+    let migrated = park(db.clone(), stranded.id.clone()).await;
+    assert_ne!(migrated, own);
+    assert!(super::reconciliation::same_park(Some(&migrated), &own));
+    assert!(!super::reconciliation::same_park(
+        Some(&migrated),
+        &own.replace("retired_state", "another_state")
+    ));
+    assert!(!super::reconciliation::same_park(None, &own));
+    for _ in 0..3 {
+        dispatcher.check_once_and_drain().await.unwrap();
+    }
+    dispatcher.schedule_state.lock().unwrap().sweep.due = std::time::Instant::now();
+    dispatcher.reconcile_all().await.unwrap();
+    assert_eq!(park(db.clone(), stranded.id.clone()).await, migrated);
+    let diagnostic = reload(&db, &stranded.id)
+        .await
+        .condition
+        .read()
+        .diagnostic
+        .unwrap();
+    assert_eq!(diagnostic.message.as_deref(), Some("as it was shown"));
+    assert_eq!(
+        diagnostic.blocked_at.as_deref(),
+        Some("2026-10-06T01:00:00Z")
+    );
 }

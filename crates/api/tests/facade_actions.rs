@@ -150,11 +150,12 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
         StatusCode::OK,
     )
     .await;
-    let TaskAnnotation::Blocking(current_annotation) =
-        current.error_annotation.expect("annotation remains")
-    else {
-        panic!("expected typed blocking annotation");
-    };
+    let current_annotation = current
+        .condition
+        .details()
+        .diagnostic
+        .clone()
+        .expect("annotation remains");
     assert!(serde_json::to_value(current_annotation)
         .unwrap()
         .get("recovery_actions")
@@ -404,8 +405,8 @@ async fn recover_full_agent_returns_queued_task_and_preserves_other_errors() {
     .await;
     assert_eq!(response.id, task.id);
     assert_eq!(response.status, "in_progress");
-    assert!(response.error_annotation.is_none());
-    assert!(response.blocked.is_none());
+    assert!(response.condition.details().diagnostic.is_none());
+    assert!(response.condition.details().interruption.is_none());
     sqlx::query("UPDATE agent_identity SET paused = 0, version = version + 1 WHERE id = ?")
         .bind(&agent_id)
         .execute(harness.state.db.pool())
@@ -640,7 +641,7 @@ async fn execution_facade_actions_work_for_both_workflows() {
             StatusCode::OK,
         )
         .await;
-        assert!(started.error_annotation.is_none());
+        assert!(started.condition.details().diagnostic.is_none());
         harness
             .state
             .task_service
@@ -665,7 +666,7 @@ async fn execution_facade_actions_work_for_both_workflows() {
             StatusCode::OK,
         )
         .await;
-        assert!(paused.error_annotation.is_some());
+        assert!(paused.condition.details().diagnostic.is_some());
 
         let _resumed: TaskResponse = common::json_request(
             &harness.app,
@@ -860,6 +861,12 @@ async fn task_actions_rest_diagnostics_and_execution_controls_share_one_offer_se
                 .bind(json!({"kind":"retry_exhausted","reason":"spent","recovery_actions":["return_to_implementation"]}).to_string())
                 .bind(&task.id).execute(harness.state.db.pool()).await.unwrap();
         }
+        harness
+            .state
+            .db
+            .check_task_conditions_of(std::slice::from_ref(&task.id))
+            .await
+            .unwrap();
         let offers: TaskActionsResponse = common::empty_request(
             &harness.app,
             Method::GET,
@@ -940,6 +947,12 @@ async fn paused_task_action_refusals_keep_wait_cause_without_erasing_the_conditi
         .bind(json!({"type":"executor_failed","blocking_reason":"fixture"}).to_string())
         .bind(&task.id)
         .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    harness
+        .state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&task.id))
         .await
         .unwrap();
     for cause in [

@@ -11,12 +11,10 @@ use api_types::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use db::{
-    new_uuid_v4, now_rfc3339,
-    task_interruption_requires_intervention as interruption_fields_require_intervention,
-    AgentContextScopeRepo, AgentRepo, AttentionListQuery, AttentionProjection, AttentionRepo,
-    CreateAttentionProjection, CreateDomainEvent, DomainEvent, DomainEventRepo,
-    EventConsumerCursor, Page, PageRequest, ProjectMemberRepo, ProjectRepo, SqliteDb,
-    UpdateAttentionLifecycle,
+    new_uuid_v4, now_rfc3339, AgentContextScopeRepo, AgentRepo, AttentionListQuery,
+    AttentionProjection, AttentionRepo, CreateAttentionProjection, CreateDomainEvent, DomainEvent,
+    DomainEventRepo, EventConsumerCursor, Page, PageRequest, ProjectMemberRepo, ProjectRepo,
+    SqliteDb, UpdateAttentionLifecycle,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -779,32 +777,13 @@ impl AttentionService {
                 // Check again under the same writer lock as wake budgeting.
                 orphan_attempt_is_current(&self.db, transaction, execution_id).await?
             } else if let Some(task_id) = context.task_id.as_deref() {
-                let row = sqlx::query(
-                    "SELECT error_annotation, blocked_json, failed_json
-                     FROM task WHERE id = ? AND deleted_at IS NULL AND status NOT IN ('done','cancelled')",
-                )
-                .bind(task_id)
-                .fetch_optional(&mut **transaction)
-                .await?;
-                row.is_some_and(|row| {
-                    let error_annotation = row
-                        .try_get::<Option<String>, _>("error_annotation")
-                        .ok()
-                        .flatten();
-                    let blocked_json = row
-                        .try_get::<Option<String>, _>("blocked_json")
-                        .ok()
-                        .flatten();
-                    let failed_json = row
-                        .try_get::<Option<String>, _>("failed_json")
-                        .ok()
-                        .flatten();
-                    interruption_fields_require_intervention(
-                        error_annotation.as_deref(),
-                        blocked_json.as_deref(),
-                        failed_json.as_deref(),
-                    )
-                })
+                let raw = sqlx::query_scalar::<_, String>(
+                    "SELECT condition_json FROM task WHERE id=? AND deleted_at IS NULL AND json_extract(condition_json,'$.kind') != 'settled'",
+                ).bind(task_id).fetch_optional(&mut **transaction).await?;
+                raw.and_then(|raw| db::task_condition::decode(&raw).ok())
+                    .is_some_and(|condition| {
+                        db::task_condition::material_blocker(&condition).requires_intervention
+                    })
             } else {
                 false
             };
@@ -2510,9 +2489,9 @@ impl AttentionService {
                     "decided_by": "user",
                 })
             });
-            let interruption = event_payload
-                .get("interruption")
-                .cloned()
+            let interruption = event
+                .task_material_blocker()
+                .and_then(|m| m.interruption)
                 .unwrap_or(Value::Null);
             let available_actions = if event.entity_type == "task" {
                 if let Some(task) =
@@ -2556,9 +2535,9 @@ impl AttentionService {
             } else {
                 Vec::new()
             };
-            let requires_intervention = event_payload
-                .get("requires_intervention")
-                .and_then(Value::as_bool)
+            let requires_intervention = event
+                .task_material_blocker()
+                .map(|m| m.requires_intervention)
                 .unwrap_or(category == "execution_failed");
             let mut details = json!({
                 "source_event_id": event.id,
@@ -3940,11 +3919,7 @@ fn is_execution_semantic_progress_event(event_type: &str) -> bool {
 }
 
 fn task_requires_intervention(task: &db::Task) -> bool {
-    interruption_fields_require_intervention(
-        task.error_annotation.as_deref(),
-        task.blocked_json.as_deref(),
-        task.failed_json.as_deref(),
-    )
+    db::task_condition::material_blocker(&task.condition).requires_intervention
 }
 
 async fn orphan_attempt_is_current(
@@ -3976,9 +3951,11 @@ async fn orphan_attempt_is_current(
     };
     // A committed disposition owns its own incident, including an intentional
     // manual stop. Raw attempt events must not override those recovery choices.
-    if task.error_annotation.is_some()
+    if task.condition.read().diagnostic_present
         || task_requires_intervention(&task)
-        || crate::deferred_dispatch::is_pending(&task, Utc::now())
+        || task.condition.read().retry.is_some_and(|r| {
+            DateTime::parse_from_rfc3339(&r.not_before).is_ok_and(|at| at > Utc::now())
+        })
     {
         return Ok(false);
     }
@@ -4160,14 +4137,9 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
         return Some("delivery_followup");
     }
     if event_type == "task.interruption_changed" {
-        return serde_json::from_str::<Value>(&event.payload_json)
-            .ok()
-            .and_then(|payload| {
-                payload
-                    .get("requires_intervention")
-                    .and_then(Value::as_bool)
-            })
-            .unwrap_or(false)
+        return event
+            .task_material_blocker()
+            .is_some_and(|m| m.requires_intervention)
             .then_some("execution_failed");
     }
     None
@@ -4205,14 +4177,9 @@ fn resolution_categories(event: &DomainEvent) -> Vec<&'static str> {
         categories.push("execution_failed");
     }
     if event_type == "task.interruption_changed"
-        && !serde_json::from_str::<Value>(&event.payload_json)
-            .ok()
-            .and_then(|payload| {
-                payload
-                    .get("requires_intervention")
-                    .and_then(Value::as_bool)
-            })
-            .unwrap_or(false)
+        && !event
+            .task_material_blocker()
+            .is_some_and(|m| m.requires_intervention)
     {
         categories.push("execution_failed");
     }
@@ -4896,6 +4863,14 @@ mod tests {
             task.error_annotation = annotation;
             task.blocked_json = blocked;
             task.failed_json = failed;
+            task.condition = db::task_condition::decode(
+                &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                    .bind(&id)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
             let event = CreateDomainEvent::task_interruption_changed(&task);
             db::DomainEventRepo::append_event_in_tx(&**db, &mut transaction, &event)
                 .await
@@ -4907,7 +4882,7 @@ mod tests {
             let payload: Value = serde_json::from_str(&event.payload_json).unwrap();
             assert_eq!(
                 json!(material.requires_intervention),
-                payload["requires_intervention"],
+                payload["material_blocker"]["requires_intervention"],
                 "{id}"
             );
             let incident: Option<String> = sqlx::query_scalar(

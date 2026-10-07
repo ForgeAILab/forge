@@ -11,6 +11,8 @@ use super::*;
 pub enum ConditionChange {
     /// The five legacy columns only.
     Legacy,
+    /// Review or assignment changed the current human decision/work boundary.
+    Human,
     /// Status, status epoch, an entry receipt, parentage or sibling order.
     /// Re-reads the entry, its hooks step and its execution binding, and
     /// refreshes the parent's child witnesses when the parent waits on them.
@@ -55,7 +57,7 @@ pub(crate) async fn derive(
 ) -> Result<Option<Produced>> {
     use ConditionChange as Change;
     let families = match change {
-        Change::Full | Change::Entry => Families::ENTRY,
+        Change::Full | Change::Entry | Change::Human => Families::ENTRY,
         Change::Hooks => Families::HOOKS,
         Change::Execution => Families::EXECUTION,
         _ => Families::ROW,
@@ -189,7 +191,7 @@ pub(crate) async fn workflow_changed(
             .await?;
     for status in statuses
         .iter()
-        .filter(|status| before.differs(&after, status))
+        .filter(|status| before.differs(&after, status) || previous_workflow != workflow)
     {
         let tasks: Vec<String> =
             sqlx::query_scalar("SELECT id FROM task WHERE project_id=? AND status=?")
@@ -261,6 +263,26 @@ pub(crate) async fn produce_best_effort(
 /// seam for writes that cannot change a condition.
 pub(crate) fn sql_change(query: &str) -> Option<ConditionChange> {
     let lower = query.to_ascii_lowercase();
+    // A role or Review row moves the human decision/work boundary whatever
+    // columns it names.
+    let statement = lower.trim_start();
+    if ["task_role_assignment", "review"].iter().any(|table| {
+        [
+            "update ",
+            "delete from ",
+            "insert into ",
+            "insert or replace into ",
+        ]
+        .iter()
+        .any(|verb| {
+            statement
+                .strip_prefix(verb)
+                .and_then(|rest| rest.trim_start().strip_prefix(table))
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+        })
+    }) {
+        return Some(ConditionChange::Human);
+    }
     let assignments = lower.split(" where ").next().unwrap_or(&lower);
     let assigns = |columns: &[&str]| columns.iter().any(|column| assignments.contains(column));
     if assigns(&[

@@ -255,7 +255,8 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
         let payload: String = sqlx::query_scalar("SELECT payload_json FROM domain_event WHERE event_type = 'task.interruption_changed' AND entity_id = ? ORDER BY sequence DESC LIMIT 1")
             .bind(&task.id).fetch_one(db.pool()).await.unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&payload).unwrap()["requires_intervention"],
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap()["material_blocker"]
+                ["requires_intervention"],
             false
         );
     }
@@ -458,6 +459,9 @@ async fn obsolete_orphan_wakes_recheck_task_and_attempt_before_spending_budget()
                 .execute(db.pool())
                 .await
                 .unwrap();
+                db.check_task_conditions_of(std::slice::from_ref(&task.id))
+                    .await
+                    .unwrap();
             }
             _ => unreachable!(),
         }
@@ -2651,4 +2655,146 @@ async fn conflict_hotspots_project_per_path_reopen_and_keep_wake_rules() {
     let ineligible: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.suppressed' AND json_extract(payload_json, '$.reason') = 'ineligible_scope'")
         .fetch_one(db.pool()).await.unwrap();
     assert_eq!(ineligible, 0);
+}
+
+/// A real stage-three-shaped condition/event, an already open incident and a
+/// configured responder cross the migration without a new incident or wake.
+#[tokio::test]
+async fn condition_reader_upgrade_keeps_open_incident_and_wake_identity() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "Condition cutover").await;
+    let task = project_task(&db, &project_id, "Unchanged blocker").await;
+    let reason = "owner must repair the workspace";
+    let interrupted =
+        serde_json::json!({"kind":"workspace_error","reason":reason,"created_at":now_rfc3339()})
+            .to_string();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET blocked_json=? WHERE id=?")
+        .bind(&interrupted)
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    db.sync_condition_in_tx(&mut tx, &task.id).await.unwrap();
+    // The typed presentation did not exist on the stage-three base.
+    let raw: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
+        .bind(&task.id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let mut old: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    old["evidence"]
+        .as_object_mut()
+        .unwrap()
+        .remove("presentation");
+    sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+        .bind(old.to_string())
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    append_attention_event(&db,"task.interruption_changed",&task.id,&project_id,serde_json::json!({"task_id":task.id,"task_version":task.version,"task_status":task.status,"requires_intervention":true,"interruption":{"source":"blocked","kind":"workspace_error","reason":reason,"execution_id":"historical-reporter"}})).await;
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(100).await.unwrap();
+    let incident_id: String = sqlx::query_scalar("SELECT id FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?").bind(&project_id).fetch_one(db.pool()).await.unwrap();
+    // The incident row as `777b5f1f` stored it. That server copied the
+    // event's `interruption` into the incident as written, reporting
+    // execution included; this build strips delivery metadata on the way in.
+    // That one field is the only part of the stored incident the two builds
+    // write differently for this event, so put it back as the old server
+    // left it and take the digest from that row.
+    sqlx::query("UPDATE attention_projection SET details_json=json_set(details_json,'$.interruption',json(?)) WHERE id=?")
+        .bind(serde_json::json!({"source":"blocked","kind":"workspace_error","reason":reason,"execution_id":"historical-reporter"}).to_string())
+        .bind(&incident_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let stored_details: String =
+        sqlx::query_scalar("SELECT details_json FROM attention_projection WHERE id=?")
+            .bind(&incident_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(stored_details.contains("historical-reporter"));
+    let before = AttentionRepo::get_attention(&*db, &incident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let digest = db::canonical_attention_incident_digest(&before);
+    let wakes_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM domain_event WHERE event_type='agent.wake.admitted' AND scope_id=?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        wakes_before, 1,
+        "the responder is configured and the old blocker admitted a wake"
+    );
+    // Reinstall just the predecessor's projection trigger/index, then replay
+    // the new migration through the production runner. Task and event data stay.
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("DELETE FROM _migration WHERE version=202610070507")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX idx_task_condition_retry_project")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    run_migrations(db.pool()).await.unwrap();
+    let condition = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .condition;
+    assert!(db::material_blocker(&condition).requires_intervention);
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    DomainEventRepo::append_event(&*db, CreateDomainEvent::task_interruption_changed(&current))
+        .await
+        .unwrap();
+    service.project_once(100).await.unwrap();
+    let after = AttentionRepo::get_attention(&*db, &incident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(digest, db::canonical_attention_incident_digest(&after));
+    assert_eq!(before.id, after.id);
+    let incidents: i64 = sqlx::query_scalar("SELECT count(*) FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?").bind(&project_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(incidents, 1);
+    let wakes_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM domain_event WHERE event_type='agent.wake.admitted' AND scope_id=?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        wakes_after, wakes_before,
+        "migration must not re-arm a consumed incident"
+    );
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    TaskRepo::update(&*db,db::UpdateTask {id:task.id.clone(),expected_version:current.version,title:None,description:None,priority:None,merge_config:None,plan:None,error_annotation:Some(None),blocked_json:Some(Some(serde_json::json!({"kind":"workspace_error","reason":"a different workspace blocker","created_at":now_rfc3339()}).to_string())),failed_json:Some(None),task_state_config:None,parent_task_id:None,updated_at:now_rfc3339()}).await.unwrap();
+    service.project_once(100).await.unwrap();
+    let changed = AttentionRepo::get_attention(&*db, &incident_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(digest, db::canonical_attention_incident_digest(&changed));
+    let material_events: i64 = sqlx::query_scalar("SELECT count(*) FROM domain_event WHERE event_type='task.interruption_changed' AND entity_id=?").bind(&task.id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(
+        material_events, 3,
+        "one historical event, one unchanged typed replay, exactly one real blocker change"
+    );
 }

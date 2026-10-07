@@ -31,6 +31,7 @@ const page = {
       board_position: 1,
       version: 2,
       updated_at: 'before',
+      condition: { kind: 'clear', details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false } },
     },
   ],
   next_cursor: null,

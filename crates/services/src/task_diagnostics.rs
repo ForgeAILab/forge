@@ -7,7 +7,7 @@ use api_types::{
 use chrono::{DateTime, Utc};
 use db::{
     AssigneeKind, Execution, ExecutionStatus, ResumePolicy, Review, ReviewStatus, Task,
-    TaskMetadata, TaskRoleAssignment, TransitionLog,
+    TaskRoleAssignment, TransitionLog,
 };
 use serde_json::Value;
 
@@ -50,14 +50,15 @@ pub fn derive_workflow_health(
     awaiting_human: bool,
     workflow_exception: Option<&WorkflowExceptionSummary>,
 ) -> WorkflowHealthSummary {
+    let condition = task.condition.read();
     let current_state = workflow
         .states
         .iter()
         .find(|state| state.name == task.status);
     let role = current_state.and_then(effective_role).map(str::to_owned);
     let awaiting_human = awaiting_human
-        || task_metadata_awaiting_human(task)
-        || latest_review.is_some_and(|review| review.status == ReviewStatus::AwaitingHuman);
+        || condition.human_wait
+        || (condition.review_wait && !matches!(task.condition, db::TaskCondition::Entering { .. }));
 
     // An interactive recovery session is live work, even when the Task row
     // still carries a stale blocker/failure/retry projection from the event
@@ -81,12 +82,12 @@ pub fn derive_workflow_health(
         );
     }
 
-    if task.failed_json.is_some() {
+    if condition.hard_failure {
         return health(
             WorkflowHealthKind::Failed,
             HealthSeverity::Error,
             "Failed",
-            interruption_message(task.failed_json.as_deref(), "Task failed"),
+            condition.failure_message.clone(),
             task,
             role,
             latest_execution.map(|execution| execution.id.clone()),
@@ -96,18 +97,49 @@ pub fn derive_workflow_health(
         );
     }
 
-    if task.blocked_json.is_some() {
+    if condition.interruption_present {
         return health(
             WorkflowHealthKind::Blocked,
             HealthSeverity::Error,
             "Blocked",
-            interruption_message(task.blocked_json.as_deref(), "Task is blocked"),
+            condition.blocked_message.clone(),
             task,
             role,
             latest_execution.map(|execution| execution.id.clone()),
             latest_review.map(|review| review.id.clone()),
             task.updated_at.clone(),
             None,
+        );
+    }
+
+    if task.condition.reasons().any(|r| {
+        matches!(
+            r,
+            db::ParkReason::WorkflowInvalid { .. }
+                | db::ParkReason::UnknownCondition {
+                    source: db::ConditionSource {
+                        field: db::LegacyConditionField::SchedulePark,
+                        ..
+                    },
+                    ..
+                }
+        )
+    }) {
+        let reason = condition
+            .diagnostic
+            .as_ref()
+            .map(|a| a.blocking_reason.clone());
+        return health(
+            WorkflowHealthKind::Stuck,
+            HealthSeverity::Warning,
+            "Needs Owner",
+            condition.message(),
+            task,
+            role,
+            latest_execution.map(|e| e.id.clone()),
+            latest_review.map(|r| r.id.clone()),
+            task.updated_at.clone(),
+            reason,
         );
     }
 
@@ -128,7 +160,22 @@ pub fn derive_workflow_health(
         }
     }
 
-    if let Some(deferred) = crate::deferred_dispatch::pending_until(task) {
+    if let db::TaskCondition::Entering { since, .. } = &task.condition {
+        return health(
+            WorkflowHealthKind::WaitingForAgent,
+            HealthSeverity::Info,
+            "Entering",
+            Some("Waiting for the current entry's workflow checks".into()),
+            task,
+            role,
+            latest_execution.map(|e| e.id.clone()),
+            latest_review.map(|r| r.id.clone()),
+            since.clone(),
+            Some("entry_checks_owned".into()),
+        );
+    }
+
+    if let Some(deferred) = condition.retry.clone() {
         // `is_pending` is the dispatcher's admission check. In particular, a
         // malformed timestamp is treated as no deferral and the dispatcher
         // proceeds with the current role. Do not project such metadata as a
@@ -197,7 +244,7 @@ pub fn derive_workflow_health(
     // Capacity waits are reconsidered each tick. Deterministic role refusals
     // stay parked until the Task changes or something wakes it, so show that
     // distinction instead of hiding them as ordinary queueing.
-    if let Some(disposition) = crate::deferred_dispatch::current_dispatch_disposition(task) {
+    if let Some(disposition) = condition.current_refusal(task.version) {
         if matches!(
             disposition.capability.as_str(),
             "project_capacity" | "machine_capacity"
@@ -437,16 +484,14 @@ pub fn task_exception_projection(
     latest_review: Option<&Review>,
     offers: Vec<api_types::Offer>,
 ) -> Option<WorkflowExceptionSummary> {
-    let annotation = task
-        .error_annotation
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<api_types::TaskBlockingAnnotation>(raw).ok());
+    let condition = task.condition.read();
+    let annotation = condition.diagnostic.clone();
     let latest_execution = executions
         .iter()
         .max_by_key(|execution| (&execution.created_at, &execution.id));
     let kind = crate::task_actions::task_condition(task);
-    let failed_review = latest_failed_review(latest_review);
-    if kind.is_none() && failed_review.is_none() && task.entry_barrier_json.is_none() {
+    let failed_review = latest_failed_review(latest_review).filter(|_| condition.review_failure);
+    if kind.is_none() && failed_review.is_none() && !condition.entry_recorded {
         return None;
     }
     let role = workflow
@@ -456,7 +501,7 @@ pub fn task_exception_projection(
         .and_then(effective_role)
         .map(str::to_owned);
     Some(WorkflowExceptionSummary {
-        exception_type: if task.failed_json.is_some() {
+        exception_type: if condition.hard_failure {
             "task_failed".to_owned()
         } else {
             kind.map(|kind| kind.to_string())
@@ -464,19 +509,13 @@ pub fn task_exception_projection(
         },
         message: annotation
             .as_ref()
-            .and_then(|annotation| {
-                annotation
-                    .message
+            .and_then(|a| {
+                a.message
                     .clone()
-                    .or_else(|| Some(annotation.blocking_reason.clone()))
+                    .or_else(|| Some(a.blocking_reason.clone()))
             })
-            .or_else(|| {
-                interruption_message(
-                    task.failed_json.as_deref().or(task.blocked_json.as_deref()),
-                    "Task interrupted",
-                )
-            })
-            .unwrap_or_else(|| "Review requires attention".to_owned()),
+            .or_else(|| condition.exception_message.clone())
+            .unwrap_or_else(|| "Review requires attention".into()),
         review_id: failed_review.map(|review| review.id.clone()),
         execution_id: annotation
             .as_ref()
@@ -540,18 +579,6 @@ fn health(
         since: Some(since),
         stale_reason,
     }
-}
-
-fn task_metadata_awaiting_human(task: &Task) -> bool {
-    TaskMetadata::parse(task.metadata_json.as_deref())
-        .ok()
-        .and_then(|metadata| {
-            metadata
-                .extra
-                .get("awaiting_human")
-                .and_then(Value::as_bool)
-        })
-        .unwrap_or(false)
 }
 
 fn stopped_execution_blocks_progress(execution: &Execution) -> bool {
@@ -745,17 +772,6 @@ fn non_empty_string(value: Option<&Value>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-}
-
-fn interruption_message(raw: Option<&str>, fallback: &str) -> Option<String> {
-    let value = raw.and_then(|raw| serde_json::from_str::<Value>(raw).ok())?;
-    value
-        .get("reason")
-        .or_else(|| value.get("message"))
-        .or_else(|| value.get("kind"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| Some(fallback.to_owned()))
 }
 
 // Disabled along with Stuck health labeling — kept for future reuse.
@@ -961,5 +977,178 @@ mod tests {
         ];
 
         assert_eq!(audit_gate_rejections_since_boundary(&entries, "review"), 1);
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+mod legacy {
+    include!("task_diagnostics_legacy.rs");
+}
+
+#[cfg(test)]
+mod condition_projection_parity {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn seven_kinds_health_exceptions_and_human_wait_match_the_old_projection() {
+        for (label, annotation, blocked, failed, metadata) in [
+            ("clear", None, None, None, None),
+            ("entering", None, None, None, None),
+            ("running", None, None, None, None),
+            (
+                "deferred",
+                None,
+                None,
+                None,
+                Some(
+                    json!({"deferred_dispatch":{"not_before":"2099-01-01T00:00:00Z","reason":"retry","target_state":"in_progress"}}),
+                ),
+            ),
+            (
+                "parked",
+                Some(json!({"type":"manual_stop","blocking_reason":"held","message":"held"})),
+                Some(
+                    json!({"kind":"manual_stop","reason":"held","created_at":"2026-10-02T00:00:00Z"}),
+                ),
+                None,
+                None,
+            ),
+            (
+                "failed",
+                None,
+                None,
+                Some(
+                    json!({"kind":"executor_failed","reason":"failure","created_at":"2026-10-02T00:00:00Z"}),
+                ),
+                None,
+            ),
+            ("settled", None, None, None, None),
+            (
+                "human",
+                None,
+                None,
+                None,
+                Some(json!({"awaiting_human":true})),
+            ),
+            (
+                "capacity",
+                None,
+                None,
+                None,
+                Some(
+                    json!({"dispatch_disposition":{"task_version":1,"capability":"machine_capacity","blocker_digest":"capacity","recorded_at":"2026-10-02T00:00:00Z","safe_message":"machine_capacity: waiting"}}),
+                ),
+            ),
+            (
+                "owner_offline",
+                None,
+                None,
+                None,
+                Some(
+                    json!({"owner_wait":{"daemon_id":"owner","started_at":"2026-10-02T00:00:00Z"}}),
+                ),
+            ),
+            (
+                "review_needs_owner",
+                Some(
+                    json!({"type":"review_needs_owner","blocking_reason":"finding","message":"needs owner"}),
+                ),
+                None,
+                None,
+                None,
+            ),
+        ] {
+            let mut s = crate::task_actions::tests::snapshot("in_progress", None);
+            s.task.error_annotation = annotation.map(|v| v.to_string());
+            s.task.blocked_json = blocked.map(|v| v.to_string());
+            s.task.failed_json = failed.map(|v| v.to_string());
+            s.task.metadata_json = metadata.map(|v| v.to_string());
+            let mut c = db::map_legacy_condition(&db::LegacyConditionInput::from(&s.task));
+            if label == "entering" {
+                c = db::TaskCondition::Entering {
+                    state: s.task.status.clone(),
+                    epoch: 1,
+                    step_id: "step".into(),
+                    phase: "post_commit_hooks".into(),
+                    since: s.task.created_at.clone(),
+                    evidence: c.evidence().clone(),
+                };
+            }
+            if label == "running" {
+                c = db::TaskCondition::Running {
+                    execution_id: "run".into(),
+                    role: "coder".into(),
+                    epoch: 1,
+                    since: s.task.created_at.clone(),
+                    evidence: c.evidence().clone(),
+                };
+            }
+            if label == "settled" {
+                c = db::TaskCondition::Settled {
+                    outcome: db::TerminalOutcome::Completed,
+                    evidence: c.evidence().clone(),
+                };
+            }
+            s.task.condition = c;
+            let offers = crate::available_actions(&s);
+            let old_exception =
+                legacy::task_exception_projection(&s.task, &s.workflow, &[], None, offers.clone());
+            let exception = task_exception_projection(&s.task, &s.workflow, &[], None, offers);
+            assert_eq!(
+                serde_json::to_value(&exception).unwrap(),
+                serde_json::to_value(old_exception).unwrap(),
+                "{label}: exception"
+            );
+            let old = legacy::derive_workflow_health(
+                &s.task,
+                &s.workflow,
+                &s.role_assignments,
+                None,
+                None,
+                false,
+                exception.as_ref(),
+            );
+            let new = derive_workflow_health(
+                &s.task,
+                &s.workflow,
+                &s.role_assignments,
+                None,
+                None,
+                false,
+                exception.as_ref(),
+            );
+            if label == "entering" {
+                assert_eq!(
+                    new.label, "Entering",
+                    "deliberate difference: entry_owner_visibility"
+                );
+                assert_ne!(new.label, old.label);
+            } else {
+                assert_eq!(
+                    serde_json::to_value(&new).unwrap(),
+                    serde_json::to_value(old).unwrap(),
+                    "{label}: health"
+                );
+            }
+            s.task.error_annotation = None;
+            s.task.blocked_json = None;
+            s.task.failed_json = None;
+            s.task.metadata_json = None;
+            assert_eq!(
+                serde_json::to_value(derive_workflow_health(
+                    &s.task,
+                    &s.workflow,
+                    &s.role_assignments,
+                    None,
+                    None,
+                    false,
+                    exception.as_ref()
+                ))
+                .unwrap(),
+                serde_json::to_value(new).unwrap(),
+                "{label}: condition is authoritative"
+            );
+        }
     }
 }

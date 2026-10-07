@@ -26,7 +26,6 @@ mod reconciliation;
 mod snapshot;
 pub(crate) use helpers::is_blocking_annotation_type;
 mod initial_scheduling;
-mod legacy_park;
 mod repo_pause_sync;
 pub mod slots;
 #[cfg(test)]

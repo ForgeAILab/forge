@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  blockedInterruption,
   deriveColumns,
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
   getTaskWorkflowWarning,
+  isTaskBlocked,
+  matchesFilters,
   outgoingWorkflowEdges,
   taskTypes,
   taskHasError,
@@ -111,6 +114,34 @@ describe('outgoingWorkflowEdges', () => {
   })
 })
 
+describe('failed and blocked records', () => {
+  const record = { kind: 'executor_failed' as const, reason: 'stored reason', created_at: '2026-10-07T00:00:00Z' }
+  const withDetails = (failed: boolean, blocked: boolean) =>
+    taskListItem({
+      // A failure record does not make the condition kind `failed` while a run is live.
+      condition: {
+        kind: 'clear',
+        details: { failure_kind: 'executor_failed', diagnostic: null, interruption: record, failed, blocked, human_wait: blocked, entry_wait: false },
+      },
+    })
+
+  it('does not treat a failed-only Task as blocked', () => {
+    const failedOnly = withDetails(true, false)
+    expect(isTaskBlocked(failedOnly)).toBe(false)
+    expect(blockedInterruption(failedOnly)).toBeNull()
+    expect(matchesFilters(failedOnly, { types: [], blockedOnly: true })).toBe(false)
+    expect(taskHasError(failedOnly)).toBe(true)
+  })
+
+  it('keeps a blocked Task blocked, with or without a failure beside it', () => {
+    for (const task of [withDetails(false, true), withDetails(true, true)]) {
+      expect(isTaskBlocked(task)).toBe(true)
+      expect(blockedInterruption(task)?.reason).toBe('stored reason')
+      expect(matchesFilters(task, { types: [], blockedOnly: true })).toBe(true)
+    }
+  })
+})
+
 describe('task interruption annotations', () => {
   function taskWithExecutionIds(blockedExecutionId: string, latestExecutionId: string): Task {
     return {
@@ -128,9 +159,7 @@ describe('task interruption annotations', () => {
       remaining_retries: {},
   retry_limits: {},
       placement: null,
-      blocked: null,
-      failed: null,
-      error_annotation: {
+      condition: { kind: 'clear', details: { failure_kind: 'executor_failed', interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false, diagnostic: {
         type: 'executor_failed',
         blocking_reason: 'executor_failed',
         blocked_by: 'system:executor',
@@ -138,7 +167,7 @@ describe('task interruption annotations', () => {
         blocked_execution_id: blockedExecutionId,
         artifact: null,
         message: 'Previous execution failed',
-      },
+      } } },
       execution_observability: {
         counts: {
           task_execution_count: 2,
@@ -170,7 +199,7 @@ describe('task interruption annotations', () => {
   it('uses compact list observability to identify stale annotations', () => {
     const fullTask = taskWithExecutionIds('execution-old', 'execution-new')
     const task = taskListItem({
-      error_annotation: fullTask.error_annotation,
+      condition: fullTask.condition,
       execution_observability: { latest_execution_id: 'execution-new' },
     })
     expect(taskHasError(task)).toBe(false)
@@ -196,7 +225,7 @@ describe('task interruption annotations', () => {
 
   it('warns when completed coder work cannot leave in-progress with an open plan', () => {
     const task = taskWithExecutionIds('execution-old', 'execution-new')
-    task.error_annotation = null
+    task.condition.details.diagnostic = null
     task.plan_progress = {
       total: 10,
       completed: 6,
@@ -210,7 +239,7 @@ describe('task interruption annotations', () => {
 
   it('does not warn while an execution is still running', () => {
     const task = taskWithExecutionIds('execution-old', 'execution-new')
-    task.error_annotation = null
+    task.condition.details.diagnostic = null
     task.plan_progress = {
       total: 10,
       completed: 6,

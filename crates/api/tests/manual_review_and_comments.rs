@@ -604,7 +604,7 @@ async fn rerun_review_pass_cascades_through_merge_instead_of_parking() {
     )
     .await;
 
-    assert!(accepted.error_annotation.is_none());
+    assert!(accepted.condition.details().diagnostic.is_none());
     harness
         .state
         .task_service
@@ -700,7 +700,7 @@ async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
     )
     .await;
 
-    assert!(accepted.error_annotation.is_none());
+    assert!(accepted.condition.details().diagnostic.is_none());
     harness
         .state
         .task_service

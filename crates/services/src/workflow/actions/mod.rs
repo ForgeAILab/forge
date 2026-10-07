@@ -1,5 +1,6 @@
 pub(crate) mod carry;
 mod common;
+pub(crate) use common::review_ci_steps;
 mod dispatch;
 mod gates;
 mod lifecycle;
@@ -8,7 +9,6 @@ mod review;
 mod subtasks;
 
 pub use carry::CarryReviewAuthority;
-pub(crate) use common::review_ci_steps;
 pub use dispatch::{DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder};
 pub use gates::{
     AutoCascadeOnUnassignedRole, CheckRetryBudget, DependencyGate, RequireCleanWorktree,

@@ -43,7 +43,7 @@ pub async fn create_task(
 }
 
 // Bump when the derived task-list projection changes across deployments.
-const TASK_LIST_PROJECTION_VERSION: u32 = 1;
+const TASK_LIST_PROJECTION_VERSION: u32 = 2;
 
 pub async fn list_tasks(
     State(state): State<AppState>,

@@ -2721,6 +2721,11 @@ fn task_actions_mcp_reads_share_offers_and_ignore_stored_lists() {
                     .bind(json!({"kind":"retry_exhausted","reason":"spent","recovery_actions":["return_to_implementation"]}).to_string())
                     .bind(&task.id).execute(state.db.pool()).await.unwrap();
             }
+            state
+                .db
+                .check_task_conditions_of(std::slice::from_ref(&task.id))
+                .await
+                .unwrap();
             let offers = state
                 .task_service
                 .task_action_offers(
@@ -2736,7 +2741,12 @@ fn task_actions_mcp_reads_share_offers_and_ignore_stored_lists() {
                 result["workflow_exception"]["actions"],
                 result["available_actions"]
             );
-            assert!(result["error_annotation"].get("recovery_actions").is_none());
+            assert!(result.get("error_annotation").is_none());
+            assert!(result.get("blocked").is_none());
+            assert!(result.get("failed").is_none());
+            assert!(result["condition"]["details"]["diagnostic"]
+                .get("recovery_actions")
+                .is_none());
             assert_eq!(result["version"], offers.version);
         }
     });

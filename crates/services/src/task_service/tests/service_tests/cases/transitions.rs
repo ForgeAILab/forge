@@ -521,7 +521,7 @@ async fn readiness_and_offers_wait_while_review_entry_hooks_run() {
             .map(|offer| offer.action.verb().to_owned())
             .collect::<Vec<_>>()
     };
-    assert!(service.is_task_awaiting_human(&task).await.unwrap());
+    assert!(service.is_awaiting_human(&task.id).await.unwrap());
     let settled = offers(
         &service
             .task_action_snapshot(&task.id, &actor)
@@ -555,7 +555,7 @@ async fn readiness_and_offers_wait_while_review_entry_hooks_run() {
     .await
     .unwrap();
     assert!(
-        !service.is_task_awaiting_human(&task).await.unwrap(),
+        !service.is_awaiting_human(&task.id).await.unwrap(),
         "a stale Review is not a decision point while entry checks run"
     );
     let running = offers(
@@ -575,7 +575,10 @@ async fn readiness_and_offers_wait_while_review_entry_hooks_run() {
         .execute(db.pool())
         .await
         .unwrap();
-    assert!(service.is_task_awaiting_human(&task).await.unwrap());
+    db.check_task_conditions_of(std::slice::from_ref(&task.id))
+        .await
+        .unwrap();
+    assert!(service.is_awaiting_human(&task.id).await.unwrap());
     sqlx::query(
         "UPDATE task_step SET expected_epoch = expected_epoch + 1, status = 'done' WHERE id = ?",
     )
@@ -583,5 +586,8 @@ async fn readiness_and_offers_wait_while_review_entry_hooks_run() {
     .execute(db.pool())
     .await
     .unwrap();
-    assert!(service.is_task_awaiting_human(&task).await.unwrap());
+    db.check_task_conditions_of(std::slice::from_ref(&task.id))
+        .await
+        .unwrap();
+    assert!(service.is_awaiting_human(&task.id).await.unwrap());
 }

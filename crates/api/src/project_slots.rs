@@ -132,6 +132,11 @@ mod tests {
 
     async fn mutate(db: &db::SqliteDb, sql: &str) {
         sqlx::query(sql).execute(db.pool()).await.unwrap();
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM task")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        db.check_task_conditions_of(&ids).await.unwrap();
     }
 
     #[tokio::test]
@@ -139,7 +144,7 @@ mod tests {
         let (db, memo) = fixture().await;
         mutate(&db, "INSERT INTO task (id, project_id, title, status, created_at, updated_at) VALUES ('wait', 'p', 'Wait', 'in_progress', 'now', 'now')").await;
         check(&db, &memo, "p", (5, 1, 0, 0)).await;
-        mutate(&db, "UPDATE task SET metadata_json = json_object('dispatch_disposition', json_object('capability', 'machine_capacity', 'task_version', version)) WHERE id = 'wait'").await;
+        mutate(&db, "UPDATE task SET metadata_json = json_object('dispatch_disposition', json_object('task_version', version, 'capability', 'machine_capacity', 'blocker_digest', 'capacity', 'recorded_at', '2026-10-07T00:00:00Z', 'safe_message', 'machine_at_capacity: waiting for a run slot')) WHERE id = 'wait'").await;
         check(&db, &memo, "p", (5, 0, 1, 0)).await;
         mutate(&db, "UPDATE task SET metadata_json = json_remove(metadata_json, '$.dispatch_disposition') WHERE id = 'wait'").await;
         check(&db, &memo, "p", (5, 1, 0, 0)).await;

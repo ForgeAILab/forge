@@ -1,3 +1,5 @@
+import type { TaskCondition } from './bindings/TaskCondition'
+export type { TaskCondition } from './bindings/TaskCondition'
 import type { ReviewConformance } from './bindings/ReviewConformance'
 export type { RepoLocationOwnerKind } from './bindings/RepoLocationOwnerKind'
 export type { RepoLocationKind } from './bindings/RepoLocationKind'
@@ -147,31 +149,7 @@ export interface BlockingArtifact {
   log_path: string | null
 }
 
-export type FailureKind =
-  | 'merge_conflict'
-  | 'target_repo_dirty'
-  | 'dirty_worktree'
-  | 'ci_failed'
-  | 'review_gate_failed'
-  | 'review_budget_exhausted'
-  | 'review_blocked'
-  | 'review_needs_owner'
-  | 'environment_not_ready'
-  | 'retry_exhausted'
-  | 'merge_fix_budget_exhausted'
-  | 'workflow_guard_rejected'
-  | 'internal_command_failed'
-  | 'executor_failed'
-  | 'workspace_failed'
-  | 'workspace_reset_required'
-  | 'workspace_error'
-  | 'before_work_hook_timeout'
-  | 'before_work_hook_failed'
-  | 'max_turns_exceeded'
-  | 'manual_stop'
-  | 'recovery_required'
-  | 'executor_unavailable'
-  | 'unknown'
+export type FailureKind = import('./bindings/FailureKind').FailureKind
 
 export interface TaskBlockingAnnotation {
   type: FailureKind
@@ -183,8 +161,6 @@ export interface TaskBlockingAnnotation {
   message: string | null
   hook?: Record<string, unknown> | null
 }
-
-export type TaskAnnotation = TaskBlockingAnnotation | Record<string, unknown>
 
 export interface ReviewConfig {
   conformance_checks?: import('./bindings/ConformanceCheck').ConformanceCheck[]
@@ -568,9 +544,7 @@ export interface Task {
   retry_limits?: Record<string, number>
   available_actions?: Offer[]
   awaiting_human?: boolean
-  error_annotation?: TaskAnnotation | null
-  blocked?: InterruptionMetadata | null
-  failed?: InterruptionMetadata | null
+  condition: TaskCondition
   workflow_health?: WorkflowHealthSummary | null
   workflow_exception?: WorkflowExceptionSummary | null
   external_issue_number?: number | null
@@ -617,9 +591,7 @@ export interface TaskListItem {
   role_assignments: TaskRoleAssignmentResponse[]
   remaining_retries: Record<string, number>
   retry_limits: Record<string, number>
-  error_annotation: TaskAnnotation | null
-  blocked: InterruptionMetadata | null
-  failed: InterruptionMetadata | null
+  condition: TaskCondition
   workflow_health: WorkflowHealthSummary | null
   workflow_exception: WorkflowExceptionSummary | null
   review_passed_at: string | null

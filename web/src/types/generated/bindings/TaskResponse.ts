@@ -3,11 +3,10 @@ import type { CanonicalPhase } from "./CanonicalPhase";
 import type { EffectiveCoderSource } from "./EffectiveCoderSource";
 import type { ExecutionBlockerProjection } from "./ExecutionBlockerProjection";
 import type { ExecutionEvidenceSummary } from "./ExecutionEvidenceSummary";
-import type { InterruptionMetadata } from "./InterruptionMetadata";
 import type { Offer } from "./Offer";
 import type { PlanArtifactDetail } from "./PlanArtifactDetail";
 import type { PlanProgressSummary } from "./PlanProgressSummary";
-import type { TaskAnnotation } from "./TaskAnnotation";
+import type { TaskCondition } from "./TaskCondition";
 import type { TaskExecutionObservability } from "./TaskExecutionObservability";
 import type { TaskPlacementDiagnostic } from "./TaskPlacementDiagnostic";
 import type { TaskRoleAssignmentResponse } from "./TaskRoleAssignmentResponse";
@@ -21,7 +20,7 @@ export type TaskResponse = { placement_diagnostics: Array<TaskPlacementDiagnosti
 /**
  * Gate state keys plus non-gate budget kinds; all values are authoritative remaining allowances.
  */
-remaining_retries: Record<string, number>, retry_limits: Record<string, number>, available_actions: Array<Offer>, error_annotation: TaskAnnotation | null, blocked: InterruptionMetadata | null, failed: InterruptionMetadata | null, workflow_health: WorkflowHealthSummary | null, workflow_exception: WorkflowExceptionSummary | null, execution_observability: TaskExecutionObservability, task_state_config: Record<string, unknown> | null, review_passed_at: string | null, archived_at: string | null, workspace: WorkspaceResponse | null, placement: WorkspacePlacementResponse | null, plan_progress: PlanProgressSummary | null, plan_artifact: PlanArtifactDetail | null, external_issue_number: bigint | null, external_issue_url: string | null, 
+remaining_retries: Record<string, number>, retry_limits: Record<string, number>, available_actions: Array<Offer>, condition: TaskCondition, workflow_health: WorkflowHealthSummary | null, workflow_exception: WorkflowExceptionSummary | null, execution_observability: TaskExecutionObservability, task_state_config: Record<string, unknown> | null, review_passed_at: string | null, archived_at: string | null, workspace: WorkspaceResponse | null, placement: WorkspacePlacementResponse | null, plan_progress: PlanProgressSummary | null, plan_artifact: PlanArtifactDetail | null, external_issue_number: bigint | null, external_issue_url: string | null, 
 /**
  * Canonical attempt/execution/commit evidence for this Task (D17, F12).
  * Progress language everywhere else must derive from this value; it can

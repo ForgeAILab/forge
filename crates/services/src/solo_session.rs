@@ -1790,39 +1790,29 @@ fn turn_snapshot(job: &AgentChatTurnJob) -> SoloTurnSnapshot {
 }
 
 fn task_interruption(task: &Task) -> Option<SoloTaskInterruption> {
-    if let Some(raw) = task.error_annotation.as_deref() {
-        if raw.chars().count() <= SOLO_MAX_JSON_CHARS {
-            if let Ok(api_types::TaskAnnotation::Blocking(annotation)) =
-                serde_json::from_str::<api_types::TaskAnnotation>(raw)
-            {
-                return Some(SoloTaskInterruption {
-                    failure_kind: Some(annotation.annotation_type),
-                    reason: safe_optional_diagnostic(
-                        annotation
-                            .message
-                            .as_deref()
-                            .or(Some(annotation.blocking_reason.as_str())),
-                    ),
-                    source: None,
-                    execution_id: annotation
-                        .blocked_execution_id
-                        .as_deref()
-                        .map(safe_identifier),
-                });
-            }
-        }
+    let read = task.condition.read();
+    if let Some(annotation) = read.diagnostic {
+        return Some(SoloTaskInterruption {
+            failure_kind: Some(annotation.annotation_type),
+            reason: safe_optional_diagnostic(
+                annotation
+                    .message
+                    .as_deref()
+                    .or(Some(annotation.blocking_reason.as_str())),
+            ),
+            source: None,
+            execution_id: annotation
+                .blocked_execution_id
+                .as_deref()
+                .map(safe_identifier),
+        });
     }
-    task.blocked_json
-        .as_deref()
-        .or(task.failed_json.as_deref())
-        .filter(|raw| raw.chars().count() <= SOLO_MAX_JSON_CHARS)
-        .and_then(|raw| serde_json::from_str::<api_types::InterruptionMetadata>(raw).ok())
-        .map(|metadata| SoloTaskInterruption {
-            failure_kind: metadata.kind,
-            reason: safe_optional_diagnostic(Some(metadata.reason.as_str())),
-            source: metadata.source.and_then(|source| safe_diagnostic(&source)),
-            execution_id: metadata.execution_id.as_deref().map(safe_identifier),
-        })
+    read.interruption.map(|metadata| SoloTaskInterruption {
+        failure_kind: metadata.kind,
+        reason: safe_optional_diagnostic(Some(metadata.reason.as_str())),
+        source: metadata.source.and_then(|source| safe_diagnostic(&source)),
+        execution_id: metadata.execution_id.as_deref().map(safe_identifier),
+    })
 }
 
 fn execution_snapshot(execution: &Execution) -> SoloTaskExecutionSnapshot {
@@ -2617,6 +2607,72 @@ fn solo_review_action(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn solo_condition_projection_ignores_legacy_columns_for_all_seven_kinds() {
+        let e = db::ConditionEvidence::default();
+        let reason = db::ParkReason::Held {
+            actor: "user".into(),
+        };
+        for c in [
+            db::TaskCondition::Clear {
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Entering {
+                state: "review".into(),
+                epoch: 1,
+                step_id: "step".into(),
+                phase: "checks".into(),
+                since: "now".into(),
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Running {
+                execution_id: "run".into(),
+                role: "coder".into(),
+                epoch: 1,
+                since: "now".into(),
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Deferred {
+                until: None,
+                reason: db::RetryCause::Legacy,
+                resume: db::ConditionContinuation::Reconcile,
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Parked {
+                primary: reason.clone(),
+                additional: vec![],
+                resume: db::ConditionContinuation::Reconcile,
+                since: None,
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Failed {
+                failure: reason,
+                additional: vec![],
+                resume: db::ConditionContinuation::Reconcile,
+                since: None,
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Settled {
+                outcome: db::TerminalOutcome::Completed,
+                evidence: e,
+            },
+        ] {
+            let mut task = crate::task_actions::tests::snapshot("in_progress", None).task;
+            task.condition = c;
+            let expected = serde_json::to_value(super::task_interruption(&task)).unwrap();
+            task.error_annotation = Some(
+                serde_json::json!({"type":"workspace_error","message":"legacy poison"}).to_string(),
+            );
+            task.blocked_json =
+                Some(serde_json::json!({"reason":"legacy poison","created_at":"now"}).to_string());
+            task.failed_json = task.blocked_json.clone();
+            assert_eq!(
+                expected,
+                serde_json::to_value(super::task_interruption(&task)).unwrap()
+            );
+        }
+    }
+
     use super::*;
     #[test]
     fn review_decisions_preserve_typed_guidance_and_reason() {

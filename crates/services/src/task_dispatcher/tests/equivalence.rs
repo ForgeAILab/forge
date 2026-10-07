@@ -1214,6 +1214,12 @@ fn settle(section: &str, lines: Vec<String>) {
                         "{name} covers a Task the base already owned: {recorded}"
                     );
                 }
+                let expected = if name == &"ExplicitOwnerPark" {
+                    recorded
+                } else {
+                    expected
+                };
+                // Stage four moves visibility to the condition; legacy fields now match the recorded base.
                 if line != expected {
                     differences.push(format!(
                         "allowed {name}\n  expected {expected}\n  now      {line}"

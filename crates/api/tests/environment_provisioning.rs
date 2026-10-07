@@ -1478,14 +1478,20 @@ async fn initial_unverified_dispatch_is_stable_until_eligibility_changes() {
         .unwrap();
     let states =
         json!({"in_progress":{"kind":"active","owns_work":true},"todo":{"kind":"initial"}});
-    // Exclude annotation blockers: the environment_wait marker itself parks
-    // active Tasks in both slot queries, without another scan rewriting it.
+    fixture
+        .harness
+        .state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&fixture.task))
+        .await
+        .unwrap();
+    // The recorded environment wait parks the active Task in both slot
+    // queries, without another scan rewriting it.
     let slots = TaskRepo::count_project_slots(
         &*fixture.harness.state.db,
         &fixture.project,
         &states.to_string(),
         "{}",
-        "[]",
     )
     .await
     .unwrap();
@@ -1494,7 +1500,6 @@ async fn initial_unverified_dispatch_is_stable_until_eligibility_changes() {
         &*fixture.harness.state.db,
         &json!({fixture.project.clone():states}).to_string(),
         "{}",
-        "[]",
     )
     .await
     .unwrap();

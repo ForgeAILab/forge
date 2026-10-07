@@ -68,7 +68,7 @@ export function WorkflowExceptionPanel({
 }) {
   const exception = task.workflow_exception
   if (!exception) return null
-  const failure = task.failed != null
+  const failure = task.condition.details.failed
   return (
     <section className="space-y-3 rounded-lg border border-warning/40 bg-warning/10 p-4">
       <h3 className="text-sm font-semibold">{workflowLabelFromKind(exception.type)}</h3>

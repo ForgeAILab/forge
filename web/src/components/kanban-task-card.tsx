@@ -12,7 +12,12 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/cn'
-import { getBlockingAnnotation, getStateColors, taskHasError } from '@/lib/workflow-utils'
+import {
+  blockedInterruption,
+  getBlockingAnnotation,
+  getStateColors,
+  taskHasError,
+} from '@/lib/workflow-utils'
 import type { Agent } from '@/types/generated'
 import type { TaskListItem as Task } from '@/types/generated'
 
@@ -70,7 +75,7 @@ export function KanbanTaskCard({
     coderAssignment?.assignee_type === 'user' ? (coderAssignment.assignee_id ?? 'manual') : null
   const coderIsHuman = coderAssignment?.assignee_type === 'user'
   const pausedAnnotation = getBlockingAnnotation(task)
-  const blockedReason = task.blocked?.reason ?? pausedAnnotation?.blocking_reason
+  const blockedReason = blockedInterruption(task)?.reason ?? pausedAnnotation?.blocking_reason
   const isPaused = task.status !== 'cancelled' && Boolean(blockedReason)
   const hasActiveError = taskHasError(task)
   return (

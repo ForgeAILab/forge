@@ -1,4 +1,5 @@
 mod condition_matrix;
+mod condition_parity_stored_rows;
 mod condition_scenarios;
 mod placement_wait_actions;
 use super::*;

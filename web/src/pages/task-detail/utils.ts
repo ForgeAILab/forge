@@ -66,7 +66,7 @@ export function getLatestReview(reviews: Review[]): Review | undefined {
 export function getErrorInfo(
   task: Task,
 ): { tone: 'timeout' | 'crash' | 'workspace'; message: string } | undefined {
-  const annotation = task.error_annotation as Record<string, unknown> | null | undefined
+  const annotation = task.condition.details.diagnostic as Record<string, unknown> | null | undefined
   if (!annotation) return undefined
   // Annotations with blocking_reason are rendered by TaskBlockingBanner; skip here to avoid duplication.
   if (typeof annotation.blocking_reason === 'string' && annotation.blocking_reason) return undefined
