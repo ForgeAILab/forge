@@ -100,15 +100,44 @@ async function setup(page: Page, running = false, board = false) {
     effective_coder_source: null,
     remaining_retries: {},
     available_actions: running ? [] : offers,
-    error_annotation: null,
-    blocked: null,
-    failed: running
-      ? null
+    condition: running
+      ? {
+          kind: 'running',
+          execution_id: 'role-run',
+          role: 'coder',
+          epoch: 0,
+          since: '2026-10-02T00:00:00Z',
+          details: {
+            failure_kind: null,
+            diagnostic: null,
+            interruption: null,
+            failed: false,
+            blocked: false,
+            human_wait: false,
+            entry_wait: false,
+          },
+        }
       : {
-          kind: 'review_failed',
-          reason: 'Missing contract coverage',
-          execution_id: null,
-          metadata: {},
+          kind: 'failed',
+          failure: { kind: 'failure', failure_kind: 'review_gate_failed' },
+          additional: [],
+          resume: { kind: 'reconcile' },
+          since: '2026-10-02T00:00:00Z',
+          details: {
+            failure_kind: 'review_gate_failed',
+            diagnostic: null,
+            interruption: {
+              reason: 'Missing contract coverage',
+              created_at: '2026-10-02T00:00:00Z',
+              kind: 'review_gate_failed',
+              execution_id: null,
+              details: {},
+            },
+            failed: true,
+            blocked: false,
+            human_wait: true,
+            entry_wait: false,
+          },
         },
     workflow_health: null,
     workflow_exception: running

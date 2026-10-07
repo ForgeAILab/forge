@@ -7818,6 +7818,10 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
         MoveTaskPersistence::Replayed(_) => panic!("first move must commit"),
     };
     assert!(moved.blocked_json.is_none());
+    assert!(
+        !crate::material_blocker(&moved.condition).requires_intervention,
+        "the returned Task states the condition the move produced"
+    );
 
     let events = DomainEventRepo::list_events_after(&db, 0, 100)
         .await

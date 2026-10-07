@@ -2095,6 +2095,12 @@ async fn dispatch_role_agent_uses_dirty_worktree_prompt_from_task_annotation() {
     .execute(harness.ctx.db.pool())
     .await
     .expect("dirty worktree annotation persists");
+    harness
+        .ctx
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&harness.ctx.task_id))
+        .await
+        .expect("the stored condition follows the raw write");
 
     let dispatch_result = DispatchRoleAgent.execute(&harness.ctx).await;
     assert!(

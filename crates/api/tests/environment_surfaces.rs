@@ -162,6 +162,12 @@ async fn task_response_exposes_recorded_environment_and_capacity_waits() {
     )
     .await;
     sqlx::query("UPDATE task SET metadata_json=? WHERE id=?").bind(json!({"environment_wait":{"kind":"environment_not_ready","machine":{"owner_kind":"server"},"checks":["cargo"]},"deferred_dispatch":{"kind":"environment_probe_pending"},"dispatch_disposition":{"task_version":task.version-1,"capability":"machine_capacity","blocker_digest":"test","recorded_at":db::now_rfc3339(),"safe_message":"Machine run capacity reached"}}).to_string()).bind(&task.id).execute(harness.state.db.pool()).await.unwrap();
+    harness
+        .state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&task.id))
+        .await
+        .unwrap();
     let read: api_types::TaskResponse = common::empty_request(
         &harness.app,
         Method::GET,
@@ -195,6 +201,12 @@ async fn task_response_exposes_recorded_environment_and_capacity_waits() {
             .bind(metadata.to_string())
             .bind(&task.id)
             .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+        harness
+            .state
+            .db
+            .check_task_conditions_of(std::slice::from_ref(&task.id))
             .await
             .unwrap();
         let response: api_types::TaskResponse = common::empty_request(

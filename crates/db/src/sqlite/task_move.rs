@@ -212,17 +212,6 @@ impl TaskBoardRepo for SqliteDb {
             });
         }
 
-        let updated_task_row =
-            sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
-                .bind(&input.task_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        let updated_task = map_task(updated_task_row)?;
-        if task.blocked_json != updated_task.blocked_json {
-            let interruption_event = CreateDomainEvent::task_interruption_changed(&updated_task);
-            DomainEventRepo::append_event_in_tx(self, &mut tx, &interruption_event).await?;
-        }
-
         let transition_input = CreateTransitionLog {
             id: input.transition_log_id.clone(),
             task_id: input.task_id.clone(),
@@ -240,6 +229,26 @@ impl TaskBoardRepo for SqliteDb {
             crate::budget::fresh_entry(&mut tx, &input.task_id, &input.transition_log_id).await?;
         }
         insert_transition_log(&mut tx, &transition_input, input.triggered_by.is_owner()).await?;
+        if let Some(step) = &input.post_commit_step {
+            crate::TaskStepRepo::enqueue_step_in_tx(self, &mut tx, step).await?;
+        }
+        // State the entry after its receipt and hooks step exist, even for a
+        // same-status reorder.
+        crate::task_condition::produce(&mut tx, &input.task_id, crate::ConditionChange::Entry)
+            .await?;
+        // Read the Task only now: the returned Task and the interruption
+        // event both state the condition this move produced, never the one
+        // stored before the block was cleared.
+        let updated_task_row =
+            sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+                .bind(&input.task_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let updated_task = map_task(updated_task_row)?;
+        if task.blocked_json != updated_task.blocked_json {
+            let interruption_event = CreateDomainEvent::task_interruption_changed(&updated_task);
+            DomainEventRepo::append_event_in_tx(self, &mut tx, &interruption_event).await?;
+        }
         let transition_event = CreateDomainEvent::task_transition(
             transition_input.id.clone(),
             transition_input.task_id.clone(),
@@ -280,13 +289,6 @@ impl TaskBoardRepo for SqliteDb {
         .bind(&input.operation_id)
         .execute(&mut *tx)
         .await?;
-        if let Some(step) = &input.post_commit_step {
-            crate::TaskStepRepo::enqueue_step_in_tx(self, &mut tx, step).await?;
-        }
-        // State the entry after its receipt and hooks step exist, even for a
-        // same-status reorder.
-        crate::task_condition::produce(&mut tx, &input.task_id, crate::ConditionChange::Entry)
-            .await?;
         tx.commit().await?;
 
         Ok(MoveTaskPersistence::Committed {
