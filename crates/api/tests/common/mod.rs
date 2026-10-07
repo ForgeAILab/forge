@@ -803,6 +803,61 @@ impl Drop for TestDir {
 
 /// Tests explicitly place this version in the command body. The transport
 /// helper never repairs missing command fields.
+/// Plan 3.1 stage 5a: an ordinary owner action on a healthy Task never
+/// leaves it parked as unreadable. The stored condition decodes, names no
+/// unreadable-condition park, the public Task does not report one, and the
+/// stored condition is what the background check would write.
+pub async fn assert_condition_readable(
+    state: &api::AppState,
+    app: &Router,
+    task_id: &str,
+    after: &str,
+) {
+    let stored = state
+        .db
+        .task_condition(task_id)
+        .await
+        .unwrap_or_else(|error| panic!("after {after}: stored condition does not decode: {error}"));
+    let unreadable = |reason: &db::ParkReason| {
+        matches!(
+            reason,
+            db::ParkReason::UnknownCondition { source, .. }
+                if source.field == db::LegacyConditionField::ConditionJson
+        )
+    };
+    assert!(
+        !stored
+            .reasons()
+            .chain(stored.evidence().observations.iter())
+            .any(unreadable),
+        "after {after}: {stored:?}"
+    );
+    let task: api_types::TaskResponse = parse_response(
+        raw_empty_request(app, Method::GET, &format!("/api/v1/tasks/{task_id}")).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        task.condition
+            .details()
+            .diagnostic
+            .as_ref()
+            .is_none_or(|diagnostic| diagnostic.blocking_reason != "unknown_condition"),
+        "after {after}: {:?}",
+        task.condition
+    );
+    assert!(
+        !state
+            .db
+            .task_condition_violations()
+            .await
+            .unwrap()
+            .iter()
+            .any(|id| id == task_id),
+        "after {after}: stored condition disagrees with the Task's durable state"
+    );
+}
+
 pub async fn task_action_version(app: &Router, uri: &str) -> i64 {
     let response = raw_empty_request(app, Method::GET, uri).await;
     let offers: api_types::TaskActionsResponse = parse_response(response, StatusCode::OK).await;

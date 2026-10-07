@@ -90,6 +90,15 @@ fn blocking(c: &TaskCondition, barrier_holds: bool) -> bool {
     {
         return true;
     }
+    // A condition its writer stated carries no legacy copy: the same three
+    // holds are its typed presentation.
+    if evidence.stated
+        && evidence.presentation.as_ref().is_some_and(|read| {
+            read.interruption_present || read.hard_failure || (barrier_holds && read.entry_recorded)
+        })
+    {
+        return true;
+    }
     match c {
         TaskCondition::Failed { .. } => true,
         TaskCondition::Parked {
@@ -147,6 +156,11 @@ impl TaskDispatcher {
         // the row read in this snapshot is not: hold exactly where the legacy
         // fields hold, and leave the stored copy to be repaired.
         let stale = |stored: &TaskCondition, task: &db::Task| {
+            // A writer stated this condition in the transaction of its write:
+            // it is not a copy of the legacy fields and cannot lag them.
+            if stored.evidence().stated {
+                return None;
+            }
             let legacy = db::map_legacy_condition(&db::LegacyConditionInput::from(task));
             let (stored, fresh) = (stored.evidence(), legacy.evidence());
             (stored.error_annotation != fresh.error_annotation
@@ -548,6 +562,35 @@ impl TaskDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A condition its writer stated carries no legacy copy; the dispatcher
+    /// holds on its typed presentation exactly where it held on the copies.
+    #[test]
+    fn a_stated_condition_holds_on_its_typed_presentation() {
+        for field in ["blocked", "failed", "entry"] {
+            let mut read = db::ConditionRead::default();
+            match field {
+                "blocked" => read.interruption_present = true,
+                "failed" => read.hard_failure = true,
+                _ => read.entry_recorded = true,
+            }
+            let mut evidence = db::ConditionEvidence {
+                presentation: Some(read),
+                stated: true,
+                ..Default::default()
+            };
+            let condition = |evidence: db::ConditionEvidence| TaskCondition::Clear { evidence };
+            assert!(blocking(&condition(evidence.clone()), true), "{field}");
+            assert_eq!(
+                blocking(&condition(evidence.clone()), false),
+                field != "entry",
+                "{field}: an unread entry record does not hold"
+            );
+            // The same presentation on a mapped condition is not a hold by
+            // itself: there the legacy copies decide, as before.
+            evidence.stated = false;
+            assert!(!blocking(&condition(evidence), true), "{field}");
+        }
+    }
     #[test]
     fn legacy_interruption_and_barrier_holds_survive_an_owned_condition() {
         for field in ["blocked", "failed", "entry"] {

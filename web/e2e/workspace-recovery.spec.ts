@@ -4,7 +4,42 @@ import { serverPlacement } from '../src/test-utils/placement'
 const MOCK_PROJECT_ID = 'proj-test-ws'
 const MOCK_TASK_ID = 'task-test-ws'
 
-function mockTask(overrides: Record<string, unknown> = {}) {
+type Diagnostic = { type: string; message: string }
+
+/** The public Task condition for a Task parked on a workspace diagnostic. */
+function mockCondition(diagnostic: Diagnostic | null) {
+  const details = {
+    failure_kind: diagnostic?.type ?? null,
+    diagnostic: diagnostic
+      ? {
+          type: diagnostic.type,
+          blocking_reason: '',
+          blocked_by: null,
+          blocked_at: null,
+          blocked_execution_id: null,
+          artifact: null,
+          message: diagnostic.message,
+        }
+      : null,
+    interruption: null,
+    failed: false,
+    blocked: false,
+    human_wait: false,
+    entry_wait: false,
+  }
+  return diagnostic
+    ? {
+        kind: 'parked',
+        primary: { kind: 'failure', failure_kind: diagnostic.type },
+        additional: [],
+        resume: { kind: 'reconcile' },
+        since: null,
+        details,
+      }
+    : { kind: 'clear', details }
+}
+
+function mockTask(diagnostic: Diagnostic | null = null, overrides: Record<string, unknown> = {}) {
   return {
     id: MOCK_TASK_ID,
     project_id: MOCK_PROJECT_ID,
@@ -18,7 +53,7 @@ function mockTask(overrides: Record<string, unknown> = {}) {
     role_assignments: [],
     remaining_retries: {},
     placement: null,
-    error_annotation: null,
+    condition: mockCondition(diagnostic),
     task_state_config: null,
     review_passed_at: null,
     version: 1,
@@ -34,6 +69,7 @@ function mockProject() {
     name: 'Test Project',
     repo_id: 'repo-1',
     workflow_definition: '',
+    slots: { active: 0, limit: 0, parked: 1, queued: 0 },
     created_at: '2026-04-22T00:00:00Z',
     updated_at: '2026-04-22T00:00:00Z',
   }
@@ -119,10 +155,8 @@ async function setupMockRoutes(page: Page, task: ReturnType<typeof mockTask>) {
 test.describe('workspace recovery banner (mocked)', () => {
   test('shows workspace reset required banner with reset button', async ({ page }) => {
     const task = mockTask({
-      error_annotation: {
-        type: 'workspace_reset_required',
-        message: 'workspace reset required: task branch no longer exists',
-      },
+      type: 'workspace_reset_required',
+      message: 'workspace reset required: task branch no longer exists',
     })
     await setupMockRoutes(page, task)
 
@@ -136,10 +170,8 @@ test.describe('workspace recovery banner (mocked)', () => {
 
   test('shows confirmation step when Reset Workspace is clicked', async ({ page }) => {
     const task = mockTask({
-      error_annotation: {
-        type: 'workspace_reset_required',
-        message: 'workspace reset required: task branch no longer exists',
-      },
+      type: 'workspace_reset_required',
+      message: 'workspace reset required: task branch no longer exists',
     })
     await setupMockRoutes(page, task)
 
@@ -158,10 +190,8 @@ test.describe('workspace recovery banner (mocked)', () => {
 
   test('cancel hides confirmation and restores reset button', async ({ page }) => {
     const task = mockTask({
-      error_annotation: {
-        type: 'workspace_reset_required',
-        message: 'workspace reset required: branch lost',
-      },
+      type: 'workspace_reset_required',
+      message: 'workspace reset required: branch lost',
     })
     await setupMockRoutes(page, task)
 
@@ -183,12 +213,10 @@ test.describe('workspace recovery banner (mocked)', () => {
   test('confirm reset calls API and shows success toast', async ({ page }) => {
     let resetCalled = false
     const task = mockTask({
-      error_annotation: {
-        type: 'workspace_reset_required',
-        message: 'workspace reset required: branch lost',
-      },
+      type: 'workspace_reset_required',
+      message: 'workspace reset required: branch lost',
     })
-    const clearedTask = mockTask({ error_annotation: null, version: 2 })
+    const clearedTask = mockTask(null, { version: 2 })
 
     await setupMockRoutes(page, task)
 
@@ -236,10 +264,8 @@ test.describe('workspace recovery banner (mocked)', () => {
 
   test('workspace_error banner shows without reset button', async ({ page }) => {
     const task = mockTask({
-      error_annotation: {
-        type: 'workspace_error',
-        message: 'workspace error: repo directory not found',
-      },
+      type: 'workspace_error',
+      message: 'workspace error: repo directory not found',
     })
     await setupMockRoutes(page, task)
 
@@ -269,8 +295,8 @@ test.describe('workspace recovery with demo data', () => {
     expect(tasksResp.ok()).toBeTruthy()
     const tasks = await tasksResp.json()
     const wsResetTask = tasks.items?.find(
-      (t: { error_annotation?: { type?: string } }) =>
-        t.error_annotation?.type === 'workspace_reset_required',
+      (t: { condition?: { details?: { diagnostic?: { type?: string } | null } } }) =>
+        t.condition?.details?.diagnostic?.type === 'workspace_reset_required',
     )
     test.skip(!wsResetTask, 'No workspace_reset_required task in demo data')
 
@@ -297,8 +323,8 @@ test.describe('workspace recovery with demo data', () => {
     expect(tasksResp.ok()).toBeTruthy()
     const tasks = await tasksResp.json()
     const wsErrorTask = tasks.items?.find(
-      (t: { error_annotation?: { type?: string } }) =>
-        t.error_annotation?.type === 'workspace_error',
+      (t: { condition?: { details?: { diagnostic?: { type?: string } | null } } }) =>
+        t.condition?.details?.diagnostic?.type === 'workspace_error',
     )
     test.skip(!wsErrorTask, 'No workspace_error task in demo data')
 

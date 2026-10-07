@@ -21,10 +21,11 @@ pub use task_condition::{
     legacy_annotation_blocks, map_legacy_condition, material_blocker, ConditionCapacityScope,
     ConditionChange, ConditionCheckPass, ConditionCheckState, ConditionCheckStatus,
     ConditionContinuation, ConditionEnvironmentKind, ConditionEvidence, ConditionFacts,
-    ConditionRead, ConditionRefusal, ConditionRetry, ConditionSource, ConditionWitness,
-    HumanBoundary, LegacyConditionField, LegacyConditionInput, MaterialBlocker, ParkReason,
-    RetryCause, TaskCondition, TerminalOutcome, UnknownConditionProblem, CONDITION_CHECK_PAGE,
-    EVIDENCE_VALUE_LIMIT, LEGACY_BLOCKING_ANNOTATION_KINDS, MAPPING_REVISION, MAPPING_REVISION_KEY,
+    ConditionRead, ConditionRefusal, ConditionRetry, ConditionSource, ConditionStatement,
+    ConditionWitness, HumanBoundary, LegacyConditionField, LegacyConditionInput, MaterialBlocker,
+    ParkReason, RetryCause, TaskCondition, TerminalOutcome, UnknownConditionProblem,
+    CONDITION_CHECK_PAGE, EVIDENCE_VALUE_LIMIT, LEGACY_BLOCKING_ANNOTATION_KINDS, MAPPING_REVISION,
+    MAPPING_REVISION_KEY,
 };
 mod task_mutation;
 mod task_step;

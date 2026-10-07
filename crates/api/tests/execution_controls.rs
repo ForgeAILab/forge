@@ -867,12 +867,15 @@ async fn fresh_task_retry_queues_replacement_execution() {
     )
     .await;
     assert!(accepted.condition.details().diagnostic.is_none());
+    common::assert_condition_readable(&harness.state, &harness.app, &task.id, "retry").await;
     harness
         .state
         .task_service
         .test_dispatch_task_action(&task.id)
         .await
         .unwrap();
+    common::assert_condition_readable(&harness.state, &harness.app, &task.id, "retry dispatch")
+        .await;
     let executions = ExecutionRepo::list_running_by_task(&*harness.state.db, &task.id)
         .await
         .unwrap();

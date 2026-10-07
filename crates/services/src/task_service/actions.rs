@@ -687,11 +687,11 @@ impl TaskService {
             &*self.db,
             &task.id,
             task.version,
-            Some(
-                json!({"type":"manual_stop", "blocking_reason":reason, "blocked_by":"user",
-                "blocked_at":now, "blocked_execution_id":null})
-                .to_string(),
-            ),
+            // The hold is stated typed, below. This legacy text is the one
+            // rendering of it the operator has always read.
+            Some(db::ConditionStatement::hold_operator_text(
+                "user", reason, &now,
+            )),
             Some(json!({"kind":"manual_stop", "reason":reason, "created_at":now}).to_string()),
             None,
             &now,
@@ -709,6 +709,11 @@ impl TaskService {
                 key: key.to_owned(),
             })
             .collect(),
+            Some(db::ConditionStatement::Hold {
+                actor: "user".to_owned(),
+                reason: reason.to_owned(),
+                at: now.clone(),
+            }),
         )
         .await?;
         self.create_system_comment(&task.id, format!("Task paused by user: {reason}"))
@@ -760,6 +765,7 @@ impl TaskService {
             None,
             Self::workflow_execution_roles(snapshot),
             Vec::new(),
+            Some(db::ConditionStatement::Release),
         )
         .await?;
         self.create_system_comment(
@@ -800,6 +806,7 @@ impl TaskService {
             None,
             Self::workflow_execution_roles(snapshot),
             mutations,
+            None,
         )
         .await?;
         self.create_system_comment(
@@ -1065,7 +1072,7 @@ impl TaskService {
         let updated = TaskRepo::update_recovery_metadata_if_no_running_execution(&*self.db, &task.id, task.version, None, None, None, &now, None, repository_roles, vec![
             db::TaskMetadataMutation::Set { key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(), value: serde_json::to_value(&queued).map_err(|error| ServiceError::invalid_operation(error.to_string()))? },
             db::TaskMetadataMutation::Set { key: "deferred_dispatch".to_owned(), value: json!({ "not_before": now, "reason": "task action queued", "target_state": task.status }) },
-        ]).await?;
+        ], None).await?;
         let updated = if machine_wait {
             crate::deferred_dispatch::record_dispatch_disposition(
                 &self.db,

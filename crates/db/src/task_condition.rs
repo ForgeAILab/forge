@@ -74,6 +74,10 @@ pub struct ConditionEvidence {
     pub witnesses: Vec<ConditionWitness>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<MaterialBlocker>,
+    /// A writer stated this condition from its own intent. Such a condition
+    /// carries none of the legacy copies below.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stated: bool,
     pub error_annotation: Option<String>,
     pub blocked_json: Option<String>,
     pub failed_json: Option<String>,
@@ -253,6 +257,30 @@ impl TaskCondition {
     /// mapping this agrees with what the dispatcher and readers block on.
     pub fn is_blocked(&self) -> bool {
         matches!(self, Self::Parked { .. } | Self::Failed { .. })
+    }
+    /// The condition without the marks of how it was produced: the legacy
+    /// copies a mapped condition carries and the mark a stated one carries.
+    /// A stated condition and the mapping of the fields its writer wrote must
+    /// agree on everything else.
+    pub fn typed(&self) -> Self {
+        let mut typed = self.clone();
+        let evidence = typed.evidence_mut();
+        evidence.stated = false;
+        evidence.error_annotation = None;
+        evidence.blocked_json = None;
+        evidence.failed_json = None;
+        evidence.entry_barrier_json = None;
+        evidence.metadata.clear();
+        evidence.unparsed_metadata = None;
+        typed
+    }
+    /// Whether the stored text `stored` says what `expected` says. A stated
+    /// condition is compared by what it states, not by the legacy copies it
+    /// does not carry.
+    pub(crate) fn stored_agrees(stored: &[u8], expected: &Self, encoded: &str) -> bool {
+        stored == encoded.as_bytes()
+            || serde_json::from_slice::<Self>(stored)
+                .is_ok_and(|stored| stored.evidence().stated && stored.typed() == expected.typed())
     }
 }
 
@@ -1028,6 +1056,7 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
             view.blocked_json,
             view.failed_json,
         ),
+        stated: false,
         error_annotation: view.error_annotation.map(bounded),
         blocked_json: view.blocked_json.map(bounded),
         failed_json: view.failed_json.map(bounded),
@@ -1330,7 +1359,7 @@ impl SqliteDb {
         task_id: &str,
         change: ConditionChange,
     ) -> Result<()> {
-        let Some(produced) = producers::derive(tx, task_id, change, None).await? else {
+        let Some(produced) = producers::derive(tx, task_id, change, None, None).await? else {
             return Ok(());
         };
         if produced.changed {
@@ -1402,8 +1431,8 @@ impl SqliteDb {
             .fetch_one(&mut *connection)
             .await?;
         let facts = ConditionFacts::load(&mut connection, &task.id).await?;
-        let expected = encode(&facts.condition(&LegacyConditionInput::from(task)));
-        if actual != expected {
+        let expected = facts.condition(&LegacyConditionInput::from(task));
+        if !TaskCondition::stored_agrees(actual.as_bytes(), &expected, &encode(&expected)) {
             return Err(DbError::Check(format!(
                 "Task condition invariant failed for {}",
                 task.id
@@ -1423,8 +1452,12 @@ impl SqliteDb {
         for row in &rows {
             let id: String = row.try_get(6)?;
             let facts = ConditionFacts::load(&mut connection, &id).await?;
-            let expected = encode(&facts.condition(&LegacyConditionInput::from_row(row)?));
-            if row.try_get::<Vec<u8>, _>(5)? != expected.as_bytes() {
+            let expected = facts.condition(&LegacyConditionInput::from_row(row)?);
+            if !TaskCondition::stored_agrees(
+                &row.try_get::<Vec<u8>, _>(5)?,
+                &expected,
+                &encode(&expected),
+            ) {
                 violations.push(id);
             }
         }
@@ -1438,17 +1471,21 @@ pub use checks::{
 };
 mod facts;
 mod producers;
+mod statements;
 use facts::legacy_material_blocker;
 pub use facts::{material_blocker, ConditionFacts, ConditionWitness, MaterialBlocker};
 pub use producers::ConditionChange;
 pub(crate) use producers::{
     execution_joined_workspace, metadata_condition, produce, produce_best_effort, produce_children,
-    sql_change, workflow_changed,
+    sql_change, state, workflow_changed,
 };
+pub use statements::ConditionStatement;
 #[cfg(test)]
 mod producer_tests;
 #[cfg(test)]
 mod stage2_tests;
+#[cfg(test)]
+mod statement_tests;
 #[cfg(test)]
 mod tests;
 

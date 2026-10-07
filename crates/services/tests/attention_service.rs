@@ -2798,3 +2798,366 @@ async fn condition_reader_upgrade_keeps_open_incident_and_wake_identity() {
         "one historical event, one unchanged typed replay, exactly one real blocker change"
     );
 }
+
+/// Plan 3.1 stage 5a, Attention continuity. The starting state is what the
+/// deployed build (`9d9b228f`) leaves in the database, not what this build
+/// would write:
+///
+/// - the `task.interruption_changed` event in that build's payload shape
+///   (`crates/db/src/repository.rs:976-982` there: no `condition`, no
+///   `material_blocker`);
+/// - the open incident row with the `details_json` that build's projector
+///   stored (`crates/services/src/attention_service.rs:2562-2584` there),
+///   hard-coded below member by member;
+/// - the wake rows and their stored incident digest. `db::sqlite::agent_wake`
+///   is unchanged since that commit, and the digest stored there is checked
+///   against that build's digest algorithm (`crates/db/src/models.rs:926-1003`
+///   there), restated here so it does not share code with this build.
+///
+/// This build then starts and runs its first projection and wake sweep.
+#[tokio::test]
+async fn incident_stored_by_the_deployed_build_survives_this_builds_first_pass() {
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+
+    fn deployed_strip(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for key in [
+                    "source_event_id",
+                    "source_event_type",
+                    "source_sequence",
+                    "task_version",
+                    "created_at",
+                    "updated_at",
+                    "detected_at",
+                    "last_checked_at",
+                    "next_check_at",
+                    "execution_id",
+                ] {
+                    object.remove(key);
+                }
+                object.values_mut().for_each(deployed_strip);
+            }
+            Value::Array(array) => array.iter_mut().for_each(deployed_strip),
+            _ => {}
+        }
+    }
+    fn sha(value: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+        format!("sha256:{}", hex::encode(hasher.finalize()))
+    }
+    /// `canonical_attention_incident_digest` as `9d9b228f` computes it.
+    async fn deployed_digest(db: &SqliteDb, incident_id: &str) -> String {
+        let (kind, scope_type, scope_id, status, details, action): (String, String, String, String, String, String) =
+            sqlx::query_as("SELECT attention_type,scope_type,scope_id,status,details_json,recommended_action FROM attention_projection WHERE id=?")
+                .bind(incident_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let bounded: String = details.chars().take(8_192).collect();
+        let canonical = serde_json::from_str::<Value>(&bounded)
+            .map(|mut value| {
+                deployed_strip(&mut value);
+                if let Some(task) = value.get_mut("task").and_then(|v| v.as_object_mut()) {
+                    task.remove("task_title");
+                }
+                if let Some(recovery) = value.get_mut("recovery").and_then(|v| v.as_object_mut()) {
+                    recovery.remove("actions");
+                }
+                value.to_string()
+            })
+            .unwrap_or(bounded);
+        let take = |value: &str| value.chars().take(256).collect::<String>();
+        sha(&format!(
+            "type={};scope_type={};scope_id={};status={};details_digest={};recommended_action={}",
+            take(&kind),
+            take(&scope_type),
+            take(&scope_id),
+            take(&status),
+            sha(&canonical),
+            take(&action),
+        ))
+    }
+    async fn count(db: &SqliteDb, sql: &str, bind: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .bind(bind)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+    const INCIDENTS: &str = "SELECT count(*) FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?";
+    const WAKES: &str =
+        "SELECT count(*) FROM domain_event WHERE event_type='agent.wake.admitted' AND scope_id=?";
+    const BLOCKERS: &str = "SELECT count(*) FROM agent_wake_blocker WHERE attention_id=?";
+
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "Deployed incident").await;
+    let task = project_task(&db, &project_id, "Unchanged blocker").await;
+    let reason = "owner must repair the workspace";
+
+    // The Task as the deployed build blocked it. Its condition is what the
+    // upgrade migration restates from those fields.
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET blocked_json=? WHERE id=?")
+        .bind(
+            json!({"kind":"workspace_error","reason":reason,"created_at":now_rfc3339()})
+                .to_string(),
+        )
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    db.sync_condition_in_tx(&mut tx, &task.id).await.unwrap();
+    tx.commit().await.unwrap();
+
+    // The event as the deployed build wrote it.
+    let deployed_interruption = json!({"source":"blocked","kind":"workspace_error","reason":reason,"execution_id":"historical-reporter"});
+    append_attention_event(
+        &db,
+        "task.interruption_changed",
+        &task.id,
+        &project_id,
+        json!({
+            "task_id": task.id,
+            "task_version": task.version,
+            "task_status": task.status,
+            "requires_intervention": true,
+            "interruption": deployed_interruption,
+        }),
+    )
+    .await;
+    let (event_id, event_sequence): (String, i64) = sqlx::query_as(
+        "SELECT id,sequence FROM domain_event WHERE event_type='task.interruption_changed' AND entity_id=?",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+
+    // The wake rows, written by code that is unchanged since the deployed
+    // build. The incident row this pass also writes is replaced below.
+    AttentionService::new(Arc::clone(&db))
+        .project_once(100)
+        .await
+        .unwrap();
+    let incident_id: String = sqlx::query_scalar(
+        "SELECT id FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let written: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>(
+            "SELECT details_json FROM attention_projection WHERE id=?",
+        )
+        .bind(&incident_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The incident row the deployed build stored for that event. The offers
+    // are illustrative, not captured from a deployed database: both builds
+    // remove `recovery.actions` before taking the digest.
+    let deployed_actions = json!([{
+        "action": {"verb": "retry", "reason": null, "fresh_session": null, "refresh_workspace": null, "reset_budget": null, "guidance": null},
+        "accepts": ["guidance"],
+        "allowed_actors": ["owner", "project_agent"],
+        "reason": "blocked",
+        "label": "Retry Task",
+    }]);
+    let deployed_details = json!({
+        "source_event_id": event_id,
+        "source_event_type": "task.interruption_changed",
+        "source_sequence": event_sequence,
+        "entity_type": "task",
+        "entity_id": task.id,
+        "scope_type": written["scope_type"],
+        "scope_id": written["scope_id"],
+        "task": {
+            "task_title": "Unchanged blocker",
+            "task_status": task.status,
+            "task_version": task.version,
+        },
+        "failure_class": null,
+        "retry_decision": null,
+        "retry_action": null,
+        "decision": null,
+        "role": null,
+        "stop_reason": null,
+        "error": null,
+        "interruption": deployed_interruption,
+        "recovery": {
+            "requires_intervention": true,
+            "actions": deployed_actions,
+            "automatic_retry": false,
+        },
+    });
+    // Guard on the hard-coded row: this build writes the same document
+    // except for the two members the builds are known to write differently
+    // (the interruption it strips, and the offers it computes).
+    let mut comparable = written.clone();
+    comparable["interruption"] = deployed_interruption.clone();
+    comparable["recovery"]["actions"] = deployed_actions.clone();
+    comparable["task"]["task_version"] = json!(task.version);
+    assert_eq!(
+        comparable, deployed_details,
+        "the hard-coded deployed incident row"
+    );
+    let deployed_details = deployed_details.to_string();
+    sqlx::query("UPDATE attention_projection SET details_json=? WHERE id=?")
+        .bind(&deployed_details)
+        .bind(&incident_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // The digest the wake rows store is the deployed build's digest of that row.
+    let digest = deployed_digest(&db, &incident_id).await;
+    let latest: Option<String> = sqlx::query_scalar(
+        "SELECT incident_digest FROM agent_wake_attention_latest WHERE attention_id=?",
+    )
+    .bind(&incident_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        latest.as_deref(),
+        Some(digest.as_str()),
+        "stored wake digest"
+    );
+    let stored_blockers: Vec<String> =
+        sqlx::query_scalar("SELECT incident_digest FROM agent_wake_blocker WHERE attention_id=?")
+            .bind(&incident_id)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_blockers,
+        vec![digest.clone()],
+        "stored blocker digest"
+    );
+    let wakes = count(&db, WAKES, &project_id).await;
+    assert_eq!(
+        wakes, 1,
+        "the deployed build admitted one wake for this blocker"
+    );
+
+    // This build starts: its first projection pass and wake sweep.
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(100).await.unwrap();
+    service.sweep_once_at(&now_rfc3339()).await.unwrap();
+    assert_eq!(
+        count(&db, INCIDENTS, &project_id).await,
+        1,
+        "no new incident"
+    );
+    assert_eq!(count(&db, WAKES, &project_id).await, wakes, "no wake");
+    assert_eq!(count(&db, BLOCKERS, &incident_id).await, 1);
+    assert_eq!(
+        deployed_digest(&db, &incident_id).await,
+        digest,
+        "same digest"
+    );
+    let stored: String =
+        sqlx::query_scalar("SELECT details_json FROM attention_projection WHERE id=?")
+            .bind(&incident_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored, deployed_details,
+        "the first pass leaves the stored incident alone"
+    );
+
+    // The first event this build writes about the same, unchanged blocker.
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    DomainEventRepo::append_event(&*db, CreateDomainEvent::task_interruption_changed(&current))
+        .await
+        .unwrap();
+    service.project_once(100).await.unwrap();
+    service.sweep_once_at(&now_rfc3339()).await.unwrap();
+    assert_eq!(
+        count(&db, INCIDENTS, &project_id).await,
+        1,
+        "no new incident"
+    );
+    assert_eq!(count(&db, WAKES, &project_id).await, wakes, "no wake");
+    assert_eq!(count(&db, BLOCKERS, &incident_id).await, 1);
+    assert_eq!(
+        deployed_digest(&db, &incident_id).await,
+        digest,
+        "same digest"
+    );
+
+    // A real blocker change, through the real writer: one new event, the one
+    // incident restated with a new digest, and never more than one wake.
+    // (In this fixture the first wake's turn is still open and no second
+    // wake is admitted, also when swept past the cooldown.)
+    TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: current.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(None),
+            blocked_json: Some(Some(
+                json!({"kind":"workspace_error","reason":"a different workspace blocker","created_at":now_rfc3339()})
+                    .to_string(),
+            )),
+            failed_json: Some(None),
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    service.project_once(100).await.unwrap();
+    service.sweep_once_at(&now_rfc3339()).await.unwrap();
+    assert_eq!(
+        count(&db, INCIDENTS, &project_id).await,
+        1,
+        "one incident, restated"
+    );
+    let changed = deployed_digest(&db, &incident_id).await;
+    assert_ne!(changed, digest, "a real change is a new blocker");
+    let events = count(
+        &db,
+        "SELECT count(*) FROM domain_event WHERE event_type='task.interruption_changed' AND entity_id=?",
+        &task.id,
+    )
+    .await;
+    assert_eq!(
+        events, 3,
+        "deployed event, unchanged restatement, one real change"
+    );
+    // The admitted wake holds a cooldown; sweep past it, twice.
+    for minutes in [10, 20] {
+        service
+            .sweep_once_at(&(Utc::now() + Duration::minutes(minutes)).to_rfc3339())
+            .await
+            .unwrap();
+    }
+    let new_wakes = count(&db, WAKES, &project_id).await - wakes;
+    let new_blockers = count(&db, BLOCKERS, &incident_id).await - 1;
+    println!("after a real change: wakes +{new_wakes}, blockers +{new_blockers}");
+    assert!(
+        new_wakes <= 1 && new_blockers <= 1,
+        "at most one wake for one change"
+    );
+}

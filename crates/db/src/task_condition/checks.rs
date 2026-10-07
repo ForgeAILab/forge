@@ -283,13 +283,14 @@ impl SqliteDb {
             let expected = async {
                 let input = LegacyConditionInput::from_row(row)?;
                 let facts = ConditionFacts::load(&mut reader, &id).await?;
-                Ok::<_, DbError>(encode(&facts.condition(&input)))
+                Ok::<_, DbError>(facts.condition(&input))
             }
             .await;
             match expected {
-                Ok(expected) => {
+                Ok(condition) => {
+                    let expected = encode(&condition);
                     let stored: Vec<u8> = row.try_get(5)?;
-                    if stored != expected.as_bytes() {
+                    if !TaskCondition::stored_agrees(&stored, &condition, &expected) {
                         stale.push((id, row.try_get::<i64, _>(7)?, stored, expected));
                     }
                 }

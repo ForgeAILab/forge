@@ -4068,6 +4068,62 @@ archive boundary before storage removal. Drop/recreate the Task-related triggers
 and indexes around any Task table rebuild; do not lose scheduler dirty generations,
 parks, wait/deadline rows, queue receipts, pending cancellations or immutable events.
 
+### Task condition statements (stage five A, in progress)
+
+Stage five is split. **5a** has no schema change: a writer states the typed
+condition its write causes and keeps writing the legacy field exactly as
+before. **5b** drops the legacy columns and keys once nothing reads them.
+
+A writer states through `db::ConditionStatement`, passed with its repository
+call and applied in the same transaction by `task_condition::state`. The
+statement edits the stored condition: it replaces the reasons its writer owns
+and carries every other owner's reason (an entry block, a placement denial, a
+human gate, a Project pause) as stored. The durable facts (entry, hooks step,
+running execution, children, cancellations, ledger) are then laid over it by
+the same `ConditionFacts::apply` every producer uses. The fields the writer
+wrote are not mapped back. A stated condition has `evidence.stated = true`
+and none of the six legacy copies (`error_annotation`, `blocked_json`,
+`failed_json`, `entry_barrier_json`, `metadata`, `unparsed_metadata`).
+
+Converted writers:
+
+| Writer | Statement | Owns | Carries |
+|---|---|---|---|
+| `TaskService::hold_waiting_task` (owner Hold on a Task with no run) | `Hold { actor, reason, at }` | `Held`, the diagnostic, the interruption; drops failure, queued command, retry timer, dispatch refusal, environment wait, owner wait | entry block, placement denial, daemon-upgrade refusal, Project pause, human decision, plan settlement wait |
+| `TaskService::release_to_dispatch_queue` (owner Release of a waiting hold) | `Release` | clears diagnostic, interruption, failure | everything else, including a recorded retry timer |
+
+The hold's legacy annotation and the operator text of its condition are one
+rendering of the same typed fields (`ConditionStatement::hold_operator_text`),
+byte for byte what the annotation held before.
+
+Every other writer still goes through the mapping (`map_legacy_condition`
+under `ConditionFacts`), including the other hold paths: stopping a running
+execution (`persist_manual_stop_annotation`) and releasing a stopped run. A
+mapped write over a stated condition replaces it with the mapping of the
+legacy fields, which agrees with it by construction (the per-writer
+equivalence tests in `db/src/task_condition/statement_tests.rs` compare the
+two after every converted write).
+
+While legacy is still written the old mapping stays the oracle. The invariant
+check, `check_task_condition_invariant` and `task_condition_violations` accept
+a stated condition when it equals the mapping in everything but those six
+copies and the `stated` mark (`TaskCondition::typed`); anything else is
+repaired as before. The dispatcher does not treat a stated condition as a
+stale copy of the legacy fields, and holds on its typed presentation
+(`interruption_present`, `hard_failure`, `entry_recorded`) where it held on
+the copies.
+
+**Unreadable stored condition.** A statement cannot edit a stored condition
+that does not decode; that write restates the row whole from the mapping, so
+an ordinary hold or release on such a row leaves it readable. Between writes
+the 120-second check still rebuilds an undecodable condition from the legacy
+fields. Both stop being possible in 5b; what replaces them is not decided.
+
+**Size.** A stated condition holds typed fields and presentation text cut at
+1,024 bytes: 8 KiB is the tested ceiling for a hold with a 200,000-byte
+reason. A mapped condition still copies each legacy field into `evidence`
+cut at 4,096 bytes; 24 KiB is its tested ceiling for the same reason.
+
 ### Task condition actions
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.

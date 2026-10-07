@@ -7925,6 +7925,7 @@ async fn failed_resume_does_not_restore_metadata_over_running_replacement() {
         Some("workspace-after-reset"),
         Vec::new(),
         Vec::new(),
+        None,
     )
     .await;
     assert!(

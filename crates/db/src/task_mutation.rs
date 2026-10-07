@@ -138,6 +138,10 @@ pub enum TaskMutation {
         workspace_id: Option<String>,
         overlapping_roles: Vec<String>,
         metadata_mutations: Vec<TaskMetadataMutation>,
+        /// What the writer states its write means. Absent on a queued
+        /// mutation written before writers stated conditions.
+        #[serde(default)]
+        condition: Option<ConditionStatement>,
     },
     TaskRestoreQueuedRecovery {
         input: RestoreQueuedRecovery,
@@ -680,6 +684,7 @@ impl TaskMutation {
                 workspace_id,
                 overlapping_roles,
                 metadata_mutations,
+                condition,
             } => encode(
                 Box::pin(TaskRepo::update_recovery_metadata_if_no_running_execution(
                     db,
@@ -692,6 +697,7 @@ impl TaskMutation {
                     workspace_id.as_deref(),
                     overlapping_roles,
                     metadata_mutations,
+                    condition,
                 ))
                 .await?,
             ),

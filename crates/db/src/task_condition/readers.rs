@@ -183,8 +183,14 @@ impl TaskCondition {
         // Which stored record the one public `interruption` is: the failure
         // record wins, and a blocked record beside it is still reported.
         let evidence = self.evidence();
-        let failed = read.interruption.is_some() && evidence.failed_json.is_some();
-        let blocked = evidence.blocked_json.is_some() && (failed || read.interruption.is_some());
+        // A condition a writer stated carries no copy of the legacy records:
+        // which record the interruption is comes from its typed presentation.
+        let stated = evidence.presentation.as_ref().filter(|_| evidence.stated);
+        let failed = read.interruption.is_some()
+            && (evidence.failed_json.is_some() || stated.is_some_and(|p| p.hard_failure));
+        let blocked = (evidence.blocked_json.is_some()
+            || stated.is_some_and(|p| p.interruption_present))
+            && (failed || read.interruption.is_some());
         let details = api_types::ConditionDetails {
             failed,
             blocked,
@@ -549,7 +555,7 @@ fn bound_text(text: &mut String) {
 
 /// The operator's copy of the stored annotation stays what it was: valid
 /// JSON when the annotation is JSON, with each text inside it bounded.
-fn bound_operator_reason(raw: &str) -> String {
+pub(super) fn bound_operator_reason(raw: &str) -> String {
     const WHOLE_LIMIT: usize = 16 * PRESENTATION_TEXT_LIMIT;
     if raw.len() <= PRESENTATION_TEXT_LIMIT {
         // The stored text, byte for byte.
@@ -569,6 +575,13 @@ fn bound_operator_reason(raw: &str) -> String {
     let mut text = encoded;
     bound_text(&mut text);
     Value::String(text).to_string()
+}
+
+/// A presentation with every text in it cut to [`PRESENTATION_TEXT_LIMIT`].
+pub(super) fn bounded_read(read: ConditionRead) -> ConditionRead {
+    let mut value = serde_json::to_value(read).expect("reader projection serializes");
+    bound(&mut value);
+    serde_json::from_value(value).expect("bounded projection retains its types")
 }
 
 fn bound(value: &mut Value) {

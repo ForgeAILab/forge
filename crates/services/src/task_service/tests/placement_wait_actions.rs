@@ -392,6 +392,60 @@ async fn running_task_with_paused_agent_offers_the_execution_hold() {
         .any(|offer| offer.action.verb() == "hold"));
 }
 
+/// Plan 3.1 stage 5a, per-writer equivalence. The writer under test stated
+/// its condition: the stored condition carries no copy of the legacy fields,
+/// equals what the legacy mapping says of the fields the writer just wrote
+/// (the only differences are the ones `typed()` removes: the legacy copies
+/// and the `stated` mark), reads the same publicly, and is left alone by the
+/// background check.
+async fn assert_stated_as_the_legacy_mapping(
+    fixture: &Fixture,
+    context: &str,
+) -> db::TaskCondition {
+    let row = reload(fixture).await;
+    let mut connection = fixture.db.pool().acquire().await.unwrap();
+    let mut input = db::LegacyConditionInput::from(&row);
+    input.facts = Some(
+        db::ConditionFacts::load(&mut connection, &row.id)
+            .await
+            .unwrap(),
+    );
+    drop(connection);
+    let mapped = db::map_legacy_condition(&input);
+    let stored = row.condition.clone();
+    let evidence = stored.evidence();
+    assert!(evidence.stated, "{context}: {stored:?}");
+    assert!(
+        evidence.error_annotation.is_none()
+            && evidence.blocked_json.is_none()
+            && evidence.failed_json.is_none()
+            && evidence.entry_barrier_json.is_none()
+            && evidence.metadata.is_empty()
+            && evidence.unparsed_metadata.is_none(),
+        "{context}: no legacy copy"
+    );
+    assert_eq!(stored.typed(), mapped.typed(), "{context}");
+    assert_eq!(stored.public(), mapped.public(), "{context}");
+    assert_eq!(
+        db::material_blocker(&stored),
+        db::material_blocker(&mapped),
+        "{context}"
+    );
+    let repaired = fixture.db.condition_check_status().repaired;
+    fixture
+        .db
+        .check_task_conditions(db::CONDITION_CHECK_PAGE)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.db.condition_check_status().repaired,
+        repaired,
+        "{context}"
+    );
+    assert_eq!(reload(fixture).await.condition, stored, "{context}");
+    stored
+}
+
 #[tokio::test]
 async fn waiting_task_held_without_an_agent_can_be_released_to_the_queue() {
     let fixture = fixture().await;
@@ -426,6 +480,19 @@ async fn waiting_task_held_without_an_agent_can_be_released_to_the_queue() {
         .await
         .unwrap();
 
+    let stated = assert_stated_as_the_legacy_mapping(&fixture, "hold").await;
+    assert!(matches!(
+        &stated,
+        db::TaskCondition::Parked { primary: db::ParkReason::Held { actor }, .. } if actor == "user"
+    ));
+    let row = reload(&fixture).await;
+    assert!(
+        row.blocked_json.is_some(),
+        "the legacy fields are still written"
+    );
+    // What the operator reads is the legacy annotation, byte for byte.
+    assert_eq!(stated.read().operator_reason, row.error_annotation);
+
     let held = fixture
         .service
         .task_action_offers(&fixture.task.id, &owner)
@@ -448,6 +515,13 @@ async fn waiting_task_held_without_an_agent_can_be_released_to_the_queue() {
         .await
         .unwrap();
     assert!(reload(&fixture).await.error_annotation.is_none());
+    let stated = assert_stated_as_the_legacy_mapping(&fixture, "release").await;
+    assert!(
+        !stated
+            .reasons()
+            .any(|reason| matches!(reason, db::ParkReason::Held { .. })),
+        "{stated:?}"
+    );
     assert!(
         ExecutionRepo::list_running_by_task(&*fixture.db, &fixture.task.id)
             .await

@@ -120,6 +120,7 @@ pub trait TaskRepo: Send + Sync {
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
         metadata_mutations: Vec<TaskMetadataMutation>,
+        condition: Option<crate::ConditionStatement>,
     ) -> Result<Task>;
     /// Restore a queued recovery's interruption and remove its intent in one
     /// versioned write, including when an unrelated execution superseded it.

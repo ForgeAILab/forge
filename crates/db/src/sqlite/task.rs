@@ -836,6 +836,7 @@ async fn update_recovery_metadata_inner(
     overlapping_roles: Vec<String>,
     metadata_mutations: Vec<TaskMetadataMutation>,
     expected_queued_recovery_id: Option<&str>,
+    condition: Option<crate::ConditionStatement>,
 ) -> Result<Task> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
     db.fence_task_lease_in_tx(&mut transaction, id, "update_recovery_metadata")
@@ -915,8 +916,21 @@ async fn update_recovery_metadata_inner(
     if result.rows_affected() == 0 {
         return Err(DbError::VersionConflict);
     }
-    crate::task_condition::produce(&mut transaction, &task.id, crate::ConditionChange::Legacy)
-        .await?;
+    match &condition {
+        // The writer said what this write means: the condition is stated,
+        // not mapped back from the fields just written.
+        Some(statement) => {
+            crate::task_condition::state(&mut transaction, &task.id, statement).await?
+        }
+        None => {
+            crate::task_condition::produce(
+                &mut transaction,
+                &task.id,
+                crate::ConditionChange::Legacy,
+            )
+            .await?
+        }
+    }
     task.condition = crate::task_condition::decode(
         &sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
             .bind(&task.id)
@@ -1433,12 +1447,14 @@ impl TaskRepo for SqliteDb {
         workspace_id: Option<&str>,
         overlapping_roles: Vec<String>,
         metadata_mutations: Vec<TaskMetadataMutation>,
+        condition: Option<crate::ConditionStatement>,
     ) -> Result<Task> {
         if !crate::task_writer::owns_task(id) {
             return self
                 .run_task_mutation(
                     id,
                     crate::TaskMutation::TaskUpdateRecoveryMetadataIfNoRunningExecution {
+                        condition: condition.clone(),
                         id: id.to_owned(),
                         expected_version,
                         error_annotation: error_annotation.clone(),
@@ -1465,6 +1481,7 @@ impl TaskRepo for SqliteDb {
             overlapping_roles,
             metadata_mutations,
             None,
+            condition,
         )
         .await
     }
@@ -1500,6 +1517,7 @@ impl TaskRepo for SqliteDb {
                 },
             ],
             Some(&input.queued_recovery_id),
+            None,
         )
         .await
     }

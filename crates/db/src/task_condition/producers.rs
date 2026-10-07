@@ -54,6 +54,7 @@ pub(crate) async fn derive(
     task_id: &str,
     change: ConditionChange,
     metadata: Option<Option<&str>>,
+    stated: Option<&ConditionStatement>,
 ) -> Result<Option<Produced>> {
     use ConditionChange as Change;
     let families = match change {
@@ -72,7 +73,14 @@ pub(crate) async fn derive(
             .non_text
             .retain(|field| *field != LegacyConditionField::MetadataJson);
     }
-    let mapped = map_view(&snapshot.input.view());
+    // A writer that states its condition edits the stored one. Only a stored
+    // condition that cannot be read falls back to the mapping.
+    let stated = stated.and_then(|statement| {
+        let stored = decode(std::str::from_utf8(&snapshot.stored).ok()?).ok()?;
+        Some(statement.apply(&stored))
+    });
+    let from_statement = stated.is_some();
+    let mapped = stated.unwrap_or_else(|| map_view(&snapshot.input.view()));
     let exhausted = mapped.budget_exhausted();
     if change == Change::Budget && !exhausted {
         // Only an exhausted condition witnesses the ledger.
@@ -117,7 +125,7 @@ pub(crate) async fn derive(
     };
     // An initial state reads the entry barrier differently; only then is the
     // mapping taken again, from the same snapshot.
-    let condition = if facts.initial {
+    let condition = if facts.initial && !from_statement {
         facts.condition_of(&snapshot.input.view())
     } else {
         facts.apply(mapped)
@@ -142,7 +150,28 @@ pub(crate) async fn produce(
     task_id: &str,
     change: ConditionChange,
 ) -> Result<()> {
-    let Some(produced) = derive(c, task_id, change, None).await? else {
+    let Some(produced) = derive(c, task_id, change, None, None).await? else {
+        return Ok(());
+    };
+    if produced.changed {
+        set_condition(c, task_id, &produced.encoded, Some(produced.version)).await?;
+    }
+    if let Some(parent) = &produced.parent {
+        produce_children(c, parent).await?;
+    }
+    Ok(())
+}
+
+/// The seam for a writer that states its condition: same transaction, after
+/// its write. The stored condition is edited by the statement and the durable
+/// facts are laid over it; the fields the writer wrote are not mapped.
+pub(crate) async fn state(
+    c: &mut SqliteConnection,
+    task_id: &str,
+    statement: &ConditionStatement,
+) -> Result<()> {
+    let Some(produced) = derive(c, task_id, ConditionChange::Legacy, None, Some(statement)).await?
+    else {
         return Ok(());
     };
     if produced.changed {
@@ -156,7 +185,7 @@ pub(crate) async fn produce(
 
 /// A child joined, left, moved within or settled under `parent_id`.
 pub(crate) async fn produce_children(c: &mut SqliteConnection, parent_id: &str) -> Result<()> {
-    if let Some(produced) = derive(c, parent_id, ConditionChange::Children, None).await? {
+    if let Some(produced) = derive(c, parent_id, ConditionChange::Children, None, None).await? {
         if produced.changed {
             set_condition(c, parent_id, &produced.encoded, Some(produced.version)).await?;
         }
@@ -240,10 +269,12 @@ pub(crate) async fn metadata_condition(
     task_id: &str,
     metadata: Option<&str>,
 ) -> Result<Option<String>> {
-    Ok(derive(c, task_id, ConditionChange::Legacy, Some(metadata))
-        .await?
-        .filter(|produced| produced.changed)
-        .map(|produced| produced.encoded))
+    Ok(
+        derive(c, task_id, ConditionChange::Legacy, Some(metadata), None)
+            .await?
+            .filter(|produced| produced.changed)
+            .map(|produced| produced.encoded),
+    )
 }
 
 /// A producer whose write is authoritative on its own (a ledger charge, an

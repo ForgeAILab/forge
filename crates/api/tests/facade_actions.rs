@@ -667,6 +667,7 @@ async fn execution_facade_actions_work_for_both_workflows() {
         )
         .await;
         assert!(paused.condition.details().diagnostic.is_some());
+        common::assert_condition_readable(&harness.state, &harness.app, &task.id, "hold").await;
 
         let _resumed: TaskResponse = common::json_request(
             &harness.app,
@@ -676,6 +677,7 @@ async fn execution_facade_actions_work_for_both_workflows() {
             StatusCode::OK,
         )
         .await;
+        common::assert_condition_readable(&harness.state, &harness.app, &task.id, "release").await;
 
         harness
             .state

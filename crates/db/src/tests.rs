@@ -4480,6 +4480,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         None,
         Vec::new(),
         Vec::new(),
+        None,
     )
     .await;
     assert!(matches!(
@@ -4518,6 +4519,7 @@ async fn recovery_execution_conflict_uses_canonical_slot_scope() {
         None,
         Vec::new(),
         Vec::new(),
+        None,
     )
     .await;
     assert!(matches!(
@@ -4589,6 +4591,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
         None,
         Vec::new(),
         mutations,
+        None,
     )
     .await
     .expect("clear and queue commit together");
@@ -4612,6 +4615,7 @@ async fn queued_recovery_metadata_is_versioned_and_consumed_at_execution_admissi
         vec![crate::TaskMetadataMutation::Remove {
             key: "queued_recovery".to_owned(),
         }],
+        None,
     )
     .await;
     assert!(matches!(stale, Err(DbError::VersionConflict)));

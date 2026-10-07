@@ -1227,6 +1227,7 @@ impl TaskService {
             workspace_id,
             overlapping_execution_roles(execution_role),
             Vec::new(),
+            None,
         )
         .await;
         if let Err(error) = result {

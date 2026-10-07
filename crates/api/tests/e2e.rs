@@ -398,6 +398,7 @@ async fn move_task_endpoint_updates_board_order_replays_and_reports_conflicts() 
     assert_eq!(response.task.id, third.id);
     assert_eq!(response.operation_id, operation_id);
     assert!(response.board_revision > initial_page.board_revision);
+    common::assert_condition_readable(&state, &app, &third.id, "board move").await;
     assert!((response.task.board_position - 1.5).abs() < 1e-9);
     assert!(response.task.role_assignments.iter().any(|assignment| {
         assignment.role_name == "coder" && assignment.assignee_id.as_deref() == Some("test-user-id")
