@@ -501,7 +501,7 @@ async fn check_reads_without_the_writer_and_survives_a_cancelled_repair() {
         .execute(db.pool())
         .await
         .unwrap();
-    let lock = crate::begin_immediate(db.pool()).await.unwrap();
+    let mut lock = crate::begin_immediate(db.pool()).await.unwrap();
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -511,7 +511,15 @@ async fn check_reads_without_the_writer_and_survives_a_cancelled_repair() {
         .is_err(),
         "the repair waits for the writer"
     );
-    lock.rollback().await.unwrap();
+    // Dropping the tick does not recall its repair statement: SQLite keeps
+    // waiting for the write lock and would race the next tick for the row.
+    // The writer moves the Task version, so that statement's fence fails and
+    // the repair below can only come from the tick after the cancelled one.
+    sqlx::query("UPDATE task SET version=version+1")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    lock.commit().await.unwrap();
     let status = db
         .check_task_conditions(CONDITION_CHECK_PAGE)
         .await
