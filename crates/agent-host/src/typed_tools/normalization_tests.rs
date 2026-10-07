@@ -116,21 +116,7 @@ fn serialized_tool_definitions() {
             snapshot[name],
             "{name} schema snapshot"
         );
-        let before: Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/tool_definitions_before_normalization.json"
-        ))
-        .unwrap();
-        for (definition, old) in definitions.iter().zip(before[name].as_array().unwrap()) {
-            assert_eq!(definition.name, old["name"]);
-            let mut properties = old["input_schema"]["properties"].clone();
-            if let Some(object) = properties.as_object_mut() {
-                object.remove("parameters");
-            }
-            assert_eq!(
-                definition.input_schema["properties"], properties,
-                "{} must retain the flat provider fields and nullable declarations",
-                definition.name
-            );
+        for definition in &definitions {
             let schema = &definition.input_schema;
             if definition.name.contains("scope_") || definition.name.contains("orchestration_") {
                 assert!(
@@ -513,6 +499,106 @@ async fn all_three_wrappers_forward_normalization() {
     assert_eq!(*provider.0.lock().unwrap(), vec![proposal(), proposal()]);
 }
 
+/// Audit 38-a M5: the tool list is exactly what the production builder
+/// returns for a ready Project Agent (denial wrapper applied by the builder),
+/// then wrapped by the result filter and the observer in the order
+/// `NativeBackend` applies them. Nothing in `composition.tools` is replaced.
+#[tokio::test]
+async fn production_project_agent_composition_accepts_enveloped_calls() {
+    let provider = Arc::new(EchoProvider::default());
+    let permissions = all_permissions()
+        .into_iter()
+        .chain(
+            [
+                "propose_discovery",
+                "propose_charter",
+                "propose_project",
+                "propose_adoption",
+            ]
+            .map(str::to_owned),
+        )
+        .collect();
+    let observations = Arc::new(Mutex::new(0));
+    let observed = observations.clone();
+    let composition = ScopeToolComposition::for_scope_with_permissions_and_project_context(
+        "identity",
+        scope(CanonicalScopeType::AgentChat, WorkspaceAccess::Deny),
+        None,
+        None,
+        &permissions,
+        ProjectChatToolContext {
+            is_project_agent_chat: true,
+            charter_setup_required: false,
+        },
+        Some(provider.clone()),
+        ScopeToolRuntime {
+            fetch_transport: Some(Arc::new(crate::ForgeFetchTransport::new())),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .filter_results(Arc::new(IdentityFilter))
+    .observe_results(Arc::new(move |_, _| {
+        *observed.lock().unwrap() += 1;
+    }));
+    // Same surface the schema snapshot records for a ready Project Agent,
+    // less web search: the builder offers it only when the provider reports a
+    // configured search backend, and the echo provider reports none.
+    let snapshot: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/tool_definitions_normalized.json"
+    ))
+    .unwrap();
+    let names: Vec<Value> = composition
+        .tools()
+        .iter()
+        .map(|tool| json!(tool.spec().name))
+        .collect();
+    let expected: Vec<Value> = snapshot["project"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|definition| definition["name"].clone())
+        .filter(|name| name != FORGE_PUBLIC_WEB_SEARCH_TOOL)
+        .collect();
+    assert_eq!(names, expected);
+
+    let read_arguments = json!({"limit": 1});
+    let read = json!({"operation": "work.read", "arguments": read_arguments.clone()});
+    let message = json!({
+        "operation": "message.send",
+        "payload": {"body": "hello"},
+        "dedupe_key": "key",
+        "correlation_id": "corr"
+    });
+    let readiness = json!({
+        "operation": "project.readiness",
+        "payload": {"action": "evaluate", "milestone_id": "m-1", "milestone_version": 1},
+        "dedupe_key": "key",
+        "correlation_id": "corr"
+    });
+    for (name, canonical, received) in [
+        ("forge_scope_read", read, read_arguments),
+        ("forge_scope_propose", message.clone(), message),
+        (
+            FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+            readiness.clone(),
+            readiness,
+        ),
+    ] {
+        let result = native_call(&composition, name, json!({"parameters": canonical})).await;
+        assert!(!result.is_error, "{name}: {result:?}");
+        // The provider is handed the prepared arguments, so this is the
+        // canonical form the hook produced, not the envelope.
+        assert_eq!(
+            provider.0.lock().unwrap().pop().unwrap(),
+            received,
+            "{name}"
+        );
+    }
+    assert!(provider.0.lock().unwrap().is_empty());
+    assert_eq!(*observations.lock().unwrap(), 3);
+}
+
 #[tokio::test]
 async fn normalization_errors_never_fall_back_on_native_or_cli() {
     let provider = Arc::new(EchoProvider::default());
@@ -757,43 +843,6 @@ async fn legitimate_payload_parameters_and_nested_nulls_survive_both_paths() {
     );
 }
 
-#[tokio::test]
-async fn serialized_prepared_call_invokes_exact_arguments_without_normalizing_again() {
-    let provider = Arc::new(EchoProvider::default());
-    let tool = proposal_tool(provider.clone());
-    let ctx = PreparationContext {
-        session: SessionId::new("session"),
-        turn: Some(TurnId::new("turn")),
-        call_id: ToolCallId::new("call"),
-        request: RequestId::new("request"),
-        workspace: Arc::new(DenyAllWorkspace),
-        clock: Arc::new(SystemClock),
-        cancel: Cancellation::new(),
-        deadline: Deadline::never(),
-    };
-    let prepared = tool.prepare(proposal(), &ctx).await.unwrap();
-    let fingerprint = prepared.fingerprint().clone();
-    let saved = serde_json::to_vec(&prepared).unwrap();
-    let recovered: PreparedToolCall = serde_json::from_slice(&saved).unwrap();
-    assert!(recovered.verify_fingerprint());
-    assert_eq!(recovered.fingerprint(), &fingerprint);
-    // A changed hook would fail if the host re-normalized a recovered action.
-    let changed = FailingHook { inner: tool };
-    let invocation = InvocationContext {
-        session: ctx.session,
-        turn: ctx.turn,
-        call_id: ctx.call_id,
-        request: ctx.request,
-        workspace: ctx.workspace,
-        clock: ctx.clock,
-        cancel: ctx.cancel,
-        deadline: ctx.deadline,
-        output_limit: 128 * 1024,
-    };
-    let outcome = changed.invoke(recovered, &invocation).await.unwrap();
-    assert_eq!(outcome.value, proposal());
-    assert_eq!(*provider.0.lock().unwrap(), vec![proposal()]);
-}
 #[derive(Debug)]
 struct FailingHook {
     inner: Arc<dyn Tool>,

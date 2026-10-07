@@ -3542,6 +3542,54 @@ mod tests {
                 );
             }
         }
+        // The envelope carries the same shape, not a looser one: a wrong type
+        // inside it is unwrapped and then refused by the schema.
+        let wrong_type = tool
+            .normalize_arguments(json!({"parameters": {"operation": 7}}))
+            .unwrap();
+        assert!(
+            !validator.is_valid(&wrong_type),
+            "a non-string operation inside the envelope must fail schema validation"
+        );
+        // `prepare` keeps its own required-field checks. Recovery hands it
+        // stored arguments without schema validation, so these refusals must
+        // not depend on the schema having run first.
+        let no_operation = tool
+            .normalize_arguments(json!({"parameters": {"payload": {}}}))
+            .unwrap();
+        assert!(!validator.is_valid(&no_operation));
+        let refused = tool
+            .prepare(no_operation, &test_preparation_context("envelope"))
+            .await
+            .expect_err("a call missing its operation is refused in prepare");
+        assert!(refused.to_string().contains("operation"), "{refused}");
+        let mut missing_dedupe = plain.clone();
+        missing_dedupe.as_object_mut().unwrap().remove("dedupe_key");
+        let missing_dedupe = tool
+            .normalize_arguments(json!({"parameters": missing_dedupe}))
+            .unwrap();
+        assert!(!validator.is_valid(&missing_dedupe));
+        let refused = tool
+            .prepare(missing_dedupe, &test_preparation_context("envelope"))
+            .await
+            .expect_err("an enveloped call missing dedupe_key is refused in prepare");
+        assert!(refused.to_string().contains("dedupe_key"), "{refused}");
+        // The schema declares `dedupe_key` nullable, so an explicit null
+        // passes validation and `prepare` is the only guard.
+        let mut null_dedupe = plain.clone();
+        null_dedupe["dedupe_key"] = Value::Null;
+        let null_dedupe = tool
+            .normalize_arguments(json!({"parameters": null_dedupe}))
+            .unwrap();
+        assert!(
+            validator.is_valid(&null_dedupe),
+            "a null dedupe_key passes the schema"
+        );
+        let refused = tool
+            .prepare(null_dedupe, &test_preparation_context("envelope"))
+            .await
+            .expect_err("a null dedupe_key is refused in prepare");
+        assert!(refused.to_string().contains("dedupe_key"), "{refused}");
     }
 
     #[tokio::test]

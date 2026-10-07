@@ -2667,13 +2667,14 @@ impl CoordinationToolProvider {
             .filter(|value| value.is_object())
             .cloned()
             .ok_or_else(|| {
-                // The schema declares `payload` nullable rather than
-                // required (a cross-provider compatibility choice), so a
-                // model can legally omit it and some do -- sending the
-                // operation's fields at the top level, or inside an invented
-                // wrapper. Naming the expected shape is the only thing that
-                // lets it correct the call; the bare message left the Agent
-                // with a non-retryable dead end.
+                // The schema requires `payload`, so a call that omits it
+                // (and supplies no flat fields to lift into one) is refused
+                // by schema validation before it reaches this code. The
+                // property is still declared nullable (a cross-provider
+                // compatibility choice), so an explicit `"payload": null`
+                // does arrive here. Naming the expected shape is the only
+                // thing that lets the model correct the call; the bare
+                // message left the Agent with a non-retryable dead end.
                 let operation_hint = arguments
                     .get("operation")
                     .and_then(Value::as_str)
