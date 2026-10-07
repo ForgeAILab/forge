@@ -249,9 +249,8 @@ async fn reconnect_cannot_be_left_offline_by_delayed_disconnect() {
     .build();
     let mut state = AppState::from_runtime(runtime, true);
     // Isolate socket lifecycle writes from asynchronous placement recovery.
-    state.daemon_connections = Arc::new(
-        services::daemon_transport::DaemonConnectionRegistry::without_handlers(),
-    );
+    state.daemon_connections =
+        Arc::new(services::daemon_transport::DaemonConnectionRegistry::without_handlers());
     let state = Arc::new(state);
     let app = test_app(&state);
     let registration = register_daemon(&app, "delayed-disconnect").await;
