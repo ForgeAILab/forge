@@ -4834,7 +4834,7 @@ impl AgentChatTurnWorker {
                         return;
                     }
                 };
-                if let Err(commit_error) = self
+                match self
                     .chat_service
                     .append_failure_with_usage(
                         &commit_job,
@@ -4845,10 +4845,21 @@ impl AgentChatTurnWorker {
                     )
                     .await
                 {
-                    let _ = self
-                        .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
-                        .await;
-                    tracing::warn!(job_id = %commit_job.id, error = %commit_error, "Agent Chat failure could not be persisted");
+                    Ok(failed) => {
+                        // A database error has no failure class of its own,
+                        // so the stored turn says only `backend_failed`.
+                        if failed.status == db::AgentChatTurnState::Failed
+                            && matches!(error, ServiceError::Db(_))
+                        {
+                            tracing::error!(chat_id = %commit_job.chat_id, job_id = %commit_job.id, failure_code = failure.code(), error = %error, "Agent Chat turn failed terminally on a database error");
+                        }
+                    }
+                    Err(commit_error) => {
+                        let _ = self
+                            .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                            .await;
+                        tracing::warn!(job_id = %commit_job.id, error = %commit_error, "Agent Chat failure could not be persisted");
+                    }
                 }
             }
         }

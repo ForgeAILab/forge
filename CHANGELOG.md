@@ -1173,6 +1173,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A chat with a leftover suspended session answers again.** Since the topic
+  working set change on `next/v0.14` (`31fdf478`, unreleased), every turn in a
+  native Agent Chat that had both a live session and an older suspended one
+  from an earlier restart failed with `UNIQUE constraint failed:
+  agent_session.identity_id, agent_session.context_scope_id`. A suspended
+  session is now resumed only when the chat has no live session, and a turn
+  that fails for good on a database error is logged with its chat and job id.
+
 - **A daemon that reconnects quickly no longer looks offline.** When a
   daemon's command stream was replaced, the closing connection could record
   the daemon offline after the new one had recorded it online; the daemon then

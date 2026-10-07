@@ -1514,59 +1514,38 @@ impl EmbeddedAgentService {
             },
         )
         .await?;
-        // A native topic retains its runtime identity across server suspension.
-        if profile.backend_kind == "native" && canonical.scope_type == CanonicalScopeType::AgentChat
-        {
-            let dormant: Option<String> = sqlx::query_scalar(
-                "SELECT s.id FROM agent_session s WHERE s.identity_id = ? AND s.context_scope_id = ? AND s.profile_id = ? AND s.backend_kind = 'native' AND s.status = 'suspended' AND s.replaced_by_session_id IS NULL ORDER BY s.created_at DESC LIMIT 1")
-                .bind(&identity.id).bind(&scope.id).bind(&profile.id).fetch_optional(self.db.pool()).await?;
-            if let Some(id) = dormant {
-                let previous = AgentSessionRepo::get_agent_session(&*self.db, &id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("agent_session", &id))?;
-                let pending_successor: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_chat_topic_rotation WHERE successor_session_id = ?)")
-                    .bind(&id).fetch_one(self.db.pool()).await?;
-                if !pending_successor {
-                    AgentSessionRepo::update_agent_session(
-                        &*self.db,
-                        UpdateAgentSession {
-                            id,
-                            expected_version: previous.version,
-                            runtime_session_id: None,
-                            status: Some("ready".to_owned()),
-                            connection_status: None,
-                            last_activity_at: None,
-                            updated_at: now.clone(),
-                        },
-                    )
-                    .await?;
-                }
-            }
-        }
         if let Some(active) =
             AgentSessionRepo::get_active_agent_session(&*self.db, &identity.id, &scope.id).await?
         {
-            let capabilities = capabilities_for_profile(&profile, &canonical);
-            if active.profile_id == profile.id
-                && serde_json::from_str::<BackendCapabilities>(&active.capabilities_json).ok()
-                    == Some(capabilities)
+            return self
+                .reuse_or_rotate_active_session(active, &profile, &canonical)
+                .await;
+        }
+        // A native topic retains its runtime identity across server
+        // suspension. Only a scope with no active session may resume one: the
+        // active-scope unique index admits a single live row, and restarts
+        // before topic working sets left older suspended rows behind.
+        if profile.backend_kind == "native" && canonical.scope_type == CanonicalScopeType::AgentChat
+        {
+            if let Some(dormant) = self
+                .dormant_native_chat_session(&identity.id, &scope.id, &profile.id)
+                .await?
             {
-                return Ok(active);
+                let resumed = self.resume_dormant_session(&dormant, &now).await?;
+                return self
+                    .reuse_or_rotate_active_session(resumed, &profile, &canonical)
+                    .await;
             }
-            // Capability policy is derived runtime state, not immutable
-            // Profile data. Rotate when a server upgrade changes it so an
-            // existing Task runtime cannot keep a now-disabled LCM session.
-            return self.rotate_authorized_session(&active, &profile).await;
         }
         let capabilities = capabilities_for_profile(&profile, &canonical);
         let (status, connection_status) = self.initial_session_status(&profile).await?;
-        AgentSessionRepo::create_agent_session(
+        let created = AgentSessionRepo::create_agent_session(
             &*self.db,
             CreateAgentSession {
                 id: new_uuid_v4(),
-                identity_id: identity.id,
-                profile_id: profile.id,
-                context_scope_id: scope.id,
+                identity_id: identity.id.clone(),
+                profile_id: profile.id.clone(),
+                context_scope_id: scope.id.clone(),
                 backend_kind: profile.backend_kind.clone(),
                 runtime_session_id: (profile.backend_kind == "native").then(new_uuid_v4),
                 status,
@@ -1579,8 +1558,139 @@ impl EmbeddedAgentService {
                 updated_at: now,
             },
         )
-        .await
-        .map_err(Into::into)
+        .await;
+        match created {
+            Ok(session) => Ok(session),
+            Err(error) => {
+                let winner = self
+                    .activation_winner(error.into(), &identity.id, &scope.id)
+                    .await?;
+                self.reuse_or_rotate_active_session(winner, &profile, &canonical)
+                    .await
+            }
+        }
+    }
+
+    /// Returns the scope's active session when it still matches the Profile
+    /// and its derived capabilities, and rotates it otherwise.
+    async fn reuse_or_rotate_active_session(
+        &self,
+        active: AgentSession,
+        profile: &AgentProfile,
+        canonical: &CanonicalScope,
+    ) -> Result<AgentSession> {
+        let capabilities = capabilities_for_profile(profile, canonical);
+        if active.profile_id == profile.id
+            && serde_json::from_str::<BackendCapabilities>(&active.capabilities_json).ok()
+                == Some(capabilities)
+        {
+            return Ok(active);
+        }
+        // Capability policy is derived runtime state, not immutable
+        // Profile data. Rotate when a server upgrade changes it so an
+        // existing Task runtime cannot keep a now-disabled LCM session.
+        self.rotate_authorized_session(&active, profile).await
+    }
+
+    /// The newest suspended native session of this scope and Profile that was
+    /// never replaced, unless a pending topic rotation owns it as its
+    /// successor.
+    async fn dormant_native_chat_session(
+        &self,
+        identity_id: &str,
+        context_scope_id: &str,
+        profile_id: &str,
+    ) -> Result<Option<AgentSession>> {
+        let dormant: Option<String> = sqlx::query_scalar(
+            "SELECT s.id FROM agent_session s
+             WHERE s.identity_id = ? AND s.context_scope_id = ? AND s.profile_id = ?
+               AND s.backend_kind = 'native' AND s.status = 'suspended'
+               AND s.replaced_by_session_id IS NULL
+             ORDER BY s.created_at DESC LIMIT 1",
+        )
+        .bind(identity_id)
+        .bind(context_scope_id)
+        .bind(profile_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some(id) = dormant else {
+            return Ok(None);
+        };
+        let pending_successor: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_chat_topic_rotation WHERE successor_session_id = ?)",
+        )
+        .bind(&id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if pending_successor {
+            return Ok(None);
+        }
+        AgentSessionRepo::get_agent_session(&*self.db, &id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_session", &id))
+            .map(Some)
+    }
+
+    /// Activates a suspended session read earlier. A concurrent call for the
+    /// same scope may activate a session first; this call then returns that
+    /// session instead of its own stale write's error.
+    async fn resume_dormant_session(
+        &self,
+        dormant: &AgentSession,
+        now: &str,
+    ) -> Result<AgentSession> {
+        let resumed = AgentSessionRepo::update_agent_session(
+            &*self.db,
+            UpdateAgentSession {
+                id: dormant.id.clone(),
+                expected_version: dormant.version,
+                runtime_session_id: None,
+                status: Some("ready".to_owned()),
+                connection_status: None,
+                last_activity_at: None,
+                updated_at: now.to_owned(),
+            },
+        )
+        .await;
+        match resumed {
+            Ok(session) => Ok(session),
+            Err(error) => {
+                self.activation_winner(
+                    error.into(),
+                    &dormant.identity_id,
+                    &dormant.context_scope_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Resolves a lost activation race. The active-scope unique index and the
+    /// session version column let one caller activate a session for a scope;
+    /// the loser adopts that session. Any other error, or a conflict with no
+    /// active session to adopt, is returned unchanged.
+    async fn activation_winner(
+        &self,
+        error: ServiceError,
+        identity_id: &str,
+        context_scope_id: &str,
+    ) -> Result<AgentSession> {
+        let lost_race = match &error {
+            ServiceError::Db(db::DbError::VersionConflict) => true,
+            ServiceError::Db(db::DbError::Sqlx(sqlx::Error::Database(database))) => {
+                database.is_unique_violation()
+            }
+            _ => false,
+        };
+        if !lost_race {
+            return Err(error);
+        }
+        match AgentSessionRepo::get_active_agent_session(&*self.db, identity_id, context_scope_id)
+            .await?
+        {
+            Some(winner) => Ok(winner),
+            None => Err(error),
+        }
     }
 
     pub async fn rotate_session(
@@ -3250,6 +3360,287 @@ mod tests {
         assert_eq!(scopes.len(), 1);
         assert!(!scopes[0].authority_json.contains("frozen_profile_id"));
         assert!(!scopes[0].authority_json.contains("frozen_binding_id"));
+    }
+
+    struct NativeChatFixture {
+        service: EmbeddedAgentService,
+        owner: String,
+        identity_id: String,
+        chat_id: String,
+    }
+
+    impl NativeChatFixture {
+        async fn resume(&self) -> Result<AgentSession> {
+            self.service
+                .create_or_resume_session(CreateScopedSession {
+                    actor_user_id: self.owner.clone(),
+                    identity_id: self.identity_id.clone(),
+                    profile_id: None,
+                    scope: RequestedCanonicalScope::AgentChat {
+                        chat_id: self.chat_id.clone(),
+                    },
+                })
+                .await
+        }
+
+        async fn session(&self, id: &str) -> AgentSession {
+            AgentSessionRepo::get_agent_session(&*self.service.db, id)
+                .await
+                .expect("session lookup")
+                .expect("session exists")
+        }
+
+        /// Rewrites a row the way a pre-3.6 restart left it: suspended, with
+        /// no replacement link, and an explicit age.
+        async fn suspend_at(&self, id: &str, created_at: &str) -> AgentSession {
+            sqlx::query(
+                "UPDATE agent_session SET status = 'suspended', created_at = ? WHERE id = ?",
+            )
+            .bind(created_at)
+            .bind(id)
+            .execute(self.service.db.pool())
+            .await
+            .expect("session suspends");
+            self.session(id).await
+        }
+
+        /// Inserts a sibling of `template` in the same scope.
+        async fn insert_sibling(
+            &self,
+            template: &AgentSession,
+            status: &str,
+            created_at: &str,
+        ) -> AgentSession {
+            AgentSessionRepo::create_agent_session(
+                &*self.service.db,
+                CreateAgentSession {
+                    id: new_uuid_v4(),
+                    identity_id: template.identity_id.clone(),
+                    profile_id: template.profile_id.clone(),
+                    context_scope_id: template.context_scope_id.clone(),
+                    backend_kind: template.backend_kind.clone(),
+                    runtime_session_id: Some(new_uuid_v4()),
+                    status: status.to_owned(),
+                    capabilities_json: template.capabilities_json.clone(),
+                    connection_status: template.connection_status.clone(),
+                    predecessor_session_id: None,
+                    last_activity_at: None,
+                    created_at: created_at.to_owned(),
+                    updated_at: created_at.to_owned(),
+                },
+            )
+            .await
+            .expect("sibling session inserts")
+        }
+    }
+
+    const OLDER: &str = "2026-01-01T00:00:00+00:00";
+    const NEWER: &str = "2026-02-01T00:00:00+00:00";
+
+    async fn native_chat_fixture() -> NativeChatFixture {
+        let (service, owner) = test_service_with_owner().await;
+        let identity_id = new_uuid_v4();
+        let now = now_rfc3339();
+        AgentRepo::create_identity_with_profile(
+            &*service.db,
+            CreateAgentIdentity {
+                id: identity_id.clone(),
+                name: "dormant-resume-main".to_owned(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: Some(owner.clone()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: json!({"permissions": ["read_account"]}).to_string(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            CreateAgentProfile {
+                id: new_uuid_v4(),
+                identity_id: identity_id.clone(),
+                backend_kind: "native".to_owned(),
+                executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
+                provider: Some("test".to_owned()),
+                model: Some("model-one".to_owned()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "{}".to_owned(),
+                tool_policy_json: json!({"allowed": ["read_account"]}).to_string(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("identity creates");
+        crate::AgentChatService::new(Arc::clone(&service.db))
+            .set_main_binding(crate::SetMainAgentBindingInput {
+                actor_user_id: owner.clone(),
+                account_id: owner.clone(),
+                identity_id: identity_id.clone(),
+                autonomy_policy_json: "{}".to_owned(),
+                tool_policy_revision: "dormant-resume-policy".to_owned(),
+                expected_version: None,
+                replacement_reason: None,
+            })
+            .await
+            .expect("Main binding creates");
+        let chat_id = AgentChatRepo::get_main_chat(&*service.db, &owner)
+            .await
+            .expect("Main Chat lookup")
+            .expect("Main Chat exists")
+            .id;
+        NativeChatFixture {
+            service,
+            owner,
+            identity_id,
+            chat_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn active_chat_session_wins_over_a_leftover_suspended_one() {
+        let fixture = native_chat_fixture().await;
+        let first = fixture.resume().await.expect("first session creates");
+        let leftover = fixture.suspend_at(&first.id, OLDER).await;
+        let ready = fixture.insert_sibling(&leftover, "ready", NEWER).await;
+
+        let resumed = fixture
+            .resume()
+            .await
+            .expect("an active session is returned despite the leftover suspended row");
+
+        assert_eq!(resumed.id, ready.id);
+        assert_eq!(resumed.version, ready.version);
+        let leftover_after = fixture.session(&leftover.id).await;
+        assert_eq!(leftover_after.status, "suspended");
+        assert_eq!(leftover_after.version, leftover.version);
+    }
+
+    #[tokio::test]
+    async fn newest_suspended_chat_session_resumes_once_when_none_is_active() {
+        let fixture = native_chat_fixture().await;
+        let first = fixture.resume().await.expect("first session creates");
+        let older = fixture.suspend_at(&first.id, OLDER).await;
+        let newest = fixture.insert_sibling(&older, "suspended", NEWER).await;
+
+        let resumed = fixture.resume().await.expect("newest session resumes");
+        assert_eq!(resumed.id, newest.id);
+        assert_eq!(resumed.status, "ready");
+        assert_eq!(resumed.runtime_session_id, newest.runtime_session_id);
+
+        let again = fixture.resume().await.expect("resumed session is reused");
+        assert_eq!(again.id, newest.id);
+        assert_eq!(again.version, resumed.version);
+
+        let older_after = fixture.session(&older.id).await;
+        assert_eq!(older_after.status, "suspended");
+        assert_eq!(older_after.version, older.version);
+    }
+
+    #[tokio::test]
+    async fn pending_topic_rotation_successor_is_not_resumed() {
+        let fixture = native_chat_fixture().await;
+        let first = fixture.resume().await.expect("first session creates");
+        let successor = fixture.suspend_at(&first.id, OLDER).await;
+        sqlx::query(
+            "INSERT INTO agent_chat_topic_rotation
+                (chat_id, id, successor_session_id, label, cause, created_at)
+             VALUES (?, ?, ?, 'Next topic', 'test', ?)",
+        )
+        .bind(&fixture.chat_id)
+        .bind(new_uuid_v4())
+        .bind(&successor.id)
+        .bind(OLDER)
+        .execute(fixture.service.db.pool())
+        .await
+        .expect("rotation intent inserts");
+
+        let session = fixture.resume().await.expect("a fresh session creates");
+
+        assert_ne!(session.id, successor.id);
+        let successor_after = fixture.session(&successor.id).await;
+        assert_eq!(successor_after.status, "suspended");
+        assert_eq!(successor_after.version, successor.version);
+    }
+
+    #[tokio::test]
+    async fn stale_dormant_resume_adopts_the_session_a_concurrent_call_activated() {
+        let fixture = native_chat_fixture().await;
+        let first = fixture.resume().await.expect("first session creates");
+        let older = fixture.suspend_at(&first.id, OLDER).await;
+        let newest = fixture.insert_sibling(&older, "suspended", NEWER).await;
+        let now = now_rfc3339();
+
+        // Both callers read the scope before either wrote; the winner then
+        // resumes the newest row.
+        let winner = fixture.resume().await.expect("winner resumes");
+        assert_eq!(winner.id, newest.id);
+
+        // A loser holding the same row loses on its version.
+        let same_row = fixture
+            .service
+            .resume_dormant_session(&newest, &now)
+            .await
+            .expect("version conflict resolves to the winner");
+        assert_eq!(same_row.id, winner.id);
+        assert_eq!(same_row.version, winner.version);
+
+        // A loser that read after the winner's write picked the older row and
+        // loses on the active-scope unique index.
+        let other_row = fixture
+            .service
+            .resume_dormant_session(&older, &now)
+            .await
+            .expect("unique violation resolves to the winner");
+        assert_eq!(other_row.id, winner.id);
+        assert_eq!(other_row.version, winner.version);
+        let older_after = fixture.session(&older.id).await;
+        assert_eq!(older_after.status, "suspended");
+        assert_eq!(older_after.version, older.version);
+    }
+
+    #[tokio::test]
+    async fn stale_dormant_resume_keeps_its_conflict_when_nothing_is_active() {
+        let fixture = native_chat_fixture().await;
+        let first = fixture.resume().await.expect("first session creates");
+        let mut stale = fixture.suspend_at(&first.id, OLDER).await;
+        stale.version += 1;
+
+        let error = fixture
+            .service
+            .resume_dormant_session(&stale, &now_rfc3339())
+            .await
+            .expect_err("no active session exists to adopt");
+
+        assert!(matches!(
+            error,
+            ServiceError::Db(db::DbError::VersionConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_dormant_resumes_return_one_session() {
+        let fixture = native_chat_fixture().await;
+        let first = fixture.resume().await.expect("first session creates");
+        let older = fixture.suspend_at(&first.id, OLDER).await;
+        let newest = fixture.insert_sibling(&older, "suspended", NEWER).await;
+
+        let (left, right) = tokio::join!(fixture.resume(), fixture.resume());
+
+        let left = left.expect("left call resolves");
+        let right = right.expect("right call resolves");
+        assert_eq!(left.id, newest.id);
+        assert_eq!(right.id, newest.id);
+        assert_eq!(fixture.session(&older.id).await.status, "suspended");
     }
 
     #[test]
