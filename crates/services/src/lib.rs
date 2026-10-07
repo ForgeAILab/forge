@@ -176,7 +176,7 @@ pub use daemon_transport::{
     ExecutionProvider, FilesystemProvider, RemoteExecutionProvider, RemoteFilesystemProvider,
 };
 pub use default_agents::ensure_default_agents;
-pub use deferred_dispatch::kick_task_reconciliation;
+pub use deferred_dispatch::wake_task_dispatch;
 pub use demo::install_demo_data;
 pub use diff::DiffService;
 pub use domain_event_broadcast::DomainEventBroadcastConsumer;

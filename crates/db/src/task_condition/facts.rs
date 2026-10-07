@@ -17,6 +17,10 @@ pub enum ConditionWitness {
         epoch: i64,
         transition_id: Option<String>,
         since: String,
+        /// The state is an initial one: the scheduler admits from it without
+        /// reading the entry barrier, so the barrier does not park here.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        initial: bool,
     },
     Step {
         step_id: String,
@@ -94,6 +98,8 @@ pub(super) struct Terminals {
     has_states: bool,
     /// First declaration of each state name: whether its kind is terminal.
     states: BTreeMap<String, bool>,
+    /// First declarations whose kind is initial.
+    initial: Vec<String>,
     cancellation_state: String,
 }
 /// A definition text and its classification.
@@ -111,8 +117,12 @@ impl Terminals {
         let workflow: Value = serde_json::from_str(definition).unwrap_or_default();
         let declared = workflow["states"].as_array();
         let mut states = BTreeMap::new();
+        let mut initial = Vec::new();
         for state in declared.into_iter().flatten() {
             if let Some(name) = state["name"].as_str() {
+                if !states.contains_key(name) && state["kind"] == "initial" {
+                    initial.push(name.to_owned());
+                }
                 states
                     .entry(name.to_owned())
                     .or_insert(state["kind"] == "terminal");
@@ -121,6 +131,7 @@ impl Terminals {
         let parsed = Arc::new(Self {
             has_states: declared.is_some_and(|states| !states.is_empty()),
             states,
+            initial,
             cancellation_state: workflow["cancellation_state"]
                 .as_str()
                 .unwrap_or("cancelled")
@@ -156,9 +167,22 @@ impl Terminals {
             }
         })
     }
+    /// Whether the Task's own effective workflow admits from `state`: the
+    /// inherited subtask workflow and the default Project workflow start in
+    /// `todo`.
+    fn initial(&self, state: &str, subtask: bool) -> bool {
+        let inherited = subtask && matches!(state, "todo" | "in_progress" | "done" | "cancelled");
+        if inherited || !self.has_states {
+            state == "todo"
+        } else {
+            self.initial.iter().any(|name| name == state)
+        }
+    }
     /// Whether a Task or child in `state` classifies differently under `other`.
     pub(super) fn differs(&self, other: &Self, state: &str) -> bool {
-        self.outcome(state, false) != other.outcome(state, false)
+        self.initial(state, false) != other.initial(state, false)
+            || self.initial(state, true) != other.initial(state, true)
+            || self.outcome(state, false) != other.outcome(state, false)
             || self.outcome(state, true) != other.outcome(state, true)
             || self.child_settled(state) != other.child_settled(state)
     }
@@ -178,6 +202,8 @@ pub struct ConditionFacts {
     pub transition_id: Option<String>,
     pub since: String,
     pub terminal: Option<TerminalOutcome>,
+    /// The state is an initial one in the Task's effective workflow.
+    pub initial: bool,
     pub hooks: Option<String>,
     /// `(id, role)` of the newest running non-interactive execution, when
     /// the current entry owns it.
@@ -375,7 +401,9 @@ impl Snapshot {
         facts.epoch = self.epoch;
         if self.families.entry {
             let workflow: String = self.row.try_get("workflow")?;
-            facts.terminal = Terminals::of(&workflow).outcome(&self.state, self.parent.is_some());
+            let classes = Terminals::of(&workflow);
+            facts.terminal = classes.outcome(&self.state, self.parent.is_some());
+            facts.initial = classes.initial(&self.state, self.parent.is_some());
             facts.since = self.created_at.clone();
             facts.transition_id = None;
             // Same-epoch audit receipts never replace the first receipt.
@@ -535,6 +563,7 @@ impl ConditionFacts {
             epoch,
             transition_id,
             since,
+            initial,
         }) = witnesses.next()
         else {
             return None;
@@ -545,6 +574,7 @@ impl ConditionFacts {
             transition_id: transition_id.clone(),
             since: since.clone(),
             terminal,
+            initial: *initial,
             ..Default::default()
         };
         for witness in witnesses {
@@ -580,6 +610,7 @@ impl ConditionFacts {
             epoch: self.epoch,
             transition_id: self.transition_id.clone(),
             since: self.since.clone(),
+            initial: self.initial,
         }];
         if let Some(step) = &self.hooks {
             witnesses.push(ConditionWitness::Step {
@@ -618,6 +649,13 @@ impl ConditionFacts {
             }));
         }
         witnesses
+    }
+    /// The condition these facts and the legacy fields state together.
+    pub fn condition(&self, input: &LegacyConditionInput) -> TaskCondition {
+        self.condition_of(&input.view())
+    }
+    pub(super) fn condition_of(&self, view: &LegacyView<'_>) -> TaskCondition {
+        self.apply(map_view_from(self.initial, view))
     }
     /// Combine the legacy mapping with these facts. Legacy is authoritative:
     /// a condition parks exactly where today's readers hold the Task.

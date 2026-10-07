@@ -95,6 +95,12 @@ async fn measure_producer_write_cost() {
         .await
         .unwrap();
     db::run_migrations(&pool).await.unwrap();
+    // Diagnosis only: statements to run first, e.g. dropping one trigger or
+    // index to see what a write path pays for it.
+    if let Ok(setup) = std::env::var("COST_SETUP_SQL") {
+        sqlx::raw_sql(&setup).execute(&pool).await.unwrap();
+        println!("COST setup: {setup}");
+    }
     let db = SqliteDb::new(pool);
     // A realistic Project workflow: the default definition is ~tens of KB.
     let workflow = std::env::var("COST_WORKFLOW").unwrap_or_else(|_| "{}".into());

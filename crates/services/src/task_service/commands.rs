@@ -268,25 +268,20 @@ impl TaskService {
                     encode(Box::pin(self.start_execution(id)).await?)
                 }
                 "reconcile_role" => {
-                    let (id, role, agent, disposition, wait): (
-                        String,
-                        String,
-                        String,
-                        Option<Value>,
-                        Option<Value>,
-                    ) = serde_json::from_value(command.arguments.clone())
-                        .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
-                    let dispatcher = crate::TaskDispatcher::new(
-                        self.db.clone(),
-                        self.event_bus.clone(),
-                        std::sync::Arc::new(self.clone()),
-                    );
+                    let (id, role, agent, wait): (String, String, String, Option<Value>) =
+                        serde_json::from_value(command.arguments.clone())
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    // The instance that queued this command owns the stop
+                    // fence; without it nothing is dispatched and the sweep
+                    // hands the Task to the next dispatcher.
+                    let Some(dispatcher) = crate::TaskDispatcher::registered(self) else {
+                        return encode(false);
+                    };
                     encode(
                         Box::pin(dispatcher.execute_resolved_role(
                             &id,
                             &role,
                             &agent,
-                            disposition.as_ref(),
                             wait.as_ref(),
                         ))
                         .await?,

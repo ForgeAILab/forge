@@ -18,6 +18,10 @@ pub(super) struct Prepared {
     pub workflow: WorkflowDefinition,
     pub facts: Facts,
     pub deadline: Option<String>,
+    /// The Task was refused a machine run slot on this pass.
+    pub machine_wait: bool,
+    /// The stored condition did not match the legacy fields it shadows.
+    pub condition_stale: bool,
 }
 fn assignment<'a>(r: &'a ScheduleRead, role: &str) -> Option<&'a TaskRoleAssignment> {
     let role = if role == "executor" { "coder" } else { role };
@@ -57,7 +61,20 @@ fn initial_target(w: &WorkflowDefinition, r: &ScheduleRead) -> Option<(String, S
         }
     }
 }
-fn blocking(c: &TaskCondition) -> bool {
+/// Whether a reason was read from the entry barrier column.
+fn from_barrier(reason: &ParkReason) -> bool {
+    let source = match reason {
+        ParkReason::EntryBlocked { source, .. }
+        | ParkReason::BudgetExhausted { source, .. }
+        | ParkReason::UnknownCondition { source, .. } => source,
+        _ => return false,
+    };
+    source.field == db::LegacyConditionField::EntryBarrierJson
+}
+/// `barrier_holds` is false where the base scheduler never read the entry
+/// barrier: admission from an initial state, and a gate that cascades past an
+/// unassigned role.
+fn blocking(c: &TaskCondition, barrier_holds: bool) -> bool {
     let evidence = match c {
         TaskCondition::Clear { evidence }
         | TaskCondition::Entering { evidence, .. }
@@ -69,7 +86,7 @@ fn blocking(c: &TaskCondition) -> bool {
     };
     if evidence.blocked_json.is_some()
         || evidence.failed_json.is_some()
-        || evidence.entry_barrier_json.is_some()
+        || (barrier_holds && evidence.entry_barrier_json.is_some())
     {
         return true;
     }
@@ -80,16 +97,16 @@ fn blocking(c: &TaskCondition) -> bool {
             additional,
             ..
         } => std::iter::once(primary).chain(additional).any(|p| {
-            matches!(
-                p,
-                ParkReason::Held { .. }
-                    | ParkReason::Failure { .. }
-                    | ParkReason::AgentTimeout { .. }
-                    | ParkReason::BudgetExhausted { .. }
-                    | ParkReason::EntryBlocked { .. }
-                    | ParkReason::UnknownCondition { .. }
-                    | ParkReason::RemoteCancelPending { .. }
-            )
+            (barrier_holds || !from_barrier(p))
+                && matches!(
+                    p,
+                    ParkReason::Held { .. }
+                        | ParkReason::Failure { .. }
+                        | ParkReason::AgentTimeout { .. }
+                        | ParkReason::BudgetExhausted { .. }
+                        | ParkReason::EntryBlocked { .. }
+                        | ParkReason::UnknownCondition { .. }
+                )
         }),
         _ => false,
     }
@@ -112,10 +129,27 @@ fn earlier(deadline: &mut Option<String>, time: Option<DateTime<Utc>>, now: Date
 impl TaskDispatcher {
     pub(super) fn prepare_schedule(
         &self,
-        r: ScheduleRead,
+        mut r: ScheduleRead,
         project: &Project,
         now: DateTime<Utc>,
     ) -> Prepared {
+        // The stored condition shadows the legacy fields, which stay
+        // authoritative. When a writer missed its sync the copy is stale but
+        // the row read in this snapshot is not: hold exactly where the legacy
+        // fields hold, and leave the stored copy to be repaired.
+        let legacy = db::map_legacy_condition(&db::LegacyConditionInput::from(&r.task));
+        let condition_stale = {
+            let (stored, fresh) = (r.condition.evidence(), legacy.evidence());
+            stored.error_annotation != fresh.error_annotation
+                || stored.blocked_json != fresh.blocked_json
+                || stored.failed_json != fresh.failed_json
+                || stored.entry_barrier_json != fresh.entry_barrier_json
+                || stored.metadata != fresh.metadata
+                || stored.unparsed_metadata != fresh.unparsed_metadata
+        };
+        if condition_stale {
+            r.condition = legacy;
+        }
         let t = &r.task;
         let w = WorkflowEngine::resolve_workflow_for_task(
             t,
@@ -150,11 +184,21 @@ impl TaskDispatcher {
             }
             entry.is_none_or(|entry| e.created_at >= entry.created_at)
         };
+        let is_initial = w.state_kind(&t.status) == Some(StateKind::Initial);
+        // The admission path: the base scheduler transitions these Tasks
+        // without reading the entry barrier.
+        let admits = is_initial
+            || state.is_some_and(|s| {
+                s.kind == StateKind::Gate
+                    && helpers::auto_cascades_on_unassigned_role(s)
+                    && helpers::role_assignment_unassigned(
+                        role.and_then(|role| assignment(&r, role)),
+                    )
+            });
         let mut f = Facts {
+            blocking: blocking(&r.condition, !admits),
             paused: project.paused_at.is_some(),
             queue_owned: r.queue_owned,
-            blocking: blocking(&r.condition),
-            dependencies_ready: r.dependencies.iter().all(|t| t.status == "done"),
             child_ready: true,
             root_role_allowed: true,
             reviewer_ready: true,
@@ -184,7 +228,12 @@ impl TaskDispatcher {
             Some("environment_unverified" | "provision_failed")
         );
         f.integrate = deferred_dispatch::paused_integration(t).is_some();
-        f.queued_recovery = deferred_dispatch::queued_recovery(t).is_some();
+        // The key is the fact, as the base scan listed it. An intent that no
+        // longer parses still reaches the replay, which blocks the Task with
+        // `recovery_required` instead of dispatching past it.
+        f.queued_recovery = metadata
+            .get(deferred_dispatch::QUEUED_RECOVERY_KEY)
+            .is_some_and(|intent| !intent.is_null());
         let mut deadline = None;
         for execution in r
             .executions
@@ -386,7 +435,7 @@ impl TaskDispatcher {
                     let grace =
                         at(Some(&review.updated_at)).map(|at| at + chrono::Duration::minutes(2));
                     let eligible = !f.blocking
-                        && t.error_annotation.is_none()
+                        && (t.error_annotation.is_none() || super::legacy_park::owns(t))
                         && !helpers::awaiting_human(t)
                         && t.entry_barrier_json.is_none()
                         && !r
@@ -410,18 +459,13 @@ impl TaskDispatcher {
         if role.is_none() && helpers::awaiting_human(t) {
             f.human_wait = true;
         }
-        let is_initial = w.state_kind(&t.status) == Some(StateKind::Initial);
-        if is_initial
-            || state.is_some_and(|s| {
-                s.kind == StateKind::Gate
-                    && helpers::auto_cascades_on_unassigned_role(s)
-                    && helpers::role_assignment_unassigned(
-                        role.and_then(|role| assignment(&r, role)),
-                    )
-            })
-        {
+        if admits {
             f.initial_target = initial_target(&w, &r);
         }
+        if let Some(held) = role.and_then(|role| assignment(&r, role)) {
+            f.role_user = held.assignee_type == Some(AssigneeKind::User);
+        }
+        f.role_open = role.is_some() && f.role_target.is_none() && !f.role_user;
         f.apply_defaults = serde_json::from_str::<api_types::ProjectSettings>(&project.settings)
             .is_ok_and(|s| !s.default_role_assignments.is_empty())
             && is_initial
@@ -437,9 +481,9 @@ impl TaskDispatcher {
         } else {
             &t.status
         };
-        f.disposition_current = !r.external
-            && !r.verify
-            && deferred_dispatch::dispatch_disposition_is_current(t, capability);
+        // A recorded refusal holds until the Task's version changes or a wake
+        // clears it, exactly as before: no other fact re-opens it.
+        f.disposition_current = deferred_dispatch::dispatch_disposition_is_current(t, capability);
         if let Some(last) = r.transitions.last() {
             if last.from_state == "merging"
                 && last.to_state == t.status
@@ -473,6 +517,8 @@ impl TaskDispatcher {
             workflow: w,
             facts: f,
             deadline,
+            machine_wait: false,
+            condition_stale,
         }
     }
 }
@@ -498,7 +544,7 @@ mod tests {
                 evidence,
             };
             assert!(
-                blocking(&condition),
+                blocking(&condition, true),
                 "legacy {field} still holds even when the entry owner is missing"
             );
         }

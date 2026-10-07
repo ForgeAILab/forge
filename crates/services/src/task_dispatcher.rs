@@ -26,13 +26,28 @@ mod reconciliation;
 mod snapshot;
 pub(crate) use helpers::is_blocking_annotation_type;
 mod initial_scheduling;
+mod legacy_park;
 mod repo_pause_sync;
 pub mod slots;
 #[cfg(test)]
 mod stranded_hooks;
 mod workspace_blocking;
 
+/// A handle to the one dispatcher instance of a runtime. The instance owns
+/// the stop fence and the reconciliation state; a queued role command reaches
+/// the same instance through the Task service instead of building its own.
 pub struct TaskDispatcher {
+    inner: Arc<DispatcherInstance>,
+}
+
+impl std::ops::Deref for TaskDispatcher {
+    type Target = DispatcherInstance;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+pub struct DispatcherInstance {
     db: Arc<db::SqliteDb>,
     event_bus: Arc<EventBus>,
     task_service: Arc<TaskService>,
@@ -47,6 +62,8 @@ pub struct TaskDispatcher {
     periodic_workers: Arc<crate::worker_runtime::PeriodicWorkers>,
     schedule_state: Mutex<reconciliation::ScheduleState>,
     reconcile_lock: tokio::sync::Mutex<()>,
+    /// One slice of the sweep at a time.
+    sweep_lock: tokio::sync::Mutex<()>,
     observer_shutdown: crate::runtime::ShutdownSignal,
     #[cfg(test)]
     fixture_worker: std::sync::OnceLock<tests::FixtureWorker>,
@@ -69,7 +86,7 @@ impl TaskDispatcher {
         task_service: Arc<TaskService>,
         check_interval: Duration,
     ) -> Self {
-        Self {
+        let inner = Arc::new(DispatcherInstance {
             periodic_workers: Arc::new(crate::worker_runtime::PeriodicWorkers::new(Arc::clone(
                 &db,
             ))),
@@ -84,26 +101,48 @@ impl TaskDispatcher {
             environment_settings_observer: std::sync::OnceLock::new(),
             schedule_state: Mutex::default(),
             reconcile_lock: tokio::sync::Mutex::default(),
+            sweep_lock: tokio::sync::Mutex::default(),
             observer_shutdown: crate::runtime::ShutdownSignal::new(),
             #[cfg(test)]
             fixture_worker: std::sync::OnceLock::new(),
-        }
+        });
+        Self { inner }
+    }
+
+    #[cfg(test)]
+    fn instance_mut(&mut self) -> &mut DispatcherInstance {
+        Arc::get_mut(&mut self.inner).expect("configured before the dispatcher runs")
+    }
+
+    /// Make this instance the one queued role commands run on. Idempotent;
+    /// called by every pass, so a command always finds the instance that
+    /// enqueued it.
+    fn register(&self) {
+        self.task_service
+            .register_dispatcher(Arc::downgrade(&self.inner));
+    }
+
+    /// The instance a queued role command was enqueued by, while it lives.
+    pub(crate) fn registered(task_service: &TaskService) -> Option<Self> {
+        task_service
+            .registered_dispatcher()
+            .map(|inner| Self { inner })
     }
 
     pub fn with_periodic_workers(
         mut self,
         workers: Arc<crate::worker_runtime::PeriodicWorkers>,
     ) -> Self {
-        self.periodic_workers = workers;
+        Arc::get_mut(&mut self.inner)
+            .expect("periodic workers are configured before the dispatcher runs")
+            .periodic_workers = workers;
         self
     }
 
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        #[cfg(test)]
-        self.fixture_worker
-            .get_or_init(|| tests::FixtureWorker::start(&self.task_service));
+        self.register();
         self.start_with_check(Duration::from_secs(3600), |dispatcher| async move {
-            dispatcher.check_once().await
+            dispatcher.tick(false).await
         })
     }
 
@@ -169,9 +208,24 @@ impl TaskDispatcher {
         self.stopped.load(Ordering::Relaxed)
     }
 
+    /// Reconcile now, as one scan did: every Task a commit, a deadline or
+    /// the sweep marked, every Task held on a fact no commit announces, and
+    /// on an instance's first direct request every Task that is not settled.
+    /// Then advance the paged sweep by one bounded slice. The runtime does
+    /// not start this way: see `startup_reconcile`.
     #[tracing::instrument(skip(self))]
     pub async fn check_once(&self) -> Result<u64> {
-        self.reconcile_once().await
+        self.tick(true).await
+    }
+
+    /// The supervised loop's tick. It re-reads the Tasks held on unannounced
+    /// facts at the scan interval; a direct `check_once` re-reads them now.
+    async fn tick(&self, asked: bool) -> Result<u64> {
+        let dispatched = self.reconcile_once(asked).await?;
+        if let Err(error) = self.sweep_slice(reconciliation::SWEEP_SLICE).await {
+            tracing::warn!(%error, "Task scheduler sweep deferred");
+        }
+        Ok(dispatched)
     }
 
     #[cfg(test)]
@@ -249,7 +303,7 @@ impl TaskDispatcher {
         // supervised loop and must not delay a dispatch. It reads off the
         // writer, takes it only for a row it repairs, and after a mapping
         // change re-runs the backfill here in slices instead of at startup.
-        if let Err(error) = self.db.check_task_conditions_if_due().await {
+        if let Err(error) = self.db.backfill_task_conditions_if_stale().await {
             tracing::warn!(%error, "Task condition invariant check deferred");
         }
         tracing::info!(

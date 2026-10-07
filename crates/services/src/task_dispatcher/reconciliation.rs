@@ -1,46 +1,164 @@
-//! One reconciliation loop: dirty generations, exact deadlines and a 120s
-//! bounded repair sweep all feed the existing Task command/cascade adapter.
+//! One reconciliation loop. A commit that changes a scheduling fact marks the
+//! Tasks it can affect; exact deadlines mark their own; a paged sweep marks
+//! whatever both missed. Everything marked is resolved by the pure
+//! `next_step` and applied through the existing Task command and cascade
+//! adapters, with the legacy fields written exactly as the scanning
+//! dispatcher wrote them.
 use super::{
     next_step::{self, Action, Next, Owner, Park, Reason, Snapshot, Step},
     snapshot::Prepared,
     TaskDispatcher,
 };
 use crate::{deferred_dispatch, Result, ServiceError};
-use api_types::{Actor, SystemComponent};
+use api_types::{Actor, StateKind, SystemComponent};
 use db::{Project, ProjectRepo};
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
+/// Every Task that is not settled is re-examined once per period.
+pub(super) const SWEEP_PERIOD: Duration = Duration::from_secs(120);
+/// What one tick spends on the sweep before it yields to dispatch.
+pub(super) const SWEEP_SLICE: Duration = Duration::from_millis(100);
+const SWEEP_PAGE: i64 = 100;
+
 #[derive(Debug)]
 pub(super) struct ScheduleState {
     pub started: bool,
+    /// The commit generation of the last pass that completed.
     pub generation: u64,
-    pub sweep_at: Instant,
     pub deadline: Option<Instant>,
     pub repo_retry: bool,
     pub server_cap: Option<Option<i64>>,
+    /// Tasks re-read at the base scan cadence without a commit: a hold on a
+    /// fact no write announces (credential, provider health and backoff,
+    /// connection health, CLI policy), a step that declined, a failed pass.
+    pub recheck: HashSet<String>,
+    pub recheck_at: Option<Instant>,
+    pub sweep: Sweep,
+}
+#[derive(Debug)]
+pub(super) struct Sweep {
+    /// When the next lap starts.
+    pub due: Instant,
+    active: bool,
+    /// In memory only: a restart begins a fresh lap.
+    cursor: Option<String>,
+    /// Tasks the sweep found work for, handed to the next pass.
+    pending: HashSet<String>,
+    /// Every Project's repository is probed once per lap.
+    projects: bool,
+    repairs: u64,
+    backfilling: bool,
+}
+impl Sweep {
+    /// A lap is in progress.
+    pub(super) fn active(&self) -> bool {
+        self.active
+    }
+    /// The sweep found Tasks the next pass has not looked at yet.
+    pub(super) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
 }
 impl Default for ScheduleState {
     fn default() -> Self {
         Self {
             started: false,
             generation: 0,
-            sweep_at: Instant::now(),
             deadline: None,
             repo_retry: false,
             server_cap: None,
+            recheck: HashSet::new(),
+            recheck_at: None,
+            sweep: Sweep {
+                due: Instant::now(),
+                active: false,
+                cursor: None,
+                pending: HashSet::new(),
+                projects: true,
+                repairs: 0,
+                backfilling: false,
+            },
         }
     }
 }
-impl TaskDispatcher {
-    pub async fn startup_reconcile(&self) -> Result<u64> {
-        self.reconcile_once().await
+
+/// What one pass was asked to look at besides the committed dirty set.
+#[derive(Default)]
+struct Marked {
+    swept: HashSet<String>,
+    recheck: HashSet<String>,
+    capacity_changed: bool,
+    all_projects: bool,
+    /// Read every Task that is not settled in this pass.
+    discover: bool,
+}
+/// Agent availability as one pass read it.
+struct AgentStatuses {
+    agents: Vec<db::Agent>,
+    statuses: HashMap<String, crate::agent_service::EffectiveStatus>,
+}
+/// What one Task's reconciliation asks of later ticks.
+#[derive(Default)]
+struct Outcome {
+    dispatched: u64,
+    recheck: bool,
+}
+
+fn encode(park: &Park) -> String {
+    serde_json::to_string(park).expect("park serializes")
+}
+fn waits(reason: Reason, owner: Owner, recovery: Action) -> Park {
+    Park {
+        reason,
+        owner,
+        recovery,
     }
+}
+
+impl TaskDispatcher {
+    /// Dispatch starts from the durable dirty set at once. Everything else a
+    /// restart has to rediscover is the first lap of the paged sweep, which
+    /// runs behind it and never delays startup.
+    pub async fn startup_reconcile(&self) -> Result<u64> {
+        self.reconcile_once(false).await
+    }
+
+    /// Reconcile everything now: the dirty set, one complete lap of the sweep
+    /// and whatever that lap found. The operator refresh asks for this, as it
+    /// asked the scanning dispatcher for a full scan.
+    pub async fn reconcile_all(&self) -> Result<u64> {
+        let mut dispatched = self.reconcile_once(true).await?;
+        {
+            let mut state = self.schedule_state.lock().expect("schedule state");
+            if !state.sweep.active {
+                state.sweep.due = Instant::now();
+            }
+        }
+        loop {
+            self.sweep_slice(Duration::MAX).await?;
+            if !self
+                .schedule_state
+                .lock()
+                .expect("schedule state")
+                .sweep
+                .active()
+            {
+                break;
+            }
+        }
+        dispatched += self.reconcile_once(true).await?;
+        Ok(dispatched)
+    }
+
+    /// Reconcile what commits marked, then fail if any Task that is not
+    /// settled is left with no queued step, no live execution and no park.
+    /// The check reads the durable state directly, before the sweep could
+    /// repair it, so a Task the kicks missed fails here.
     pub async fn sweep_and_assert(&self) -> Result<()> {
-        self.schedule_state.lock().expect("schedule state").sweep_at = Instant::now();
-        self.reconcile_once().await?;
+        self.reconcile_once(false).await?;
         let violations = self.db.task_schedule_violations().await?;
         if !violations.is_empty() {
             return Err(ServiceError::invalid_operation(format!(
@@ -49,7 +167,15 @@ impl TaskDispatcher {
         }
         Ok(())
     }
-    pub(super) async fn reconcile_once(&self) -> Result<u64> {
+
+    /// `asked` is a direct request to look now (a caller of `check_once`,
+    /// the operator refresh), as opposed to the supervised loop's own tick:
+    /// it also re-reads the Tasks held on facts no commit announces, which
+    /// the loop re-reads at the scan interval, and the first one an instance
+    /// receives reads every Task that is not settled, as a first scan did.
+    /// Startup and the loop never do that: the paged sweep does it for them.
+    pub(super) async fn reconcile_once(&self, asked: bool) -> Result<u64> {
+        self.register();
         let _reconciliation = self.reconcile_lock.lock().await;
         let generation = self.db.schedule_generation();
         let now = Instant::now();
@@ -60,30 +186,64 @@ impl TaskDispatcher {
             .values()
             .any(|j| j.is_finished());
         let cap = self.db.server_run_cap.effective();
-        let (sweep, first, capacity_changed) = {
+        let marked = {
             let mut state = self.schedule_state.lock().expect("schedule state");
             let capacity_changed = state.server_cap.is_some_and(|old| old != cap);
+            let recheck_due = state.recheck_at.is_some_and(|at| at <= now)
+                || (asked && !state.recheck.is_empty());
             if state.started
                 && !capacity_changed
                 && state.generation == generation
                 && !self.db.schedule_commit_pending()
-                && state.sweep_at > now
                 && state.deadline.is_none_or(|d| d > now)
                 && !jobs_ready
                 && !state.repo_retry
+                && state.sweep.pending.is_empty()
+                && !state.sweep.projects
+                && !recheck_due
             {
                 return Ok(0);
             }
-            let first = !state.started;
-            let sweep = first || state.sweep_at <= now;
+            let discover = asked && !state.started;
             state.started = true;
-            state.generation = generation;
             state.server_cap = Some(cap);
-            if sweep {
-                state.sweep_at = now + Duration::from_secs(120);
+            let recheck = if recheck_due {
+                state.recheck_at = None;
+                std::mem::take(&mut state.recheck)
+            } else {
+                HashSet::new()
+            };
+            Marked {
+                swept: std::mem::take(&mut state.sweep.pending),
+                recheck,
+                capacity_changed,
+                all_projects: std::mem::take(&mut state.sweep.projects),
+                discover,
             }
-            (sweep, first, capacity_changed)
         };
+        let retry: Vec<String> = marked
+            .swept
+            .iter()
+            .chain(&marked.recheck)
+            .cloned()
+            .collect();
+        let all_projects = marked.all_projects;
+        let result = Box::pin(self.reconcile_pass(marked)).await;
+        let mut state = self.schedule_state.lock().expect("schedule state");
+        match &result {
+            // Only a pass that completed has seen this generation.
+            Ok(_) => state.generation = generation,
+            Err(error) => {
+                tracing::warn!(%error, "Task reconciliation pass failed; retrying at the next tick");
+                state.recheck.extend(retry);
+                state.recheck_at = Some(Instant::now() + self.check_interval);
+                state.sweep.projects |= all_projects;
+            }
+        }
+        result
+    }
+
+    async fn reconcile_pass(&self, marked: Marked) -> Result<u64> {
         self.observe_environment_settings();
         let mut ids: HashSet<String> = self
             .db
@@ -91,48 +251,69 @@ impl TaskDispatcher {
             .await?
             .into_iter()
             .collect();
-        let capacity_ids: HashSet<String> = if capacity_changed {
-            sqlx::query_scalar(
-                "SELECT task_id FROM task_schedule_wait WHERE daemon_id IS NULL OR daemon_id=?",
-            )
-            .bind(self.db.server_run_cap.embedded_machine_id())
-            .fetch_all(self.db.pool())
-            .await?
-            .into_iter()
-            .collect()
+        let capacity_ids: HashSet<String> = if marked.capacity_changed {
+            self.db
+                .schedule_machine_waiters()
+                .await?
+                .into_iter()
+                .collect()
         } else {
             HashSet::new()
         };
         ids.extend(capacity_ids.iter().cloned());
         ids.extend(self.db.due_schedule_tasks(&db::now_rfc3339()).await?);
-        if sweep || !ids.is_empty() {
+        ids.extend(marked.swept);
+        ids.extend(marked.recheck);
+        if marked.discover {
+            ids.extend(self.db.open_schedule_tasks(None, i64::MAX).await?);
+        }
+        if !ids.is_empty() {
             crate::placement::admission::sweep_expired_reservations(&self.db, &db::now_rfc3339())
                 .await?;
         }
-        let environment_changed = self.sync_due_environment_checks().await?;
-        if !environment_changed.is_empty() {
-            ids.extend(self.db.dirty_schedule_tasks(i64::MAX).await?);
+        match self.sync_due_environment_checks().await {
+            Ok(changed) if !changed.is_empty() => {
+                ids.extend(self.db.dirty_schedule_tasks(i64::MAX).await?)
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "environment readiness scan failed; continuing dispatch")
+            }
         }
-        if sweep {
-            self.db.begin_condition_sweep(first).await?;
-            // Discover candidates cheaply before admission. Full condition
-            // checking remains after the dispatch pass, as on the base.
-            ids.extend(
-                sqlx::query_scalar::<_, String>("SELECT id FROM task")
-                    .fetch_all(self.db.pool())
-                    .await?,
-            );
-        }
+        // One Task that cannot be read or reconciled is logged, counted in the
+        // invariant report and retried; every other Task still gets its pass.
+        let mut failures = 0_u64;
+        let mut retry: Vec<String> = Vec::new();
         let mut reads = Vec::new();
         let ids: Vec<_> = ids.into_iter().collect();
         for page in ids.chunks(50) {
-            reads.extend(self.db.schedule_reads(page).await?);
+            let (page_reads, unreadable) = self.db.schedule_reads_isolated(page).await?;
+            reads.extend(page_reads);
+            for (id, error) in unreadable {
+                tracing::warn!(task_id = %id, %error, "Task scheduling snapshot unreadable; recomputing its condition");
+                failures += 1;
+                // The stored condition is what failed to decode; the legacy
+                // fields it shadows are intact, so recompute it and go on.
+                let one = std::slice::from_ref(&id);
+                let repaired = match self.db.check_task_conditions_of(one).await {
+                    Ok(_) => self.db.schedule_reads_isolated(one).await.ok(),
+                    Err(error) => {
+                        tracing::warn!(task_id = %id, %error, "Task condition repair failed");
+                        None
+                    }
+                };
+                match repaired {
+                    Some((mut read, unreadable)) if unreadable.is_empty() => {
+                        reads.append(&mut read)
+                    }
+                    _ => retry.push(id),
+                }
+            }
         }
         for read in &mut reads {
             read.external |= capacity_ids.contains(&read.task.id);
-            read.verify = sweep;
         }
-        let project_reads = self.db.schedule_projects(sweep).await?;
+        let project_reads = self.db.schedule_projects(marked.all_projects).await?;
         let mut projects: HashMap<_, _> = project_reads
             .iter()
             .map(|(p, _)| (p.id.clone(), p.clone()))
@@ -145,34 +326,49 @@ impl TaskDispatcher {
             }
         }
         let mut skipped = HashSet::new();
+        let mut unsynced = HashSet::new();
         // Repo negative readiness still needs a filesystem probe on the sweep.
         // Positive readiness is memoized and only relevant Projects are loaded.
         for p in projects.values() {
-            if self.sync_repository_pause(p).await? {
-                skipped.insert(p.id.clone());
+            match self.sync_repository_pause(p).await {
+                Ok(true) => {
+                    skipped.insert(p.id.clone());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(project_id = %p.id, %error, "repository pause synchronization failed; skipping Project");
+                    unsynced.insert(p.id.clone());
+                }
             }
         }
         for (p, generation) in &project_reads {
-            self.db
-                .acknowledge_schedule_project(&p.id, *generation)
-                .await?;
+            if !unsynced.contains(&p.id) {
+                self.db
+                    .acknowledge_schedule_project(&p.id, *generation)
+                    .await?;
+            }
         }
         self.schedule_state
             .lock()
             .expect("schedule state")
-            .repo_retry = projects
-            .values()
-            .any(|p| p.system_pause_reason.as_deref() == Some("repository_not_ready"));
+            .repo_retry = !unsynced.is_empty()
+            || projects
+                .values()
+                .any(|p| p.system_pause_reason.as_deref() == Some("repository_not_ready"));
         let now = chrono::Utc::now();
         let mut prepared: Vec<_> = reads
             .into_iter()
+            .filter(|r| !unsynced.contains(&r.task.project_id))
             .filter_map(|r| {
                 projects
                     .get(&r.task.project_id)
                     .map(|p| self.prepare_schedule(r, p, now))
             })
             .collect();
-        self.enrich_schedule_agents(&mut prepared).await?;
+        let agents = self.schedule_agent_statuses(&prepared).await?;
+        // The scanning dispatcher's order: Projects oldest first; within one,
+        // publication cleanup, queued recoveries, work already in flight, then
+        // new admissions by priority. Every tie breaks on creation order.
         prepared.sort_by(|a, b| {
             let (pa, pb) = (
                 &projects[&a.read.task.project_id],
@@ -183,9 +379,7 @@ impl TaskDispatcher {
                     0
                 } else if p.facts.queued_recovery {
                     1
-                } else if p.workflow.state_kind(&p.read.task.status)
-                    == Some(api_types::StateKind::Initial)
-                {
+                } else if p.workflow.state_kind(&p.read.task.status) == Some(StateKind::Initial) {
                     3
                 } else {
                     2
@@ -207,301 +401,46 @@ impl TaskDispatcher {
         });
         let mut count = 0;
         let mut slots = HashMap::new();
-        let mut repairs = 0;
+        let mut recheck = Vec::new();
         for mut p in prepared {
             if self.is_stopped() {
                 break;
             }
             let project = &projects[&p.read.task.project_id];
-            if p.read.task.deleted_at.is_some() || p.read.task.archived_at.is_some() {
-                self.db
-                    .acknowledge_schedule(
-                        &p.read.task.id,
-                        if p.read.dirty { p.read.generation } else { 0 },
-                    )
-                    .await?;
-                continue;
-            }
-            if skipped.contains(&project.id) && !p.facts.publication {
-                let park = Park {
-                    reason: Reason::ProjectPaused,
-                    owner: Owner::User,
-                    recovery: Action::ResumeProject,
-                };
-                self.db
-                    .record_schedule_park(
-                        &p.read.task.id,
-                        p.read.epoch,
-                        &serde_json::to_string(&park).expect("park serializes"),
-                    )
-                    .await?;
-                continue;
-            }
-            let unowned = sweep
-                && !self
-                    .db
-                    .schedule_has_owner(&p.read.task.id, p.read.epoch)
-                    .await?
-                && p.workflow.state_kind(&p.read.task.status)
-                    != Some(api_types::StateKind::Terminal);
-            if unowned {
-                repairs += 1;
-                tracing::warn!(task_id=%p.read.task.id, startup=first,"scheduler invariant repaired by reconciliation");
-            }
-            // Default assignment and stale approval cleanup can expose the same
-            // admission candidate in this pass, preserving the old fairness.
-            for _ in 0..3 {
-                let next = next_step::next_step(&Snapshot {
-                    state: &p.read.task.status,
-                    condition: &p.read.condition,
-                    workflow: &p.workflow,
-                    facts: &p.facts,
-                });
-                let mut result_park = None;
-                match &next {
-                    Next::Park(park) => result_park = Some(park.clone()),
-                    Next::Step(step) => {
-                        tracing::debug!(task_id=%p.read.task.id, queue_identity=%step.identity(), "resolved Task step");
-                        if matches!(step, Step::Initial { .. }) {
-                            if !slots.contains_key(&project.id) {
-                                slots.insert(
-                                    project.id.clone(),
-                                    match super::slots::load_project_slots(&self.db, project).await
-                                    {
-                                        Ok(slots) => slots,
-                                        Err(error) => {
-                                            self.handle_schedule_error(&p, step, &error).await?;
-                                            break;
-                                        }
-                                    },
-                                );
-                            }
-                            let slot = slots.get_mut(&project.id).expect("project slots");
-                            if slot.limit > 0
-                                && (slot.active >= slot.limit || slot.parked >= 2 * slot.limit)
-                            {
-                                let message = if slot.active >= slot.limit {
-                                    format!(
-                                        "project_at_capacity: waiting for a slot ({}/{} active)",
-                                        slot.active, slot.limit
-                                    )
-                                } else {
-                                    format!("project_waiting_on_owner: {} parked tasks waiting on the owner",slot.parked)
-                                };
-                                deferred_dispatch::record_dispatch_disposition(
-                                    &self.db,
-                                    &p.read.task,
-                                    "project_capacity",
-                                    &message,
-                                )
-                                .await?;
-                                result_park = Some(Park {
-                                    reason: Reason::Capacity,
-                                    owner: Owner::Scheduler,
-                                    recovery: Action::FreeCapacity,
-                                });
-                            }
-                        }
-                        if result_park.is_none() {
-                            match self.apply_schedule_step(&p, project, step).await {
-                                Ok(n) => {
-                                    count += n;
-                                    if n > 0 && matches!(step, Step::Initial { .. }) {
-                                        slots.get_mut(&project.id).expect("slots").active += 1;
-                                    }
-                                    if matches!(
-                                        step,
-                                        Step::ApplyDefaults
-                                            | Step::ClearPlanningWait
-                                            | Step::RefreshPlacement
-                                    ) {
-                                        let id = p.read.task.id.clone();
-                                        if let Some(read) =
-                                            self.db.schedule_reads(&[id]).await?.pop()
-                                        {
-                                            p = self.prepare_schedule(
-                                                read,
-                                                project,
-                                                chrono::Utc::now(),
-                                            );
-                                            p.facts.refresh_placement = false;
-                                            continue;
-                                        }
-                                    }
-                                    if !self
-                                        .db
-                                        .schedule_has_owner(&p.read.task.id, p.read.epoch)
-                                        .await?
-                                    {
-                                        result_park = Some(match step {
-                                            Step::Publication => {
-                                                p.deadline = Some(
-                                                    (chrono::Utc::now()
-                                                        + chrono::Duration::seconds(10))
-                                                    .to_rfc3339(),
-                                                );
-                                                Park {
-                                                    reason: Reason::RetryDeadline,
-                                                    owner: Owner::Worker,
-                                                    recovery: Action::WaitForDeadline,
-                                                }
-                                            }
-                                            Step::Initial { .. }
-                                            | Step::Role { .. }
-                                            | Step::QueuedRecovery => Park {
-                                                reason: Reason::Capacity,
-                                                owner: Owner::Scheduler,
-                                                recovery: Action::FreeCapacity,
-                                            },
-                                            _ => Park {
-                                                reason: Reason::UnknownCondition {
-                                                    owner: step.identity(),
-                                                },
-                                                owner: Owner::Workflow,
-                                                recovery: Action::ReconcileEntry,
-                                            },
-                                        });
-                                    }
-                                }
-                                Err(error) => {
-                                    self.handle_schedule_error(&p, step, &error).await?;
-                                    result_park = Some(Park {
-                                        reason: Reason::UnknownCondition {
-                                            owner: "dispatch admission".into(),
-                                        },
-                                        owner: Owner::Workflow,
-                                        recovery: Action::RepairAndRetry,
-                                    });
-                                    if !super::helpers::is_deterministic_dispatch_refusal(&error) {
-                                        p.deadline = Some(
-                                            (chrono::Utc::now() + chrono::Duration::seconds(10))
-                                                .to_rfc3339(),
-                                        );
-                                    }
-                                }
-                            }
-                        }
+            let id = p.read.task.id.clone();
+            let paused_by_sync = skipped.contains(&project.id);
+            match Box::pin(self.reconcile_task(
+                &mut p,
+                project,
+                paused_by_sync,
+                &agents,
+                &mut slots,
+            ))
+            .await
+            {
+                Ok(outcome) => {
+                    count += outcome.dispatched;
+                    if outcome.recheck {
+                        recheck.push(id);
                     }
                 }
-                if let Some(park) = result_park {
-                    let encoded = serde_json::to_string(&park).expect("park serializes");
-                    if p.read.park_json.as_deref() != Some(&encoded) {
-                        self.db
-                            .record_schedule_park(&p.read.task.id, p.read.epoch, &encoded)
-                            .await?;
-                        if unowned {
-                            tracing::warn!(task_id=%p.read.task.id,reason=?park.reason,owner=?park.owner,recovery=?park.recovery,"installed Task owner park");
-                        }
-                    }
+                Err(ServiceError::Db(
+                    db::DbError::VersionConflict | db::DbError::TaskVersionConflict { .. },
+                )) => {
+                    // The write that won dirtied the Task again.
+                    tracing::debug!(task_id = %id, "Task reconciliation lost a version race");
                 }
-                let wait_scope = matches!(
-                    next,
-                    Next::Step(
-                        Step::Initial { .. }
-                            | Step::Role { .. }
-                            | Step::QueuedRecovery
-                            | Step::FailedReview
-                    )
-                ) || matches!(
-                    next,
-                    Next::Park(Park {
-                        reason: Reason::RetryDeadline | Reason::AgentUnavailable | Reason::Capacity,
-                        ..
-                    })
-                );
-                let recovery_agent = if matches!(next, Next::Step(Step::FailedReview)) {
-                    serde_json::from_str::<api_types::ProjectSettings>(&project.settings)
-                        .ok()
-                        .filter(|s| s.automatic_recovery.enabled)
-                        .and_then(|s| s.automatic_recovery.agent_id)
-                } else {
-                    None
-                };
-                let agent = wait_scope
-                    .then(|| {
-                        p.facts
-                            .role_target
-                            .as_ref()
-                            .map(|(_, id)| id.as_str())
-                            .or_else(|| {
-                                p.facts
-                                    .initial_target
-                                    .as_ref()
-                                    .map(|(_, _, id)| id.as_str())
-                            })
-                    })
-                    .flatten();
-                let agent = recovery_agent.as_deref().or(agent);
-                let agent_daemon = match agent {
-                    Some(id) => db::AgentRepo::get_by_id(&*self.db, id)
-                        .await?
-                        .and_then(|a| a.daemon_id),
-                    None => None,
-                };
-                let metadata = p.read.task.metadata().ok();
-                let daemon = p
-                    .read
-                    .placement_daemon_id
-                    .clone()
-                    .or_else(|| {
-                        metadata
-                            .as_ref()
-                            .and_then(|m| m.extra.get("environment_wait"))
-                            .and_then(|v| v["machine"]["daemon_id"].as_str())
-                            .map(str::to_owned)
-                    })
-                    .or_else(|| {
-                        metadata
-                            .as_ref()
-                            .and_then(|m| m.extra.get("owner_wait"))
-                            .and_then(|v| v["daemon_id"].as_str())
-                            .map(str::to_owned)
-                    })
-                    .or(agent_daemon);
-                if agent.is_some() || p.deadline.is_some() || p.read.has_wait {
-                    self.db
-                        .schedule_wait(
-                            &p.read.task.id,
-                            (
-                                &project.id,
-                                p.workflow.state_kind(&p.read.task.status)
-                                    == Some(api_types::StateKind::Initial),
-                            ),
-                            agent,
-                            daemon.as_deref(),
-                            p.deadline.as_deref(),
-                        )
-                        .await?;
+                Err(error) => {
+                    tracing::warn!(task_id = %id, %error, "Task reconciliation failed; continuing with the next Task");
+                    failures += 1;
+                    retry.push(id);
                 }
-                self.db
-                    .acknowledge_schedule(
-                        &p.read.task.id,
-                        if p.read.dirty { p.read.generation } else { 0 },
-                    )
-                    .await?;
-                break;
             }
         }
-        if sweep {
-            // One bounded checker and persisted cursor, after dispatch work.
-            loop {
-                self.db
-                    .check_task_conditions(db::CONDITION_CHECK_PAGE)
-                    .await?;
-                self.db.persist_condition_cursor().await?;
-                if self.db.condition_check_page_ids().1.is_none() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        }
-        if repairs > 0 {
-            self.db.count_schedule_repairs(repairs);
-        }
-        // The owning timers (Task retries, leases, reservation expiry, readiness
-        // and failed Review grace) wake independently of the slow sweep.
-        let deadline:Option<String>=sqlx::query_scalar("SELECT MIN(deadline) FROM (SELECT deadline FROM task_schedule_wait WHERE deadline IS NOT NULL UNION ALL SELECT next_check_at FROM project_machine_readiness WHERE status='not_ready' UNION ALL SELECT reserved_until FROM workspace_placement WHERE state IN ('reserved','preparing') UNION ALL SELECT lease_until FROM task_step WHERE status='claimed' UNION ALL SELECT lease_expires_at FROM execution WHERE status='running') WHERE julianday(deadline)>julianday('now')").fetch_one(self.db.pool()).await?;
-        let deadline = deadline
+        let deadline = self
+            .db
+            .next_schedule_deadline()
+            .await?
             .as_deref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|d| {
@@ -510,17 +449,495 @@ impl TaskDispatcher {
                         .to_std()
                         .unwrap_or(Duration::ZERO)
             });
-        self.schedule_state.lock().expect("schedule state").deadline = deadline;
+        let mut state = self.schedule_state.lock().expect("schedule state");
+        state.deadline = deadline;
+        state.sweep.repairs += failures;
+        state.recheck.extend(retry);
+        state.recheck.extend(recheck);
+        if !state.recheck.is_empty() && state.recheck_at.is_none() {
+            state.recheck_at = Some(Instant::now() + self.check_interval);
+        }
         Ok(count)
     }
+
+    /// Resolve one Task and apply what it resolved to. Default assignment and
+    /// stale approval cleanup can expose an admission candidate in the same
+    /// pass, preserving the old fairness.
+    async fn reconcile_task(
+        &self,
+        p: &mut Prepared,
+        project: &Project,
+        paused_by_sync: bool,
+        agents: &AgentStatuses,
+        slots: &mut HashMap<String, api_types::ProjectSlots>,
+    ) -> Result<Outcome> {
+        let mut outcome = Outcome::default();
+        if p.read.task.deleted_at.is_some() || p.read.task.archived_at.is_some() {
+            self.acknowledge(p).await?;
+            return Ok(outcome);
+        }
+        if paused_by_sync && !p.facts.publication {
+            // The Project row this pass loaded is stale; the pause change
+            // dirtied its Tasks, so the next pass resolves them.
+            let park = encode(&waits(
+                Reason::ProjectPaused,
+                Owner::User,
+                Action::ResumeProject,
+            ));
+            if p.read.park_json.as_deref() != Some(&park) {
+                self.db
+                    .record_schedule_park(&p.read.task.id, p.read.epoch, &park)
+                    .await?;
+            }
+            return Ok(outcome);
+        }
+        // A placement refusal is re-evaluated against live facts no commit
+        // announces (a machine's connection, a due provisioning retry). The
+        // scanning dispatcher re-read such a Task on every scan; so does this.
+        outcome.recheck |= p.facts.refresh_placement;
+        if p.condition_stale {
+            // A writer missed its condition sync. This pass already resolved
+            // from the legacy fields; repair the stored copy and report it.
+            let repaired = self
+                .db
+                .check_task_conditions_of(std::slice::from_ref(&p.read.task.id))
+                .await?;
+            self.schedule_state
+                .lock()
+                .expect("schedule state")
+                .sweep
+                .repairs += repaired;
+        }
+        let mut gate = true;
+        let mut refused = false;
+        for _ in 0..4 {
+            let machine_wait = p.machine_wait;
+            refused |= Box::pin(self.observe_admission(p, project, agents, gate)).await;
+            p.machine_wait |= machine_wait;
+            gate = false;
+            let initial = p.workflow.state_kind(&p.read.task.status) == Some(StateKind::Initial);
+            let next = next_step::next_step(&Snapshot {
+                state: &p.read.task.status,
+                condition: &p.read.condition,
+                workflow: &p.workflow,
+                facts: &p.facts,
+            });
+            // The visible half of an owner park follows the resolution: it
+            // is written for a Task nothing owns and removed the moment the
+            // Task resolves to anything else, before that step is applied.
+            let park = match &next {
+                Next::Park(park) => Some(park),
+                Next::Step(_) => None,
+            };
+            if self.sync_legacy_park(&p.read.task, park).await? {
+                if self.reread(p, project).await? {
+                    continue;
+                }
+                return Ok(outcome);
+            }
+            let mut parked = None;
+            let mut project_wait = false;
+            match &next {
+                Next::Park(park) => {
+                    parked = Some(park.clone());
+                    // Availability also turns on facts no commit announces.
+                    outcome.recheck |= park.reason == Reason::AgentUnavailable;
+                    if initial
+                        && p.facts.initial_target.is_none()
+                        && park.reason == Reason::HumanWork
+                    {
+                        // No dispatch target: a capacity wait recorded for an
+                        // earlier target no longer describes this Task.
+                        deferred_dispatch::clear_capacity_wait(&self.db, &p.read.task).await?;
+                    }
+                }
+                // The admission check for this role failed without leaving a
+                // refusal: nothing is dispatched past it, and it is tried
+                // again at the scan cadence, as the next scan tried it.
+                Next::Step(Step::Role { .. }) if refused => {
+                    outcome.recheck = true;
+                    parked = Some(waits(
+                        Reason::RetryDeadline,
+                        Owner::Scheduler,
+                        Action::WaitForDeadline,
+                    ));
+                }
+                Next::Step(step) => {
+                    tracing::debug!(task_id=%p.read.task.id, queue_identity=%step.identity(), "resolved Task step");
+                    // Only an admission from an initial state takes a Project
+                    // slot. A gate cascading past an unassigned role already
+                    // holds one.
+                    if initial && matches!(step, Step::Initial { .. }) {
+                        if !slots.contains_key(&project.id) {
+                            slots.insert(
+                                project.id.clone(),
+                                super::slots::load_project_slots(&self.db, project).await?,
+                            );
+                        }
+                        let slot = slots.get(&project.id).expect("project slots");
+                        let waiting = if slot.limit == 0 {
+                            None
+                        } else if slot.active >= slot.limit {
+                            Some(format!(
+                                "project_at_capacity: waiting for a slot ({}/{} active)",
+                                slot.active, slot.limit
+                            ))
+                        } else if slot.parked >= 2 * slot.limit {
+                            Some(format!(
+                                "project_waiting_on_owner: {} parked tasks waiting on the owner",
+                                slot.parked
+                            ))
+                        } else {
+                            None
+                        };
+                        if let Some(message) = waiting {
+                            // Written once: an unchanged reason is not
+                            // recorded again, so a Project at its limit costs
+                            // nothing while it waits.
+                            if deferred_dispatch::record_dispatch_disposition(
+                                &self.db,
+                                &p.read.task,
+                                "project_capacity",
+                                &message,
+                            )
+                            .await?
+                            {
+                                self.publish_capacity_disposition_change(&p.read.task);
+                            }
+                            project_wait = true;
+                            parked = Some(waits(
+                                Reason::Capacity,
+                                Owner::Scheduler,
+                                Action::FreeCapacity,
+                            ));
+                        }
+                    }
+                    if parked.is_none() {
+                        match Box::pin(self.apply_schedule_step(p, project, step)).await {
+                            Ok(n) => {
+                                outcome.dispatched += n;
+                                if n > 0 && matches!(step, Step::Initial { .. }) {
+                                    self.clear_dispatch_disposition(&p.read.task).await?;
+                                    if initial {
+                                        slots.get_mut(&project.id).expect("slots").active += 1;
+                                    }
+                                }
+                                if matches!(
+                                    step,
+                                    Step::ApplyDefaults
+                                        | Step::ClearPlanningWait
+                                        | Step::RefreshPlacement
+                                ) {
+                                    if self.reread(p, project).await? {
+                                        p.facts.refresh_placement = false;
+                                        continue;
+                                    }
+                                    return Ok(outcome);
+                                }
+                                let owned = self
+                                    .db
+                                    .schedule_has_owner(&p.read.task.id, p.read.epoch)
+                                    .await?;
+                                match step {
+                                    // Admission declined without a refusal:
+                                    // a slot, a queued admission or the
+                                    // machine is full. Freed capacity kicks.
+                                    Step::Initial { .. }
+                                    | Step::Role { .. }
+                                    | Step::QueuedRecovery => {
+                                        if !owned {
+                                            p.machine_wait = true;
+                                            parked = Some(waits(
+                                                Reason::Capacity,
+                                                Owner::Scheduler,
+                                                Action::FreeCapacity,
+                                            ));
+                                        }
+                                    }
+                                    // The step had nothing to do yet. The
+                                    // scanning dispatcher asked again on its
+                                    // next scan; so does this one.
+                                    _ => {
+                                        outcome.recheck |= n == 0;
+                                        if !owned {
+                                            parked = Some(waits(
+                                                Reason::RetryDeadline,
+                                                Owner::Scheduler,
+                                                Action::WaitForDeadline,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                self.handle_schedule_error(p, step, &error).await?;
+                                // A recorded refusal waits for the Task to
+                                // change; anything else is retried at the
+                                // scan cadence, as before.
+                                outcome.recheck |=
+                                    !super::helpers::is_deterministic_dispatch_refusal(&error);
+                                parked = Some(waits(
+                                    Reason::RetryDeadline,
+                                    Owner::Scheduler,
+                                    Action::WaitForDeadline,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(park) = &parked {
+                let encoded = encode(park);
+                if p.read.park_json.as_deref() != Some(&encoded) {
+                    self.db
+                        .record_schedule_park(&p.read.task.id, p.read.epoch, &encoded)
+                        .await?;
+                }
+            }
+            self.record_wait(p, project, &next, parked.as_ref(), project_wait)
+                .await?;
+            self.acknowledge(p).await?;
+            return Ok(outcome);
+        }
+        // Each repeat follows a write that dirtied the Task again.
+        Ok(outcome)
+    }
+
+    async fn acknowledge(&self, p: &Prepared) -> Result<()> {
+        self.db
+            .acknowledge_schedule(
+                &p.read.task.id,
+                if p.read.dirty { p.read.generation } else { 0 },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Replace the snapshot after a write of this pass. False when the Task
+    /// is gone.
+    async fn reread(&self, p: &mut Prepared, project: &Project) -> Result<bool> {
+        let id = p.read.task.id.clone();
+        let Some(read) = self.db.schedule_reads(&[id]).await?.pop() else {
+            return Ok(false);
+        };
+        *p = self.prepare_schedule(read, project, chrono::Utc::now());
+        Ok(true)
+    }
+
+    /// Which later commits must look at this Task again: the Agent it waits
+    /// for, the machine it waits on, the Project limit, an exact deadline.
+    /// Nothing else is recorded, so nothing else kicks it.
+    async fn record_wait(
+        &self,
+        p: &Prepared,
+        project: &Project,
+        next: &Next,
+        parked: Option<&Park>,
+        project_wait: bool,
+    ) -> Result<()> {
+        let wait_scope = matches!(
+            next,
+            Next::Step(
+                Step::Initial { .. }
+                    | Step::Role { .. }
+                    | Step::QueuedRecovery
+                    | Step::FailedReview
+            )
+        ) || matches!(
+            next,
+            Next::Park(Park {
+                reason: Reason::RetryDeadline | Reason::AgentUnavailable | Reason::Capacity,
+                ..
+            })
+        );
+        let recovery_agent = if matches!(next, Next::Step(Step::FailedReview)) {
+            serde_json::from_str::<api_types::ProjectSettings>(&project.settings)
+                .ok()
+                .filter(|s| s.automatic_recovery.enabled)
+                .and_then(|s| s.automatic_recovery.agent_id)
+        } else {
+            None
+        };
+        let agent = wait_scope
+            .then(|| {
+                p.facts
+                    .role_target
+                    .as_ref()
+                    .map(|(_, id)| id.as_str())
+                    .or_else(|| {
+                        p.facts
+                            .initial_target
+                            .as_ref()
+                            .map(|(_, _, id)| id.as_str())
+                    })
+            })
+            .flatten();
+        let agent = recovery_agent.as_deref().or(agent);
+        let metadata = p.read.task.metadata().ok();
+        let machine = |key: &str, path: &[&str]| {
+            let mut value = metadata.as_ref()?.extra.get(key)?;
+            for part in path {
+                value = &value[*part];
+            }
+            value
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        };
+        // A readiness or reconnect wait names its machine. A wait for a run
+        // slot is for whichever machine placement can use.
+        let machine_wait = p.machine_wait
+            && parked.is_some_and(|park| park.reason == Reason::Capacity)
+            || deferred_dispatch::dispatch_disposition_is_current(&p.read.task, "machine_capacity");
+        let daemon = machine("environment_wait", &["machine", "daemon_id"])
+            .or_else(|| machine("owner_wait", &["daemon_id"]))
+            .or_else(|| machine_wait.then(|| "*".to_owned()));
+        if agent.is_some()
+            || daemon.is_some()
+            || p.deadline.is_some()
+            || project_wait
+            || p.read.has_wait
+        {
+            self.db
+                .schedule_wait(
+                    &p.read.task.id,
+                    (&project.id, project_wait),
+                    agent,
+                    daemon.as_deref(),
+                    p.deadline.as_deref(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Advance the sweep by at most `budget`. It runs outside the dispatch
+    /// pass and takes no writer for a read: a page of Tasks that are not
+    /// settled is condition-checked, resolved without I/O, and whatever the
+    /// kicks missed is handed to the next pass. A settled Task is never read.
+    pub(super) async fn sweep_slice(&self, budget: Duration) -> Result<()> {
+        let _slice = self.sweep_lock.lock().await;
+        let started = Instant::now();
+        // After a mapping change the backfill covers every Task once, in its
+        // own bounded slices, behind dispatch.
+        let backfilling = self.db.backfill_task_conditions_if_stale().await?;
+        {
+            let mut state = self.schedule_state.lock().expect("schedule state");
+            state.sweep.backfilling = backfilling;
+            if !state.sweep.active {
+                if state.sweep.due > started {
+                    return Ok(());
+                }
+                state.sweep.active = true;
+                state.sweep.cursor = None;
+                state.sweep.due = started + SWEEP_PERIOD;
+                state.sweep.projects = true;
+            }
+        }
+        let mut projects: HashMap<String, Option<Project>> = HashMap::new();
+        loop {
+            let cursor = self
+                .schedule_state
+                .lock()
+                .expect("schedule state")
+                .sweep
+                .cursor
+                .clone();
+            let ids = self
+                .db
+                .open_schedule_tasks(cursor.as_deref(), SWEEP_PAGE)
+                .await?;
+            let Some(last) = ids.last().cloned() else {
+                let repairs = {
+                    let mut state = self.schedule_state.lock().expect("schedule state");
+                    state.sweep.active = false;
+                    std::mem::take(&mut state.sweep.repairs)
+                };
+                self.db.complete_condition_pass(repairs);
+                return Ok(());
+            };
+            self.db.check_task_conditions_of(&ids).await?;
+            let (reads, unreadable) = self.db.schedule_reads_isolated(&ids).await?;
+            let mut marked = Vec::new();
+            let mut repairs = unreadable.len() as u64;
+            for (id, error) in unreadable {
+                tracing::warn!(task_id = %id, %error, "Task scheduling snapshot unreadable during the sweep");
+                marked.push(id);
+            }
+            let now = chrono::Utc::now();
+            for read in reads {
+                if read.task.deleted_at.is_some() || read.task.archived_at.is_some() {
+                    continue;
+                }
+                if !projects.contains_key(&read.task.project_id) {
+                    let project = ProjectRepo::get_by_id(&*self.db, &read.task.project_id).await?;
+                    projects.insert(read.task.project_id.clone(), project);
+                }
+                let Some(project) = &projects[&read.task.project_id] else {
+                    continue;
+                };
+                let p = self.prepare_schedule(read, project, now);
+                let next = next_step::next_step(&Snapshot {
+                    state: &p.read.task.status,
+                    condition: &p.read.condition,
+                    workflow: &p.workflow,
+                    facts: &p.facts,
+                });
+                let owned = p.read.queue_owned
+                    || p.read.park_json.is_some()
+                    || p.read.condition.is_blocked()
+                    || p.read.executions.iter().any(|e| {
+                        e.status == db::ExecutionStatus::Running && e.role != "interactive"
+                    });
+                if !owned && p.workflow.state_kind(&p.read.task.status) != Some(StateKind::Terminal)
+                {
+                    // Every Task that is not settled has a queued step, a
+                    // live execution or a park. This one has none.
+                    repairs += 1;
+                    tracing::warn!(task_id = %p.read.task.id, "scheduler invariant repaired by reconciliation");
+                    marked.push(p.read.task.id.clone());
+                    continue;
+                }
+                // Work the kicks missed, or a park that no longer says why
+                // the Task waits. A cached refusal resolves to its own park
+                // and is left alone until a fact it depends on changes.
+                let stale = match &next {
+                    Next::Step(_) => true,
+                    Next::Park(park) => {
+                        p.read.park_json.as_deref() != Some(encode(park).as_str())
+                            && !p.read.queue_owned
+                    }
+                };
+                if stale {
+                    marked.push(p.read.task.id.clone());
+                }
+            }
+            {
+                let mut state = self.schedule_state.lock().expect("schedule state");
+                state.sweep.cursor = Some(last);
+                state.sweep.repairs += repairs;
+                state.sweep.pending.extend(marked);
+            }
+            if started.elapsed() >= budget {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     pub(super) fn schedule_sleep(&self) -> Duration {
         let state = self.schedule_state.lock().expect("schedule state");
         if !state.started {
             return self.check_interval;
         }
-        let due = state
-            .deadline
-            .map_or(state.sweep_at, |d| d.min(state.sweep_at));
+        if state.sweep.active() || state.sweep.has_pending() || state.sweep.backfilling {
+            // A lap in progress continues in slices between dispatch passes.
+            return Duration::from_millis(5);
+        }
+        let mut due = state.sweep.due;
+        for other in [state.deadline, state.recheck_at].into_iter().flatten() {
+            due = due.min(other);
+        }
         due.saturating_duration_since(Instant::now())
             .min(self.check_interval)
     }
@@ -530,16 +947,7 @@ impl TaskDispatcher {
         project: &Project,
         step: &Step,
     ) -> Result<u64> {
-        let mut current = p.read.task.clone();
-        if p.read.external || p.read.verify {
-            // A dependency revision invalidates the observation, without a
-            // bookkeeping Task write or cancelling an owned retry deadline.
-            if let Ok(mut metadata) = db::TaskMetadata::parse(current.metadata_json.as_deref()) {
-                metadata.extra.remove("dispatch_disposition");
-                current.metadata_json = metadata.to_json();
-            }
-        }
-        let task = &current;
+        let task = &p.read.task;
         match step {
             Step::RefreshPlacement => {
                 self.task_service
@@ -548,9 +956,7 @@ impl TaskDispatcher {
                 Ok(0)
             }
             Step::Publication => self.reconcile_publication_task(task).await,
-            Step::QueuedRecovery => self
-                .task_service
-                .dispatch_queued_recovery(task)
+            Step::QueuedRecovery => Box::pin(self.task_service.dispatch_queued_recovery(task))
                 .await
                 .map(u64::from),
             Step::Integrate => self
@@ -629,17 +1035,16 @@ impl TaskDispatcher {
                 target,
                 role,
                 agent_id,
-            } => self
-                .dispatch_initial_task(
-                    task,
-                    &super::initial_scheduling::InitialScheduleTarget {
-                        transition_to: target.clone(),
-                        role: role.clone(),
-                        agent_id: agent_id.clone(),
-                    },
-                )
-                .await
-                .map(u64::from),
+            } => Box::pin(self.dispatch_initial_task(
+                task,
+                &super::initial_scheduling::InitialScheduleTarget {
+                    transition_to: target.clone(),
+                    role: role.clone(),
+                    agent_id: agent_id.clone(),
+                },
+            ))
+            .await
+            .map(u64::from),
             Step::Role { role, agent_id } => {
                 self.enqueue_resolved_role(p, project, role, agent_id).await
             }
@@ -651,21 +1056,18 @@ impl TaskDispatcher {
                 .map(|id| u64::from(id.is_some())),
         }
     }
-    async fn enrich_schedule_agents(&self, prepared: &mut [Prepared]) -> Result<()> {
-        let ids: std::collections::HashSet<String> = prepared
+    /// Whether each candidate's target Agent can take work, read once per
+    /// pass for every Agent the pass may dispatch to.
+    async fn schedule_agent_statuses(&self, prepared: &[Prepared]) -> Result<AgentStatuses> {
+        let ids: HashSet<String> = prepared
             .iter()
             .filter_map(|p| {
-                match next_step::next_step(&Snapshot {
-                    state: &p.read.task.status,
-                    condition: &p.read.condition,
-                    workflow: &p.workflow,
-                    facts: &p.facts,
-                }) {
-                    Next::Step(Step::Role { agent_id, .. } | Step::Initial { agent_id, .. }) => {
-                        Some(agent_id)
-                    }
-                    _ => None,
-                }
+                p.facts
+                    .initial_target
+                    .as_ref()
+                    .map(|(_, _, id)| id)
+                    .or_else(|| p.facts.role_target.as_ref().map(|(_, id)| id))
+                    .cloned()
             })
             .collect();
         let ids: Vec<_> = ids.into_iter().collect();
@@ -682,74 +1084,110 @@ impl TaskDispatcher {
             &self.db, &agents, &running, &registry,
         )
         .await?;
-        for p in prepared {
-            let candidate = next_step::next_step(&Snapshot {
-                state: &p.read.task.status,
-                condition: &p.read.condition,
-                workflow: &p.workflow,
-                facts: &p.facts,
-            });
-            if let Next::Step(step @ (Step::Role { .. } | Step::Initial { .. })) = &candidate {
-                let (role, agent) = match step {
-                    Step::Role { role, agent_id } | Step::Initial { role, agent_id, .. } => {
-                        (role, agent_id)
-                    }
-                    _ => unreachable!(),
+        Ok(AgentStatuses { agents, statuses })
+    }
+
+    /// The facts a pure resolution cannot read, taken at the Task's own turn
+    /// so that it sees what earlier Tasks of this pass did, as each Task of
+    /// a scan did. For a role dispatch these are the gates and the machine
+    /// precheck the scanning dispatcher ran before it looked for a running
+    /// execution or finished Review checks: a Task in flight still has its
+    /// capacity wait recorded and retired, and a refusal is written exactly
+    /// as it was written there.
+    ///
+    /// Returns whether an admission check failed. What a refusal wrote is
+    /// read back, so the Task resolves from it; a failure that wrote nothing
+    /// is retried at the scan cadence and never mistaken for a park.
+    async fn observe_admission(
+        &self,
+        p: &mut Prepared,
+        project: &Project,
+        agents: &AgentStatuses,
+        gate: bool,
+    ) -> bool {
+        let mut failed = false;
+        let probe = next_step::next_step(&Snapshot {
+            state: &p.read.task.status,
+            condition: &p.read.condition,
+            workflow: &p.workflow,
+            facts: &next_step::Facts {
+                in_flight: false,
+                reviewer_ready: true,
+                ..p.facts.clone()
+            },
+        });
+        if let (true, Next::Step(step @ Step::Role { .. })) = (gate, probe) {
+            let Step::Role { role, agent_id } = step.clone() else {
+                unreachable!("matched a role step")
+            };
+            // One Task's refusal or failure never ends the pass.
+            let gated: Result<()> = async {
+                let gate = if role == "reviewer" {
+                    self.task_service.ensure_task_reviewable(&p.read.task).await
+                } else {
+                    self.task_service.ensure_task_runnable(&p.read.task).await
                 };
-                if matches!(step, Step::Role { .. }) {
-                    let gate = if role == "reviewer" {
-                        self.task_service.ensure_task_reviewable(&p.read.task).await
-                    } else {
-                        self.task_service.ensure_task_runnable(&p.read.task).await
-                    };
-                    if let Err(error) = gate {
-                        self.handle_schedule_error(p, step, &error).await?;
-                        p.read.condition = self.db.task_condition(&p.read.task.id).await?;
-                        p.facts.disposition_current = true;
-                        continue;
+                let waiting = match gate {
+                    Err(error) => Err(error),
+                    Ok(()) => match agents.agents.iter().find(|a| a.id == agent_id) {
+                        Some(identity) => {
+                            crate::placement::machine_precheck::wait_before_dispatch(
+                                &self.db,
+                                &self.task_service,
+                                &p.read.task,
+                                identity,
+                                Some(&role),
+                            )
+                            .await
+                        }
+                        None => Ok(false),
+                    },
+                };
+                match waiting {
+                    Ok(true) => p.machine_wait = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        failed = true;
+                        self.handle_schedule_error(p, &step, &error).await?;
                     }
                 }
-                if let Some(identity) = agents.iter().find(|a| a.id == *agent) {
-                    match crate::placement::machine_precheck::wait_before_dispatch(
-                        &self.db,
-                        &self.task_service,
-                        &p.read.task,
-                        identity,
-                        Some(role),
-                    )
-                    .await
-                    {
-                        Ok(true) => {
-                            p.facts.agent_full = true;
-                            continue;
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            self.handle_schedule_error(p, step, &error).await?;
-                            p.read.condition = self.db.task_condition(&p.read.task.id).await?;
-                            p.facts.disposition_current = true;
-                            continue;
-                        }
-                    }
-                }
+                Ok(())
             }
-            if let Some(agent) = p
-                .facts
-                .initial_target
-                .as_ref()
-                .map(|(_, _, id)| id)
-                .or_else(|| p.facts.role_target.as_ref().map(|(_, id)| id))
-            {
-                use crate::agent_service::EffectiveStatus;
-                let status = statuses.get(agent);
-                p.facts.agent_unavailable = !matches!(
-                    status,
-                    Some(EffectiveStatus::Active | EffectiveStatus::Busy)
-                );
-                p.facts.agent_full = status == Some(&EffectiveStatus::Busy);
+            .await;
+            if let Err(error) = gated {
+                failed = true;
+                tracing::warn!(task_id = %p.read.task.id, %error, "Task admission check failed; continuing with the next Task");
+            }
+            if failed {
+                // A refusal may have recorded a disposition, a deferral or a
+                // blocker. Resolve from what is stored now.
+                match self.reread(p, project).await {
+                    Ok(true) => {}
+                    Ok(false) => return true,
+                    Err(error) => {
+                        tracing::warn!(task_id = %p.read.task.id, %error, "Task could not be re-read after a refused admission");
+                    }
+                }
             }
         }
-        Ok(())
+        if p.machine_wait {
+            p.facts.agent_full = true;
+        } else if let Some(agent) = p
+            .facts
+            .initial_target
+            .as_ref()
+            .map(|(_, _, id)| id)
+            .or_else(|| p.facts.role_target.as_ref().map(|(_, id)| id))
+        {
+            use crate::agent_service::EffectiveStatus;
+            let status = agents.statuses.get(agent);
+            p.facts.agent_unavailable = !matches!(
+                status,
+                Some(EffectiveStatus::Active | EffectiveStatus::Busy)
+            );
+            p.facts.agent_full = status == Some(&EffectiveStatus::Busy);
+        }
+        failed
     }
     async fn enqueue_resolved_role(
         &self,
@@ -784,13 +1222,6 @@ impl TaskDispatcher {
                 p.read.task.id,
                 role,
                 agent,
-                (p.read.external || p.read.verify)
-                    .then(
-                        || db::TaskMetadata::parse(p.read.task.metadata_json.as_deref())
-                            .ok()
-                            .and_then(|m| m.extra.get("dispatch_disposition").cloned())
-                    )
-                    .flatten(),
                 p.read.external.then(|| {
                     let metadata = p.read.task.metadata().ok();
                     serde_json::json!({
@@ -850,7 +1281,6 @@ impl TaskDispatcher {
         id: &str,
         role: &str,
         agent: &str,
-        invalidated_disposition: Option<&serde_json::Value>,
         invalidated_wait: Option<&serde_json::Value>,
     ) -> Result<bool> {
         let Some(mut read) = self.db.schedule_reads(&[id.into()]).await?.pop() else {
@@ -858,15 +1288,6 @@ impl TaskDispatcher {
         };
         if read.task.deleted_at.is_some() || read.task.archived_at.is_some() {
             return Ok(false);
-        }
-        if let Some(expected) = invalidated_disposition {
-            if let Ok(mut metadata) = db::TaskMetadata::parse(read.task.metadata_json.as_deref()) {
-                if metadata.extra.get("dispatch_disposition") == Some(expected) {
-                    metadata.extra.remove("dispatch_disposition");
-                    read.verify = true;
-                    read.task.metadata_json = metadata.to_json();
-                }
-            }
         }
         if let Some(wait) = invalidated_wait {
             let metadata = read.task.metadata().ok();
@@ -884,10 +1305,6 @@ impl TaskDispatcher {
         }
         // The command itself owns the Task lease; no other head can execute.
         read.queue_owned = false;
-        // This durable command already authorized a reconciliation attempt.
-        // Refusal metadata is a cache, including late writes from the old
-        // dependency observation; fresh admission gates remain authoritative.
-        read.verify = true;
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &read.task.project_id).await? else {
             return Ok(false);
         };
@@ -905,9 +1322,17 @@ impl TaskDispatcher {
         if resolved != Next::Step(expected.clone()) {
             return Ok(false);
         }
-        match self
-            .dispatch_resolved_role(&project, &p.workflow, &p.read.task, role, agent)
-            .await
+        if self.is_stopped() {
+            return Ok(false);
+        }
+        match Box::pin(self.dispatch_resolved_role(
+            &project,
+            &p.workflow,
+            &p.read.task,
+            role,
+            agent,
+        ))
+        .await
         {
             Ok(done) => {
                 if done {
@@ -927,14 +1352,25 @@ impl TaskDispatcher {
                         )
                     )
                 {
-                    if let Some(current) = db::TaskRepo::get_by_id(&*self.db, id, false).await? {
-                        db::TaskRepo::mutate_metadata(&*self.db,id,Some(current.version),vec![db::TaskMetadataMutation::SetIfAbsent {key:"deferred_dispatch".into(),value:serde_json::json!({"not_before":(chrono::Utc::now()+chrono::Duration::seconds(10)).to_rfc3339(),"target_state":current.status,"reason":"transient dispatcher admission"})}],&db::now_rfc3339()).await?;
-                    }
+                    // Retried at the scan cadence, as the scanning dispatcher
+                    // retried it. The Task's own fields are not touched.
+                    self.db
+                        .schedule_retry_at(
+                            id,
+                            &(chrono::Utc::now()
+                                + chrono::Duration::from_std(self.check_interval)
+                                    .unwrap_or_else(|_| chrono::Duration::seconds(10)))
+                            .to_rfc3339(),
+                        )
+                        .await?;
                 }
                 Ok(false)
             }
         }
     }
+    /// The scanning dispatcher's handling of a failed dispatch, branch for
+    /// branch: the same refusal writes the same annotation, deferral or
+    /// disposition, and a transient failure writes nothing.
     async fn handle_schedule_error(
         &self,
         p: &Prepared,
@@ -948,14 +1384,50 @@ impl TaskDispatcher {
                 db::DbError::VersionConflict | db::DbError::TaskVersionConflict { .. }
             )
         ) {
+            tracing::debug!(task_id = %task.id, "Task dispatch lost a version race");
+            return Ok(());
+        }
+        let deterministic = super::helpers::is_deterministic_dispatch_refusal(error);
+        if let Step::Initial { role, .. } = step {
+            // Admission from an initial state recorded a deterministic
+            // refusal and only logged anything else.
+            if deterministic {
+                let current = db::TaskRepo::get_by_id(&*self.db, &task.id, false)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                if current.status == task.status
+                    && self
+                        .task_service
+                        .record_placement_dispatch_refusal(&current, error)
+                        .await?
+                {
+                    return Ok(());
+                }
+                deferred_dispatch::record_dispatch_disposition(
+                    &self.db,
+                    task,
+                    role,
+                    &error.to_string(),
+                )
+                .await?;
+                crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+                    &self.db,
+                    &task.id,
+                    &task.status,
+                    error,
+                )
+                .await?;
+                tracing::warn!(task_id = %task.id, %error, "task dispatch blocked; parked until Task/governance state changes or an explicit wake");
+            } else {
+                tracing::warn!(task_id = %task.id, %error, "task dispatcher initial dispatch failed");
+            }
             return Ok(());
         }
         if matches!(error, ServiceError::WorkspaceResetRequired { .. }) {
+            tracing::warn!(task_id = %task.id, %error, "task branch lost, blocking for user reset");
             self.block_task_for_workspace_reset(task, error).await?;
-        } else if super::helpers::is_io_or_workspace_error(error) {
-            self.block_task_on_workspace_error(task, error).await?;
-        } else if matches!(step, Step::Role { .. })
-            && crate::placement::admission_refusal_is_retryable(&self.db, &task.id, error).await?
+        } else if crate::placement::admission_refusal_is_retryable(&self.db, &task.id, error)
+            .await?
         {
             let current = db::TaskRepo::get_by_id(&*self.db, &task.id, false)
                 .await?
@@ -963,20 +1435,21 @@ impl TaskDispatcher {
             self.task_service
                 .defer_placement_refusal(&current, error)
                 .await?;
-        } else if super::helpers::is_deterministic_dispatch_refusal(error)
-            && !self
+        } else if super::helpers::is_io_or_workspace_error(error) {
+            tracing::error!(task_id = %task.id, %error, "task dispatcher recovery blocked task due to workspace error");
+            self.block_task_on_workspace_error(task, error).await?;
+        } else if deterministic {
+            if self
                 .task_service
                 .record_placement_dispatch_refusal(task, error)
                 .await?
-        {
-            let capability = match step {
-                Step::Initial { role, .. } => role.as_str(),
-                _ => task.status.as_str(),
-            };
+            {
+                return Ok(());
+            }
             deferred_dispatch::record_dispatch_disposition(
                 &self.db,
                 task,
-                capability,
+                &task.status,
                 &error.to_string(),
             )
             .await?;
@@ -987,8 +1460,10 @@ impl TaskDispatcher {
                 error,
             )
             .await?;
+            tracing::warn!(task_id = %task.id, %error, "task dispatch blocked; parked until Task/governance state changes or an explicit wake");
+        } else {
+            tracing::warn!(task_id = %task.id, %error, "task dispatcher recovery failed");
         }
-        tracing::warn!(task_id=%task.id,%error,"Task reconciliation deferred");
         Ok(())
     }
 }

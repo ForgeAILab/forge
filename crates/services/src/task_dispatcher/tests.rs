@@ -669,15 +669,6 @@ pub(super) struct FixtureWorker {
     stop: tokio::sync::watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
 }
-impl FixtureWorker {
-    pub(super) fn start(service: &Arc<TaskService>) -> Self {
-        let (stop, shutdown) = tokio::sync::watch::channel(false);
-        Self {
-            stop,
-            handle: service.task_step_worker().start(shutdown),
-        }
-    }
-}
 impl Drop for FixtureWorker {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
@@ -1574,12 +1565,7 @@ async fn changing_root_default_wakes_and_dispatches_unstarted_subtask() {
         .await
         .expect("child reloads")
         .expect("child exists");
-    assert!(deferred_dispatch::dispatch_disposition_for_test(&woken_child).is_some());
-    assert!(db
-        .dirty_schedule_tasks(100)
-        .await
-        .unwrap()
-        .contains(&child.id));
+    assert!(deferred_dispatch::dispatch_disposition_for_test(&woken_child).is_none());
     assert_eq!(
         dispatcher
             .check_once_and_drain()
@@ -5807,7 +5793,7 @@ async fn wake_does_not_duplicate_already_dispatched_charter_work() {
             describe_stalled_dispatch(&db, &task.id).await
         );
     }
-    deferred_dispatch::kick_task_reconciliation(&db, &task.id, "test: redundant wake")
+    deferred_dispatch::wake_task_dispatch(&db, &task.id, "test: redundant wake")
         .await
         .expect("wake succeeds");
 
@@ -9011,7 +8997,7 @@ async fn supervised_dispatcher_recovers_panic_reports_budget_keeps_wakes_and_sto
     let status_service = crate::OperatorStatusService::new_for_test(Arc::clone(&db));
     let root = TempDir::new().unwrap();
     let (mut built, _launches) = build_dispatcher(db, root.path()).await;
-    built.check_interval = Duration::from_secs(300);
+    built.instance_mut().check_interval = Duration::from_secs(300);
     let dispatcher = Arc::new(built.with_periodic_workers(status_service.periodic_workers()));
     let calls = Arc::new(AtomicUsize::new(0));
     let in_flight = Arc::new(AtomicBool::new(false));
@@ -9963,8 +9949,8 @@ async fn idle_load_5000_parked_tasks() {
     );
     counts.0.store(0, Ordering::Relaxed);
     counts.1.store(0, Ordering::Relaxed);
-    dispatcher.schedule_state.lock().unwrap().sweep_at = std::time::Instant::now();
-    dispatcher.check_once().await.unwrap();
+    dispatcher.schedule_state.lock().unwrap().sweep.due = std::time::Instant::now();
+    dispatcher.reconcile_all().await.unwrap();
     println!(
         "SWEEP_LOAD tasks=5000 period=120 queries={} write_statements={}",
         counts.0.load(Ordering::Relaxed),
@@ -9989,130 +9975,7 @@ async fn unchanged_reconciliation_does_not_enqueue_a_second_step() {
     assert_eq!(db.task_steps(&task.id).await.unwrap().len(), before);
 }
 
-#[tokio::test]
-async fn startup_and_sweep_recover_a_committed_task_without_a_delivered_kick() {
-    let db = Arc::new(sqlite_db().await);
-    let repo = TempDir::new().unwrap();
-    let workspace = TempDir::new().unwrap();
-    let (project, _) = seed_project_repo(&db, repo.path()).await;
-    let (dispatcher, _) = build_dispatcher(db.clone(), workspace.path()).await;
-    dispatcher.check_once().await.unwrap();
-    let task = seed_task(&db, &project, "unowned custom", "unsupported", 0).await;
-    // Drop both durable hint rows to prove the sweep is independent of kicks.
-    sqlx::query("DELETE FROM task_schedule_dirty WHERE task_id=?")
-        .bind(&task.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    dispatcher.sweep_and_assert().await.unwrap();
-    let park: String =
-        sqlx::query_scalar("SELECT reason_json FROM task_schedule_park WHERE task_id=?")
-            .bind(&task.id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    assert!(
-        park.contains("WorkflowInvalid")
-            && park.contains("ProjectAgent")
-            && park.contains("EditWorkflow"),
-        "{park}"
-    );
-    sqlx::query("DELETE FROM task_schedule_park WHERE task_id=?")
-        .bind(&task.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let (restarted, _) = build_dispatcher(db.clone(), workspace.path()).await;
-    restarted.startup_reconcile().await.unwrap();
-    assert!(db.task_schedule_violations().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn missed_wake_repair_rechecks_a_cached_refusal_at_startup_and_on_sweep() {
-    use db::TaskStepRepo;
-    for startup in [true, false] {
-        let db = Arc::new(sqlite_db().await);
-        let repo = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        let (project, _) = seed_project_repo(&db, repo.path()).await;
-        let agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-        let (dispatcher, _) = build_dispatcher_runtime(db.clone(), workspace.path(), false).await;
-        if !startup {
-            dispatcher.check_once().await.unwrap();
-            dispatcher.check_once().await.unwrap();
-        }
-        let task = seed_task(&db, &project, "missed fact revision", "in_progress", 0).await;
-        assign_role(&db, &task.id, "coder", &agent).await;
-        deferred_dispatch::record_dispatch_disposition(
-            &db,
-            &task,
-            "in_progress",
-            "old setup refusal",
-        )
-        .await
-        .unwrap();
-        // Model losing the delivery/hint after the authoritative commit. The
-        // proof must not trust the Task-version-keyed legacy refusal cache.
-        sqlx::query("DELETE FROM task_schedule_dirty")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        if !startup {
-            dispatcher.schedule_state.lock().unwrap().sweep_at = std::time::Instant::now();
-        }
-        assert_eq!(dispatcher.check_once().await.unwrap(), 1);
-        let steps = db.task_steps(&task.id).await.unwrap();
-        let roles: Vec<_> = steps
-            .iter()
-            .filter(|s| {
-                serde_json::from_str::<serde_json::Value>(&s.payload_json).unwrap()["operation"]
-                    == "reconcile_role"
-            })
-            .collect();
-        assert_eq!(
-            roles.len(),
-            1,
-            "metadata mutations do not count as role enqueues"
-        );
-        assert_eq!(roles[0].status, "pending");
-        assert_eq!(dispatcher.check_once().await.unwrap(), 0);
-    }
-}
-
-#[tokio::test]
-async fn queued_role_rechecks_facts_after_a_late_cached_refusal_write() {
-    let db = Arc::new(sqlite_db().await);
-    let repo = TempDir::new().unwrap();
-    let workspace = TempDir::new().unwrap();
-    let (project, _) = seed_project_repo(&db, repo.path()).await;
-    let agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project, "late refusal", "in_progress", 0).await;
-    assign_role(&db, &task.id, "coder", &agent).await;
-    deferred_dispatch::record_dispatch_disposition(&db, &task, "in_progress", "old setup refusal")
-        .await
-        .unwrap();
-    let (dispatcher, mut rx) = build_dispatcher_runtime(db.clone(), workspace.path(), false).await;
-    assert_eq!(dispatcher.check_once().await.unwrap(), 1);
-    let current = TaskRepo::get_by_id(&*db, &task.id, false)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut metadata = current.metadata().unwrap();
-    metadata.extra.get_mut("dispatch_disposition").unwrap()["blocker_digest"] =
-        serde_json::json!("late-old-observation");
-    sqlx::query("UPDATE task SET metadata_json=? WHERE id=?")
-        .bind(metadata.to_json())
-        .bind(&task.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    dispatcher.drain_steps().await.unwrap();
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .task_id,
-        task.id
-    );
-}
+#[path = "tests/equivalence.rs"]
+mod equivalence;
+#[path = "tests/scheduler.rs"]
+mod scheduler;

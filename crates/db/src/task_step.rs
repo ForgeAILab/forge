@@ -640,7 +640,7 @@ impl SqliteDb {
                 return Ok(None);
             }
         }
-        let candidate = "SELECT s.* FROM task_step s WHERE s.status IN ('pending','claimed') AND (? IS NULL OR s.lane=?) AND s.task_id NOT IN (SELECT value FROM json_each(?)) AND (? IS NULL OR s.task_id = ?) AND ((s.status = 'pending' AND s.available_at <= ?) OR (s.status = 'claimed' AND s.lease_until <= ?)) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND ((p.integration_started_at IS NOT NULL AND p.seq<s.seq) OR (s.integration_started_at IS NULL AND p.priority>s.priority) OR (p.priority=s.priority AND p.seq<s.seq)) AND p.status IN ('pending','claimed')) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND p.id != s.id AND p.lease_until > ?) AND CASE WHEN s.kind='command' AND json_valid(s.payload_json) AND json_extract(s.payload_json,'$.admission_agent_id') IS NOT NULL THEN NOT EXISTS (SELECT 1 FROM task_step prior JOIN task t ON t.id=prior.task_id WHERE prior.kind='command' AND prior.status IN ('pending','claimed') AND prior.expected_epoch=t.status_epoch AND prior.expected_status=t.status AND prior.priority>=s.priority AND (prior.status='claimed' OR julianday(prior.available_at)<=julianday('now')) AND json_valid(prior.payload_json) AND json_extract(prior.payload_json,'$.operation')='reconcile_role' AND (prior.created_at,prior.id)<(s.created_at,s.id)) ELSE 1 END ORDER BY s.priority DESC,s.created_at,s.seq LIMIT 1";
+        let candidate = "SELECT s.* FROM task_step s WHERE s.status IN ('pending','claimed') AND (? IS NULL OR s.lane=?) AND s.task_id NOT IN (SELECT value FROM json_each(?)) AND (? IS NULL OR s.task_id = ?) AND ((s.status = 'pending' AND s.available_at <= ?) OR (s.status = 'claimed' AND s.lease_until <= ?)) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND ((p.integration_started_at IS NOT NULL AND p.seq<s.seq) OR (s.integration_started_at IS NULL AND p.priority>s.priority) OR (p.priority=s.priority AND p.seq<s.seq)) AND p.status IN ('pending','claimed')) AND NOT EXISTS (SELECT 1 FROM task_step p WHERE p.task_id = s.task_id AND p.id != s.id AND p.lease_until > ?) ORDER BY s.priority DESC,s.created_at,s.seq LIMIT 1";
         if sqlx::query(candidate)
             .bind(lane)
             .bind(lane)
@@ -1392,55 +1392,6 @@ mod tests {
             !fk[0].0.contains("task_step_new"),
             "self-reference not renamed: {}",
             fk[0].0
-        );
-    }
-    #[tokio::test]
-    async fn role_admission_order_crosses_agents_and_lanes_without_blocking_backoff() {
-        let db = fixture().await;
-        let mut first = input("a", "first-role");
-        first.kind = "command".into();
-        first.lane = "long".into();
-        first.expected_epoch = Some(
-            sqlx::query_scalar("SELECT status_epoch FROM task WHERE id='a'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap(),
-        );
-        first.payload_json =
-            serde_json::json!({"operation":"reconcile_role","admission_agent_id":"agent-a"})
-                .to_string();
-        db.enqueue_step(&first).await.unwrap();
-        let mut second = input("b", "later-admission");
-        second.kind = "command".into();
-        second.payload_json =
-            serde_json::json!({"operation":"claim_and_start_task","admission_agent_id":"agent-b"})
-                .to_string();
-        db.enqueue_step(&second).await.unwrap();
-        sqlx::query("UPDATE task_step SET created_at='2000-01-01T00:00:00Z' WHERE id=?")
-            .bind(&first.id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        assert!(db
-            .claim_step("second", Some("b"), &later())
-            .await
-            .unwrap()
-            .is_none());
-        let claimed = db
-            .claim_step("first", Some("a"), &later())
-            .await
-            .unwrap()
-            .unwrap();
-        db.retry_step(&claimed, "transient", &later())
-            .await
-            .unwrap();
-        assert_eq!(
-            db.claim_step("second", Some("b"), &later())
-                .await
-                .unwrap()
-                .unwrap()
-                .id,
-            second.id
         );
     }
     #[tokio::test]

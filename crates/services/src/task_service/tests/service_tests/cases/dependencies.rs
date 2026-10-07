@@ -298,17 +298,13 @@ async fn done_prerequisite_wakes_dependent_with_stale_dispatch_disposition() {
         .expect("dependent reloads")
         .expect("dependent exists");
     assert_eq!(
-        dependent_after.version, dependent_before.version,
-        "dependency invalidation does not write the dependent Task"
+        dependent_after.version,
+        dependent_before.version + 1,
+        "the dependency wake advances the dependent's dispatch generation"
     );
-    assert!(db
-        .dirty_schedule_tasks(100)
-        .await
-        .unwrap()
-        .contains(&dependent.id));
     assert!(
-        crate::deferred_dispatch::dispatch_disposition_for_test(&dependent_after).is_some(),
-        "the legacy observation is retained until reconciliation"
+        crate::deferred_dispatch::dispatch_disposition_for_test(&dependent_after).is_none(),
+        "completing the prerequisite must wake the dependent's stale dispatch disposition"
     );
 }
 
@@ -384,14 +380,9 @@ async fn removing_dependency_wakes_dependent_with_stale_dispatch_disposition() {
         .await
         .expect("dependent reloads")
         .expect("dependent exists");
-    assert!(db
-        .dirty_schedule_tasks(100)
-        .await
-        .unwrap()
-        .contains(&dependent.id));
     assert!(
-        crate::deferred_dispatch::dispatch_disposition_for_test(&dependent_after).is_some(),
-        "dependency invalidation preserves the legacy observation"
+        crate::deferred_dispatch::dispatch_disposition_for_test(&dependent_after).is_none(),
+        "removing the dependency must wake the dependent's stale dispatch disposition"
     );
 }
 

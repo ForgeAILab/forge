@@ -326,8 +326,7 @@ async fn assign_default_coder(
         )
         .await?;
     }
-    crate::kick_task_reconciliation(db, task_id, "integration default coder assignment changed")
-        .await?;
+    crate::wake_task_dispatch(db, task_id, "integration default coder assignment changed").await?;
     Ok(())
 }
 

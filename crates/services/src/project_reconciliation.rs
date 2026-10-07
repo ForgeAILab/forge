@@ -360,7 +360,7 @@ impl ProjectReconciliationService {
         })?;
 
         let dispatch_woken = if resolved.record_type == "task" {
-            match crate::kick_task_reconciliation(
+            match crate::wake_task_dispatch(
                 &self.db,
                 &resolved.record_id,
                 "reconciliation_resolved",

@@ -964,12 +964,15 @@ impl RuntimeSupervisor {
             // API routes from starting, matching the legacy entry point.
             tracing::warn!(%error, "workflow template initialization failed");
         }
-        // Integration entries whose hooks were lost (before the durable-hooks
-        // upgrade) get their hooks row before the step worker starts.
+        // Reconcile what was committed before the restart. Everything else,
+        // stranded integration entries included, is found by the first lap
+        // of the dispatcher's paged sweep, which never delays startup.
         match self.runtime.task_dispatcher.startup_reconcile().await {
             Ok(0) => {}
-            Ok(count) => tracing::info!(count, "re-enqueued stranded integration hooks"),
-            Err(error) => tracing::warn!(%error, "stranded hook recovery failed during startup"),
+            Ok(count) => tracing::info!(count, "startup reconciliation dispatched Tasks"),
+            Err(error) => {
+                tracing::warn!(%error, "startup reconciliation failed; the dispatcher retries")
+            }
         }
 
         // Projection startup intentionally follows recovery so all common

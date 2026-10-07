@@ -11,8 +11,6 @@ pub struct ScheduleRead {
     pub generation: i64,
     pub dirty: bool,
     pub external: bool,
-    /// Slow/startup proof re-evaluates a cached refusal without cancelling timers.
-    pub verify: bool,
     pub assignments: Vec<TaskRoleAssignment>,
     pub executions: Vec<Execution>,
     pub reviews: Vec<Review>,
@@ -20,7 +18,6 @@ pub struct ScheduleRead {
     pub children: Vec<Task>,
     pub parent: Option<Task>,
     pub siblings: Vec<Task>,
-    pub dependencies: Vec<Task>,
     pub queue_owned: bool,
     pub entry_hooks_seen: bool,
     pub park_json: Option<String>,
@@ -37,9 +34,14 @@ impl SqliteDb {
     pub fn schedule_generation(&self) -> u64 {
         self.domain_event_hooks.generation()
     }
+    /// Unordered: the reconciler orders candidates by the Project's workflow.
     pub async fn dirty_schedule_tasks(&self, limit: i64) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar("SELECT d.task_id FROM task_schedule_dirty d JOIN task t ON t.id=d.task_id JOIN project p ON p.id=t.project_id WHERE d.dirty=1 ORDER BY p.created_at,p.id,CASE WHEN t.status IN ('todo') THEN 1 ELSE 0 END,t.created_at,t.id LIMIT ?")
-            .bind(limit).fetch_all(self.pool()).await?)
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM task_schedule_dirty WHERE dirty=1 LIMIT ?")
+                .bind(limit)
+                .fetch_all(self.pool())
+                .await?,
+        )
     }
     /// No generation arriving during reconciliation can be acknowledged away.
     pub async fn acknowledge_schedule(&self, id: &str, generation: i64) -> Result<()> {
@@ -59,21 +61,43 @@ impl SqliteDb {
         Ok(())
     }
     pub async fn schedule_reads(&self, ids: &[String]) -> Result<Vec<ScheduleRead>> {
+        Ok(self.schedule_reads_isolated(ids).await?.0)
+    }
+    /// The batched snapshot, plus the Tasks whose own row could not be decoded.
+    /// One unreadable row never fails the page it shares with healthy Tasks.
+    pub async fn schedule_reads_isolated(
+        &self,
+        ids: &[String],
+    ) -> Result<(Vec<ScheduleRead>, Vec<(String, DbError)>)> {
+        let mut unreadable = Vec::new();
         if ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), unreadable));
         }
         let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
         let mut reader = self.pool().begin().await?;
         let mut reads = Vec::new();
         for row in sqlx::query("SELECT t.*,COALESCE(d.generation,0) AS dirty_generation,COALESCE(d.dirty,0) AS dirty,COALESCE(d.external,0) AS dirty_external,EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=t.id AND s.kind!='mutation' AND s.status IN ('pending','claimed') AND (s.entry_fenced=0 OR (s.expected_epoch=t.status_epoch AND s.expected_status=t.status))) AS queue_owned,EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=t.id AND s.kind='hooks' AND s.expected_epoch=t.status_epoch AND s.expected_status=t.status) AS hooks_seen,(SELECT state FROM workspace_placement WHERE task_id=COALESCE(t.parent_task_id,t.id)) AS placement_state,(SELECT COALESCE(execution_daemon_id,daemon_id) FROM workspace_placement WHERE task_id=COALESCE(t.parent_task_id,t.id)) AS placement_daemon_id,(SELECT checks_digest FROM project_machine_readiness WHERE project_id=t.project_id AND status='ready' AND owner_kind=json_extract(CASE WHEN json_valid(t.metadata_json) THEN t.metadata_json ELSE '{}' END,'$.environment_wait.machine.owner_kind') AND daemon_id=COALESCE(json_extract(CASE WHEN json_valid(t.metadata_json) THEN t.metadata_json ELSE '{}' END,'$.environment_wait.machine.daemon_id'),'') AND runtime_id=COALESCE(json_extract(CASE WHEN json_valid(t.metadata_json) THEN t.metadata_json ELSE '{}' END,'$.environment_wait.machine.runtime_id'),'')) AS ready_environment_digest,(SELECT capability_class FROM project_task_governance WHERE task_id=t.id) AS capability_class,(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch) AS park_json,EXISTS(SELECT 1 FROM task_schedule_wait WHERE task_id=t.id) AS has_wait FROM task t LEFT JOIN task_schedule_dirty d ON d.task_id=t.id WHERE t.id IN (SELECT value FROM json_each(?))")
             .bind(&ids).fetch_all(&mut *reader).await? {
-            let raw: String = row.try_get("condition_json")?;
+            let id: String = row.try_get("id")?;
+            let condition = row
+                .try_get::<String, _>("condition_json")
+                .map_err(DbError::from)
+                .and_then(|raw| {
+                    serde_json::from_str(&raw).map_err(|e| DbError::Check(e.to_string()))
+                });
+            let condition = match condition {
+                Ok(condition) => condition,
+                Err(error) => {
+                    unreadable.push((id, error));
+                    continue;
+                }
+            };
             reads.push(ScheduleRead {
                 epoch: row.try_get("status_epoch")?,
-                condition: serde_json::from_str(&raw).map_err(|e| DbError::Check(e.to_string()))?,
-                generation: row.try_get("dirty_generation")?, dirty:row.try_get("dirty")?, verify:false, external: row.try_get::<i64,_>("dirty_external")? != 0,
-                queue_owned: row.try_get("queue_owned")?, entry_hooks_seen: row.try_get("hooks_seen")?, placement_state: row.try_get("placement_state")?, placement_daemon_id:row.try_get("placement_daemon_id")?, ready_environment_digest:row.try_get("ready_environment_digest")?, capability_class:row.try_get("capability_class")?, park_json:row.try_get("park_json")?, has_wait:row.try_get("has_wait")?,
-                task: map_schedule_task(row)?, assignments: Vec::new(), executions: Vec::new(), reviews: Vec::new(), transitions: Vec::new(), children: Vec::new(), parent: None, siblings: Vec::new(), dependencies: Vec::new(),
+                condition,
+                generation: row.try_get("dirty_generation")?, dirty:row.try_get("dirty")?, external: row.try_get::<i64,_>("dirty_external")? != 0,
+                queue_owned: row.try_get("queue_owned")?, entry_hooks_seen: row.try_get("hooks_seen")?, placement_state: row.try_get("placement_state")?, placement_daemon_id:row.try_get("placement_daemon_id")?, ready_environment_digest:row.try_get("ready_environment_digest")?, capability_class:row.try_get("capability_class")?, park_json:row.try_get("park_json")?, has_wait: row.try_get("has_wait")?,
+                task: map_schedule_task(row)?, assignments: Vec::new(), executions: Vec::new(), reviews: Vec::new(), transitions: Vec::new(), children: Vec::new(), parent: None, siblings: Vec::new(),
             });
         }
         let index: HashMap<String, usize> = reads
@@ -144,20 +168,8 @@ impl SqliteDb {
             .bind(&ids).fetch_all(&mut *reader).await? {
             let t=super::workflow::map_transition_log_row(row)?; if let Some(i)=index.get(&t.task_id) { reads[*i].transitions.push(t); }
         }
-        let deps = format!("SELECT {cols},d.task_id AS dependent FROM task_dependency d JOIN task t ON t.id=d.depends_on_id WHERE d.task_id IN (SELECT value FROM json_each(?)) AND t.deleted_at IS NULL",cols=TASK_COLUMNS.split(", ").map(|c|format!("t.{c}")).collect::<Vec<_>>().join(","));
-        for row in sqlx::query(&deps)
-            .bind(&ids)
-            .fetch_all(&mut *reader)
-            .await?
-        {
-            let id: String = row.try_get("dependent")?;
-            let t = map_task(row)?;
-            if let Some(i) = index.get(&id) {
-                reads[*i].dependencies.push(t);
-            }
-        }
         reader.rollback().await?;
-        Ok(reads)
+        Ok((reads, unreadable))
     }
     pub async fn record_schedule_park(&self, id: &str, epoch: i64, reason: &str) -> Result<()> {
         sqlx::query("INSERT INTO task_schedule_park(task_id,epoch,reason_json) SELECT id,?,? FROM task WHERE id=? AND status_epoch=? ON CONFLICT(task_id) DO UPDATE SET epoch=excluded.epoch,reason_json=excluded.reason_json WHERE epoch IS NOT excluded.epoch OR reason_json IS NOT excluded.reason_json")
@@ -166,6 +178,8 @@ impl SqliteDb {
     }
 }
 impl SqliteDb {
+    /// `daemon` names the machine the Task waits on (`"*"`: a run slot on
+    /// any machine); `project.1` is set only while it waits on the Project limit.
     pub async fn schedule_wait(
         &self,
         id: &str,
@@ -174,7 +188,7 @@ impl SqliteDb {
         daemon: Option<&str>,
         deadline: Option<&str>,
     ) -> Result<()> {
-        if agent.is_none() && deadline.is_none() {
+        if agent.is_none() && daemon.is_none() && deadline.is_none() && !project.1 {
             sqlx::query("DELETE FROM task_schedule_wait WHERE task_id=?")
                 .bind(id)
                 .execute(self.pool())
@@ -193,12 +207,43 @@ impl SqliteDb {
         .fetch_all(self.pool())
         .await?)
     }
+    /// The earliest timer any Task waits on: retries, step and execution
+    /// leases, placement reservations and readiness rechecks.
     pub async fn next_schedule_deadline(&self) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT MIN(deadline) FROM task_schedule_wait WHERE deadline IS NOT NULL",
+        Ok(sqlx::query_scalar("SELECT MIN(deadline) FROM (SELECT deadline FROM task_schedule_wait WHERE deadline IS NOT NULL UNION ALL SELECT next_check_at FROM project_machine_readiness WHERE status='not_ready' UNION ALL SELECT reserved_until FROM workspace_placement WHERE state IN ('reserved','preparing') UNION ALL SELECT lease_until FROM task_step WHERE status='claimed' UNION ALL SELECT lease_expires_at FROM execution WHERE status='running') WHERE julianday(deadline)>julianday('now')")
+            .fetch_one(self.pool())
+            .await?)
+    }
+    /// One keyset page of Tasks that are not settled, read from the partial
+    /// index: a settled Task is never visited.
+    pub async fn open_schedule_tasks(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT id FROM task WHERE json_extract(condition_json,'$.kind') != 'settled' AND (?1 IS NULL OR id>?1) ORDER BY id LIMIT ?2")
+            .bind(after)
+            .bind(limit)
+            .fetch_all(self.pool())
+            .await?)
+    }
+    /// Tasks waiting for a machine run slot.
+    pub async fn schedule_machine_waiters(&self) -> Result<Vec<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT task_id FROM task_schedule_wait WHERE daemon_id='*'")
+                .fetch_all(self.pool())
+                .await?,
         )
-        .fetch_one(self.pool())
-        .await?)
+    }
+    /// Re-read one Task at `deadline`: a transient admission failure is
+    /// retried then, without touching the Task's own fields.
+    pub async fn schedule_retry_at(&self, id: &str, deadline: &str) -> Result<()> {
+        sqlx::query("INSERT INTO task_schedule_wait(task_id,project_id,deadline) SELECT id,project_id,?2 FROM task WHERE id=?1 ON CONFLICT(task_id) DO UPDATE SET deadline=excluded.deadline")
+            .bind(id)
+            .bind(deadline)
+            .execute(self.pool())
+            .await?;
+        Ok(())
     }
     pub async fn schedule_has_owner(&self, id: &str, epoch: i64) -> Result<bool> {
         Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND status IN ('pending','claimed') AND (entry_fenced=0 OR expected_epoch=?)) OR EXISTS(SELECT 1 FROM execution WHERE task_id=? AND status='running' AND role!='interactive') OR EXISTS(SELECT 1 FROM task_schedule_park WHERE task_id=? AND epoch=?) OR EXISTS(SELECT 1 FROM task WHERE id=? AND json_extract(condition_json,'$.kind') IN ('parked','failed'))")
@@ -275,7 +320,7 @@ mod tests {
 impl SqliteDb {
     /// Read-only liveness proof, independent of the dirty notification path.
     pub async fn task_schedule_violations(&self) -> Result<Vec<String>> {
-        let tasks:Vec<(String,i64)>=sqlx::query_as("SELECT id,status_epoch FROM task WHERE deleted_at IS NULL AND archived_at IS NULL AND json_extract(condition_json,'$.kind')!='settled'")
+        let tasks:Vec<(String,i64)>=sqlx::query_as("SELECT id,status_epoch FROM task WHERE json_extract(condition_json,'$.kind') != 'settled' AND deleted_at IS NULL AND archived_at IS NULL")
             .fetch_all(self.pool()).await?;
         let mut violations = Vec::new();
         for (id, epoch) in tasks {
@@ -364,7 +409,7 @@ mod fanout_tests {
     async fn capacity_release_kicks_only_matching_waiters() {
         let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
         crate::run_migrations(&pool).await.unwrap();
-        sqlx::raw_sql("INSERT INTO project(id,name,settings,workflow_definition,created_at,updated_at) VALUES ('p','p','{}','{}','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'); INSERT INTO task(id,project_id,title,task_type,status,created_at,updated_at) VALUES ('work','p','work','task','in_progress','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'),('wait','p','wait','task','todo','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'),('other','p','other','task','todo','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'); INSERT INTO task_schedule_wait(task_id,project_id,daemon_id) VALUES ('wait','p',NULL),('other','p','other-machine'); INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES ('e','work','coder','running','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'); DELETE FROM task_schedule_dirty;").execute(&pool).await.unwrap();
+        sqlx::raw_sql("INSERT INTO project(id,name,settings,workflow_definition,created_at,updated_at) VALUES ('p','p','{}','{}','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'); INSERT INTO task(id,project_id,title,task_type,status,created_at,updated_at) VALUES ('work','p','work','task','in_progress','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'),('wait','p','wait','task','todo','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'),('other','p','other','task','todo','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'),('idle','p','idle','task','todo','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'); INSERT INTO task_schedule_wait(task_id,project_id,daemon_id) VALUES ('wait','p','*'),('other','p','other-machine'),('idle','p',NULL); INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES ('e','work','coder','running','2026-10-06T00:00:00Z','2026-10-06T00:00:00Z'); DELETE FROM task_schedule_dirty;").execute(&pool).await.unwrap();
         let db = SqliteDb::new(pool);
         sqlx::query("UPDATE execution SET status='completed' WHERE id='e'")
             .execute(db.pool())

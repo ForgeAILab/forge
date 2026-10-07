@@ -28,7 +28,7 @@ pub(super) fn is_io_or_workspace_error(error: &ServiceError) -> bool {
 /// Only a deterministic refusal earns a dispatch disposition. Quiescing on a
 /// transient failure — a busy database, an unreachable daemon, a rate limit —
 /// would park the Task until its `version` happened to change or someone
-/// called `kick_task_reconciliation`, turning a momentary blip into a permanent
+/// called `wake_task_dispatch`, turning a momentary blip into a permanent
 /// stall. Those keep the previous behavior of being retried next scan.
 ///
 /// Classification is by typed variant, never by matching refusal text: the

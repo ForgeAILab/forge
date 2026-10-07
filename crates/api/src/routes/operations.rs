@@ -108,7 +108,8 @@ pub async fn refresh_operations(
     State(state): State<AppState>,
 ) -> ApiResult<Json<OperationsRefreshResponse>> {
     let dispatched_tasks = if let Some(dispatcher) = state.task_dispatcher.as_ref() {
-        dispatcher.check_once().await?
+        // A refresh reconciles every Task now, as it scanned every Task before.
+        dispatcher.reconcile_all().await?
     } else {
         0
     };

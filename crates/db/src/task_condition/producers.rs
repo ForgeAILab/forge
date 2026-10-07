@@ -113,7 +113,13 @@ pub(crate) async fn derive(
             ConditionFacts::load_all(c, &snapshot).await?
         }
     };
-    let condition = facts.apply(mapped);
+    // An initial state reads the entry barrier differently; only then is the
+    // mapping taken again, from the same snapshot.
+    let condition = if facts.initial {
+        facts.condition_of(&snapshot.input.view())
+    } else {
+        facts.apply(mapped)
+    };
     let encoded = encode(&condition);
     Ok(Some(Produced {
         version: snapshot.version,

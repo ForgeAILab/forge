@@ -1,7 +1,8 @@
 -- Internal scheduler state. Legacy Task columns and public readers are unchanged.
 CREATE INDEX idx_execution_running_task ON execution(task_id) WHERE status = 'running';
-CREATE INDEX idx_execution_task_role_latest ON execution(task_id,role,created_at DESC,id DESC);
 DROP INDEX idx_task_condition_kind;
+-- The sweep pages over Tasks that are not settled; settled rows are never read.
+CREATE INDEX idx_task_schedule_open ON task(id) WHERE json_extract(condition_json,'$.kind') != 'settled';
 CREATE TABLE task_schedule_dirty (
     task_id TEXT PRIMARY KEY REFERENCES task(id) ON DELETE CASCADE,
     generation INTEGER NOT NULL DEFAULT 1,
@@ -14,6 +15,10 @@ CREATE TABLE task_schedule_park (
     epoch INTEGER NOT NULL,
     reason_json TEXT NOT NULL CHECK(json_valid(reason_json))
 );
+-- `daemon_id` is set only while the Task waits on a machine: that machine's
+-- readiness or reconnect, or '*' for a run slot on whichever machine can take
+-- it. `project_capacity` is set only while it waits on the Project limit. A
+-- capacity change therefore kicks the waiters it can admit and no others.
 CREATE TABLE task_schedule_wait (
     task_id TEXT PRIMARY KEY REFERENCES task(id) ON DELETE CASCADE,
     project_id TEXT NOT NULL,
@@ -26,13 +31,6 @@ CREATE INDEX task_schedule_wait_project ON task_schedule_wait(project_id);
 CREATE INDEX task_schedule_wait_agent ON task_schedule_wait(agent_id);
 CREATE INDEX task_schedule_wait_machine ON task_schedule_wait(daemon_id);
 CREATE INDEX task_schedule_wait_deadline ON task_schedule_wait(deadline) WHERE deadline IS NOT NULL;
-CREATE TABLE task_schedule_sweep (
-    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-    cursor TEXT,
-    checked INTEGER NOT NULL DEFAULT 0,
-    repaired INTEGER NOT NULL DEFAULT 0
-);
-INSERT INTO task_schedule_sweep(singleton) VALUES(1);
 
 CREATE TRIGGER task_schedule_insert AFTER INSERT ON task BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 0 FROM (SELECT id FROM task WHERE id=NEW.id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
@@ -62,7 +60,7 @@ CREATE TRIGGER task_schedule_role_insert AFTER INSERT ON task_role_assignment BE
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT id FROM task WHERE id=NEW.task_id OR (parent_task_id=NEW.task_id AND NEW.role_name='coder')) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
-CREATE TRIGGER task_schedule_step_insert AFTER INSERT ON task_step BEGIN
+CREATE TRIGGER task_schedule_step_insert AFTER INSERT ON task_step WHEN NEW.kind != 'mutation' BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 0 FROM (SELECT id FROM task WHERE id=NEW.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
@@ -70,14 +68,18 @@ CREATE TRIGGER task_schedule_review_insert AFTER INSERT ON review BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 0 FROM (SELECT id FROM task WHERE id=NEW.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
+-- A new execution takes capacity; it never frees any. It marks its own Task
+-- and the Tasks waiting on its Project's limit, whose recorded wait names the
+-- count of active Tasks. Waiters on an Agent or a machine are kicked when an
+-- execution ends.
 CREATE TRIGGER task_schedule_execution_insert AFTER INSERT ON execution BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 0 FROM (SELECT id FROM task WHERE id=NEW.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
-    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=NEW.agent_id OR daemon_id IS COALESCE((SELECT COALESCE(execution_daemon_id,daemon_id) FROM workspace_placement WHERE workspace_id=NEW.workspace_id),CASE WHEN json_valid(NEW.executor_config_snapshot_json) THEN json_extract(NEW.executor_config_snapshot_json,'$.daemon_id') END,(SELECT daemon_id FROM agent_current WHERE id=NEW.agent_id)) OR (project_capacity=1 AND project_id=(SELECT project_id FROM task WHERE id=NEW.task_id))) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
+    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE project_capacity=1 AND project_id=(SELECT project_id FROM task WHERE id=NEW.task_id)) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
 CREATE TRIGGER task_schedule_placement_insert AFTER INSERT ON workspace_placement BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT id FROM task WHERE id=NEW.task_id OR parent_task_id=NEW.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
-    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=NEW.agent_id OR daemon_id IS NEW.daemon_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
+    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=NEW.agent_id OR daemon_id IN (COALESCE(NEW.execution_daemon_id,NEW.daemon_id,''),'*')) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
 CREATE TRIGGER task_schedule_cancel_insert AFTER INSERT ON pending_remote_cancel BEGIN
@@ -104,7 +106,7 @@ CREATE TRIGGER task_schedule_role_delete AFTER DELETE ON task_role_assignment BE
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT id FROM task WHERE id=OLD.task_id OR (parent_task_id=OLD.task_id AND OLD.role_name='coder')) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
-CREATE TRIGGER task_schedule_step_delete AFTER DELETE ON task_step BEGIN
+CREATE TRIGGER task_schedule_step_delete AFTER DELETE ON task_step WHEN OLD.kind != 'mutation' BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 0 FROM (SELECT id FROM task WHERE id=OLD.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
@@ -114,12 +116,12 @@ END;
 
 CREATE TRIGGER task_schedule_execution_delete AFTER DELETE ON execution BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 0 FROM (SELECT id FROM task WHERE id=OLD.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
-    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=OLD.agent_id OR daemon_id IS (SELECT daemon_id FROM agent_current WHERE id=OLD.agent_id) OR (project_capacity=1 AND project_id=(SELECT project_id FROM task WHERE id=OLD.task_id))) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
+    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=OLD.agent_id OR daemon_id IN (COALESCE((SELECT daemon_id FROM agent_current WHERE id=OLD.agent_id),''),'*') OR (project_capacity=1 AND project_id=(SELECT project_id FROM task WHERE id=OLD.task_id))) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
 CREATE TRIGGER task_schedule_placement_delete AFTER DELETE ON workspace_placement BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT id FROM task WHERE id=OLD.task_id OR parent_task_id=OLD.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
-    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=OLD.agent_id OR daemon_id IS OLD.daemon_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
+    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=OLD.agent_id OR daemon_id IN (COALESCE(OLD.execution_daemon_id,OLD.daemon_id,''),'*')) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
 CREATE TRIGGER task_schedule_cancel_delete AFTER DELETE ON pending_remote_cancel BEGIN
@@ -146,7 +148,7 @@ CREATE TRIGGER task_schedule_role_update AFTER UPDATE ON task_role_assignment BE
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT id FROM task WHERE id=NEW.task_id OR (parent_task_id=NEW.task_id AND NEW.role_name='coder')) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
-CREATE TRIGGER task_schedule_step_update AFTER UPDATE ON task_step WHEN OLD.status IS NOT NEW.status OR OLD.available_at IS NOT NEW.available_at OR OLD.lease_until IS NOT NEW.lease_until BEGIN
+CREATE TRIGGER task_schedule_step_update AFTER UPDATE ON task_step WHEN NEW.kind != 'mutation' AND (OLD.status IS NOT NEW.status OR OLD.available_at IS NOT NEW.available_at) BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 0 FROM (SELECT id FROM task WHERE id=NEW.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
@@ -154,14 +156,14 @@ CREATE TRIGGER task_schedule_review_update AFTER UPDATE ON review BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 0 FROM (SELECT id FROM task WHERE id=NEW.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
-CREATE TRIGGER task_schedule_execution_update AFTER UPDATE ON execution WHEN OLD.status IS NOT NEW.status OR OLD.agent_id IS NOT NEW.agent_id OR OLD.workspace_id IS NOT NEW.workspace_id OR OLD.executor_config_snapshot_json IS NOT NEW.executor_config_snapshot_json OR OLD.lease_owner IS NOT NEW.lease_owner OR OLD.lease_expires_at IS NOT NEW.lease_expires_at BEGIN
+CREATE TRIGGER task_schedule_execution_update AFTER UPDATE ON execution WHEN OLD.status IS NOT NEW.status OR OLD.agent_id IS NOT NEW.agent_id OR OLD.workspace_id IS NOT NEW.workspace_id OR OLD.executor_config_snapshot_json IS NOT NEW.executor_config_snapshot_json BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 0 FROM (SELECT id FROM task WHERE id=NEW.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
-    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=NEW.agent_id OR daemon_id IS COALESCE((SELECT COALESCE(execution_daemon_id,daemon_id) FROM workspace_placement WHERE workspace_id=NEW.workspace_id),CASE WHEN json_valid(NEW.executor_config_snapshot_json) THEN json_extract(NEW.executor_config_snapshot_json,'$.daemon_id') END,(SELECT daemon_id FROM agent_current WHERE id=NEW.agent_id)) OR (project_capacity=1 AND project_id=(SELECT project_id FROM task WHERE id=NEW.task_id))) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
+    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=NEW.agent_id OR daemon_id IN (COALESCE((SELECT COALESCE(execution_daemon_id,daemon_id) FROM workspace_placement WHERE workspace_id=NEW.workspace_id),CASE WHEN json_valid(NEW.executor_config_snapshot_json) THEN json_extract(NEW.executor_config_snapshot_json,'$.daemon_id') END,(SELECT daemon_id FROM agent_current WHERE id=NEW.agent_id),''),'*') OR (project_capacity=1 AND project_id=(SELECT project_id FROM task WHERE id=NEW.task_id))) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
 CREATE TRIGGER task_schedule_placement_update AFTER UPDATE ON workspace_placement WHEN OLD.state IS NOT NEW.state OR OLD.reserved_until IS NOT NEW.reserved_until OR OLD.generation IS NOT NEW.generation BEGIN
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT id FROM task WHERE id=NEW.task_id OR parent_task_id=NEW.task_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
-    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=NEW.agent_id OR daemon_id IS NEW.daemon_id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
+    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE agent_id=NEW.agent_id OR daemon_id IN (COALESCE(NEW.execution_daemon_id,NEW.daemon_id,''),'*')) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
 CREATE TRIGGER task_schedule_cancel_update AFTER UPDATE ON pending_remote_cancel BEGIN
@@ -185,7 +187,7 @@ CREATE TRIGGER task_schedule_project AFTER UPDATE ON project WHEN OLD.version IS
 END;
 
 CREATE TRIGGER task_schedule_daemon AFTER UPDATE ON daemon WHEN OLD.removed_at IS NOT NEW.removed_at OR OLD.status IS NOT NEW.status OR OLD.run_limit IS NOT NEW.run_limit OR OLD.max_concurrent_runs IS NOT NEW.max_concurrent_runs OR OLD.agent_version IS NOT NEW.agent_version OR OLD.detected_clis_json IS NOT NEW.detected_clis_json BEGIN
-    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE daemon_id=NEW.id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
+    INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT task_id FROM task_schedule_wait WHERE daemon_id IN (NEW.id,'*')) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
     INSERT INTO task_schedule_dirty(task_id,external) SELECT *, 1 FROM (SELECT DISTINCT a.task_id FROM task_role_assignment a JOIN agent_current g ON g.id=a.assignee_id WHERE g.daemon_id=NEW.id) WHERE 1 ON CONFLICT(task_id) DO UPDATE SET generation=generation+1, dirty=1, external=MAX(external,excluded.external);
 END;
 
@@ -249,17 +251,17 @@ END;
 
 -- Chat turns consume the same machine slots as Task executions.
 CREATE TRIGGER task_schedule_chat_insert AFTER INSERT ON agent_chat_turn_job WHEN NEW.status IN ('leased','running') BEGIN
- INSERT INTO task_schedule_dirty(task_id,external) SELECT task_id,1 FROM task_schedule_wait WHERE daemon_id IS (SELECT daemon_id FROM agent_current WHERE id=NEW.responder_identity_id) ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1;
+ INSERT INTO task_schedule_dirty(task_id,external) SELECT task_id,1 FROM task_schedule_wait WHERE daemon_id IN (COALESCE((SELECT daemon_id FROM agent_current WHERE id=NEW.responder_identity_id),''),'*') ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1;
 END;
 CREATE TRIGGER task_schedule_chat_update AFTER UPDATE ON agent_chat_turn_job WHEN (OLD.status IS NOT NEW.status OR OLD.responder_identity_id IS NOT NEW.responder_identity_id) AND (OLD.status IN ('leased','running') OR NEW.status IN ('leased','running')) BEGIN
- INSERT INTO task_schedule_dirty(task_id,external) SELECT task_id,1 FROM task_schedule_wait WHERE daemon_id IS (SELECT daemon_id FROM agent_current WHERE id=NEW.responder_identity_id) OR daemon_id IS (SELECT daemon_id FROM agent_current WHERE id=OLD.responder_identity_id) ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1;
+ INSERT INTO task_schedule_dirty(task_id,external) SELECT task_id,1 FROM task_schedule_wait WHERE daemon_id IN (COALESCE((SELECT daemon_id FROM agent_current WHERE id=NEW.responder_identity_id),''),'*') OR daemon_id IN (COALESCE((SELECT daemon_id FROM agent_current WHERE id=OLD.responder_identity_id),''),'*') ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1;
 END;
 CREATE TRIGGER task_schedule_chat_delete AFTER DELETE ON agent_chat_turn_job WHEN OLD.status IN ('leased','running') BEGIN
- INSERT INTO task_schedule_dirty(task_id,external) SELECT task_id,1 FROM task_schedule_wait WHERE daemon_id IS (SELECT daemon_id FROM agent_current WHERE id=OLD.responder_identity_id) ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1;
+ INSERT INTO task_schedule_dirty(task_id,external) SELECT task_id,1 FROM task_schedule_wait WHERE daemon_id IN (COALESCE((SELECT daemon_id FROM agent_current WHERE id=OLD.responder_identity_id),''),'*') ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1;
 END;
 
 -- Eligible queued admissions release Agent/machine references without creating
 -- an execution when preparation refuses or is preempted.
-CREATE TRIGGER task_schedule_admission_release AFTER UPDATE ON task_step WHEN OLD.kind='command' AND OLD.lane='fast' AND json_valid(OLD.payload_json) AND json_extract(OLD.payload_json,'$.admission_agent_id') IS NOT NULL AND (OLD.status IS NOT NEW.status OR OLD.available_at IS NOT NEW.available_at OR OLD.lease_until IS NOT NEW.lease_until) BEGIN
- INSERT INTO task_schedule_dirty(task_id,external) SELECT task_id,1 FROM task_schedule_wait WHERE agent_id=json_extract(OLD.payload_json,'$.admission_agent_id') OR daemon_id IS COALESCE((SELECT COALESCE(p.execution_daemon_id,p.daemon_id) FROM workspace_placement p JOIN task t ON p.task_id=COALESCE(t.parent_task_id,t.id) WHERE t.id=OLD.task_id),(SELECT daemon_id FROM agent_current WHERE id=json_extract(OLD.payload_json,'$.admission_agent_id'))) ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1;
+CREATE TRIGGER task_schedule_admission_release AFTER UPDATE ON task_step WHEN OLD.kind='command' AND json_valid(OLD.payload_json) AND json_extract(OLD.payload_json,'$.admission_agent_id') IS NOT NULL AND (OLD.status IS NOT NEW.status OR OLD.available_at IS NOT NEW.available_at OR OLD.lease_until IS NOT NEW.lease_until) BEGIN
+ INSERT INTO task_schedule_dirty(task_id,external) SELECT task_id,1 FROM task_schedule_wait WHERE agent_id=json_extract(OLD.payload_json,'$.admission_agent_id') OR daemon_id IN (COALESCE((SELECT COALESCE(p.execution_daemon_id,p.daemon_id) FROM workspace_placement p JOIN task t ON p.task_id=COALESCE(t.parent_task_id,t.id) WHERE t.id=OLD.task_id),(SELECT daemon_id FROM agent_current WHERE id=json_extract(OLD.payload_json,'$.admission_agent_id')),''),'*') ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1;
 END;

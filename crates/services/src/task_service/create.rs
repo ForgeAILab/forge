@@ -683,7 +683,7 @@ impl TaskService {
                     &now_rfc3339(),
                 )
                 .await?;
-            crate::kick_task_reconciliation(
+            crate::wake_task_dispatch(
                 &self.db,
                 &task_id,
                 "Project default role assignment changed",

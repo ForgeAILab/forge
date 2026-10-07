@@ -264,9 +264,34 @@ pub(crate) async fn wake_dispatch_for_project_in_tx(
     project_id: &str,
     updated_at: &str,
 ) -> Result<u64> {
-    let _ = (db, updated_at);
-    Ok(sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) SELECT id,1 FROM task WHERE project_id=? AND deleted_at IS NULL ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1")
-        .bind(project_id).execute(&mut **transaction).await?.rows_affected())
+    let result = crate::task_writer::BulkTaskQuery::new(
+        db,
+        "UPDATE task
+         SET metadata_json = NULLIF(
+                 json_remove(metadata_json, '$.dispatch_disposition', '$.deferred_dispatch'),
+                 '{}'
+             ),
+             updated_at = ?,
+             version = version + 1
+         WHERE project_id = ?
+           AND deleted_at IS NULL
+           AND json_valid(metadata_json)
+           AND (
+               json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+               OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL
+           )",
+    )
+    .bind(updated_at)
+    .bind(project_id)
+    .execute_in_tx(transaction)
+    .await?;
+    // Open Tasks with nothing stored to clear are reconsidered too: the
+    // Project fact they were held on changed without touching their rows.
+    sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) SELECT id,1 FROM task WHERE project_id=? AND deleted_at IS NULL ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1")
+        .bind(project_id)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(result.tasks())
 }
 
 fn limit(page: &PageRequest) -> i64 {

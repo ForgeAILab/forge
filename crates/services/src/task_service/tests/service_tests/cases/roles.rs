@@ -390,12 +390,7 @@ async fn reassign_role_same_assignee_does_not_emit_event() {
         .await
         .expect("task reload succeeds")
         .expect("task exists");
-    assert!(crate::deferred_dispatch::dispatch_disposition_for_test(&woken_task).is_some());
-    assert!(db
-        .dirty_schedule_tasks(100)
-        .await
-        .unwrap()
-        .contains(&task.id));
+    assert!(crate::deferred_dispatch::dispatch_disposition_for_test(&woken_task).is_none());
 }
 
 #[tokio::test]

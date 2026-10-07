@@ -6,10 +6,8 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-/// Rows recomputed per supervised tick.
+/// Rows recomputed per page.
 pub const CONDITION_CHECK_PAGE: usize = 50;
-/// Cadence of the steady-state check.
-const CHECK_INTERVAL: Duration = Duration::from_secs(120);
 /// Work one tick may spend re-running the backfill after a mapping change.
 const BACKFILL_SLICE: Duration = Duration::from_millis(250);
 
@@ -34,14 +32,11 @@ pub struct ConditionCheckStatus {
 pub struct ConditionCheckState {
     pub(crate) after: Option<String>,
     pub(crate) in_progress: bool,
-    pub(crate) next: Option<Instant>,
     pub(crate) status: ConditionCheckStatus,
     pass: ConditionCheckPass,
     /// Whether the recorded mapping revision is stale: unknown until the
     /// first tick reads it, then true until one pass completes.
     backfill: Option<bool>,
-    cursor_loaded: bool,
-    page_ids: Vec<String>,
 }
 // Supervised loop cancellation must not disable subsequent checks.
 struct CheckGuard(std::sync::Arc<std::sync::Mutex<ConditionCheckState>>);
@@ -51,63 +46,61 @@ impl Drop for CheckGuard {
     }
 }
 struct Page {
-    ids: Vec<String>,
     checked: u64,
     repaired: u64,
     /// The cursor after this page; `None` once the last Task was read.
     next: Option<String>,
 }
 impl SqliteDb {
-    pub async fn begin_condition_sweep(&self, startup: bool) -> Result<()> {
-        let unknown = self
-            .condition_checks
-            .lock()
-            .expect("condition checks")
-            .backfill
-            .is_none();
-        if unknown {
-            let recorded =
-                crate::SystemSettingRepo::get_setting(self, MAPPING_REVISION_KEY).await?;
-            let mut state = self.condition_checks.lock().expect("condition checks");
-            state.backfill =
-                Some(recorded.as_deref() != Some(MAPPING_REVISION.to_string().as_str()));
-        }
-        if startup {
-            // Startup proves the entire current set, even when a previous
-            // process persisted a partial pass's cursor.
-            let mut state = self.condition_checks.lock().expect("condition checks");
-            state.after = None;
-            state.cursor_loaded = true;
-            state.pass = ConditionCheckPass::default();
-        }
-        Ok(())
-    }
-    pub async fn persist_condition_cursor(&self) -> Result<()> {
-        let cursor = self
-            .condition_checks
-            .lock()
-            .expect("condition checks")
-            .after
-            .clone();
-        sqlx::query(
-            "UPDATE task_schedule_sweep SET cursor=? WHERE singleton=1 AND cursor IS NOT ?",
-        )
-        .bind(&cursor)
-        .bind(&cursor)
-        .execute(self.pool())
-        .await?;
-        Ok(())
-    }
-    pub fn condition_check_page_ids(&self) -> (Vec<String>, Option<String>) {
-        let state = self.condition_checks.lock().expect("condition checks");
-        (state.page_ids.clone(), state.after.clone())
-    }
-    pub fn count_schedule_repairs(&self, repairs: u64) {
+    /// One lap of the scheduler sweep ended: its condition checks and the
+    /// scheduler repairs it counted become the reported pass. A lap that
+    /// repaired nothing is a log line.
+    pub fn complete_condition_pass(&self, schedule_repairs: u64) {
         let mut state = self.condition_checks.lock().expect("condition checks");
-        state.status.repaired += repairs;
-        if let Some(pass) = state.status.last_pass.as_mut() {
-            pass.repaired += repairs;
+        let mut pass = std::mem::take(&mut state.pass);
+        pass.repaired += schedule_repairs;
+        pass.completed_at = crate::now_rfc3339();
+        state.status.repaired += schedule_repairs;
+        // A lap is one run of the check, also when it found no open Task.
+        state.status.ticks += 1;
+        state.status.last_at = Some(pass.completed_at.clone());
+        tracing::info!(
+            checked = pass.checked,
+            repaired = pass.repaired,
+            "Task condition and scheduler invariant pass completed"
+        );
+        state.status.last_pass = Some(pass);
+    }
+    /// Recompute and repair exactly these Tasks: the page the scheduler sweep
+    /// is on, or one Task whose stored condition could not be decoded.
+    pub async fn check_task_conditions_of(&self, ids: &[String]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
         }
+        let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
+        let page = self
+            .check_condition_rows(
+                &format!("SELECT {LEGACY_SELECT},id,version FROM task WHERE id IN (SELECT value FROM json_each(?1)) AND ?2 ORDER BY id"),
+                Some(&ids),
+                1,
+            )
+            .await?;
+        let mut state = self.condition_checks.lock().expect("condition checks");
+        state.status.checked += page.checked;
+        state.status.repaired += page.repaired;
+        state.status.ticks += 1;
+        state.status.last_at = Some(crate::now_rfc3339());
+        state.pass.checked += page.checked;
+        state.pass.repaired += page.repaired;
+        drop(state);
+        if page.repaired != 0 {
+            tracing::warn!(
+                checked = page.checked,
+                repaired = page.repaired,
+                "Task condition invariant check repaired rows"
+            );
+        }
+        Ok(page.repaired)
     }
     pub fn condition_check_status(&self) -> ConditionCheckStatus {
         self.condition_checks
@@ -121,20 +114,6 @@ impl SqliteDb {
     /// keeps its cursor for a later supervised tick; a row that cannot be
     /// recomputed is logged and passed over.
     pub async fn check_task_conditions(&self, budget: usize) -> Result<ConditionCheckStatus> {
-        let loaded = self
-            .condition_checks
-            .lock()
-            .expect("condition checks")
-            .cursor_loaded;
-        if !loaded {
-            let cursor: Option<String> =
-                sqlx::query_scalar("SELECT cursor FROM task_schedule_sweep WHERE singleton=1")
-                    .fetch_one(self.pool())
-                    .await?;
-            let mut state = self.condition_checks.lock().expect("condition checks");
-            state.after = cursor;
-            state.cursor_loaded = true;
-        }
         let (after, limit) = {
             let mut state = self.condition_checks.lock().expect("condition checks");
             if state.in_progress {
@@ -155,7 +134,6 @@ impl SqliteDb {
             state.pass.checked += page.checked;
             state.pass.repaired += page.repaired;
             state.after = page.next.clone();
-            state.page_ids = page.ids.clone();
             let backfilling = state.backfill == Some(true);
             let completed = (limit != 0 && page.next.is_none()).then(|| {
                 let mut pass = std::mem::take(&mut state.pass);
@@ -199,11 +177,12 @@ impl SqliteDb {
         }
         Ok(self.condition_check_status())
     }
-    /// The supervised tick. It never blocks startup: the first call only
-    /// reads the recorded mapping revision. While that revision is stale the
-    /// backfill is re-run in slices on every tick; afterwards one page is
-    /// checked per [`CHECK_INTERVAL`].
-    pub async fn check_task_conditions_if_due(&self) -> Result<()> {
+    /// Re-run the backfill in slices while the recorded mapping revision is
+    /// stale. It never blocks startup: the first call only reads the recorded
+    /// revision, and every later call is one bounded slice until the pass
+    /// that covers every Task (settled ones included) completes. The steady
+    /// check belongs to the scheduler sweep. Returns whether work remains.
+    pub async fn backfill_task_conditions_if_stale(&self) -> Result<bool> {
         let known = self
             .condition_checks
             .lock()
@@ -225,31 +204,26 @@ impl SqliteDb {
                 stale
             }
         };
-        if backfilling {
-            let started = Instant::now();
-            let mut ticks = self.condition_check_status().ticks;
-            while started.elapsed() < BACKFILL_SLICE {
-                let status = self.check_task_conditions(CONDITION_CHECK_PAGE).await?;
-                let state = self.condition_checks.lock().expect("condition checks");
-                // Done, or another caller holds the check: yield the tick.
-                if state.backfill != Some(true) || status.ticks == ticks {
-                    break;
-                }
-                ticks = status.ticks;
-            }
-            return Ok(());
+        if !backfilling {
+            return Ok(false);
         }
-        {
-            let mut state = self.condition_checks.lock().expect("condition checks");
-            let now = Instant::now();
-            if state.next.is_some_and(|next| next > now) {
-                return Ok(());
+        let started = Instant::now();
+        let mut ticks = self.condition_check_status().ticks;
+        while started.elapsed() < BACKFILL_SLICE {
+            let status = self.check_task_conditions(CONDITION_CHECK_PAGE).await?;
+            let state = self.condition_checks.lock().expect("condition checks");
+            // Done, or another caller holds the check: yield the tick.
+            if state.backfill != Some(true) || status.ticks == ticks {
+                break;
             }
-            state.next = Some(now + CHECK_INTERVAL);
+            ticks = status.ticks;
         }
-        self.check_task_conditions(CONDITION_CHECK_PAGE)
-            .await
-            .map(|_| ())
+        Ok(self
+            .condition_checks
+            .lock()
+            .expect("condition checks")
+            .backfill
+            == Some(true))
     }
     /// One fenced statement: a row whose version or stored condition changed
     /// since the check read it is not written.
@@ -272,28 +246,44 @@ impl SqliteDb {
     async fn check_condition_page(&self, after: Option<&str>, limit: usize) -> Result<Page> {
         if limit == 0 {
             return Ok(Page {
-                ids: Vec::new(),
                 checked: 0,
                 repaired: 0,
                 next: after.map(str::to_owned),
             });
         }
-        // One read snapshot for the page, so a row and its facts agree.
+        let mut page = self
+            .check_condition_rows(
+                &format!("SELECT {LEGACY_SELECT},id,version FROM task WHERE ?1 IS NULL OR id>?1 ORDER BY id LIMIT ?2"),
+                after,
+                limit as i64,
+            )
+            .await?;
+        if page.checked as usize != limit {
+            page.next = None;
+        }
+        Ok(page)
+    }
+    /// One read snapshot for the rows, so a row and its facts agree. `next`
+    /// is the last id read.
+    async fn check_condition_rows(
+        &self,
+        select: &str,
+        first: Option<&str>,
+        second: i64,
+    ) -> Result<Page> {
         let mut reader = self.pool().begin().await?;
-        let rows = sqlx::query(&format!(
-            "SELECT {LEGACY_SELECT},id,version FROM task WHERE ?1 IS NULL OR id>?1 ORDER BY id LIMIT ?2"
-        ))
-        .bind(after)
-        .bind(limit as i64)
-        .fetch_all(&mut *reader)
-        .await?;
+        let rows = sqlx::query(select)
+            .bind(first)
+            .bind(second)
+            .fetch_all(&mut *reader)
+            .await?;
         let mut stale = Vec::new();
         for row in &rows {
             let id: String = row.try_get(6)?;
             let expected = async {
                 let input = LegacyConditionInput::from_row(row)?;
                 let facts = ConditionFacts::load(&mut reader, &id).await?;
-                Ok::<_, DbError>(encode(&facts.apply(map_legacy_condition(&input))))
+                Ok::<_, DbError>(encode(&facts.condition(&input)))
             }
             .await;
             match expected {
@@ -317,16 +307,9 @@ impl SqliteDb {
                 .await?;
         }
         Ok(Page {
-            ids: rows
-                .iter()
-                .map(|r| r.try_get(6))
-                .collect::<std::result::Result<Vec<_>, _>>()?,
             checked: rows.len() as u64,
             repaired,
-            next: (rows.len() == limit)
-                .then(|| rows.last().map(|row| row.try_get(6)))
-                .flatten()
-                .transpose()?,
+            next: rows.last().map(|row| row.try_get(6)).transpose()?,
         })
     }
 }

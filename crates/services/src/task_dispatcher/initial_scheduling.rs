@@ -34,7 +34,7 @@ pub(super) struct InitialScheduleTarget {
 }
 
 impl TaskDispatcher {
-    fn publish_capacity_disposition_change(&self, task: &Task) {
+    pub(super) fn publish_capacity_disposition_change(&self, task: &Task) {
         self.event_bus.publish(ForgeEvent {
             event_type: "task.updated".to_owned(),
             entity_id: task.id.clone(),
@@ -70,7 +70,7 @@ impl TaskDispatcher {
     /// 19 consecutive scans until a user recovered the Task by hand.
     ///
     /// Parking is safe here because every event that can change the answer also
-    /// wakes the root: `advance_subtask_sequence` calls `kick_task_reconciliation` on
+    /// wakes the root: `advance_subtask_sequence` calls `wake_task_dispatch` on
     /// the parent before advancing it, and any recovery action that clears the
     /// root's blocker bumps its `version`. Either invalidates the disposition.
     ///
@@ -234,7 +234,7 @@ impl TaskDispatcher {
                     // and its warning — entirely rather than re-deriving and
                     // re-logging the identical denial every scan (F11). Nothing
                     // schedules this Task again until its version changes or an
-                    // explicit `kick_task_reconciliation` clears the disposition.
+                    // explicit `wake_task_dispatch` clears the disposition.
                     return Ok(());
                 }
                 // Only an actual admission candidate needs the capacity query.

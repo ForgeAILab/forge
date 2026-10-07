@@ -495,6 +495,58 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     17% over its three transactions. Ordinary metadata updates and recording
     an execution are unchanged.
 
+- **The dispatcher reconciles Tasks that changed instead of scanning all of
+  them (plan 3.1 stage 3).** Until now the dispatcher re-read every Task of
+  every Project every 10 seconds. It now reads a Task when a commit changes
+  something that Task's dispatch depends on, when one of its timers is due,
+  and once every 120 seconds in a background sweep. Dispatch decisions are
+  unchanged: the same Tasks are dispatched to the same Agents, in the same
+  order and within the same Project, Agent and machine limits, no later than
+  before; held Tasks stay held; and every condition field, wait reason, event
+  and annotation is written as before. REST, MCP and `forge-ctl` shapes are
+  unchanged, and every reader still uses the existing condition fields.
+  Three things are different:
+  - **A Task nothing can continue is parked visibly.** A Task in a state its
+    Project workflow does not define, a Task whose merge entry was lost and
+    cannot be replayed safely, and a Task with an unreadable plan publication
+    marker used to sit with no explanation. Each now carries an
+    `error_annotation` of the existing `workflow_guard_rejected` kind whose
+    message names the owner and what to do. It appears in Task health,
+    exceptions and Attention. It does not block the Task or change which
+    Project slot it holds, and the dispatcher removes it as soon as the Task
+    can continue. A Task whose role nobody holds, or a person holds, is
+    unchanged.
+  - **A missed wake is repaired within 120 seconds.** The sweep finds a Task
+    with work that nothing announced, and a Task with no queued step, no
+    running execution and no recorded wait, and reconciles it. A merging Task
+    whose hooks were lost before the durable-hooks upgrade is re-driven by the
+    sweep, not only at startup. A recorded dispatch refusal is not replayed:
+    it still waits for the Task to change or for an explicit wake.
+  - **An idle server does no dispatch work.** A Project at its
+    `max_active_tasks` limit, or a machine at its run cap, no longer costs a
+    scan every 10 seconds; a waiting Task is re-read when capacity frees.
+  - Startup no longer waits for a scan. Dispatch starts from the changes
+    recorded before the restart and the first sweep runs behind it, in slices.
+  - `POST /api/v1/operations/refresh` reconciles every Task at once, as it
+    scanned every Task before.
+  - `GET /api/v1/operations/status`: the `task_condition_invariant` entry in
+    `recent_errors` now also counts a Task the sweep found with no owner and a
+    Task whose reconciliation failed. A healthy server still never shows it.
+  - A Task in an initial state (`todo`) with an entry barrier is dispatched,
+    as it always was; its internal condition no longer says it is parked. The
+    stored conditions are recomputed once after the upgrade
+    (`task_condition_mapping_revision` 3), in small slices behind dispatch.
+  - Upgrade: migration `V202610060838` adds three internal `task_schedule_*`
+    tables and `project_schedule_dirty`, with their triggers, a partial index over Tasks that are not
+    settled and a running-execution index, and drops the unused condition-kind
+    index. No Task, execution or step row is changed.
+  - Cost: a write that changes what a Task's dispatch depends on also marks
+    the Task for the dispatcher in the same transaction. In a release build a
+    status change takes about 13% longer (33 µs), a condition metadata write
+    23% (25 µs), recording an execution 11 to 24% (14 to 34 µs) and an entry
+    hooks step 20% over its three transactions. Ordinary metadata updates
+    (5%) and budget charges (under 3%) are unchanged within noise.
+
 - **Operator status reports the Task's Execution limit (refactor 2.5).**
   `retry_pressure[].max_attempts` is the Task's resolved Execution retry limit
   (Task override, then workflow state, then 3) instead of a constant 3.

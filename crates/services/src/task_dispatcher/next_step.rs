@@ -54,7 +54,6 @@ pub enum Reason {
     RetryDeadline,
     ReviewGrace,
     ProjectPaused,
-    Dependencies,
     Children,
     HumanWork,
     AgentUnavailable,
@@ -128,7 +127,6 @@ pub struct Facts {
     pub root: bool,
     pub root_advance: bool,
     pub root_role_allowed: bool,
-    pub dependencies_ready: bool,
     pub child_ready: bool,
     pub disposition_current: bool,
     pub stopped_execution: bool,
@@ -136,6 +134,10 @@ pub struct Facts {
     pub apply_defaults: bool,
     pub initial_target: Option<(String, String, String)>,
     pub role_target: Option<(String, String)>,
+    /// The state's role is assigned to a person.
+    pub role_user: bool,
+    /// The state has a role and nobody holds it.
+    pub role_open: bool,
     pub missing_merge_entry: bool,
     pub unsafe_merge_entry: bool,
     pub merge_witness: bool,
@@ -146,6 +148,10 @@ pub struct Snapshot<'a> {
     pub workflow: &'a WorkflowDefinition,
     pub facts: &'a Facts,
 }
+/// The two missing owners a park can name for a Task nothing else owns.
+pub const PUBLICATION_OWNER: &str = "plan publication cleanup";
+pub const ENTRY_HOOKS_OWNER: &str = "entry hooks";
+
 fn park(reason: Reason, owner: Owner, recovery: Action) -> Next {
     Next::Park(Park {
         reason,
@@ -211,7 +217,7 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         } else {
             park(
                 Reason::UnknownCondition {
-                    owner: "plan publication cleanup".into(),
+                    owner: PUBLICATION_OWNER.into(),
                 },
                 Owner::Workflow,
                 Action::ReconcileEntry,
@@ -296,7 +302,13 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
             Some(StateKind::Initial | StateKind::Active | StateKind::Gate)
         )
     {
-        return Next::Step(Step::AdvanceRoot);
+        // A refused advance is recorded on the root and holds like any
+        // other recorded refusal.
+        return if f.disposition_current {
+            condition_park(s.condition)
+        } else {
+            Next::Step(Step::AdvanceRoot)
+        };
     }
     if f.disposition_current {
         return condition_park(s.condition);
@@ -311,13 +323,9 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     if f.in_flight {
         return park(Reason::InFlight, Owner::Worker, Action::WaitForOwner);
     }
-    if !f.dependencies_ready {
-        return park(
-            Reason::Dependencies,
-            Owner::ProjectAgent,
-            Action::CompleteDependencies,
-        );
-    }
+    // An unfinished or cancelled dependency is not a park of its own: the
+    // admission attempt meets the dependency gate, which writes the visible
+    // refusal (and blocks on a cancelled dependency) exactly as before.
     if !f.child_ready || (f.root && !f.root_role_allowed) {
         return park(
             Reason::Children,
@@ -396,21 +404,20 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
                 } else {
                     park(
                         Reason::UnknownCondition {
-                            owner: "entry hooks".into(),
+                            owner: ENTRY_HOOKS_OWNER.into(),
                         },
                         Owner::Workflow,
                         Action::ReconcileEntry,
                     )
                 };
             }
-            park(
-                Reason::WorkflowInvalid {
-                    state: s.state.into(),
-                    cause: "no safe automatic continuation or assigned execution role".into(),
-                },
-                Owner::ProjectAgent,
-                Action::EditWorkflow,
-            )
+            // Nothing automatic continues from here, and that is not a
+            // defect: a person holds the role, nobody was given it yet, or the
+            // state is worked by hand. The base left these alone too.
+            if f.role_open && !f.role_user {
+                return park(Reason::HumanWork, Owner::ProjectAgent, Action::AssignRole);
+            }
+            park(Reason::HumanWork, Owner::User, Action::ApproveOrMove)
         }
         Some(StateKind::Backlog) => park(
             Reason::HumanWork,
@@ -452,7 +459,7 @@ mod tests {
             root: bit(13),
             root_advance: bit(14),
             root_role_allowed: bit(15),
-            dependencies_ready: bit(16),
+            stopped_execution: bit(16),
             child_ready: bit(17),
             reviewer_ready: bit(18),
             initial_target: Some(("in_progress".into(), "coder".into(), "agent".into())),
@@ -547,96 +554,6 @@ mod tests {
             }
         }
     }
-    /// Frozen legacy dispatch decision (D5-D7). Repair effects are separate
-    /// from an execution/transition target, as in the original dispatcher.
-    fn old_dispatch(kind: Option<StateKind>, f: &Facts) -> Option<Step> {
-        if f.publication
-            || f.paused
-            || f.queue_owned
-            || f.environment_manual
-            || f.owner_expired
-            || f.placement_unavailable
-            || f.review_ci_retry
-            || f.queued_recovery
-            || f.blocking
-            || f.human_wait
-            || f.root_advance
-            || f.retry_pending
-            || f.in_flight
-            || !f.dependencies_ready
-            || !f.child_ready
-            || (f.root && !f.root_role_allowed)
-        {
-            return None;
-        }
-        match kind {
-            Some(StateKind::Initial) if !f.root => {
-                f.initial_target
-                    .as_ref()
-                    .map(|(target, role, agent_id)| Step::Initial {
-                        target: target.clone(),
-                        role: role.clone(),
-                        agent_id: agent_id.clone(),
-                    })
-            }
-            Some(StateKind::Active | StateKind::Gate)
-                if !f.stopped_execution && f.reviewer_ready =>
-            {
-                f.initial_target
-                    .as_ref()
-                    .map(|(target, role, agent_id)| Step::Initial {
-                        target: target.clone(),
-                        role: role.clone(),
-                        agent_id: agent_id.clone(),
-                    })
-                    .or_else(|| {
-                        f.role_target.as_ref().map(|(role, agent_id)| Step::Role {
-                            role: role.clone(),
-                            agent_id: agent_id.clone(),
-                        })
-                    })
-            }
-            _ => None,
-        }
-    }
-    #[test]
-    fn enumerated_legacy_and_condition_dispatch_targets_match() {
-        let workflow = WorkflowEngine::resolve_workflow("{}");
-        let conditions = conditions();
-        for state in &workflow.states {
-            for condition in &conditions {
-                for bits in 0..(1 << 19) {
-                    let base = facts(bits);
-                    for targets in 0..4 {
-                        let mut f = base.clone();
-                        if targets & 1 == 0 {
-                            f.initial_target = None;
-                        }
-                        if targets & 2 == 0 {
-                            f.role_target = None;
-                        }
-                        let new = match next_step(&Snapshot {
-                            state: &state.name,
-                            condition,
-                            workflow: &workflow,
-                            facts: &f,
-                        }) {
-                            Next::Step(s @ (Step::Initial { .. } | Step::Role { .. })) => Some(s),
-                            _ => None,
-                        };
-                        assert_eq!(
-                            old_dispatch(Some(state.kind), &f),
-                            new,
-                            "{} facts={bits} targets={targets}",
-                            state.name
-                        );
-                    }
-                }
-            }
-        }
-        // Named permitted differences: ExplicitOwnerPark, MissedWakeRepair,
-        // IdleTickQuiescence. None changes an old execution target.
-    }
     #[test]
     fn missing_merge_owner_parks_without_replaying_custom_hooks() {
         let workflow = WorkflowEngine::resolve_workflow("{}");
@@ -645,7 +562,6 @@ mod tests {
         };
         let f = Facts {
             missing_merge_entry: true,
-            dependencies_ready: true,
             child_ready: true,
             root_role_allowed: true,
             reviewer_ready: true,
@@ -675,7 +591,6 @@ mod tests {
             missing_merge_entry: true,
             unsafe_merge_entry: true,
             merge_witness: true,
-            dependencies_ready: true,
             child_ready: true,
             root_role_allowed: true,
             reviewer_ready: true,
@@ -705,7 +620,6 @@ mod tests {
             root: true,
             root_advance: true,
             root_role_allowed: true,
-            dependencies_ready: true,
             child_ready: true,
             ..Default::default()
         };
