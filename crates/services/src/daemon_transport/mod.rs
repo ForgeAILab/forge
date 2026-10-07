@@ -290,6 +290,7 @@ pub struct DaemonConnectionRegistry {
 
 struct DaemonConnectionRegistryInner {
     connections: Mutex<HashMap<String, DaemonConnection>>,
+    socket_lifecycle: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     event_bus: Option<Arc<EventBus>>,
     execution_events: Mutex<Option<Arc<dyn DaemonExecutionEventHandler>>>,
     terminal_events: Mutex<Option<Arc<dyn DaemonTerminalEventHandler>>>,
@@ -307,6 +308,7 @@ impl DaemonConnectionRegistry {
         Self {
             inner: Arc::new(DaemonConnectionRegistryInner {
                 connections: Mutex::new(HashMap::new()),
+                socket_lifecycle: Mutex::new(HashMap::new()),
                 event_bus: Some(event_bus),
                 execution_events: Mutex::new(Some(execution_events)),
                 terminal_events: Mutex::new(None),
@@ -321,6 +323,7 @@ impl DaemonConnectionRegistry {
         Self {
             inner: Arc::new(DaemonConnectionRegistryInner {
                 connections: Mutex::new(HashMap::new()),
+                socket_lifecycle: Mutex::new(HashMap::new()),
                 event_bus: None,
                 execution_events: Mutex::new(None),
                 terminal_events: Mutex::new(None),
@@ -363,6 +366,19 @@ impl DaemonConnectionRegistry {
             task_service,
             context.task_executor,
         )))
+    }
+
+    /// Serialize command-socket registration/removal and their durable status
+    /// writes, including lifecycle events, for one daemon across reconnects.
+    pub fn socket_lifecycle_lock(&self, daemon_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = lock(&self.inner.socket_lifecycle);
+        locks.retain(|_, entry| entry.strong_count() > 0);
+        if let Some(existing) = locks.get(daemon_id).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let lifecycle = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(daemon_id.to_owned(), Arc::downgrade(&lifecycle));
+        lifecycle
     }
 
     pub fn register(

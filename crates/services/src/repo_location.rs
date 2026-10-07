@@ -486,9 +486,15 @@ impl RepoLocationService {
     /// Invoke after accepting the replacement daemon's command-stream handshake.
     /// Ready locations are also rechecked: the checkout or shared mount may have changed.
     pub async fn retry_verification_on_reconnect(&self, daemon_id: &str) -> Result<usize> {
+        // Provisioning owns verification and full checks until its retry row
+        // is removed. A delayed handshake scan must not mark that clone ready
+        // or invalidate the provisioning job's location-version witness.
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM repo_location WHERE daemon_id = ?
-             AND (owner_kind = 'daemon' OR kind = 'shared_mount') ORDER BY created_at, id",
+             AND (owner_kind = 'daemon' OR kind = 'shared_mount')
+             AND NOT EXISTS (SELECT 1 FROM repo_provision_retry j
+                             WHERE j.location_id = repo_location.id)
+             ORDER BY created_at, id",
         )
         .bind(daemon_id)
         .fetch_all(self.db.pool())

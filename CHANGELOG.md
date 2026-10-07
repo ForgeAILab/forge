@@ -1076,6 +1076,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A daemon that reconnects quickly no longer looks offline.** When a
+  daemon's command stream was replaced, the closing connection could record
+  the daemon offline after the new one had recorded it online; the daemon then
+  showed offline, and received no work, until its next heartbeat, up to about
+  30 seconds. Connect and disconnect are now ordered per daemon. The
+  reconnect check also leaves alone a repository location that is still being
+  provisioned, so a reconnect during provisioning no longer starts a second
+  provision of the same location.
+
 - Pre-V149 LCM timelines are adopted once by their own session, a failed
   snapshot save after adoption no longer wedges the chat, and topic-summary
   usage is charged exactly once, even if the new topic never runs a turn

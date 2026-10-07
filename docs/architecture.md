@@ -3074,7 +3074,10 @@ A background job, single-flight per repository/runtime, runs machine checks
 before `repo_location.provision`. Only passing applicable checks permit cloning
 under `<workspace_root>/repos/<repo id>` with the daemon's own Git credentials.
 The resulting managed location is unverified until `repo_location.verify` and
-full checks finish. Check failures retain per-role facts; successful completion
+full checks finish. Handshake re-verification skips locations still referenced by
+`repo_provision_retry`: provisioning owns their verification and full-check fence
+until settlement, including after reconnect or server restart.
+Check failures retain per-role facts; successful completion
 wakes normal dispatch. Clone failures leave an unavailable location and bounded
 error. Durable exponential retry deadlines (`repo_provision_retry`) survive
 server restarts without a persistent running flag; daemon retries reuse an
