@@ -106,7 +106,7 @@ async fn sqlite_lcm_is_acl_first_idempotent_and_restart_safe() {
     assert_eq!(store.store_revision().as_str(), "forge-sqlite-lcm-1");
     assert_eq!(
         AGENT_RUNTIME_REVISION,
-        "b3f966b0e108e6d4683c0a9c94055aaa6aa7d919"
+        "5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
     );
 
     let entry = LcmEntry::new(

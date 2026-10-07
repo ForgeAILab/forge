@@ -885,7 +885,23 @@ impl ScopeToolComposition {
             .ok_or_else(|| {
                 AgentHostError::Unsupported("Forge chat tool is not available".to_owned())
             })?;
-        let spec = tool.spec();
+        // Freeze the selected spec with the same registry/validator used by
+        // native execution. Preparation receives only normalized, validated
+        // arguments; failures never retry the raw provider value.
+        let map_error = |error: RuntimeError| {
+            AgentHostError::Runtime(bound_chat_tool_error(
+                error.to_string(),
+                MAX_CHAT_TOOL_ERROR_CHARS,
+            ))
+        };
+        let mut registry = agent_runtime::tool::ToolRegistry::new();
+        registry.register(tool.clone()).map_err(map_error)?;
+        let registry = registry.seal();
+        let spec = registry.spec(tool_name).expect("registered CLI tool");
+        let arguments = tool.normalize_arguments(arguments).map_err(map_error)?;
+        registry
+            .validate_arguments(tool_name, &arguments)
+            .map_err(map_error)?;
 
         let session = SessionId::new(session_id);
         let turn = TurnId::new(turn_id);
@@ -1061,6 +1077,10 @@ impl Tool for TerminalDenialTool {
         self.inner.spec()
     }
 
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        self.inner.normalize_arguments(arguments)
+    }
+
     async fn prepare(
         &self,
         arguments: Value,
@@ -1171,6 +1191,10 @@ impl Tool for FilteredTool {
     fn spec(&self) -> ToolSpec {
         self.inner.spec()
     }
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        self.inner.normalize_arguments(arguments)
+    }
+
     async fn prepare(
         &self,
         arguments: Value,
@@ -1225,6 +1249,10 @@ impl fmt::Debug for ObservedTool {
 impl Tool for ObservedTool {
     fn spec(&self) -> ToolSpec {
         self.inner.spec()
+    }
+
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        self.inner.normalize_arguments(arguments)
     }
 
     async fn prepare(
@@ -1611,42 +1639,10 @@ struct ForgeScopeReadTool {
     reject_authority_overrides: bool,
 }
 
-/// Let a provider-emitted call wrap its arguments in a `parameters` object.
-///
-/// OpenAI gpt-5.x models intermittently emit `{"parameters": {...}}` for a
-/// tool whose schema names no such property. The runtime validates the
-/// provider's call against the tool schema before Forge sees it, and a
-/// mismatch fails the whole turn — three attempts in a row on a delivery
-/// wake, leaving a milestone unverified. As with the null-tolerant payload
-/// below, the provider-facing schema admits the envelope and `prepare`
-/// unwraps it; every required field stays enforced there, where a rejection
-/// returns to the model in-turn instead of ending the turn.
-fn tolerate_parameters_envelope(schema: Value) -> Value {
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
-        return schema;
-    };
-    // Neither shape keeps a `required` list: the envelope copy must be as
-    // lenient as the root, or a wrapped call that omits `dedupe_key` still
-    // ends the turn at the provider validator instead of in `prepare`
-    // (PantryPal's handoff turn lost its first attempt exactly that way).
-    let mut inner = schema.clone();
-    inner
-        .as_object_mut()
-        .map(|object| object.remove("required"));
-    let mut properties = properties.clone();
-    properties.insert("parameters".to_owned(), inner);
-    let mut envelope = schema;
-    envelope["properties"] = Value::Object(properties);
-    envelope
-        .as_object_mut()
-        .map(|object| object.remove("required"));
-    envelope
-}
-
-/// Undo the envelope `tolerate_parameters_envelope` admits. Providers emit
-/// both a complete wrapper and a mixed shape with canonical fields outside
-/// plus operation fields inside `parameters`; merge either form before Forge
-/// validates it, rejecting ambiguous duplicates.
+/// Normalize the historical provider envelope only for Forge read/proposal
+/// tools, whose canonical root schemas have no `parameters` property. Nested
+/// properties of that name remain ordinary data; other tools keep identity
+/// normalization. Merge mixed shapes and reject conflicting duplicates.
 fn unwrap_parameters_envelope(mut arguments: Value) -> Result<Value, RuntimeError> {
     let Some(object) = arguments.as_object_mut() else {
         return Ok(arguments);
@@ -1692,7 +1688,7 @@ fn lift_coordination_payload(
     for field in payload_properties.keys() {
         if let Some(value) = object.remove(field) {
             // Provider schemas declare aliases nullable so an explicit null
-            // reaches `prepare`; null means omitted and must not become an
+            // is normalized; null means omitted and must not become an
             // operation-specific payload field.
             if !value.is_null() {
                 flat_payload.insert(field.clone(), value);
@@ -1794,7 +1790,7 @@ impl ForgeScopeReadTool {
         ToolSpec::new(
             self.tool_name,
             description,
-            tolerate_parameters_envelope(schema),
+            schema,
             ToolEffects::new(Vec::new()),
         )
         .with_permission_upper_bound(PermissionSet::single(Permission::other(
@@ -1809,12 +1805,15 @@ impl Tool for ForgeScopeReadTool {
         self.spec_with_operations()
     }
 
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        unwrap_parameters_envelope(arguments)
+    }
+
     async fn prepare(
         &self,
         arguments: Value,
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
-        let arguments = unwrap_parameters_envelope(arguments)?;
         let object = arguments
             .as_object()
             .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
@@ -2079,12 +2078,10 @@ impl ForgeScopeProposeTool {
                         "enum": self.operations.iter().collect::<Vec<_>>(),
                     },
                     "payload": payload_property,
-                    // Declared null-tolerant on purpose: some providers
-                    // (notably Gemini) emit explicit nulls, and a schema
-                    // violation in the provider's emitted call fails the
-                    // whole turn before Forge sees it. Presence and
-                    // non-emptiness stay enforced in `prepare`/server-side
-                    // validators, whose errors return to the model in-turn.
+                    // Keep the existing nullable provider fields (notably
+                    // for Gemini). Normalization precedes schema validation;
+                    // non-null/nonblank identifiers are still enforced in
+                    // `prepare` and errors return to the model in-turn.
                     "dedupe_key": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null idempotency key"},
                     "correlation_id": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null correlation id"},
                     "causation_id": string_or_null_schema(),
@@ -2092,7 +2089,7 @@ impl ForgeScopeProposeTool {
                 },
                 "additionalProperties": false
             });
-            // Provider-friendly aliases. `prepare` removes these and builds
+            // Provider-friendly aliases. Normalization removes these and builds
             // the canonical payload object, so the service boundary still
             // sees exactly one envelope shape.
             if let Some(Value::Object(properties)) = payload_properties {
@@ -2105,7 +2102,7 @@ impl ForgeScopeProposeTool {
         ToolSpec::new(
             self.tool_name,
             description,
-            tolerate_parameters_envelope(schema),
+            schema,
             ToolEffects::new(Vec::new()),
         )
         .with_permission_upper_bound(PermissionSet::single(Permission::other(
@@ -2120,13 +2117,18 @@ impl Tool for ForgeScopeProposeTool {
         self.spec_with_operations()
     }
 
+    fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
+        let mut arguments = unwrap_parameters_envelope(arguments)?;
+        lift_coordination_payload(&mut arguments, &self.operations)?;
+        Ok(arguments)
+    }
+
     async fn prepare(
         &self,
         arguments: Value,
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
-        let mut arguments = unwrap_parameters_envelope(arguments)?;
-        lift_coordination_payload(&mut arguments, &self.operations)?;
+        let mut arguments = arguments;
         let operation = required_string(&arguments, "operation")?.to_owned();
         let operation = operation.as_str();
         if !self.operations.contains(operation) {
@@ -3499,14 +3501,9 @@ mod tests {
 
     #[tokio::test]
     async fn orchestration_tools_admit_and_unwrap_a_parameters_envelope() {
-        let scope = CanonicalScope {
-            scope_type: CanonicalScopeType::Project,
-            scope_id: "project-1".to_owned(),
-            workspace_access: WorkspaceAccess::Deny,
-        };
         let tool = ForgeScopeProposeTool::new(
             "agent-1".to_owned(),
-            scope,
+            scope(CanonicalScopeType::Project, WorkspaceAccess::Deny),
             vec![PROJECT_READINESS_OPERATION.to_owned()],
             Arc::new(TestProvider::default()),
         );
@@ -3516,73 +3513,45 @@ mod tests {
             "dedupe_key": "readiness-1",
             "correlation_id": "readiness-1"
         });
-        let enveloped = json!({"parameters": plain.clone()});
-        // The provider-facing schema, which the runtime validates the model's
-        // call against before Forge sees it, admits both shapes.
-        let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
-        assert!(validator.validate(&plain).is_ok(), "plain call validates");
-        assert!(
-            validator.validate(&enveloped).is_ok(),
-            "enveloped call validates"
-        );
-        assert!(
-            validator
-                .validate(&json!({"parameters": {"operation": 7}}))
-                .is_err(),
-            "the envelope carries the same shape, not a looser one"
-        );
-        // A missing required field is `prepare`'s to refuse in-turn, in both
-        // shapes: the provider validator must admit the call so the model
-        // sees a correctable error instead of a dead turn.
-        let mut missing_dedupe = plain.clone();
-        missing_dedupe.as_object_mut().unwrap().remove("dedupe_key");
-        assert!(
-            validator.validate(&missing_dedupe).is_ok(),
-            "plain call without dedupe_key passes the schema"
-        );
-        assert!(
-            validator
-                .validate(&json!({"parameters": missing_dedupe.clone()}))
-                .is_ok(),
-            "enveloped call without dedupe_key passes the schema"
-        );
-        // `prepare` unwraps the envelope and enforces the required fields.
-        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
-            root: "<none>".to_owned(),
-        });
-        let prepared = tool
-            .prepare(enveloped, &command_preparation_context(workspace.clone()))
-            .await
-            .expect("enveloped call prepares");
+        let spec = tool.spec();
+        let validator = jsonschema::validator_for(&spec.input_schema).expect("schema");
+        assert!(spec.input_schema["properties"].get("parameters").is_none());
         assert_eq!(
-            prepared.arguments()["operation"],
-            PROJECT_READINESS_OPERATION
+            spec.input_schema["required"],
+            json!(["operation", "payload", "dedupe_key", "correlation_id"])
         );
-        let refused = tool
-            .prepare(
-                json!({"parameters": {"payload": {}}}),
-                &command_preparation_context(workspace.clone()),
-            )
-            .await
-            .expect_err("a call missing its operation is refused in prepare");
-        assert!(refused.to_string().contains("operation"), "{refused}");
-        let refused = tool
-            .prepare(
-                json!({"parameters": missing_dedupe}),
-                &command_preparation_context(workspace),
-            )
-            .await
-            .expect_err("an enveloped call missing dedupe_key is refused in prepare");
-        assert!(refused.to_string().contains("dedupe_key"), "{refused}");
+        for arguments in [plain.clone(), json!({"parameters": plain.clone()})] {
+            let normalized = tool.normalize_arguments(arguments).unwrap();
+            validator
+                .validate(&normalized)
+                .expect("normalized call validates");
+            let prepared = tool
+                .prepare(normalized, &test_preparation_context("envelope"))
+                .await
+                .unwrap();
+            assert_eq!(prepared.arguments(), &plain);
+        }
+        for field in ["operation", "payload", "dedupe_key", "correlation_id"] {
+            let mut missing = plain.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            for arguments in [missing.clone(), json!({"parameters": missing})] {
+                let normalized = tool.normalize_arguments(arguments).unwrap();
+                assert!(
+                    !validator.is_valid(&normalized),
+                    "missing {field} must fail schema validation"
+                );
+            }
+        }
     }
 
     #[tokio::test]
     async fn task_plan_schema_is_visible_null_tolerant_and_lifts_flat_payload_fields() {
+        let root = tempfile::tempdir().expect("Task workspace");
         let composition = ScopeToolComposition::for_scope_with_permissions(
             "planner-1",
             scope(CanonicalScopeType::Task, WorkspaceAccess::TaskRead),
             Some("planner"),
-            Some("/tmp/forge/task-plan-schema"),
+            Some(root.path().to_str().unwrap()),
             &all_permissions(),
             Some(Arc::new(TestProvider::default())),
         )
@@ -3637,7 +3606,13 @@ mod tests {
             }
         });
         assert!(
-            validator.validate(&explicit_null_envelope).is_ok(),
+            validator
+                .validate(
+                    &tool
+                        .normalize_arguments(explicit_null_envelope.clone())
+                        .unwrap()
+                )
+                .is_ok(),
             "Gemini-style explicit nulls must reach prepare for an in-turn correction"
         );
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
@@ -3645,7 +3620,7 @@ mod tests {
         });
         let refusal = tool
             .prepare(
-                explicit_null_envelope,
+                tool.normalize_arguments(explicit_null_envelope).unwrap(),
                 &command_preparation_context(workspace.clone()),
             )
             .await
@@ -3661,11 +3636,16 @@ mod tests {
             "correlation_id": "task-plan-1"
         });
         assert!(
-            validator.validate(&flat).is_ok(),
+            validator
+                .validate(&tool.normalize_arguments(flat.clone()).unwrap())
+                .is_ok(),
             "provider-facing schema must admit flat task.plan fields"
         );
         let prepared = tool
-            .prepare(flat, &command_preparation_context(workspace))
+            .prepare(
+                tool.normalize_arguments(flat).unwrap(),
+                &command_preparation_context(workspace),
+            )
             .await
             .expect("flat task.plan call prepares");
         assert_eq!(prepared.arguments()["payload"]["action"], "write");
@@ -3703,14 +3683,19 @@ mod tests {
         });
         let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
         assert!(
-            validator.validate(&mixed).is_ok(),
+            validator
+                .validate(&tool.normalize_arguments(mixed.clone()).unwrap())
+                .is_ok(),
             "provider-facing schema admits mixed flat recovery fields"
         );
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
             root: "<none>".to_owned(),
         });
         let prepared = tool
-            .prepare(mixed, &command_preparation_context(workspace.clone()))
+            .prepare(
+                tool.normalize_arguments(mixed).unwrap(),
+                &command_preparation_context(workspace.clone()),
+            )
             .await
             .expect("flat recovery call prepares");
         assert_eq!(prepared.arguments()["operation"], operation);
@@ -3724,21 +3709,17 @@ mod tests {
         assert!(prepared.arguments().get("task_id").is_none());
 
         let conflict = tool
-            .prepare(
-                json!({
-                    "operation": operation,
-                    "payload": {
-                        "task_id": "task-1",
-                        "version": 1,
-                        "action": {"verb":"cancel"}
-                    },
-                    "action": {"verb":"retry","fresh_session":true},
-                    "dedupe_key": "recover-task-1-conflict",
-                    "correlation_id": "recover-task-1-conflict"
-                }),
-                &command_preparation_context(workspace),
-            )
-            .await
+            .normalize_arguments(json!({
+                "operation": operation,
+                "payload": {
+                    "task_id": "task-1",
+                    "version": 1,
+                    "action": {"verb":"cancel"}
+                },
+                "action": {"verb":"retry","fresh_session":true},
+                "dedupe_key": "recover-task-1-conflict",
+                "correlation_id": "recover-task-1-conflict"
+            }))
             .expect_err("conflicting flat and nested fields are ambiguous");
         assert!(conflict.to_string().contains("conflicts"), "{conflict}");
     }
@@ -3766,14 +3747,19 @@ mod tests {
         });
         let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
         assert!(
-            validator.validate(&flat).is_ok(),
+            validator
+                .validate(&tool.normalize_arguments(flat.clone()).unwrap())
+                .is_ok(),
             "provider-facing schema admits flat cancellation fields"
         );
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
             root: "<none>".to_owned(),
         });
         let prepared = tool
-            .prepare(flat, &command_preparation_context(workspace))
+            .prepare(
+                tool.normalize_arguments(flat).unwrap(),
+                &command_preparation_context(workspace),
+            )
             .await
             .expect("flat cancellation call prepares");
         assert_eq!(prepared.arguments()["payload"]["action"]["verb"], "cancel");
@@ -3916,7 +3902,7 @@ mod tests {
         }
     }
 
-    fn scope(scope_type: CanonicalScopeType, access: WorkspaceAccess) -> CanonicalScope {
+    pub(super) fn scope(scope_type: CanonicalScopeType, access: WorkspaceAccess) -> CanonicalScope {
         CanonicalScope {
             scope_type,
             scope_id: "scope-1".to_owned(),
@@ -3924,7 +3910,7 @@ mod tests {
         }
     }
 
-    fn all_permissions() -> BTreeSet<String> {
+    pub(super) fn all_permissions() -> BTreeSet<String> {
         BTreeSet::from([
             "read_account".to_owned(),
             "read_project".to_owned(),
@@ -5539,7 +5525,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct ConfiguredSearchProvider;
+    pub(super) struct ConfiguredSearchProvider;
 
     #[async_trait]
     impl ForgeToolProvider for ConfiguredSearchProvider {
@@ -5679,3 +5665,7 @@ mod bounded_command_tests {
         assert_gone(background_pid(&pid_file).await).await;
     }
 }
+
+#[cfg(test)]
+#[path = "typed_tools/normalization_tests.rs"]
+mod normalization_tests;
