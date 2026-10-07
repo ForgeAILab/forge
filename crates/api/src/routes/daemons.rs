@@ -148,6 +148,8 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
     let outbound_tx = connection.outbound.clone();
     let connection_id = connection.id();
     let mut stale_rx = connection.stale_receiver();
+    let lifecycle_lock = state.daemon_connections.socket_lifecycle_lock(&daemon_id);
+    let lifecycle_guard = lifecycle_lock.lock().await;
 
     if state
         .daemon_connections
@@ -176,6 +178,7 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
         }
         return;
     }
+    drop(lifecycle_guard);
 
     tracing::info!(
         daemon_id = %daemon_id,
@@ -285,6 +288,9 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
         }
     }
 
+    // Keep the ownership check, removal, offline commit and event publication
+    // ordered with a replacement socket's registration and online commit.
+    let lifecycle_guard = lifecycle_lock.lock().await;
     let should_unregister = !connection.is_stale()
         && state
             .daemon_connections
@@ -300,6 +306,7 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
             );
         }
     }
+    drop(lifecycle_guard);
 
     drop(outbound_tx);
     drop(connection);

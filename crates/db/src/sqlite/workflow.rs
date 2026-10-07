@@ -5,7 +5,7 @@ use crate::{
 };
 use std::str::FromStr;
 
-fn map_task_role_assignment_row(
+pub(super) fn map_task_role_assignment_row(
     row: SqliteRow,
 ) -> std::result::Result<TaskRoleAssignment, DbError> {
     let assignee_type = row
@@ -36,7 +36,7 @@ fn assignment_snapshot_matches(
         && current.updated_at == expected.updated_at
 }
 
-fn map_transition_log_row(row: SqliteRow) -> Result<TransitionLog> {
+pub(super) fn map_transition_log_row(row: SqliteRow) -> Result<TransitionLog> {
     let id: String = row.get(0);
     let bridge = crate::decode_transition_bridge(
         &id,

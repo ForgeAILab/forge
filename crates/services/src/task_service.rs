@@ -441,6 +441,8 @@ pub struct TaskService {
     dispatch_notify: Arc<tokio::sync::Notify>,
     credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
     pub(crate) dispatch_wake: Arc<tokio::sync::Notify>,
+    /// The runtime's dispatcher instance, for commands it queued.
+    dispatcher: Arc<std::sync::Mutex<std::sync::Weak<crate::task_dispatcher::DispatcherInstance>>>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -545,6 +547,7 @@ impl TaskService {
             dispatch_notify: Arc::default(),
             credential_env: None,
             dispatch_wake: Arc::default(),
+            dispatcher: Arc::default(),
         }
     }
 
@@ -619,6 +622,22 @@ impl TaskService {
         Arc::clone(&self.dispatch_notify)
     }
 
+    pub(crate) fn register_dispatcher(
+        &self,
+        dispatcher: std::sync::Weak<crate::task_dispatcher::DispatcherInstance>,
+    ) {
+        *self.dispatcher.lock().expect("dispatcher registration") = dispatcher;
+    }
+
+    pub(crate) fn registered_dispatcher(
+        &self,
+    ) -> Option<Arc<crate::task_dispatcher::DispatcherInstance>> {
+        self.dispatcher
+            .lock()
+            .expect("dispatcher registration")
+            .upgrade()
+    }
+
     pub fn with_task_executor(mut self, task_executor: Arc<dyn TaskExecutor>) -> Self {
         self.task_executor = Some(task_executor);
         self.task_step_driver = Arc::default();
@@ -679,6 +698,10 @@ impl TaskService {
         self.cleanup_scheduler = Some(cleanup_scheduler);
         self.task_step_driver = Arc::default();
         self
+    }
+
+    pub(crate) fn owner_wait_timeout(&self) -> Duration {
+        self.workspace_max_disconnect
     }
 
     pub fn with_workspace_max_disconnect(mut self, timeout: Duration) -> Self {

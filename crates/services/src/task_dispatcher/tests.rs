@@ -665,9 +665,27 @@ async fn describe_stalled_dispatch(db: &db::SqliteDb, task_id: &str) -> String {
     }
 }
 
+pub(super) struct FixtureWorker {
+    stop: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+impl Drop for FixtureWorker {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        self.handle.abort();
+    }
+}
+
 async fn build_dispatcher(
     db: Arc<db::SqliteDb>,
     workspace_root: &Path,
+) -> (TaskDispatcher, mpsc::UnboundedReceiver<ExecutionContext>) {
+    build_dispatcher_runtime(db, workspace_root, false).await
+}
+async fn build_dispatcher_runtime(
+    db: Arc<db::SqliteDb>,
+    workspace_root: &Path,
+    start_worker: bool,
 ) -> (TaskDispatcher, mpsc::UnboundedReceiver<ExecutionContext>) {
     let event_bus = Arc::new(EventBus::new(64));
     let (tx, rx) = mpsc::unbounded_channel();
@@ -678,15 +696,20 @@ async fn build_dispatcher(
             .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
             .with_workspace_root(workspace_root.to_path_buf()),
     );
-    (
-        TaskDispatcher::with_check_interval(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-            task_service,
-            Duration::from_millis(10),
-        ),
-        rx,
-    )
+    let dispatcher = TaskDispatcher::with_check_interval(
+        db,
+        event_bus,
+        task_service.clone(),
+        Duration::from_millis(10),
+    );
+    if start_worker {
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let _ = dispatcher.fixture_worker.set(FixtureWorker {
+            stop,
+            handle: task_service.task_step_worker().start(shutdown),
+        });
+    }
+    (dispatcher, rx)
 }
 
 /// A bare Project with no repository, as it looks before provisioning
@@ -720,7 +743,10 @@ async fn dispatcher_pauses_a_project_with_no_primary_repository() {
     let project_id = seed_unprovisioned_project(&db, "Unprovisioned").await;
     let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    dispatcher.check_once().await.expect("dispatcher runs");
+    dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     let project = ProjectRepo::get_by_id(&*db, &project_id)
         .await
@@ -761,7 +787,13 @@ async fn dispatcher_pauses_a_project_with_cross_project_primary_repository() {
     .expect("cross-Project pointer stores for legacy-corruption fixture");
     let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        0
+    );
 
     let paused = ProjectRepo::get_by_id(&*db, &project_id)
         .await
@@ -940,7 +972,10 @@ async fn dispatcher_leaves_a_deliberately_paused_project_alone() {
         .expect("manual pause sets paused_at");
     let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    dispatcher.check_once().await.expect("dispatcher runs");
+    dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     let still_paused = ProjectRepo::get_by_id(&*db, &project_id)
         .await
@@ -988,7 +1023,10 @@ async fn dispatcher_leaves_a_deliberately_paused_project_alone() {
     .await
     .expect("project repository attaches");
 
-    dispatcher.check_once().await.expect("dispatcher runs");
+    dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     let untouched = ProjectRepo::get_by_id(&*db, &project_id)
         .await
@@ -1006,7 +1044,7 @@ async fn stale_repository_resume_cannot_clear_a_later_manual_pause() {
     let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
     dispatcher
-        .check_once()
+        .check_once_and_drain()
         .await
         .expect("dispatcher pauses project");
     let auto_paused = ProjectRepo::get_by_id(&*db, &project_id)
@@ -1313,7 +1351,10 @@ async fn dispatcher_gives_unassigned_initial_tasks_the_project_defaults() {
     .expect("project defaults update");
     let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    dispatcher.check_once().await.expect("dispatcher runs");
+    dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     let coder = TaskRoleAssignmentRepo::get_by_task_and_role(
         &*db,
@@ -1562,7 +1603,10 @@ async fn dispatcher_check_once_does_not_dispatch_after_stop() {
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
     dispatcher.stop();
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     let updated = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -1653,7 +1697,10 @@ async fn dispatcher_waits_for_deferred_dispatch_cooldown() {
     .expect("deferred dispatch metadata writes");
 
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     assert!(rx.try_recv().is_err());
@@ -1681,7 +1728,10 @@ async fn dispatcher_waits_for_deferred_dispatch_cooldown() {
     )
     .await
     .expect("deferred dispatch metadata updates");
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -1903,7 +1953,7 @@ async fn failed_review_fixture(failed_ago: chrono::Duration, budget: i32) -> Fai
 #[tokio::test]
 async fn dispatcher_failed_review_recovers_after_grace_idempotently() {
     let fixture = failed_review_fixture(chrono::Duration::minutes(3), 3).await;
-    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(fixture.dispatcher.check_once_and_drain().await.unwrap(), 1);
     let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
         .unwrap()
@@ -2096,7 +2146,7 @@ async fn dispatcher_failed_review_composes_finding_routing_with_ci_budget() {
 #[tokio::test]
 async fn dispatcher_failed_review_records_exhausted_budget_once() {
     let fixture = failed_review_fixture(chrono::Duration::minutes(3), 1).await;
-    assert_eq!(fixture.dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(fixture.dispatcher.check_once_and_drain().await.unwrap(), 1);
     let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
         .unwrap()
@@ -2420,9 +2470,12 @@ async fn dispatcher_does_not_relaunch_planner_awaiting_plan_review() {
         .expect("task exists");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let first_scan = dispatcher.check_once().await.expect("dispatcher runs");
+    let first_scan = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
     let second_scan = dispatcher
-        .check_once()
+        .check_once_and_drain()
         .await
         .expect("dispatcher runs again");
 
@@ -2585,7 +2638,13 @@ async fn dispatcher_clears_plan_review_wait_from_an_older_planning_entry() {
     .expect("new planning entry records");
 
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        1
+    );
     let replacement = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("replacement planner dispatches")
@@ -2765,7 +2824,13 @@ async fn dispatcher_clears_stale_plan_review_wait_on_default_auto_approval_gate(
         .expect("legacy wait metadata writes");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 1);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        1
+    );
     let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
         .expect("planner dispatches in time")
@@ -2888,9 +2953,12 @@ async fn dispatcher_repeated_scans_do_not_churn_or_redispatch_completed_custom_g
         .expect("task exists");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let first_scan = dispatcher.check_once().await.expect("dispatcher runs");
+    let first_scan = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
     let second_scan = dispatcher
-        .check_once()
+        .check_once_and_drain()
         .await
         .expect("dispatcher runs again");
 
@@ -2947,7 +3015,10 @@ async fn dispatcher_skips_task_when_agent_at_capacity() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     let updated = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -2977,7 +3048,10 @@ async fn dispatcher_skips_task_when_agent_offline() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     let updated = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -3128,7 +3202,13 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
         );
         assert_eq!(health.kind, api_types::WorkflowHealthKind::WaitingForAgent);
         assert_eq!(health.label, "Retry Queued");
-        assert_eq!(dispatcher.check_once().await.expect("full scan runs"), 0);
+        assert_eq!(
+            dispatcher
+                .check_once_and_drain()
+                .await
+                .expect("full scan runs"),
+            0
+        );
         assert!(rx.try_recv().is_err());
         assert!(ExecutionRepo::list_running_by_task(&*db, &task.id)
             .await
@@ -3145,7 +3225,13 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
         // A new dispatcher proves the accepted intent survives runtime restart.
         let (restarted, mut restarted_rx) =
             build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-        assert_eq!(restarted.check_once().await.expect("recovery scan runs"), 1);
+        assert_eq!(
+            restarted
+                .check_once_and_drain()
+                .await
+                .expect("recovery scan runs"),
+            1
+        );
         let ctx = tokio::time::timeout(Duration::from_secs(30), restarted_rx.recv())
             .await
             .expect("recovery dispatch completes")
@@ -3185,7 +3271,13 @@ async fn recovery_on_full_agent_queues_and_dispatches_after_capacity_frees() {
             .expect("task exists");
         assert!(deferred_dispatch::queued_recovery(&current).is_none());
         assert!(deferred_dispatch::pending_until(&current).is_none());
-        assert_eq!(restarted.check_once().await.expect("replay scan runs"), 0);
+        assert_eq!(
+            restarted
+                .check_once_and_drain()
+                .await
+                .expect("replay scan runs"),
+            0
+        );
         assert!(restarted_rx.try_recv().is_err());
     }
 }
@@ -3769,7 +3861,10 @@ async fn dispatcher_skips_paused_project() {
         .expect("project paused");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     let updated = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -3799,7 +3894,10 @@ async fn dispatcher_recovers_undispatched_active_task() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -3839,7 +3937,10 @@ async fn dispatcher_recovers_undispatched_reviewer_task() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -3898,7 +3999,7 @@ async fn dispatcher_reconciles_completed_reviewer_and_launches_its_retry() {
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
     let first = dispatcher
-        .check_once()
+        .check_once_and_drain()
         .await
         .expect("dispatcher reconciles");
 
@@ -3929,7 +4030,7 @@ async fn dispatcher_reconciles_completed_reviewer_and_launches_its_retry() {
         .expect("retry backoff elapses");
 
     let second = dispatcher
-        .check_once()
+        .check_once_and_drain()
         .await
         .expect("dispatcher launches retry");
 
@@ -4062,7 +4163,10 @@ async fn dispatcher_replaces_completed_custom_role_from_superseded_project_revis
         .version;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -4134,7 +4238,10 @@ async fn dispatcher_replaces_completed_reviewer_from_superseded_project_revision
         .version;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -4218,7 +4325,10 @@ async fn dispatcher_never_reuses_reviewer_execution_for_newer_review_attempt() {
     seed_running_review(&db, &task.id, &candidate_execution, r#"{"ci_steps":[]}"#).await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -4455,7 +4565,10 @@ async fn reviewer_assignment_after_stopped_attempt_dispatches_without_separate_r
     .expect("reviewer assignment confirms after stopped attempt");
 
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -4561,7 +4674,10 @@ async fn coordination_root_target_moved_rebase_returns_to_aggregate_review() {
     .expect("review-refresh transition records");
 
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let recovered = TaskRepo::get_by_id(&*db, &root.id, false)
@@ -4833,7 +4949,10 @@ async fn dispatcher_skips_auto_restart_for_user_cancelled_execution() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     assert_eq!(
@@ -4877,7 +4996,10 @@ async fn dispatcher_skips_auto_restart_for_task_cancelled_execution() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     assert_eq!(
@@ -4921,7 +5043,10 @@ async fn dispatcher_dispatches_when_graceful_shutdown_stop_is_auto() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     assert_eq!(
@@ -4980,7 +5105,10 @@ async fn interrupted_task_resumes_before_a_fresh_task_claims_the_only_slot() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    dispatcher.check_once().await.expect("dispatcher runs");
+    dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
         .await
@@ -5029,7 +5157,10 @@ async fn dispatcher_does_not_dispatch_when_graceful_shutdown_stop_is_manual() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     assert_eq!(
@@ -5073,7 +5204,10 @@ async fn dispatcher_skips_legacy_stopped_execution_without_resume_policy() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     assert_eq!(
@@ -5137,7 +5271,10 @@ async fn dispatcher_skips_active_task_with_blocking_annotation() {
     .expect("task update creates");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     assert_eq!(
@@ -5203,7 +5340,10 @@ async fn dispatcher_skips_todo_task_with_dispatch_failed_annotation() {
     .expect("task annotation updates");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
@@ -5244,7 +5384,10 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 0);
     assert_eq!(
@@ -5270,7 +5413,10 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
     )
     .await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -5314,7 +5460,10 @@ async fn dispatcher_dispatches_read_only_reviewer_without_ci_review_record() {
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     assert_eq!(dispatched, 1);
     let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -5503,7 +5652,13 @@ async fn dispatcher_parks_charter_task_with_missing_governance_before_execution(
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    assert_eq!(
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
+        0
+    );
     assert!(rx.try_recv().is_err());
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(
@@ -5558,7 +5713,10 @@ async fn dispatcher_starts_charter_backed_work_without_a_baseline_gate() {
     // dispatch that never lands is a real refusal, and the report below says
     // which one rather than leaving a bare timeout.
     for _ in 0..DISPATCH_WAIT_ATTEMPTS {
-        total_progress += dispatcher.check_once().await.expect("dispatcher runs");
+        total_progress += dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs");
         if tokio::time::timeout(DISPATCH_WAIT_STEP, rx.recv())
             .await
             .is_ok()
@@ -5617,7 +5775,10 @@ async fn wake_does_not_duplicate_already_dispatched_charter_work() {
 
     let mut execution_received = false;
     for _ in 0..DISPATCH_WAIT_ATTEMPTS {
-        dispatcher.check_once().await.expect("dispatcher runs");
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs");
         if tokio::time::timeout(DISPATCH_WAIT_STEP, rx.recv())
             .await
             .is_ok()
@@ -5645,7 +5806,10 @@ async fn wake_does_not_duplicate_already_dispatched_charter_work() {
         "an already-dispatched Task has no deferred disposition"
     );
 
-    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    let dispatched = dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
     assert_eq!(dispatched, 0, "the wake does not duplicate active work");
 
     // Restart: a fresh dispatcher over the same database must not re-dispatch
@@ -5653,7 +5817,10 @@ async fn wake_does_not_duplicate_already_dispatched_charter_work() {
     let (restarted, mut restarted_rx) =
         build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
     assert_eq!(
-        restarted.check_once().await.expect("dispatcher runs"),
+        restarted
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs"),
         0,
         "restart must not duplicate the dispatch"
     );
@@ -5829,7 +5996,10 @@ async fn dispatcher_blocks_task_whose_failed_execution_was_never_recorded() {
         let execution_id = seed_failed_coder_execution(&db, &task.id, &project_id, &agent_id).await;
         let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-        dispatcher.check_once().await.expect("dispatcher runs");
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs");
 
         let healed = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
@@ -5857,7 +6027,10 @@ async fn dispatcher_blocks_task_whose_failed_execution_was_never_recorded() {
         assert!(rx.try_recv().is_err(), "no replacement run is launched");
 
         // Idempotent: a second tick changes nothing.
-        dispatcher.check_once().await.expect("dispatcher runs");
+        dispatcher
+            .check_once_and_drain()
+            .await
+            .expect("dispatcher runs");
         let again = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("task loads")
@@ -5895,7 +6068,10 @@ async fn dispatcher_leaves_failed_execution_alone_while_a_newer_run_is_live() {
     .await;
     let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    dispatcher.check_once().await.expect("dispatcher runs");
+    dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
 
     let after = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
@@ -5925,7 +6101,10 @@ async fn dispatcher_schedules_retry_for_unrecorded_failure_once() {
     let execution_id = seed_failed_coder_execution(&db, &task.id, &project_id, &agent_id).await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
-    dispatcher.check_once().await.expect("dispatcher runs");
+    dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
     let scheduled = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -5940,7 +6119,10 @@ async fn dispatcher_schedules_retry_for_unrecorded_failure_once() {
         .expect("metadata")
         .contains(&execution_id));
 
-    dispatcher.check_once().await.expect("dispatcher runs");
+    dispatcher
+        .check_once_and_drain()
+        .await
+        .expect("dispatcher runs");
     let again = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
@@ -6187,7 +6369,7 @@ async fn environment_settings_edit_starts_probe_without_a_task() {
     ProjectRepo::set_environment_pause_if_unchanged(&*db,&project_id,snapshot.version,&now_rfc3339(),
         &serde_json::json!({"checks":["old"],"role":"coder","output":"old failure","paused_at":now_rfc3339(),"last_checked_at":now_rfc3339(),"next_check_at":"2099-01-01T00:00:00Z"}).to_string()).await.unwrap();
     let (dispatcher, _) = build_dispatcher(db.clone(), root.path()).await;
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let current = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .unwrap()
@@ -6390,7 +6572,7 @@ async fn environment_recheck_without_rerunnable_checks_stays_paused() {
     )
     .await;
     let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let current = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .unwrap()
@@ -6401,7 +6583,7 @@ async fn environment_recheck_without_rerunnable_checks_stays_paused() {
         .unwrap()
         .output
         .contains("No re-runnable"));
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     assert_eq!(
         ProjectRepo::get_by_id(&*db, &project_id)
             .await
@@ -6439,7 +6621,7 @@ async fn environment_recheck_without_rerunnable_checks_stays_paused() {
         .bind(&project_id).execute(db.pool()).await.unwrap();
     // A configured check that passes says nothing about the failure that
     // caused this pause, so the dispatcher must not resume on it.
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     assert!(dispatcher
         .environment_rechecks
         .lock()
@@ -6710,7 +6892,7 @@ async fn environment_recheck_still_failing_reschedules_without_dispatch() {
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
     let mut events = dispatcher.event_bus.subscribe();
     let before = chrono::Utc::now();
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     finish_environment_recheck(&dispatcher, &project_id).await;
     let current = ProjectRepo::get_by_id(&*db, &project_id)
         .await
@@ -6746,7 +6928,7 @@ async fn environment_recheck_still_failing_reschedules_without_dispatch() {
     assert!(waiting_now.error_annotation.is_none());
     assert!(rx.try_recv().is_err());
     assert_eq!(events.try_recv().unwrap().event_type, "project.updated");
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     assert_eq!(
         ProjectRepo::get_by_id(&*db, &project_id)
             .await
@@ -6789,7 +6971,7 @@ async fn environment_recheck_preserves_user_pause_and_stale_resume_loses() {
         .clear_environment_pause(&paused)
         .await
         .unwrap());
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     assert!(!repo_dir.path().join("checked").exists());
     let (checks, current) = dispatcher
         .task_service
@@ -6829,7 +7011,7 @@ async fn environment_recheck_missing_checkout_reschedules_without_immediate_resp
     std::fs::remove_dir_all(repo.path().join(".git")).unwrap();
     let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace.path()).await;
     let started_at = chrono::Utc::now();
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if dispatcher.environment_rechecks.lock().unwrap()[&project_id].is_finished() {
@@ -6856,8 +7038,8 @@ async fn environment_recheck_missing_checkout_reschedules_without_immediate_resp
             >= started_at + chrono::Duration::seconds(60)
     );
     // Observe the finished job, then scan once more against the new due time.
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     assert!(!dispatcher
         .environment_rechecks
         .lock()
@@ -7932,7 +8114,7 @@ async fn machine_capacity_active_waiter_is_parked_at_final_version() {
     );
     assert!(waiting.error_annotation.is_none());
     for _ in 0..4 {
-        dispatcher.check_once().await.unwrap();
+        dispatcher.check_once_and_drain().await.unwrap();
     }
     let stable = TaskRepo::get_by_id(&*db, &queued.id, false)
         .await
@@ -7944,7 +8126,7 @@ async fn machine_capacity_active_waiter_is_parked_at_final_version() {
         .execute(db.pool())
         .await
         .unwrap();
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
@@ -8028,7 +8210,7 @@ async fn machine_capacity_queued_recovery_is_quiet_until_slot_frees() {
     let marker = deferred_dispatch::queued_recovery(&queued).unwrap();
     while events.try_recv().is_ok() {}
     for _ in 0..4 {
-        dispatcher.check_once().await.unwrap();
+        dispatcher.check_once_and_drain().await.unwrap();
         let current = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .unwrap()
@@ -8048,7 +8230,7 @@ async fn machine_capacity_queued_recovery_is_quiet_until_slot_frees() {
         .execute(db.pool())
         .await
         .unwrap();
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
@@ -8166,7 +8348,7 @@ async fn machine_capacity_queued_recovery_lost_race_is_quiet() {
     .await
     .unwrap();
     for _ in 0..3 {
-        assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+        assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
         let current = machine_capacity_task(&db, &task.id).await;
         assert_eq!(current.version, queued.version);
         assert_eq!(
@@ -8189,7 +8371,7 @@ async fn machine_capacity_queued_recovery_lost_race_is_quiet() {
         .execute(db.pool())
         .await
         .unwrap();
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let started = tokio::time::timeout(Duration::from_secs(30), rx.recv())
         .await
         .unwrap()
@@ -8255,7 +8437,7 @@ async fn machine_capacity_stale_marker_clears_on_agent_skip() {
         .unwrap();
     assert_eq!((slots.active, slots.parked), (2, 0));
     for _ in 0..2 {
-        dispatcher.check_once().await.unwrap();
+        dispatcher.check_once_and_drain().await.unwrap();
     }
     assert!(deferred_dispatch::current_dispatch_disposition(
         &machine_capacity_task(&db, &queued.id).await
@@ -8274,7 +8456,7 @@ async fn machine_capacity_review_recovery_is_quiet_and_resumes() {
     assign_role(&db, &task.id, "coder", &agent_id).await;
     let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
     // A real coder run with a real workspace, then it completes and review fails.
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let ctx = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .unwrap()
@@ -8358,7 +8540,7 @@ async fn machine_capacity_review_recovery_is_quiet_and_resumes() {
     let before = machine_capacity_task(&db, &task.id).await;
     let mut events = dispatcher.event_bus.subscribe();
     for _ in 0..4 {
-        assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+        assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
         let current = machine_capacity_task(&db, &task.id).await;
         assert_eq!(current.version, before.version);
         assert!(current.error_annotation.is_none());
@@ -8372,7 +8554,7 @@ async fn machine_capacity_review_recovery_is_quiet_and_resumes() {
         .execute(db.pool())
         .await
         .unwrap();
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     let after = machine_capacity_task(&db, &task.id).await;
     let runs = ExecutionRepo::list_running_by_task(&*db, &task.id)
         .await
@@ -8626,7 +8808,7 @@ async fn machine_capacity_title_edit_keeps_waiter_parked_until_recheck() {
         1
     );
     assert!(deferred_dispatch::current_dispatch_disposition(&edited).is_some());
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     assert_eq!(
         machine_capacity_task(&db, &task.id).await.version,
         edited.version
@@ -8670,7 +8852,7 @@ async fn machine_capacity_unparking_respects_project_limit() {
         .set(Some(4), 4, &config::embedded_machine_id());
     let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
     for _ in 0..3 {
-        assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+        assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     }
     let current = machine_capacity_task(&db, &t1.id).await;
     assert_eq!(
@@ -8697,7 +8879,7 @@ async fn machine_capacity_unparking_respects_project_limit() {
         .execute(db.pool())
         .await
         .unwrap();
-    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
@@ -8751,10 +8933,10 @@ async fn machine_capacity_fifty_full_waiters_use_zero_write_transactions() {
         assign_role(&db, &task.id, "coder", &agent).await;
     }
     let (dispatcher, _) = build_dispatcher(db.clone(), workspaces.path()).await;
-    dispatcher.check_once().await.unwrap(); // Establish visible waits and Project readiness caches.
+    dispatcher.check_once_and_drain().await.unwrap(); // Establish visible waits and Project readiness caches.
     let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let _trace = tracing::subscriber::set_default(MachineCapacityWriteCounter(writes.clone()));
-    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
     assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
@@ -8778,7 +8960,7 @@ async fn machine_capacity_restart_between_prepare_and_start_relaunches_ready() {
         .unwrap();
     drop(before_restart);
     let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
-    assert_eq!(dispatcher.check_once().await.unwrap(), 1);
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 1);
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
@@ -8815,7 +8997,7 @@ async fn supervised_dispatcher_recovers_panic_reports_budget_keeps_wakes_and_sto
     let status_service = crate::OperatorStatusService::new_for_test(Arc::clone(&db));
     let root = TempDir::new().unwrap();
     let (mut built, _launches) = build_dispatcher(db, root.path()).await;
-    built.check_interval = Duration::from_secs(300);
+    built.instance_mut().check_interval = Duration::from_secs(300);
     let dispatcher = Arc::new(built.with_periodic_workers(status_service.periodic_workers()));
     let calls = Arc::new(AtomicUsize::new(0));
     let in_flight = Arc::new(AtomicBool::new(false));
@@ -9164,33 +9346,9 @@ async fn legacy_merging_task_without_hook_step_is_merged_after_one_startup() {
         .unwrap()
         .iter()
         .all(|step| !matches!(step.kind.as_str(), "hooks" | "cascade") && step.status == "done"));
-    // The dispatcher loop alone does not re-drive it.
-    fixture.dispatcher.check_once_and_drain().await.unwrap();
-    assert!(fixture
-        .db
-        .task_steps(&fixture.task.id)
-        .await
-        .unwrap()
-        .iter()
-        .all(|step| !matches!(step.kind.as_str(), "hooks" | "cascade") && step.status == "done"));
-
-    assert_eq!(
-        fixture
-            .dispatcher
-            .recover_stranded_hook_entries()
-            .await
-            .unwrap(),
-        1
-    );
-    // Repeated starts never duplicate the recovered row.
-    assert_eq!(
-        fixture
-            .dispatcher
-            .recover_stranded_hook_entries()
-            .await
-            .unwrap(),
-        0
-    );
+    // Startup and the slow sweep now use the same reconciliation path.
+    assert_eq!(fixture.dispatcher.startup_reconcile().await.unwrap(), 1);
+    assert_eq!(fixture.dispatcher.startup_reconcile().await.unwrap(), 0);
     let steps = fixture
         .db
         .task_steps(&fixture.task.id)
@@ -9286,8 +9444,8 @@ async fn paused_integration_resume_does_not_supersede_its_own_pending_merge() {
         .unwrap();
     // Two dispatcher scans before the step worker gets to the merge (lane busy,
     // or the merge/CI simply takes longer than one scan interval).
-    fixture.dispatcher.check_once().await.unwrap();
-    fixture.dispatcher.check_once().await.unwrap();
+    fixture.dispatcher.check_once_and_drain().await.unwrap();
+    fixture.dispatcher.check_once_and_drain().await.unwrap();
     let logs = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
         .await
         .unwrap();
@@ -9707,3 +9865,117 @@ async fn transient_merge_failures_settle_as_merge_failure_once_retries_are_spent
     assert_eq!(steps[0].status, "failed");
     assert_eq!(steps[0].attempts, 8);
 }
+
+/// Run alone: the global SQLx subscriber measures only the dispatcher's calls.
+#[tokio::test]
+#[ignore = "one-minute dispatcher query/write measurement"]
+async fn idle_load_5000_parked_tasks() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
+    #[derive(Clone)]
+    struct Counts(Arc<AtomicU64>, Arc<AtomicU64>);
+    impl<S: tracing::Subscriber> Layer<S> for Counts {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Sql(Option<String>);
+            impl tracing::field::Visit for Sql {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "db.statement" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "db.statement" {
+                        self.0 = Some(value.into());
+                    }
+                }
+            }
+            let mut sql = Sql(None);
+            event.record(&mut sql);
+            if let Some(statement) = sql.0 {
+                let statement = statement.trim_start().to_ascii_uppercase();
+                if statement.starts_with("SELECT") || statement.starts_with("WITH") {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+                if ["UPDATE", "INSERT", "DELETE", "REPLACE"]
+                    .iter()
+                    .any(|verb| statement.starts_with(verb))
+                {
+                    self.1.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    let counts = Counts(Arc::default(), Arc::default());
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(counts.clone()))
+        .unwrap();
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let (project, _) = seed_project_repo(&db, repo.path()).await;
+    let seed = seed_task(&db, &project, "parked", "in_progress", 0).await;
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query(
+        "UPDATE task SET blocked_json='{\"kind\":\"manual_stop\",\"reason\":\"held\"}' WHERE id=?",
+    )
+    .bind(&seed.id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    db.sync_condition_in_tx(&mut tx, &seed.id).await.unwrap();
+    sqlx::query("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<4999) INSERT INTO task(id,project_id,title,task_type,status,priority,created_at,updated_at,blocked_json,condition_json) SELECT 'idle-'||i,project_id,title,task_type,status,priority,created_at,updated_at,blocked_json,json_set(condition_json,'$.evidence.witnesses[0].task_id','idle-'||i) FROM task JOIN n WHERE id=?")
+        .bind(&seed.id).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let (dispatcher, _) = build_dispatcher_runtime(db, workspace.path(), false).await;
+    dispatcher.check_once().await.unwrap();
+    dispatcher.check_once().await.unwrap(); // Consume acknowledgements before measuring idle ticks.
+    counts.0.store(0, Ordering::Relaxed);
+    counts.1.store(0, Ordering::Relaxed);
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    }
+    println!(
+        "IDLE_LOAD tasks=5000 seconds=60 queries={} write_statements={}",
+        counts.0.load(Ordering::Relaxed),
+        counts.1.load(Ordering::Relaxed)
+    );
+    counts.0.store(0, Ordering::Relaxed);
+    counts.1.store(0, Ordering::Relaxed);
+    dispatcher.schedule_state.lock().unwrap().sweep.due = std::time::Instant::now();
+    dispatcher.reconcile_all().await.unwrap();
+    println!(
+        "SWEEP_LOAD tasks=5000 period=120 queries={} write_statements={}",
+        counts.0.load(Ordering::Relaxed),
+        counts.1.load(Ordering::Relaxed)
+    );
+}
+
+#[tokio::test]
+async fn unchanged_reconciliation_does_not_enqueue_a_second_step() {
+    use db::TaskStepRepo;
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let (project, _) = seed_project_repo(&db, repo.path()).await;
+    let agent = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project, "once", "in_progress", 0).await;
+    assign_role(&db, &task.id, "coder", &agent).await;
+    let (dispatcher, _) = build_dispatcher_runtime(db.clone(), workspace.path(), false).await;
+    assert_eq!(dispatcher.check_once().await.unwrap(), 1);
+    let before = db.task_steps(&task.id).await.unwrap().len();
+    assert_eq!(dispatcher.check_once().await.unwrap(), 0);
+    assert_eq!(db.task_steps(&task.id).await.unwrap().len(), before);
+}
+
+#[path = "tests/equivalence.rs"]
+mod equivalence;
+#[path = "tests/scheduler.rs"]
+mod scheduler;

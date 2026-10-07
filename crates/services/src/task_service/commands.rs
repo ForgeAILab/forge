@@ -35,6 +35,7 @@ impl TaskCommand {
                 self.arguments[1].as_str()
             }
             "dispatch_recovery_role" => self.arguments[3].as_str(),
+            "reconcile_role" => self.arguments[2].as_str(),
             "claim_task" | "claim_and_start_task" => self.arguments[1]["Agent"].as_str(),
             _ => None,
         };
@@ -265,6 +266,26 @@ impl TaskService {
                     let (id,): (String,) = serde_json::from_value(command.arguments.clone())
                         .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
                     encode(Box::pin(self.start_execution(id)).await?)
+                }
+                "reconcile_role" => {
+                    let (id, role, agent, wait): (String, String, String, Option<Value>) =
+                        serde_json::from_value(command.arguments.clone())
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    // The instance that queued this command owns the stop
+                    // fence; without it nothing is dispatched and the sweep
+                    // hands the Task to the next dispatcher.
+                    let Some(dispatcher) = crate::TaskDispatcher::registered(self) else {
+                        return encode(false);
+                    };
+                    encode(
+                        Box::pin(dispatcher.execute_resolved_role(
+                            &id,
+                            &role,
+                            &agent,
+                            wait.as_ref(),
+                        ))
+                        .await?,
+                    )
                 }
                 "dispatch_queued_recovery" => {
                     let (id,): (String,) = serde_json::from_value(command.arguments.clone())

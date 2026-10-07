@@ -264,7 +264,7 @@ pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
 /// Revision of the mapping and of the stored encoding. A database whose
 /// recorded revision differs is recomputed once in the background, off the
 /// startup path. Bump it with every change to either.
-pub const MAPPING_REVISION: i64 = 2;
+pub const MAPPING_REVISION: i64 = 3;
 /// Protected `system_setting` key recording the revision last backfilled.
 pub const MAPPING_REVISION_KEY: &str = "task_condition_mapping_revision";
 
@@ -621,11 +621,46 @@ fn interruption_reasons(
 /// table is read. `Running`/`Entering`/`Settled` need durable witnesses absent
 /// from these five inputs; the stage-one mapping never fabricates them.
 pub fn map_legacy_condition(input: &LegacyConditionInput) -> TaskCondition {
-    let legacy = map_view(&input.view());
     match &input.facts {
-        Some(facts) => facts.apply(legacy),
-        None => legacy,
+        Some(facts) => facts.condition(input),
+        None => map_view(&input.view()),
     }
+}
+
+/// The mapping for a Task whose state is, or is not, an initial one. The
+/// scheduler admits from an initial state without reading the entry barrier,
+/// so there the barrier is evidence and a diagnosis, never a park: condition
+/// and dispatcher agree that the Task is dispatched.
+pub(crate) fn map_view_from(initial: bool, view: &LegacyView<'_>) -> TaskCondition {
+    let barrier_non_text = view
+        .non_text
+        .contains(&LegacyConditionField::EntryBarrierJson);
+    if !initial || (view.entry_barrier_json.is_none() && !barrier_non_text) {
+        return map_view(view);
+    }
+    let non_text: Vec<_> = view
+        .non_text
+        .iter()
+        .filter(|field| **field != LegacyConditionField::EntryBarrierJson)
+        .cloned()
+        .collect();
+    let mut condition = map_view(&LegacyView {
+        entry_barrier_json: None,
+        non_text: &non_text,
+        ..*view
+    });
+    let evidence = condition.evidence_mut();
+    evidence.entry_barrier_json = view.entry_barrier_json.map(bounded);
+    evidence.observations.push(unknown(
+        &LegacyConditionField::EntryBarrierJson,
+        None,
+        if barrier_non_text {
+            UnknownConditionProblem::NonText
+        } else {
+            UnknownConditionProblem::UnownedEntry
+        },
+    ));
+    condition
 }
 
 pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
@@ -1145,11 +1180,12 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
         };
         after = Some(last.try_get(6)?);
         for row in &rows {
-            let mapped = map_legacy_condition(&LegacyConditionInput::from_row(row)?);
+            let input = LegacyConditionInput::from_row(row)?;
+            let mapped = map_legacy_condition(&input);
             let id: String = row.try_get(6)?;
             let condition = if full_schema == 3 {
                 match ConditionFacts::load(connection, &id).await {
-                    Ok(facts) => encode(&facts.apply(mapped)),
+                    Ok(facts) => encode(&facts.condition(&input)),
                     Err(_) => encode(&mapped),
                 }
             } else {
@@ -1237,7 +1273,7 @@ impl SqliteDb {
                 facts
             })
             .filter(|facts| facts.epoch == row.get::<i64, _>(8));
-        if stated.is_none_or(|facts| facts.apply(map_legacy_condition(&bare)) != *condition) {
+        if stated.is_none_or(|facts| facts.condition(&bare) != *condition) {
             return Err(DbError::Check(
                 "Task condition differs from legacy fields".into(),
             ));
@@ -1333,8 +1369,7 @@ impl SqliteDb {
             .fetch_one(&mut *connection)
             .await?;
         let facts = ConditionFacts::load(&mut connection, &task.id).await?;
-        let expected =
-            encode(&facts.apply(map_legacy_condition(&LegacyConditionInput::from(task))));
+        let expected = encode(&facts.condition(&LegacyConditionInput::from(task)));
         if actual != expected {
             return Err(DbError::Check(format!(
                 "Task condition invariant failed for {}",
@@ -1355,8 +1390,7 @@ impl SqliteDb {
         for row in &rows {
             let id: String = row.try_get(6)?;
             let facts = ConditionFacts::load(&mut connection, &id).await?;
-            let expected =
-                encode(&facts.apply(map_legacy_condition(&LegacyConditionInput::from_row(row)?)));
+            let expected = encode(&facts.condition(&LegacyConditionInput::from_row(row)?));
             if row.try_get::<Vec<u8>, _>(5)? != expected.as_bytes() {
                 violations.push(id);
             }

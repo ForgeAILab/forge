@@ -808,3 +808,25 @@ pub async fn task_action_version(app: &Router, uri: &str) -> i64 {
     let offers: api_types::TaskActionsResponse = parse_response(response, StatusCode::OK).await;
     offers.version
 }
+
+/// Every Task that is not settled has a queued step, a live execution or a
+/// park once the committed kicks are reconciled. The runtime's own dispatcher
+/// proves it when there is one, so its stop fence and state are the ones used.
+pub async fn assert_scheduler_clean(state: &api::AppState) {
+    let fixture;
+    let dispatcher = match state.task_dispatcher.as_deref() {
+        Some(dispatcher) => dispatcher,
+        None => {
+            fixture = services::TaskDispatcher::new(
+                state.db.clone(),
+                state.event_bus.clone(),
+                state.task_service.clone(),
+            );
+            &fixture
+        }
+    };
+    dispatcher
+        .sweep_and_assert()
+        .await
+        .expect("every Task is owned or parked after reconciliation");
+}

@@ -1,18 +1,24 @@
+#[cfg(test)]
 use std::collections::HashSet;
 
-use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
-use db::{AgentRepo, DbError, Project, Task, TaskRoleAssignmentRepo};
+use api_types::{Actor, SystemComponent};
+#[cfg(test)]
+use api_types::{StateKind, WorkflowDefinition};
+use db::{AgentRepo, DbError, Task};
+#[cfg(test)]
+use db::{Project, TaskRoleAssignmentRepo};
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
     deferred_dispatch,
     task_service::TransitionOptions,
-    workflow::engine::WorkflowEngine,
     Result, ServiceError,
 };
 
 use super::{helpers, TaskDispatcher};
+#[cfg(test)]
+use crate::workflow::engine::WorkflowEngine;
 
 /// Dispatch-disposition capability for the coordination-root aggregate review
 /// advance. A root never takes an ordinary role dispatch — both scans `continue`
@@ -28,7 +34,7 @@ pub(super) struct InitialScheduleTarget {
 }
 
 impl TaskDispatcher {
-    fn publish_capacity_disposition_change(&self, task: &Task) {
+    pub(super) fn publish_capacity_disposition_change(&self, task: &Task) {
         self.event_bus.publish(ForgeEvent {
             event_type: "task.updated".to_owned(),
             entity_id: task.id.clone(),
@@ -114,6 +120,7 @@ impl TaskDispatcher {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn dispatch_initial_tasks(
         &self,
         project: &Project,
@@ -469,6 +476,7 @@ impl TaskDispatcher {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_initial_schedule_target(
         &self,
         workflow: &WorkflowDefinition,

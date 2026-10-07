@@ -98,6 +98,7 @@ async fn disconnected_owner_can_remove_and_audit_orphan_cancellations() {
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 #[tokio::test]
@@ -155,6 +156,7 @@ async fn connected_machine_returns_typed_conflict_without_revoking_token() {
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 #[tokio::test]
@@ -194,6 +196,7 @@ async fn embedded_machine_returns_typed_conflict_even_while_offline() {
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 #[tokio::test]
@@ -258,6 +261,7 @@ async fn another_owner_gets_not_found_without_machine_state_disclosure() {
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 #[tokio::test]
@@ -325,6 +329,7 @@ async fn removed_machine_rejects_old_report_and_websocket_credential_after_fresh
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 /// A second user re-registering the first user's `machine_id` is refused, so
@@ -417,6 +422,7 @@ async fn other_user_cannot_take_over_by_reregistering_then_remove() {
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 #[tokio::test]
@@ -445,6 +451,7 @@ async fn reserved_machine_ids_are_refused_at_registration() {
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 /// The machine list is admin-only, so an admin can remove a departed user's
@@ -544,4 +551,5 @@ async fn admin_can_preview_and_remove_another_users_machine() {
             .is_empty(),
         "condition producers agree with durable facts"
     );
+    common::assert_scheduler_clean(&harness.state).await;
 }

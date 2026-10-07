@@ -512,6 +512,9 @@ fn bounded_safe_message(message: &str) -> String {
 /// commits one of those must call this afterward, or the previously observed
 /// denial keeps the Task quiesced forever.
 pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) -> Result<()> {
+    // The stored refusal is cleared below exactly as before. The kick makes the
+    // reconciler look at the Task even when nothing was stored to clear.
+    db.kick_schedule(task_id).await?;
     if !db::task_writer::owns_task(task_id) {
         if TaskRepo::get_by_id(db, task_id, false).await?.is_none() {
             return Ok(());

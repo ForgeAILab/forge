@@ -45,6 +45,7 @@ uuid = { version = "1", features = ["v4", "v5"] }
 which = "*"
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 services = { path = ".", features = ["test-support"] }
 db = { path = "../db", features = ["test-template"] }

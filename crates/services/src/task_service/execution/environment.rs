@@ -1070,7 +1070,7 @@ mod tests {
         let version = due.version;
         due.next_check_at = Some("2026-01-01T00:00:00Z".into());
         db.put_readiness(due, Some(version)).await.unwrap();
-        let dispatcher = crate::TaskDispatcher::new(db.clone(), events, service);
+        let dispatcher = crate::TaskDispatcher::new(db.clone(), events, service.clone());
         dispatcher.check_once().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -1114,6 +1114,7 @@ mod tests {
         assert_eq!(status, "resolved");
         dispatcher.check_once().await.unwrap(); // Observe the successful pause CAS.
         dispatcher.check_once().await.unwrap();
+        service.drain(&task.id).await.unwrap();
         let runs = ExecutionRepo::list_running_by_task(&*db, &task.id)
             .await
             .unwrap();
@@ -1202,7 +1203,7 @@ mod tests {
             TaskService::new(db.clone(), events.clone())
                 .with_workspace_backend_router(Arc::new(router)),
         );
-        let dispatcher = crate::TaskDispatcher::new(db.clone(), events, service);
+        let dispatcher = crate::TaskDispatcher::new(db.clone(), events, service.clone());
         dispatcher.check_once().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {

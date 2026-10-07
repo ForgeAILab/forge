@@ -122,10 +122,12 @@ mod repo;
 mod repo_location;
 mod review;
 mod runtime;
+mod schedule;
 mod shared_media;
 mod skill;
 mod system_setting;
 mod task;
+pub use schedule::ScheduleRead;
 mod task_adaptive;
 mod task_comment;
 mod task_dependency;
@@ -283,6 +285,12 @@ pub(crate) async fn wake_dispatch_for_project_in_tx(
     .bind(project_id)
     .execute_in_tx(transaction)
     .await?;
+    // Open Tasks with nothing stored to clear are reconsidered too: the
+    // Project fact they were held on changed without touching their rows.
+    sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) SELECT id,1 FROM task WHERE project_id=? AND deleted_at IS NULL ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1")
+        .bind(project_id)
+        .execute(&mut **transaction)
+        .await?;
     Ok(result.tasks())
 }
 

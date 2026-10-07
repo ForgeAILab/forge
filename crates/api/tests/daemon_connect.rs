@@ -197,6 +197,146 @@ async fn daemon_heartbeat_refreshes_last_report_at() {
     assert_eq!(touched.status, db::DaemonStatus::Online);
 }
 
+#[tokio::test]
+async fn reconnect_cannot_be_left_offline_by_delayed_disconnect() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    let root = common::TestDir::new("forge-api-daemon-delayed-disconnect");
+    let armed = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(4)
+        .min_connections(4)
+        .before_acquire({
+            let armed = armed.clone();
+            let paused = paused.clone();
+            let release = release.clone();
+            move |_, _| {
+                let armed = armed.clone();
+                let paused = paused.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if armed.swap(false, Ordering::SeqCst) {
+                        paused.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(true)
+                })
+            }
+        })
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(root.path().join("forge.sqlite"))
+                .create_if_missing(true)
+                .foreign_keys(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    // AppState::new starts a notification worker that also acquires from the
+    // pool. Build without it so only the socket can consume the armed gate.
+    let runtime = services::ForgeRuntimeBuilder::from_config(
+        Arc::new(db::SqliteDb::new(pool)),
+        Arc::new(events::EventBus::new(64)),
+        config::ForgeConfig::with_data_dir(root.path().to_path_buf()),
+    )
+    .with_workspace_root(root.path().join("workspaces"))
+    .with_workflows_dir(api::state::test_workflows_dir())
+    .build();
+    let mut state = AppState::from_runtime(runtime, true);
+    // Isolate socket lifecycle writes from asynchronous placement recovery.
+    state.daemon_connections =
+        Arc::new(services::daemon_transport::DaemonConnectionRegistry::without_handlers());
+    let state = Arc::new(state);
+    let app = test_app(&state);
+    let registration = register_daemon(&app, "delayed-disconnect").await;
+    let server = TestServer::start(state.clone()).await;
+    let mut events = state.event_bus.subscribe();
+    let mut first = connect_daemon(
+        &server,
+        &registration.daemon_id,
+        Some(&registration.registration_token),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while events.recv().await.unwrap().event_type != "daemon.connected" {}
+    })
+    .await
+    .expect("initial socket commits online");
+
+    // The old handler has unregistered, but its offline UPDATE has not begun.
+    // Hold only its pool acquisition so the replacement can use another one.
+    armed.store(true, Ordering::SeqCst);
+    first.send(WsMessage::Close(None)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), paused.notified())
+        .await
+        .expect("old disconnect reaches the gated database write");
+    assert!(!state
+        .daemon_connections
+        .is_connected(&registration.daemon_id));
+    let _replacement = connect_daemon(
+        &server,
+        &registration.daemon_id,
+        Some(&registration.registration_token),
+    )
+    .await
+    .unwrap();
+
+    // Before the fix the replacement commits online while the old UPDATE is
+    // gated. With serialization it must wait; release the old write after the
+    // bounded wait and verify both lifecycle events and the final row.
+    let mut statuses = Vec::new();
+    let replacement_connected = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            eprintln!("before release: {}", event.event_type);
+            assert_ne!(
+                event.event_type, "daemon.offline",
+                "the old offline write must remain gated until release"
+            );
+            if event.event_type == "daemon.connected" {
+                statuses.push(event.event_type);
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while statuses.len() < 2 {
+            let event = events.recv().await.unwrap();
+            eprintln!("after release: {}", event.event_type);
+            if matches!(
+                event.event_type.as_str(),
+                "daemon.offline" | "daemon.connected"
+            ) {
+                statuses.push(event.event_type);
+            }
+        }
+    })
+    .await
+    .expect("both lifecycle writes finish");
+    let daemon = db::DaemonRepo::get_by_id(&*state.db, &registration.daemon_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state
+        .daemon_connections
+        .is_connected(&registration.daemon_id));
+    assert_eq!(
+        daemon.status,
+        db::DaemonStatus::Online,
+        "replacement connected before old write released: {replacement_connected}; events: {statuses:?}"
+    );
+    assert_eq!(statuses, ["daemon.offline", "daemon.connected"]);
+}
+
 async fn test_state() -> Arc<AppState> {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await

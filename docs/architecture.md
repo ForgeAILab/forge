@@ -3074,7 +3074,10 @@ A background job, single-flight per repository/runtime, runs machine checks
 before `repo_location.provision`. Only passing applicable checks permit cloning
 under `<workspace_root>/repos/<repo id>` with the daemon's own Git credentials.
 The resulting managed location is unverified until `repo_location.verify` and
-full checks finish. Check failures retain per-role facts; successful completion
+full checks finish. Handshake re-verification skips locations still referenced by
+`repo_provision_retry`: provisioning owns their verification and full-check fence
+until settlement, including after reconnect or server restart.
+Check failures retain per-role facts; successful completion
 wakes normal dispatch. Clone failures leave an unavailable location and bounded
 error. Durable exponential retry deadlines (`repo_provision_retry`) survive
 server restarts without a persistent running flag; daemon retries reuse an
@@ -3868,7 +3871,7 @@ recomputed in full.
 win over live workflow work. Interactive sessions are never the witnessed
 execution, and a settled execution is history, not a witness: recording one
 writes no condition. The running execution is read from the running-only
-partial index `idx_execution_usage_running_agent`, so no producer walks or
+partial index `idx_execution_running_task`, so no producer walks or
 sorts a Task's execution history.
 
 The entry is the first transition row stamped with the Task's status epoch
@@ -3952,24 +3955,29 @@ the `happy_path`, `e2e` and `remove_machine` api cases assert it is empty.
   observations rechecked by existing dispatch. Advisory merge/CI/dirty-worktree
   annotations stay non-parking where legacy proceeds.
 
-**The invariant check.** The dispatcher's supervised loop runs it after each
-dispatch pass, never before. Once per 60 seconds it reads one keyset page of
-at most 50 Tasks on a reader connection, recomputes each in full and compares.
+**The invariant check.** The dispatcher's sweep runs it (see "Task condition
+scheduler and owner matrix"): once per 120 seconds it visits every Task that
+is not settled, in keyset pages behind the dispatch pass, reads each page on a
+reader connection, recomputes each Task in full and compares.
 It takes the writer only for a row that differs, with one statement fenced on
 the Task version and the condition text it read, so a row written since is
 left to its own producer. A row that cannot be recomputed is logged and
 passed over. It writes only `condition_json`: never workflow state, version,
 time, event or wake. Errors log and defer without stopping dispatch.
 
+An entry barrier parks in every state but an initial one: the scheduler
+admits a Task from an initial state without reading the barrier, so there it
+is evidence and an observation, and the `entry` witness records `initial`.
+
 `db::MAPPING_REVISION` versions the mapping and the stored encoding. The
 revision last backfilled is recorded under the protected `system_setting` key
 `task_condition_mapping_revision` (hidden from, and not writable through, the
 admin settings API). The migration that creates the column records it after
 its own backfill. When it differs at the first tick (a database migrated by an
-earlier binary, or a later mapping change), the backfill is re-run by the same
-check in slices of at most 250 ms per tick, off the startup path, and the
-revision is recorded when one pass completes. Bump the constant with every
-mapping or encoding change.
+earlier binary, or a later mapping change), the backfill is re-run over every
+Task, settled ones included, in slices of at most 250 ms per tick, off the
+startup path, and the revision is recorded when one pass completes. Bump the
+constant with every mapping or encoding change.
 
 Every completed pass logs its checked and repaired counts. Operator status
 reports a `task_condition_invariant` entry in `recent_errors`, severity
@@ -5483,3 +5491,175 @@ column `task_step.workflow_ref_id`, not a JSON scan.
 Initial dispatcher admission only commits/enqueues and kicks the worker. A queued rollback to the initial state finalizes the existing placement-refusal bookkeeping; the dispatcher does not drain chains inline.
 
 Board reorders and recovery markers remain audit rows only; neither changes the status epoch. expected_version remains a diagnostic stamp and is never rebound. Replay-marker cleanup is a queued Task mutation. Queued role-entry agent references reserve admission capacity only for the short window before the entry takes its slot: a Task's available fast-lane head step, a claimed fast cascade or hook step whose dispatch has no recorded result. Steps behind another step, in retry back-off, or waiting for or inside a long-lane merge/CI hook hold no agent or server capacity; if their later dispatch finds the agent full it is skipped and the dispatcher's active-task recovery re-drives it. The dispatcher kicks and continues rather than running the queue. Lane classification is checked again against the resolved workflow at execution and requeues a changed lane before any transition starts.
+
+### Task condition scheduler and owner matrix
+
+Stage three switches the dispatcher from scanning every Task every 10 seconds
+to reconciling the Tasks something changed. Its decisions are those of the
+scanning dispatcher: every Task that was dispatched is dispatched, to the same
+target, in the same order and within the same limits, no later than before;
+every Task that was held is held; and every legacy field, event and annotation
+that was written is written with the same value. Public health,
+awaiting-human, exceptions, actions, operator Task status, MCP, Attention and
+web projections still read those legacy fields. Three things differ, and
+nothing else:
+
+1. a Task that sat forever with no step, no owner and no annotation is parked
+   explicitly, with an owner action;
+2. a missed wake is repaired within 120 seconds;
+3. the dispatcher does no work on an idle tick.
+
+**Resolution.** `next_step(snapshot)` is pure and total over default and
+custom workflow states: one batched read per page of Tasks loads condition,
+entry epoch, queue ownership, role assignments, the latest execution per role,
+Reviews, hierarchy and placement, and the resolver returns either a step for
+the existing `task_step` command/hooks adapter or a typed park naming an owner
+and a recovery action. Admission keeps its authority, capacity and
+optimistic-concurrency checks, and the facts a pure function cannot read (the
+admission gates, the machine precheck, Agent availability) are taken at each
+Task's own turn in the pass, so a Task sees what earlier Tasks of the same
+pass did, as it did in a scan. A refusal is written by the same writer as
+before: the dependency gate records its disposition and blocks on a cancelled
+dependency, the Project limit and a machine run slot record their capacity
+wait, a failed provision records its refusal annotation. A recorded refusal
+holds until the Task's version changes or `services::wake_task_dispatch`
+clears it; nothing else re-opens it. A role dispatch is a queued Task command
+that resolves the Task again under its lease; role commands of different
+Tasks are claimed independently, across Projects, Agents and lanes, and the
+command runs on the one dispatcher instance of the runtime, whose stop fence
+it observes.
+
+**Kicks.** `task_schedule_dirty` holds one row per Task with a monotonic
+generation. Triggers write it in the transaction that commits the fact, so a
+crash after commit loses nothing, and acknowledgement clears only the
+generation a pass read. Only a change that can alter a dispatch decision
+kicks:
+
+| Commit | Tasks marked |
+|---|---|
+| Task create, status, version, condition, priority, plan, hold or release | the Task |
+| Task status, order, parent or condition | its parent, siblings, children and dependants; waiters on its Project's limit |
+| Dependency or role assignment added, changed or removed | the Task (a root's coder: its children too) |
+| Step queued, claimed, finished or retried (not a queued Task write) | the Task |
+| Execution ends, or changes Agent, workspace or snapshot | the Task; waiters on that Agent, on a machine run slot and on the Project's limit |
+| Execution starts | the Task; waiters on the Project's limit (their wait names the active count) |
+| Execution heartbeat | nothing |
+| Review or transition row | the Task |
+| Workspace or placement change | the Task and its children; waiters on that Agent or machine |
+| Machine status, run limit, version or CLI report | waiters on that machine or a run slot; Tasks whose Agents it hosts |
+| Readiness result | Tasks waiting on that machine in that Project |
+| Remote cancellation marked or acknowledged | the Tasks it fences |
+| Project version, workflow, settings, pause or primary repository; repository | every Task of the Project |
+| Agent profile, status, pause or slot count | Tasks assigned to that Agent |
+| Chat turn leased or released | waiters on that machine or a run slot |
+| Queued admission released | waiters on that Agent or a run slot |
+
+`wake_task_dispatch` and the Project-wide wake clear the stored refusal and
+deferral and bump the Task version, as before, and also mark the Tasks.
+Some holds turn on facts no commit announces. Credentials, provider health
+and backoff, connection health and CLI policy all surface as Agent
+availability; a placement refusal is re-evaluated against a machine's live
+connection and due provisioning retries; a step that had nothing to do yet,
+and a Task whose pass failed, are asked again. Those Tasks, and only those,
+are kept in an in-memory set and re-read at the scan interval (10 seconds),
+which is when the scanning dispatcher re-read them. Exact deadlines (retry,
+owner grace, failed-Review grace, readiness, reservation and lease expiry)
+wake the loop at their time. A direct `check_once`, as tests and fixtures
+call it, re-reads that set at once, and the first one an instance receives
+reads every Task that is not settled, as a first scan did; the operator
+refresh reconciles every Task at once. `project_schedule_dirty` keeps
+repository maintenance working for Projects with no Tasks.
+
+**Sweep.** Every 120 seconds, and from the first tick after startup, the
+dispatcher walks every Task that is not settled, in keyset pages of 100 read
+from the partial index `idx_task_schedule_open`, outside the dispatch pass and
+never holding the writer for a read. A settled Task is never visited. Each
+page is condition-checked (the stage-two check, repaired with its fenced
+statement), resolved without I/O, and handed to the next dispatch pass when it
+has work nothing kicked, a park that no longer says why it waits, or no owner
+at all. The last case is the invariant: every Task that is not settled has a
+queued step, a live execution or a park. A violation is logged, repaired by
+reconciling and counted in the existing invariant report, with every Task
+whose pass failed. The sweep replays no recorded refusal. Its cursor is in
+memory; a restart begins a fresh lap. A tick spends at most 100 ms on it and
+then yields to dispatch, and startup never waits for it: dispatch starts from
+the durable dirty set and the first lap runs behind it. After a mapping
+revision change the backfill covers every Task once, settled ones included,
+in its own bounded slices.
+
+**Failures stay with their Task.** The legacy fields stay authoritative: when
+a stored condition does not match the legacy fields read in the same snapshot
+(a writer missed its sync), the pass resolves from the legacy fields and
+repairs the stored copy. A Task whose stored condition cannot be decoded is
+recomputed from its legacy fields and reconciled in the same pass.
+A Task whose reconciliation fails is logged, counted and retried at the scan
+interval; the pass continues, and only a pass that completed records the
+commit generation it saw.
+
+**Parks.** Derived parks live in `task_schedule_park`, fenced by status epoch;
+they are not a second queue. A Task waiting on capacity is parked once:
+`task_schedule_wait` records the Agent it waits for, whether it waits for a
+machine run slot (`daemon_id = '*'`) or a named machine, and whether it waits
+on the Project limit, so that a capacity change kicks exactly the waiters it
+can admit and the wait writes nothing while it lasts.
+
+A `WorkflowInvalid` or `UnknownCondition` park is also written as an
+`error_annotation` of the existing `workflow_guard_rejected` kind, by the
+dispatcher, with a message naming the owner and the action, so health,
+exceptions and Attention show it before stage four. That kind blocks no
+dispatch and moves no slot. The dispatcher removes its own annotation on the
+pass that resolves the Task to anything else, before it applies that step.
+These parks are reserved for Tasks nothing can continue: a state the workflow
+does not define or gives no scheduling meaning, a merge entry whose hooks were
+lost and cannot be replayed safely, a plan publication marker that cannot be
+read. A Task whose role nobody holds, or a person holds, is human work and is
+left exactly as before.
+
+| Park reason | Responsible owner | Recovery action |
+|---|---|---|
+| Held | User who held the Task | Release the hold |
+| Failure, AgentTimeout, BudgetExhausted | User / Project Agent | Repair the cause, authorize recovery or a new budget window |
+| EntryBlocked | Workflow | Inspect the entry barrier and retry the entry |
+| UnknownCondition (visible) | Project owner | Move the Task back and forward again, or cancel it |
+| WorkflowInvalid (visible) | Project Agent | Edit the workflow or move the Task to a state it defines |
+| HumanDecision, HumanWork | User / Project Agent | Approve, do the work, assign the role or move the Task |
+| Capacity | Scheduler | Wait: freed capacity kicks the matching waiters |
+| DispatchRefusal | User / Project Agent | Correct the Task, Project or execution setup; a wake or a Task change re-opens it |
+| ProjectPaused | User / repository or readiness owner | Fix setup and resume the Project |
+| OwnerOffline, DaemonUpgradeRequired, AgentUnavailable | Machine or Agent owner | Reconnect, upgrade, enable the Agent or select another |
+| Environment, PlacementDenied | Machine / Project execution-setup owner | Check, provision or repair the environment or placement |
+| RemoteCancelPending | The remote operation's machine | Acknowledge the cancellation |
+| Dependencies | Project Agent / dependency owner | Complete or resolve the dependency |
+| Children | Project Agent / child workers | Settle the ordered child sequence |
+| PlanSettlementWait | Publication worker | Settle the publication or cleanup |
+| QueueOwned, InFlight | Task-step / execution worker | Wait for the live owner; its lease timer owns recovery |
+| RetryDeadline, ReviewGrace | Scheduler | Re-read at the deadline or the next scan interval |
+| ExecutionStopped | User / assigned role owner | Confirm, repair or resume the stopped attempt |
+| ReviewChecks | Workflow / check owner | Complete or retry the required checks |
+
+Slot accounting is the existing legacy projection: an admitted `OwnerOffline`
+wait keeps an active slot and `ReviewNeedsOwner` a parked one. Active recovery
+precedes new admission; initial candidates keep priority, creation and ID
+order; only an admission from an initial state takes a Project slot.
+
+**Equivalence.** `task_dispatcher/tests/equivalence.rs` replays real rows
+through the dispatcher and compares the outcome with
+`fixtures/scheduler_equivalence_9d9b228f.txt`, recorded by running the same
+file on the base commit: dispatched or held, the target, every legacy field
+and every event, for a hundred Task shapes at startup and in steady state, a
+load test with a machine cap and a Project limit, failed-Review recovery and
+wakes. The only differences accepted are the fixture's `@`-lines, each naming
+one of the three allowed changes.
+
+**Stage five.** SQLite drops a table's triggers and indexes with the table,
+and refuses to drop a column an index or trigger names. Any `task` column drop
+or table rebuild must first drop the `task_schedule_*` triggers on `task` and
+the partial index `idx_task_schedule_open` (which reads `condition_json`), and
+recreate them afterwards. The same holds for the triggers on every other
+table the scheduler watches.
+
+Stage four must compose these owner results into the public condition DTO and
+switch all projections together, replace the visible park annotation with the
+condition's own park, preserve the material-blocker digest and slot
+classification, regenerate bindings and document the single public beta break.
+

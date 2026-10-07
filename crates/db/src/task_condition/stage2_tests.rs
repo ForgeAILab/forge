@@ -410,6 +410,9 @@ async fn inherited_child_execution_and_custom_terminal_use_their_actual_workflow
         .execute(&mut *tx)
         .await
         .unwrap();
+    // The raw workflow rewrite also changed whether the root's `todo` is an
+    // initial state; a real workflow edit re-states such Tasks itself.
+    db.sync_condition_in_tx(&mut tx, &root.id).await.unwrap();
     let now = crate::now_rfc3339();
     sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at,status_epoch) VALUES('child-entry',?,'todo','in_progress','system','entry',?,(SELECT status_epoch FROM task WHERE id=?))").bind(&child.id).bind(&now).bind(&child.id).execute(&mut *tx).await.unwrap();
     sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at,executor_config_snapshot_json) VALUES('child-run',?,'executor','running',?,?,'{\"state_entry_token\":\"child-entry\",\"task_state\":\"in_progress\"}')")
@@ -498,7 +501,7 @@ async fn check_reads_without_the_writer_and_survives_a_cancelled_repair() {
         .execute(db.pool())
         .await
         .unwrap();
-    let lock = crate::begin_immediate(db.pool()).await.unwrap();
+    let mut lock = crate::begin_immediate(db.pool()).await.unwrap();
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -508,7 +511,15 @@ async fn check_reads_without_the_writer_and_survives_a_cancelled_repair() {
         .is_err(),
         "the repair waits for the writer"
     );
-    lock.rollback().await.unwrap();
+    // Dropping the tick does not recall its repair statement: SQLite keeps
+    // waiting for the write lock and would race the next tick for the row.
+    // The writer moves the Task version, so that statement's fence fails and
+    // the repair below can only come from the tick after the cancelled one.
+    sqlx::query("UPDATE task SET version=version+1")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    lock.commit().await.unwrap();
     let status = db
         .check_task_conditions(CONDITION_CHECK_PAGE)
         .await
@@ -626,7 +637,7 @@ async fn stale_mapping_revision_reruns_the_backfill_once() {
         .await
         .unwrap();
     for _ in 0..50 {
-        db.check_task_conditions_if_due().await.unwrap();
+        db.backfill_task_conditions_if_stale().await.unwrap();
         if db.task_condition_violations().await.unwrap().is_empty() {
             break;
         }
@@ -644,12 +655,12 @@ async fn stale_mapping_revision_reruns_the_backfill_once() {
         status.last_pass.is_none(),
         "rewriting after a mapping change is not an operator issue"
     );
-    // Steady state: one page per interval, so an immediate second tick and a
-    // third are at most one page of work.
+    // Once the revision is recorded the backfill does nothing further: the
+    // steady check belongs to the scheduler sweep.
     let ticks = status.ticks;
-    db.check_task_conditions_if_due().await.unwrap();
-    db.check_task_conditions_if_due().await.unwrap();
-    assert_eq!(db.condition_check_status().ticks, ticks + 1);
+    assert!(!db.backfill_task_conditions_if_stale().await.unwrap());
+    assert!(!db.backfill_task_conditions_if_stale().await.unwrap());
+    assert_eq!(db.condition_check_status().ticks, ticks);
     // The stage-1 migration backfill itself still agrees with the producers.
     let mut connection = db.pool().acquire().await.unwrap();
     backfill(&mut connection).await.unwrap();
@@ -694,5 +705,59 @@ async fn opaque_metadata_values_preserve_shadow_until_the_bounded_check() {
         "an opaque value is not a condition producer"
     );
     db.check_task_conditions(1).await.unwrap();
+    assert!(db.task_condition_violations().await.unwrap().is_empty());
+}
+
+/// The scheduler admits a Task from an initial state without reading its
+/// entry barrier, so there the barrier is evidence and a diagnosis; in every
+/// other state it parks, as the dispatcher holds on it.
+#[tokio::test]
+async fn entry_barrier_parks_everywhere_but_an_initial_state() {
+    let db = db().await;
+    let t = task(&db, "barrier-by-state").await;
+    let barrier = json!({"status":"blocked","state":"review"}).to_string();
+    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET entry_barrier_json=? WHERE id=?")
+        .bind(&barrier)
+        .bind(&t.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    db.sync_condition_in_tx(&mut tx, &t.id).await.unwrap();
+    tx.commit().await.unwrap();
+    let initial = db.task_condition(&t.id).await.unwrap();
+    assert!(!initial.is_blocked(), "{initial:?}");
+    assert_eq!(
+        initial.evidence().entry_barrier_json.as_deref(),
+        Some(barrier.as_str())
+    );
+    assert!(initial
+        .evidence()
+        .observations
+        .iter()
+        .any(|reason| matches!(
+            reason,
+            ParkReason::UnknownCondition { source, .. }
+                if source.field == LegacyConditionField::EntryBarrierJson
+        )));
+    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET status='in_progress',status_epoch=status_epoch+1 WHERE id=?")
+        .bind(&t.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    db.sync_condition_in_tx(&mut tx, &t.id).await.unwrap();
+    tx.commit().await.unwrap();
+    let active = db.task_condition(&t.id).await.unwrap();
+    assert!(
+        matches!(
+            &active,
+            TaskCondition::Parked {
+                primary: ParkReason::EntryBlocked { .. },
+                ..
+            }
+        ),
+        "{active:?}"
+    );
     assert!(db.task_condition_violations().await.unwrap().is_empty());
 }

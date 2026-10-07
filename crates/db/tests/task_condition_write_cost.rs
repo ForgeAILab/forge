@@ -21,6 +21,12 @@ async fn measure_task_write_cost() {
         .await
         .unwrap();
     db::run_migrations(&pool).await.unwrap();
+    // Diagnosis only: statements to run first, e.g. dropping one trigger or
+    // index to see what a write path pays for it.
+    if let Ok(setup) = std::env::var("COST_SETUP_SQL") {
+        sqlx::raw_sql(&setup).execute(&pool).await.unwrap();
+        println!("COST setup: {setup}");
+    }
     let db = SqliteDb::new(pool);
     ProjectRepo::create(
         &db,

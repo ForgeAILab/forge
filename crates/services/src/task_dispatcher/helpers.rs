@@ -265,6 +265,7 @@ fn review_ci_steps_finished(step_results_json: &str) -> bool {
 /// - `Failed`/`Cancelled` with `resume_policy: Some(ResumePolicy::Auto)` —
 ///   the executor already opted this attempt into automatic retry.
 /// - Environment pre-dispatch failures — the Project pause owns recovery.
+#[cfg(test)]
 pub(super) async fn latest_stopped_execution_blocks_dispatch(
     db: &db::SqliteDb,
     task_id: &str,

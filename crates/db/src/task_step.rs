@@ -1394,4 +1394,36 @@ mod tests {
             fk[0].0
         );
     }
+    #[tokio::test]
+    async fn retiring_a_queued_admission_kicks_capacity_waiters_without_an_execution() {
+        let db = fixture().await;
+        let mut first = input("a", "queued-role");
+        first.kind = "command".into();
+        first.payload_json =
+            serde_json::json!({"operation":"reconcile_role","admission_agent_id":"agent-a"})
+                .to_string();
+        db.enqueue_step(&first).await.unwrap();
+        db.schedule_wait("b", ("p", false), Some("agent-a"), None, None)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM task_schedule_dirty")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task_step SET status='done' WHERE id=?")
+            .bind(&first.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut ids = db.dirty_schedule_tasks(100).await.unwrap();
+        ids.sort();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+    }
 }

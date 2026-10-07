@@ -361,6 +361,7 @@ pub(crate) fn coordination_root_allows_child_dispatch(
 }
 
 /// Return whether a coordination root's non-empty child sequence is complete.
+#[cfg(test)]
 pub(crate) async fn coordination_root_sequence_complete(
     db: &SqliteDb,
     task: &Task,

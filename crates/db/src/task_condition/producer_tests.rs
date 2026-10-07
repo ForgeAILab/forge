@@ -779,7 +779,7 @@ async fn producer_fact_queries_use_indexes() {
         for (_, _, _, step) in &plan {
             // The one scan and sort allowed are over the executions running
             // right now, read from the running-only partial index.
-            let running = "idx_execution_usage_running_agent";
+            let running = "idx_execution_running_task";
             assert!(
                 !step.starts_with("SCAN") || step.contains(running),
                 "{name}: {step}"
@@ -809,6 +809,7 @@ async fn producers_do_not_rederive_unrelated_families() {
                 epoch: 0,
                 transition_id: Some("carried".into()),
                 since: "carried".into(),
+                initial: false,
             }],
             ..Default::default()
         },
@@ -856,6 +857,7 @@ async fn producers_do_not_rederive_unrelated_families() {
                 epoch: 0,
                 transition_id: Some("carried".into()),
                 since: "carried".into(),
+                initial: false,
             }));
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
         db.finish_step_in_tx(&mut tx, &step, "done", None)
