@@ -172,8 +172,63 @@ impl SqliteDb {
         Ok((reads, unreadable))
     }
     pub async fn record_schedule_park(&self, id: &str, epoch: i64, reason: &str) -> Result<()> {
-        sqlx::query("INSERT INTO task_schedule_park(task_id,epoch,reason_json) SELECT id,?,? FROM task WHERE id=? AND status_epoch=? ON CONFLICT(task_id) DO UPDATE SET epoch=excluded.epoch,reason_json=excluded.reason_json WHERE epoch IS NOT excluded.epoch OR reason_json IS NOT excluded.reason_json")
-            .bind(epoch).bind(reason).bind(id).bind(epoch).execute(self.pool()).await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let before = self
+            .get_task_in_tx(&mut tx, id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let changed = sqlx::query("INSERT INTO task_schedule_park(task_id,epoch,reason_json) SELECT id,?,? FROM task WHERE id=? AND status_epoch=? ON CONFLICT(task_id) DO UPDATE SET epoch=excluded.epoch,reason_json=excluded.reason_json WHERE epoch IS NOT excluded.epoch OR reason_json IS NOT excluded.reason_json")
+            .bind(epoch).bind(reason).bind(id).bind(epoch).execute(&mut *tx).await?.rows_affected() != 0;
+        if changed {
+            crate::task_condition::produce(&mut tx, id, crate::ConditionChange::Legacy).await?;
+            self.append_condition_change_in_tx(&mut tx, &before).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    pub async fn clear_visible_schedule_park(&self, id: &str) -> Result<bool> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let before = self
+            .get_task_in_tx(&mut tx, id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let raw = sqlx::query_scalar::<_, String>(
+            "SELECT reason_json FROM task_schedule_park WHERE task_id=?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let visible = raw
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .as_ref()
+            .and_then(crate::task_condition::readers::owner_park)
+            .is_some();
+        if visible {
+            sqlx::query("DELETE FROM task_schedule_park WHERE task_id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            crate::task_condition::produce(&mut tx, id, crate::ConditionChange::Legacy).await?;
+            self.append_condition_change_in_tx(&mut tx, &before).await?;
+        }
+        tx.commit().await?;
+        Ok(visible)
+    }
+    async fn append_condition_change_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        before: &Task,
+    ) -> Result<()> {
+        let after = self
+            .get_task_in_tx(tx, &before.id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        if crate::task_condition::material_blocker(&before.condition)
+            != crate::task_condition::material_blocker(&after.condition)
+        {
+            let event = crate::CreateDomainEvent::task_interruption_changed(&after);
+            crate::DomainEventRepo::append_event_in_tx(self, tx, &event).await?;
+        }
         Ok(())
     }
 }
@@ -372,6 +427,7 @@ impl SqliteDb {
 
 fn map_schedule_task(row: SqliteRow) -> Result<Task> {
     Ok(Task {
+        condition: Default::default(),
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
         parent_task_id: row.try_get("parent_task_id")?,

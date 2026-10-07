@@ -110,6 +110,8 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         let assignment = map_task_role_assignment_row(row)?;
         self.record_mutation_reply_in_tx(&mut tx, &assignment)
             .await?;
+        crate::task_condition::produce(&mut tx, &input.task_id, crate::ConditionChange::Human)
+            .await?;
         tx.commit().await?;
         Ok(assignment)
     }
@@ -200,6 +202,12 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         .await
         .map_err(map_workflow_sqlx_error)?;
         let assignment = map_task_role_assignment_row(row)?;
+        crate::task_condition::produce(
+            &mut transaction,
+            &input.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(assignment)
     }
@@ -264,6 +272,7 @@ impl TaskRoleAssignmentRepo for SqliteDb {
             .execute(&mut *tx)
             .await
             .map_err(map_workflow_sqlx_error)?;
+        crate::task_condition::produce(&mut tx, task_id, crate::ConditionChange::Human).await?;
         self.record_mutation_reply_in_tx(&mut tx, &()).await?;
         tx.commit().await?;
         Ok(())
@@ -366,6 +375,12 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         .await
         .map_err(map_workflow_sqlx_error)
         .and_then(map_task_role_assignment_row)?;
+        crate::task_condition::produce(
+            &mut transaction,
+            &input.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         let task = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.task_id)
             .fetch_one(&mut *transaction)
@@ -454,6 +469,12 @@ impl TaskRoleAssignmentRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
+        crate::task_condition::produce(
+            &mut transaction,
+            &expected_assignment.task_id,
+            crate::ConditionChange::Human,
+        )
+        .await?;
         let task = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&expected_assignment.task_id)
             .fetch_one(&mut *transaction)

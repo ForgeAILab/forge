@@ -1181,6 +1181,12 @@ impl TaskStepWorker {
         }
         task.version += 1;
         task.updated_at = now;
+        task.condition = self
+            .db
+            .get_task_in_tx(tx, &task.id)
+            .await?
+            .ok_or(db::DbError::NotFound)?
+            .condition;
         let event = db::CreateDomainEvent::task_interruption_changed(task);
         db::DomainEventRepo::append_event_in_tx(&*self.db, tx, &event).await?;
         if status == "parked" {

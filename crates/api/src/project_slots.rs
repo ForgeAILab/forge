@@ -132,6 +132,11 @@ mod tests {
 
     async fn mutate(db: &db::SqliteDb, sql: &str) {
         sqlx::query(sql).execute(db.pool()).await.unwrap();
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM task")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        db.check_task_conditions_of(&ids).await.unwrap();
     }
 
     #[tokio::test]

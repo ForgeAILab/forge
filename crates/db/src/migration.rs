@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202610060838 (internal Task scheduler dirty generations, parks and sweep cursor, running-Task execution index); previous V202610060030 (Task condition shadow column with a Rust-mapped preserving backfill; no view or trigger); previous V202610052305 (data-preserving machine registration tombstones and guarded cleanup receipt abandonment); previous V202610051649 (per-kind Task budget ledger and retained-allowance backfill); previous V202610051343 (typed workflow bridges and execution purpose, data-preserving history/queue/checkpoint backfill; open kind/purpose columns and base gate-decision rules); previous V202610051045 (data-preserving single Task writer commands, replies, preemption and remote cancellation fences); previous V202610050233 (topic working sets, protected fork seeds, timeline claims, bounded native-only rotation intents and a summary-usage outbox); previous V202610042145 (level-triggered wakes, category budgets, owner escalation, per-Attention wake decisions, capped lease refunds and Project doctrine @21); previous V202610040225 (durable post-commit hook steps and hook/script checkpoints); previous V202610032100 (conflict hot-spot episodes, indexed transition-log windows and UTC installation time); previous V202610031934 (Task status epochs and step epoch fences, fast/long step lanes, retained workflow references and prune indexes; V202610031431 merge-friendly layout guidance; V202610030400 Task cascade outbox; dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
+// Embedded migration bundle revision: V202610070507 (condition public readers, projection revisions and retry index); previous V202610060838 (internal Task scheduler dirty generations, parks and sweep cursor, running-Task execution index); previous V202610060030 (Task condition shadow column with a Rust-mapped preserving backfill; no view or trigger); previous V202610052305 (data-preserving machine registration tombstones and guarded cleanup receipt abandonment); previous V202610051649 (per-kind Task budget ledger and retained-allowance backfill); previous V202610051343 (typed workflow bridges and execution purpose, data-preserving history/queue/checkpoint backfill; open kind/purpose columns and base gate-decision rules); previous V202610051045 (data-preserving single Task writer commands, replies, preemption and remote cancellation fences); previous V202610050233 (topic working sets, protected fork seeds, timeline claims, bounded native-only rotation intents and a summary-usage outbox); previous V202610042145 (level-triggered wakes, category budgets, owner escalation, per-Attention wake decisions, capped lease refunds and Project doctrine @21); previous V202610040225 (durable post-commit hook steps and hook/script checkpoints); previous V202610032100 (conflict hot-spot episodes, indexed transition-log windows and UTC installation time); previous V202610031934 (Task status epochs and step epoch fences, fast/long step lanes, retained workflow references and prune indexes; V202610031431 merge-friendly layout guidance; V202610030400 Task cascade outbox; dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later
@@ -486,7 +486,20 @@ async fn apply_migration_sql(pool: &SqlitePool, migration: &Migration, sql: &str
         if migration.name == "task_budgets" {
             crate::budget::migrate_pending_mutations(&mut transaction).await?;
         }
-        if migration.name == "task_condition" {
+        if migration.name == "task_condition_readers" {
+            // A presentation rewrite must not fan out across all capacity waiters
+            // or turn settled history into newly dirty scheduler work.
+            let triggers: Vec<(String,String)> = sqlx::query_as("SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND name IN ('task_schedule_update','task_schedule_relationship')").fetch_all(&mut *transaction).await?;
+            for (name, _) in &triggers {
+                sqlx::raw_sql(&format!("DROP TRIGGER {name}"))
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            crate::task_condition::backfill(&mut transaction).await?;
+            for (_, ddl) in triggers {
+                sqlx::raw_sql(&ddl).execute(&mut *transaction).await?;
+            }
+        } else if migration.name == "task_condition" {
             crate::task_condition::backfill(&mut transaction).await?;
         }
         sqlx::query("INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, ?)")
@@ -665,13 +678,13 @@ mod tests {
                 .unwrap()
                 .conditional_safe
         );
-        let plans = sqlx::query("EXPLAIN QUERY PLAN SELECT EXISTS (SELECT 1 FROM task WHERE project_id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL AND deleted_at IS NULL)")
+        let plans = sqlx::query("EXPLAIN QUERY PLAN SELECT EXISTS (SELECT 1 FROM task WHERE project_id = ? AND json_extract(condition_json,'$.evidence.presentation.retry_recorded')=1 AND deleted_at IS NULL)")
             .bind("malformed-project").fetch_all(&pool).await.unwrap();
         assert!(
             plans.iter().any(|row| row
                 .get::<String, _>("detail")
-                .contains("idx_task_deferred_dispatch_project")),
-            "the guarded probe must use idx_task_deferred_dispatch_project"
+                .contains("idx_task_condition_retry_project")),
+            "the guarded probe must use idx_task_condition_retry_project"
         );
     }
 

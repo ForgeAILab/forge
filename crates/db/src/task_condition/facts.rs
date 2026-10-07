@@ -21,6 +21,12 @@ pub enum ConditionWitness {
         /// reading the entry barrier, so the barrier does not park here.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         initial: bool,
+        #[serde(default)]
+        human_wait: bool,
+        #[serde(default)]
+        review_wait: bool,
+        #[serde(default)]
+        review_failure: bool,
     },
     Step {
         step_id: String,
@@ -59,6 +65,23 @@ pub struct MaterialBlocker {
 /// is not a new blocker. Witnesses, observations, leases and new condition
 /// tags never enter this projection. No Attention reader switches.
 pub fn material_blocker(condition: &TaskCondition) -> MaterialBlocker {
+    if matches!(
+        condition,
+        TaskCondition::Entering { .. }
+            | TaskCondition::Running { .. }
+            | TaskCondition::Deferred { .. }
+    ) || matches!(
+        condition,
+        TaskCondition::Parked {
+            primary: ParkReason::Held { .. } | ParkReason::Capacity { .. },
+            ..
+        }
+    ) {
+        return MaterialBlocker {
+            requires_intervention: false,
+            interruption: None,
+        };
+    }
     condition
         .evidence()
         .material
@@ -101,6 +124,14 @@ pub(super) struct Terminals {
     /// First declarations whose kind is initial.
     initial: Vec<String>,
     cancellation_state: String,
+    human_states: BTreeMap<String, HumanState>,
+}
+#[derive(Clone)]
+struct HumanState {
+    role: Option<String>,
+    gate: bool,
+    requires: bool,
+    optional: bool,
 }
 /// A definition text and its classification.
 type Parsed = (Arc<str>, Arc<Terminals>);
@@ -118,11 +149,20 @@ impl Terminals {
         let declared = workflow["states"].as_array();
         let mut states = BTreeMap::new();
         let mut initial = Vec::new();
+        let mut human_states = BTreeMap::new();
         for state in declared.into_iter().flatten() {
             if let Some(name) = state["name"].as_str() {
                 if !states.contains_key(name) && state["kind"] == "initial" {
                     initial.push(name.to_owned());
                 }
+                human_states
+                    .entry(name.to_owned())
+                    .or_insert_with(|| HumanState {
+                        role: state["role"].as_str().map(str::to_owned),
+                        gate: state["kind"] == "gate",
+                        requires: state["gate_config"]["requires_user_approval"] == true,
+                        optional: state["gate_config"]["optional_when_unassigned"] == true,
+                    });
                 states
                     .entry(name.to_owned())
                     .or_insert(state["kind"] == "terminal");
@@ -132,6 +172,7 @@ impl Terminals {
             has_states: declared.is_some_and(|states| !states.is_empty()),
             states,
             initial,
+            human_states,
             cancellation_state: workflow["cancellation_state"]
                 .as_str()
                 .unwrap_or("cancelled")
@@ -195,6 +236,10 @@ impl Terminals {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConditionFacts {
+    pub human_wait: bool,
+    pub review_wait: bool,
+    pub review_failure: bool,
+    pub owner_park: Option<Value>,
     pub version: i64,
     pub task_id: String,
     pub state: String,
@@ -239,7 +284,7 @@ impl TaskCondition {
             | Self::Settled { evidence, .. } => evidence,
         }
     }
-    fn reasons(&self) -> impl Iterator<Item = &ParkReason> {
+    pub fn reasons(&self) -> impl Iterator<Item = &ParkReason> {
         let (first, rest) = match self {
             Self::Parked {
                 primary,
@@ -314,7 +359,7 @@ impl Families {
         &SQL.get_or_init(|| {
             (0..8usize)
                 .map(|bits| {
-                    let mut columns = String::from("t.error_annotation,t.blocked_json,t.failed_json,t.entry_barrier_json,t.metadata_json,t.condition_json,t.version,t.status,t.status_epoch,t.created_at,t.parent_task_id,t.project_id");
+                    let mut columns = String::from("t.error_annotation,t.blocked_json,t.failed_json,t.entry_barrier_json,t.metadata_json,t.condition_json,t.version,t.status,t.status_epoch,t.created_at,t.parent_task_id,t.project_id,(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch) AS owner_park,(SELECT status FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_status,(SELECT created_at FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_created_at");
                     let mut joins = String::new();
                     if bits & 1 != 0 {
                         // An engine or board entry logs its epoch and is the
@@ -364,12 +409,20 @@ impl Snapshot {
         id: &str,
         families: Families,
     ) -> Result<Option<Self>> {
-        let Some(row) = sqlx::query(families.sql())
-            .bind(id)
-            .fetch_optional(&mut *c)
-            .await?
-        else {
-            return Ok(None); // Hard deletion has no shadow row.
+        let query = families.sql();
+        let row = match sqlx::query(query).bind(id).fetch_optional(&mut *c).await {
+            Ok(row) => row,
+            // Migration replay before the scheduler table was introduced.
+            Err(sqlx::Error::Database(e))
+                if e.message().contains("no such table: task_schedule_park") =>
+            {
+                let old = query.replace("(SELECT reason_json FROM task_schedule_park WHERE task_id=t.id AND epoch=t.status_epoch) AS owner_park", "NULL AS owner_park,(SELECT status FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_status,(SELECT created_at FROM review WHERE task_id=t.id ORDER BY attempt_number DESC,created_at DESC,id DESC LIMIT 1) AS human_review_created_at");
+                sqlx::query(&old).bind(id).fetch_optional(&mut *c).await?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let Some(row) = row else {
+            return Ok(None);
         };
         Ok(Some(Self {
             id: id.to_owned(),
@@ -395,11 +448,21 @@ impl Snapshot {
         c: &mut SqliteConnection,
         facts: &mut ConditionFacts,
     ) -> Result<()> {
+        facts.owner_park = self
+            .row
+            .try_get::<Option<String>, _>("owner_park")?
+            .and_then(|s| serde_json::from_str(&s).ok());
         facts.version = self.version;
+        let mut latest_review_status: Option<String> = None;
+        if self.families.entry || self.families.hooks || self.families.execution {
+            latest_review_status = self.row.try_get("human_review_status")?;
+            facts.review_wait = latest_review_status.as_deref() == Some("awaiting_human");
+        }
         facts.task_id = self.id.clone();
         facts.state = self.state.clone();
         facts.epoch = self.epoch;
         if self.families.entry {
+            facts.human_wait = self.human_wait(c, latest_review_status.as_deref()).await?;
             let workflow: String = self.row.try_get("workflow")?;
             let classes = Terminals::of(&workflow);
             facts.terminal = classes.outcome(&self.state, self.parent.is_some());
@@ -417,10 +480,19 @@ impl Snapshot {
                 facts.since = self.row.try_get("entry0_at")?;
             }
         }
+        if self.families.entry || self.families.hooks || self.families.execution {
+            facts.review_failure = latest_review_status.as_deref() == Some("failed")
+                && self
+                    .row
+                    .try_get::<Option<String>, _>("human_review_created_at")?
+                    .is_some_and(|at| at >= facts.since);
+        }
         if self.families.hooks {
+            facts.human_wait = self.human_wait(c, latest_review_status.as_deref()).await?;
             facts.hooks = self.row.try_get("hooks")?;
         }
         if self.families.execution {
+            facts.human_wait = self.human_wait(c, latest_review_status.as_deref()).await?;
             facts.execution = None;
             if let Some(execution) = self.row.try_get::<Option<String>, _>("execution_id")? {
                 let snapshot: Value = self
@@ -564,6 +636,9 @@ impl ConditionFacts {
             transition_id,
             since,
             initial,
+            human_wait,
+            review_wait,
+            review_failure,
         }) = witnesses.next()
         else {
             return None;
@@ -575,6 +650,9 @@ impl ConditionFacts {
             since: since.clone(),
             terminal,
             initial: *initial,
+            human_wait: *human_wait,
+            review_wait: *review_wait,
+            review_failure: *review_failure,
             ..Default::default()
         };
         for witness in witnesses {
@@ -611,6 +689,9 @@ impl ConditionFacts {
             transition_id: self.transition_id.clone(),
             since: self.since.clone(),
             initial: self.initial,
+            human_wait: self.human_wait,
+            review_wait: self.review_wait,
+            review_failure: self.review_failure,
         }];
         if let Some(step) = &self.hooks {
             witnesses.push(ConditionWitness::Step {
@@ -659,12 +740,24 @@ impl ConditionFacts {
     }
     /// Combine the legacy mapping with these facts. Legacy is authoritative:
     /// a condition parks exactly where today's readers hold the Task.
-    pub fn apply(&self, mut condition: TaskCondition) -> TaskCondition {
+    pub fn apply(&self, condition: TaskCondition) -> TaskCondition {
+        self.apply_lifecycle(super::readers::apply_owner_park(
+            condition,
+            self.owner_park.as_ref(),
+        ))
+    }
+    fn apply_lifecycle(&self, mut condition: TaskCondition) -> TaskCondition {
         let exhausted = condition.budget_exhausted();
         let children = self.children_pending && !self.children.is_empty();
         {
             let evidence = condition.evidence_mut();
             evidence.witnesses = self.witnesses(exhausted);
+            if let Some(read) = &mut evidence.presentation {
+                read.human_wait = read.interruption_present
+                    || (self.hooks.is_none() && (read.explicit_human_wait || self.human_wait));
+                read.review_wait = self.review_wait;
+                read.review_failure = self.review_failure;
+            }
             if self.children_pending && !children {
                 // Legacy dispatches a flagged root without visible children as
                 // an ordinary Task. Keep the diagnosis; do not park.
@@ -773,5 +866,113 @@ impl ConditionFacts {
             };
         }
         unreachable!("a lifecycle fact always states a condition")
+    }
+}
+
+impl Snapshot {
+    /// One read of the canonical human-work facts, captured by the producer.
+    /// No public reader reconstructs them or reads migrated metadata.
+    async fn human_wait(
+        &self,
+        c: &mut SqliteConnection,
+        latest_review_status: Option<&str>,
+    ) -> Result<bool> {
+        let hooks = if self.families.hooks {
+            self.row.try_get::<Option<String>, _>("hooks")?.is_some()
+        } else {
+            ConditionFacts::recover_stored(&self.stored).is_some_and(|f| f.hooks.is_some())
+        };
+        if hooks {
+            return Ok(false);
+        }
+        if self.state == "review" {
+            if latest_review_status == Some("awaiting_human") {
+                return Ok(true);
+            }
+            if latest_review_status == Some("failed") {
+                let running: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM execution WHERE task_id=? AND status='running')",
+                )
+                .bind(&self.id)
+                .fetch_one(&mut *c)
+                .await?;
+                if !running {
+                    return Ok(true);
+                }
+            }
+        }
+        if self.parent.is_some()
+            && matches!(
+                self.state.as_str(),
+                "todo" | "in_progress" | "done" | "cancelled"
+            )
+        {
+            return Ok(false);
+        }
+        let workflow: String = if self.families.entry {
+            self.row.try_get("workflow")?
+        } else {
+            sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id=?")
+                .bind(&self.project)
+                .fetch_one(&mut *c)
+                .await?
+        };
+        let classes = Terminals::of(&workflow);
+        let state = if classes.has_states {
+            classes.human_states.get(&self.state).cloned()
+        } else {
+            match self.state.as_str() {
+                "planning" => Some(HumanState {
+                    role: Some("planner".into()),
+                    gate: true,
+                    requires: false,
+                    optional: true,
+                }),
+                "review" => Some(HumanState {
+                    role: Some("reviewer".into()),
+                    gate: true,
+                    requires: false,
+                    optional: false,
+                }),
+                _ => None,
+            }
+        };
+        let Some(state) = state else {
+            return Ok(false);
+        };
+        if self.state != "planning" && !state.gate {
+            return Ok(false);
+        }
+        let role = state.role.as_deref();
+        let assignment = if let Some(role) = role {
+            sqlx::query_as::<_,(Option<String>,Option<String>)>("SELECT assignee_type,assignee_id FROM task_role_assignment WHERE task_id=? AND role_name=?").bind(&self.id).bind(role).fetch_optional(&mut *c).await?
+        } else {
+            None
+        };
+        let user = assignment
+            .as_ref()
+            .is_some_and(|(kind, id)| kind.as_deref() == Some("user") && id.is_some());
+        if self.state == "planning" {
+            return Ok(user);
+        }
+        if !state.gate {
+            return Ok(false);
+        }
+        if !user && !state.requires {
+            return Ok(false);
+        }
+        let entry = sqlx::query_scalar::<_,String>("SELECT created_at FROM transition_log WHERE task_id=? AND to_state=? ORDER BY created_at DESC,rowid DESC LIMIT 1").bind(&self.id).bind(&self.state).fetch_optional(&mut *c).await?.unwrap_or_else(||self.created_at.clone());
+        let decided: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM transition_log WHERE task_id=? AND from_state=? AND created_at>=? AND bridge_kind IN ('gate_approved','gate_rejected'))").bind(&self.id).bind(&self.state).bind(entry).fetch_one(&mut *c).await?;
+        if state.requires {
+            if state.optional
+                && !assignment
+                    .as_ref()
+                    .is_some_and(|(kind, id)| kind.is_some() && id.is_some())
+            {
+                return Ok(false);
+            }
+            return Ok(!decided);
+        }
+        Ok(user && !decided)
     }
 }

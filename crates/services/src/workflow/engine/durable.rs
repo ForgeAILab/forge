@@ -200,9 +200,7 @@ impl WorkflowExecution<'_> {
                 .await?
                 .is_some_and(|review| review.status == db::ReviewStatus::Failed);
         Ok(crate::memory::TransitionFailureEvidence {
-            failure_kind: crate::memory::TransitionFailureEvidence::annotation_kind(
-                task.error_annotation.as_deref(),
-            ),
+            failure_kind: task.condition.read().diagnostic.map(|a| a.annotation_type),
             review_failed,
         })
     }

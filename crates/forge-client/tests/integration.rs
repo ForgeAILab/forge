@@ -589,9 +589,9 @@ fn task_response(
         remaining_retries: HashMap::new(),
         retry_limits: HashMap::new(),
         available_actions: Vec::new(),
-        error_annotation: None,
-        blocked: None,
-        failed: None,
+        condition: api_types::TaskCondition::Clear {
+            details: Default::default(),
+        },
         workflow_health: None,
         workflow_exception: None,
         execution_observability: TaskExecutionObservability {

@@ -97,7 +97,16 @@ fn blocking(c: &TaskCondition, barrier_holds: bool) -> bool {
             additional,
             ..
         } => std::iter::once(primary).chain(additional).any(|p| {
-            (barrier_holds || !from_barrier(p))
+            !matches!(
+                p,
+                ParkReason::UnknownCondition {
+                    source: db::ConditionSource {
+                        field: db::LegacyConditionField::SchedulePark,
+                        ..
+                    },
+                    ..
+                }
+            ) && (barrier_holds || !from_barrier(p))
                 && matches!(
                     p,
                     ParkReason::Held { .. }
@@ -435,7 +444,20 @@ impl TaskDispatcher {
                     let grace =
                         at(Some(&review.updated_at)).map(|at| at + chrono::Duration::minutes(2));
                     let eligible = !f.blocking
-                        && (t.error_annotation.is_none() || super::legacy_park::owns(t))
+                        && (t.error_annotation.is_none()
+                            || t.condition.reasons().any(|r| {
+                                matches!(
+                                    r,
+                                    ParkReason::WorkflowInvalid { .. }
+                                        | ParkReason::UnknownCondition {
+                                            source: db::ConditionSource {
+                                                field: db::LegacyConditionField::SchedulePark,
+                                                ..
+                                            },
+                                            ..
+                                        }
+                                )
+                            }))
                         && !helpers::awaiting_human(t)
                         && t.entry_barrier_json.is_none()
                         && !r

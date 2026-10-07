@@ -612,7 +612,7 @@ async fn an_unavailable_agent_hold_is_rechecked_at_the_scan_interval() {
 /// changes neither the Task's slot nor its dispatch, and the dispatcher
 /// removes it on the pass that sees the Task repaired.
 #[tokio::test]
-async fn an_owner_park_is_visible_in_the_legacy_fields_and_clears_itself() {
+async fn an_owner_park_is_visible_in_the_condition_and_clears_itself() {
     let (db, project, agent, _repo, ws) = fixture().await;
     set_project_active_task_limit(&db, &project, 5).await;
     // A state the Project workflow does not define.
@@ -634,8 +634,15 @@ async fn an_owner_park_is_visible_in_the_legacy_fields_and_clears_itself() {
         dispatcher.check_once_and_drain().await.unwrap();
     }
     let parked = reload(&db, &stranded.id).await;
-    let annotation: api_types::TaskBlockingAnnotation =
-        serde_json::from_str(parked.error_annotation.as_deref().expect("visible park")).unwrap();
+    assert!(
+        parked.error_annotation.is_none(),
+        "the stage-three bridge is removed"
+    );
+    let annotation = parked
+        .condition
+        .read()
+        .diagnostic
+        .expect("visible condition park");
     assert_eq!(
         annotation.annotation_type,
         api_types::FailureKind::WorkflowGuardRejected
@@ -648,18 +655,21 @@ async fn an_owner_park_is_visible_in_the_legacy_fields_and_clears_itself() {
         "{message}"
     );
     assert!(parked.blocked_json.is_none() && parked.failed_json.is_none());
-    assert_eq!(parked.version, stranded.version + 1, "written once");
+    assert_eq!(
+        parked.version, stranded.version,
+        "condition-only diagnostics use the list revision"
+    );
     // Public readers show it today.
     let workflow = WorkflowEngine::resolve_workflow("{}");
     let exception =
         crate::task_diagnostics::task_exception_projection(&parked, &workflow, &[], None, vec![])
             .expect("the exception reader shows the park");
     assert_eq!(exception.message, message);
-    assert!(db::task_interruption_requires_intervention(
-        parked.error_annotation.as_deref(),
-        None,
-        None
-    ));
+    assert!(db::material_blocker(&parked.condition).requires_intervention);
+    let public = parked.condition.public();
+    let public = serde_json::to_value(public).unwrap();
+    assert_eq!(public["details"]["owner"], "project_agent");
+    assert_eq!(public["details"]["recovery"], "edit_workflow");
     // It neither blocks dispatch nor moves the Task to a parked slot.
     assert!(!helpers::has_blocking_annotation(&parked));
     assert_eq!(

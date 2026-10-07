@@ -522,14 +522,25 @@ impl TaskDispatcher {
                 workflow: &p.workflow,
                 facts: &p.facts,
             });
-            // The visible half of an owner park follows the resolution: it
-            // is written for a Task nothing owns and removed the moment the
-            // Task resolves to anything else, before that step is applied.
-            let park = match &next {
-                Next::Park(park) => Some(park),
-                Next::Step(_) => None,
-            };
-            if self.sync_legacy_park(&p.read.task, park).await? {
+            // Ownerless diagnoses now live in the condition; never write a legacy annotation.
+            let visible = matches!(&next, Next::Park(park) if matches!(&park.reason, Reason::WorkflowInvalid{..}) || matches!(&park.reason, Reason::UnknownCondition{owner} if owner == next_step::PUBLICATION_OWNER || owner == next_step::ENTRY_HOOKS_OWNER));
+            let current_visible = p.read.condition.reasons().any(|r| {
+                matches!(
+                    r,
+                    db::ParkReason::WorkflowInvalid { .. }
+                        | db::ParkReason::UnknownCondition {
+                            source: db::ConditionSource {
+                                field: db::LegacyConditionField::SchedulePark,
+                                ..
+                            },
+                            ..
+                        }
+                )
+            });
+            if !visible
+                && current_visible
+                && self.db.clear_visible_schedule_park(&p.read.task.id).await?
+            {
                 if self.reread(p, project).await? {
                     continue;
                 }

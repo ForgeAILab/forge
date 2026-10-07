@@ -14,7 +14,7 @@ pub(super) struct TaskDiagnosticProjection {
     pub(super) canonical_phase: api_types::CanonicalPhase,
     pub(super) remaining_retries: HashMap<String, i64>,
     pub(super) retry_limits: HashMap<String, i64>,
-    pub(super) error_annotation: Option<TaskAnnotation>,
+    pub(super) condition: api_types::TaskCondition,
     pub(super) workflow_health: Option<api_types::WorkflowHealthSummary>,
     pub(super) workflow_exception: Option<api_types::WorkflowExceptionSummary>,
 }
@@ -34,10 +34,7 @@ pub(super) fn task_diagnostic_projection(
         execution_authority,
         running_executions,
     } = rows;
-    let error_annotation = task.error_annotation.as_deref().map(|s| {
-        serde_json::from_str::<TaskAnnotation>(s)
-            .unwrap_or_else(|_| TaskAnnotation::Legacy(parse_json_value(s)))
-    });
+    let condition = task.condition.public();
     let canonical_phase = workflow.canonical_phase_for_state(&task.status);
     let remaining_retries = remaining_retries.clone();
     let retry_limits = retry_limits.clone();
@@ -95,7 +92,7 @@ pub(super) fn task_diagnostic_projection(
         canonical_phase,
         remaining_retries,
         retry_limits,
-        error_annotation,
+        condition,
         workflow_health,
         workflow_exception,
     }
@@ -114,7 +111,9 @@ pub(super) fn task_list_response(
         .map(task_role_assignment_response)
         .collect();
     let latest_execution_id = rows.latest_execution.map(|execution| execution.id.clone());
-    let projection = task_diagnostic_projection(&task, workflow, rows, false);
+    let awaiting_human =
+        task.condition.read().human_wait || task.condition.read().interruption_present;
+    let projection = task_diagnostic_projection(&task, workflow, rows, awaiting_human);
     api_types::TaskListItemResponse {
         id: task.id,
         project_id: task.project_id,
@@ -125,22 +124,14 @@ pub(super) fn task_list_response(
         task_type: parse_task_type(&task.task_type),
         status: task.status,
         canonical_phase: projection.canonical_phase,
-        awaiting_human: false,
+        awaiting_human,
         priority: task.priority,
         board_position: task.board_position,
         subtask_order: task.subtask_order,
         role_assignments,
         remaining_retries: projection.remaining_retries,
         retry_limits: projection.retry_limits,
-        error_annotation: projection.error_annotation,
-        blocked: task
-            .blocked_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
-        failed: task
-            .failed_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok()),
+        condition: projection.condition,
         workflow_health: projection.workflow_health,
         workflow_exception: projection.workflow_exception,
         review_passed_at: task.review_passed_at,

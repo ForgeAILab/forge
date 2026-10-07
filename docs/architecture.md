@@ -3765,13 +3765,16 @@ in Mission Control.
 ### Task condition dual-write foundation
 
 `V202610060030__task_condition` adds one private, non-null `condition_json`
-column and an expression index on its tagged enum kind. Stage one is a shadow:
-`error_annotation`, `blocked_json`, `failed_json`, `entry_barrier_json` and
-condition metadata stay authoritative. Task serialization, admission, dispatch,
-actions, health, human-readiness, flow-control slot counts, events and Attention
-continue to read those legacy inputs. The migration does not change their bytes,
-Task versions/timestamps, retained queue intents, publication claims or budget
-receipts, including archived/deleted Tasks and malformed historical JSON.
+column and an expression index on its tagged enum kind. Stages one and two
+established the shadow and dual-write adapters. Stage four makes its typed
+presentation authoritative for public readers: health, human-readiness,
+exceptions, offers/apply, slots, overview, operations, MCP/native/Solo,
+Attention and environment surfaces. Legacy columns and condition metadata are
+still written by the adapters and retained for import, rollback and invariant
+repair until stage five. They are not public-reader inputs. The original
+migration preserves Task versions/timestamps, retained queue intents,
+publication claims and budget receipts, including archived/deleted Tasks and
+malformed historical JSON.
 
 The internal `db::TaskCondition` variants are `Clear`, `Entering`, `Running`,
 `Deferred`, `Parked`, `Failed` and `Settled`. Parks carry one primary typed reason,
@@ -4020,13 +4023,58 @@ Attention service really materializes for every blocker shape. Attention
 still consumes its original events, so rollout re-arms no incident. Stage
 three owns the total reconciler and dirty-set cutover.
 
+### Task condition public readers (stage four)
+
+The stored condition now carries a normalized typed presentation captured by its
+producer before import-evidence truncation. Runtime public readers consume this
+presentation and typed reasons, not private raw evidence or migrated metadata.
+`ConditionChange::Human` refreshes Review and assignment changes in the same
+transaction; entry, execution, hooks and workflow changes refresh their current
+human-work facts. Generic human intervention remains distinct from approval
+eligibility. A pending entry owns its checks and suppresses obsolete human waits.
+List and detail project the same wait; health can overlay a live interactive run
+without changing the Task condition or its blocker.
+
+`V202610070507__task_condition_readers` rederives every existing condition inside
+its migration transaction (mapping revision 4), replaces the list-revision trigger
+and retry-time partial index, and preserves all Task/history/Attention/queue/budget
+data. It clears only the retired dispatcher bridge, retaining its diagnosis in a
+park when needed. Condition-only changes advance `project.list_revision`; ETag
+projection version 2 prevents an old list validator from surviving the wire cutover.
+The clock-sensitive probe uses `idx_task_condition_retry_project` and the condition
+recorded retry/deferred-wait flag, including a timer co-occurring with another primary reason.
+
+REST and forge-ctl Task JSON replace `error_annotation`, `blocked`, `failed` with
+`api_types::TaskCondition`; MCP and native Task values use the same DTO. It excludes
+raw import evidence, metadata and witnesses. Named health, exception, human wait
+and offers stay. Entry owners show `Entering`; observer parks show `Needs Owner`.
+Failed Review history after a newer entry or live continuation is not a current
+exception. Unsupported stored encodings return a typed unknown diagnosis while invariant repair rebuilds them; private historical Task receipts import their condition at the archive boundary. Normalized diagnostic strings are bounded to 1,024 bytes and arrays to
+16 entries; legacy storage retains full originals during this stage.
+
+`task.interruption_changed` retains its type and carries `condition` plus the typed
+`material_blocker`. The old payload decodes only in `DomainEvent::task_material_blocker`
+at the immutable archive boundary. New condition/step identities, Task versions,
+timestamps, reporting execution IDs and offer changes never enter incident identity.
+Unchanged open incidents do not create a new incident or wake during upgrade.
+Held, entry-owned, in-flight, capacity and retry-timer conditions are not autonomous
+repair incidents. Admitted `OwnerOffline` retains an active slot; `ReviewNeedsOwner`
+retains a parked slot. No scheduler decision or sweep policy changes.
+
+Stage five must retain this typed presentation/material identity while deleting
+legacy columns and migrated keys and replacing import/dual-write adapters. Full
+legacy originals that exceed the presentation bounds must be preserved at an
+archive boundary before storage removal. Drop/recreate the Task-related triggers
+and indexes around any Task table rebuild; do not lose scheduler dirty generations,
+parks, wait/deadline rows, queue receipts, pending cancellations or immutable events.
+
 ### Task condition actions
 
-`services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, existing interruption columns, entry-barrier/flow-control metadata, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
+`services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
 
 The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Each offer carries meaningful parameters, allowed boolean values, authority, reason, label, cancellation propagation, and a pinned resumable execution. Required operator reasons and send-back guidance are supplied by the caller and retained in review records, comments, follow-up Tasks and transition logs. Commands check the version and select a current offer. A missing offer produces one `action_unavailable` error with current offers. Gate overrides remain owner-only.
 
-Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Annotation, blocked, failed and entry-barrier columns remain separate.
+Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Legacy annotation, blocked, failed and entry-barrier columns remain private dual-write storage until stage five.
 
 Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
@@ -5499,9 +5547,9 @@ to reconciling the Tasks something changed. Its decisions are those of the
 scanning dispatcher: every Task that was dispatched is dispatched, to the same
 target, in the same order and within the same limits, no later than before;
 every Task that was held is held; and every legacy field, event and annotation
-that was written is written with the same value. Public health,
-awaiting-human, exceptions, actions, operator Task status, MCP, Attention and
-web projections still read those legacy fields. Three things differ, and
+that was written is written with the same value. Stage four switches public health, awaiting-human, exceptions, actions,
+operator Task status, MCP, Attention and web to the condition; the dispatcher
+keeps its dispatch decisions and adapter-level reconciliation unchanged. Three things differ, and
 nothing else:
 
 1. a Task that sat forever with no step, no owner and no annotation is parked
@@ -5603,12 +5651,14 @@ machine run slot (`daemon_id = '*'`) or a named machine, and whether it waits
 on the Project limit, so that a capacity change kicks exactly the waiters it
 can admit and the wait writes nothing while it lasts.
 
-A `WorkflowInvalid` or `UnknownCondition` park is also written as an
-`error_annotation` of the existing `workflow_guard_rejected` kind, by the
-dispatcher, with a message naming the owner and the action, so health,
-exceptions and Attention show it before stage four. That kind blocks no
-dispatch and moves no slot. The dispatcher removes its own annotation on the
-pass that resolves the Task to anything else, before it applies that step.
+A `WorkflowInvalid` or `UnknownCondition` owner park is folded into the typed
+condition from the epoch-fenced `task_schedule_park` record. It names the same
+owner and recovery guidance in health, exceptions and Attention. Stage four
+removes `legacy_park.rs` and its temporary `workflow_guard_rejected` annotation
+bridge. The migration captures a bridge left without a park by a crash before
+clearing only dispatcher-owned bridge annotations. No user annotation is removed.
+These observer parks neither block dispatch nor change slot classification;
+resolution clears their condition when the Task can continue.
 These parks are reserved for Tasks nothing can continue: a state the workflow
 does not define or gives no scheduling meaning, a merge entry whose hooks were
 lost and cannot be replayed safely, a plan publication marker that cannot be

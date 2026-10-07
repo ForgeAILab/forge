@@ -1281,6 +1281,7 @@ pub struct CreateNotification {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "TaskArchive")]
 pub struct Task {
     pub id: String,
     pub project_id: String,
@@ -1309,6 +1310,81 @@ pub struct Task {
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub condition: crate::TaskCondition,
+}
+/// Decoder for private stored Task receipts written before condition became public.
+/// Live REST/MCP serializers always use their dedicated DTOs.
+#[derive(Deserialize)]
+struct TaskArchive {
+    pub id: String,
+    pub project_id: String,
+    pub parent_task_id: Option<String>,
+    pub assignee_type: Option<String>,
+    pub assignee_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub task_type: String,
+    pub status: TaskStatus,
+    pub is_automation: bool,
+    pub priority: i64,
+    pub board_position: f64,
+    pub subtask_order: Option<i64>,
+    pub task_state_config: Option<String>,
+    pub merge_config: Option<String>,
+    pub metadata_json: Option<String>,
+    pub plan: Option<String>,
+    pub error_annotation: Option<String>,
+    pub blocked_json: Option<String>,
+    pub failed_json: Option<String>,
+    pub entry_barrier_json: Option<String>,
+    pub review_passed_at: Option<String>,
+    pub archived_at: Option<String>,
+    pub deleted_at: Option<String>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub condition: Option<crate::TaskCondition>,
+}
+impl From<TaskArchive> for Task {
+    fn from(archive: TaskArchive) -> Self {
+        let condition = archive.condition;
+        let mut task = Self {
+            id: archive.id,
+            project_id: archive.project_id,
+            parent_task_id: archive.parent_task_id,
+            assignee_type: archive.assignee_type,
+            assignee_id: archive.assignee_id,
+            title: archive.title,
+            description: archive.description,
+            task_type: archive.task_type,
+            status: archive.status,
+            is_automation: archive.is_automation,
+            priority: archive.priority,
+            board_position: archive.board_position,
+            subtask_order: archive.subtask_order,
+            task_state_config: archive.task_state_config,
+            merge_config: archive.merge_config,
+            metadata_json: archive.metadata_json,
+            plan: archive.plan,
+            error_annotation: archive.error_annotation,
+            blocked_json: archive.blocked_json,
+            failed_json: archive.failed_json,
+            entry_barrier_json: archive.entry_barrier_json,
+            review_passed_at: archive.review_passed_at,
+            archived_at: archive.archived_at,
+            deleted_at: archive.deleted_at,
+            version: archive.version,
+            created_at: archive.created_at,
+            updated_at: archive.updated_at,
+            condition: crate::TaskCondition::default(),
+        };
+        task.condition = condition.unwrap_or_else(|| {
+            crate::map_legacy_condition(&crate::LegacyConditionInput::from(&task))
+        });
+        task
+    }
 }
 
 pub type TaskStatus = String;
@@ -5087,5 +5163,30 @@ impl DomainEventConsumerLag {
             && self.oldest_unprocessed_at.as_deref().is_some_and(old)
             && self.last_advanced_at.as_deref().is_none_or(old)
             && self.initialized_at.as_deref().is_none_or(old)
+    }
+}
+
+impl DomainEvent {
+    /// Decode immutable stored interruption events. The old payload is accepted
+    /// only here at the event archive boundary; new writers emit the typed form.
+    pub fn task_material_blocker(&self) -> Option<crate::MaterialBlocker> {
+        if self.event_type != "task.interruption_changed" {
+            return None;
+        }
+        let payload: serde_json::Value = serde_json::from_str(&self.payload_json).ok()?;
+        if let Some(material) = payload.get("material_blocker") {
+            return serde_json::from_value(material.clone()).ok();
+        }
+        let mut interruption = payload
+            .get("interruption")
+            .filter(|v| !v.is_null())
+            .cloned();
+        if let Some(value) = &mut interruption {
+            crate::strip_attention_delivery_metadata(value);
+        }
+        Some(crate::MaterialBlocker {
+            requires_intervention: payload.get("requires_intervention")?.as_bool()?,
+            interruption,
+        })
     }
 }

@@ -300,12 +300,12 @@ async fn manual_transition_clears_executor_failure_annotation() {
         StatusCode::OK,
     )
     .await;
-    assert!(annotated_response.error_annotation.is_some());
+    assert!(annotated_response.condition.details().diagnostic.is_some());
 
     let moved = transition(&harness, &annotated_response, "in_progress").await;
     assert_eq!(moved.status, "in_progress");
     assert!(
-        moved.error_annotation.is_none(),
+        moved.condition.details().diagnostic.is_none(),
         "manual transition should clear stale executor failure annotation"
     );
 }

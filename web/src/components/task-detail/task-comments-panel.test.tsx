@@ -18,6 +18,7 @@ const originalRevokeObjectURL = URL.revokeObjectURL
 let objectUrlCounter = 0
 
 const task = {
+  condition: { kind: 'clear', details: { failure_kind: null, diagnostic: null, interruption: null, human_wait: false, entry_wait: false } },
   id: 'task-1',
   project_id: 'project-1',
   title: 'Task',

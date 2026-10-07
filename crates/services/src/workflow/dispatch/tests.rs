@@ -33,6 +33,7 @@ fn execution_input_preserves_role_contract_and_user_request() {
 
 fn fake_task(id: &str, title: &str, description: Option<&str>) -> db::Task {
     db::Task {
+        condition: Default::default(),
         id: id.to_string(),
         project_id: "project-1".to_string(),
         parent_task_id: None,

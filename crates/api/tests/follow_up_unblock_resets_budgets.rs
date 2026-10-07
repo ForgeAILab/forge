@@ -120,12 +120,14 @@ async fn human_unblock_resets_review_follow_up_budget_boundary() {
             StatusCode::OK,
         )
         .await;
-        if t.blocked.is_some() {
+        if t.condition.details().interruption.is_some() {
             break t;
         }
     };
     let blocked_metadata = blocked
-        .blocked
+        .condition
+        .details()
+        .interruption
         .as_ref()
         .expect("task should have blocked metadata");
     assert!(
@@ -165,7 +167,8 @@ async fn human_unblock_resets_review_follow_up_budget_boundary() {
         "human unblock should clear review_passed_at before the task is re-claimed"
     );
     assert_eq!(
-        unblocked.blocked, None,
+        unblocked.condition.details().interruption,
+        None,
         "human unblock should clear stale blocked metadata"
     );
 
@@ -473,7 +476,10 @@ async fn poll_until_coder_follow_up_running(app: &Router, task_id: &str) -> Task
                 matches!(execution.role.as_str(), "coder" | "executor")
                     && execution.status == api_types::ExecutionStatus::Running
             });
-        if has_running_coder && task.status == "in_progress" && task.blocked.is_none() {
+        if has_running_coder
+            && task.status == "in_progress"
+            && task.condition.details().interruption.is_none()
+        {
             return task;
         }
         last_task = Some(task);

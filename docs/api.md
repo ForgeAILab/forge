@@ -865,7 +865,7 @@ cancellation or reassignment are silent. A manually resumable terminal run
 with no Task disposition after the bounded settlement grace is surfaced by
 the orphan safety net as an actionable Attention item.
 Intentional Pause/Stop retains manual recovery actions but publishes
-`requires_intervention: false`, so those controls do not trigger autonomous
+`material_blocker.requires_intervention: false`, so those controls do not trigger autonomous
 recovery. A stopped attempt superseded by a running, newer, or explicitly
 linked attempt is not an orphan; admission rechecks this before spending wake
 budget.
@@ -879,28 +879,51 @@ workflow or Task parent, when replaying review, delivery, and cancellation.
 Historical events without a snapshot retain unknown semantics and are not
 reclassified from the current workflow; stored history is not rewritten.
 
-The post-disposition event payload is bounded and carries the current Task
-version:
+The post-disposition event carries the same public typed condition as a Task
+value, alongside its stable material blocker:
 
 ```json
 {
   "task_id": "task-uuid",
   "task_version": 12,
   "task_status": "in_progress",
-  "requires_intervention": true,
-  "interruption": {
-    "source": "blocked",
-    "kind": "executor_failed",
-    "reason": "Executor stopped before completing the Task",
-    "execution_id": "execution-uuid"
+  "condition": {
+    "kind": "failed",
+    "failure": { "kind": "failure", "failure_kind": "executor_failed" },
+    "additional": [],
+    "resume": { "kind": "reconcile" },
+    "since": "2026-10-07T05:00:00Z",
+    "details": {
+      "failure_kind": "executor_failed",
+      "diagnostic": null,
+      "interruption": {
+        "kind": "executor_failed",
+        "reason": "Executor stopped before completing the Task",
+        "created_at": "2026-10-07T05:00:00Z",
+        "execution_id": "execution-uuid"
+      },
+      "human_wait": false,
+      "entry_wait": false
+    }
+  },
+  "material_blocker": {
+    "requires_intervention": true,
+    "interruption": {
+      "source": "failed",
+      "kind": "executor_failed",
+      "reason": "Executor stopped before completing the Task"
+    }
   }
 }
 ```
 
-`interruption` is `null` when cleared. It contains condition evidence only;
-fetch current action offers separately before acting;
-consumers must refresh the current Task and use only actions it still
-advertises.
+The former payload-root `requires_intervention` and `interruption` fields are
+removed. `material_blocker.interruption` is null when cleared or transient;
+reporting execution IDs, condition/step identities and bookkeeping are excluded
+from incident identity. Fetch current offers separately before acting. Historical
+old-shape events remain byte-for-byte unchanged; the stored-event decoder accepts
+that shape at the archive boundary, with no live aliases. Incident identity is
+preserved across this cutover for an unchanged blocker.
 
 `AttentionCategory` also includes `decision_recorded` (recommended action
 `continue_from_decision`). Forge projects it when the *user* records a
@@ -2936,8 +2959,35 @@ normal pagination fields:
 }
 ```
 
+Task detail/list/mutation results and MCP Task values expose `condition`, a
+closed discriminated union. REST removes `error_annotation`, `blocked` and
+`failed`; MCP removes its former `error_annotation`. There are no aliases.
+
+| `condition.kind` | Additional typed fields |
+|---|---|
+| `clear` | `details` |
+| `entering` | `state`, `epoch`, `step_id`, `phase`, `since`, `details` |
+| `running` | `execution_id`, `role`, `epoch`, `since`, `details` |
+| `deferred` | `until`, retry `reason`, `resume`, `details` |
+| `parked` | `primary`, `additional`, `resume`, `since`, `details` |
+| `failed` | `failure`, `additional`, `resume`, `since`, `details` |
+| `settled` | `outcome`, `details` |
+
+`details` contains `failure_kind`, a typed `diagnostic`, typed `interruption`,
+`human_wait` and `entry_wait`, plus an optional `execution_id` reference. Explicit owner parks additionally name typed
+`owner` and `recovery` guidance. Guidance is not an action authorization: use the
+current action offers. Import evidence, migrated metadata and ownership witnesses
+are private. Diagnostic strings are bounded to 1,024 bytes and arrays to 16 entries;
+legacy columns retain the complete original data during dual-write.
+`awaiting_human`, `workflow_health`, `workflow_exception` and offers retain their
+names. The first now agrees between list and detail; entry ownership and waits
+are explicit. A historical failed Review after a newer entry or live continuation
+is evidence, not a current exception. Unsupported stored condition encodings
+project an unknown diagnosis while invariant repair rebuilds them. Legacy
+metadata remains private and does not need to be parsed by public wait readers.
+
 `items` contains `TaskListItemResponse` objects: identity, title/type/status,
-canonical phase, assignment and ordering fields, retry budgets, annotations,
+canonical phase, assignment and ordering fields, retry budgets, typed `condition`,
 workflow health/exception, review/archive timestamps, issue links, version, and
 creation/update timestamps. `execution_observability` is always present and
 contains only `latest_execution_id` (a string or `null`), used to identify stale
@@ -2974,12 +3024,12 @@ and an empty body. Both `200` and `304` send `Cache-Control: private, no-cache`
 and `Vary: Authorization`. Authentication runs before the
 conditional response; this route has no separate project-authorization check
 (pre-existing behavior). Cache pages separately by complete request parameters.
-No list item fields change.
+Task list and detail share the condition contract below.
 
 The conditional path reads one indexed project row and probes the partial
-`task(project_id)` index for non-deleted deferred-dispatch metadata. Both the
-index predicate and the probe guard JSON access with `json_valid(metadata_json)`,
-so malformed legacy metadata does not block migration, task writes or list reads. It does not
+`task(project_id)` index `idx_task_condition_retry_project` for non-deleted
+conditions carrying a recorded retry/deferred wait. The probe and index use
+`condition_json` and its typed presentation, never legacy metadata. It does not
 load Task rows or decorations. Unlike a project-row marker, this probe requires
 no project-wide JSON scan on task writes.
 
@@ -2990,11 +3040,11 @@ Revision coverage for `TaskListItemResponse`:
 | `id`, `project_id` | Task insert/delete; project moves invalidate both projects |
 | `parent_task_id`, `assignee_type`, `assignee_id`, `title`, `task_type`, `status`, `priority`, `board_position`, `subtask_order` | Changes to these Task columns |
 | `canonical_phase` | Task status/type/parent/config updates and Project `workflow_definition` updates |
-| `awaiting_human` | Constant `false` in this list projection; review/metadata-driven waiting is shown in `workflow_health` |
+| `awaiting_human` | Condition changes; current Review, role, entry-hook and workflow facts are captured by the producer; list and detail agree |
 | `role_assignments` | Role assignment insert/update/delete |
 | `remaining_retries`, `retry_limits` | Task-budget ledger insert/update/delete, Task config, Project workflow/settings changes |
-| `error_annotation`, `blocked`, `failed`, `review_passed_at`, `archived_at`, `version`, `created_at`, `updated_at` | Changes to their Task columns (including metadata-only writes without a Task version increment) |
-| `workflow_health`, `workflow_exception` | Task annotations/metadata/config, role assignments, review projection fields, execution projection fields, and Project workflow changes |
+| `condition`, `review_passed_at`, `archived_at`, `version`, `created_at`, `updated_at` | Condition/scalar column changes; a condition-only update advances the list revision without changing the Task version |
+| `workflow_health`, `workflow_exception` | Condition/config, role assignments, review/execution facts, and Project workflow changes |
 | `external_issue_number`, `external_issue_url` | External-link insert/update/delete |
 | `execution_observability.latest_execution_id` | Execution insert/delete and task/creation-order changes |
 

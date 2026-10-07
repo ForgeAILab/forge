@@ -105,7 +105,9 @@ async fn merge_fix_zero_blocks_first_conflict_without_follow_up() {
         "merge_fix = 0 should block at the merge gate without dispatching merge-fix work"
     );
     let blocked = task
-        .blocked
+        .condition
+        .details()
+        .interruption
         .as_ref()
         .expect("task should have blocked metadata");
     assert!(
@@ -485,7 +487,7 @@ async fn poll_until_blocked_metadata(app: &Router, task_id: &str) -> TaskRespons
             StatusCode::OK,
         )
         .await;
-        if task.blocked.is_some() {
+        if task.condition.details().interruption.is_some() {
             return task;
         }
         last_task = Some(task);

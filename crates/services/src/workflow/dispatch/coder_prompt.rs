@@ -286,9 +286,11 @@ fn conflict_handoff_reason(ctx: &AgentDispatchContext) -> Option<String> {
 }
 
 fn merge_failure_kind(ctx: &AgentDispatchContext) -> Option<api_types::FailureKind> {
-    let annotation = ctx.task.error_annotation.as_deref()?;
-    let value = serde_json::from_str::<serde_json::Value>(annotation).ok()?;
-    serde_json::from_value(value.get("type")?.clone()).ok()
+    ctx.task
+        .condition
+        .read()
+        .diagnostic
+        .map(|a| a.annotation_type)
 }
 
 fn last_merge_failed_reason(ctx: &AgentDispatchContext) -> Option<String> {

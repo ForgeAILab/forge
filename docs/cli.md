@@ -691,6 +691,15 @@ Every subcommand respects `--output json` and emits the same payload structure
 the REST API does — the tables shown in the default mode are just a render of
 that JSON.
 
+Task JSON uses the REST condition contract. Task list, get and action results
+remove `error_annotation`, `blocked` and `failed`, and expose `condition.kind`,
+typed reasons/continuation and `condition.details`. Use
+`condition.details.diagnostic` or the computed `workflow_exception` for a
+failure explanation, `condition.details.interruption` for process interruption
+evidence, and `awaiting_human` for the current human wait. The list value now
+agrees with detail. CLI flag names and human table columns do not change.
+
+
 ### Per-run build budget and CPU priority
 
 Every CLI agent process (and its children), native tool command, review CI

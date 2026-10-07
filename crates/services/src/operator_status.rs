@@ -373,7 +373,7 @@ impl OperatorStatusService {
         // points at that step: resolved rows are history, not queue health.
         let (pending,claimed,oldest): (i64,i64,Option<String>) = sqlx::query_as("SELECT COALESCE(SUM(status='pending'),0),COALESCE(SUM(status='claimed'),0),MIN(CASE WHEN status='pending' THEN created_at END) FROM task_step WHERE status IN ('pending','claimed')")
             .fetch_one(self.db.pool()).await?;
-        let (failed,parked): (i64,i64) = sqlx::query_as("SELECT COALESCE(SUM(s.status='failed'),0),COALESCE(SUM(s.status='parked'),0) FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.status IN ('failed','parked') AND t.deleted_at IS NULL AND CASE WHEN json_valid(t.error_annotation) THEN json_extract(t.error_annotation,'$.task_step_id') END=s.id")
+        let (failed,parked): (i64,i64) = sqlx::query_as("SELECT COALESCE(SUM(s.status='failed'),0),COALESCE(SUM(s.status='parked'),0) FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.status IN ('failed','parked') AND t.deleted_at IS NULL AND json_extract(t.condition_json,'$.evidence.presentation.failed_step_id')=s.id")
             .fetch_one(self.db.pool()).await?;
         let (last_error,last_error_at,restart_count): (Option<String>,Option<String>,i64) = sqlx::query_as("SELECT last_error,last_error_at,restart_count FROM worker_health WHERE worker_name='task_steps'")
             .fetch_optional(self.db.pool()).await?.unwrap_or_default();
@@ -532,9 +532,9 @@ impl OperatorStatusService {
 
     async fn blocked_tasks(&self) -> Result<Vec<BlockedTaskSummary>, ServiceError> {
         let rows = sqlx::query(
-            "SELECT id, title, error_annotation, blocked_json, updated_at
+            "SELECT id, title, condition_json, updated_at
              FROM task
-             WHERE (status = 'blocked' OR blocked_json IS NOT NULL)
+             WHERE (status = 'blocked' OR json_extract(condition_json,'$.evidence.presentation.interruption_present') = 1)
                AND deleted_at IS NULL
                AND archived_at IS NULL
                AND status NOT IN ('done', 'cancelled')
@@ -545,12 +545,12 @@ impl OperatorStatusService {
 
         rows.into_iter()
             .map(|row| {
-                let error_annotation: Option<String> = row.try_get("error_annotation")?;
-                let blocked_json: Option<String> = row.try_get("blocked_json")?;
+                let condition =
+                    db::task_condition::decode(&row.try_get::<String, _>("condition_json")?)?;
                 Ok(BlockedTaskSummary {
                     task_id: row.try_get("id")?,
                     title: row.try_get("title")?,
-                    blocked_reason: error_annotation.or_else(|| blocked_reason(&blocked_json)),
+                    blocked_reason: condition.read().operator_reason,
                     blocked_since: Some(row.try_get("updated_at")?),
                 })
             })
@@ -743,7 +743,7 @@ impl OperatorStatusService {
                 t.id AS task_id,
                 t.title,
                 t.status,
-                t.metadata_json,
+                t.condition_json,
                 COUNT(tl.id) AS attempt_count,
                 COALESCE((
                     SELECT b.spent FROM task_budget b
@@ -760,8 +760,8 @@ impl OperatorStatusService {
              LEFT JOIN transition_log tl ON tl.task_id = t.id AND tl.rejection = 1
              WHERE t.deleted_at IS NULL
                AND t.status NOT IN ('done', 'cancelled')
-             GROUP BY t.id, t.title, t.status, t.metadata_json
-             HAVING COUNT(tl.id) >= 1 OR t.metadata_json IS NOT NULL OR execution_spent > 0
+             GROUP BY t.id, t.title, t.status, t.condition_json
+             HAVING COUNT(tl.id) >= 1 OR json_extract(t.condition_json,'$.evidence.presentation.retry_display.reason') IS NOT NULL OR execution_spent > 0
              ORDER BY attempt_count DESC, t.updated_at DESC, t.id ASC",
         )
         .fetch_all(self.db.pool())
@@ -805,24 +805,17 @@ impl OperatorStatusService {
         let mut pressure = Vec::new();
         for row in rows {
             let attempt_count: i64 = row.try_get("attempt_count")?;
-            let metadata_json: Option<String> = row.try_get("metadata_json")?;
-            let metadata = metadata_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                .unwrap_or(Value::Null);
+            let condition =
+                db::task_condition::decode(&row.try_get::<String, _>("condition_json")?)?;
             let task_id: String = row.try_get("task_id")?;
             let execution_retry_count = row.try_get::<i64, _>("execution_spent")?.max(0) as u32;
-            let deferred = metadata.get("deferred_dispatch").and_then(Value::as_object);
+            let deferred = condition.read().retry_display;
             let retry_reason = deferred
-                .and_then(|value| value.get("reason"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+                .as_ref()
+                .and_then(|d| d.reason.clone())
                 .or_else(|| (execution_retry_count > 0).then(|| "execution retry".to_owned()))
                 .or_else(|| (attempt_count > 0).then(|| "transition rejection".to_owned()));
-            let due_time = deferred
-                .and_then(|value| value.get("not_before"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+            let due_time = deferred.and_then(|d| d.not_before);
             let attempt_count = (attempt_count.max(0) as u32)
                 .max(execution_retry_count)
                 .max(u32::from(retry_reason.is_some()));
@@ -923,15 +916,6 @@ fn rate_limit_snapshot(snapshot_json: Option<&str>) -> Option<Value> {
         .or_else(|| config.get("rate_limit_snapshot"))
         .or_else(|| config.get("rate_limit"))
         .cloned()
-}
-
-fn blocked_reason(blocked_json: &Option<String>) -> Option<String> {
-    let value = serde_json::from_str::<Value>(blocked_json.as_deref()?).ok()?;
-    value
-        .get("reason")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("message").and_then(Value::as_str))
-        .map(str::to_owned)
 }
 
 fn effective_policy(
@@ -1051,10 +1035,18 @@ async fn plan_progress(
 
 #[cfg(test)]
 mod tests {
-    //! Fixture tests for operator status payloads. Each test sets up specific DB rows and
-    //! workspace state, calls compute_status(), and asserts the resulting payload shape.
-    //! To add a new fixture: insert rows using the helpers in this module, call compute_status(),
-    //! and assert the fields you care about. Tests are independent (in-memory SQLite per test).
+    async fn sync_fixtures(service: &super::OperatorStatusService) {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM task")
+            .fetch_all(service.db.pool())
+            .await
+            .unwrap();
+        service.db.check_task_conditions_of(&ids).await.unwrap();
+    }
+
+    // Fixture tests for operator status payloads. Each test sets up specific DB rows and
+    // workspace state, calls compute_status(), and asserts the resulting payload shape.
+    // To add a new fixture: insert rows using the helpers in this module, call compute_status(),
+    // and assert the fields you care about. Tests are independent (in-memory SQLite per test).
 
     use super::*;
     use std::fs;
@@ -1126,6 +1118,7 @@ mod tests {
             .record_restart("fixture restart")
             .await
             .unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert_eq!(status.overall_severity, OperatorSeverity::Attention);
         assert!(status
@@ -1413,6 +1406,7 @@ mod tests {
     async fn empty_db_is_healthy() {
         let (_db, service) = test_service().await;
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
@@ -1443,6 +1437,7 @@ mod tests {
         let task_id = insert_task(&db, "todo").await;
         insert_execution(&db, &task_id, "running", None, Utc::now()).await;
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
@@ -1481,6 +1476,7 @@ mod tests {
             .await
             .expect("execution workspace updates");
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.active_executions.len(), 1);
@@ -1499,6 +1495,7 @@ mod tests {
         let (db, service) = test_service().await;
         let task_id = insert_task(&db, "blocked").await;
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.overall_severity, OperatorSeverity::Blocked);
@@ -1541,6 +1538,7 @@ mod tests {
         let service = service.with_daemon_connections(registry);
         service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('upgrade-lag', 'test', 'test', 'test', 'system', 'system', 'system', 'test', '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert!(status
             .recent_errors
@@ -1561,6 +1559,7 @@ mod tests {
         let (db, service) = test_service().await;
         let daemon_id = insert_daemon(&db, "offline").await;
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.overall_severity, OperatorSeverity::Attention);
@@ -1589,6 +1588,7 @@ mod tests {
             .await
             .expect("check constraints restored");
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.overall_severity, OperatorSeverity::Error);
@@ -1605,6 +1605,7 @@ mod tests {
         let cleanup_after = (Utc::now() - Duration::hours(1)).to_rfc3339();
         insert_workspace(&db, &task_id, "ready", &cleanup_after).await;
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.overall_severity, OperatorSeverity::Attention);
@@ -1626,6 +1627,7 @@ mod tests {
         )
         .await;
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.overall_severity, OperatorSeverity::Error);
@@ -1649,6 +1651,7 @@ mod tests {
         )
         .await;
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert!(status.recent_errors.is_empty());
@@ -1663,6 +1666,7 @@ mod tests {
         insert_rejected_transition(&db, &done_task_id).await;
         insert_rejected_transition(&db, &active_task_id).await;
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.retry_pressure.len(), 1);
@@ -1692,6 +1696,7 @@ mod tests {
         )
         .await;
 
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.expect("status computes");
 
         assert_eq!(status.overall_severity, OperatorSeverity::Error);
@@ -1714,6 +1719,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert_eq!(status.overall_severity, OperatorSeverity::Blocked);
         assert_eq!(status.blocked_tasks.len(), 1);
@@ -1733,6 +1739,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        sync_fixtures(&service).await;
         assert!(service
             .compute_status()
             .await
@@ -1758,6 +1765,7 @@ mod tests {
             .await
             .unwrap();
         }
+        sync_fixtures(&service).await;
         assert!(service
             .compute_status()
             .await
@@ -1780,6 +1788,7 @@ mod tests {
                 .bind(consumer).bind(&old).execute(db.pool()).await.unwrap();
         }
         sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 1 WHERE consumer_name = 'attention_projection'").execute(db.pool()).await.unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         let stalled = status
             .event_consumers
@@ -1807,6 +1816,7 @@ mod tests {
                 && c.oldest_unprocessed_at.is_none()
                 && c.last_advanced_at.as_deref() == Some(old.as_str())));
         sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 10, updated_at = ? WHERE consumer_name = 'attention_projection'").bind(now.to_rfc3339()).execute(db.pool()).await.unwrap();
+        sync_fixtures(&service).await;
         let recovered = service.compute_status().await.unwrap();
         assert_eq!(recovered.overall_severity, OperatorSeverity::Healthy);
         assert!(recovered.recent_errors.is_empty());
@@ -1859,6 +1869,7 @@ mod tests {
             .report_error("persistent worker failure")
             .await
             .unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert!(status
             .recent_errors
@@ -1870,6 +1881,7 @@ mod tests {
             .run_once(10)
             .await
             .unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert!(!status
             .recent_errors
@@ -1882,6 +1894,7 @@ mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert!(status.recent_errors.is_empty());
         assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
@@ -1908,6 +1921,7 @@ mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         let issue = status
             .recent_errors
@@ -1935,6 +1949,7 @@ mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert!(status
             .recent_errors
@@ -1945,6 +1960,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert!(status.recent_errors.is_empty());
         assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
@@ -1996,6 +2012,7 @@ mod tests {
         service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Attention]);
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('processed', 'test', 'test', 'test', 'system', 'system', 'system', 'test', '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('attention_projection', 1, '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert_eq!(status.event_consumers.len(), 1);
         let consumer = &status.event_consumers[0];
@@ -2016,6 +2033,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert_eq!(status.event_consumers[0].lag, 1);
         assert!(!status.event_consumers[0].stalled);
@@ -2063,6 +2081,7 @@ mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         let worker = &status.event_consumers[0];
         assert_eq!(worker.dead_letter_count, 7);
@@ -2076,6 +2095,7 @@ mod tests {
             .iter()
             .map(|item| item.id.clone())
             .collect();
+        sync_fixtures(&service).await;
         let again = service.compute_status().await.unwrap();
         assert_eq!(
             again.event_consumers[0]
@@ -2112,6 +2132,7 @@ mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert_eq!(status.event_consumers[0].dead_letter_count, 1);
         assert_eq!(status.event_consumers[0].recent_dead_letters[0].attempts, 8);
@@ -2131,6 +2152,7 @@ mod tests {
             )
             .await
             .unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert_eq!(status.event_consumers[0].dead_letter_count, 0);
         assert!(status.event_consumers[0].recent_dead_letters.is_empty());
@@ -2173,6 +2195,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
+        sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
         assert_eq!(status.task_steps.worker_name, "task_steps");
         assert_eq!(status.task_steps.pending, 1);

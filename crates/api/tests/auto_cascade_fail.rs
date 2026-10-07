@@ -130,7 +130,9 @@ async fn failed_executor_does_not_auto_cascade_to_review() {
     .await;
     assert_eq!(task.status, "in_progress".to_owned());
     let blocked = task
-        .blocked
+        .condition
+        .details()
+        .interruption
         .as_ref()
         .expect("task should have blocked metadata");
     assert_eq!(
@@ -138,7 +140,7 @@ async fn failed_executor_does_not_auto_cascade_to_review() {
         Some(api_types::FailureKind::InternalCommandFailed)
     );
     assert!(
-        task.error_annotation.is_some(),
+        task.condition.details().diagnostic.is_some(),
         "blocked task records error annotation"
     );
 

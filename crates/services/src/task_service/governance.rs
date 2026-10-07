@@ -1730,6 +1730,7 @@ mod tests {
 
     fn minimal_task(id: &str, project_id: &str) -> db::Task {
         db::Task {
+            condition: Default::default(),
             id: id.to_owned(),
             project_id: project_id.to_owned(),
             parent_task_id: None,

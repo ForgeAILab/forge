@@ -1,7 +1,7 @@
 //! Task condition offers are derived from values, never from stored action lists.
 use api_types::{
-    ActionAuthority, Actor, FailureKind, Offer, StateKind, TaskAction, TaskAnnotation,
-    WorkflowDefinition, WorkflowTrigger,
+    ActionAuthority, Actor, FailureKind, Offer, StateKind, TaskAction, WorkflowDefinition,
+    WorkflowTrigger,
 };
 use db::{
     Execution, ExecutionStatus, Review, ReviewStatus, Task, TaskRoleAssignment, TransitionLog,
@@ -65,19 +65,17 @@ impl TaskSnapshot {
     }
 
     pub fn annotation(&self) -> Option<api_types::TaskBlockingAnnotation> {
-        match self
-            .task
-            .error_annotation
-            .as_deref()
-            .and_then(|raw| serde_json::from_str(raw).ok())
-        {
-            Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
-            _ => None,
-        }
+        self.task.condition.read().diagnostic
     }
 }
 
 pub fn task_condition(task: &Task) -> Option<FailureKind> {
+    task.condition.read().failure_kind
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_task_condition(task: &Task) -> Option<FailureKind> {
+    use api_types::TaskAnnotation;
     if let Some(raw) = task.failed_json.as_deref() {
         return Some(
             serde_json::from_str::<serde_json::Value>(raw)
@@ -120,6 +118,7 @@ pub fn task_condition(task: &Task) -> Option<FailureKind> {
 pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     use ActionAuthority::{Owner, ProjectAgent};
     let task = &snapshot.task;
+    let condition_read = task.condition.read();
     let workflow = &snapshot.workflow;
     let Some(state) = workflow
         .states
@@ -176,22 +175,12 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         .copied()
         .any(|execution| eligible_resume(&execution));
     let condition = snapshot.condition();
-    let barrier = task
-        .entry_barrier_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    let barrier = condition_read.entry.clone();
     let barrier_blocked = barrier
         .as_ref()
         .is_some_and(|barrier| barrier["status"] == "blocked");
-    let metadata = task
-        .metadata_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .unwrap_or_default();
     let held = condition == Some(FailureKind::ManualStop);
-    let queued = metadata
-        .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
-        .is_some();
+    let queued = condition_read.queued_command;
     let implementation_candidate = snapshot.executions.iter().any(|execution| {
         execution.status == ExecutionStatus::Completed
             && (execution.task_id == task.id || snapshot.coordination_root)
@@ -226,7 +215,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             .latest_review
             .as_ref()
             .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-            || (metadata["awaiting_human"] == true
+            || (condition_read.explicit_human_wait
                 && (task.status != "review" || snapshot.latest_review.is_none()))
             || (task.status == "review"
                 && snapshot.latest_review.is_none()
@@ -443,7 +432,9 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     if !held
         && !running_live
         && (queued
-            || (snapshot.wait_cause.is_some() && condition.is_none() && task.failed_json.is_none()))
+            || (snapshot.wait_cause.is_some()
+                && condition.is_none()
+                && !condition_read.hard_failure))
     {
         offer(
             TaskAction::Hold { reason: None },
@@ -456,7 +447,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     if dependency_cancelled {
         return offers;
     }
-    if task.failed_json.is_some() {
+    if condition_read.hard_failure {
         if workflow
             .states
             .iter()
@@ -511,20 +502,19 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     let placement_wait = snapshot.wait_cause.is_some() && !decision_ready
         || condition.is_none()
             && ((snapshot.project_paused && !decision_ready)
-                || metadata.get("environment_wait").is_some()
-                || metadata.get("deferred_dispatch").is_some_and(|deferred| {
-                    deferred["kind"]
-                        .as_str()
-                        .is_some_and(|kind| kind.starts_with("environment_"))
-                })
-                || crate::deferred_dispatch::current_dispatch_disposition(task).is_some_and(
-                    |disposition| {
+                || condition_read.environment_recorded
+                || condition_read
+                    .retry_kind
+                    .as_deref()
+                    .is_some_and(|kind| kind.starts_with("environment_"))
+                || condition_read
+                    .current_refusal(task.version)
+                    .is_some_and(|disposition| {
                         matches!(
                             disposition.capability.as_str(),
                             "machine_capacity" | "project_capacity"
                         )
-                    },
-                ));
+                    }));
     if placement_wait {
         if !queued && snapshot.wait_cause.is_none() {
             offer(
@@ -545,13 +535,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     if matches!(
         condition,
         Some(FailureKind::DispatchFailed | FailureKind::WorkflowLoop | FailureKind::CascadeFailed)
-    ) && metadata["placement_refusal"]["annotation"]
-        == task
-            .error_annotation
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .unwrap_or_default()
-        && metadata.get("placement_refusal").is_some()
+    ) && condition_read.placement_matches_diagnostic
     {
         offer(
             TaskAction::retry(),
@@ -744,7 +728,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             return offers;
         }
     }
-    if metadata["awaiting_human_reason"] == "pull_request_merge" {
+    if condition_read.external_merge {
         offer(
             retry(None, None, None),
             &[],
@@ -1332,13 +1316,10 @@ pub async fn load_snapshot(
         .find(|state| state.name == task.status)
         .and_then(crate::workflow::effective_role);
     let blocked_id = task
-        .error_annotation
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<TaskAnnotation>(raw).ok())
-        .and_then(|annotation| match annotation {
-            TaskAnnotation::Blocking(annotation) => annotation.blocked_execution_id,
-            _ => None,
-        });
+        .condition
+        .read()
+        .diagnostic
+        .and_then(|a| a.blocked_execution_id);
     let executions = crate::task_service::action_resolver::list_execution_action_authority(
         db,
         &task.id,
@@ -1477,9 +1458,14 @@ pub async fn load_snapshot(
     let planning_approval_ready = if task.status != "planning" {
         true
     } else {
-        let metadata = db::TaskMetadata::parse(task.metadata_json.as_deref()).ok();
-        let published = metadata.as_ref().is_some_and(|metadata| {
-            metadata.extra.get("awaiting_human_reason") == Some(&serde_json::json!("plan_review"))
+        let published = task.condition.reasons().any(|r| {
+            matches!(
+                r,
+                db::ParkReason::HumanDecision {
+                    boundary: db::HumanBoundary::PlanReview,
+                    ..
+                }
+            )
         });
         let optional_unassigned = workflow
             .states
@@ -1683,10 +1669,10 @@ async fn owner_supports_resume(
         return Ok(true);
     };
     let Some(execution_id) = task
-        .error_annotation
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<api_types::TaskBlockingAnnotation>(raw).ok())
-        .and_then(|annotation| annotation.blocked_execution_id)
+        .condition
+        .read()
+        .diagnostic
+        .and_then(|a| a.blocked_execution_id)
         .or_else(|| {
             if logical_thread {
                 executions
@@ -1793,11 +1779,18 @@ pub(crate) fn action_test_evidence_dir() -> std::path::PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    fn projected_actions(snapshot: &super::TaskSnapshot) -> Vec<api_types::Offer> {
+        let mut projected = snapshot.clone();
+        projected.task.condition =
+            db::map_legacy_condition(&db::LegacyConditionInput::from(&projected.task));
+        super::available_actions(&projected)
+    }
+
     use super::*;
     use serde_json::json;
 
-    pub(super) fn snapshot(state: &str, kind: Option<FailureKind>) -> TaskSnapshot {
+    pub(crate) fn snapshot(state: &str, kind: Option<FailureKind>) -> TaskSnapshot {
         let mut task: Task = serde_json::from_value(json!({
             "id":"task", "project_id":"project", "parent_task_id":null, "assignee_type":"agent", "assignee_id":"agent", "title":"Fixture", "description":null, "task_type":"task", "status":state, "is_automation":false, "priority":0, "board_position":0.0, "subtask_order":null, "task_state_config":null, "merge_config":null, "metadata_json":null, "plan":null, "error_annotation":null, "blocked_json":null, "failed_json":null, "entry_barrier_json":null, "review_passed_at":null, "archived_at":null, "deleted_at":null, "version":1, "created_at":"2026-10-02T00:00:00Z", "updated_at":"2026-10-02T00:00:00Z"
         })).expect("Task fixture");
@@ -1844,7 +1837,7 @@ mod tests {
                 false,
             ));
             snapshot.task.metadata_json = Some(json!({"awaiting_human":true}).to_string());
-            let offers = available_actions(&snapshot);
+            let offers = projected_actions(&snapshot);
             assert!(!offers.iter().any(|offer| matches!(
                 offer.reason.as_str(),
                 "gate_waiting_for_decision" | "human_review_decision"
@@ -1881,7 +1874,7 @@ mod tests {
             ExecutionStatus::Completed,
             false,
         )];
-        let offers = available_actions(&snapshot);
+        let offers = projected_actions(&snapshot);
         let retries = offers
             .iter()
             .filter(|offer| offer.action.verb() == "retry")
@@ -1916,13 +1909,13 @@ mod tests {
             .as_mut()
             .unwrap()
             .requires_user_approval = Some(true);
-        assert!(available_actions(&snapshot)
+        assert!(projected_actions(&snapshot)
             .iter()
             .any(|offer| offer.reason == "gate_waiting_for_decision"));
         snapshot.task.metadata_json = Some(json!({"awaiting_human":true}).to_string());
         for status in [ReviewStatus::Running, ReviewStatus::Passed] {
             snapshot.latest_review = Some(super::condition_matrix::review(status));
-            assert!(!available_actions(&snapshot).iter().any(|offer| matches!(
+            assert!(!projected_actions(&snapshot).iter().any(|offer| matches!(
                 offer.reason.as_str(),
                 "human_review_decision" | "gate_waiting_for_decision"
             )));
@@ -1937,7 +1930,7 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(
-            available_actions(&snapshot)
+            projected_actions(&snapshot)
                 .iter()
                 .map(|offer| offer.action.verb())
                 .collect::<Vec<_>>(),
@@ -1958,7 +1951,7 @@ mod tests {
             json!({crate::deferred_dispatch::QUEUED_RECOVERY_KEY:{"action":{"verb":"retry"}}})
                 .to_string(),
         );
-        let offers = available_actions(&snapshot);
+        let offers = projected_actions(&snapshot);
         assert!(offers
             .iter()
             .any(|offer| offer.reason == "dispatch_wait" && offer.action.verb() == "hold"));
@@ -1972,7 +1965,7 @@ mod tests {
         snapshot.wait_cause = Some(api_types::DeniedBy::ProjectPaused(
             "environment_not_ready".to_owned(),
         ));
-        let offers = available_actions(&snapshot);
+        let offers = projected_actions(&snapshot);
         // A Hold would overwrite the exhausted-budget condition; nothing is
         // waiting to be dispatched.
         assert!(!offers.iter().any(|offer| offer.action.verb() == "hold"));
@@ -1994,7 +1987,7 @@ mod tests {
     #[test]
     fn review_retry_needs_a_completed_implementation_candidate() {
         let mut snapshot = snapshot("review", None);
-        assert!(!available_actions(&snapshot)
+        assert!(!projected_actions(&snapshot)
             .iter()
             .any(|offer| offer.action.verb() == "retry"));
         for role in ["planner", "reviewer", "auditor", "interactive"] {
@@ -2005,7 +1998,7 @@ mod tests {
                 false,
             )];
             assert!(
-                !available_actions(&snapshot)
+                !projected_actions(&snapshot)
                     .iter()
                     .any(|offer| offer.action.verb() == "retry"),
                 "{role}"
@@ -2017,7 +2010,7 @@ mod tests {
             ExecutionStatus::Completed,
             false,
         )];
-        assert!(available_actions(&snapshot)
+        assert!(projected_actions(&snapshot)
             .iter()
             .any(|offer| offer.reason == "review_checks_retry"));
     }
@@ -2030,7 +2023,7 @@ mod tests {
             FailureKind::InternalCommandFailed,
         ] {
             assert!(
-                !available_actions(&snapshot("in_progress", Some(kind)))
+                !projected_actions(&snapshot("in_progress", Some(kind)))
                     .iter()
                     .any(|offer| offer.action.verb() == "restart"),
                 "{kind:?}"
@@ -2077,8 +2070,8 @@ mod tests {
         for state in states {
             for condition in conditions {
                 let snapshot = snapshot(state, condition);
-                let offers = available_actions(&snapshot);
-                assert_eq!(offers, available_actions(&snapshot));
+                let offers = projected_actions(&snapshot);
+                assert_eq!(offers, projected_actions(&snapshot));
                 let mut verbs = std::collections::HashSet::new();
                 for offer in offers {
                     assert!(
@@ -2107,7 +2100,7 @@ mod tests {
     #[test]
     fn old_stored_lists_are_ignored_including_non_enum_strings() {
         let mut original = snapshot("in_progress", Some(FailureKind::ExecutorFailed));
-        let expected = available_actions(&original);
+        let expected = projected_actions(&original);
         let mut annotation: serde_json::Value =
             serde_json::from_str(original.task.error_annotation.as_deref().unwrap()).unwrap();
         annotation["recovery_actions"] = json!([
@@ -2122,7 +2115,7 @@ mod tests {
             .get("recovery_actions")
             .is_none());
         original.task.error_annotation = Some(annotation.to_string());
-        assert_eq!(expected, available_actions(&original));
+        assert_eq!(expected, projected_actions(&original));
     }
 
     #[test]
@@ -2137,12 +2130,12 @@ mod tests {
             ] {
                 let mut snapshot = snapshot(state, kind);
                 snapshot.caller = ActionCaller::default();
-                assert!(available_actions(&snapshot).is_empty());
+                assert!(projected_actions(&snapshot).is_empty());
                 snapshot.caller = ActionCaller {
                     project_agent: true,
                     ..ActionCaller::default()
                 };
-                for offer in available_actions(&snapshot) {
+                for offer in projected_actions(&snapshot) {
                     assert!(!matches!(
                         offer.action,
                         TaskAction::Approve {
@@ -2160,7 +2153,7 @@ mod tests {
         let mut snapshot = snapshot("review", Some(FailureKind::BeforeWorkHookFailed));
         snapshot.task.entry_barrier_json =
             Some(json!({"status":"blocked","state":"review"}).to_string());
-        let offers = available_actions(&snapshot);
+        let offers = projected_actions(&snapshot);
         assert!(offers
             .iter()
             .any(|offer| offer.reason == "entry_barrier_blocked"));
@@ -2170,7 +2163,7 @@ mod tests {
         snapshot.task.entry_barrier_json = None;
         snapshot.entry_hooks_running = true;
         assert_eq!(
-            available_actions(&snapshot).len(),
+            projected_actions(&snapshot).len(),
             1,
             "only cancellation while entry checks run"
         );
@@ -2184,7 +2177,7 @@ mod tests {
             false,
         ));
         snapshot.latest_review = Some(super::condition_matrix::review(ReviewStatus::Failed));
-        let offers = available_actions(&snapshot);
+        let offers = projected_actions(&snapshot);
         assert_eq!(
             offers
                 .iter()
@@ -2200,6 +2193,20 @@ mod tests {
 
 #[cfg(test)]
 mod condition_matrix {
+    fn projected_actions(snapshot: &super::TaskSnapshot) -> Vec<api_types::Offer> {
+        let mut projected = snapshot.clone();
+        projected.task.condition =
+            db::map_legacy_condition(&db::LegacyConditionInput::from(&projected.task));
+        let actual = super::available_actions(&projected);
+        let expected =
+            super::legacy::available_actions(&super::legacy::TaskSnapshot::from(&projected));
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(expected).unwrap(),
+            "old action offers must agree for each matrix condition"
+        );
+        actual
+    }
     use super::*;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -2484,7 +2491,7 @@ mod condition_matrix {
                                         advance_target: None,
                                         entry_hooks_running: false,
                                     };
-                                    let offers = available_actions(&snapshot);
+                                    let offers = projected_actions(&snapshot);
                                     let verbs: Vec<String> = offers
                                         .iter()
                                         .map(|offer| {
@@ -2551,5 +2558,136 @@ mod condition_matrix {
             }
         }
         std::fs::write(action_test_evidence_dir().join("pure-matrix-dead.tsv"), out).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod legacy {
+    include!("task_actions_legacy.rs");
+    impl From<&super::TaskSnapshot> for TaskSnapshot {
+        fn from(s: &super::TaskSnapshot) -> Self {
+            Self {
+                task: s.task.clone(),
+                workflow: s.workflow.clone(),
+                executions: s.executions.clone(),
+                latest_review: s.latest_review.clone(),
+                role_assignments: s.role_assignments.clone(),
+                transition_logs: s.transition_logs.clone(),
+                budget_spent: s.budget_spent.clone(),
+                recovery_budget_limit: s.recovery_budget_limit,
+                caller: ActionCaller {
+                    owner: s.caller.owner,
+                    assigned_agent: s.caller.assigned_agent,
+                    project_agent: s.caller.project_agent,
+                    reviewer: s.caller.reviewer,
+                },
+                has_agent: s.has_agent,
+                dependencies_satisfied: s.dependencies_satisfied,
+                owner_supports_resume: s.owner_supports_resume,
+                coordination_root: s.coordination_root,
+                owner_disconnected: s.owner_disconnected,
+                project_paused: s.project_paused,
+                wait_cause: s.wait_cause.clone(),
+                action_agent_id: s.action_agent_id.clone(),
+                planning_approval_ready: s.planning_approval_ready,
+                advance_target: s.advance_target.clone(),
+                entry_hooks_running: s.entry_hooks_running,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod condition_reader_parity {
+    use super::*;
+    use serde_json::{json, Value};
+    #[test]
+    fn all_condition_kinds_and_actions_match_the_legacy_reader() {
+        let conditions = [
+            ("clear", None, None, None, None),
+            ("entering", None, None, None, None),
+            ("running", None, None, None, None),
+            (
+                "deferred",
+                None,
+                None,
+                None,
+                Some(
+                    json!({"deferred_dispatch":{"not_before":"2099-01-01T00:00:00Z","reason":"retry","target_state":"in_progress"}}),
+                ),
+            ),
+            (
+                "parked",
+                Some(
+                    json!({"type":"manual_stop","blocking_reason":"held","blocked_by":"user","blocked_at":null,"blocked_execution_id":null,"artifact":null,"message":"held"}),
+                ),
+                None,
+                None,
+                None,
+            ),
+            (
+                "failed",
+                None,
+                None,
+                Some(
+                    json!({"kind":"executor_failed","reason":"failure","created_at":"2026-10-02T00:00:00Z"}),
+                ),
+                None,
+            ),
+            ("settled", None, None, None, None),
+        ];
+        for (kind, a, b, f, m) in conditions {
+            let mut s = super::tests::snapshot("in_progress", None);
+            s.task.error_annotation = a.map(|v| v.to_string());
+            s.task.blocked_json = b.map(|v: Value| v.to_string());
+            s.task.failed_json = f.map(|v| v.to_string());
+            s.task.metadata_json = m.map(|v| v.to_string());
+            let mut condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&s.task));
+            if kind == "entering" {
+                condition = db::TaskCondition::Entering {
+                    state: s.task.status.clone(),
+                    epoch: 1,
+                    step_id: "step".into(),
+                    phase: "post_commit_hooks".into(),
+                    since: s.task.created_at.clone(),
+                    evidence: condition.evidence().clone(),
+                };
+            }
+            if kind == "running" {
+                condition = db::TaskCondition::Running {
+                    execution_id: "run".into(),
+                    role: "coder".into(),
+                    epoch: 1,
+                    since: s.task.created_at.clone(),
+                    evidence: condition.evidence().clone(),
+                };
+            }
+            if kind == "settled" {
+                condition = db::TaskCondition::Settled {
+                    outcome: db::TerminalOutcome::Completed,
+                    evidence: condition.evidence().clone(),
+                };
+            }
+            s.task.condition = condition;
+            assert_eq!(
+                serde_json::to_value(available_actions(&s)).unwrap(),
+                serde_json::to_value(legacy::available_actions(&legacy::TaskSnapshot::from(&s)))
+                    .unwrap(),
+                "{kind}"
+            );
+            assert_eq!(s.condition(), legacy_task_condition(&s.task), "{kind}");
+            let expected = available_actions(&s);
+            s.task.error_annotation =
+                Some(json!({"type":"workspace_error","blocking_reason":"poison"}).to_string());
+            s.task.blocked_json = Some("{}".into());
+            s.task.failed_json = Some("{}".into());
+            s.task.metadata_json = None;
+            assert_eq!(
+                serde_json::to_value(available_actions(&s)).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{kind}: legacy columns are not reader inputs"
+            );
+        }
     }
 }

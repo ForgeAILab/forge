@@ -526,135 +526,7 @@ impl TaskService {
     /// Resolve human-readiness from the same Task snapshot whose version will
     /// be returned to the caller.
     pub async fn is_task_awaiting_human(&self, task: &Task) -> Result<bool> {
-        if task.blocked_json.is_some() {
-            return Ok(true);
-        }
-        if db::TaskStepRepo::entry_hooks_pending(&*self.db, &task.id).await? {
-            // The entry's checks (CI, before-work scripts, dispatch) are
-            // still queued or running in its hook step. A gate decision
-            // taken now would act on the previous Review, not this entry's.
-            return Ok(false);
-        }
-        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-            ServiceError::invalid_operation(format!("invalid task metadata: {error}"))
-        })?;
-        if metadata
-            .extra
-            .get("awaiting_human")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(true);
-        }
-        if task.status == crate::workflow::default_states::REVIEW {
-            let latest_review = ReviewRepo::list_by_task(&*self.db, &task.id)
-                .await?
-                .into_iter()
-                .max_by_key(|review| review.attempt_number);
-            if latest_review
-                .as_ref()
-                .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
-            {
-                return Ok(true);
-            }
-            // A *failed* review parked in `review` is also waiting on a
-            // person, and nothing said so. The dispatcher cannot re-dispatch
-            // a reviewer while the latest review is `Failed`
-            // (`reviewer_dispatch_ready` requires a `Running` review), so the
-            // Task sits reporting "Waiting for reviewer dispatch" at `info`
-            // severity with `awaiting_human: false` while only a human
-            // `retry_hook` can move it.
-            if latest_review
-                .as_ref()
-                .is_some_and(|review| review.status == ReviewStatus::Failed)
-                && sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
-                )
-                .bind(&task.id)
-                .fetch_one(self.db.pool())
-                .await?
-                    == 0
-            {
-                return Ok(true);
-            }
-        }
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &Actor::system(SystemComponent::General),
-        );
-        let Some(state) = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-        else {
-            return Ok(false);
-        };
-        if task.status == crate::workflow::default_states::PLANNING {
-            let Some(role_name) = state.role.as_deref() else {
-                return Ok(false);
-            };
-            let assignment =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                    .await?;
-            return Ok(assignment.as_ref().is_some_and(|assignment| {
-                assignment.assignee_type == Some(AssigneeKind::User)
-                    && assignment.assignee_id.is_some()
-            }));
-        }
-        if state.kind != api_types::StateKind::Gate {
-            return Ok(false);
-        }
-        let transition_log = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
-        let entered_at = transition_log
-            .iter()
-            .rev()
-            .find(|entry| entry.to_state == task.status)
-            .map(|entry| entry.created_at.as_str())
-            .unwrap_or(task.created_at.as_str());
-        let has_decision_since_entry =
-            gate_decision_since_entry(&transition_log, &task.status, entered_at);
-        if let Some(gate_config) = state
-            .gate_config
-            .as_ref()
-            .filter(|gate_config| gate_config.requires_user_approval())
-        {
-            if gate_config.optional_when_unassigned() {
-                let Some(role_name) = state.role.as_deref() else {
-                    return Ok(false);
-                };
-                let assignment =
-                    TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
-                        .await?;
-                let assigned = assignment.as_ref().is_some_and(|assignment| {
-                    assignment.assignee_type.is_some() && assignment.assignee_id.is_some()
-                });
-                if !assigned {
-                    return Ok(false);
-                }
-            }
-            return Ok(!has_decision_since_entry);
-        }
-
-        let Some(role_name) = state.role.as_deref() else {
-            return Ok(false);
-        };
-
-        let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?;
-        let Some(assignment) = role_assignments
-            .iter()
-            .find(|assignment| assignment.role_name == role_name)
-        else {
-            return Ok(false);
-        };
-        if assignment.assignee_type != Some(AssigneeKind::User) {
-            return Ok(false);
-        }
-
-        Ok(!has_decision_since_entry)
+        Ok(task.condition.read().human_wait)
     }
 
     pub async fn executor_attempt_count(&self, task_id: &str) -> Result<i64> {
@@ -1345,6 +1217,7 @@ mod tests {
         // a Task stuck in `merging` advertising no way out at all.
         let now = db::now_rfc3339();
         let mut task = Task {
+            condition: Default::default(),
             id: "task".into(),
             project_id: "project".into(),
             parent_task_id: None,
@@ -1427,6 +1300,7 @@ mod tests {
     fn blocked_free_task(status: &str) -> Task {
         let now = db::now_rfc3339();
         Task {
+            condition: Default::default(),
             id: "task".into(),
             project_id: "project".into(),
             parent_task_id: None,
@@ -1534,6 +1408,7 @@ mod audit_tests {
     }
 }
 
+#[cfg(test)]
 fn gate_decision_since_entry(entries: &[db::TransitionLog], state: &str, entered_at: &str) -> bool {
     entries.iter().any(|entry| {
         entry.from_state == state

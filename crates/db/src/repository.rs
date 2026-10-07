@@ -1,5 +1,6 @@
 use crate::{models::*, pagination::*, DbError, Result};
 use async_trait::async_trait;
+use sha2::Digest;
 use sqlx::{Sqlite, Transaction};
 
 #[async_trait]
@@ -26,7 +27,6 @@ pub trait TaskRepo: Send + Sync {
         project_id: &str,
         project_states_json: &str,
         subtask_states_json: &str,
-        blocking_kinds_json: &str,
     ) -> Result<(i64, i64, i64)>;
     /// One grouped statement for a JSON object mapping Project IDs to state maps.
     /// Revision fences come from the same SQLite snapshot as the counts.
@@ -34,7 +34,6 @@ pub trait TaskRepo: Send + Sync {
         &self,
         project_states_json: &str,
         subtask_states_json: &str,
-        blocking_kinds_json: &str,
     ) -> Result<Vec<ProjectSlotCounts>>;
     /// List non-deleted Tasks in a Project whose metadata contains `key`.
     /// Recovery uses this narrow query for durable claims that must be found
@@ -926,35 +925,13 @@ impl CreateDomainEvent {
     /// so attempt-level failures can remain audit-only without losing the
     /// action-required boundary.
     pub fn task_interruption_changed(task: &Task) -> Self {
-        let failed = task
-            .failed_json
-            .as_deref()
-            .map(parse_event_json_object)
-            .unwrap_or_default();
-        let blocked = task
-            .blocked_json
-            .as_deref()
-            .map(parse_event_json_object)
-            .unwrap_or_default();
-        let annotation = task
-            .error_annotation
-            .as_deref()
-            .map(parse_event_json_object)
-            .unwrap_or_default();
-        let requires_intervention = task_interruption_requires_intervention(
-            task.error_annotation.as_deref(),
-            task.blocked_json.as_deref(),
-            task.failed_json.as_deref(),
-        );
-        let interruption = if task.failed_json.is_some() {
-            Some(event_interruption_details("failed", &failed))
-        } else if task.blocked_json.is_some() {
-            Some(event_interruption_details("blocked", &blocked))
-        } else if task.error_annotation.is_some() {
-            Some(event_interruption_details("annotation", &annotation))
-        } else {
-            None
-        };
+        let material = crate::task_condition::material_blocker(&task.condition);
+        let condition = task.condition.public();
+        let material_digest =
+            sha2::Sha256::digest(serde_json::to_vec(&material).expect("material serializes"))
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
         let event_id = crate::new_uuid_v4();
 
         Self {
@@ -970,15 +947,15 @@ impl CreateDomainEvent {
             causation_id: None,
             causation_depth: 0,
             dedupe_key: Some(format!(
-                "task-interruption-update:{}:{}",
-                task.id, task.version
+                "task-interruption-update:{}:{}:{}",
+                task.id, task.version, material_digest
             )),
             payload_json: serde_json::json!({
                 "task_id": interruption_bounded_text(&task.id, 128),
                 "task_version": task.version,
                 "task_status": interruption_bounded_text(&task.status, 128),
-                "requires_intervention": requires_intervention,
-                "interruption": interruption,
+                "condition": condition,
+                "material_blocker": material,
             })
             .to_string(),
             created_at: task.updated_at.clone(),

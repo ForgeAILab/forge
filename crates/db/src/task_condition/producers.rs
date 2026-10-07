@@ -11,6 +11,8 @@ use super::*;
 pub enum ConditionChange {
     /// The five legacy columns only.
     Legacy,
+    /// Review or assignment changed the current human decision/work boundary.
+    Human,
     /// Status, status epoch, an entry receipt, parentage or sibling order.
     /// Re-reads the entry, its hooks step and its execution binding, and
     /// refreshes the parent's child witnesses when the parent waits on them.
@@ -55,7 +57,7 @@ pub(crate) async fn derive(
 ) -> Result<Option<Produced>> {
     use ConditionChange as Change;
     let families = match change {
-        Change::Full | Change::Entry => Families::ENTRY,
+        Change::Full | Change::Entry | Change::Human => Families::ENTRY,
         Change::Hooks => Families::HOOKS,
         Change::Execution => Families::EXECUTION,
         _ => Families::ROW,
@@ -189,7 +191,7 @@ pub(crate) async fn workflow_changed(
             .await?;
     for status in statuses
         .iter()
-        .filter(|status| before.differs(&after, status))
+        .filter(|status| before.differs(&after, status) || previous_workflow != workflow)
     {
         let tasks: Vec<String> =
             sqlx::query_scalar("SELECT id FROM task WHERE project_id=? AND status=?")

@@ -2347,7 +2347,7 @@ impl CoordinationToolProvider {
                 sqlx::query(
                     "SELECT id, parent_task_id, subtask_order, version,
                             title, status, priority, assignee_type, assignee_id,
-                            blocked_json, error_annotation, failed_json
+                            condition_json
                      FROM task WHERE project_id = ? AND deleted_at IS NULL
                      ORDER BY updated_at DESC, id DESC LIMIT ?",
                 )
@@ -2360,7 +2360,7 @@ impl CoordinationToolProvider {
             (CanonicalScopeType::Task, _) => sqlx::query(
                 "SELECT id, parent_task_id, subtask_order, version,
                         title, status, priority, assignee_type, assignee_id,
-                        blocked_json, error_annotation, failed_json
+                        condition_json
                      FROM task WHERE id = ? AND deleted_at IS NULL LIMIT 1",
             )
             .bind(&scope.scope_id)
@@ -2467,21 +2467,8 @@ impl CoordinationToolProvider {
             .map(|row| {
                 let id = row.try_get::<String, _>("id").unwrap_or_default();
                 let depends_on = dependencies.remove(&id).unwrap_or_default();
-                let blocked = row
-                    .try_get::<Option<String>, _>("blocked_json")
-                    .ok()
-                    .flatten()
-                    .map(|value| truncate(&value, 2_048));
-                let error = row
-                    .try_get::<Option<String>, _>("error_annotation")
-                    .ok()
-                    .flatten()
-                    .map(|value| truncate(&value, 2_048));
-                let failed = row
-                    .try_get::<Option<String>, _>("failed_json")
-                    .ok()
-                    .flatten()
-                    .map(|value| truncate(&value, 2_048));
+                let condition = row.try_get::<String, _>("condition_json").ok()
+                    .and_then(|raw| db::task_condition::decode(&raw).ok()).map(|c| c.public());
                 json!({
                     "id": id,
                     "parent_task_id": row.try_get::<Option<String>, _>("parent_task_id").ok().flatten(),
@@ -2492,9 +2479,7 @@ impl CoordinationToolProvider {
                     "priority": row.try_get::<i64, _>("priority").unwrap_or_default(),
                     "assignee_type": row.try_get::<Option<String>, _>("assignee_type").ok().flatten(),
                     "assignee_id": row.try_get::<Option<String>, _>("assignee_id").ok().flatten(),
-                    "blocked": blocked,
-                    "error": error,
-                    "failed": failed,
+                    "condition": condition,
                     "depends_on": depends_on,
                     "available_actions": offers_by_task.remove(&id).unwrap_or_default(),
                     "latest_execution": latest_executions.remove(&id).unwrap_or(Value::Null),
@@ -3194,7 +3179,7 @@ impl CoordinationToolProvider {
                 "task_id": task.id,
                 "task_status": task.status,
                 "task_version": task.version,
-                "blocked": task.blocked_json.is_some(),
+                "condition": task.condition.public(),
                 "requires_user_authorization": false,
             }));
         }
@@ -5822,6 +5807,71 @@ fn content_type_for(filename: &str, kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_work_condition_projection_uses_all_seven_kinds_without_legacy_aliases() {
+        let fixture = native_plan_fixture("coder", "coder").await;
+        let e = db::ConditionEvidence::default();
+        let reason = db::ParkReason::Held {
+            actor: "user".into(),
+        };
+        for c in [
+            db::TaskCondition::Clear {
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Entering {
+                state: "review".into(),
+                epoch: 1,
+                step_id: "step".into(),
+                phase: "checks".into(),
+                since: "now".into(),
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Running {
+                execution_id: fixture.execution_id.clone(),
+                role: "coder".into(),
+                epoch: 1,
+                since: "now".into(),
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Deferred {
+                until: None,
+                reason: db::RetryCause::Legacy,
+                resume: db::ConditionContinuation::Reconcile,
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Parked {
+                primary: reason.clone(),
+                additional: vec![],
+                resume: db::ConditionContinuation::Reconcile,
+                since: None,
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Failed {
+                failure: reason,
+                additional: vec![],
+                resume: db::ConditionContinuation::Reconcile,
+                since: None,
+                evidence: e.clone(),
+            },
+            db::TaskCondition::Settled {
+                outcome: db::TerminalOutcome::Completed,
+                evidence: e,
+            },
+        ] {
+            sqlx::query("UPDATE task SET condition_json=?,error_annotation='legacy poison',blocked_json='legacy poison',failed_json='legacy poison' WHERE id=?").bind(serde_json::to_string(&c).unwrap()).bind(&fixture.task_id).execute(fixture.db.pool()).await.unwrap();
+            let value = fixture
+                .provider
+                .read_work(&fixture.agent_id, &fixture.scope, 10)
+                .await
+                .unwrap();
+            let item = &value["items"][0];
+            assert_eq!(item["condition"], serde_json::to_value(c.public()).unwrap());
+            for removed in ["blocked", "error", "failed", "error_annotation"] {
+                assert!(item.get(removed).is_none(), "{removed}");
+            }
+        }
+    }
 
     struct NativePlanFixture {
         db: Arc<db::SqliteDb>,

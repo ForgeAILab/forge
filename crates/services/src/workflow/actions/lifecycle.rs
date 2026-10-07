@@ -365,9 +365,11 @@ async fn persist_before_work_annotation(
     ctx.db
         .produce_condition_in_tx(&mut transaction, &task.id, db::ConditionChange::Legacy)
         .await?;
-    let mut interruption_snapshot = task.clone();
-    interruption_snapshot.error_annotation = Some(annotation);
-    interruption_snapshot.updated_at = updated_at;
+    let interruption_snapshot = ctx
+        .db
+        .get_task_in_tx(&mut transaction, &task.id)
+        .await?
+        .ok_or(db::DbError::NotFound)?;
     let mut interruption_event =
         db::CreateDomainEvent::task_interruption_changed(&interruption_snapshot);
     interruption_event.dedupe_key = Some(format!(

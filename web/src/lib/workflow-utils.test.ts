@@ -128,9 +128,7 @@ describe('task interruption annotations', () => {
       remaining_retries: {},
   retry_limits: {},
       placement: null,
-      blocked: null,
-      failed: null,
-      error_annotation: {
+      condition: { kind: 'clear', details: { failure_kind: 'executor_failed', interruption: null, human_wait: false, entry_wait: false, diagnostic: {
         type: 'executor_failed',
         blocking_reason: 'executor_failed',
         blocked_by: 'system:executor',
@@ -138,7 +136,7 @@ describe('task interruption annotations', () => {
         blocked_execution_id: blockedExecutionId,
         artifact: null,
         message: 'Previous execution failed',
-      },
+      } } },
       execution_observability: {
         counts: {
           task_execution_count: 2,
@@ -170,7 +168,7 @@ describe('task interruption annotations', () => {
   it('uses compact list observability to identify stale annotations', () => {
     const fullTask = taskWithExecutionIds('execution-old', 'execution-new')
     const task = taskListItem({
-      error_annotation: fullTask.error_annotation,
+      condition: fullTask.condition,
       execution_observability: { latest_execution_id: 'execution-new' },
     })
     expect(taskHasError(task)).toBe(false)
@@ -196,7 +194,7 @@ describe('task interruption annotations', () => {
 
   it('warns when completed coder work cannot leave in-progress with an open plan', () => {
     const task = taskWithExecutionIds('execution-old', 'execution-new')
-    task.error_annotation = null
+    task.condition.details.diagnostic = null
     task.plan_progress = {
       total: 10,
       completed: 6,
@@ -210,7 +208,7 @@ describe('task interruption annotations', () => {
 
   it('does not warn while an execution is still running', () => {
     const task = taskWithExecutionIds('execution-old', 'execution-new')
-    task.error_annotation = null
+    task.condition.details.diagnostic = null
     task.plan_progress = {
       total: 10,
       completed: 6,

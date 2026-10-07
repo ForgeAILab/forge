@@ -16,6 +16,7 @@ async fn material_blocker_matches_the_interruption_event() {
         t.error_annotation = a.clone();
         t.blocked_json = b.clone();
         t.failed_json = f.clone();
+        t.condition = map_legacy_condition(&LegacyConditionInput::from(&t));
         let old: Value =
             serde_json::from_str(&CreateDomainEvent::task_interruption_changed(&t).payload_json)
                 .unwrap();
@@ -23,10 +24,10 @@ async fn material_blocker_matches_the_interruption_event() {
         let projected = material_blocker(&condition);
         assert_eq!(
             json!(projected.requires_intervention),
-            old["requires_intervention"],
+            old["material_blocker"]["requires_intervention"],
             "{a:?} {b:?} {f:?}"
         );
-        let mut interruption = old["interruption"].clone();
+        let mut interruption = old["material_blocker"]["interruption"].clone();
         crate::strip_attention_delivery_metadata(&mut interruption);
         assert_eq!(json!(projected.interruption), interruption);
         // The reporting execution is delivery metadata, not blocker identity.

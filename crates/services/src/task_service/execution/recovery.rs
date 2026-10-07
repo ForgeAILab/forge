@@ -544,7 +544,7 @@ impl TaskService {
         };
         if queued.target_state != task.status
             || task.archived_at.is_some()
-            || task.failed_json.is_some()
+            || task.condition.read().hard_failure
         {
             self.restore_failed_task_action(
                 &task,
@@ -1015,7 +1015,7 @@ impl TaskService {
                     ) {
                         self.refresh_workspace_and_retry_entry(task, reason.clone())
                             .await
-                    } else if task.entry_barrier_json.is_some() {
+                    } else if task.condition.read().entry_recorded {
                         self.retry_entry_checks(task, reason.clone()).await
                     } else {
                         self.recover_retry_current_state_hooks(task, reason.clone())
@@ -1034,6 +1034,8 @@ impl TaskService {
                     let mut evidence = task;
                     evidence.error_annotation = queued.error_annotation.clone();
                     evidence.blocked_json = queued.blocked_json.clone();
+                    evidence.condition =
+                        db::map_legacy_condition(&db::LegacyConditionInput::from(&evidence));
                     if matches!(
                         &request.action,
                         api_types::TaskAction::Retry {
@@ -1062,6 +1064,8 @@ impl TaskService {
                     let mut evidence = task;
                     evidence.error_annotation = queued.error_annotation.clone();
                     evidence.blocked_json = queued.blocked_json.clone();
+                    evidence.condition =
+                        db::map_legacy_condition(&db::LegacyConditionInput::from(&evidence));
                     self.continue_task_process(evidence, guidance.clone(), guidance)
                         .await
                 }
@@ -1136,12 +1140,7 @@ impl TaskService {
     }
 
     fn parse_blocking_annotation(&self, task: &Task) -> Option<api_types::TaskBlockingAnnotation> {
-        let annotation = task.error_annotation.as_deref()?;
-        match serde_json::from_str::<api_types::TaskAnnotation>(annotation) {
-            Ok(api_types::TaskAnnotation::Blocking(annotation)) => Some(annotation),
-            Ok(api_types::TaskAnnotation::Legacy(_)) => None,
-            Err(_) => None,
-        }
+        task.condition.read().diagnostic
     }
 
     /// Clear the interruption projection using the exact Task snapshot that
@@ -1153,9 +1152,10 @@ impl TaskService {
             let mut cleared = task.clone();
             cleared.error_annotation = None;
             cleared.blocked_json = None;
+            cleared.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&cleared));
             return Ok(cleared);
         }
-        let previous_reason = interruption_reason(task.blocked_json.as_deref());
+        let previous_reason = task.condition.read().interruption.map(|i| i.reason);
         let updated = TaskRepo::update(
             &*self.db,
             UpdateTask {
@@ -1175,7 +1175,7 @@ impl TaskService {
             },
         )
         .await?;
-        if task.blocked_json.is_some() {
+        if task.condition.read().interruption_present {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
                 entity_id: updated.id.clone(),
@@ -1460,7 +1460,7 @@ impl TaskService {
     ) -> Result<Task> {
         let reason = required_recovery_reason(reason, "retry")?;
 
-        if task.entry_barrier_json.is_some() {
+        if task.condition.read().entry_recorded {
             let transition_log = recovery_marker(
                 &task.id,
                 &task.status,
@@ -1631,7 +1631,8 @@ impl TaskService {
             )));
         }
 
-        let has_interruption = task.error_annotation.is_some() || task.blocked_json.is_some();
+        let has_interruption =
+            task.condition.read().diagnostic_present || task.condition.read().interruption_present;
         let has_failed_review = if task.status == crate::workflow::default_states::REVIEW {
             matches!(
                 self.latest_review_for_task(&task.id).await,
@@ -1999,25 +2000,25 @@ impl TaskService {
         }
 
         super::clear_execution_retry_metadata(&self.db, &recovered).await?;
-        if task.blocked_json.is_some() {
+        if task.condition.read().interruption_present {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
                 entity_id: recovered.id.clone(),
                 timestamp: event_timestamp(),
                 context: EventContext::TaskUnblocked {
                     project_id: recovered.project_id.clone(),
-                    previous_reason: interruption_reason(task.blocked_json.as_deref()),
+                    previous_reason: task.condition.read().interruption.map(|i| i.reason),
                 },
             });
         }
-        if task.failed_json.is_some() {
+        if task.condition.read().hard_failure {
             self.publish(ForgeEvent {
                 event_type: "task.restarted".to_owned(),
                 entity_id: recovered.id.clone(),
                 timestamp: event_timestamp(),
                 context: EventContext::TaskRestarted {
                     project_id: recovered.project_id.clone(),
-                    previous_reason: interruption_reason(task.failed_json.as_deref()),
+                    previous_reason: task.condition.read().interruption.map(|i| i.reason),
                     new_execution_id: None,
                 },
             });
@@ -2597,7 +2598,7 @@ impl TaskService {
             }
         }
 
-        if task.entry_barrier_json.is_some() {
+        if task.condition.read().entry_recorded {
             self.retry_entry_checks(task, reason).await
         } else {
             self.recover_retry_current_state_hooks(task, reason).await
@@ -2615,7 +2616,7 @@ impl TaskService {
             reason = %reason.clone().unwrap_or_else(|| "approve".to_owned()),
             "entry-check override recorded"
         );
-        let recovered = if task.entry_barrier_json.is_some() {
+        let recovered = if task.condition.read().entry_recorded {
             let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -2824,17 +2825,6 @@ fn default_target_branch(repo_default_branch: &str) -> String {
     } else {
         trimmed.to_owned()
     }
-}
-
-fn interruption_reason(raw_metadata: Option<&str>) -> Option<String> {
-    raw_metadata
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|metadata| {
-            metadata
-                .get("reason")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
 }
 
 fn optional_recovery_reason(reason: Option<String>, action_kind: &str) -> String {

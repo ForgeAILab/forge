@@ -294,7 +294,7 @@ pub struct RelatedEvidence {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct InterruptionMetadata {
     pub reason: String,

@@ -54,7 +54,7 @@ async fn owner_send_back_preserves_budget_without_blocking_gate_entry() {
     );
     assert_eq!(task.remaining_retries.get("review"), Some(&1));
     assert!(
-        task.blocked.is_none(),
+        task.condition.details().interruption.is_none(),
         "entering review should not block before review execution fails"
     );
 }

@@ -1080,7 +1080,7 @@ impl TaskService {
         } else {
             updated
         };
-        if task.blocked_json.is_some() {
+        if task.condition.read().interruption_present {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
                 entity_id: task.id.clone(),

@@ -63,9 +63,6 @@ interface TaskDetailSidebarProps {
   onStatusChange: (status: string, reason?: string) => void
 }
 
-function hasAwaitingHuman(task: Task): task is Task & { awaiting_human: boolean } {
-  return 'awaiting_human' in task && typeof task.awaiting_human === 'boolean'
-}
 
 function getTaskDetailApiErrorMessage(error: unknown, fallback = 'Request failed'): string {
   return getApiErrorMessage(error, fallback)
@@ -182,7 +179,7 @@ export function TaskDetailSidebar({
               </span>
             </SidebarField>
 
-            {hasAwaitingHuman(task) && task.awaiting_human ? (
+            {task.condition.details.human_wait ? (
               <SidebarField label={task.status === 'planning' ? 'Plan' : 'Review'}>
                 <Badge className="border-transparent bg-violet-100 text-violet-900 dark:bg-violet-950 dark:text-violet-300 text-[11px]">
                   {task.status === 'planning' ? 'Plan ready - awaiting review' : 'Awaiting human'}

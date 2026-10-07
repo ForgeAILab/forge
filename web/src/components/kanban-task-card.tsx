@@ -70,7 +70,7 @@ export function KanbanTaskCard({
     coderAssignment?.assignee_type === 'user' ? (coderAssignment.assignee_id ?? 'manual') : null
   const coderIsHuman = coderAssignment?.assignee_type === 'user'
   const pausedAnnotation = getBlockingAnnotation(task)
-  const blockedReason = task.blocked?.reason ?? pausedAnnotation?.blocking_reason
+  const blockedReason = task.condition.details.interruption?.reason ?? pausedAnnotation?.blocking_reason
   const isPaused = task.status !== 'cancelled' && Boolean(blockedReason)
   const hasActiveError = taskHasError(task)
   return (

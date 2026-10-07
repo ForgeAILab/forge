@@ -9,6 +9,7 @@ vi.mock('@tanstack/react-router', () => ({
 }))
 function task(offers: Offer[]): Task {
   return {
+    condition: {kind:'clear',details:{failure_kind:null,diagnostic:null,interruption:null,human_wait:false,entry_wait:false}},
     id: 'task',
     version: 7,
     status: 'review',

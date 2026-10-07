@@ -75,7 +75,7 @@ async fn execution_stop_exposes_task_action_offers() {
     )
     .await;
     assert!(
-        task["error_annotation"].is_null(),
+        task["condition"]["details"]["diagnostic"].is_null(),
         "stopping a side session leaves the Task condition unchanged"
     );
     let actions = task["available_actions"].as_array().expect("offers");
@@ -863,7 +863,7 @@ async fn fresh_task_retry_queues_replacement_execution() {
         StatusCode::OK,
     )
     .await;
-    assert!(accepted.error_annotation.is_none());
+    assert!(accepted.condition.details().diagnostic.is_none());
     harness
         .state
         .task_service

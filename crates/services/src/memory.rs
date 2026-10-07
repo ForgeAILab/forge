@@ -1434,6 +1434,7 @@ pub(crate) struct TransitionFailureEvidence {
     pub review_failed: bool,
 }
 
+#[cfg(test)]
 impl TransitionFailureEvidence {
     /// The interruption kind of a stored `error_annotation`, if any.
     pub(crate) fn annotation_kind(raw: Option<&str>) -> Option<api_types::FailureKind> {

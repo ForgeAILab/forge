@@ -172,6 +172,11 @@ async fn task_list_revisions_cover_persisted_projection_sources() {
         .execute(h.state.db.pool())
         .await
         .unwrap();
+        h.state
+            .db
+            .check_task_conditions_of(std::slice::from_ref(&t.id))
+            .await
+            .unwrap();
         let response = get(&h, &uri, Some(&etag)).await;
         assert_eq!(response.status(), StatusCode::OK, "{column}");
         let next = tag(&response);
@@ -194,6 +199,7 @@ async fn task_list_revisions_cover_persisted_projection_sources() {
         "DELETE FROM task_role_assignment WHERE id = 'role'".to_owned(),
     ] {
         sqlx::query(&sql).execute(h.state.db.pool()).await.unwrap();
+        h.state.db.check_task_conditions_of(std::slice::from_ref(&t.id)).await.unwrap();
         let response = get(&h, &uri, Some(&etag)).await;
         assert_eq!(response.status(), StatusCode::OK, "{sql}");
         let next = tag(&response); assert_ne!(next, etag, "{sql}"); etag = next;
@@ -206,6 +212,7 @@ async fn task_list_revisions_cover_persisted_projection_sources() {
         "DELETE FROM task_external_link WHERE id = 'link'".to_owned(),
     ] {
         sqlx::query(&sql).execute(h.state.db.pool()).await.unwrap();
+        h.state.db.check_task_conditions_of(std::slice::from_ref(&t.id)).await.unwrap();
         let response = get(&h, &uri, Some(&etag)).await;
         assert_eq!(response.status(), StatusCode::OK);
         let next = tag(&response); assert_ne!(next, etag); etag = next;
@@ -213,12 +220,22 @@ async fn task_list_revisions_cover_persisted_projection_sources() {
     // Clock-dependent retry health must always bypass conditional responses.
     sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
         .bind(json!({"deferred_dispatch":{"not_before":"2099-01-01T00:00:00Z", "reason":"retry", "target_state":"in_progress"}}).to_string()).bind(&t.id).execute(h.state.db.pool()).await.unwrap();
+    h.state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&t.id))
+        .await
+        .unwrap();
     let response = get(&h, &uri, Some("*")).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().get("etag").is_none());
     sqlx::query("UPDATE task SET metadata_json = NULL WHERE id = ?")
         .bind(&t.id)
         .execute(h.state.db.pool())
+        .await
+        .unwrap();
+    h.state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&t.id))
         .await
         .unwrap();
     assert_eq!(
@@ -404,4 +421,44 @@ async fn task_list_read_path_bench() {
             counts[index][0], counts[index][39]
         );
     }
+}
+
+#[tokio::test]
+async fn condition_serialization_and_truthful_human_wait_agree_in_list_and_detail() {
+    let dir = common::TestDir::new("condition-wire");
+    let h = common::test_app(dir.path(), "condition-wire").await;
+    let p = project(&h).await;
+    let t = task(&h, &p.id).await;
+    h.stop_step_worker();
+    sqlx::query("UPDATE task SET metadata_json='{\"awaiting_human\":true,\"awaiting_human_reason\":\"plan_review\"}' WHERE id=?").bind(&t.id).execute(h.state.db.pool()).await.unwrap();
+    h.state
+        .db
+        .check_task_conditions_of(std::slice::from_ref(&t.id))
+        .await
+        .unwrap();
+    let list = get(&h, &format!("/api/v1/projects/{}/tasks", p.id), None).await;
+    assert_eq!(list.status(), StatusCode::OK);
+    let list: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let detail = get(&h, &format!("/api/v1/tasks/{}", t.id), None).await;
+    assert_eq!(detail.status(), StatusCode::OK);
+    let detail: serde_json::Value =
+        serde_json::from_slice(&to_bytes(detail.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let item = &list["items"][0];
+    for value in [item, &detail] {
+        for removed in ["error_annotation", "blocked", "failed"] {
+            assert!(value.get(removed).is_none(), "{removed}");
+        }
+        assert_eq!(
+            value["awaiting_human"], true,
+            "deliberate difference: truthful_list_awaiting_human"
+        );
+        assert_eq!(value["condition"]["details"]["human_wait"], true);
+        assert_eq!(value["condition"]["kind"], "parked");
+        assert_eq!(value["condition"]["primary"]["kind"], "human_decision");
+        assert!(value["condition"].get("evidence").is_none());
+    }
+    assert_eq!(item["condition"], detail["condition"]);
+    assert_eq!(item["workflow_health"], detail["workflow_health"]);
+    assert_eq!(item["workflow_exception"], detail["workflow_exception"]);
 }

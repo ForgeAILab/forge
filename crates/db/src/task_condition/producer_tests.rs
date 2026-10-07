@@ -810,6 +810,9 @@ async fn producers_do_not_rederive_unrelated_families() {
                 transition_id: Some("carried".into()),
                 since: "carried".into(),
                 initial: false,
+                human_wait: false,
+                review_wait: false,
+                review_failure: false,
             }],
             ..Default::default()
         },
@@ -858,6 +861,9 @@ async fn producers_do_not_rederive_unrelated_families() {
                 transition_id: Some("carried".into()),
                 since: "carried".into(),
                 initial: false,
+                human_wait: false,
+                review_wait: false,
+                review_failure: false,
             }));
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
         db.finish_step_in_tx(&mut tx, &step, "done", None)

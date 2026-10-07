@@ -1546,22 +1546,6 @@ impl WorkflowExecution<'_> {
                         )
                         .await?;
                     }
-                    if task.blocked_json.is_some() {
-                        let mut interruption_snapshot = task.clone();
-                        interruption_snapshot.status = target_state.clone();
-                        interruption_snapshot.blocked_json = None;
-                        interruption_snapshot.entry_barrier_json = entry_barrier_json.clone();
-                        interruption_snapshot.version = version + 1;
-                        interruption_snapshot.updated_at = updated_at.clone();
-                        let interruption_event =
-                            CreateDomainEvent::task_interruption_changed(&interruption_snapshot);
-                        DomainEventRepo::append_event_in_tx(
-                            &*self.db,
-                            &mut transaction,
-                            &interruption_event,
-                        )
-                        .await?;
-                    }
                     let event = CreateDomainEvent::task_transition(
                         transition_log_id.clone(),
                         task_id.clone(),
@@ -1575,7 +1559,6 @@ impl WorkflowExecution<'_> {
                         updated_at.clone(),
                         workflow_snapshot,
                     );
-                    DomainEventRepo::append_event_in_tx(&*self.db, &mut transaction, &event).await?;
                     sqlx::query(
                         "INSERT INTO transition_log (
                             id, task_id, from_state, to_state, trigger_name, triggered_by,
@@ -1629,6 +1612,12 @@ impl WorkflowExecution<'_> {
                     if let Some(input) = &initial_hook_step {
                         self.db.enqueue_step_in_tx(&mut transaction, input).await?;
                     }
+                    if task.blocked_json.is_some() {
+                        let interruption_snapshot = self.db.get_task_in_tx(&mut transaction,&task_id).await?.ok_or(db::DbError::NotFound)?;
+                        let interruption_event = CreateDomainEvent::task_interruption_changed(&interruption_snapshot);
+                        DomainEventRepo::append_event_in_tx(&*self.db,&mut transaction,&interruption_event).await?;
+                    }
+                    DomainEventRepo::append_event_in_tx(&*self.db,&mut transaction,&event).await?;
                     let task = self.db.get_task_in_tx(&mut transaction, &task_id).await?.ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
                     transaction.commit().await?;
                     let transition_log = TransitionLog {
@@ -1976,6 +1965,7 @@ mod resolve_workflow_tests {
     fn task(parent_task_id: Option<String>, status: &str) -> db::Task {
         let now = now_rfc3339();
         db::Task {
+            condition: Default::default(),
             id: new_uuid_v4(),
             project_id: new_uuid_v4(),
             parent_task_id: parent_task_id.clone(),

@@ -776,10 +776,16 @@ async fn column_default_is_the_mapping_of_no_condition_facts() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    let expected = encode(&map_legacy_condition(&LegacyConditionInput::default()));
-    assert_eq!(default, format!("'{expected}'"));
-    let created = task(&db, "defaulted").await;
-    db.check_task_condition_invariant(&created).await.unwrap();
+    let old_default = default.trim_matches(char::from(39));
+    let condition = decode(old_default).unwrap();
+    assert_eq!(
+        condition.read(),
+        map_legacy_condition(&LegacyConditionInput::default()).read()
+    );
+    assert!(
+        condition.evidence().witnesses.is_empty(),
+        "column defaults are rederived by the first producer"
+    );
 }
 
 fn update(t: &Task) -> UpdateTask {
@@ -1471,7 +1477,7 @@ async fn clone_tasks(db: &SqliteDb, template: &str, n: usize, prefix: &str) {
 /// Back to the pre-stage-one schema, keeping every other table and trigger.
 async fn unmigrate(db: &SqliteDb) {
     sqlx::raw_sql(
-        "DROP TRIGGER task_schedule_update; DROP TRIGGER task_schedule_relationship; DROP INDEX IF EXISTS idx_task_schedule_open; DROP INDEX IF EXISTS idx_task_condition_kind; ALTER TABLE task DROP COLUMN condition_json;",
+        "DROP TRIGGER task_schedule_update; DROP TRIGGER task_schedule_relationship; DROP INDEX IF EXISTS idx_task_schedule_open; DROP INDEX IF EXISTS idx_task_condition_kind; DROP INDEX IF EXISTS idx_task_condition_retry_project; DROP TRIGGER IF EXISTS task_list_revision_task_update; ALTER TABLE task DROP COLUMN condition_json;",
     )
     .execute(db.pool())
     .await

@@ -33,6 +33,7 @@ mod requests;
 mod review_conformance;
 mod runtime;
 mod settings;
+mod task_condition;
 mod terminal;
 mod workflow;
 
@@ -67,6 +68,7 @@ pub use requests::*;
 pub use review_conformance::*;
 pub use runtime::*;
 pub use settings::*;
+pub use task_condition::*;
 pub use terminal::*;
 pub use workflow::*;
 

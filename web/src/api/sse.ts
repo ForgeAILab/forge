@@ -341,7 +341,7 @@ function patchTaskList(payload: SsePayload, queryClient: QueryClient): boolean {
     // Revision gaps can include renormalized neighbors or missed mutations.
     if (cached.pages.some((page) => payload.board_revision !== page.board_revision + 1))
       needsRefetch = true
-    if (item.blocked) needsRefetch = true
+    if (item.condition.details.interruption) needsRefetch = true
     // A status transition can also change diagnostics and retry budgets.
     // Paint the delivered status immediately, then use the throttled fallback
     // for fields the event does not carry. Same-status moves need no refetch
