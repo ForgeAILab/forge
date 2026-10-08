@@ -2122,6 +2122,53 @@ async fn registry_reads_use_real_handlers_and_unmoved_reads_keep_the_hand_path()
             );
         }
     }
+    // A contract violation is refused before any handler runs, as a tool
+    // error naming the operation and the field; the provider enforces the
+    // same contract if it is reached directly.
+    let composition = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        fixture.project_scope.clone(),
+        None,
+        None,
+        &permissions,
+        Some(Arc::new(fixture.provider.clone())),
+    )
+    .unwrap();
+    for (arguments, expected) in [
+        (
+            json!({"operation":"skill.section"}),
+            "skill.section: argument `section` is required",
+        ),
+        (
+            json!({"parameters":{"operation":"project.charter","arguments":{"limit":1}}}),
+            "project.charter: argument `limit` is not admitted",
+        ),
+    ] {
+        let error = invoke_tool(
+            &composition,
+            FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+            arguments,
+            "violation",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+    let direct = forge_agent_host::ForgeToolProvider::read(
+        &fixture.provider,
+        AGENT_ID,
+        &fixture.project_scope,
+        "skill.section",
+        json!({"section":"everything"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{direct:?}").contains("skill.section: argument `section` must be one of"),
+        "{direct:?}"
+    );
+
     assert!(operation_registry::READ_CATALOG
         .lookup("discovery.read")
         .is_none());

@@ -13,6 +13,8 @@ pub trait ScopeReadContext<E>: Send + Sync {
 #[serde(deny_unknown_fields)]
 pub struct NoArguments {}
 
+pub const IDS: &[&str] = &["account.summary", "agent_chat.summary"];
+
 pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
     vec![
         OperationSpec::typed(

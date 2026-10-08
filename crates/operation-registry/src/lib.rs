@@ -92,22 +92,62 @@ pub struct TypedInputContract {
     decode: fn(Value) -> Result<(), String>,
 }
 impl TypedInputContract {
-    pub fn validate(&self, value: &Value) -> Result<(), String> {
-        let object = value
-            .as_object()
-            .ok_or("Forge read arguments must be an object")?;
+    fn fields(&self) -> impl Iterator<Item = (&String, &Value)> {
+        self.schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+    }
+    fn is_required(&self, field: &str) -> bool {
+        self.schema["required"]
+            .as_array()
+            .is_some_and(|required| required.iter().any(|name| name == field))
+    }
+    /// The whole argument contract on one line, for the advertised aggregate
+    /// description and for validation errors: `no arguments`, or
+    /// `{section: one of a|b, limit?}` (`?` marks an optional field).
+    pub fn contract_line(&self) -> String {
+        let fields = self
+            .fields()
+            .map(|(name, schema)| {
+                let values = schema.get("enum").and_then(Value::as_array).map(|values| {
+                    values
+                        .iter()
+                        .map(|value| value.as_str().map_or(value.to_string(), str::to_owned))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                });
+                let optional = if self.is_required(name) { "" } else { "?" };
+                match values {
+                    Some(values) => format!("{name}{optional}: one of {values}"),
+                    None => format!("{name}{optional}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            "no arguments".to_owned()
+        } else {
+            format!("{{{}}}", fields.join(", "))
+        }
+    }
+    /// Structural validation of already-normalized arguments. The error names
+    /// the offending field; [`OperationSpec::validate_arguments`] adds the
+    /// operation.
+    fn validate(&self, value: &Value) -> Result<(), String> {
+        let object = value.as_object().ok_or("arguments must be an object")?;
         for constraint in self.constraints {
             match constraint {
                 StructuralConstraint::ClosedObject => {
-                    let properties = self.schema["properties"].as_object().expect("typed object");
-                    if let Some(key) = object.keys().find(|key| !properties.contains_key(*key)) {
-                        return Err(format!(
-                            "Forge orchestration read argument `{key}` is not admitted"
-                        ));
+                    if let Some(key) = object
+                        .keys()
+                        .find(|key| !self.fields().any(|(name, _)| name == *key))
+                    {
+                        return Err(format!("argument `{key}` is not admitted"));
                     }
                 }
                 StructuralConstraint::Required(field) if !object.contains_key(*field) => {
-                    return Err(format!("{field} is required"))
+                    return Err(format!("argument `{field}` is required"))
                 }
                 StructuralConstraint::StringEnum { field, values }
                     if !object
@@ -115,7 +155,10 @@ impl TypedInputContract {
                         .and_then(Value::as_str)
                         .is_some_and(|v| values.contains(&v)) =>
                 {
-                    return Err(format!("{field} must be one of: {}", values.join(", ")));
+                    return Err(format!(
+                        "argument `{field}` must be one of: {}",
+                        values.join(", ")
+                    ));
                 }
                 _ => {}
             }
@@ -220,13 +263,24 @@ impl<E: Send + 'static> OperationSpec<E> {
         }
         schema
     }
+    /// The one generated line a model is shown for this operation.
+    pub fn contract_line(&self) -> String {
+        format!("{}: {}", self.id, self.input.contract_line())
+    }
+    /// Enforce the argument contract on normalized arguments. A violation
+    /// names the operation, the offending field and the expected contract, and
+    /// is returned to the model as an ordinary tool error.
+    pub fn validate_arguments(&self, arguments: &Value) -> Result<(), String> {
+        self.input
+            .validate(arguments)
+            .map_err(|error| format!("{}: {error}; expected {}", self.id, self.contract_line()))
+    }
     pub async fn dispatch(
         &self,
         context: &dyn ReadContext<E>,
         input: Value,
     ) -> Result<Value, DispatchError<E>> {
-        self.input
-            .validate(&input)
+        self.validate_arguments(&input)
             .map_err(DispatchError::InvalidInput)?;
         (self.handler)(context, input).await
     }
@@ -262,43 +316,22 @@ impl<E: Send + 'static> OperationCatalog<E> {
     pub fn iter(&self) -> impl Iterator<Item = &OperationSpec<E>> {
         self.entries.values()
     }
-    /// Project only selected, authority-filtered operations. Unmoved schemas
-    /// remain in the supplied aggregate and retain their existing hand path.
-    pub fn project_aggregate(
-        &self,
-        mut schema: Value,
-        aggregate: &str,
-        selected: &BTreeSet<String>,
-    ) -> Value {
-        let branches = self.iter().filter(|spec| selected.contains(spec.id)
-            && spec.surfaces.iter().any(|binding| binding.native_aggregate == aggregate))
-            .map(|spec| {
-                let mut then = json!({"properties":{"arguments":spec.input.schema}});
-                if !spec.input.schema["required"].as_array().unwrap().is_empty() {
-                    then["required"] = json!(["arguments"]);
-                }
-                json!({"if":{"properties":{"operation":{"const":spec.id}},"required":["operation"]},"then":then})
-            }).collect::<Vec<_>>();
-        if !branches.is_empty() {
-            schema["allOf"] = json!(branches);
-        }
-        schema
-    }
 }
 
-/// Completeness receipt for this slice. Domain specs themselves live below.
-pub const MOVED_OPERATIONS: &[&str] = &[
-    "account.summary",
-    "agent_chat.summary",
-    "project.charter",
-    "skill.section",
-];
+/// Every registered read operation, from the domain modules' own id lists.
+/// A domain module adds its ids next to its specs; the catalog refuses a
+/// module whose specs and ids disagree and any id declared twice.
+pub fn registered_operations() -> Vec<&'static str> {
+    let mut ids = [scope_reads::IDS, project_reads::IDS].concat();
+    ids.sort_unstable();
+    ids
+}
 pub fn read_catalog<E: Send + 'static>() -> OperationCatalog<E> {
     OperationCatalog::new(
         scope_reads::specs()
             .into_iter()
             .chain(project_reads::specs()),
-        MOVED_OPERATIONS,
+        &registered_operations(),
     )
     .expect("complete read catalog")
 }

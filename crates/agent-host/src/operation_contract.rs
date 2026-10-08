@@ -1267,7 +1267,10 @@ pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
 pub(crate) fn orchestration_read_schema(operations: &BTreeSet<String>) -> Value {
     let mut guidance = vec!["Arguments by operation:".to_owned()];
     for operation in operations {
-        if operation_registry::READ_CATALOG.lookup(operation).is_some() {
+        // A registered operation states its own contract, generated from its
+        // spec. The contract is enforced at preparation, not by this schema.
+        if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
+            guidance.push(format!("- {}", spec.contract_line()));
             continue;
         }
         let arguments = orchestration_read_arguments_schema(operation);

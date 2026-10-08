@@ -45,17 +45,10 @@ pub const PROJECT_CHARTER_READ_OPERATION: &str = "project.charter";
 /// operating skill keeps only an index of these sections so the detailed
 /// doctrine stops occupying every turn's fixed prompt budget.
 pub const PROJECT_SKILL_SECTION_OPERATION: &str = "skill.section";
-/// The canonical doctrine section names. The read schema exposes this enum
-/// and the services provider must serve exactly these names; a drift between
-/// the two is caught by a services-side test.
-pub const PROJECT_SKILL_SECTION_NAMES: &[&str] = &[
-    "research",
-    "documents",
-    "scope_change",
-    "tasks",
-    "milestones",
-    "release",
-];
+/// The canonical doctrine section names, owned by the `skill.section`
+/// operation spec. The services provider must serve exactly these names; a
+/// drift between the two is caught by a services-side test.
+pub const PROJECT_SKILL_SECTION_NAMES: &[&str] = operation_registry::project_reads::SECTION_NAMES;
 pub const PROJECT_CHARTER_ADOPTION_OPERATION: &str = "project.charter.adoption";
 /// Replace the Project's default independent review commands while
 /// preserving every other Project review-policy field.

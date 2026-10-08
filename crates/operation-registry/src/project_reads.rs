@@ -56,6 +56,8 @@ const SURFACES: &[SurfaceBinding] = &[SurfaceBinding {
     native_aggregate: "forge_project_orchestration_read",
     projection: FieldProjection::ReadArguments,
 }];
+pub const IDS: &[&str] = &["project.charter", "skill.section"];
+
 pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
     vec![
         OperationSpec::typed::<NoArguments>("project.charter", AUTHORITY, EffectClass::Query, AvailabilityRule::ReadyOnly, SURFACES,

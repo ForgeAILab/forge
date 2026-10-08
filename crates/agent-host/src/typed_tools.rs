@@ -1786,11 +1786,6 @@ impl ForgeScopeReadTool {
                 "additionalProperties": false
             })
         };
-        let schema = operation_registry::READ_CATALOG.project_aggregate(
-            schema,
-            self.tool_name,
-            &self.operations,
-        );
         ToolSpec::new(
             self.tool_name,
             description,
@@ -2942,8 +2937,7 @@ fn validate_orchestration_read_arguments(
             )));
         }
         return spec
-            .input
-            .validate(object.get("arguments").unwrap_or(&json!({})))
+            .validate_arguments(object.get("arguments").unwrap_or(&json!({})))
             .map_err(RuntimeError::tool);
     }
     let allowed = match operation {

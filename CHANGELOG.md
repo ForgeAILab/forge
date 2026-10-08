@@ -8,6 +8,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Native `account.summary` and `agent_chat.summary` refuse nested arguments
+  (3.8 slice B).** Through `forge_scope_read` these two reads used to ignore
+  whatever was passed in `arguments`; a call such as
+  `{"operation":"agent_chat.summary","arguments":{"limit":1}}` succeeded. It
+  is now refused with a tool error
+  the model can correct in the same turn
+  (``agent_chat.summary: argument `limit` is not admitted; expected
+  agent_chat.summary: no arguments``). Omitting `arguments` or passing `{}`
+  works as before. No other previously accepted input is refused:
+  `project.charter` already rejected nested arguments, and `skill.section`
+  already failed without a known `section`. MCP is unchanged.
+
 - **Task condition replaces raw interruption fields (3.1 stage 4).**
   - REST Task detail, lists and mutation results, and `forge-ctl --output json`,
     remove `error_annotation`, `blocked` and `failed`. They add the typed
@@ -509,6 +521,28 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Typed operation registry for the first native reads (3.8 slice B).**
+  `account.summary`, `agent_chat.summary`, `project.charter` and
+  `skill.section` are now declared once, as typed specifications in the new
+  `operation-registry` crate, and their schema, validation and dispatch are
+  generated from that declaration. Results and domain errors are unchanged.
+  What a model sees differently:
+  - The tool schemas sent to providers keep their shape and use no conditional
+    JSON-Schema keywords. In the Project read tool's `arguments` description,
+    the line for `skill.section` changes from `optional {section}` to
+    `{section: one of research|documents|scope_change|tasks|milestones|release}`,
+    which is the contract that was always enforced. This adds 56 bytes (about
+    14 tokens) to the ready Project and Solo verification tool prefixes; every
+    other surface is byte-identical.
+  - A call that breaks one of these four contracts gets one consistent error
+    naming the operation, the field and the expected arguments, on native and
+    CLI chat turns alike. `skill.section` without a `section` is now refused
+    before the read runs instead of failing inside it with
+    `unknown doctrine section`.
+  - Tests now fail if a native tool schema uses `allOf`, `anyOf`, `not`,
+    `if`/`then`/`else`, `$ref`, `$defs`, `dependentSchemas` or
+    `patternProperties`, or if any native surface grows past its recorded size.
 
 - **Native tool arguments are normalized before schema validation.** Native
   Forge read and proposal tools now normalize provider arguments first and
