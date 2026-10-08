@@ -386,6 +386,11 @@ impl MergeService {
                 .trim()
                 .to_owned()
         };
+        if !expected_target_sha.is_empty() {
+            if let Some(hook) = crate::workflow::engine::durable::current_hook(&task_id) {
+                db::note_integration_target(&task_id, hook.index, None, &expected_target_sha);
+            }
+        }
         let spec = MergeSpec {
             target_branch,
             // Embedded integration retains its locked review-contract precondition.
@@ -643,6 +648,9 @@ impl MergeService {
         .await
         .map_err(ServiceError::invalid_operation)?;
         let target_sha = target_sha.trim().to_owned();
+        if let Some(hook) = crate::workflow::engine::durable::current_hook(&task_id) {
+            db::note_integration_target(&task_id, hook.index, Some(&worktree_sha), &target_sha);
+        }
         // A merge can land before its terminal workflow cascade is persisted.
         // Recognize that result before treating the now-newer target as another
         // review refresh; this also handles siblings landing after this Task.

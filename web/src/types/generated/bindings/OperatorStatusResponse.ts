@@ -7,6 +7,7 @@ import type { DaemonPressureSummary } from "./DaemonPressureSummary";
 import type { DatabaseStorageStatus } from "./DatabaseStorageStatus";
 import type { EventConsumerStatus } from "./EventConsumerStatus";
 import type { EventRelayStatus } from "./EventRelayStatus";
+import type { IntegrationQueueStatus } from "./IntegrationQueueStatus";
 import type { OperatorSeverity } from "./OperatorSeverity";
 import type { PeriodicWorkerStatus } from "./PeriodicWorkerStatus";
 import type { RecentErrorSummary } from "./RecentErrorSummary";
@@ -16,4 +17,4 @@ import type { UsageIndexStatus } from "./UsageIndexStatus";
 import type { UsageSummary } from "./UsageSummary";
 import type { WorkspaceCleanupSummary } from "./WorkspaceCleanupSummary";
 
-export type OperatorStatusResponse = { overall_severity: OperatorSeverity, active_executions: Array<ActiveExecutionSummary>, blocked_tasks: Array<BlockedTaskSummary>, daemon_issues: Array<DaemonIssueSummary>, daemon_pressure: Array<DaemonPressureSummary>, agent_pressure: Array<AgentPressureSummary>, workspace_cleanup: Array<WorkspaceCleanupSummary>, retry_pressure: Array<RetryPressureSummary>, usage_summary: UsageSummary | null, usage_index: UsageIndexStatus, recent_errors: Array<RecentErrorSummary>, event_consumers: Array<EventConsumerStatus>, periodic_workers: Array<PeriodicWorkerStatus>, task_steps: TaskStepQueueStatus, pending_remote_cancels: number, event_relay: EventRelayStatus, database: DatabaseStorageStatus, computed_at: string, };
+export type OperatorStatusResponse = { overall_severity: OperatorSeverity, active_executions: Array<ActiveExecutionSummary>, blocked_tasks: Array<BlockedTaskSummary>, daemon_issues: Array<DaemonIssueSummary>, daemon_pressure: Array<DaemonPressureSummary>, agent_pressure: Array<AgentPressureSummary>, workspace_cleanup: Array<WorkspaceCleanupSummary>, retry_pressure: Array<RetryPressureSummary>, usage_summary: UsageSummary | null, usage_index: UsageIndexStatus, recent_errors: Array<RecentErrorSummary>, event_consumers: Array<EventConsumerStatus>, periodic_workers: Array<PeriodicWorkerStatus>, task_steps: TaskStepQueueStatus, integration_queues: IntegrationQueueStatus, pending_remote_cancels: number, event_relay: EventRelayStatus, database: DatabaseStorageStatus, computed_at: string, };

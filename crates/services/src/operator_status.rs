@@ -14,7 +14,7 @@ use api_types::{
     WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
-use db::{SqliteDb, WorkspaceRepo};
+use db::{IntegrationQueueRepo, SqliteDb, WorkspaceRepo};
 use serde_json::Value;
 use sqlx::Row;
 
@@ -355,6 +355,12 @@ impl OperatorStatusService {
             raise_severity(&mut overall_severity, OperatorSeverity::Error);
         }
 
+        let integration_counts = self.db.integration_queue_counts().await?;
+        let integration_queues = api_types::IntegrationQueueStatus {
+            queues_by_state: integration_counts.queues_by_state,
+            current_attempts_by_state: integration_counts.current_attempts_by_state,
+            quarantined_imports: integration_counts.quarantined_imports,
+        };
         Ok(OperatorStatusResponse {
             overall_severity,
             active_executions,
@@ -370,6 +376,7 @@ impl OperatorStatusService {
             event_consumers,
             periodic_workers,
             task_steps,
+            integration_queues,
             pending_remote_cancels,
             event_relay,
             database,
@@ -1101,6 +1108,40 @@ mod tests {
         let service = OperatorStatusService::new(Arc::clone(&db));
         service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
         (db, service)
+    }
+
+    #[tokio::test]
+    async fn integration_status_counts_passive_queues_current_members_and_quarantined_imports() {
+        let (db, service) = test_service().await;
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('queue-project','queue-project',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO repo(id,project_id,name,default_branch,created_at,updated_at) VALUES('queue-repo','queue-project','queue-repo','main',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        for id in ["queue-task", "quarantined-task"] {
+            sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'queue-project',?,'merging',?,?)").bind(id).bind(id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        }
+        let queue = db
+            .create_or_get_integration_queue("queue-repo", "main")
+            .await
+            .unwrap();
+        let attempt = db::IntegrationAttempt::new(
+            Some(queue.id),
+            "queue-task".into(),
+            "queue-project".into(),
+            "admission".into(),
+            "merging".into(),
+            0,
+            1,
+        );
+        db.admit_integration_attempt(attempt).await.unwrap();
+        db.import_integration_pass(100).await.unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.integration_queues.queues_by_state["suspended"], 1);
+        assert_eq!(status.integration_queues.queues_by_state["open"], 0);
+        assert_eq!(
+            status.integration_queues.current_attempts_by_state["queued"],
+            1
+        );
+        assert_eq!(status.integration_queues.quarantined_imports, 2);
     }
 
     #[tokio::test]

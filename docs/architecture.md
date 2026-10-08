@@ -4189,7 +4189,7 @@ cut at 4,096 bytes; 24 KiB is its tested ceiling for the same reason.
 
 Stage A extends the statement seam only. No production caller emits these reasons;
 merge/rebase/CI/fast-forward, legacy writers, budgets and completion semantics are
-unchanged. There are no queue/attempt tables, queue worker or path guards yet.
+unchanged. Stage B below adds passive queue/attempt storage; there is still no queue worker or path guard enforcement.
 `IntegrationAttemptId` is an opaque typed string, never queue rank or worker token.
 
 `ConditionStatement::Integration { reason }` replaces only integration's reason,
@@ -4302,6 +4302,309 @@ phase timestamps and retry deadlines/ticks never change incident identity.
 Ordinary progress raises no incident or agent wake. Stage A emits no condition
 events; later Task-step consumers must atomically emit a changed material blocker
 when applying a real owner failure. Pushing remains explicit repository sync.
+
+### Passive integration queues, import and observations (3.2 stage B)
+
+Stage B adds `integration_queue` and `integration_attempt`. Their repository
+methods are storage operations; no production queue worker calls them to run
+Git, rebase, CI, authorize a fast-forward, send a Task back or mark it done.
+`merging` still runs today's merge hooks. No condition statement is emitted,
+no Task column or budget is migrated, and no legacy producer is retired.
+
+A queue is unique by `(repo_id, target_branch)`. Branch validation strips one
+`refs/heads/` prefix and preserves exact spelling. Location is never a queue
+key. `resolve_integration_target_in_tx` is the single location-selection seam:
+it reads `repo.local_path` and the repo's explicitly default
+`repo_location` rows of kind `primary_checkout`. Exactly one must exist; if a
+local path is configured, it must match that server location. Multiple defaults
+(including a server checkout and daemon copies), missing defaults, contradictory
+local configuration and non-ready targets suspend the queue with a typed
+`target_ambiguous`, `target_unconfigured` or `target_unavailable` reason. Task
+placement and mere daemon presence never choose the target. This conservative
+selection can be replaced in one function when the authoritative setting is
+settled. The witness stores location/owner/runtime/generation, never a path or
+token. Repo and target-location deletion are restricted by foreign keys while
+these retained queue records reference them; resolved evidence detachment and
+retention are later-stage work.
+
+The migration is additive SQL only: two tables and their indexes, no data DML,
+no logic triggers, no changes to historical migrations. Task deletion nulls the
+attempt's Task FK while retaining `task_ref`/`project_ref`. Delivery FKs are
+nullable with separate opaque refs, so workspace/execution cleanup cannot erase
+recorded identity. `daemon_id`/`runtime_id` and contract/Review/carry identifiers
+are retained opaque witnesses rather than cascading foreign keys.
+
+`integration_queue` columns (the SQL is authoritative):
+
+| Column | SQL type / constraints |
+|---|---|
+| `id` | `TEXT PRIMARY KEY` |
+| `repo_id` | `TEXT NOT NULL REFERENCES repo(id) ON DELETE RESTRICT` |
+| `target_branch` | `TEXT NOT NULL` |
+| `target_location_id` | `TEXT REFERENCES repo_location(id) ON DELETE RESTRICT` |
+| `target_owner_json` | `TEXT CHECK(target_owner_json IS NULL OR json_valid(target_owner_json))` |
+| `next_seq` | `INTEGER NOT NULL DEFAULT 1 CHECK(next_seq >= 1)` |
+| `head_attempt_id` | `TEXT REFERENCES integration_attempt(id) DEFERRABLE INITIALLY DEFERRED` |
+| `lease_owner` | `TEXT` |
+| `lease_until` | `TEXT` |
+| `fence_generation` | `INTEGER NOT NULL DEFAULT 0 CHECK(fence_generation >= 0)` |
+| `state` | `TEXT NOT NULL CHECK(state IN ('open','suspended','quarantined','closed'))` |
+| `available_at` | `TEXT` |
+| `updated_at` | `TEXT NOT NULL` |
+| `created_at` | `TEXT NOT NULL` |
+| `revision` | `INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1)` |
+| `last_error_kind` | `TEXT CHECK(last_error_kind IN ('infrastructure','target_unconfigured','target_ambiguous','target_unavailable','owner_required','unsupported_path','corrupt_import','contradictory_proof','needs_fact','timeout','workspace_lost','candidate_check_failed'))` |
+| `last_error` | `TEXT CHECK(length(CAST(last_error AS BLOB)) <= 4096)` |
+
+`integration_attempt` columns (the SQL is authoritative):
+
+| Column | SQL type / constraints |
+|---|---|
+| `id` | `TEXT PRIMARY KEY` |
+| `queue_id` | `TEXT REFERENCES integration_queue(id) ON DELETE RESTRICT` |
+| `task_id` | `TEXT REFERENCES task(id) ON DELETE SET NULL` |
+| `task_ref` | `TEXT NOT NULL` |
+| `project_ref` | `TEXT NOT NULL` |
+| `queue_seq` | `INTEGER NOT NULL CHECK(queue_seq >= 1)` |
+| `attempt_number` | `INTEGER NOT NULL DEFAULT 1 CHECK(attempt_number >= 1)` |
+| `predecessor_attempt_id` | `TEXT REFERENCES integration_attempt(id) ON DELETE RESTRICT` |
+| `current` | `INTEGER NOT NULL CHECK(current IN (0,1))` |
+| `admission_key` | `TEXT NOT NULL` |
+| `expected_status` | `TEXT NOT NULL` |
+| `expected_epoch` | `INTEGER NOT NULL CHECK(expected_epoch >= 0)` |
+| `observed_task_version` | `INTEGER NOT NULL` |
+| `workflow_ref_id` | `TEXT REFERENCES task_step_workflow(id) ON DELETE SET NULL` |
+| `enqueued_at` | `TEXT NOT NULL` |
+| `execution_id` | `TEXT REFERENCES execution(id) ON DELETE SET NULL` |
+| `execution_ref` | `TEXT` |
+| `workspace_id` | `TEXT REFERENCES workspace(id) ON DELETE SET NULL` |
+| `workspace_ref` | `TEXT` |
+| `placement_id` | `TEXT REFERENCES workspace_placement(id) ON DELETE SET NULL` |
+| `placement_ref` | `TEXT` |
+| `repo_location_id` | `TEXT REFERENCES repo_location(id) ON DELETE SET NULL` |
+| `repo_location_ref` | `TEXT` |
+| `owner_kind` | `TEXT CHECK(owner_kind IN ('server','daemon'))` |
+| `daemon_id` | `TEXT` |
+| `runtime_id` | `TEXT` |
+| `placement_generation` | `INTEGER` |
+| `original_candidate_sha` | `TEXT` |
+| `candidate_sha` | `TEXT` |
+| `fork_base_sha` | `TEXT` |
+| `target_tip_sha` | `TEXT` |
+| `contract_execution_id` | `TEXT` |
+| `review_id` | `TEXT` |
+| `carry_id` | `TEXT` |
+| `authority_digest` | `TEXT` |
+| `source_digest_version` | `INTEGER` |
+| `reviewed_paths_json` | `TEXT CHECK(reviewed_paths_json IS NULL OR json_valid(reviewed_paths_json))` |
+| `changed_paths_json` | `TEXT CHECK(changed_paths_json IS NULL OR json_valid(changed_paths_json))` |
+| `conflict_paths_json` | `TEXT CHECK(conflict_paths_json IS NULL OR json_valid(conflict_paths_json))` |
+| `repair_paths_json` | `TEXT CHECK(repair_paths_json IS NULL OR json_valid(repair_paths_json))` |
+| `guard_paths_json` | `TEXT CHECK(guard_paths_json IS NULL OR json_valid(guard_paths_json))` |
+| `blocked_by_attempt_ids_json` | `TEXT CHECK(blocked_by_attempt_ids_json IS NULL OR json_valid(blocked_by_attempt_ids_json))` |
+| `paths_commit_sha` | `TEXT` |
+| `paths_base_sha` | `TEXT` |
+| `state` | `TEXT NOT NULL CHECK(state IN ('queued','path_wait','validating','rebasing','checking','awaiting_task_step','ready_ff','ff_inflight','reconciling','applied','ejected','needs_review','parked','quarantined','completed','cancelled','superseded'))` |
+| `resume_state` | `TEXT CHECK(resume_state IN ('queued','path_wait','validating','rebasing','checking','awaiting_task_step','ready_ff','ff_inflight','reconciling','applied','ejected','needs_review','parked','quarantined','completed','cancelled','superseded'))` |
+| `outcome_kind` | `TEXT CHECK(outcome_kind IN ('admission','candidate','target_tip','clean_rebase','conflict_handoff','conflict','review_required','target_moved','dirty','target_dirty','markers','ci_passed','ci_failed','owner_offline','workspace_lost','done','cancelled','unsupported_conflict'))` |
+| `failure_kind` | `TEXT CHECK(failure_kind IN ('infrastructure','target_unconfigured','target_ambiguous','target_unavailable','owner_required','unsupported_path','corrupt_import','contradictory_proof','needs_fact','timeout','workspace_lost','candidate_check_failed'))` |
+| `failure_message` | `TEXT CHECK(length(CAST(failure_message AS BLOB)) <= 4096)` |
+| `slot_generation` | `INTEGER NOT NULL DEFAULT 0 CHECK(slot_generation >= 0)` |
+| `critical_started_at` | `TEXT` |
+| `permit_json` | `TEXT CHECK(permit_json IS NULL OR json_valid(permit_json))` |
+| `cancel_requested_at` | `TEXT` |
+| `hold_requested_at` | `TEXT` |
+| `operation_kind` | `TEXT CHECK(operation_kind IN ('merge','rebase','check','fast_forward','reconcile'))` |
+| `operation_id` | `TEXT` |
+| `request_digest` | `TEXT` |
+| `current_operation_state` | `TEXT CHECK(current_operation_state IN ('pending','running','succeeded','failed','uncertain','acknowledged'))` |
+| `operation_receipts_json` | `TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(operation_receipts_json))` |
+| `rebase_result_json` | `TEXT CHECK(rebase_result_json IS NULL OR json_valid(rebase_result_json))` |
+| `checks_digest` | `TEXT` |
+| `checks_json` | `TEXT CHECK(checks_json IS NULL OR json_valid(checks_json))` |
+| `check_index` | `INTEGER NOT NULL DEFAULT 0 CHECK(check_index >= 0)` |
+| `checks_commit_sha` | `TEXT` |
+| `checks_started_at` | `TEXT` |
+| `checks_finished_at` | `TEXT` |
+| `interruption_count` | `INTEGER NOT NULL DEFAULT 0 CHECK(interruption_count >= 0)` |
+| `deadline` | `TEXT` |
+| `effect_seq` | `INTEGER NOT NULL DEFAULT 0 CHECK(effect_seq >= 0)` |
+| `effect_kind` | `TEXT CHECK(effect_kind IN ('advance','park','send_back'))` |
+| `effect_payload_json` | `TEXT CHECK(effect_payload_json IS NULL OR json_valid(effect_payload_json))` |
+| `effect_step_id` | `TEXT REFERENCES task_step(id) ON DELETE SET NULL` |
+| `effect_ack_json` | `TEXT CHECK(effect_ack_json IS NULL OR json_valid(effect_ack_json))` |
+| `acknowledged_at` | `TEXT` |
+| `integrated_before_sha` | `TEXT` |
+| `integrated_sha` | `TEXT` |
+| `target_observed_sha` | `TEXT` |
+| `available_at` | `TEXT` |
+| `retry_count` | `INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0)` |
+| `last_error_kind` | `TEXT CHECK(last_error_kind IN ('infrastructure','target_unconfigured','target_ambiguous','target_unavailable','owner_required','unsupported_path','corrupt_import','contradictory_proof','needs_fact','timeout','workspace_lost','candidate_check_failed'))` |
+| `last_error` | `TEXT CHECK(length(CAST(last_error AS BLOB)) <= 4096)` |
+| `started_at` | `TEXT` |
+| `updated_at` | `TEXT NOT NULL` |
+| `created_at` | `TEXT NOT NULL` |
+| `completed_at` | `TEXT` |
+| `import_source_json` | `TEXT CHECK(import_source_json IS NULL OR json_valid(import_source_json))` |
+| `observations_json` | `TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(observations_json))` |
+| `revision` | `INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1)` |
+
+Keys: queue `UNIQUE(repo_id,target_branch)`; attempts
+`UNIQUE(queue_id,queue_seq,attempt_number)` and
+`UNIQUE(queue_id,admission_key)`. The orphan admission key is separately unique.
+
+Indexes:
+
+- `CREATE INDEX integration_queue_ready ON integration_queue(state,available_at)`
+- `CREATE INDEX integration_queue_expired_lease ON integration_queue(lease_until) WHERE lease_until IS NOT NULL`
+- `CREATE INDEX integration_queue_location ON integration_queue(target_location_id)`
+- `CREATE UNIQUE INDEX integration_attempt_current_task ON integration_attempt(task_ref) WHERE current=1`
+- `CREATE UNIQUE INDEX integration_attempt_current_seq ON integration_attempt(queue_id,queue_seq) WHERE current=1`
+- `CREATE UNIQUE INDEX integration_attempt_orphan_admission ON integration_attempt(admission_key) WHERE queue_id IS NULL`
+- `CREATE INDEX integration_attempt_members ON integration_attempt(queue_id,state,available_at,queue_seq) WHERE current=1`
+- `CREATE INDEX integration_attempt_history ON integration_attempt(task_ref,created_at DESC)`
+- `CREATE INDEX integration_attempt_reconnect ON integration_attempt(daemon_id,current_operation_state)`
+- `CREATE UNIQUE INDEX integration_attempt_operation ON integration_attempt(operation_id) WHERE operation_id IS NOT NULL`
+- `CREATE INDEX integration_attempt_retention ON integration_attempt(state,completed_at)`
+- `CREATE INDEX integration_attempt_import ON integration_attempt(task_ref,expected_epoch) WHERE import_source_json IS NOT NULL`
+
+Nullable JSON path sets distinguish an unknown set (`NULL`) from a known empty
+set (`[]`). They keep exact repo-relative UTF-8 identity, including both rename
+endpoints, case and Unicode spelling. Unsupported encodings and invalid path
+shapes quarantine imports; no lossy normalization grants eligibility. Guards
+have no expiry column. Repair-touched paths have their own full set; conflict
+and guard sets are distinct. Stage E must implement their union, overlap and
+explicit closure rules. Queue sequence is a reservation, not visible eligible
+rank; successors atomically supersede their predecessor and keep its sequence.
+Only one current attempt per Task and one current attempt per queue sequence can
+exist. Terminal attempts are not current. Imported orphan evidence has no queue
+and no current membership.
+
+Claims reserve one head in a `BEGIN IMMEDIATE` transaction. An open queue without a live process lease can be claimed. A quarantined queue
+can only transfer ownership of its existing reconciling/in-flight head, never
+select another member. Takeover retains the reserved head,
+advances `fence_generation`, stamps the head's `slot_generation` and advances its
+revision. A ready permit is invalidated on takeover and returns to Task-step
+authorization; in-flight work returns to reconciliation of its original
+operation. Renewal requires queue revision, owner and fencing generation. Attempt
+updates require revision and the transition graph; ReadyFf/FF-inflight data must bind candidate, target, Task epoch and slot generation in its permit, and configured check evidence must name the same candidate. Stale snapshots return
+`DbError::VersionConflict`. These methods write no Task version. Expired process
+leases never imply that an uncertain logical head is free. No production caller
+claims these leases in Stage B.
+
+The attempt transition table is data (`INTEGRATION_TRANSITIONS`), with an exit
+for every non-terminal state and none for terminals. Self-state updates can
+record facts on non-terminal rows; terminal machine state cannot transition.
+Critical and uncertain states cannot be cancelled merely by a timeout.
+
+| From | Allowed next states |
+|---|---|
+| `queued` | `path_wait`, `validating`, `parked`, `cancelled`, `superseded` |
+| `path_wait` | `queued`, `validating`, `parked`, `cancelled`, `superseded` |
+| `validating` | `applied`, `needs_review`, `parked`, `rebasing`, `cancelled`, `superseded` |
+| `rebasing` | `checking`, `ejected`, `parked`, `reconciling`, `cancelled` |
+| `checking` | `awaiting_task_step`, `ejected`, `parked`, `cancelled` |
+| `awaiting_task_step` | `ready_ff`, `needs_review`, `ejected`, `parked`, `cancelled` |
+| `ready_ff` | `awaiting_task_step`, `ff_inflight`, `needs_review`, `parked`, `cancelled` |
+| `ff_inflight` | `applied`, `rebasing`, `reconciling` |
+| `reconciling` | `applied`, `rebasing`, `ready_ff`, `parked`, `quarantined` |
+| `applied` | `completed` |
+| `ejected` | `needs_review`, `parked`, `cancelled`, `superseded` |
+| `needs_review` | `parked`, `cancelled`, `superseded` |
+| `parked` | `queued`, `rebasing`, `checking`, `needs_review`, `ejected`, `cancelled`, `superseded` |
+| `quarantined` | `reconciling`, `parked`, `queued`, `superseded` |
+| `completed` | None (terminal) |
+| `cancelled` | None (terminal) |
+| `superseded` | None (terminal) |
+
+`available_at` and `deadline` are optional application timestamps; there is no
+SQL timeout default. The later head pipeline must read its timeout setting
+(default 1800 seconds). The tables do not charge budgets: a normal stale-base
+rebase must cost nothing, external target movement must be charged once by its
+Task-step consumer, and ordinary waiters keep their active Project slot. Stage A
+already owns the condition projection; queue positions, clocks, leases and full
+path sets stay out of it.
+
+**Bounded import.** `SqliteDb::import_integration_pass` imports at most 100 Tasks
+per call in one transaction, with bounded history queries (64 rows per source,
+plus one sentinel), and caps each source text at 65,536 characters before materialization. Oversized sources retain their original byte length and a marked prefix and require `complete_legacy_evidence`. Its unique `import:<Task>:<status_epoch>` admission records
+are the durable progress register. Committed entries are excluded on the next
+pass; a crash rolls back the whole unfinished slice. It orders by current entry
+time, transition identity and Task ID and pins repository provenance from the
+implementation execution's workspace, including a coordination root's relevant
+child execution. It never substitutes the Project's current primary repo for
+attempted work. It visits `merging`/`merge_failed` and relevant `review`, `done`
+and `cancelled` history. This storage pass is callable but is not scheduled or
+activated at startup in Stage B; cutover must drive it before queue consumption.
+
+Each row freezes the priority, disposition, named missing facts and raw source
+JSON in `import_source_json`. Malformed JSON, unknown typed bridges, unsupported
+paths, missing execution/target and contradictory proof sources are retained as
+quarantined rows. The importer writes only the two new tables: no Task, step,
+condition, Review, carry, event, budget or Git effect. It does not redirect any
+legacy hook. Actual Git/daemon facts unavailable to this pass are `needs_fact`,
+never invented approvals, CI results or ancestry. An unresolved operation pins
+a quarantined head and retains its original identity; a second uncertain head
+is separately quarantined. Already current shadow membership is preserved and
+its import records the need to resolve `existing_attempt_identity`.
+
+| Priority | Storage disposition and evidence |
+|---|---|
+| 1 | Certified persisted Done → `applied` (`completed` for a done Task), preserving candidate and integrated result separately, including manual merge commits. Intent without success needs `candidate_ancestry`; incomplete owner receipts need `validated_owner_receipt`. Cancelled/deleted/archived success needs original-operation reconciliation. |
+| 2 | Unresolved retained merge intent or running remote operation → `reconciling`, `needs_fact: original_remote_operation_result`; quarantine and pin the queue head. |
+| 3 | Terminal/deleted/archived without possible effect → completed/cancelled/superseded history, not current. Subtasks acquire no independent queue. |
+| 4 | Current pending/claimed hook and its frozen input/effects → `needs_fact: legacy_hook_continuation`; preserve its recorded phase and all blockers, with no redirect. |
+| 5 | Rebase target without outcome → parked with rebasing resume and `needs_fact: git_rebase_in_progress_and_conflict_paths`; do not test ancestry before active-rebase recovery. |
+| 6 | Rebased outcome or clean mechanical bridge → parked with checking resume and `needs_fact: rebased_head_and_bound_checks`; no invented coder or reused CI. |
+| 7 | Typed conflict outcome/handoff in merge_failed → ejected (parked for held/exhausted repair), known conflict/guard paths retained; `needs_fact: current_retry_window_conflict_and_repair_paths`. Retry resets bound the typed bridge union. |
+| 8 | ReviewRefresh or cleared authority without mechanical proof → needs_review; no carry grant. |
+| 9 | Stored carry → parked with validating resume and `needs_fact: carry_head_base_and_check_evidence`; no approval is inferred from the row alone. |
+| 10 | Matching paused-integration marker and paused Project → parked with the exact source/generation retained. |
+| 11 | Matching marker, resumed Project → parked with queued resume and `needs_fact: candidate_head_and_review_authority`. |
+| 12 | Marker names another entry → obsolete evidence with queued resume; current candidate/authority still needs a fact. |
+| 13 | Existing blocked/failed/manual/human/entry blocker → parked; every source reason is preserved. |
+| 14 | Future retry or CI infrastructure interruption → parked with deadline; an incompatible target is obsolete evidence. |
+| 15 | Owner wait/disconnected placement/upgrade/pending remote cancellation → parked owner exclusion. Uncertain operations were handled first. |
+| 16 | Removed owner/machine_removed workspace/lost daemon handle → parked with `needs_fact: candidate_object_availability`. |
+| 17 | Accepted queued recovery or sticky disposition → parked, preserving owner command ordering. |
+| 18 | Root merging with passed marker, pinned delivery, no hook or blocker → parked with queued resume and `needs_fact: candidate_head_and_review_authority`; the timestamp alone grants no authority. |
+| 19 | Ordinary dirty/conflict repair → ejected, workspace/target repair → parked; no manufactured conflict paths or carry provenance. |
+| 20 | Unknown/malformed/contradictory input → quarantined, never dropped. A history source exceeding the bound needs `complete_legacy_evidence`. |
+
+Proof disagreement is checked before a lower-priority blocker can hide it. Owner
+receipts must match the frozen operation, location, owner and generation; a
+reviewed exact object must match its Done result, while an explicitly manual
+merge may integrate a merge commit. A generation-only pause marker grants no
+resume. Bridge-looking prose grants no mechanical lineage.
+
+**Shadow observations.** The existing Task-step owner records typed, idempotent
+observations on current membership. `record_hook_effect` stores admission,
+merge and rebase observations in the same transaction as the legacy checkpoint.
+MergeService buffers the exact target tip where it already reads it (embedded
+under its authority lock, daemon from its existing target precondition); this
+adds no Git command or database transaction during Git work. The buffer is
+scoped to the Task step and is flushed with the existing hook result.
+`update_status_inner` and `update_status_with_review_authority_inner` observe
+actual CI exit codes, and carried authority's candidate/base/changed paths, in
+their existing Review transaction. `finish_step_in_tx` records terminal done or
+cancellation in the existing result transaction. Ordinary observations never
+advance a runnable attempt phase; only resolved terminal Task results detach membership
+into terminal history. A terminal legacy Task does not release an uncertain
+operation or its quarantined head. Unobserved fields remain null; notably Done.before_sha is
+not re-labelled as a target-tip fact.
+
+Every optional observer uses a savepoint. A failed insert/update rolls back only
+its queue/attempt writes, logs once per observation identity and leaves the real
+result to commit. The shadow emits no event, states no condition, schedules no
+worker, changes no ordering/retry timing/budget and drives no Git or CI. Five
+result-transaction differential fixtures (Done, clean rebase, conflict handoff,
+CI failure, cancellation) compare the literal values of every other table,
+including nonempty Task, step, transition, event and budget history, against the
+same database image with observation recording forced to fail. Existing merge
+and workflow/API targets continue to exercise actual Git and Task outcomes.
+Operator status adds only read-only counts by queue/current-attempt state and
+quarantined imports; there are no queue REST/MCP/web/CLI reads yet.
+
 
 ### Task condition actions
 

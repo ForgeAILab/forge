@@ -36,7 +36,12 @@ pub fn owns_task(task_id: &str) -> bool {
         .unwrap_or(false)
 }
 pub async fn in_task_step<T>(step: TaskStep, future: impl std::future::Future<Output = T>) -> T {
-    CURRENT_STEP.scope(step, future).await
+    CURRENT_STEP
+        .scope(
+            step,
+            crate::integration_queue::shadow::with_observation_buffer(future),
+        )
+        .await
 }
 
 /// Central guard for in-transaction helpers that write a Task's workflow

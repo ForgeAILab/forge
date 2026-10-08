@@ -1584,6 +1584,7 @@ export interface PeriodicWorkerStatus {
 }
 
 export interface OperatorStatusResponse {
+  integration_queues: import('./bindings/IntegrationQueueStatus').IntegrationQueueStatus
   pending_remote_cancels: number
   usage_index: UsageIndexStatus
   event_relay: EventRelayStatus

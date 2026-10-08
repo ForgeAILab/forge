@@ -7,6 +7,8 @@ mod connection;
 mod environment_readiness;
 mod error;
 mod ids;
+pub mod integration_queue;
+pub use integration_queue::*;
 pub mod machine_capacity;
 mod migration;
 mod models;
