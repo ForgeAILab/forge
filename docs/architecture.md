@@ -95,8 +95,9 @@ type, so a mismatch does not compile.
   negative value for an unsigned field are refused), and neither the
   advertised line nor the canonical schema is widened. Denial comes before
   contract detail: the read tool rejects an operation outside the session's
-  grant, then a forged scope or authority field, and only then reports a
-  contract violation; at dispatch, a caller the Main handler would deny gets
+  grant, then (on the named orchestration read tools; `forge_scope_read` has
+  no such guard, its closed contracts refuse the field) a forged scope or
+  authority field, and only then reports a contract violation; at dispatch, a caller the Main handler would deny gets
   that denial even when the arguments are malformed.
 - *Canonical.* The full per-operation JSON Schema stays in the registry for
   validation, documentation and the `read_contracts.json` fixture. It is not
