@@ -4743,6 +4743,90 @@ Operator status adds only read-only counts by queue/current-attempt state and
 quarantined imports; there are no queue REST/MCP/web/CLI reads yet.
 
 
+### Integration effect primitives and Task-step recorders (3.2 stage C, part 1)
+
+`services::integration_effects` contains the Git/command/socket effects and
+read-only facts used by today's Task-step consumer. It accepts an explicit
+`EffectWorkspace` witness (owner, workspace, placement, generation and handle),
+Git paths/branches and candidate/target objects, command purpose/environment,
+and caller-supplied command/transport deadlines. Its functions receive no
+repository, database, event publisher or Task service. The witness is input
+provenance; the current consumers still perform placement and review authority
+checks. It is not a new owner-side or queue-generation fence.
+
+The split is phased to preserve the existing transaction and read order:
+
+- `merge_cleanliness`, `expected_target`, `merge_heads`, `target_tip` and
+  `validate_merge_candidate` collect/classify Git facts. The consumer records
+  the candidate's execution `before_sha` before taking the local review guard,
+  buffers stage B's target observation at the same target read, then calls
+  `apply_merge`. Reviewed integration fast-forwards the exact approved object;
+  manual integration still permits a merge commit. `merge_result` collects the
+  resulting SHA or reads conflict paths and aborts after the guard is released,
+  as before. An exact-object mismatch retains the original guard-drop path.
+  `MergeService::record_merge_execution_evidence` owns execution writes,
+  including their existing Project list-revision and usage-ledger triggers.
+- `rebase` moves the existing dirty/stopped-rebase checks, text-marker
+  materialization and unsupported-conflict abort behavior. `recover_rebase`
+  checks for an interrupted rebase before ancestry;
+  `finish_rebase_recovery` preserves the union and order of previously
+  committed marker paths. Their `GitFacts` port can only query Git. The hook
+  consumer still reads/writes `rebase_target` and `rebase_outcome`, records
+  Forge-established HEAD evidence, and applies comments, typed bridges and
+  Task results. The existing owner HEAD probe produces `RebaseHeadFacts`;
+  `record_rebase_head` consumes it and issues only the original SQLite write.
+  Qualification and probe order are unchanged, with no added HEAD read.
+  Fresh local rebase still uses the branch name, exactly as the
+  legacy path does; local expected-object metadata is absent where today's
+  caller has no such precondition. Daemon rebase retains its existing expected
+  HEAD/generation checks and owner-operation messages.
+- `CheckRunInput` supplies one command list, purpose, environment and placement
+  witness, an explicit optional timeout and output capture bound. `CheckRun`
+  yields one command at a time and returns `CheckRunOutcome` (command index,
+  exit code, bounded redacted stderr/combined output tails and timestamps) or
+  `CheckRunFailure` (infrastructure error and the completed command facts).
+  `run_at` owns only local process execution and capture. The daemon uses the
+  same `RunSpec`/`RunResult` and existing owner wire types. The consumer can
+  retain/acknowledge each owner reply before issuing the next command; the
+  `RunCiSteps` recorder then serializes the facts and performs the same Review
+  settlement, Task authority projection and event publication. Entry CI still
+  passes `None` (wire `timeout_secs=0`), with unbounded collection and the same
+  4096-byte Review tails. No default timeout, CheckRunner cache or conformance
+  consolidation is introduced.
+- `RpcExchange::prepare` installs only the in-memory pending reply; the
+  consumer's `record_exchange_admission` persists remote-operation admission
+  before `execute` sends a frame. `execute` performs the socket exchange with
+  the caller's existing timeout or `None`. The pending reply guard lives
+  through `record_exchange_completion`, and `decode_reply` performs the
+  existing typed/operation-identity validation. `record_merge_reply` retains
+  validated execution evidence and the command receipt before finishing the
+  Task operation and acknowledging the owner journal. The existing client
+  owns persisted intents, retry/reconciliation and acknowledgement receipts.
+  Authority check → persisted intent → authority recheck → RPC outside SQLite
+  → typed validation → evidence commit → journal ACK is unchanged; reconnect
+  still inspects outstanding intents. No daemon method or payload changes.
+
+**Boundary rule.** Production files in `integration_effects/` must not import
+or reference database repositories, SQL, the event bus, Task services or the
+workflow engine. `effects_have_no_persistence_or_task_capability_imports`
+checks every production source in this module for those capabilities. This is
+an enforced module/source boundary, not a new crate boundary: existing service
+error and transport types are retained. Direct server and real-daemon primitive
+tests compare digests of every SQLite table before/after and assert no event;
+owner journal retention is an effect fact and is deliberately not acknowledged
+by a primitive. The same characterization assertions run before and after the
+extraction, including execution trigger effects and remote receipt ordering.
+
+All stage B shadow observation sites and content remain in their original
+Task-step/Review/result transactions. Carry predicates, manual mode, Task
+single-writer authority and cancellation protection are unchanged. There is
+still no integration worker or activation. Part 2 must add durable owner
+fencing, an attempt-keyed receipt sink and the cancel/reconnect/removal contract
+before a queue worker can consume these effects. The later head CI/rebase wall
+timeout remains an explicit setting decision (default 1800 seconds), not a
+default supplied by these primitives.
+
+
 ### Task condition actions
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.

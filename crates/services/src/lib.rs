@@ -35,6 +35,7 @@ pub mod environment_surfaces;
 pub mod execution_setup;
 pub mod external_api;
 pub mod external_sync;
+pub mod integration_effects;
 pub mod integration_service;
 pub mod lifecycle;
 pub mod main_chat_topic;

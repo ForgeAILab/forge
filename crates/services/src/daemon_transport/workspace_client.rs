@@ -7,10 +7,9 @@ use db::{CommandReceiptRepo, DomainEventRepo, SqliteDb, WorkspacePlacementRepo};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
 
-use super::{lock, DaemonConnection, DaemonConnectionRegistry};
-use crate::ServiceError;
+use super::DaemonConnectionRegistry;
+use crate::{integration_effects::rpc::validate_merge_result, ServiceError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceClientError {
@@ -420,25 +419,7 @@ impl DaemonWorkspaceClient {
                 result => break result?,
             }
         };
-        // Validate the complete typed payload before recording or acknowledging it.
-        let result = serde_json::from_value(value.clone()).map_err(|error| {
-            WorkspaceClientError::Transport(ServiceError::invalid_operation(format!(
-                "invalid daemon response payload: {error}"
-            )))
-        })?;
-        if let Some(operation_id) = params["operation_id"]
-            .as_str()
-            .filter(|_| method != METHOD_WORKSPACE_CANCEL)
-        {
-            if value["operation_id"].as_str() != Some(operation_id)
-                || value["entry_id"].as_str().is_none_or(str::is_empty)
-            {
-                return Err(ServiceError::invalid_operation(
-                    "daemon returned a different workspace operation identity",
-                )
-                .into());
-            }
-        }
+        let result = crate::integration_effects::rpc::decode_reply(method, &params, &value)?;
         if !matches!(method, METHOD_WORKSPACE_MERGE | METHOD_WORKSPACE_CANCEL) {
             self.retain_result(daemon_id, method, &params, &value)
                 .await?;
@@ -1066,30 +1047,24 @@ impl DaemonWorkspaceClient {
         params: Value,
         timeout: Option<Duration>,
     ) -> Result<Value> {
-        let unavailable = || ServiceError::DaemonUnavailable {
-            daemon_id: daemon_id.to_owned(),
-        };
-        let connection = self
-            .registry
-            .get(daemon_id)
-            .filter(|connection| !connection.is_stale())
-            .ok_or_else(unavailable)?;
-        self.registry
-            .ensure_protocol_dispatchable(daemon_id, &connection)?;
+        let mut exchange = crate::integration_effects::rpc::RpcExchange::prepare(
+            Arc::clone(&self.registry),
+            daemon_id,
+            method,
+            params.clone(),
+        )?;
+        let tracked = self.record_exchange_admission(method, &params).await?;
+        let value = exchange.execute(timeout).await?;
+        self.record_exchange_completion(tracked.as_ref()).await?;
+        Ok(value)
+    }
 
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let (sender, receiver) = oneshot::channel();
-        lock(&connection.pending).insert(request_id.clone(), sender);
-        let _pending = PendingRequest {
-            connection: connection.clone(),
-            request_id: request_id.clone(),
-        };
-        if !self.registry.is_current(daemon_id, connection.id())
-            || !connection.protocol_allows_dispatch()
-        {
-            return Err(unavailable().into());
-        }
-        let tracked = if matches!(
+    async fn record_exchange_admission(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Option<(db::TaskStep, String)>> {
+        if matches!(
             method,
             METHOD_WORKSPACE_PREPARE
                 | METHOD_WORKSPACE_RUN
@@ -1110,52 +1085,22 @@ impl DaemonWorkspaceClient {
                 db.register_remote_task_operation(&step, &placement, operation_id)
                     .await
                     .map_err(ServiceError::from)?;
-                Some((step, operation_id.to_owned()))
-            } else {
-                None
+                return Ok(Some((step, operation_id.to_owned())));
             }
-        } else {
-            None
-        };
-        let frame = DaemonFrame::Request {
-            id: request_id,
-            method: method.to_owned(),
-            params,
-        };
-        let mut stale = connection.stale_receiver();
-        let exchange = async {
-            connection
-                .outbound
-                .send(frame)
-                .await
-                .map_err(|_| WorkspaceClientError::Transport(unavailable()))?;
-            receiver
-                .await
-                .map_err(|_| WorkspaceClientError::Transport(unavailable()))?
-                .map_err(WorkspaceClientError::Daemon)
-        };
-        tokio::select! {
-            result = async {
-                match timeout {
-                    Some(timeout) => tokio::time::timeout(timeout, exchange).await.map_err(|_| {
-                        WorkspaceClientError::Transport(ServiceError::DaemonTimeout {
-                            daemon_id: daemon_id.to_owned(), method: method.to_owned(),
-                        })
-                    })?,
-                    None => exchange.await,
-                }
-            } => {
-                let value = result?;
-                if !self.registry.is_current(daemon_id, connection.id()) {
-                    return Err(unavailable().into());
-                }
-                if let (Some(db),Some((step,operation_id)))=(&self.db,&tracked) {
-                    db.finish_remote_task_operation(step,operation_id).await.map_err(ServiceError::from)?;
-                }
-                Ok(value)
-            }
-            _ = stale.changed() => Err(unavailable().into()),
         }
+        Ok(None)
+    }
+
+    async fn record_exchange_completion(
+        &self,
+        tracked: Option<&(db::TaskStep, String)>,
+    ) -> Result<()> {
+        if let (Some(db), Some((step, operation_id))) = (&self.db, tracked) {
+            db.finish_remote_task_operation(step, operation_id)
+                .await
+                .map_err(ServiceError::from)?;
+        }
+        Ok(())
     }
 }
 
@@ -1216,44 +1161,9 @@ fn mutation_identity(method: &str, params: &Value) -> Value {
     identity
 }
 
-pub(crate) fn validate_merge_result(params: &Value, result: &WorkspaceMergeResult) -> Result<()> {
-    if let WorkspaceMergeOutcome::Done {
-        before_sha,
-        after_sha,
-        branch,
-    } = &result.outcome
-    {
-        if Some(before_sha.as_str()) != params["expected_target_sha"].as_str()
-            || after_sha.is_empty()
-            || Some(branch.as_str()) != params["target_branch"].as_str()
-            || params["reviewed_commit_sha"]
-                .as_str()
-                .is_some_and(|sha| sha != after_sha)
-            || result.diffstat.is_none()
-        {
-            return Err(ServiceError::invalid_operation(
-                "daemon merge result does not match the approved evidence",
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-// Cancellation, queue-send failures, and timeouts must all remove the pending sender.
-pub(super) struct PendingRequest {
-    pub(super) connection: DaemonConnection,
-    pub(super) request_id: String,
-}
-
-impl Drop for PendingRequest {
-    fn drop(&mut self) {
-        lock(&self.connection.pending).remove(&self.request_id);
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::daemon_transport::{lock, DaemonConnection};
     use std::sync::Mutex;
 
     use async_trait::async_trait;

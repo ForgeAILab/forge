@@ -25,7 +25,7 @@ pub struct MergeService {
 }
 
 pub(crate) struct WorkspaceMergeInput<'a> {
-    pub workspace_id: &'a str,
+    pub workspace: &'a crate::integration_effects::EffectWorkspace,
     pub worktree_path: &'a Path,
     pub repo_path: &'a Path,
     pub spec: &'a crate::workspace_backend::MergeSpec,
@@ -479,25 +479,11 @@ impl MergeService {
         // object, so the candidate is the merge result. The target's tip may
         // since be a sibling's commit and is never recorded here.
         let merged_sha = intent.candidate_sha.clone();
-        ExecutionRepo::update(
-            &*self.db,
-            db::UpdateExecution {
-                id: execution.id,
-                status: None,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
+        self.record_merge_execution_evidence(
+            &execution.id,
+            crate::integration_effects::MergeExecutionEvidence {
                 before_sha: None,
-                after_sha: Some(Some(merged_sha.clone())),
-                error: None,
-                executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
+                after_sha: Some(merged_sha.clone()),
             },
         )
         .await?;
@@ -539,7 +525,7 @@ impl MergeService {
                 message: format!("task {task_id} has no executor execution"),
             })?;
         let workspace = resolve_delivery_workspace(&self.db, &execution).await?;
-        if input.workspace_id != workspace.id {
+        if input.workspace.workspace_id != workspace.id {
             return Err(ServiceError::conflict(
                 "merge placement differs from the implementation execution workspace",
             ));
@@ -558,15 +544,10 @@ impl MergeService {
 
         let _integration_lock = self.integration_locks.acquire(repo_id).await;
 
-        if !git::is_worktree_clean(worktree_path).await? {
-            return Ok(MergeOutcome::Dirty {
-                files: git::status_porcelain(worktree_path).await?,
-            });
-        }
-        if !git::is_worktree_clean(repo_path).await? {
-            return Ok(MergeOutcome::TargetDirty {
-                files: git::status_porcelain(repo_path).await?,
-            });
+        if let Some(outcome) =
+            crate::integration_effects::merge::merge_cleanliness(worktree_path, repo_path).await?
+        {
+            return Ok(outcome);
         }
         let unresolved =
             unresolved_handed_off_markers(&self.db, &task_id, worktree_path, &target_branch)
@@ -575,50 +556,23 @@ impl MergeService {
             return Ok(MergeOutcome::UnresolvedConflictMarkers { paths: unresolved });
         }
 
-        if !input.spec.expected_target_sha.is_empty() {
-            let target_sha = ::review::contract::git_read(
-                repo_path,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    &format!("refs/heads/{target_branch}"),
-                ],
-            )
-            .await
-            .map_err(ServiceError::invalid_operation)?;
-            if target_sha.trim() != input.spec.expected_target_sha {
-                return Ok(MergeOutcome::TargetMoved {
-                    reason: format!(
-                        "{target_branch} advanced to {} since this Task was reviewed against {}",
-                        short_sha(target_sha.trim()),
-                        short_sha(&input.spec.expected_target_sha)
-                    ),
-                    target_branch: target_branch.clone(),
-                });
-            }
+        if let Some(outcome) = crate::integration_effects::merge::expected_target(
+            repo_path,
+            &target_branch,
+            &input.spec.expected_target_sha,
+        )
+        .await?
+        {
+            return Ok(outcome);
         }
 
-        let before_sha = git::get_current_sha(repo_path).await?;
-        let worktree_sha = git::get_current_sha(worktree_path).await?;
-        ExecutionRepo::update(
-            &*self.db,
-            db::UpdateExecution {
-                id: execution.id.clone(),
-                status: None,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: Some(Some(worktree_sha.clone())),
+        let (before_sha, worktree_sha) =
+            crate::integration_effects::merge::merge_heads(repo_path, worktree_path).await?;
+        self.record_merge_execution_evidence(
+            &execution.id,
+            crate::integration_effects::MergeExecutionEvidence {
+                before_sha: Some(worktree_sha.clone()),
                 after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
             },
         )
         .await?;
@@ -631,23 +585,8 @@ impl MergeService {
             }
             Err(error) => return Err(error.into()),
         };
-        // The candidate is the reviewed commit and base, or the mechanically
-        // rebased/repaired successor a carry recorded under the same review.
-        let reviewed_sha = review_guard
-            .candidate
-            .as_ref()
-            .map(|candidate| candidate.commit_sha.clone());
-        let target_sha = ::review::contract::git_read(
-            repo_path,
-            &[
-                "rev-parse",
-                "--verify",
-                &format!("refs/heads/{target_branch}"),
-            ],
-        )
-        .await
-        .map_err(ServiceError::invalid_operation)?;
-        let target_sha = target_sha.trim().to_owned();
+        let target_sha =
+            crate::integration_effects::merge::target_tip(repo_path, &target_branch).await?;
         if let Some(hook) = crate::workflow::engine::durable::current_hook(&task_id) {
             db::note_integration_target(
                 &hook.step.id,
@@ -656,118 +595,94 @@ impl MergeService {
                 &target_sha,
             );
         }
-        // A merge can land before its terminal workflow cascade is persisted.
-        // Recognize that result before treating the now-newer target as another
-        // review refresh; this also handles siblings landing after this Task.
-        let already_merged = ::review::contract::git_read(
-            repo_path,
-            &["merge-base", "--is-ancestor", &worktree_sha, &target_sha],
-        )
-        .await
-        .is_ok();
-        if let Some(candidate) = &review_guard.candidate {
-            let current_sha = git::get_current_sha(worktree_path).await?;
-            // Two different situations used to share one outcome. The Task
-            // branch moving out from under its own review is a genuine
-            // problem; the integration target moving is ordinary contention
-            // that the caller can resolve mechanically by rebasing.
-            if candidate.commit_sha != current_sha {
-                return Ok(MergeOutcome::ReviewRequired {
-                    reason: "reviewed commit changed since review; fresh review required".into(),
-                });
-            }
-            if !already_merged && candidate.base_sha != target_sha {
-                return Ok(MergeOutcome::TargetMoved {
-                    reason: format!(
-                        "{target_branch} advanced to {} since this Task was reviewed against {}",
-                        short_sha(&target_sha),
-                        short_sha(&candidate.base_sha)
-                    ),
-                    target_branch: target_branch.clone(),
-                });
-            }
-        }
         let task_branch = workspace::task_branch_name(&task_id);
-        // Keep this step through integration and its durable merge outcome.
-        // A pending Cancel observes the terminal cascade when Git has landed.
-
-        if !already_merged {
-            git::checkout_branch(repo_path, &target_branch).await?;
-        }
-        let merged = if already_merged {
-            review_guard.release().await?;
-            Ok(())
-        } else if let Some(sha) = reviewed_sha {
-            // Integrate the immutable reviewed object. Fast-forward refuses to
-            // synthesize an unreviewed merge tree if target ancestry changed.
-            let result =
-                ::review::contract::git_read(repo_path, &["merge", "--ff-only", &sha]).await;
-            if result.is_ok() && git::get_current_sha(repo_path).await? != sha {
-                return Ok(MergeOutcome::TargetMoved {
-                    reason: "integration target changed during merge; reviewed content was not integrated".into(),
-                    target_branch: target_branch.clone(),
-                });
-            }
-            review_guard.release().await?;
-            match result {
-                Ok(_) => Ok(()),
-                Err(reason) => return Ok(MergeOutcome::ReviewRequired { reason }),
-            }
-        } else {
-            let result = git::merge_branch_into(repo_path, &task_branch).await;
-            review_guard.release().await?;
-            result
-        };
-        match merged {
-            Ok(()) => {
-                // An already-landed candidate is the merge result; the
-                // target's tip may be a sibling merged after it.
-                let after_sha = if already_merged {
-                    worktree_sha
-                } else {
-                    git::get_current_sha(repo_path).await?
-                };
-                ExecutionRepo::update(
-                    &*self.db,
-                    db::UpdateExecution {
-                        id: execution.id,
-                        status: None,
-                        stop_reason: None,
-                        stopped_by: None,
-                        resume_policy: None,
-                        stopped_at: None,
-                        agent_session_id: None,
-                        agent_message_id: None,
-                        last_activity_at: None,
-                        summary: None,
-                        logs_path: None,
-                        before_sha: None,
-                        after_sha: Some(Some(after_sha.clone())),
-                        error: None,
-                        executor_config_snapshot_json: None,
-                        updated_at: now_rfc3339(),
-                    },
-                )
-                .await?;
-                Ok(MergeOutcome::Done {
-                    before_sha,
-                    after_sha,
-                    branch: target_branch,
-                })
-            }
-            Err(git::GitError::MergeConflict { stderr, .. }) => {
-                let conflict_paths = read_conflict_paths(repo_path).await;
-                if let Err(error) = git::abort_merge(repo_path).await {
-                    tracing::warn!(%task_id, %error, "failed to abort merge");
+        let effect = crate::integration_effects::merge::MergeEffectInput {
+            workspace: input.workspace,
+            worktree_path,
+            repo_path,
+            target_branch: &target_branch,
+            task_branch: &task_branch,
+            diagnostic_entity_id: &task_id,
+            before_sha: &before_sha,
+            expected_head_sha: &worktree_sha,
+            observed_target_sha: &target_sha,
+            reviewed: review_guard.candidate.as_ref().map(|candidate| {
+                crate::integration_effects::merge::ReviewedMergeObject {
+                    commit_sha: candidate.commit_sha.clone(),
+                    base_sha: candidate.base_sha.clone(),
                 }
-                Ok(MergeOutcome::Conflict {
-                    details: stderr,
-                    conflict_paths,
-                    target_branch,
-                })
-            }
-            Err(error) => Err(error.into()),
+            }),
+        };
+        let already_merged =
+            match crate::integration_effects::merge::validate_merge_candidate(&effect).await? {
+                crate::integration_effects::merge::MergeCandidateOutcome::Ready {
+                    already_merged,
+                } => already_merged,
+                crate::integration_effects::merge::MergeCandidateOutcome::Refused(outcome) => {
+                    return Ok(outcome)
+                }
+            };
+        let applied =
+            crate::integration_effects::merge::apply_merge(&effect, already_merged).await?;
+        // Preserve the original guard lifetime on the exact-object refusal.
+        if matches!(
+            applied,
+            crate::integration_effects::merge::MergeApplyOutcome::ExactObjectMismatch
+        ) {
+            return crate::integration_effects::merge::merge_result(
+                &effect,
+                already_merged,
+                applied,
+            )
+            .await;
         }
+        review_guard.release().await?;
+        let outcome =
+            crate::integration_effects::merge::merge_result(&effect, already_merged, applied)
+                .await?;
+        if let MergeOutcome::Done { after_sha, .. } = &outcome {
+            self.record_merge_execution_evidence(
+                &execution.id,
+                crate::integration_effects::MergeExecutionEvidence {
+                    before_sha: None,
+                    after_sha: Some(after_sha.clone()),
+                },
+            )
+            .await?;
+        }
+        Ok(outcome)
+    }
+
+    /// Today's Task-step projection, including the original repository
+    /// transaction and its Project/usage trigger effects.
+    async fn record_merge_execution_evidence(
+        &self,
+        execution_id: &str,
+        evidence: crate::integration_effects::MergeExecutionEvidence,
+    ) -> Result<()> {
+        ExecutionRepo::update(
+            &*self.db,
+            db::UpdateExecution {
+                id: execution_id.to_owned(),
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: evidence.before_sha.map(Some),
+                after_sha: evidence.after_sha.map(Some),
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn resolve_repo_source(&self, repo: &db::Repo) -> Result<String> {
@@ -811,15 +726,12 @@ async fn unresolved_handed_off_markers(
 ) -> Result<Vec<String>> {
     let transitions = db::TransitionLogRepo::list_by_task(db, task_id).await?;
     let handed_off_paths = crate::workflow::handed_off_conflict_paths(&transitions);
-    if handed_off_paths.is_empty() {
-        return Ok(Vec::new());
-    }
-    let marker_paths =
-        git::paths_adding_conflict_markers(worktree_path, target_branch, "HEAD").await?;
-    Ok(marker_paths
-        .into_iter()
-        .filter(|path| handed_off_paths.contains(path))
-        .collect())
+    crate::integration_effects::merge::unresolved_marker_paths(
+        worktree_path,
+        target_branch,
+        &handed_off_paths,
+    )
+    .await
 }
 
 /// Resolve the exact worktree pinned to the selected implementation attempt.
@@ -863,46 +775,6 @@ async fn ensure_managed_clone(remote_url: &str, clone_path: &Path) -> Result<Str
         )));
     }
     Ok(clone_path.to_string_lossy().into_owned())
-}
-
-async fn read_conflict_paths(worktree_path: &Path) -> Vec<PathBuf> {
-    let output = Command::new("git")
-        .args(["diff", "--name-only", "--diff-filter=U"])
-        .current_dir(worktree_path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await;
-
-    match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(PathBuf::from)
-            .collect(),
-        Ok(output) => {
-            tracing::warn!(
-                worktree_path = %worktree_path.display(),
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "failed to read merge conflict paths"
-            );
-            Vec::new()
-        }
-        Err(error) => {
-            tracing::warn!(
-                worktree_path = %worktree_path.display(),
-                %error,
-                "failed to run git diff for merge conflict paths"
-            );
-            Vec::new()
-        }
-    }
-}
-
-fn short_sha(sha: &str) -> &str {
-    sha.get(..12).unwrap_or(sha)
 }
 
 fn target_branch(merge_config: &Option<String>, repo_default_branch: &str) -> Result<String> {
@@ -1468,7 +1340,19 @@ mod tests {
 
     #[tokio::test]
     async fn conformance_merge_refuses_changed_candidate_target_policy_and_legacy_pass() {
-        for changed in ["none", "candidate", "target", "policy", "legacy", "landed"] {
+        for changed in [
+            "none",
+            "candidate",
+            "target",
+            "target_after_rebase",
+            "exact_object",
+            "policy",
+            "legacy",
+            "landed",
+        ] {
+            if changed == "exact_object" && !cfg!(unix) {
+                continue;
+            }
             let db = sqlite_db().await;
             let temp = TempDir::new().unwrap();
             let repo = setup_repo(&temp).await;
@@ -1478,7 +1362,13 @@ mod tests {
                 .await
                 .unwrap();
             std::fs::write(worktree.join("feature.txt"), "reviewed\n").unwrap();
-            let accepted_sha = git::commit_all(&worktree, "candidate").await.unwrap();
+            let mut accepted_sha = git::commit_all(&worktree, "candidate").await.unwrap();
+            if changed == "target_after_rebase" {
+                std::fs::write(repo.join("sibling.txt"), "sibling\n").unwrap();
+                git::commit_all(&repo, "first target move").await.unwrap();
+                git::rebase(&worktree, "main").await.unwrap();
+                accepted_sha = git::get_current_sha(&worktree).await.unwrap();
+            }
             let execution_id = seed_merge_rows(&db, &repo, &worktree, &task_id).await;
             sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES ('reviewer-role',?,'reviewer','agent','reviewer','now','now')")
                 .bind(&task_id).execute(db.pool()).await.unwrap();
@@ -1548,7 +1438,7 @@ mod tests {
                     std::fs::write(worktree.join("feature.txt"), "unreviewed\n").unwrap();
                     git::commit_all(&worktree, "repair").await.unwrap();
                 }
-                "target" => {
+                "target" | "target_after_rebase" => {
                     std::fs::write(repo.join("target.txt"), "new target\n").unwrap();
                     git::commit_all(&repo, "target moved").await.unwrap();
                 }
@@ -1556,6 +1446,23 @@ mod tests {
                     run_git(&repo, &["merge", "--ff-only", &accepted_sha]).await;
                     std::fs::write(repo.join("sibling.txt"), "later merge\n").unwrap();
                     git::commit_all(&repo, "sibling landed").await.unwrap();
+                }
+                "exact_object" => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let hooks = temp.path().join("hooks");
+                        std::fs::create_dir(&hooks).unwrap();
+                        let hook = hooks.join("post-merge");
+                        std::fs::write(&hook, "#!/bin/sh\ngit -c core.hooksPath=/dev/null commit --allow-empty -m hook-moved\n").unwrap();
+                        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                            .unwrap();
+                        run_git(
+                            &repo,
+                            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+                        )
+                        .await;
+                    }
                 }
                 "policy" => {
                     sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
@@ -1589,7 +1496,15 @@ mod tests {
                 let outcome = service.merge(task_id).await.unwrap();
                 assert!(matches!(outcome, MergeOutcome::Done { .. }), "{outcome:?}");
                 assert_eq!(git::get_current_sha(&repo).await.unwrap(), before);
-            } else if changed == "target" {
+            } else if changed == "exact_object" {
+                let outcome = service.merge(task_id).await.unwrap();
+                assert_eq!(outcome, MergeOutcome::TargetMoved {
+                    reason: "integration target changed during merge; reviewed content was not integrated".into(),
+                    target_branch: "main".into(),
+                });
+                assert_ne!(git::get_current_sha(&repo).await.unwrap(), accepted_sha);
+                assert!(git::is_worktree_clean(&repo).await.unwrap());
+            } else if matches!(changed, "target" | "target_after_rebase") {
                 let outcome = service.merge(task_id).await.unwrap();
                 // A moved integration target is contention, not a fault, and
                 // is reported separately so the caller can rebase instead of

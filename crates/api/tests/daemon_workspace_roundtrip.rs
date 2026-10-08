@@ -1605,6 +1605,604 @@ async fn remote_merge_without_a_reviewer_preserves_merge_commit_and_conflict_evi
     fixture.assert_server_cannot_resolve_workspace();
 }
 
+// Snapshot every table, including rows the effect must leave alone. SQLite's
+// quote() preserves NULL/blob/text distinctions; sorting removes row order.
+async fn table_digests(db: &db::SqliteDb) -> BTreeMap<String, String> {
+    use sha2::{Digest, Sha256};
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    let mut digests = BTreeMap::new();
+    for table in tables {
+        let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
+            .bind(&table)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        let expression = columns
+            .iter()
+            .map(|column| format!("quote(\"{}\")", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ");
+        async fn digest(db: &db::SqliteDb, table: &str, expression: &str) -> String {
+            let mut rows: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT {expression} FROM \"{}\"",
+                table.replace('"', "\"\""),
+            ))
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            rows.sort();
+            hex::encode(Sha256::digest(serde_json::to_vec(&rows).unwrap()))
+        }
+        digests.insert(table.clone(), digest(db, &table, &expression).await);
+        let volatile: &[&str] = match table.as_str() {
+            "execution" => &["before_sha", "after_sha", "updated_at"],
+            "project" => &["list_revision"],
+            "usage_ledger_revision" => &["execution_revision"],
+            _ => &[],
+        };
+        if !volatile.is_empty() {
+            let stable = columns
+                .iter()
+                .filter(|column| !volatile.contains(&column.as_str()))
+                .map(|column| format!("quote(\"{}\")", column.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" || '|' || ");
+            digests.insert(
+                format!("{table}::stable"),
+                digest(db, &table, &stable).await,
+            );
+        }
+        if let Some(column) = match table.as_str() {
+            "project" => Some("list_revision"),
+            "usage_ledger_revision" => Some("execution_revision"),
+            _ => None,
+        } {
+            let revision: i64 = sqlx::query_scalar(&format!("SELECT {column} FROM {table}"))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            digests.insert(format!("{table}::{column}"), revision.to_string());
+        }
+    }
+    digests
+}
+
+// These backend effects leave Task-step projections to their caller.
+async fn task_projection(fixture: &Fixture) -> (String, Vec<(String, String)>, i64) {
+    let db = &fixture.harness.state.db;
+    let id = &fixture.resolved.placement.task_id;
+    let task: String = sqlx::query_scalar("SELECT status || '|' || version || '|' || status_epoch || '|' || COALESCE(review_passed_at,'') || '|' || condition_json FROM task WHERE id=?")
+        .bind(id).fetch_one(db.pool()).await.unwrap();
+    let reviews =
+        sqlx::query_as("SELECT status, step_results_json FROM review WHERE task_id=? ORDER BY id")
+            .bind(id)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    let comments = sqlx::query_scalar("SELECT COUNT(*) FROM task_comment WHERE task_id=?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    (task, reviews, comments)
+}
+
+#[tokio::test]
+async fn remote_ci_pass_failure_and_infrastructure_record_review_receipts_and_events() {
+    use services::workflow::{
+        actions::RunCiSteps, default_workflow, HookAction, HookContext, HookResult,
+    };
+    for case in ["pass", "fail", "infrastructure"] {
+        let fixture = if case == "infrastructure" {
+            Fixture::with_policy(
+                "forge-ci-infrastructure-characterization",
+                WorkspaceRunPolicy {
+                    allowed_purposes: vec![WorkspaceRunPurpose::Hook],
+                },
+            )
+            .await
+        } else {
+            Fixture::new("forge-ci-characterization").await
+        };
+        let state = &fixture.harness.state;
+        let task_id = &fixture.resolved.placement.task_id;
+        let task = TaskRepo::get_by_id(&*state.db, task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let project = ProjectRepo::get_by_id(&*state.db, &task.project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut events = state.event_bus.subscribe();
+        let command = if case == "fail" {
+            "printf failure; printf diagnostic >&2; exit 7"
+        } else {
+            "printf first"
+        };
+        let ctx = HookContext {
+            task_id: task_id.clone(),
+            project_id: task.project_id.clone(),
+            from_state: "in_progress".into(),
+            to_state: "review".into(),
+            db: Arc::clone(&state.db),
+            event_bus: Arc::clone(&state.event_bus),
+            gate_config: None,
+            workflow: Arc::new(default_workflow::default_workflow()),
+            project_version: Some(project.version),
+            project_workflow_definition: Some(project.workflow_definition),
+            triggered_by: Actor::system(SystemComponent::Test),
+            review_runner: None,
+            merge_service: None,
+            cleanup_scheduler: None,
+            task_service: state.task_service.as_ref().clone(),
+            daemon_connections: None,
+            workspace_exec_locks: None,
+            terminal_activity: None,
+            workspace_root: fixture.server_root.path().join("workspaces"),
+            repo_cache_locks: None,
+            workspace_backend_router: Arc::clone(&state.workspace_backend_router),
+            workspace_id: Some(fixture.resolved.placement.workspace_id.clone()),
+            agent_id: None,
+            execution_id: Some(fixture.execution_id.clone()),
+            state_config: json!({"ci_steps": [command, "printf second"]}),
+        };
+        let result = RunCiSteps.execute(&ctx).await;
+        let reviews = ReviewRepo::list_by_task(&*state.db, task_id).await.unwrap();
+        assert_eq!(reviews.len(), 1, "{case}: {result:?}");
+        let details: Value = serde_json::from_str(&reviews[0].step_results_json).unwrap();
+        let task = TaskRepo::get_by_id(&*state.db, task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "review");
+        match case {
+            "pass" => {
+                assert!(matches!(result, HookResult::Ok));
+                assert_eq!(reviews[0].status, ReviewStatus::Passed);
+                assert_eq!(details["ci_steps"].as_array().unwrap().len(), 2);
+                assert!(task.review_passed_at.is_some());
+                assert_eq!(details["ci_steps"][1]["output_tail"], "second");
+            }
+            "fail" => {
+                assert!(matches!(result, HookResult::Failed { .. }));
+                assert_eq!(reviews[0].status, ReviewStatus::Failed);
+                assert_eq!(details["ci_steps"].as_array().unwrap().len(), 1);
+                assert_eq!(details["ci_steps"][0]["exit_code"], 7);
+                assert_eq!(details["ci_steps"][0]["output_tail"], "failure\ndiagnostic");
+                assert!(task.review_passed_at.is_none());
+            }
+            _ => {
+                assert!(matches!(result, HookResult::Failed { .. }));
+                assert_eq!(reviews[0].status, ReviewStatus::Cancelled);
+                assert!(task.review_passed_at.is_none());
+            }
+        }
+        let expected_commands = if case == "pass" { 2 } else { 1 };
+        let requests = fixture
+            .link
+            .as_ref()
+            .unwrap()
+            .requests(METHOD_WORKSPACE_RUN);
+        assert_eq!(requests.len(), expected_commands);
+        assert_eq!(requests[0]["timeout_secs"], 0);
+        assert_eq!(requests[0]["max_output_bytes"], json!(u64::MAX));
+        let receipt = fixture.receipt(METHOD_WORKSPACE_RUN).await;
+        assert_eq!(
+            receipt["metadata"]["status"],
+            if case == "infrastructure" {
+                "error"
+            } else {
+                "result"
+            }
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type='workspace.operation_recorded' AND scope_id=? AND json_extract(payload_json,'$.method')=? AND json_extract(payload_json,'$.status') IN ('result','error')")
+            .bind(task_id).bind(METHOD_WORKSPACE_RUN).fetch_one(state.db.pool()).await.unwrap();
+        assert_eq!(count, expected_commands as i64);
+        let comments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_comment WHERE task_id=?")
+            .bind(task_id)
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(comments, 0);
+        let mut review_events = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.event_type.starts_with("review.") {
+                review_events.push(event.event_type);
+            }
+        }
+        assert_eq!(
+            review_events,
+            match case {
+                "pass" => vec!["review.passed"],
+                "fail" => vec!["review.failed"],
+                _ => vec![],
+            }
+        );
+        assert_eq!(
+            fixture
+                .resolved
+                .git_query(
+                    WorkspaceGitQuery::TargetHead {
+                        branch: "main".into()
+                    },
+                    false
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .trim(),
+            fixture.base_sha
+        );
+        fixture.wait_until_journal_empty().await;
+    }
+}
+
+#[tokio::test]
+async fn remote_exact_object_mismatch_retains_refusal_without_execution_success() {
+    let fixture = Fixture::new("forge-workspace-exact-object-mismatch").await;
+    let candidate = fixture.candidate().await;
+    let contract = fixture.approve_candidate().await;
+    let hooks = fixture.checkout.join(".git").join("effect-hooks");
+    let hook = hooks.join("post-merge");
+    let script = "#!/bin/sh\ngit -c core.hooksPath=/dev/null commit --allow-empty -m hook-moved\n";
+    assert_eq!(
+        fixture
+            .run(&format!(
+                "mkdir -p {}; printf %s {} > {}; chmod +x {}; git -C {} config core.hooksPath {}",
+                quote(&hooks.to_string_lossy()),
+                quote(script),
+                quote(&hook.to_string_lossy()),
+                quote(&hook.to_string_lossy()),
+                quote(&fixture.checkout.to_string_lossy()),
+                quote(&hooks.to_string_lossy())
+            ))
+            .await
+            .exit_code,
+        0
+    );
+    let before = task_projection(&fixture).await;
+    let outcome = fixture
+        .resolved
+        .backend
+        .merge(
+            &fixture.resolved.placement,
+            &MergeSpec {
+                target_branch: "main".into(),
+                expected_target_sha: contract.base_sha,
+                handed_off_paths: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        MergeOutcome::TargetMoved {
+            reason: "integration target changed during merge; reviewed content was not integrated"
+                .into(),
+            target_branch: "main".into(),
+        }
+    );
+    assert_eq!(before, task_projection(&fixture).await);
+    let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &fixture.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.after_sha, None);
+    assert_ne!(
+        fixture
+            .resolved
+            .git_query(
+                WorkspaceGitQuery::TargetHead {
+                    branch: "main".into()
+                },
+                false
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .trim(),
+        candidate
+    );
+    assert_eq!(
+        fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["outcome"]["kind"],
+        "target_moved"
+    );
+    fixture.wait_until_journal_empty().await;
+}
+
+#[tokio::test]
+async fn remote_target_moves_after_rebase_and_review_before_fast_forward() {
+    let fixture = Fixture::new("forge-workspace-target-moves-after-rebase").await;
+    fixture.candidate().await;
+    let target = quote(&fixture.checkout.to_string_lossy());
+    assert_eq!(
+        fixture
+            .run(&format!(
+                "git -C {target} commit --allow-empty -m first-target-move"
+            ))
+            .await
+            .exit_code,
+        0
+    );
+    assert!(matches!(
+        fixture.resolved.rebase_target("main", true).await.unwrap(),
+        WorkspaceOwnerOperationOutcome::Rebased
+    ));
+    let contract = fixture.approve_candidate().await;
+    assert_eq!(
+        fixture
+            .run(&format!(
+                "git -C {target} commit --allow-empty -m second-target-move"
+            ))
+            .await
+            .exit_code,
+        0
+    );
+    let before = task_projection(&fixture).await;
+    let outcome = fixture
+        .resolved
+        .backend
+        .merge(
+            &fixture.resolved.placement,
+            &MergeSpec {
+                target_branch: "main".into(),
+                expected_target_sha: contract.base_sha,
+                handed_off_paths: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, MergeOutcome::TargetMoved { .. }));
+    assert_eq!(before, task_projection(&fixture).await);
+    let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &fixture.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.after_sha, None);
+    assert_eq!(
+        fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["outcome"]["kind"],
+        "target_moved"
+    );
+    fixture.wait_until_journal_empty().await;
+}
+
+#[tokio::test]
+async fn remote_dirty_task_and_target_retain_receipts_without_task_projection() {
+    for target_dirty in [false, true] {
+        let fixture = Fixture::new("forge-workspace-dirty-characterization").await;
+        let candidate = fixture.candidate().await;
+        let command = if target_dirty {
+            format!(
+                "printf dirty > {}/README.md",
+                quote(&fixture.checkout.to_string_lossy())
+            )
+        } else {
+            "printf dirty > feature.txt".into()
+        };
+        assert_eq!(fixture.run(&command).await.exit_code, 0);
+        let before = task_projection(&fixture).await;
+        let outcome = fixture
+            .resolved
+            .backend
+            .merge(
+                &fixture.resolved.placement,
+                &MergeSpec {
+                    target_branch: "main".into(),
+                    expected_target_sha: fixture.base_sha.clone(),
+                    handed_off_paths: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        if target_dirty {
+            assert!(matches!(outcome, MergeOutcome::TargetDirty { .. }));
+        } else {
+            assert_eq!(
+                outcome,
+                MergeOutcome::Dirty {
+                    files: vec!["feature.txt".into()]
+                }
+            );
+        }
+        let receipt = fixture.receipt(METHOD_WORKSPACE_MERGE).await;
+        assert_eq!(receipt["metadata"]["status"], "result");
+        assert_eq!(before, task_projection(&fixture).await);
+        let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &fixture.execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.after_sha, None);
+        assert_eq!(
+            fixture
+                .resolved
+                .git_query(WorkspaceGitQuery::Head, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .trim(),
+            candidate
+        );
+        assert_eq!(
+            fixture
+                .resolved
+                .git_query(
+                    WorkspaceGitQuery::TargetHead {
+                        branch: "main".into()
+                    },
+                    false
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .trim(),
+            fixture.base_sha
+        );
+        fixture.wait_until_journal_empty().await;
+    }
+}
+
+#[tokio::test]
+async fn remote_rebase_clean_conflict_and_interrupted_recovery_preserve_projection() {
+    for case in ["clean", "conflict", "restart", "abort"] {
+        let mut fixture = Fixture::new("forge-workspace-rebase-characterization").await;
+        fixture.candidate().await;
+        let target = quote(&fixture.checkout.to_string_lossy());
+        let file = if case == "clean" {
+            "sibling.txt"
+        } else {
+            "feature.txt"
+        };
+        assert_eq!(fixture.run(&format!("printf 'target\\n' > {target}/{file}; git -C {target} add {file}; git -C {target} commit -m target")).await.exit_code, 0);
+        if matches!(case, "restart" | "abort") {
+            assert_ne!(fixture.run("git rebase main").await.exit_code, 0);
+        }
+        if case == "restart" {
+            fixture.wait_until_journal_empty().await;
+            fixture.link.take();
+            common::fake_daemon::wait_until_disconnected(
+                &fixture.harness.state,
+                &fixture.daemon_id,
+            )
+            .await;
+            let (outbound, _discarded) = mpsc::unbounded_channel();
+            fixture.runtime = DaemonRuntime::new_owned(
+                outbound,
+                fixture._daemon_root.path().to_path_buf(),
+                ActiveExecutionTracker::default(),
+                fixture.daemon_id.clone(),
+                WorkspaceRunPolicy {
+                    allowed_purposes: vec![
+                        WorkspaceRunPurpose::CiStep,
+                        WorkspaceRunPurpose::Hook,
+                        WorkspaceRunPurpose::EnvironmentSetup,
+                    ],
+                },
+            )
+            .unwrap();
+            fixture.reconnect().await;
+        }
+        let before = task_projection(&fixture).await;
+        let result = fixture
+            .resolved
+            .rebase_target("main", case != "abort")
+            .await
+            .unwrap();
+        match case {
+            "clean" => assert!(matches!(result, WorkspaceOwnerOperationOutcome::Rebased)),
+            "abort" => assert!(
+                matches!(result, api_types::WorkspaceOwnerOperationOutcome::Conflict { details, conflict_paths } if details == "aborted interrupted rebase" && conflict_paths.is_empty())
+            ),
+            _ => assert!(
+                matches!(result, WorkspaceOwnerOperationOutcome::Conflict { conflict_paths, .. } if conflict_paths == vec!["feature.txt"])
+            ),
+        }
+        assert_eq!(before, task_projection(&fixture).await);
+        assert_eq!(
+            fixture
+                .resolved
+                .git_query(WorkspaceGitQuery::RebaseInProgress, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .trim(),
+            "false"
+        );
+        fixture.wait_until_journal_empty().await;
+        if case == "clean" {
+            assert!(matches!(
+                fixture
+                    .harness
+                    .state
+                    .merge_service
+                    .merge(&fixture.resolved.placement.task_id)
+                    .await
+                    .unwrap(),
+                MergeOutcome::Done { .. }
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn remote_lost_merge_reply_reconnect_commits_evidence_before_ack_without_rerun() {
+    let mut fixture = Fixture::new("forge-workspace-lost-merge-reply").await;
+    let candidate = fixture.candidate().await;
+    fixture.approve_candidate().await;
+    let before = task_projection(&fixture).await;
+    fixture
+        .link
+        .as_ref()
+        .unwrap()
+        .drop_replies
+        .lock()
+        .unwrap()
+        .insert(METHOD_WORKSPACE_MERGE.into());
+    let resolved = fixture.resolved.clone();
+    let target = fixture.base_sha.clone();
+    let running = tokio::spawn(async move {
+        resolved
+            .backend
+            .merge(
+                &resolved.placement,
+                &MergeSpec {
+                    target_branch: "main".into(),
+                    expected_target_sha: target,
+                    handed_off_paths: vec![],
+                },
+            )
+            .await
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if fixture.runtime.journal().pending().unwrap().iter().any(|entry| matches!(entry,
+            JournalEntry::Operation { operation } if operation.method == METHOD_WORKSPACE_MERGE && operation.outcome.is_some())) { break }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "merge reaches the owner journal"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    fixture.link.take();
+    common::fake_daemon::wait_until_disconnected(&fixture.harness.state, &fixture.daemon_id).await;
+    assert!(matches!(
+        running.await.unwrap(),
+        Err(WorkspaceBackendError::OwnerUnreachable { .. })
+    ));
+    fixture.reconnect().await;
+    let client = fixture.resolved.backend.daemon_client().unwrap();
+    client
+        .reconcile_pending_operations(&fixture.daemon_id)
+        .await
+        .unwrap();
+    client
+        .retry_acknowledgements(&fixture.daemon_id)
+        .await
+        .unwrap();
+    let execution = ExecutionRepo::get_by_id(&*fixture.harness.state.db, &fixture.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.before_sha.as_deref(), Some(candidate.as_str()));
+    assert_eq!(execution.after_sha.as_deref(), Some(candidate.as_str()));
+    assert_eq!(
+        fixture.receipt(METHOD_WORKSPACE_MERGE).await["owner_result"]["outcome"]["after_sha"],
+        candidate
+    );
+    assert_eq!(before, task_projection(&fixture).await);
+    fixture.wait_until_journal_empty().await;
+    assert!(fixture
+        .link
+        .as_ref()
+        .unwrap()
+        .requests(METHOD_WORKSPACE_MERGE)
+        .is_empty());
+}
+
 #[tokio::test]
 async fn remote_cleanup_stays_cleaning_offline_until_owner_acknowledges() {
     let mut fixture = Fixture::new("forge-workspace-cleanup").await;
@@ -2932,4 +3530,162 @@ async fn cancel_during_slow_remote_merge_push_reports_done() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn daemon_merge_rebase_and_check_primitives_write_no_server_tables_or_events() {
+    use services::integration_effects::rpc::{decode_reply, validate_merge_result, RpcExchange};
+    for case in ["merge", "rebase", "check"] {
+        let fixture = Fixture::new("forge-owner-effect-without-recorder").await;
+        let candidate = fixture.candidate().await;
+        if case == "merge" {
+            fixture.approve_candidate().await;
+        }
+        if case == "rebase" {
+            assert_eq!(
+                fixture
+                    .run(&format!(
+                        "git -C {} commit --allow-empty -m target",
+                        quote(&fixture.checkout.to_string_lossy())
+                    ))
+                    .await
+                    .exit_code,
+                0
+            );
+        }
+        // Stop the fixture heartbeat so a background writer cannot invalidate
+        // the all-table assertion. A describe reply drains earlier socket frames.
+        fixture.link.as_ref().unwrap().tasks[2].abort();
+        tokio::task::yield_now().await;
+        let placement = &fixture.resolved.placement;
+        let reference = WorkspaceHandleReference {
+            daemon_id: fixture.daemon_id.clone(),
+            runtime_id: placement.runtime_id.clone().unwrap(),
+            placement_id: placement.id.clone(),
+            workspace_handle: placement.workspace_handle.clone().unwrap(),
+            generation: placement.generation as u64,
+        };
+        fixture
+            .resolved
+            .backend
+            .daemon_client()
+            .unwrap()
+            .describe(
+                &fixture.daemon_id,
+                WorkspaceDescribeParams {
+                    workspace: reference,
+                },
+            )
+            .await
+            .unwrap();
+        let operation_id = db::new_uuid_v4();
+        let fence = WorkspaceMutationFence {
+            daemon_id: fixture.daemon_id.clone(),
+            runtime_id: placement.runtime_id.clone().unwrap(),
+            placement_id: placement.id.clone(),
+            operation_id: operation_id.clone(),
+            generation: placement.generation as u64,
+            expected: WorkspaceOperationExpected::BaseSha {
+                sha: candidate.clone(),
+            },
+        };
+        let handle = placement.workspace_handle.clone().unwrap();
+        let (method, request) = match case {
+            "merge" => (
+                METHOD_WORKSPACE_MERGE,
+                serde_json::to_value(WorkspaceReviewedMergeParams {
+                    merge: WorkspaceMergeParams {
+                        fence,
+                        workspace_handle: handle,
+                        repo_location_id: placement.repo_location_id.clone(),
+                        target_branch: "main".into(),
+                        expected_target_sha: fixture.base_sha.clone(),
+                        handed_off_paths: vec![],
+                    },
+                    reviewed_commit_sha: Some(candidate.clone()),
+                })
+                .unwrap(),
+            ),
+            "rebase" => (
+                METHOD_WORKSPACE_RESET,
+                serde_json::to_value(WorkspaceOwnerOperationParams {
+                    fence,
+                    workspace_handle: handle,
+                    operation: WorkspaceOwnerOperation::RebaseTarget {
+                        target_branch: "main".into(),
+                        handoff_conflicts: true,
+                    },
+                })
+                .unwrap(),
+            ),
+            _ => (
+                METHOD_WORKSPACE_RUN,
+                serde_json::to_value(WorkspaceRunParams {
+                    fence,
+                    workspace_handle: handle,
+                    purpose: WorkspaceRunPurpose::CiStep,
+                    command: "printf '%s' \"$TEST_SECRET\"".into(),
+                    env: vec![("TEST_SECRET".into(), "hidden-value".into())],
+                    timeout_secs: 0,
+                    max_output_bytes: u64::MAX,
+                })
+                .unwrap(),
+            ),
+        };
+        let before = table_digests(&fixture.harness.state.db).await;
+        let mut events = fixture.harness.state.event_bus.subscribe();
+        let mut exchange = RpcExchange::prepare(
+            Arc::clone(&fixture.harness.state.daemon_connections),
+            &fixture.daemon_id,
+            method,
+            request.clone(),
+        )
+        .unwrap();
+        let value = exchange
+            .execute(if case == "check" {
+                None
+            } else {
+                Some(Duration::from_secs(5))
+            })
+            .await
+            .unwrap();
+        match case {
+            "merge" => {
+                let result: WorkspaceMergeResult = decode_reply(method, &request, &value).unwrap();
+                validate_merge_result(&request, &result).unwrap();
+                assert!(
+                    matches!(result.outcome, WorkspaceMergeOutcome::Done { after_sha, .. } if after_sha == candidate)
+                );
+            }
+            "rebase" => {
+                let result: WorkspaceOwnerOperationResult =
+                    decode_reply(method, &request, &value).unwrap();
+                assert!(matches!(
+                    result.outcome,
+                    WorkspaceOwnerOperationOutcome::Rebased
+                ));
+            }
+            _ => {
+                let result: WorkspaceRunResult = decode_reply(method, &request, &value).unwrap();
+                assert_eq!(result.exit_code, Some(0));
+                assert!(!result.stdout.contains("hidden-value"));
+                assert!(!result.timed_out);
+            }
+        }
+        assert_eq!(
+            before,
+            table_digests(&fixture.harness.state.db).await,
+            "{case}"
+        );
+        assert!(events.try_recv().is_err());
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM command_receipt WHERE correlation_id=?")
+                .bind(&operation_id)
+                .fetch_one(fixture.harness.state.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(receipts, 0);
+        assert!(fixture.runtime.journal().pending().unwrap().iter().any(|entry| matches!(entry,
+            JournalEntry::Operation { operation } if operation.fence.operation_id == operation_id && operation.outcome.is_some() && !operation.acknowledged)));
+    }
 }

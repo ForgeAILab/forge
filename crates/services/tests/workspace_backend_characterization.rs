@@ -34,6 +34,116 @@ const TITLE: &str = "Add greeting";
 const DESCRIPTION: &str = "Add a greeting file without changing the existing file.";
 const NOW: &str = "2026-09-29T00:00:00Z";
 
+// Snapshot every table, including rows the effect must leave alone. SQLite's
+// quote() preserves NULL/blob/text distinctions; sorting removes row order.
+async fn table_digests(db: &SqliteDb) -> BTreeMap<String, String> {
+    use sha2::{Digest, Sha256};
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    let mut digests = BTreeMap::new();
+    for table in tables {
+        let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
+            .bind(&table)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        let expression = columns
+            .iter()
+            .map(|column| format!("quote(\"{}\")", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ");
+        async fn digest(db: &SqliteDb, table: &str, expression: &str) -> String {
+            let mut rows: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT {expression} FROM \"{}\"",
+                table.replace('"', "\"\""),
+            ))
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            rows.sort();
+            hex::encode(Sha256::digest(serde_json::to_vec(&rows).unwrap()))
+        }
+        digests.insert(table.clone(), digest(db, &table, &expression).await);
+        let volatile: &[&str] = match table.as_str() {
+            "execution" => &["before_sha", "after_sha", "updated_at"],
+            "project" => &["list_revision"],
+            "usage_ledger_revision" => &["execution_revision"],
+            _ => &[],
+        };
+        if !volatile.is_empty() {
+            let stable = columns
+                .iter()
+                .filter(|column| !volatile.contains(&column.as_str()))
+                .map(|column| format!("quote(\"{}\")", column.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" || '|' || ");
+            digests.insert(
+                format!("{table}::stable"),
+                digest(db, &table, &stable).await,
+            );
+        }
+        if let Some(column) = match table.as_str() {
+            "project" => Some("list_revision"),
+            "usage_ledger_revision" => Some("execution_revision"),
+            _ => None,
+        } {
+            let revision: i64 = sqlx::query_scalar(&format!("SELECT {column} FROM {table}"))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            digests.insert(format!("{table}::{column}"), revision.to_string());
+        }
+    }
+    digests
+}
+
+async fn assert_execution_evidence_writes(
+    db: &SqliteDb,
+    mut before: BTreeMap<String, String>,
+    mut after: BTreeMap<String, String>,
+    updates: i64,
+) {
+    // Pin the existing trigger effects instead of excluding their entire data.
+    for table in [
+        "execution",
+        "project",
+        "usage_ledger_revision",
+        "usage_changed_execution",
+    ] {
+        assert_ne!(before.remove(table), after.remove(table), "{table}");
+    }
+    for key in [
+        "project::list_revision",
+        "usage_ledger_revision::execution_revision",
+    ] {
+        let old: i64 = before.remove(key).unwrap().parse().unwrap();
+        let new: i64 = after.remove(key).unwrap().parse().unwrap();
+        assert_eq!(new, old + updates, "{key}");
+    }
+    let revision: i64 = sqlx::query_scalar("SELECT execution_revision FROM usage_ledger_revision")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let changed: Vec<(String, i64)> =
+        sqlx::query_as("SELECT id,revision FROM usage_changed_execution")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(changed, vec![(EXECUTION_ID.into(), revision)]);
+    let changed_tables: Vec<_> = before
+        .keys()
+        .filter(|key| before.get(*key) != after.get(*key))
+        .collect();
+    assert!(
+        changed_tables.is_empty(),
+        "unexpected changes: {changed_tables:?}"
+    );
+    assert_eq!(before, after);
+}
+
 struct Fixture {
     temp: TempDir,
     repo: PathBuf,
@@ -357,6 +467,8 @@ async fn reviewer_prompt_bytes_for_server_workspace() {
 async fn clean_merge_outcome() {
     let fixture = fixture().await;
     let db = seed(&fixture, None).await;
+    embedded(&db, &fixture).await;
+    let before = table_digests(&db).await;
     let outcome = merge_service(&db, &fixture).merge(TASK_ID).await.unwrap();
     assert_eq!(
         outcome,
@@ -376,6 +488,7 @@ async fn clean_merge_outcome() {
         .unwrap();
     assert_eq!(execution.before_sha, Some(fixture.candidate_sha.clone()));
     assert_eq!(execution.after_sha, Some(fixture.candidate_sha));
+    assert_execution_evidence_writes(&db, before, table_digests(&db).await, 2).await;
 }
 
 #[tokio::test]
@@ -615,6 +728,8 @@ async fn conflict_merge_outcome_and_abort() {
     std::fs::write(fixture.repo.join("file.txt"), "target change\n").unwrap();
     let target = commit(&fixture.repo, "target change").await;
     let db = seed(&fixture, None).await;
+    embedded(&db, &fixture).await;
+    let before = table_digests(&db).await;
     let outcome = merge_service(&db, &fixture).merge(TASK_ID).await.unwrap();
     assert_eq!(outcome, MergeOutcome::Conflict {
         target_branch: "main".to_owned(),
@@ -630,6 +745,7 @@ async fn conflict_merge_outcome_and_abort() {
         .unwrap();
     assert_eq!(execution.before_sha, Some(candidate));
     assert_eq!(execution.after_sha, None);
+    assert_execution_evidence_writes(&db, before, table_digests(&db).await, 1).await;
 }
 
 #[tokio::test]
@@ -637,6 +753,8 @@ async fn dirty_target_merge_outcome_preserves_target() {
     let fixture = fixture().await;
     std::fs::write(fixture.repo.join("file.txt"), "uncommitted target\n").unwrap();
     let db = seed(&fixture, None).await;
+    embedded(&db, &fixture).await;
+    let before = table_digests(&db).await;
     assert_eq!(
         merge_service(&db, &fixture).merge(TASK_ID).await.unwrap(),
         MergeOutcome::TargetDirty {
@@ -657,6 +775,92 @@ async fn dirty_target_merge_outcome_preserves_target() {
         .unwrap();
     assert_eq!(execution.before_sha, None);
     assert_eq!(execution.after_sha, None);
+    assert_eq!(before, table_digests(&db).await);
+}
+
+#[tokio::test]
+async fn dirty_task_merge_writes_nothing() {
+    let fixture = fixture().await;
+    let db = seed(&fixture, None).await;
+    embedded(&db, &fixture).await;
+    std::fs::write(fixture.worktree.join("file.txt"), "uncommitted task\n").unwrap();
+    let before = table_digests(&db).await;
+    let bus = Arc::new(EventBus::new(16));
+    let mut events = bus.subscribe();
+    let service =
+        MergeService::new_for_test(db.clone(), bus, fixture.temp.path().join("worktrees"));
+    assert_eq!(
+        service.merge(TASK_ID).await.unwrap(),
+        MergeOutcome::Dirty {
+            files: vec!["file.txt".into()]
+        }
+    );
+    assert_eq!(before, table_digests(&db).await);
+    assert!(events.try_recv().is_err());
+    assert_eq!(
+        git::get_current_sha(&fixture.worktree).await.unwrap(),
+        fixture.candidate_sha
+    );
+    assert_eq!(
+        git::get_current_sha(&fixture.repo).await.unwrap(),
+        fixture.base_sha
+    );
+}
+
+#[tokio::test]
+async fn server_rebase_clean_conflict_and_restart_write_nothing() {
+    for case in ["clean", "conflict", "restart", "abort"] {
+        let fixture = fixture().await;
+        let db = seed(&fixture, None).await;
+        let (backend, placement) = embedded(&db, &fixture).await;
+        if case != "clean" {
+            std::fs::write(fixture.worktree.join("file.txt"), "task\n").unwrap();
+            commit(&fixture.worktree, "task change").await;
+        }
+        std::fs::write(fixture.repo.join("file.txt"), "target\n").unwrap();
+        let target = commit(&fixture.repo, "target change").await;
+        if matches!(case, "restart" | "abort") {
+            assert!(matches!(
+                git::rebase(&fixture.worktree, "main").await,
+                Err(git::GitError::MergeConflict { .. })
+            ));
+        }
+        let before = table_digests(&db).await;
+        let resolved = services::workspace_backend::ResolvedWorkspace { placement, backend };
+        let result = resolved
+            .rebase_target("main", case != "abort")
+            .await
+            .unwrap();
+        match case {
+            "clean" => assert!(matches!(
+                result,
+                api_types::WorkspaceOwnerOperationOutcome::Rebased
+            )),
+            "abort" => assert!(
+                matches!(result, api_types::WorkspaceOwnerOperationOutcome::Conflict { details, conflict_paths } if details == "aborted interrupted rebase" && conflict_paths.is_empty())
+            ),
+            _ => assert!(
+                matches!(result, api_types::WorkspaceOwnerOperationOutcome::Conflict { conflict_paths, .. } if conflict_paths == vec!["file.txt"])
+            ),
+        }
+        assert!(!git::detect_rebase_in_progress(&fixture.worktree)
+            .await
+            .unwrap());
+        assert!(git::is_worktree_clean(&fixture.worktree).await.unwrap());
+        assert_eq!(git::get_current_sha(&fixture.repo).await.unwrap(), target);
+        assert_eq!(before, table_digests(&db).await);
+        if case == "clean" {
+            let head = git::get_current_sha(&fixture.worktree).await.unwrap();
+            assert_eq!(
+                merge_service(&db, &fixture).merge(TASK_ID).await.unwrap(),
+                MergeOutcome::Done {
+                    before_sha: target,
+                    after_sha: head,
+                    branch: "main".into(),
+                }
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -974,4 +1178,209 @@ async fn outbox_harvest_is_bounded_preserves_line_ids_and_captures_bytes() {
         .unwrap()
         .entries
         .is_empty());
+}
+
+fn effect_binding(
+    placement: &db::WorkspacePlacement,
+) -> services::integration_effects::EffectWorkspace {
+    services::integration_effects::EffectWorkspace {
+        workspace_id: placement.workspace_id.clone(),
+        placement_id: placement.id.clone(),
+        generation: placement.generation,
+        owner: services::integration_effects::EffectOwner::Server,
+        handle: placement.workspace_handle.clone().unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn merge_primitives_return_facts_without_any_table_or_event_write() {
+    use services::integration_effects::merge::*;
+    for case in [
+        "clean",
+        "candidate",
+        "target",
+        "conflict",
+        "dirty_task",
+        "dirty_target",
+    ] {
+        let fixture = fixture().await;
+        match case {
+            "candidate" => {
+                run_git(
+                    &fixture.worktree,
+                    &["commit", "--allow-empty", "-m", "unreviewed"],
+                )
+                .await;
+            }
+            "target" => {
+                run_git(&fixture.repo, &["commit", "--allow-empty", "-m", "target"]).await;
+            }
+            "conflict" => {
+                std::fs::write(fixture.worktree.join("file.txt"), "task\n").unwrap();
+                commit(&fixture.worktree, "task").await;
+                std::fs::write(fixture.repo.join("file.txt"), "target\n").unwrap();
+                commit(&fixture.repo, "target").await;
+            }
+            "dirty_task" => {
+                std::fs::write(fixture.worktree.join("file.txt"), "dirty\n").unwrap();
+            }
+            "dirty_target" => {
+                std::fs::write(fixture.repo.join("file.txt"), "dirty\n").unwrap();
+            }
+            _ => {}
+        }
+        let db = seed(&fixture, None).await;
+        let (_, placement) = embedded(&db, &fixture).await;
+        let binding = effect_binding(&placement);
+        let bus = EventBus::new(16);
+        let mut events = bus.subscribe();
+        let before = table_digests(&db).await;
+        let outcome = if let Some(outcome) = merge_cleanliness(&fixture.worktree, &fixture.repo)
+            .await
+            .unwrap()
+        {
+            outcome
+        } else {
+            let (before_sha, head_sha) =
+                merge_heads(&fixture.repo, &fixture.worktree).await.unwrap();
+            let tip = target_tip(&fixture.repo, "main").await.unwrap();
+            let branch = workspace::task_branch_name(TASK_ID);
+            let input = MergeEffectInput {
+                workspace: &binding,
+                worktree_path: &fixture.worktree,
+                repo_path: &fixture.repo,
+                target_branch: "main",
+                task_branch: &branch,
+                diagnostic_entity_id: TASK_ID,
+                before_sha: &before_sha,
+                expected_head_sha: &head_sha,
+                observed_target_sha: &tip,
+                reviewed: (case != "conflict").then(|| ReviewedMergeObject {
+                    commit_sha: fixture.candidate_sha.clone(),
+                    base_sha: fixture.base_sha.clone(),
+                }),
+            };
+            match validate_merge_candidate(&input).await.unwrap() {
+                MergeCandidateOutcome::Refused(outcome) => outcome,
+                MergeCandidateOutcome::Ready { already_merged } => {
+                    let applied = apply_merge(&input, already_merged).await.unwrap();
+                    merge_result(&input, already_merged, applied).await.unwrap()
+                }
+            }
+        };
+        match case {
+            "clean" => assert!(
+                matches!(outcome, MergeOutcome::Done { after_sha, .. } if after_sha == fixture.candidate_sha)
+            ),
+            "candidate" => assert!(matches!(outcome, MergeOutcome::ReviewRequired { .. })),
+            "target" => assert!(matches!(outcome, MergeOutcome::TargetMoved { .. })),
+            "conflict" => {
+                assert!(
+                    matches!(outcome, MergeOutcome::Conflict { conflict_paths, .. } if conflict_paths == vec![PathBuf::from("file.txt")])
+                );
+                assert!(!git::detect_interrupted_merge(&fixture.repo).await.unwrap());
+                assert!(git::is_worktree_clean(&fixture.repo).await.unwrap());
+            }
+            "dirty_task" => assert!(matches!(outcome, MergeOutcome::Dirty { .. })),
+            "dirty_target" => assert!(matches!(outcome, MergeOutcome::TargetDirty { .. })),
+            _ => unreachable!(),
+        }
+        assert_eq!(before, table_digests(&db).await, "{case}");
+        assert!(events.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn rebase_primitive_returns_conflict_paths_without_any_table_or_event_write() {
+    use services::integration_effects::rebase::*;
+    let fixture = fixture().await;
+    std::fs::write(fixture.worktree.join("file.txt"), "task\n").unwrap();
+    commit(&fixture.worktree, "task").await;
+    std::fs::write(fixture.repo.join("file.txt"), "target\n").unwrap();
+    commit(&fixture.repo, "target").await;
+    let db = seed(&fixture, None).await;
+    let (_, placement) = embedded(&db, &fixture).await;
+    let binding = effect_binding(&placement);
+    let before = table_digests(&db).await;
+    let bus = EventBus::new(16);
+    let mut events = bus.subscribe();
+    let outcome = rebase(&RebaseEffectInput {
+        workspace: &binding,
+        worktree_path: &fixture.worktree,
+        target_branch: "main",
+        handoff_conflicts: true,
+        expected_head_sha: None,
+        expected_target_sha: None,
+        deadline: None,
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, api_types::WorkspaceOwnerOperationOutcome::Conflict { conflict_paths, .. } if conflict_paths == vec!["file.txt"])
+    );
+    assert!(!git::detect_rebase_in_progress(&fixture.worktree)
+        .await
+        .unwrap());
+    assert!(git::is_worktree_clean(&fixture.worktree).await.unwrap());
+    assert_eq!(
+        git::paths_adding_conflict_markers(&fixture.worktree, "main", "HEAD")
+            .await
+            .unwrap(),
+        vec!["file.txt"]
+    );
+    assert_eq!(before, table_digests(&db).await);
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn check_primitive_pass_failure_and_infrastructure_write_no_tables_or_events() {
+    use services::integration_effects::check::*;
+    let fixture = fixture().await;
+    let db = seed(&fixture, None).await;
+    let (_, placement) = embedded(&db, &fixture).await;
+    let binding = effect_binding(&placement);
+    let env = BTreeMap::from([("TEST_SECRET".into(), "hidden-value".into())]);
+    let commands = vec![
+        "test -f file.txt; printf '%5000s' x; printf '%s' \"$TEST_SECRET\" >&2".into(),
+        "printf fail; exit 7".into(),
+        "touch should-not-run".into(),
+    ];
+    let bus = EventBus::new(16);
+    let mut events = bus.subscribe();
+    let before = table_digests(&db).await;
+    let input = || CheckRunInput {
+        workspace: &binding,
+        commands: &commands,
+        purpose: WorkspaceRunPurpose::CiStep,
+        environment: &env,
+        deadline: None,
+        max_output_bytes: usize::MAX,
+    };
+    let mut checks = CheckRun::new(input());
+    while let Some(command) = checks.next_command() {
+        assert_eq!(command.spec.timeout_secs, 0);
+        let output = run_at(&fixture.worktree, &command.spec).await.unwrap();
+        checks.completed(command, output);
+    }
+    let result = checks.outcome();
+    assert_eq!(result.failed_step_index, Some(1));
+    assert_eq!(result.commands.len(), 2);
+    assert!(result.commands[0].output_tail.len() <= 4096);
+    assert!(!result.commands[0].stderr_tail.contains("hidden-value"));
+    assert_eq!(result.commands[1].exit_code, 7);
+    assert!(!fixture.worktree.join("should-not-run").exists());
+    let checks = CheckRun::new(input());
+    let command = checks.next_command().unwrap();
+    let error = run_at(&fixture.worktree.join("missing"), &command.spec)
+        .await
+        .unwrap_err();
+    let failure = checks.infrastructure_failed(error);
+    assert_eq!(failure.completed_steps, 0);
+    assert!(failure.commands.is_empty());
+    assert_eq!(before, table_digests(&db).await);
+    assert!(events.try_recv().is_err());
+    assert_eq!(
+        git::get_current_sha(&fixture.worktree).await.unwrap(),
+        fixture.candidate_sha
+    );
 }

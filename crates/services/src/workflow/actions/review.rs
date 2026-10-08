@@ -148,7 +148,16 @@ impl HookAction for RunCiSteps {
         )
         .await
         {
-            Ok(result) => result,
+            Ok(outcome) => (
+                outcome
+                    .commands
+                    .into_iter()
+                    .map(|command| {
+                        serde_json::to_value(command).expect("CI command facts serialize")
+                    })
+                    .collect::<Vec<_>>(),
+                outcome.failed_step_index,
+            ),
             Err(failure) => {
                 let retry = matches!(
                     &failure.error,

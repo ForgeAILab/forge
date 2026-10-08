@@ -8018,7 +8018,15 @@ pub(crate) mod tests {
             resolved.rebase_target("main", false).await.unwrap(),
             api_types::WorkspaceOwnerOperationOutcome::Rebased
         ));
-        resolved.record_rebase_head(&db).await.unwrap();
+        let facts = crate::integration_effects::rebase::rebase_head_facts(
+            resolved
+                .backend
+                .describe(&resolved.placement)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        resolved.record_rebase_head(&db, facts).await.unwrap();
         sqlx::query("UPDATE execution SET updated_at = ? WHERE id = ?")
             .bind((Utc::now() + ChronoDuration::minutes(1)).to_rfc3339())
             .bind(&execution.id)

@@ -9,10 +9,13 @@ use std::{collections::BTreeMap, path::PathBuf};
 impl ResolvedWorkspace {
     /// A Forge-driven rebase is authoritative HEAD evidence, independent of
     /// the worker's earlier terminal SHA. Fence it to this physical workspace.
-    pub(crate) async fn record_rebase_head(&self, db: &db::SqliteDb) -> Result<()> {
+    async fn read_rebase_head_facts(
+        &self,
+        db: &db::SqliteDb,
+    ) -> Result<Option<crate::integration_effects::rebase::RebaseHeadFacts>> {
         if self.placement.owner_kind == db::PlacementOwnerKind::Server {
             let Some(daemon_id) = self.placement.execution_daemon_id.as_deref() else {
-                return Ok(());
+                return Ok(None);
             };
             if db::DaemonRepo::get_by_id(db, daemon_id)
                 .await?
@@ -20,15 +23,20 @@ impl ResolvedWorkspace {
                     crate::embedded_daemon::is_embedded_daemon_machine(&daemon.machine_id)
                 })
             {
-                return Ok(());
+                return Ok(None);
             }
         }
-        let head = self
-            .backend
-            .describe(&self.placement)
-            .await?
-            .head_sha
-            .ok_or_else(|| ServiceError::invalid_operation("rebased workspace has no HEAD"))?;
+        Ok(Some(crate::integration_effects::rebase::rebase_head_facts(
+            self.backend.describe(&self.placement).await?,
+        )?))
+    }
+
+    /// Project the supplied owner facts without issuing another Git/RPC read.
+    pub(crate) async fn record_rebase_head(
+        &self,
+        db: &db::SqliteDb,
+        facts: crate::integration_effects::rebase::RebaseHeadFacts,
+    ) -> Result<()> {
         let changed = sqlx::query(
             "INSERT INTO workspace_expected_head (placement_id, generation, head_sha, recorded_at)
              SELECT id, generation, ?, ? FROM workspace_placement
@@ -36,7 +44,7 @@ impl ResolvedWorkspace {
              ON CONFLICT(placement_id) DO UPDATE SET generation = excluded.generation,
                  head_sha = excluded.head_sha, recorded_at = excluded.recorded_at",
         )
-        .bind(head)
+        .bind(facts.head_sha)
         .bind(db::now_rfc3339())
         .bind(&self.placement.id)
         .bind(self.placement.generation)
@@ -51,7 +59,14 @@ impl ResolvedWorkspace {
     }
 
     pub(crate) async fn record_head_best_effort(&self, db: &db::SqliteDb) {
-        if let Err(error) = self.record_rebase_head(db).await {
+        let recorded = async {
+            if let Some(facts) = self.read_rebase_head_facts(db).await? {
+                self.record_rebase_head(db, facts).await?;
+            }
+            Ok::<_, WorkspaceBackendError>(())
+        }
+        .await;
+        if let Err(error) = recorded {
             tracing::warn!(placement_id = %self.placement.id,
                 daemon_id = ?self.placement.daemon_id.as_ref().or(self.placement.execution_daemon_id.as_ref()),
                 %error, "could not record Forge-established workspace HEAD");
@@ -317,56 +332,19 @@ impl ResolvedWorkspace {
                 .await;
         }
         let path = self.embedded_path()?;
-        let in_progress = git::detect_rebase_in_progress(&path).await?;
-        if in_progress && !handoff_conflicts {
-            // Resume an interrupted rebase the way a fresh conflicting one
-            // ends without handoff: abort, restoring the branch.
-            git::abort_rebase(&path).await?;
-            return Ok(WorkspaceOwnerOperationOutcome::Conflict {
-                details: "aborted interrupted rebase".into(),
-                conflict_paths: Vec::new(),
-            });
-        }
-        if in_progress {
-            return match git::continue_rebase_keeping_conflicts(&path).await {
-                Ok(conflict_paths) => Ok(WorkspaceOwnerOperationOutcome::Conflict {
-                    details: "resumed interrupted rebase".into(),
-                    conflict_paths,
-                }),
-                Err(git::GitError::UnsupportedRebaseConflict { details }) => {
-                    Ok(WorkspaceOwnerOperationOutcome::UnsupportedConflict { details })
-                }
-                Err(error) => Err(error.into()),
-            };
-        }
-        if !git::is_worktree_clean(&path).await? {
-            return Ok(WorkspaceOwnerOperationOutcome::Dirty {
-                files: git::status_porcelain(&path).await?,
-            });
-        }
-        match git::rebase(&path, target_branch).await {
-            Ok(()) => Ok(WorkspaceOwnerOperationOutcome::Rebased),
-            Err(git::GitError::MergeConflict { stderr, .. }) => {
-                if !handoff_conflicts {
-                    git::abort_rebase(&path).await?;
-                    return Ok(WorkspaceOwnerOperationOutcome::Conflict {
-                        details: stderr,
-                        conflict_paths: Vec::new(),
-                    });
-                }
-                match git::continue_rebase_keeping_conflicts(&path).await {
-                    Ok(conflict_paths) => Ok(WorkspaceOwnerOperationOutcome::Conflict {
-                        details: stderr,
-                        conflict_paths,
-                    }),
-                    Err(git::GitError::UnsupportedRebaseConflict { details }) => {
-                        Ok(WorkspaceOwnerOperationOutcome::UnsupportedConflict { details })
-                    }
-                    Err(error) => Err(error.into()),
-                }
-            }
-            Err(error) => Err(error.into()),
-        }
+        let workspace = super::effect_workspace(&self.placement);
+        Ok(crate::integration_effects::rebase::rebase(
+            &crate::integration_effects::rebase::RebaseEffectInput {
+                workspace: &workspace,
+                worktree_path: &path,
+                target_branch,
+                handoff_conflicts,
+                expected_head_sha: None,
+                expected_target_sha: None,
+                deadline: None,
+            },
+        )
+        .await?)
     }
 
     pub(crate) async fn apply_plan_operation(
@@ -756,5 +734,16 @@ fn review_workspace_error(error: WorkspaceBackendError) -> ::review::ReviewError
             error => ::review::ReviewError::Workspace(error.to_string()),
         },
         error => ::review::ReviewError::WorkspaceInfrastructure(error.to_string()),
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::integration_effects::rebase::GitFacts for ResolvedWorkspace {
+    async fn query(
+        &self,
+        query: api_types::WorkspaceGitQuery,
+        optional: bool,
+    ) -> crate::Result<Option<String>> {
+        Ok(self.git_query(query, optional).await?)
     }
 }

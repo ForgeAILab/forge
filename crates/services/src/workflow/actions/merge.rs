@@ -524,78 +524,29 @@ pub(crate) async fn target_moved_result(
                 target
             }
         };
-        // A crash inside the rebase leaves it stopped mid-way, and Git has
-        // already moved HEAD onto the target, so ancestry would misread it
-        // as landed. Resume it the way the fresh path ends one: continue and
-        // hand off, or abort.
-        let in_progress = previous.is_some()
-            && resolved
-                .git_query(api_types::WorkspaceGitQuery::RebaseInProgress, false)
-                .await?
-                .is_some_and(|value| value.trim() == "true");
-        // A committed clean/conflicted rebase contains the recorded target.
-        // Reconstruct its handoff rather than applying another rebase.
-        let landed = previous.is_some()
-            && !in_progress
-            && resolved
-                .git_query(
-                    api_types::WorkspaceGitQuery::IsAncestor {
-                        base: target.clone(),
-                        head: "HEAD".into(),
-                    },
-                    true,
+        let recovery = crate::integration_effects::rebase::recover_rebase(
+            &resolved,
+            &crate::integration_effects::rebase::RebaseRecoveryInput {
+                previous_target: previous.as_deref(),
+                recorded_target: &target,
+                handoff_conflicts,
+            },
+        )
+        .await?;
+        let outcome = match recovery {
+            crate::integration_effects::rebase::RebaseRecoveryOutcome::Recorded(outcome) => outcome,
+            crate::integration_effects::rebase::RebaseRecoveryOutcome::Perform { in_progress } => {
+                let outcome = resolved
+                    .rebase_target(target_branch, handoff_conflicts)
+                    .await?;
+                crate::integration_effects::rebase::finish_rebase_recovery(
+                    &resolved,
+                    &target,
+                    in_progress,
+                    handoff_conflicts,
+                    outcome,
                 )
                 .await?
-                .is_some();
-        let committed_marker_paths = || async {
-            Ok::<_, crate::ServiceError>(
-                resolved
-                    .git_query(
-                        api_types::WorkspaceGitQuery::MarkerPaths {
-                            base: target.clone(),
-                            head: "HEAD".into(),
-                        },
-                        false,
-                    )
-                    .await?
-                    .unwrap_or_default()
-                    .lines()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let outcome = if landed {
-            let paths = committed_marker_paths().await?;
-            if handoff_conflicts && !paths.is_empty() {
-                api_types::WorkspaceOwnerOperationOutcome::Conflict {
-                    details: "resumed committed conflict handoff".into(),
-                    conflict_paths: paths,
-                }
-            } else {
-                api_types::WorkspaceOwnerOperationOutcome::Rebased
-            }
-        } else {
-            match resolved
-                .rebase_target(target_branch, handoff_conflicts)
-                .await?
-            {
-                // Stops committed with markers before the crash are not in
-                // the resumed continuation's list.
-                api_types::WorkspaceOwnerOperationOutcome::Conflict {
-                    details,
-                    mut conflict_paths,
-                } if in_progress && handoff_conflicts => {
-                    for path in committed_marker_paths().await? {
-                        if !conflict_paths.contains(&path) {
-                            conflict_paths.push(path);
-                        }
-                    }
-                    api_types::WorkspaceOwnerOperationOutcome::Conflict {
-                        details,
-                        conflict_paths,
-                    }
-                }
-                outcome => outcome,
             }
         };
         record_hook_effect(

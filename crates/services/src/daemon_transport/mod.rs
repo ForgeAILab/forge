@@ -468,7 +468,7 @@ impl DaemonConnectionRegistry {
             .is_some_and(|connection| connection.id() == connection_id && !connection.is_stale())
     }
 
-    fn ensure_protocol_dispatchable(
+    pub(crate) fn ensure_protocol_dispatchable(
         &self,
         daemon_id: &str,
         connection: &DaemonConnection,
@@ -558,7 +558,7 @@ impl DaemonConnectionRegistry {
         })?;
         let (sender, receiver) = oneshot::channel();
         lock(&connection.pending).insert(request_id.clone(), sender);
-        let _pending = workspace_client::PendingRequest {
+        let _pending = crate::integration_effects::rpc::PendingRequest {
             connection: connection.clone(),
             request_id: request_id.clone(),
         };
@@ -645,7 +645,7 @@ impl DaemonConnectionRegistry {
         })?;
         let (sender, receiver) = oneshot::channel();
         lock(&connection.pending).insert(request_id.clone(), sender);
-        let _pending = workspace_client::PendingRequest {
+        let _pending = crate::integration_effects::rpc::PendingRequest {
             connection: connection.clone(),
             request_id: request_id.clone(),
         };
@@ -1233,7 +1233,7 @@ fn fail_pending(connection: &DaemonConnection, error: api_types::DaemonErrorPayl
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

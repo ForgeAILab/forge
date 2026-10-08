@@ -835,83 +835,37 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
     Ok(())
 }
 
-pub(super) struct CiStepFailure {
-    pub error: crate::workspace_backend::WorkspaceBackendError,
-    pub completed_steps: usize,
-}
-
 pub(super) async fn run_ci_steps_in_worktree(
     workspace: &crate::workspace_backend::ResolvedWorkspace,
     ci_steps: &[String],
     env: &std::collections::BTreeMap<String, String>,
-) -> Result<(Vec<Value>, Option<usize>), CiStepFailure> {
-    let mut results = Vec::with_capacity(ci_steps.len());
-
-    for (index, step) in ci_steps.iter().enumerate() {
-        // `StepResultEntry` declares `started_at`/`finished_at` and the review
-        // API publishes them, so stamp each step here — this is the only place
-        // that knows when a step actually ran.
-        let started_at = now_rfc3339();
-        let output = workspace
+) -> Result<
+    crate::integration_effects::check::CheckRunOutcome,
+    crate::integration_effects::check::CheckRunFailure,
+> {
+    let binding = crate::workspace_backend::effect_workspace(&workspace.placement);
+    let mut checks = crate::integration_effects::check::CheckRun::new(
+        crate::integration_effects::check::CheckRunInput {
+            workspace: &binding,
+            commands: ci_steps,
+            purpose: api_types::WorkspaceRunPurpose::CiStep,
+            environment: env,
+            deadline: None,
+            max_output_bytes: usize::MAX,
+        },
+    );
+    while let Some(command) = checks.next_command() {
+        let output = match workspace
             .backend
-            .run(
-                &workspace.placement,
-                &crate::workspace_backend::RunSpec {
-                    purpose: api_types::WorkspaceRunPurpose::CiStep,
-                    command: step.clone(),
-                    env: env.clone(),
-                    timeout_secs: 0,
-                    max_output_bytes: usize::MAX,
-                },
-            )
+            .run(&workspace.placement, &command.spec)
             .await
-            .map_err(|error| CiStepFailure {
-                error,
-                completed_steps: index,
-            })?;
-        let finished_at = now_rfc3339();
-        let stderr = executors::environment::redact_environment_values(&output.stderr_tail, env);
-        let stdout = executors::environment::redact_environment_values(&output.stdout_tail, env);
-        let output_tail = if stdout.is_empty() {
-            stderr.clone()
-        } else if stderr.is_empty() {
-            stdout.clone()
-        } else {
-            format!("{stdout}\n{stderr}")
+        {
+            Ok(output) => output,
+            Err(error) => return Err(checks.infrastructure_failed(error)),
         };
-        let exit_code = if output.exit_code < 0 {
-            1
-        } else {
-            output.exit_code
-        };
-        results.push(json!({
-            "index": index,
-            "command": step,
-            "exit_code": exit_code,
-            "stderr_tail": tail_bytes(&stderr, 4096),
-            "output_tail": tail_bytes(&output_tail, 4096),
-            "started_at": started_at,
-            "finished_at": finished_at,
-        }));
-
-        if exit_code != 0 {
-            return Ok((results, Some(index)));
-        }
+        checks.completed(command, output);
     }
-
-    Ok((results, None))
-}
-
-pub(super) fn tail_bytes(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-
-    let mut start = text.len().saturating_sub(max_bytes);
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    text[start..].to_string()
+    Ok(checks.outcome())
 }
 
 pub(super) fn publish_review_passed(ctx: &HookContext, review: &db::Review) {

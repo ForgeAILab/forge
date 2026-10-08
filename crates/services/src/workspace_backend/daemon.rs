@@ -1,8 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use api_types::{
     WorkspaceCleanupParams, WorkspaceDescribeParams, WorkspaceDiffFileStatus, WorkspaceDiffParams,
-    WorkspaceHandleReference, WorkspaceMergeOutcome, WorkspaceMergeParams, WorkspaceMutationFence,
+    WorkspaceHandleReference, WorkspaceMergeParams, WorkspaceMutationFence,
     WorkspaceOperationExpected, WorkspacePrepareParams, WorkspacePreparedState,
     WorkspaceReadParams, WorkspaceResetParams, WorkspaceReviewedMergeParams, WorkspaceRunParams,
 };
@@ -16,11 +16,20 @@ use super::{
 };
 use crate::{
     daemon_transport::{
-        workspace_client::{validate_merge_result, DaemonWorkspaceClient, WorkspaceClientError},
+        workspace_client::{DaemonWorkspaceClient, WorkspaceClientError},
         DaemonConnectionRegistry,
     },
+    integration_effects::rpc::validate_merge_result,
     ServiceError,
 };
+
+struct MergeReplyRecord<'a> {
+    request: &'a serde_json::Value,
+    result: &'a api_types::WorkspaceMergeResult,
+    execution_id: &'a str,
+    attempt: Option<&'a db::TaskStep>,
+    operation_id: &'a str,
+}
 
 pub struct DaemonWorkspaceBackend {
     db: Arc<SqliteDb>,
@@ -35,6 +44,30 @@ impl DaemonWorkspaceBackend {
             client: DaemonWorkspaceClient::new(registry).with_receipts(Arc::clone(&db)),
             integration_locks: workspace::RepoCacheLockManager::new(),
         }
+    }
+
+    /// Consume validated owner facts with today's receipt transaction, then
+    /// finish the Task operation and acknowledge the retained owner journal.
+    async fn record_merge_reply(
+        &self,
+        placement: &WorkspacePlacement,
+        daemon_id: &str,
+        record: MergeReplyRecord<'_>,
+    ) -> Result<()> {
+        validate_merge_result(record.request, record.result)
+            .map_err(|error| Self::error(placement, None, error))?;
+        let value = serde_json::to_value(record.result).expect("merge result serializes");
+        self.client
+            .retain_merge_result(daemon_id, record.request, &value, record.execution_id)
+            .await
+            .map_err(|error| Self::error(placement, None, error))?;
+        if let Some(step) = record.attempt {
+            self.db
+                .finish_remote_task_operation(step, record.operation_id)
+                .await?;
+        }
+        self.client.acknowledge_recorded(daemon_id, &value).await;
+        Ok(())
     }
 
     fn owner<'a>(&self, placement: &'a WorkspacePlacement) -> Result<(&'a str, &'a str)> {
@@ -668,53 +701,22 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             }
             Err(error) => return Err(Self::error(placement, None, error)),
         };
-        validate_merge_result(&request, &result)
-            .map_err(|error| Self::error(placement, None, error))?;
-        let value = serde_json::to_value(&result).expect("merge result serializes");
-        self.client
-            .retain_merge_result(daemon_id, &request, &value, &execution.id)
-            .await
-            .map_err(|error| Self::error(placement, None, error))?;
-        if let Some(step) = &attempt {
-            self.db
-                .finish_remote_task_operation(step, &params.merge.fence.operation_id)
-                .await?;
-        }
-        self.client.acknowledge_recorded(daemon_id, &value).await;
-        Ok(match result.outcome {
-            WorkspaceMergeOutcome::ReviewRequired { reason } => {
-                MergeOutcome::ReviewRequired { reason }
-            }
-            WorkspaceMergeOutcome::TargetMoved {
-                reason,
-                target_branch,
-            } => MergeOutcome::TargetMoved {
-                reason,
-                target_branch,
+        self.record_merge_reply(
+            placement,
+            daemon_id,
+            MergeReplyRecord {
+                request: &request,
+                result: &result,
+                execution_id: &execution.id,
+                attempt: attempt.as_ref(),
+                operation_id: &params.merge.fence.operation_id,
             },
-            WorkspaceMergeOutcome::Done {
-                before_sha,
-                after_sha,
-                branch,
-            } => MergeOutcome::Done {
-                before_sha,
-                after_sha,
-                branch,
-            },
-            WorkspaceMergeOutcome::Conflict {
-                details,
-                conflict_paths,
-            } => MergeOutcome::Conflict {
-                target_branch: spec.target_branch.clone(),
-                details,
-                conflict_paths: conflict_paths.into_iter().map(PathBuf::from).collect(),
-            },
-            WorkspaceMergeOutcome::Dirty { files } => MergeOutcome::Dirty { files },
-            WorkspaceMergeOutcome::TargetDirty { files } => MergeOutcome::TargetDirty { files },
-            WorkspaceMergeOutcome::UnresolvedConflictMarkers { paths } => {
-                MergeOutcome::UnresolvedConflictMarkers { paths }
-            }
-        })
+        )
+        .await?;
+        Ok(crate::integration_effects::merge::owner_merge_outcome(
+            result.outcome,
+            &spec.target_branch,
+        ))
     }
 
     async fn reset(

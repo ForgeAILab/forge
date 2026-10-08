@@ -11,10 +11,10 @@ use db::{PlacementOwnerKind, SqliteDb, Workspace, WorkspacePlacement, WorkspaceP
 
 use crate::ServiceError;
 
+pub(crate) use crate::integration_effects::check::run_at as run_environment_checkout;
 pub use crate::merge_service::MergeOutcome;
 pub use api_types::{ExecutionOutboxEntry, WorkspaceRunPurpose};
 pub use daemon::DaemonWorkspaceBackend;
-pub(crate) use embedded::run_at as run_environment_checkout;
 pub use embedded::EmbeddedWorkspaceBackend;
 
 mod daemon;
@@ -363,7 +363,7 @@ impl WorkspaceBackendRouter {
         path: &Path,
         spec: &RunSpec,
     ) -> Result<RunResult> {
-        embedded::run_at(path, spec).await
+        crate::integration_effects::check::run_at(path, spec).await
     }
 
     pub fn for_placement(
@@ -378,6 +378,25 @@ impl WorkspaceBackendRouter {
                 }
             }),
         }
+    }
+}
+
+pub(crate) fn effect_workspace(
+    placement: &WorkspacePlacement,
+) -> crate::integration_effects::EffectWorkspace {
+    use crate::integration_effects::{EffectOwner, EffectWorkspace};
+    EffectWorkspace {
+        workspace_id: placement.workspace_id.clone(),
+        placement_id: placement.id.clone(),
+        generation: placement.generation,
+        handle: placement.workspace_handle.clone().unwrap_or_default(),
+        owner: match placement.owner_kind {
+            PlacementOwnerKind::Server => EffectOwner::Server,
+            PlacementOwnerKind::Daemon => EffectOwner::Daemon {
+                daemon_id: placement.daemon_id.clone().unwrap_or_default(),
+                runtime_id: placement.runtime_id.clone().unwrap_or_default(),
+            },
+        },
     }
 }
 
