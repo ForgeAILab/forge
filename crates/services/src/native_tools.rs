@@ -6,6 +6,8 @@
 //! call their shared command services, while approval-required mutations
 //! retain an `AgentAction` envelope.
 
+mod registered_reads;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -35,17 +37,14 @@ use forge_agent_host::{
     contains_adaptive_authority_override, contains_authority_override, operation_contract,
     operation_descriptor, operation_permission, AgentHostError, CanonicalScope, CanonicalScopeType,
     CommandObservation, ForgeToolProvider, OperationClassification, PublicSearchScope,
-    WorkspaceAccess, MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
-    MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
-    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    WorkspaceAccess, MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
+    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -636,18 +635,14 @@ impl CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        input: operation_registry::main_reads::BoundedListQuery,
     ) -> Result<Value, AgentHostError> {
         let account_id = self
             .authorization
             .main_account_id(actor_identity_id, scope)
             .await
             .map_err(native_scope_error)?;
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(10)
-            .clamp(1, 20) as i64;
+        let limit = input.limit.unwrap_or(10).clamp(1, 20) as i64;
         let rows = sqlx::query(
             "SELECT id, maturity, lifecycle, project_id, handoff_id, version,
                     created_at, updated_at
@@ -678,18 +673,14 @@ impl CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        input: operation_registry::main_reads::BoundedListQuery,
     ) -> Result<Value, AgentHostError> {
         let account_id = self
             .authorization
             .main_account_id(actor_identity_id, scope)
             .await
             .map_err(native_scope_error)?;
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(20)
-            .clamp(1, 20) as i64;
+        let limit = input.limit.unwrap_or(20).clamp(1, 20) as i64;
         let rows = sqlx::query(
             "SELECT id, name, paused_at, created_at, updated_at
              FROM project WHERE owner_id = ? ORDER BY updated_at DESC, id DESC LIMIT ?",
@@ -1952,18 +1943,18 @@ impl CoordinationToolProvider {
     /// Agent that cannot run anything still has to be able to read what the run
     /// found before it cites that run as authority, and before it decides the
     /// outcome needs a corrective Task.
-    /// Dispatch one ephemeral inquiry sub-agent and block on its findings.
+    /// Whether this caller may dispatch an inquiry: the runner, the owning
+    /// account and the chat the run record hangs off.
     ///
     /// `main_account_id` is what confines this to a Main Chat: it rejects a
     /// Project Chat outright and requires an Account scope's id to be the
     /// caller's own, so an inquiry can only ever be run against the account
     /// that dispatched it.
-    async fn inquiry_run(
+    async fn inquiry_admission(
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
-    ) -> Result<Value, AgentHostError> {
+    ) -> Result<(Arc<dyn InquiryRunner>, String, String), AgentHostError> {
         let runner = self.inquiry_runner_handle().ok_or_else(|| {
             AgentHostError::Unsupported("inquiries are not available on this server".to_owned())
         })?;
@@ -1975,31 +1966,39 @@ impl CoordinationToolProvider {
         // The run record hangs off the conversation the user is watching, so
         // an inquiry is only dispatchable from a chat, never from a bare
         // Account session (which is what an inquiry sub-agent itself holds).
-        let chat_id = match scope.scope_type {
-            CanonicalScopeType::AgentChat => scope.scope_id.clone(),
-            _ => {
-                return Err(AgentHostError::Authority(
-                    "inquiries are dispatched from a Main Chat".to_owned(),
-                ));
-            }
-        };
-        let title = arguments
-            .get("title")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AgentHostError::Unsupported("an inquiry needs a title".to_owned()))?
-            .to_owned();
-        let question = arguments
-            .get("question")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AgentHostError::Unsupported("an inquiry needs a question".to_owned()))?
-            .to_owned();
-        let context = arguments
-            .get("context")
-            .and_then(Value::as_str)
+        match scope.scope_type {
+            CanonicalScopeType::AgentChat => Ok((runner, account_id, scope.scope_id.clone())),
+            _ => Err(AgentHostError::Authority(
+                "inquiries are dispatched from a Main Chat".to_owned(),
+            )),
+        }
+    }
+
+    /// Dispatch one ephemeral inquiry sub-agent and block on its findings.
+    async fn inquiry_run(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        input: operation_registry::main_reads::InquiryQuery,
+    ) -> Result<Value, AgentHostError> {
+        let (runner, account_id, chat_id) =
+            self.inquiry_admission(actor_identity_id, scope).await?;
+        let title = input.title.trim().to_owned();
+        let question = input.question.trim().to_owned();
+        // Preserve semantic whitespace checks and trimming in the handler.
+        if title.is_empty() {
+            return Err(AgentHostError::Unsupported(
+                "an inquiry needs a title".to_owned(),
+            ));
+        }
+        if question.is_empty() {
+            return Err(AgentHostError::Unsupported(
+                "an inquiry needs a question".to_owned(),
+            ));
+        }
+        let context = input
+            .context
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
@@ -2219,7 +2218,7 @@ impl CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        input: operation_registry::project_reads::SectionArguments,
     ) -> Result<Value, AgentHostError> {
         // Doctrine text is static server-owned content, but the read still
         // authenticates the Project binding so the operation cannot become an
@@ -2229,10 +2228,7 @@ impl CoordinationToolProvider {
             .project_orchestration_target(actor_identity_id, scope)
             .await
             .map_err(native_scope_error)?;
-        let section = arguments
-            .get("section")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let section = input.section.as_str();
         let body = crate::operating_skills::project_skill_section(section).ok_or_else(|| {
             AgentHostError::Unsupported(format!(
                 "unknown doctrine section `{section}`; sections: {}",
@@ -4380,71 +4376,62 @@ impl ForgeToolProvider for CoordinationToolProvider {
                 ));
             }
         }
-        let result = match operation {
-            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION
-            | MAIN_CHARTER_READINESS_OPERATION
-            | MAIN_CHARTER_DIFF_OPERATION
-            | MAIN_CHARTER_APPROVAL_TARGET_OPERATION => self
-                .main_queries
-                .execute(actor_identity_id, scope, operation, arguments)
-                .await
-                .map_err(service_error),
-            MAIN_CHARTER_READ_OPERATION => self
-                .main_queries
-                .execute(actor_identity_id, scope, operation, arguments)
-                .await
-                .map_err(native_scope_error),
-            MAIN_INQUIRY_RUN_OPERATION => {
-                self.inquiry_run(actor_identity_id, scope, arguments).await
-            }
-            PROJECT_CURRENT_STATE_OPERATION => {
-                self.project_current_state_read(actor_identity_id, scope, arguments)
-                    .await
-            }
-            PROJECT_OBSERVATIONS_OPERATION => {
-                self.project_observations_read(actor_identity_id, scope, arguments)
-                    .await
-            }
-            PROJECT_CHARTER_READ_OPERATION => {
-                self.project_charter_read(actor_identity_id, scope).await
-            }
-            PROJECT_SKILL_SECTION_OPERATION => {
-                self.project_skill_section_read(actor_identity_id, scope, arguments)
-                    .await
-            }
-            "memory.read" => {
-                self.memory_read(actor_identity_id, scope, arguments, false)
-                    .await
-            }
-            "account.summary" | "project.summary" | "agent_chat.summary" | "task.summary" => {
-                if operation == "project.summary"
-                    && scope.scope_type == CanonicalScopeType::AgentChat
-                {
-                    self.project_summary_read(actor_identity_id, scope, arguments)
-                        .await
-                } else {
-                    self.summary(actor_identity_id, scope).await
+        let result = if let Some(spec) = registered_reads::CATALOG.lookup(operation) {
+            let context = registered_reads::Context {
+                provider: self,
+                actor_identity_id,
+                scope,
+            };
+            match spec.dispatch(&context, arguments).await {
+                Ok(result) => Ok(result),
+                Err(operation_registry::DispatchError::Handler(error)) => Err(error),
+                // The contract is checked before the handler authorizes the
+                // caller. A caller the handler would deny gets that denial,
+                // not the contract.
+                Err(operation_registry::DispatchError::InvalidInput(message)) => {
+                    Err(match context.main_read_denial(operation).await {
+                        Some(denial) => denial,
+                        None => invalid_arguments(message),
+                    })
                 }
             }
-            "discovery.read" => {
-                self.discovery_read(actor_identity_id, scope, arguments)
-                    .await
+        } else {
+            match operation {
+                PROJECT_CURRENT_STATE_OPERATION => {
+                    self.project_current_state_read(actor_identity_id, scope, arguments)
+                        .await
+                }
+                PROJECT_OBSERVATIONS_OPERATION => {
+                    self.project_observations_read(actor_identity_id, scope, arguments)
+                        .await
+                }
+                "memory.read" => {
+                    self.memory_read(actor_identity_id, scope, arguments, false)
+                        .await
+                }
+                "project.summary" | "task.summary" => {
+                    if operation == "project.summary"
+                        && scope.scope_type == CanonicalScopeType::AgentChat
+                    {
+                        self.project_summary_read(actor_identity_id, scope, arguments)
+                            .await
+                    } else {
+                        self.summary(actor_identity_id, scope).await
+                    }
+                }
+                "decisions.read" => {
+                    self.memory_read(actor_identity_id, scope, arguments, true)
+                        .await
+                }
+                "work.read" | "events.read" | "inbox.read" | "commitments.read"
+                | "delivery.read" => {
+                    self.scoped_rows(actor_identity_id, scope, operation, arguments)
+                        .await
+                }
+                _ => Err(AgentHostError::Unsupported(
+                    "Forge read operation is not implemented".to_owned(),
+                )),
             }
-            "portfolio.read" => {
-                self.portfolio_read(actor_identity_id, scope, arguments)
-                    .await
-            }
-            "decisions.read" => {
-                self.memory_read(actor_identity_id, scope, arguments, true)
-                    .await
-            }
-            "work.read" | "events.read" | "inbox.read" | "commitments.read" | "delivery.read" => {
-                self.scoped_rows(actor_identity_id, scope, operation, arguments)
-                    .await
-            }
-            _ => Err(AgentHostError::Unsupported(
-                "Forge read operation is not implemented".to_owned(),
-            )),
         };
         if operation_contract(operation).is_some() {
             match result {

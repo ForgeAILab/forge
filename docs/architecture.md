@@ -21,6 +21,7 @@ crates/
 ├── api/           # Axum REST endpoints, SSE, middleware
 ├── api-types/     # Shared request/response types (zero internal deps)
 ├── agent-host/    # Forge-owned direct Agent Runtime composition and protected stores
+├── operation-registry/ # Typed native operation specs and generated projections
 ├── db/            # SQLite schema, migrations, repository implementations
 ├── services/      # Business logic (task state machine, workflow engine)
 ├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
@@ -50,6 +51,92 @@ forge-solo → services → db / events / agent-host / executors / workspace →
 ```
 
 ## Architectural patterns
+
+### Native operation registry
+
+`operation-registry` is a leaf crate: Serde, schemars and async-trait, all of
+which the workspace already resolved. Both `agent-host` and `services` depend
+on it; it imports neither, so typed service handler registration does not
+create a dependency cycle. Specifications live in domain modules of that crate
+(`scope_reads`, `project_reads`, `main_reads`), below `agent-host`, because `agent-host`
+builds the advertised schema and cannot depend on `services`. Each module owns
+its specs, its id list and the small context trait its handlers need;
+`services` implements the traits. `lib.rs` only concatenates the modules,
+checks that specs and ids agree with no collision, and iterates by id.
+
+An `OperationSpec` owns its Serde input type and the JSON schema derived from
+it, declared structural constraints, authority facts, effect class,
+availability, native aggregate and field projection, short summary, bounded
+guidance, and typed handler binding. A handler takes exactly the spec's input
+type, so a mismatch does not compile.
+
+**What is advertised, what is enforced.** These are deliberately different:
+
+- *Advertised.* The aggregate tool schema sent to a provider keeps the flat
+  shape `{operation: enum, arguments: object}` and uses only the JSON-Schema
+  keywords the native schemas already used. It never expresses a per-operation
+  contract with `allOf`, `anyOf`, `not`, `if`/`then`/`else`, `$ref`, `$defs`,
+  `dependentSchemas` or `patternProperties`. The model learns a registered
+  operation's contract from one generated line in the `arguments` description
+  (`project.charter: no arguments`; `skill.section: {section: one of
+  research|documents|...}`; `?` marks an optional field). The line is generated
+  from the spec's schema, so it cannot drift from what is enforced.
+- *Enforced.* After argument normalization, the registry validates and decodes
+  the arguments against the spec: in tool preparation, which native execution
+  and the CLI chat callback both run, and again at dispatch in `services`. A
+  violation is an ordinary in-turn tool error naming the operation, the
+  offending field and the expected contract. The check lives in one place,
+  `input_check.rs`, and is driven by the canonical schema: closed object,
+  required fields, scalar types, string lengths, numeric bounds, then the
+  Serde decode. Before the type check an integer field sent as an
+  integer-valued string (`"10"`) or float (`10.0`) is rewritten to the
+  integer, because several providers emit numbers that way; the handler
+  receives the integer. Nothing else is coerced (`"ten"`, `1.5`, `true` and a
+  negative value for an unsigned field are refused), and neither the
+  advertised line nor the canonical schema is widened. Denial comes before
+  contract detail: the read tool rejects an operation outside the session's
+  grant, then (on the named orchestration read tools; `forge_scope_read` has
+  no such guard, its closed contracts refuse the field) a forged scope or
+  authority field, and only then reports a contract violation; at dispatch, a caller the Main handler would deny gets
+  that denial even when the arguments are malformed.
+- *Canonical.* The full per-operation JSON Schema stays in the registry for
+  validation, documentation and the `read_contracts.json` fixture. It is not
+  what providers are sent.
+
+Why: function-declaration schema dialects (OpenAI Chat Completions and
+Responses, OpenAI-compatible routers, xAI, Gemini) do not reliably accept
+conditional keywords, and Gemini rejects unknown ones; and a conditional per
+operation would add thousands of tokens to every turn's tool prefix once all
+operations move. Two tests in `agent-host` hold the rule: one walks every
+advertised native definition for the forbidden keywords, one pins a byte
+ceiling per surface (`SURFACE_BYTE_CEILINGS`, the unit
+`scripts/measure-tool-definitions.py` prints). Raise a ceiling only on purpose.
+
+Registered reads are `account.summary`, `agent_chat.summary`, `project.charter`,
+`skill.section`, `genesis.project_agents.read`, `charter.read`,
+`charter.readiness`, `charter.diff`, `charter.approval_target`, `discovery.read`,
+`portfolio.read`, and `inquiry.run`. Main query handlers accept the registry's
+input types directly; their former dispatcher and handwritten decoders are
+removed. Discovery/portfolio defaults and clamping remain in the handlers. Inquiry remains a query: its run log and
+bounded findings do not grant proposal authority. Its `MainChatOnly`
+availability records the existing exclusion from account inquiry sessions.
+The scope-read aggregate adds no contract prose where the base had none.
+Main proposals remain on their existing path, including all approval receipts,
+dedupe/causation fields and prepared-action continuation; proposal projection
+is deferred. All other operations keep their hand paths; an operation never
+has both. Existing permission/binding checks enforce
+authority; spec/check parity is tested pending EffectiveAuthority. Domain
+semantic validation, transactions, workspace preparation, MCP projections and
+doctrine remain hand-written.
+
+To add an operation, declare a closed Serde/JsonSchema input and its
+constraints in its domain module, add its id to that module's `IDS`, and bind
+a typed context handler. Delete its former schema fragment, validator branch
+and dispatch branch, implement the context method in `services`, and test
+schema, contract line, dispatch, constraints and authority parity. Adding an
+operation to an existing domain module needs no edit to `lib.rs`. A new domain
+module adds four lines there: its `mod`, its specs and its ids in the two
+concatenations, and its context trait as a bound on `ReadContext`.
 
 ### Repository trait pattern
 
@@ -6301,4 +6388,3 @@ Stage four must compose these owner results into the public condition DTO and
 switch all projections together, replace the visible park annotation with the
 condition's own park, preserve the material-blocker digest and slot
 classification, regenerate bindings and document the single public beta break.
-

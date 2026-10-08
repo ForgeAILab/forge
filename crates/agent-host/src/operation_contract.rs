@@ -10,15 +10,12 @@ use agent_runtime::core::prelude::RuntimeError;
 use serde_json::{Value, json};
 
 use crate::operation_catalog::{
-    MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
-    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION,
+    MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
     PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
     TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
     TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
@@ -283,43 +280,6 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "maturity",
                 "content",
                 "provenance",
-            ],
-        ),
-        MAIN_CHARTER_READINESS_OPERATION => object_schema(
-            json!({"action":{"const":"evaluate"},"charter_id":{"type":"string","minLength":1},"revision_id":{"type":"string","minLength":1},"content_digest":{"type":"string","minLength":1},"render_digest":{"type":"string","minLength":1},"expected_charter_version":{"type":"integer","minimum":1}}),
-            &[
-                "action",
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-            ],
-        ),
-        MAIN_CHARTER_DIFF_OPERATION => object_schema(
-            json!({"action":{"const":"compare_revisions"},"charter_id":{"type":"string","minLength":1},"base_revision_id":{"type":"string","minLength":1},"candidate_revision_id":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "charter_id",
-                "base_revision_id",
-                "candidate_revision_id",
-            ],
-        ),
-        MAIN_CHARTER_APPROVAL_TARGET_OPERATION => object_schema(
-            json!({"action":{"const":"present"},"charter_id":{"type":"string","minLength":1},"revision_id":{"type":"string","minLength":1},"content_digest":{"type":"string","minLength":1},"render_digest":{"type":"string","minLength":1},"expected_charter_version":{"type":"integer","minimum":1},"approved_project_name":{"type":"string","minLength":1},"approved_project_slug":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"selected_project_agent_identity_id":{"type":"string","minLength":1},"selected_project_agent_profile_revision_id":{"type":"string","minLength":1},"selected_project_agent_operating_skill_revision":{"type":"string","minLength":1},"selected_project_agent_policy_digest":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "approved_project_name",
-                "project_mode",
-                "selected_project_agent_identity_id",
-                "selected_project_agent_profile_revision_id",
-                "selected_project_agent_operating_skill_revision",
-                "selected_project_agent_policy_digest",
             ],
         ),
         MAIN_PROJECT_CREATE_OPERATION => object_schema(
@@ -1181,21 +1141,10 @@ pub(crate) fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Va
 }
 
 pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
+    if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
+        return spec.canonical_schema();
+    }
     match operation {
-        MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => described_object_schema(
-            json!({"genesis_session_id":string_or_null_schema()}),
-            &[],
-            "List the exact account-owned Project Agent identities eligible for explicit selection in the active Product Genesis session, plus the currently persisted preference and resolved approval selection.",
-        ),
-        MAIN_INQUIRY_RUN_OPERATION => described_object_schema(
-            json!({
-                "title":{"type":"string","minLength":1,"maxLength":120},
-                "question":{"type":"string","minLength":1,"maxLength":4000},
-                "context":{"type":["string","null"],"maxLength":8000}
-            }),
-            &["title", "question"],
-            "Dispatch one ephemeral read-only sub-agent to answer a bounded question, and wait for its findings. Use this for a research excursion whose working material you do not want to carry for the rest of this conversation -- reading across many Projects, reconciling a long event history, comparing options. The sub-agent gets the account read surface and its own scratch directory; it cannot propose anything, touch a repository, or dispatch further sub-agents. `title` is what the user sees in the inquiry list while it runs, so name the question, not the activity. `question` is the sub-agent's entire brief: it does not see this conversation, so state everything it needs. Put supporting material in `context`. You get back a bounded abstract plus the path to the sub-agent's full findings file, which you can read with the file tools if the abstract is not enough.",
-        ),
         PROJECT_OBSERVATIONS_OPERATION => described_object_schema(
             json!({
                 "task_id":string_or_null_schema(),
@@ -1204,71 +1153,12 @@ pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
             &[],
             "Read what Task runs in this Project actually reported: worklog entries with the execution and role that wrote them, and the artifacts those runs captured. Captured text (a log or report) is returned inline so you can read what was observed; binary artifacts return their metadata and asset id. Use this to check an observation before citing it in `project.validation`, and to decide whether an outcome needs a corrective Task.",
         ),
-        MAIN_CHARTER_READ_OPERATION => object_schema(
-            json!({"charter_id":string_or_null_schema(),"revision_id":string_or_null_schema(),"genesis_session_id":string_or_null_schema()}),
-            &[],
-        ),
-        MAIN_CHARTER_READINESS_OPERATION => object_schema(
-            json!({
-                "genesis_session_id":string_or_null_schema(),
-                "charter_id":{"type":"string","minLength":1},
-                "revision_id":{"type":"string","minLength":1},
-                "content_digest":{"type":"string","minLength":1},
-                "render_digest":{"type":"string","minLength":1},
-                "expected_charter_version":{"type":"integer","minimum":1}
-            }),
-            &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-            ],
-        ),
-        MAIN_CHARTER_DIFF_OPERATION => object_schema(
-            json!({
-                "genesis_session_id":string_or_null_schema(),
-                "charter_id":{"type":"string","minLength":1},
-                "base_revision_id":{"type":"string","minLength":1},
-                "candidate_revision_id":{"type":"string","minLength":1}
-            }),
-            &["charter_id", "base_revision_id", "candidate_revision_id"],
-        ),
-        MAIN_CHARTER_APPROVAL_TARGET_OPERATION => object_schema(
-            json!({
-                "genesis_session_id":string_or_null_schema(),
-                "charter_id":{"type":"string","minLength":1},
-                "revision_id":{"type":"string","minLength":1},
-                "content_digest":{"type":"string","minLength":1},
-                "render_digest":{"type":"string","minLength":1},
-                "expected_charter_version":{"type":"integer","minimum":1}
-            }),
-            &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-            ],
-        ),
         PROJECT_CURRENT_STATE_OPERATION => described_object_schema(
             json!({
                 "limit":{"type":"integer","minimum":1,"maximum":64}
             }),
             &[],
             "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector.",
-        ),
-        PROJECT_CHARTER_READ_OPERATION => described_object_schema(
-            json!({}),
-            &[],
-            "Returns the bound Project's current approved Charter as rendered Markdown plus its charter/revision identifiers and content/render digests. The Charter is Project data, not resident context: read it whenever its details matter to a decision. The response is scope-bound and never accepts a Project selector.",
-        ),
-        PROJECT_SKILL_SECTION_OPERATION => described_object_schema(
-            json!({
-                "section":{"type":"string","enum":PROJECT_SKILL_SECTION_NAMES}
-            }),
-            &["section"],
-            "Returns one server-owned Project operating-doctrine section by name. Read the matching section before the first work of that kind in a conversation and re-read it when unsure: research, documents, scope_change, tasks, milestones, release.",
         ),
         _ => object_schema(json!({}), &[]),
     }
@@ -1277,6 +1167,12 @@ pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
 pub(crate) fn orchestration_read_schema(operations: &BTreeSet<String>) -> Value {
     let mut guidance = vec!["Arguments by operation:".to_owned()];
     for operation in operations {
+        // A registered operation states its own contract, generated from its
+        // spec. The contract is enforced at preparation, not by this schema.
+        if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
+            guidance.push(format!("- {}", spec.contract_line()));
+            continue;
+        }
         let arguments = orchestration_read_arguments_schema(operation);
         let keys = arguments
             .get("properties")
@@ -1398,6 +1294,7 @@ pub(crate) fn validate_orchestration_proposal_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION;
     use crate::operation_catalog::{
         MIGRATED_OPERATION_CONTRACTS, OperationInputContract, OperationOutputContract,
         SHARED_ORCHESTRATION_OUTCOME,

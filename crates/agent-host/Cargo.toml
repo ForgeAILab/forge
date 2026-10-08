@@ -6,6 +6,7 @@ rust-version = "1.86"
 license.workspace = true
 
 [dependencies]
+operation-registry = { path = "../operation-registry" }
 agent-runtime.workspace = true
 async-trait = "0.1"
 chacha20poly1305 = "0.10"

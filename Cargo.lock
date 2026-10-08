@@ -1324,6 +1324,7 @@ dependencies = [
  "hex",
  "jsonschema",
  "nix 0.28.0",
+ "operation-registry",
  "regex",
  "reqwest",
  "ring",
@@ -2478,6 +2479,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "operation-registry"
+version = "0.13.12"
+dependencies = [
+ "async-trait",
+ "jsonschema",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3318,6 +3331,7 @@ dependencies = [
  "git",
  "hex",
  "jsonwebtoken",
+ "operation-registry",
  "portable-pty",
  "rand 0.8.6",
  "reqwest",

@@ -47,13 +47,9 @@ use agent_runtime::harness::{FetchTool, FetchTransport};
 use crate::{
     AgentHostError, CanonicalScope, CanonicalScopeType, CommandAllowlist, WorkspaceAccess,
     operation_catalog::{
-        MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-        MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
-        MAIN_CHARTER_READINESS_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
-        MAIN_INQUIRY_RUN_OPERATION, OperationExposure, OperationSurface,
-        PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-        PROJECT_OBSERVATIONS_OPERATION, PROJECT_SKILL_SECTION_NAMES,
-        PROJECT_SKILL_SECTION_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+        MAIN_CHARTER_DRAFT_OPERATION, MAIN_INQUIRY_RUN_OPERATION, OperationExposure,
+        OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+        PROJECT_OBSERVATIONS_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
         TASK_WORKLOG_OPERATION, operation_names_for_surface,
     },
     operation_contract::{
@@ -1833,6 +1829,10 @@ impl Tool for ForgeScopeReadTool {
         }
         if self.reject_authority_overrides {
             reject_authority_overrides(&arguments)?;
+        }
+        if self.reject_authority_overrides
+            || operation_registry::READ_CATALOG.lookup(operation).is_some()
+        {
             validate_orchestration_read_arguments(operation, &arguments)?;
         }
         let resource = SecurityResource::other(
@@ -2924,8 +2924,20 @@ fn validate_orchestration_read_arguments(
     let object = arguments.as_object().ok_or_else(|| {
         RuntimeError::tool("Forge orchestration read arguments must be an object")
     })?;
+    if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
+        if let Some(field) = object
+            .keys()
+            .find(|field| !matches!(field.as_str(), "operation" | "arguments"))
+        {
+            return Err(RuntimeError::tool(format!(
+                "Forge orchestration read field `{field}` is not admitted"
+            )));
+        }
+        return spec
+            .validate_arguments(object.get("arguments").unwrap_or(&json!({})))
+            .map_err(RuntimeError::tool);
+    }
     let allowed = match operation {
-        MAIN_CHARTER_READ_OPERATION => &["operation", "arguments"][..],
         PROJECT_CURRENT_STATE_OPERATION => &["operation", "arguments"][..],
         _ => &["operation", "arguments"][..],
     };
@@ -2937,34 +2949,8 @@ fn validate_orchestration_read_arguments(
             .as_object()
             .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
         let nested_allowed: &[&str] = match operation {
-            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => &["genesis_session_id"],
-            MAIN_CHARTER_READ_OPERATION => &["charter_id", "revision_id", "genesis_session_id"],
-            MAIN_CHARTER_READINESS_OPERATION => &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "genesis_session_id",
-            ],
-            MAIN_CHARTER_DIFF_OPERATION => &[
-                "charter_id",
-                "base_revision_id",
-                "candidate_revision_id",
-                "genesis_session_id",
-            ],
-            MAIN_CHARTER_APPROVAL_TARGET_OPERATION => &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "genesis_session_id",
-            ],
             PROJECT_CURRENT_STATE_OPERATION => &["limit"],
             PROJECT_OBSERVATIONS_OPERATION => &["task_id", "limit"],
-            PROJECT_SKILL_SECTION_OPERATION => &["section"],
-            MAIN_INQUIRY_RUN_OPERATION => &["title", "question", "context"],
             _ => &[],
         };
         if let Some(field) = nested
@@ -2986,17 +2972,6 @@ fn validate_orchestration_read_arguments(
                 return Err(RuntimeError::tool(
                     "Project state read limit must be an integer",
                 ));
-            }
-        }
-        if operation == PROJECT_SKILL_SECTION_OPERATION {
-            match nested.get("section").and_then(Value::as_str) {
-                Some(section) if PROJECT_SKILL_SECTION_NAMES.contains(&section) => {}
-                _ => {
-                    return Err(RuntimeError::tool(format!(
-                        "skill.section requires `section` from: {}",
-                        PROJECT_SKILL_SECTION_NAMES.join(", ")
-                    )));
-                }
             }
         }
     }
@@ -3369,9 +3344,9 @@ mod tests {
 
     use super::*;
     use crate::operation_catalog::{
-        MAIN_PROJECT_CREATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-        PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
-        PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
+        MAIN_CHARTER_READ_OPERATION, MAIN_PROJECT_CREATE_OPERATION, PROJECT_DECISION_OPERATION,
+        PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
+        PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
     };
     use crate::operation_contract::{
         orchestration_payload_schema, orchestration_read_arguments_schema,
@@ -5434,7 +5409,7 @@ mod tests {
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), 2);
     }
 
-    fn test_preparation_context(call_id: &str) -> PreparationContext {
+    pub(super) fn test_preparation_context(call_id: &str) -> PreparationContext {
         PreparationContext {
             session: agent_runtime::core::ids::SessionId::new("session"),
             turn: None,
@@ -5447,7 +5422,7 @@ mod tests {
         }
     }
 
-    fn test_invocation_context(call_id: &str) -> InvocationContext {
+    pub(super) fn test_invocation_context(call_id: &str) -> InvocationContext {
         InvocationContext {
             session: agent_runtime::core::ids::SessionId::new("session"),
             turn: None,
@@ -5717,3 +5692,7 @@ mod bounded_command_tests {
 #[cfg(test)]
 #[path = "typed_tools/normalization_tests.rs"]
 mod normalization_tests;
+
+#[cfg(test)]
+#[path = "typed_tools/registry_tests.rs"]
+mod registry_tests;

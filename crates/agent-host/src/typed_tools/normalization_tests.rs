@@ -141,6 +141,126 @@ fn serialized_tool_definitions() {
     }
 }
 
+/// Estimated-prefix ceilings per native surface, in compact UTF-8 bytes (the
+/// unit `scripts/measure-tool-definitions.py` prints; tokens = ceil(bytes / 4)).
+/// A surface may shrink freely. Raise a ceiling only deliberately, in the
+/// change that explains why the prefix has to grow.
+const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
+    // 8,860 and 4,127 at 8bc736f5, less 46 and 38: the Main read lines state
+    // which fields are required instead of `optional {...}` for all of them.
+    ("main", 8_814),
+    ("inquiry", 4_089),
+    // 24,048 and 25,297 at 172338b3, plus 56 each: the `skill.section`
+    // argument line states the required enum instead of `optional {section}`.
+    ("project", 24_104),
+    ("project_verify_solo", 25_353),
+    ("project_setup", 15_572),
+    ("worker", 6_062),
+    ("reviewer", 4_829),
+    ("planner", 5_437),
+];
+
+/// Schema keywords that provider function-declaration dialects do not
+/// reliably accept. Advertised native schemas must not use them; a
+/// per-operation contract is enforced by the operation registry instead.
+const FORBIDDEN_SCHEMA_KEYWORDS: &[&str] = &[
+    "allOf",
+    "anyOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "$ref",
+    "$defs",
+    "dependentSchemas",
+    "patternProperties",
+];
+/// `oneOf` predates the registry: four nullable-variant fields of the Charter
+/// draft content in the setup surface's `forge_project_orchestration_propose`
+/// at 172338b3. Tolerated exactly there, by count, until that schema moves.
+const PRE_EXISTING_ONE_OF: &[(&str, usize)] = &[("project_setup", 4)];
+
+fn schema_keyword_uses(value: &Value, keyword: &str) -> usize {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| {
+                // A property may legitimately be *named* like a keyword; only
+                // the members of a `properties` map are names, not keywords.
+                let nested = if key == "properties" {
+                    value
+                        .as_object()
+                        .into_iter()
+                        .flat_map(|properties| properties.values())
+                        .map(|schema| schema_keyword_uses(schema, keyword))
+                        .sum()
+                } else {
+                    schema_keyword_uses(value, keyword)
+                };
+                usize::from(key == keyword && key != "properties") + nested
+            })
+            .sum(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| schema_keyword_uses(item, keyword))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn native_tool_definition_snapshot() -> serde_json::Map<String, Value> {
+    serde_json::from_str(include_str!(
+        "../../tests/fixtures/tool_definitions_normalized.json"
+    ))
+    .unwrap()
+}
+
+/// `serialized_tool_definitions` pins this fixture to the live definitions.
+#[test]
+fn advertised_native_schemas_use_only_the_portable_keyword_set() {
+    let snapshot = native_tool_definition_snapshot();
+    assert_eq!(snapshot.len(), SURFACE_BYTE_CEILINGS.len());
+    for (surface, definitions) in &snapshot {
+        for definition in definitions.as_array().unwrap() {
+            let schema = &definition["input_schema"];
+            for keyword in FORBIDDEN_SCHEMA_KEYWORDS {
+                assert_eq!(
+                    schema_keyword_uses(schema, keyword),
+                    0,
+                    "{surface} {} advertises `{keyword}`",
+                    definition["name"]
+                );
+            }
+        }
+        let allowed = PRE_EXISTING_ONE_OF
+            .iter()
+            .find(|(name, _)| name == surface)
+            .map_or(0, |(_, count)| *count);
+        assert_eq!(
+            schema_keyword_uses(definitions, "oneOf"),
+            allowed,
+            "{surface} `oneOf` uses"
+        );
+    }
+    // The walker itself: keywords are found at any depth, property names are not.
+    let probe = json!({"properties":{"if":{"type":"string"},"x":{"items":{"allOf":[{"not":{}}]}}}});
+    assert_eq!(schema_keyword_uses(&probe, "if"), 0);
+    assert_eq!(schema_keyword_uses(&probe, "allOf"), 1);
+    assert_eq!(schema_keyword_uses(&probe, "not"), 1);
+}
+
+#[test]
+fn native_tool_prefix_stays_within_its_byte_ceilings() {
+    let snapshot = native_tool_definition_snapshot();
+    for (surface, ceiling) in SURFACE_BYTE_CEILINGS {
+        let bytes = serde_json::to_string(&snapshot[*surface]).unwrap().len();
+        assert!(
+            bytes <= *ceiling,
+            "{surface} tool definitions are {bytes} bytes, over the {ceiling} byte ceiling"
+        );
+    }
+}
+
 use agent_runtime::core::{
     approval::{AllowAll, ApprovalDecision, ApprovalPolicy, ApprovalRequest},
     check_set::{EnforcementLimits, SecurityCheckSetBuilder},

@@ -1090,6 +1090,22 @@ structured Project Agent candidates plus the persisted/resolved selection.
 requiring `propose_discovery`; it accepts the Genesis session/version and one
 identity id, mutates no Charter prose, and freezes no approval by itself.
 
+Main reads use closed registry contracts after envelope normalization and again
+at dispatch. `forge_main_orchestration_read` keeps the portable
+`{operation, arguments}` shape; its generated argument lines mark optional
+fields with `?` rather than describing every field as optional. Charter
+readiness/approval-target queries require exact revision/digest references and
+a positive Charter version; diff requires both revision references.
+`inquiry.run` requires title (1–120 characters) and question (1–4000), with
+optional nullable context (at most 8000). Only a Main Chat exposes inquiry
+execution. The scope-read `discovery.read` and `portfolio.read` accept only an
+optional nullable unsigned `limit`; defaults and clamping are unchanged.
+An integer field of a registered operation also accepts an integer-valued
+string or float (`"10"` and `10.0` are `10`); any other malformed integer
+(`"ten"`, `1.5`, `-1` for an unsigned field, a boolean) is refused.
+Contract violations return an in-turn tool error naming the operation, field
+and expected contract. Proposal/approval and MCP contracts are unchanged.
+
 Project Agent validation results use the typed `project.validation` operation.
 A `record` payload must include the current positive
 `expected_milestone_version` alongside `milestone_id`, `check_id`,
@@ -4611,6 +4627,26 @@ is to use a new key. Protected persistence/runtime causes are retained in
 operator diagnostics and redacted from the envelope. `safe_message` is bounded
 guidance, and `correlation_id` is the handle for authorized support/log
 correlation.
+
+The native read aggregates retain their names and their advertised shape:
+`operation` (an enum of the operations the scope allows) and an untyped
+`arguments` object. The advertised schema never carries a per-operation
+conditional (`allOf`, `if`/`then`, `anyOf`, `$ref` and similar are not used),
+because provider function-declaration dialects do not reliably accept them.
+For a registry-backed operation the `arguments` description carries one
+generated line stating its contract, for example `project.charter: no
+arguments` and `skill.section: {section: one of
+research|documents|scope_change|tasks|milestones|release}` (a `?` suffix marks
+an optional field). The contract is enforced after normalization, on native
+and CLI chat calls alike: `account.summary`, `agent_chat.summary` and
+`project.charter` take no nested arguments (omit `arguments` or pass `{}`),
+and `skill.section` requires `arguments.section`. A violation is an ordinary
+tool error the model can correct in the same turn, naming the operation, the
+field and the expected contract, for example ``skill.section: argument
+`section` is required; expected skill.section: {section: one of ...}``. The
+remaining read operations retain their current schemas and validation.
+Provider-wrapped `parameters` calls still normalize before validation. MCP
+schemas are unchanged.
 
 Native agent tools return domain failures in-band as the structured tool value
 with the runtime error marker (`is_error: true`), so the model can branch on
