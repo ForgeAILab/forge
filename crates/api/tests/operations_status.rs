@@ -21,6 +21,12 @@ async fn operations_status_empty_db_is_healthy() {
     )
     .await;
 
+    assert_eq!(status.integration_queues.quarantined_imports, 0);
+    assert_eq!(status.integration_queues.queues_by_state["open"], 0);
+    assert_eq!(
+        status.integration_queues.current_attempts_by_state["queued"],
+        0
+    );
     assert_eq!(status.overall_severity, OperatorSeverity::Healthy);
     assert!(status.active_executions.is_empty());
     assert!(status.blocked_tasks.is_empty());

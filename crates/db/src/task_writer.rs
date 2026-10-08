@@ -35,8 +35,24 @@ pub fn owns_task(task_id: &str) -> bool {
         .try_with(|step| step.task_id == task_id)
         .unwrap_or(false)
 }
+pub fn owns_step(step_id: &str) -> bool {
+    CURRENT_STEP
+        .try_with(|step| step.id == step_id)
+        .unwrap_or(false)
+}
+pub fn current_step_id() -> Option<String> {
+    CURRENT_STEP.try_with(|step| step.id.clone()).ok()
+}
+/// The scope also carries the step's one-slot target-read buffer for shadow
+/// integration observations: created empty here, dropped with the step, never
+/// shared with another step or Task, and never awaited on.
 pub async fn in_task_step<T>(step: TaskStep, future: impl std::future::Future<Output = T>) -> T {
-    CURRENT_STEP.scope(step, future).await
+    CURRENT_STEP
+        .scope(
+            step,
+            crate::integration_queue::shadow::with_observation_buffer(future),
+        )
+        .await
 }
 
 /// Central guard for in-transaction helpers that write a Task's workflow

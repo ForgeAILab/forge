@@ -82,11 +82,24 @@ pub struct OperatorStatusResponse {
     pub event_consumers: Vec<EventConsumerStatus>,
     pub periodic_workers: Vec<PeriodicWorkerStatus>,
     pub task_steps: TaskStepQueueStatus,
+    pub integration_queues: IntegrationQueueStatus,
     #[ts(type = "number")]
     pub pending_remote_cancels: i64,
     pub event_relay: EventRelayStatus,
     pub database: DatabaseStorageStatus,
     pub computed_at: String,
+}
+
+/// Passive queue/import observations; no integration worker is active.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationQueueStatus {
+    #[ts(type = "Record<string, number>")]
+    pub queues_by_state: std::collections::BTreeMap<String, i64>,
+    #[ts(type = "Record<string, number>")]
+    pub current_attempts_by_state: std::collections::BTreeMap<String, i64>,
+    #[ts(type = "number")]
+    pub quarantined_imports: i64,
 }
 
 /// Cascade queue health, separate from durable consumer dead letters.

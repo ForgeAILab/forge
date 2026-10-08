@@ -100,6 +100,7 @@ pub async fn get_operations_status(
     State(state): State<AppState>,
 ) -> ApiResult<Json<OperatorStatusResponse>> {
     // Includes leased task_steps queue pressure alongside worker/consumer health.
+    // Includes passive integration queue/import counts; no queue mutation route.
     Ok(Json(state.operator_status_service.compute_status().await?))
 }
 

@@ -621,6 +621,31 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   behave as before. The Main tool definitions shrink from 8,814 to 8,558
   bytes. `genesis.start` and `charter.draft` are unchanged.
 
+- **Passive integration queues and shadow observations (3.2 stage B).** Two
+  new tables, `integration_queue` (one per repository and target branch) and
+  `integration_attempt` (a Task's membership, candidate and history), are
+  added by an additive migration. Merge behaviour is unchanged: today's merge
+  hooks still do all the work, nothing reads these tables to make a decision,
+  and no rebase, CI, fast-forward or Task effect is driven from the queue.
+  Today's merge, rebase and review-settlement steps record a typed observation
+  on the Task's current attempt in their existing transaction (admission,
+  candidate, target tip, outcome, conflict paths). Recording is one bounded
+  statement; if it fails, the real result still commits and the failure is
+  logged. An attempt keeps its first and 15 most recent observations and
+  counts the rest. The legacy importer exists as a storage pass but nothing
+  schedules it. These rows are evidence only and never block a deletion:
+  deleting a repository or its Project removes its queues and attempts,
+  deleting a repo location leaves the queue suspended without a target, and
+  deleting a Task keeps the attempt under its recorded Task id. Rows written
+  by this stage are disposable; the activation stage discards them before its
+  first import.
+- **Operator status reports integration queue counts.** `GET
+  /api/v1/operations/status` gains `integration_queues` with
+  `queues_by_state`, `current_attempts_by_state` and `quarantined_imports`
+  (all zero on a fresh database, every state listed). The field is always
+  present. This is additive for JSON consumers; a strictly typed client that
+  constructs `OperatorStatusResponse` itself (for example a test fixture built
+  from the generated TypeScript type) must add the field.
 - **Main reads moved onto the operation registry (3.8 slice C).**
   `genesis.project_agents.read`, `charter.read`, `charter.readiness`,
   `charter.diff`, `charter.approval_target`, `discovery.read`,

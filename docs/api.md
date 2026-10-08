@@ -3436,6 +3436,9 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `periodic_workers[].last_error`, `.last_error_at` | Nullable bounded error and RFC3339 time from existing worker health. Successful ticks clear tick/runtime causes. Faults also enter `recent_errors` as `periodic_worker` and raise severity to attention. |
 | `periodic_workers[].restart_count` | Persisted total unexpected loop exits/panics/cancellations; normal shutdown does not increment it. |
 | `event_relay` | Separate supervised SSE tail status: `running`, nullable in-memory `position` and live `head`, bounded `last_error` and `last_error_at`. No durable consumer cursor. |
+| `integration_queues.queues_by_state` | Passive integration queues counted by `open`, `suspended`, `quarantined`, `closed` (zero states included). |
+| `integration_queues.current_attempts_by_state` | Current membership counted by attempt state; terminal history is excluded. Zero states are included. |
+| `integration_queues.quarantined_imports` | Import rows with an explicit `quarantined` disposition, including rows with no resolvable queue. |
 | `task_steps` | Cascade step queue health. No consumer cursor or dead-letter actions. |
 | `task_steps.pending`, `.claimed` | Current pending and claimed step rows. |
 | `task_steps.failed`, `.parked` | Unresolved failed and parked (loop-detected) steps: rows the Task's error annotation still references. Resolved history does not count. |

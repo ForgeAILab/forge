@@ -340,6 +340,7 @@ impl TaskStepRepo for SqliteDb {
         if n != 1 {
             return Err(DbError::VersionConflict);
         }
+        self.observe_integration_terminal_best_effort(tx, s).await;
         // Only a hooks step is witnessed. Its settlement is authoritative;
         // the shadow never refuses it.
         if s.kind == "hooks" {
@@ -476,6 +477,8 @@ impl SqliteDb {
         self.fence_hook_in_tx(&mut tx, step).await?;
         sqlx::query("UPDATE task_hook_checkpoint SET effects_json=json_set(effects_json,?,?) WHERE step_id=? AND hook_index=?")
             .bind(format!("$.{key}")).bind(value).bind(&step.id).bind(index).execute(&mut *tx).await?;
+        self.observe_integration_hook_best_effort(&mut tx, step, index, key, value)
+            .await;
         tx.commit().await?;
         Ok(())
     }
