@@ -313,8 +313,12 @@ impl TaskDispatcher {
             for (id, error) in unreadable {
                 tracing::warn!(task_id = %id, %error, "Task scheduling snapshot unreadable; recomputing its condition");
                 failures += 1;
-                // The stored condition is what failed to decode; the legacy
-                // fields it shadows are intact, so recompute it and go on.
+                // The row itself could not be read. An undecodable condition
+                // is not this case: it reads as a typed unknown park. Run the
+                // check on the Task anyway and read it again: the check
+                // restates a corrupt or stale condition from the legacy
+                // fields, and leaves one a newer build wrote quarantined,
+                // counted in the pass and never rewritten.
                 let one = std::slice::from_ref(&id);
                 let repaired = match self.db.check_task_conditions_of(one).await {
                     Ok(_) => self.db.schedule_reads_isolated(one).await.ok(),
@@ -533,7 +537,12 @@ impl TaskDispatcher {
         let mut refused = false;
         for _ in 0..4 {
             let machine_wait = p.machine_wait;
-            refused |= Box::pin(self.observe_admission(p, project, agents, gate)).await;
+            // Skipped only where integration decides the Task's next step.
+            // Under a self-clearing primary the admission is observed as
+            // for any other Task, so that park can clear.
+            if !next_step::integration_decides(&p.read.condition, &p.facts) {
+                refused |= Box::pin(self.observe_admission(p, project, agents, gate)).await;
+            }
             p.machine_wait |= machine_wait;
             gate = false;
             let initial = p.workflow.state_kind(&p.read.task.status) == Some(StateKind::Initial);
@@ -918,6 +927,7 @@ impl TaskDispatcher {
                 let owned = p.read.queue_owned
                     || p.read.park_json.is_some()
                     || p.read.condition.is_blocked()
+                    || p.read.condition.integration_wait().is_some()
                     || p.read.executions.iter().any(|e| {
                         e.status == db::ExecutionStatus::Running && e.role != "interactive"
                     });

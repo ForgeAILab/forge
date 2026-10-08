@@ -105,6 +105,11 @@ pub enum DbError {
     #[error("check constraint failed: {0}")]
     Check(String),
 
+    /// The Task's stored condition is recognisably a newer build's encoding.
+    /// It is never rewritten here, so a statement over it is refused whole.
+    #[error("Task {task_id} has a condition written by a newer Forge build; it is quarantined until a build that understands it runs")]
+    TaskConditionQuarantined { task_id: String },
+
     #[error("review {review_id} has corrupt persisted step_results_json: {reason}")]
     ReviewDetailsCorrupt { review_id: String, reason: String },
 

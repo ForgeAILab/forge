@@ -158,10 +158,34 @@ impl TaskDispatcher {
         let stale = |stored: &TaskCondition, task: &db::Task| {
             // A writer stated this condition in the transaction of its write:
             // it is not a copy of the legacy fields and cannot lag them.
+            let unreadable = stored.reasons().find_map(|reason| match reason {
+                ParkReason::UnknownCondition {
+                    source:
+                        db::ConditionSource {
+                            field: db::LegacyConditionField::ConditionJson,
+                            ..
+                        },
+                    problem,
+                } => Some(problem),
+                _ => None,
+            });
+            match unreadable {
+                // A newer build's encoding is quarantined: this build neither
+                // resolves around it nor repairs it.
+                Some(db::UnknownConditionProblem::UnknownKind) => return None,
+                // Corrupt or empty: the legacy fields are intact, so resolve
+                // from them and let the check restate the stored copy.
+                Some(_) => {
+                    return Some(db::map_legacy_condition(&db::LegacyConditionInput::from(
+                        task,
+                    )))
+                }
+                None => {}
+            }
             if stored.evidence().stated {
                 return None;
             }
-            let legacy = db::map_legacy_condition(&db::LegacyConditionInput::from(task));
+            let legacy = stored.restate_legacy(&db::LegacyConditionInput::from(task));
             let (stored, fresh) = (stored.evidence(), legacy.evidence());
             (stored.error_annotation != fresh.error_annotation
                 || stored.blocked_json != fresh.blocked_json
@@ -562,6 +586,28 @@ impl TaskDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn integration_restatement_preserves_lineage_and_new_legacy_holds() {
+        for condition in crate::task_actions::tests::integration_conditions() {
+            let input = db::LegacyConditionInput { error_annotation: Some(serde_json::json!({"type":"manual_stop","blocking_reason":"new hold","blocked_by":"user"}).to_string()), ..Default::default() };
+            let restated = condition.restate_legacy(&input);
+            assert_eq!(
+                restated.integration_reason(),
+                condition.integration_reason()
+            );
+            assert!(blocking(&restated, true));
+            assert!(matches!(
+                restated,
+                TaskCondition::Parked {
+                    primary: ParkReason::Held { .. },
+                    ..
+                }
+            ));
+        }
+        let unknown = db::task_condition::decode_or_unknown(r#"{"kind":"future"}"#);
+        assert!(blocking(&unknown, true));
+    }
+
     /// A condition its writer stated carries no legacy copy; the dispatcher
     /// holds on its typed presentation exactly where it held on the copies.
     #[test]

@@ -2997,9 +2997,67 @@ Legacy columns retain the complete original data during dual-write.
 names. The first now agrees between list and detail; entry ownership and waits
 are explicit. A failed Review from before the Task's current state entry, or on
 a settled Task, is evidence, not a current exception; a reviewer run that is
-merely live does not clear it. Unsupported stored condition encodings
-project an unknown diagnosis while invariant repair rebuilds them. Legacy
+merely live does not clear it. Legacy
 metadata remains private and does not need to be parsed by public wait readers.
+
+A stored condition this build cannot decode projects a `parked` condition whose
+primary reason is `unknown_condition` with `source.field = condition_json`. Its
+`problem` says which of two classes it is:
+
+- `malformed_json`, `non_object`, `invalid_shape` or `non_text`: corrupt or
+  empty. The next write to the Task, a hold or release, or the invariant check
+  restates it from the Task's own fields. Nothing is lost and no call fails.
+- `unknown_kind`: recognisably a newer Forge build's encoding (a well-formed
+  tagged value naming a variant this build does not know, or any undecodable
+  value in a database whose recorded mapping revision is higher than this
+  build's). It is **quarantined**: the stored bytes are never rewritten. Holding
+  or releasing such a Task returns HTTP 409 with code
+  `task_condition_quarantined` and `details.task_id`, and writes nothing (no
+  annotation, no version change, no event). MCP returns error `-32010` with
+  `data.code = "task_condition_quarantined"`. Other writes to the Task still
+  land and leave the condition as it is. There is no repair endpoint: the exit
+  is to run a build that understands the encoding. Operator status lists the
+  count and the first 20 Task ids as a `task_condition_quarantined` entry in
+  `recent_errors`.
+
+Integration's condition foundation adds `ConditionReason::Integration`, serialized
+as `{ "kind": "integration", "reason": { ... } }`, and a distinct
+`resume: { "kind": "integration", "attempt_id": "opaque-id" }`. The top-level
+condition kinds are unchanged. The older continuation `integrate` is a different
+thing: it is the legacy paused-integration retry (a Project pause caught a passed
+review), while `integration` means the integration worker owns the wait.
+`reason.kind` is one of:
+
+| Integration reason | Fields besides opaque `attempt_id` |
+|---|---|
+| `waiting` | none: queue order and who is ahead belong to the queue, never to the condition |
+| `owned` | typed `phase`: validating, rebasing, checking, awaiting_carry, awaiting_authorization, fast_forwarding, reconciling |
+| `repair` | optional `predecessor_attempt_id`, `conflict_paths` (a path sample, or `null` when the conflicting paths are unknown), `repair_paths` (a path sample) |
+| `review_required` | `authority_reason` |
+| `candidate_check_failed` | `check`, `message` |
+| `deferred` | typed `cause`, optional `owner_id`, `message`; no retry time or deadline |
+| `applied` | awaiting identity-fenced consumption by the Task step |
+
+A path sample is `{ "count": n, "paths": [...], "truncated": bool }`: `count`
+is the size of the whole set, `paths` holds its first paths, at most 32, and
+`truncated` is true when some were left out. The whole set belongs to the
+integration attempt's own record, not to the condition. Statement IDs, paths
+and diagnostic text are bounded to 1,024 bytes each. Queue rank and neighbours,
+revisions, leases, worker tokens, phase times, retry times and deadlines are
+absent from the reason and from the material digest. A settled Task keeps only
+the attempt identity privately; it is not part of the public condition.
+
+Deferral causes are `infrastructure`, `owner_offline`, `target_dirty`,
+`budget_exhausted`, `owner_required`, and `unresolved_result`. Ordinary waits
+have `details.owner = integration_worker`, `recovery = wait_for_integration`,
+no diagnostic/interruption, and false blocked/failed/human/entry flags. Real
+owner-fixable causes (dirty target, exhausted budget, owner required) expose a
+blocked diagnostic and `repair_integration` guidance. Guidance does not authorize
+an action: stage A offers Hold/Cancel on integration waits, and preserves normal
+Release on an independent user hold. These variants are emitted only in tests
+until queue activation; there are no new routes, queue tables or worker yet.
+Private witnesses retain repair/review lineage through real running states; a
+Task with a live execution is always `running`, never parked on integration.
 
 `items` contains `TaskListItemResponse` objects: identity, title/type/status,
 canonical phase, assignment and ordering fields, retry budgets, typed `condition`,
@@ -4181,7 +4239,7 @@ Common HTTP mappings:
 |--------|------|
 | 400 | Validation failure |
 | 404 | Resource not found |
-| 409 | Optimistic task/board version conflict, move operation conflict, role assignment conflict, execution admission conflict, `task_busy` (accepted and queued; see [Task command contention](#task-command-contention-and-remote-cleanup)), or `resource_in_use` |
+| 409 | Optimistic task/board version conflict, move operation conflict, role assignment conflict, execution admission conflict, `task_busy` (accepted and queued; see [Task command contention](#task-command-contention-and-remote-cleanup)), `task_condition_quarantined` (hold or release of a Task whose stored condition a newer Forge build wrote; nothing is changed), or `resource_in_use` |
 | 412 | Workflow guard rejection (`before_exit` blocked the transition) |
 | 422 | Illegal state transition |
 | 500 | Internal error |

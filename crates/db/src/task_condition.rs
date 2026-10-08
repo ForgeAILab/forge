@@ -1,4 +1,5 @@
-//! Stage-one shadow condition. Legacy columns still own runtime decisions.
+//! Typed Task conditions. Legacy mapping remains authoritative for legacy
+//! writers; integration ownership is stated directly under the Task-step lease.
 //!
 //! [`map_legacy_condition`] is the single deterministic mapping: a pure Rust
 //! function used by the migration backfill, the writer seams and the invariant
@@ -6,6 +7,10 @@
 //! carries the mapping. No queue intent, publication claim or settlement
 //! receipt is moved here.
 use crate::{DbError, Result, SqliteDb, Task};
+pub use api_types::{
+    IntegrationAttemptId, IntegrationDeferralCause, IntegrationPaths, IntegrationPhase,
+    IntegrationReason, INTEGRATION_PATH_SAMPLE,
+};
 use serde::{de::IgnoredAny, Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
@@ -144,6 +149,9 @@ pub enum ConditionEnvironmentKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParkReason {
+    Integration {
+        reason: IntegrationReason,
+    },
     Held {
         actor: String,
     },
@@ -229,6 +237,7 @@ pub enum RetryCause {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConditionContinuation {
+    Integration { attempt_id: IntegrationAttemptId },
     Reconcile,
     AdvanceAggregateReview { child_ids: Vec<String> },
     Dispatch { target_state: String },
@@ -256,7 +265,11 @@ impl TaskCondition {
     /// Whether the condition holds the Task out of dispatch. For a legacy-only
     /// mapping this agrees with what the dispatcher and readers block on.
     pub fn is_blocked(&self) -> bool {
-        matches!(self, Self::Parked { .. } | Self::Failed { .. })
+        matches!(self, Self::Failed { .. })
+            || self.reasons().any(|r| match r {
+                ParkReason::Integration { reason } => reason.requires_intervention(),
+                _ => true,
+            })
     }
     /// The condition without the marks of how it was produced: the legacy
     /// copies a mapped condition carries and the mark a stated one carries.
@@ -305,7 +318,7 @@ pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
 /// Revision of the mapping and of the stored encoding. A database whose
 /// recorded revision differs is recomputed once in the background, off the
 /// startup path. Bump it with every change to either.
-pub const MAPPING_REVISION: i64 = 4;
+pub const MAPPING_REVISION: i64 = 5;
 /// Protected `system_setting` key recording the revision last backfilled.
 pub const MAPPING_REVISION_KEY: &str = "task_condition_mapping_revision";
 
@@ -1169,24 +1182,135 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
 }
 
 pub fn decode(raw: &str) -> Result<TaskCondition> {
-    serde_json::from_str(raw).map_err(|e| DbError::Check(format!("invalid Task condition: {e}")))
+    let condition: TaskCondition = serde_json::from_str(raw)
+        .map_err(|e| DbError::Check(format!("invalid Task condition: {e}")))?;
+    integration::validate(&condition)?;
+    Ok(condition)
 }
+/// How a stored condition reads to this build.
+#[derive(Debug)]
+pub(crate) enum Stored {
+    Readable(Box<TaskCondition>),
+    /// Corrupt or empty: invalid JSON, a scalar, `{}`, `[]`, a known tag with
+    /// a broken body. The legacy columns and durable facts still hold what
+    /// the row should say, so every producer, statement and check RESTATES
+    /// it from them.
+    Corrupt(UnknownConditionProblem),
+    /// Recognisably a newer encoding: a well-formed tagged value naming a
+    /// variant this build does not know, or any undecodable value in a
+    /// database whose recorded mapping revision is higher than this build's.
+    /// QUARANTINED: the bytes are never rewritten here. The only exit is a
+    /// build that understands the encoding.
+    Newer,
+}
+
+/// Whether `value` is a tagged value of `T` naming a variant `T` lacks.
+fn unknown_tag<T: serde::de::DeserializeOwned>(value: Option<&serde_json::Value>) -> bool {
+    let Some(kind) = value.and_then(|v| v.get("kind")).and_then(|k| k.as_str()) else {
+        return false;
+    };
+    // serde reports an unknown tag before it reads any field.
+    serde_json::from_value::<T>(serde_json::json!({ "kind": kind }))
+        .is_err_and(|error| error.to_string().starts_with("unknown variant"))
+}
+/// A reason, and the integration reason nested in it, names an unknown variant.
+fn unknown_reason(value: Option<&serde_json::Value>) -> bool {
+    unknown_tag::<ParkReason>(value)
+        || value.is_some_and(|v| {
+            v.get("kind").and_then(|k| k.as_str()) == Some("integration")
+                && unknown_tag::<IntegrationReason>(v.get("reason"))
+        })
+}
+/// Whether an undecodable object is recognisably a newer encoding: its own
+/// tag, or the tag of a value at a typed position inside it, is unknown.
+fn newer_encoding(value: &serde_json::Value) -> bool {
+    if unknown_tag::<TaskCondition>(Some(value)) {
+        return true;
+    }
+    fn list(value: Option<&serde_json::Value>) -> &[serde_json::Value] {
+        value
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+    let evidence = value.get("evidence");
+    unknown_reason(value.get("primary"))
+        || unknown_reason(value.get("failure"))
+        || unknown_tag::<ConditionContinuation>(value.get("resume"))
+        || list(value.get("additional"))
+            .iter()
+            .chain(list(evidence.and_then(|e| e.get("observations"))))
+            .any(|reason| unknown_reason(Some(reason)))
+        || list(evidence.and_then(|e| e.get("witnesses")))
+            .iter()
+            .any(|witness| {
+                unknown_tag::<ConditionWitness>(Some(witness))
+                    || unknown_tag::<IntegrationReason>(witness.get("reason"))
+            })
+}
+/// Classify stored bytes by their own shape. A database-wide newer revision
+/// is added by [`stored_condition`].
+pub(crate) fn classify(stored: &[u8]) -> Stored {
+    use UnknownConditionProblem as Problem;
+    let Ok(raw) = std::str::from_utf8(stored) else {
+        return Stored::Corrupt(Problem::NonText);
+    };
+    if let Ok(condition) = decode(raw) {
+        return Stored::Readable(Box::new(condition));
+    }
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Err(_) => Stored::Corrupt(Problem::MalformedJson),
+        Ok(value) if !value.is_object() => Stored::Corrupt(Problem::NonObject),
+        Ok(value) if newer_encoding(&value) => Stored::Newer,
+        Ok(_) => Stored::Corrupt(Problem::InvalidShape),
+    }
+}
+/// [`classify`], with every undecodable value of a database a newer build
+/// has recorded its mapping revision in counted as that build's encoding.
+pub(crate) async fn stored_condition(connection: &mut SqliteConnection, stored: &[u8]) -> Stored {
+    match classify(stored) {
+        Stored::Corrupt(_) if recorded_revision_is_newer(connection).await => Stored::Newer,
+        classified => classified,
+    }
+}
+/// Whether a newer build recorded its mapping revision here. A database with
+/// no settings table (the migration that adds this column) records none.
+async fn recorded_revision_is_newer(connection: &mut SqliteConnection) -> bool {
+    sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key=?")
+        .bind(MAPPING_REVISION_KEY)
+        .fetch_optional(connection)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|recorded| recorded.parse::<i64>().ok())
+        .is_some_and(|recorded| recorded > MAPPING_REVISION)
+}
+/// The ids a quarantine warning or report names.
+pub const QUARANTINE_REPORT_LIMIT: usize = 20;
+
 /// The stored condition as every row reader sees it: a value that cannot be
-/// decoded is a typed unknown park, never a silent `Clear`.
+/// decoded is a typed unknown park, never a silent `Clear`. `unknown_kind`
+/// is the quarantined class (a newer encoding); every other problem is
+/// corruption the next producer or check restates.
 pub fn decode_or_unknown(raw: &str) -> TaskCondition {
-    decode(raw).unwrap_or_else(|_| TaskCondition::Parked {
+    let problem = match classify(raw.as_bytes()) {
+        Stored::Readable(condition) => return *condition,
+        Stored::Newer => UnknownConditionProblem::UnknownKind,
+        Stored::Corrupt(problem) => problem,
+    };
+    TaskCondition::Parked {
         primary: ParkReason::UnknownCondition {
             source: ConditionSource {
                 field: LegacyConditionField::ConditionJson,
                 key: None,
             },
-            problem: UnknownConditionProblem::UnknownKind,
+            problem,
         },
         additional: Vec::new(),
         resume: ConditionContinuation::Reconcile,
         since: None,
         evidence: Default::default(),
-    })
+    }
 }
 fn encode(condition: &TaskCondition) -> String {
     serde_json::to_string(condition).expect("Task condition serializes")
@@ -1217,8 +1341,10 @@ async fn set_condition(
 }
 
 /// The full recompute of one row: the mapping fallback, used by the backfill,
-/// the invariant check and a writer with no narrower claim. A stored condition
-/// is compared as text and never decoded, so an undecodable one is overwritten.
+/// the invariant check and a writer with no narrower claim. Integration
+/// witnesses of a readable row survive. A corrupt or empty stored value is
+/// restated from the legacy columns and facts; a recognisably newer encoding
+/// is quarantined and left byte for byte.
 pub(crate) async fn sync_condition(connection: &mut SqliteConnection, task_id: &str) -> Result<()> {
     produce(connection, task_id, ConditionChange::Full).await
 }
@@ -1230,6 +1356,7 @@ pub(crate) async fn sync_condition(connection: &mut SqliteConnection, task_id: &
 pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
     let full_schema: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('project','execution','task_step')").fetch_one(&mut *connection).await?;
     let mut after: Option<String> = None;
+    let (mut quarantined, mut quarantined_ids) = (0_u64, Vec::<String>::new());
     loop {
         let rows = sqlx::query(&format!(
             "SELECT {LEGACY_SELECT},id FROM task WHERE ?1 IS NULL OR id>?1 ORDER BY id LIMIT 200"
@@ -1242,9 +1369,21 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
         };
         after = Some(last.try_get(6)?);
         for row in &rows {
+            let stored: Vec<u8> = row.try_get(5)?;
+            let id: String = row.try_get(6)?;
+            // A newer encoding is left alone; corruption is restated below.
+            if matches!(
+                stored_condition(&mut *connection, &stored).await,
+                Stored::Newer
+            ) {
+                quarantined += 1;
+                if quarantined_ids.len() < QUARANTINE_REPORT_LIMIT {
+                    quarantined_ids.push(id);
+                }
+                continue;
+            }
             let input = LegacyConditionInput::from_row(row)?;
             let mapped = map_legacy_condition(&input);
-            let id: String = row.try_get(6)?;
             let condition = if full_schema == 3 {
                 match ConditionFacts::load(connection, &id).await {
                     Ok(facts) => encode(&facts.condition(&input)),
@@ -1259,8 +1398,16 @@ pub(crate) async fn backfill(connection: &mut SqliteConnection) -> Result<()> {
             }
         }
     }
-    // Every row now holds this revision's encoding: record it, so the first
-    // dispatcher tick after a clean upgrade does not walk the table again.
+    if quarantined != 0 {
+        tracing::warn!(
+            quarantined,
+            task_ids = ?quarantined_ids,
+            "Task conditions written by a newer build were left quarantined by the backfill; run a build that understands them"
+        );
+    }
+    // Every row this build can read or restate now holds this revision's
+    // encoding: record it, so the first dispatcher tick after a clean upgrade
+    // does not walk the table again.
     let settings: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='system_setting'",
     )
@@ -1288,11 +1435,60 @@ impl SqliteDb {
         decode(&raw)
     }
 
+    /// State integration ownership under the live Task-step lease. No legacy
+    /// field, version, event, budget or queue row is written by this seam.
+    pub async fn state_integration_condition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+        statement: &ConditionStatement,
+    ) -> Result<()> {
+        if !matches!(
+            statement,
+            ConditionStatement::Integration { .. }
+                | ConditionStatement::IntegrationHandedOff { .. }
+                | ConditionStatement::IntegrationCleared { .. }
+        ) {
+            return Err(DbError::Check("expected an integration statement".into()));
+        }
+        if !crate::task_writer::owns_task(task_id) {
+            return Err(DbError::Check(
+                "integration statement requires the Task step lease".into(),
+            ));
+        }
+        // The generic hook fence permits completed command bookkeeping.
+        // An integration statement needs a currently claimed Task step.
+        let step = crate::task_writer::current_task_step().expect("owns_task checked");
+        let claimed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE id=? AND task_id=? AND status='claimed' AND claimed_by=? AND (lease_until>? OR ?))")
+            .bind(&step.id).bind(task_id).bind(&step.claimed_by)
+            .bind(crate::now_rfc3339()).bind(self.step_is_active(&step))
+            .fetch_one(&mut **tx).await?;
+        if !claimed {
+            return Err(DbError::VersionConflict);
+        }
+        self.fence_task_lease_in_tx(tx, task_id, "integration statement")
+            .await?;
+        // A quarantined row refuses the statement inside `derive`.
+        let produced =
+            producers::derive(tx, task_id, ConditionChange::Legacy, None, Some(statement))
+                .await?
+                .ok_or(DbError::NotFound)?;
+        self.set_condition(
+            tx,
+            task_id,
+            produced.version,
+            &produced.legacy,
+            &produced.condition,
+        )
+        .await
+    }
+
     /// Strict single-writer seam for a producer that states a condition. It
     /// requires the Task's claimed step and its live lease, never rebinds a
     /// stale version, and compares all five source values (metadata changes
-    /// without advancing Task.version). The legacy fields are authoritative,
-    /// so a condition is refused unless it is their mapping under the
+    /// without advancing Task.version). Legacy-derived reasons must agree
+    /// with their mapping; integration is validated from its typed witness.
+    /// A condition is refused unless those owners agree under the
     /// witnesses it states itself. Those witnesses are the producer's claim:
     /// they are not re-read here (the invariant check does that), so stating a
     /// condition costs no fact query.
@@ -1305,6 +1501,7 @@ impl SqliteDb {
         expected_legacy: &LegacyConditionInput,
         condition: &TaskCondition,
     ) -> Result<()> {
+        integration::validate(condition)?;
         if !crate::task_writer::owns_task(task_id) {
             return Err(DbError::Check(
                 "set_condition requires the Task step lease".into(),
@@ -1319,6 +1516,52 @@ impl SqliteDb {
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(DbError::NotFound)?;
+        let stored: Vec<u8> = row.try_get(5)?;
+        // A corrupt stored value states no integration ownership: the
+        // condition written over it is the restatement.
+        let stored_condition = match stored_condition(tx, &stored).await {
+            Stored::Readable(stored) => Some(*stored),
+            Stored::Corrupt(_) => None,
+            Stored::Newer => {
+                return Err(DbError::TaskConditionQuarantined {
+                    task_id: task_id.to_owned(),
+                })
+            }
+        };
+        let owned = |c: &TaskCondition| {
+            // Settlement keeps the attempt identity alone, so a settled
+            // condition owns what its unsettled predecessor's attempt owned.
+            match c {
+                TaskCondition::Settled { .. } => (None, false, c.integration_attempt().cloned()),
+                _ => (
+                    c.integration_reason().cloned(),
+                    c.integration_handoff_ready(),
+                    c.integration_attempt().cloned(),
+                ),
+            }
+        };
+        let before = stored_condition.as_ref().map(owned).unwrap_or_default();
+        let after = owned(condition);
+        let unchanged = if matches!(condition, TaskCondition::Settled { .. }) {
+            before.2 == after.2
+        } else {
+            before == after
+        };
+        if !unchanged {
+            // Completed command bookkeeping may carry integration, never
+            // introduce, replace or clear its independently owned statement.
+            let step = crate::task_writer::current_task_step().expect("owns_task checked");
+            let claimed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE id=? AND task_id=? AND status='claimed')")
+                .bind(&step.id).bind(task_id).fetch_one(&mut **tx).await?;
+            if !claimed {
+                // A check failure, not a version conflict: the caller that
+                // answers a conflict by writing under the version fence alone
+                // (`state_condition_in_tx`) must not write this one.
+                return Err(DbError::Check(
+                    "integration ownership cannot change under a completed Task step".into(),
+                ));
+            }
+        }
         let mut bare = expected_legacy.clone();
         bare.facts = None;
         if row.try_get::<i64, _>(6)? != expected_version
@@ -1335,9 +1578,23 @@ impl SqliteDb {
                 facts
             })
             .filter(|facts| facts.epoch == row.get::<i64, _>(8));
-        if stated.is_none_or(|facts| facts.condition(&bare) != *condition) {
+        // The condition must be exactly what its witnesses and the legacy
+        // fields state. One carrying an integration reason is the exception:
+        // an integration statement edits the stored condition's typed form
+        // (it writes no legacy field), so the result carries the `stated`
+        // mark and none of the legacy copies the recomputation carries, and
+        // the two can only be compared without them.
+        let agrees = |facts: ConditionFacts| {
+            let expected = facts.condition(&bare);
+            if condition.integration_reason().is_some() {
+                expected.typed() == condition.typed()
+            } else {
+                expected == *condition
+            }
+        };
+        if !stated.is_some_and(agrees) {
             return Err(DbError::Check(
-                "Task condition differs from legacy fields".into(),
+                "Task condition differs from its legacy and owner witnesses".into(),
             ));
         }
         set_condition(tx, task_id, &encode(condition), Some(expected_version)).await
@@ -1430,6 +1687,7 @@ impl SqliteDb {
             .bind(&task.id)
             .fetch_one(&mut *connection)
             .await?;
+        decode(&actual)?;
         let facts = ConditionFacts::load(&mut connection, &task.id).await?;
         let expected = facts.condition(&LegacyConditionInput::from(task));
         if !TaskCondition::stored_agrees(actual.as_bytes(), &expected, &encode(&expected)) {
@@ -1466,6 +1724,7 @@ impl SqliteDb {
 }
 
 mod checks;
+mod integration;
 pub use checks::{
     ConditionCheckPass, ConditionCheckState, ConditionCheckStatus, CONDITION_CHECK_PAGE,
 };
@@ -1480,6 +1739,8 @@ pub(crate) use producers::{
     sql_change, state, workflow_changed,
 };
 pub use statements::ConditionStatement;
+#[cfg(test)]
+mod integration_tests;
 #[cfg(test)]
 mod producer_tests;
 #[cfg(test)]

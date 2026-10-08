@@ -110,8 +110,14 @@ impl TaskCondition {
                             field: LegacyConditionField::ConditionJson,
                             ..
                         },
-                    ..
+                    problem,
                 } => {
+                    // `unknown_kind` is a newer build's encoding: quarantined,
+                    // never rewritten here, and holds, releases and
+                    // integration statements over it are refused. Anything
+                    // else is corruption the next write or check restates
+                    // from the legacy columns.
+                    let quarantined = *problem == UnknownConditionProblem::UnknownKind;
                     read.failure_kind = Some(FailureKind::Unknown);
                     read.diagnostic_present = true;
                     read.diagnostic = Some(TaskBlockingAnnotation {
@@ -122,8 +128,12 @@ impl TaskCondition {
                         blocked_execution_id: None,
                         artifact: None,
                         message: Some(
-                            "Stored Task condition is unreadable; waiting for invariant repair"
-                                .into(),
+                            if quarantined {
+                                "Stored Task condition was written by a newer Forge build and is quarantined; run a build that understands it. Holding or releasing this Task is refused until then"
+                            } else {
+                                "Stored Task condition is unreadable; the next write or invariant check restates it from the Task's fields"
+                            }
+                            .into(),
                         ),
                         hook: None,
                     });
@@ -185,7 +195,17 @@ impl TaskCondition {
         let evidence = self.evidence();
         // A condition a writer stated carries no copy of the legacy records:
         // which record the interruption is comes from its typed presentation.
-        let stated = evidence.presentation.as_ref().filter(|_| evidence.stated);
+        let integration_primary = matches!(
+            self,
+            TaskCondition::Parked {
+                primary: ParkReason::Integration { .. },
+                ..
+            }
+        );
+        let stated = evidence
+            .presentation
+            .as_ref()
+            .filter(|_| evidence.stated || integration_primary);
         let failed = read.interruption.is_some()
             && (evidence.failed_json.is_some() || stated.is_some_and(|p| p.hard_failure));
         let blocked = (evidence.blocked_json.is_some()

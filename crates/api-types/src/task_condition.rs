@@ -1,6 +1,153 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+/// Opaque identity; queue order and worker leases belong to stage-B storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(export)]
+pub struct IntegrationAttemptId(String);
+impl IntegrationAttemptId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum IntegrationPhase {
+    Validating,
+    Rebasing,
+    Checking,
+    AwaitingCarry,
+    AwaitingAuthorization,
+    FastForwarding,
+    Reconciling,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum IntegrationDeferralCause {
+    Infrastructure,
+    OwnerOffline,
+    TargetDirty,
+    BudgetExhausted,
+    OwnerRequired,
+    UnresolvedResult,
+}
+impl IntegrationDeferralCause {
+    pub fn requires_intervention(&self) -> bool {
+        matches!(
+            self,
+            Self::TargetDirty | Self::BudgetExhausted | Self::OwnerRequired
+        )
+    }
+}
+
+/// A bounded sample of a path set: how many paths there are and at most
+/// [`INTEGRATION_PATH_SAMPLE`] of them. The whole set is the attempt's record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct IntegrationPaths {
+    /// Paths in the whole set.
+    pub count: u32,
+    /// The first paths of the set, at most [`INTEGRATION_PATH_SAMPLE`].
+    pub paths: Vec<String>,
+    /// Whether `paths` leaves some of the set out.
+    pub truncated: bool,
+}
+/// Paths one integration reason carries per path set.
+pub const INTEGRATION_PATH_SAMPLE: usize = 32;
+impl IntegrationPaths {
+    /// The bounded sample of `all`, in the order given.
+    pub fn bounded(all: impl IntoIterator<Item = String>) -> Self {
+        let mut paths = Vec::new();
+        let mut count = 0_u32;
+        for path in all {
+            count = count.saturating_add(1);
+            if paths.len() < INTEGRATION_PATH_SAMPLE {
+                paths.push(path);
+            }
+        }
+        Self {
+            count,
+            truncated: count as usize > paths.len(),
+            paths,
+        }
+    }
+}
+
+/// Integration owns these statements until a Task step consumes or replaces
+/// them. Repair/review lineage survives actual coder/reviewer execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[ts(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum IntegrationReason {
+    /// Queued behind other attempts. Queue order is the queue's own state and
+    /// is never copied here: a queue advance rewrites no waiter.
+    Waiting {
+        attempt_id: IntegrationAttemptId,
+    },
+    Owned {
+        attempt_id: IntegrationAttemptId,
+        phase: IntegrationPhase,
+    },
+    /// Lineage is bounded: the full path sets belong to the attempt record.
+    /// `conflict_paths` is `None` when the conflicting paths are not known.
+    Repair {
+        attempt_id: IntegrationAttemptId,
+        predecessor_attempt_id: Option<IntegrationAttemptId>,
+        conflict_paths: Option<IntegrationPaths>,
+        repair_paths: IntegrationPaths,
+    },
+    ReviewRequired {
+        attempt_id: IntegrationAttemptId,
+        authority_reason: String,
+    },
+    CandidateCheckFailed {
+        attempt_id: IntegrationAttemptId,
+        check: String,
+        message: String,
+    },
+    Deferred {
+        attempt_id: IntegrationAttemptId,
+        cause: IntegrationDeferralCause,
+        owner_id: Option<String>,
+        message: String,
+    },
+    Applied {
+        attempt_id: IntegrationAttemptId,
+    },
+}
+impl IntegrationReason {
+    pub fn attempt_id(&self) -> &IntegrationAttemptId {
+        match self {
+            Self::Waiting { attempt_id, .. }
+            | Self::Owned { attempt_id, .. }
+            | Self::Repair { attempt_id, .. }
+            | Self::ReviewRequired { attempt_id, .. }
+            | Self::CandidateCheckFailed { attempt_id, .. }
+            | Self::Deferred { attempt_id, .. }
+            | Self::Applied { attempt_id } => attempt_id,
+        }
+    }
+    pub fn requires_intervention(&self) -> bool {
+        matches!(self, Self::Deferred { cause, .. } if cause.requires_intervention())
+    }
+    pub fn hands_off(&self) -> bool {
+        matches!(
+            self,
+            Self::Repair { .. } | Self::ReviewRequired { .. } | Self::CandidateCheckFailed { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[ts(tag = "kind", rename_all = "snake_case")]
@@ -82,6 +229,9 @@ pub enum ConditionEnvironmentKind {
 #[ts(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
 pub enum ConditionReason {
+    Integration {
+        reason: IntegrationReason,
+    },
     Held {
         actor: String,
     },
@@ -156,6 +306,7 @@ pub enum RetryCause {
 #[ts(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
 pub enum ConditionContinuation {
+    Integration { attempt_id: IntegrationAttemptId },
     Reconcile,
     AdvanceAggregateReview { child_ids: Vec<String> },
     Dispatch { target_state: String },
@@ -213,6 +364,7 @@ pub enum UnknownConditionProblem {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum ConditionOwner {
+    IntegrationWorker,
     User,
     ProjectAgent,
     Worker,
@@ -226,6 +378,8 @@ pub enum ConditionOwner {
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum ConditionRecovery {
+    WaitForIntegration,
+    RepairIntegration,
     EditWorkflow,
     ReconcileEntry,
 }

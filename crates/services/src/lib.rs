@@ -350,6 +350,10 @@ pub enum ServiceError {
         pending_steps: i64,
         retry_after_ms: u64,
     },
+    /// The Task's stored condition is a newer build's encoding. The command
+    /// wrote nothing.
+    #[error("Task {task_id} has a condition written by a newer Forge build; it is quarantined until a build that understands it runs")]
+    TaskConditionQuarantined { task_id: String },
     #[error(transparent)]
     PlacementUnavailable(#[from] placement::PlacementUnavailable),
 
@@ -500,6 +504,9 @@ impl From<db::DbError> for ServiceError {
                 pending_steps,
                 retry_after_ms,
             },
+            db::DbError::TaskConditionQuarantined { task_id } => {
+                Self::TaskConditionQuarantined { task_id }
+            }
             db::DbError::DependencyGate => Self::DependencyGate,
             db::DbError::AgentPaused { agent_id } => Self::AgentPaused { agent_id },
             db::DbError::ProjectPaused { project_id } => Self::ProjectPaused { project_id },

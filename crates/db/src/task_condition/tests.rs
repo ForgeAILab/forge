@@ -1008,21 +1008,46 @@ async fn stale_condition_version_source_and_lease_are_rejected() {
 }
 
 /// m1: a stored condition that no longer decodes must not fail a legitimate
-/// legacy write. The seam compares text and overwrites.
+/// legacy write. A corrupt value is compared as text and overwritten.
 #[tokio::test]
 async fn undecodable_stored_condition_is_recomputed_not_fatal() {
     let db = db().await;
-    let t = task(&db, "undecodable").await;
-    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"from_a_future_release\"}' WHERE id=?")
-        .bind(&t.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
+    undecodable_stored_condition(&db, "undecodable", "{\"kind\":\"clear\"}").await;
+    assert!(matches!(
+        db.task_condition("undecodable").await.unwrap(),
+        TaskCondition::Clear { .. }
+    ));
+    assert!(db.task_condition_violations().await.unwrap().is_empty());
+}
+/// The same legacy writes over a newer build's encoding land too, and leave
+/// that encoding quarantined: the writers state nothing, so nothing is refused.
+#[tokio::test]
+async fn undecodable_newer_condition_is_quarantined_not_fatal() {
+    let db = db().await;
+    undecodable_stored_condition(&db, "newer", "{\"kind\":\"from_a_future_release\"}").await;
+    assert!(db.task_condition("newer").await.is_err());
+    assert_eq!(
+        db.task_condition_violations().await.unwrap(),
+        vec!["newer".to_owned()]
+    );
+}
+async fn undecodable_stored_condition(db: &SqliteDb, id: &str, undecodable: &str) {
+    let quarantined = matches!(classify(undecodable.as_bytes()), Stored::Newer);
+    let t = task(db, id).await;
+    let corrupt = || async {
+        sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+            .bind(undecodable)
+            .bind(&t.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    };
+    corrupt().await;
     assert!(db.task_condition(&t.id).await.is_err());
-    let step = claim(&db, &t.id).await;
+    let step = claim(db, &t.id).await;
     crate::task_writer::in_task_step(step, async {
         let updated = TaskRepo::mutate_metadata(
-            &db,
+            db,
             &t.id,
             Some(t.version),
             vec![TaskMetadataMutation::Set {
@@ -1033,16 +1058,13 @@ async fn undecodable_stored_condition_is_recomputed_not_fatal() {
         )
         .await
         .unwrap();
-        db.check_task_condition_invariant(&updated).await.unwrap();
-        sqlx::query(
-            "UPDATE task SET condition_json='{\"kind\":\"from_a_future_release\"}' WHERE id=?",
-        )
-        .bind(&t.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
+        assert_eq!(
+            db.check_task_condition_invariant(&updated).await.is_err(),
+            quarantined
+        );
+        corrupt().await;
         crate::task_writer::TaskQuery::new(
-            &db,
+            db,
             &t.id,
             "UPDATE task SET metadata_json=json_remove(metadata_json,'$.owner_wait') WHERE id=?",
         )
@@ -1052,10 +1074,6 @@ async fn undecodable_stored_condition_is_recomputed_not_fatal() {
         .unwrap();
     })
     .await;
-    assert!(matches!(
-        db.task_condition(&t.id).await.unwrap(),
-        TaskCondition::Clear { .. }
-    ));
 }
 
 #[tokio::test]

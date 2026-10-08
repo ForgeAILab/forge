@@ -256,3 +256,42 @@ describe('task interruption annotations', () => {
     expect(getTaskWorkflowWarning(task)).toBeNull()
   })
 })
+
+
+describe('integration conditions', () => {
+  it('reads queue ownership without a manual block or failure', () => {
+    const task = taskListItem({
+      condition: {
+        kind: 'parked',
+        primary: { kind: 'integration', reason: { kind: 'waiting', attempt_id: 'attempt' } },
+        additional: [], resume: { kind: 'integration', attempt_id: 'attempt' }, since: null,
+        details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false, owner: 'integration_worker', recovery: 'wait_for_integration' },
+      },
+    })
+    expect(isTaskBlocked(task)).toBe(false)
+    expect(taskHasError(task)).toBe(false)
+    expect(blockedInterruption(task)).toBeNull()
+    expect(matchesFilters(task, { types: [], blockedOnly: true })).toBe(false)
+  })
+
+  it('keeps another owner hold visible beside integration and shows real owner failures', () => {
+    const task = taskListItem({
+      condition: {
+        kind: 'parked', primary: { kind: 'held', actor: 'user' },
+        additional: [{ kind: 'integration', reason: { kind: 'deferred', attempt_id: 'attempt', cause: 'target_dirty', owner_id: 'owner', message: 'target dirty' } }],
+        resume: { kind: 'reconcile' }, since: null,
+        details: { failure_kind: 'manual_stop', diagnostic: null, interruption: { kind: 'manual_stop', reason: 'held', created_at: '' }, failed: false, blocked: true, human_wait: true, entry_wait: false },
+      },
+    })
+    expect(isTaskBlocked(task)).toBe(true)
+    expect(taskHasError(task)).toBe(true)
+    expect(blockedInterruption(task)?.reason).toBe('held')
+    if (task.condition.kind !== 'parked') throw new Error('fixture kind')
+    task.condition.primary = task.condition.additional[0]
+    task.condition.additional = []
+    task.condition.details.failure_kind = 'target_repo_dirty'
+    task.condition.details.interruption = { kind: 'target_repo_dirty', reason: 'target dirty', created_at: '' }
+    expect(blockedInterruption(task)?.reason).toBe('target dirty')
+    expect(isTaskBlocked(task)).toBe(true)
+  })
+})

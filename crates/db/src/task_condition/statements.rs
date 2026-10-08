@@ -14,6 +14,16 @@ use api_types::{FailureKind, InterruptionMetadata, TaskBlockingAnnotation};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "statement", rename_all = "snake_case")]
 pub enum ConditionStatement {
+    /// Replace only integration's reason, preserving every other owner.
+    /// Fenced on the attempt: the owning attempt restates freely; another
+    /// attempt is refused unless none owns the row (never stated, cleared,
+    /// or handed off to a role).
+    Integration { reason: IntegrationReason },
+    /// The Task step has sent repair/review back to its configured role.
+    /// Retain lineage while allowing ordinary role admission and recovery.
+    IntegrationHandedOff { attempt_id: IntegrationAttemptId },
+    /// Clear only the named attempt; a stale consumer cannot clear a successor.
+    IntegrationCleared { attempt_id: IntegrationAttemptId },
     /// The owner holds a Task that no execution is running for. The hold
     /// replaces the Task's diagnostic, interruption and failure, and drops
     /// its queued command, retry timer, dispatch refusal, environment wait
@@ -70,6 +80,7 @@ impl ConditionStatement {
     fn carries(&self, reason: &ParkReason) -> bool {
         use LegacyConditionField as Field;
         match reason {
+            ParkReason::Integration { .. } => true,
             ParkReason::EntryBlocked { .. }
             | ParkReason::PlacementDenied { .. }
             | ParkReason::DaemonUpgradeRequired { .. }
@@ -124,6 +135,16 @@ impl ConditionStatement {
     /// The condition after this statement, before the durable facts (entry,
     /// hooks, execution, children, cancellations) are laid over it.
     pub(super) fn apply(&self, stored: &TaskCondition) -> TaskCondition {
+        if matches!(
+            self,
+            Self::Integration { .. }
+                | Self::IntegrationHandedOff { .. }
+                | Self::IntegrationCleared { .. }
+        ) {
+            let mut stated = stored.typed();
+            stated.evidence_mut().stated = true;
+            return stated;
+        }
         use LegacyConditionField as Field;
         let prior = stored.evidence();
         let mut read = prior.presentation.clone().unwrap_or_default();
@@ -178,6 +199,9 @@ impl ConditionStatement {
 
         let material;
         match self {
+            Self::Integration { .. }
+            | Self::IntegrationHandedOff { .. }
+            | Self::IntegrationCleared { .. } => unreachable!(),
             Self::Hold { actor, reason, at } => {
                 // The retry timer goes, so a plan settlement it was standing
                 // in for is a wait of its own.

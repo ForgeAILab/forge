@@ -157,6 +157,9 @@ impl TaskMutationReply {
                     DbError::Check(message) => {
                         serde_json::json!({"code":"check","message":message})
                     }
+                    DbError::TaskConditionQuarantined { task_id } => {
+                        serde_json::json!({"code":"task_condition_quarantined","task_id":task_id})
+                    }
                     DbError::AgentAtCapacity => serde_json::json!({"code":"agent_at_capacity"}),
                     DbError::MachineAtCapacity => serde_json::json!({"code":"machine_at_capacity"}),
                     DbError::ExecutionAlreadyRunning {
@@ -211,6 +214,9 @@ impl TaskMutationReply {
                     project_id: value("project_id"),
                     running_executions: error["running_executions"].as_i64().unwrap_or_default(),
                     active_leases: error["active_leases"].as_i64().unwrap_or_default(),
+                },
+                Some("task_condition_quarantined") => DbError::TaskConditionQuarantined {
+                    task_id: value("task_id"),
                 },
                 Some("turn_not_retryable") => DbError::TurnNotRetryable,
                 Some("chat_turn_live") => DbError::ChatTurnLive,

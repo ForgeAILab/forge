@@ -427,6 +427,8 @@ async fn task_response_inner(
         canonical_phase,
         remaining_retries,
         retry_limits,
+        // Integration reasons use this same condition projection in detail
+        // and list responses; no route reconstructs them from merge markers.
         condition,
         workflow_health,
         workflow_exception,
@@ -624,6 +626,47 @@ mod retry_projection_tests {
             assert_eq!(blocked.reason, "owner unavailable");
             assert_eq!(blocked.created_at, "2026-10-01T00:00:00Z");
         }
+    }
+
+    #[tokio::test]
+    async fn integration_condition_survives_the_task_response_projection() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = std::sync::Arc::new(db::SqliteDb::new(pool));
+        sqlx::query("INSERT INTO project (id, name, created_at, updated_at) VALUES ('project', 'projection', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')").execute(db.pool()).await.unwrap();
+        let service = services::TaskService::new_for_test(
+            db.clone(),
+            std::sync::Arc::new(events::EventBus::default()),
+        );
+        let workflow = services::workflow::default_workflow::default_workflow();
+        let mut task = test_task();
+        task.status = "merging".into();
+        task.condition = db::ConditionFacts {
+            task_id: task.id.clone(),
+            state: task.status.clone(),
+            integration: Some(api_types::IntegrationReason::Waiting {
+                attempt_id: api_types::IntegrationAttemptId::new("attempt"),
+            }),
+            ..Default::default()
+        }
+        .condition(&db::LegacyConditionInput::default());
+        let expected = task.condition.public();
+        let response = super::task_response_inner(
+            &db,
+            &service.workspace_backend_router(),
+            task,
+            false,
+            false,
+            None,
+            None,
+            &workflow,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.condition, expected);
+        assert!(!response.condition.details().blocked);
+        assert!(!response.awaiting_human);
+        assert!(response.workflow_exception.is_none());
     }
 
     fn annotation(_actions: Vec<api_types::TaskAction>) -> api_types::TaskBlockingAnnotation {

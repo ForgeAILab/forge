@@ -43,45 +43,62 @@ async fn sweep_now(dispatcher: &TaskDispatcher) {
 }
 
 /// One Task whose stored condition cannot be decoded neither fails the pass
-/// nor leaves it marked idle: every other Project still dispatches, the row is
-/// recomputed from its legacy fields and the repair is reported.
+/// nor leaves it marked idle: every other Project still dispatches. A corrupt
+/// value is recomputed from the Task's legacy fields and the repair is
+/// reported. A newer build's encoding is quarantined: left byte for byte and
+/// reported by Task id.
 #[tokio::test]
 async fn one_undecodable_condition_does_not_stall_any_project() {
-    let db = Arc::new(sqlite_db().await);
-    let (ra, rb, ws) = (
-        TempDir::new().unwrap(),
-        TempDir::new().unwrap(),
-        TempDir::new().unwrap(),
-    );
-    let (pa, _) = seed_project_repo(&db, ra.path()).await;
-    let (pb, _) = seed_project_repo(&db, rb.path()).await;
-    let agent = seed_agent(&db, 3, DaemonStatus::Online, AgentStatus::Idle).await;
-    let good = seed_task(&db, &pa, "good", "todo", 0).await;
-    assign_role(&db, &good.id, "coder", &agent).await;
-    let bad = seed_task(&db, &pb, "bad", "todo", 0).await;
-    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"from_a_newer_build\"}' WHERE id=?")
-        .bind(&bad.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let (dispatcher, _rx) = build_dispatcher(db.clone(), ws.path()).await;
-    for _ in 0..3 {
-        dispatcher.check_once_and_drain().await.unwrap();
+    for (undecodable, quarantined) in [("{}", false), (r#"{"kind":"from_a_newer_build"}"#, true)] {
+        let db = Arc::new(sqlite_db().await);
+        let (ra, rb, ws) = (
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        );
+        let (pa, _) = seed_project_repo(&db, ra.path()).await;
+        let (pb, _) = seed_project_repo(&db, rb.path()).await;
+        let agent = seed_agent(&db, 3, DaemonStatus::Online, AgentStatus::Idle).await;
+        let good = seed_task(&db, &pa, "good", "todo", 0).await;
+        assign_role(&db, &good.id, "coder", &agent).await;
+        let bad = seed_task(&db, &pb, "bad", "todo", 0).await;
+        sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+            .bind(undecodable)
+            .bind(&bad.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (dispatcher, _rx) = build_dispatcher(db.clone(), ws.path()).await;
+        for _ in 0..3 {
+            dispatcher.check_once_and_drain().await.unwrap();
+        }
+        assert_ne!(
+            reload(&db, &good.id).await.status,
+            "todo",
+            "a healthy Project's Task must still dispatch"
+        );
+        assert_eq!(executions(&db, &good.id).await, 1);
+        let pass = db.condition_check_status().last_pass;
+        if quarantined {
+            sweep_now(&dispatcher).await;
+            let stored: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
+                .bind(&bad.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(stored, undecodable, "a newer encoding is never rewritten");
+            let pass = db.condition_check_status().last_pass.unwrap();
+            assert_eq!(pass.quarantined, 1);
+            assert_eq!(pass.quarantined_ids, vec![bad.id.clone()]);
+            assert_eq!(executions(&db, &bad.id).await, 0, "and it stays parked");
+        } else {
+            // The unreadable row was recomputed, and the lap that saw it
+            // reports it in the invariant report.
+            assert!(db.task_condition(&bad.id).await.is_ok());
+            assert!(pass.is_some_and(|pass| pass.repaired >= 1));
+            assert!(db.task_schedule_violations().await.unwrap().is_empty());
+        }
     }
-    assert_ne!(
-        reload(&db, &good.id).await.status,
-        "todo",
-        "a healthy Project's Task must still dispatch"
-    );
-    assert_eq!(executions(&db, &good.id).await, 1);
-    // The unreadable row was recomputed, and the lap that saw it reports it
-    // in the invariant report.
-    assert!(db.task_condition(&bad.id).await.is_ok());
-    assert!(db
-        .condition_check_status()
-        .last_pass
-        .is_some_and(|pass| pass.repaired >= 1));
-    assert!(db.task_schedule_violations().await.unwrap().is_empty());
 }
 
 /// A Task refused for the Project limit or a machine run slot is parked once.

@@ -4730,6 +4730,202 @@ mod tests {
     /// interruption and intervention flag are replaced by the condition's
     /// material blocker. Stage 4 hashes through this digest, not the struct.
     #[tokio::test]
+    async fn integration_progress_is_quiet_and_owner_blockers_have_stable_incidents() {
+        let service = health_service().await;
+        let db = &service.db;
+        let now = now_rfc3339();
+        db::ProjectRepo::create(
+            &**db,
+            db::CreateProject {
+                id: "integration".into(),
+                owner_id: None,
+                name: "Integration".into(),
+                primary_repo_id: None,
+                updated_at: now.clone(),
+                settings: "{}".into(),
+                workflow_definition: "{}".into(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let task = db::TaskRepo::create(
+            &**db,
+            db::CreateTask {
+                id: "integration-task".into(),
+                project_id: "integration".into(),
+                parent_task_id: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Integration".into(),
+                description: None,
+                task_type: "task".into(),
+                status: "merging".into(),
+                is_automation: false,
+                priority: 0,
+                task_state_config: None,
+                merge_config: None,
+                subtask_order: None,
+                plan: None,
+                updated_at: now.clone(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        service.project_once(100).await.unwrap();
+        let baseline: i64 = sqlx::query_scalar("SELECT count(*) FROM attention_projection")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        // The condition is driven through the statement seam under a claimed
+        // Task step, as stage B's consumer will. A statement writes no event
+        // and no version (asserted below), and `task.interruption_changed`
+        // is deduplicated by Task version, so the consumer's own commit is
+        // modelled by the version bump and the event appended after each
+        // statement: emitting that event is a stage D requirement.
+        use db::TaskStepRepo as _;
+        let step_id = db::new_uuid_v4();
+        db.enqueue_step(&db::EnqueueTaskStep {
+            id: step_id.clone(),
+            task_id: task.id.clone(),
+            kind: "command".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: step_id.clone(),
+            chain_id: step_id,
+            chain_position: 1,
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "fast".into(),
+            available_at: now_rfc3339(),
+        })
+        .await
+        .unwrap();
+        let step = db
+            .claim_step(
+                "attention-tests",
+                Some(&task.id),
+                &db::task_writer::lease_deadline(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let task_id = task.id.clone();
+        let state = |statement: db::ConditionStatement| {
+            let (db, service, step, task_id) =
+                (db.clone(), &service, step.clone(), task_id.clone());
+            async move {
+                let events = |db: Arc<db::SqliteDb>| async move {
+                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM domain_event")
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap()
+                };
+                let before = events(db.clone()).await;
+                db::task_writer::in_task_step(step, async {
+                    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+                    db.state_integration_condition_in_tx(&mut tx, &task_id, &statement)
+                        .await
+                        .unwrap();
+                    tx.commit().await.unwrap();
+                })
+                .await;
+                assert_eq!(
+                    events(db.clone()).await,
+                    before,
+                    "a statement writes no event"
+                );
+                sqlx::query("UPDATE task SET version=version+1 WHERE id=?")
+                    .bind(&task_id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                let task = db::TaskRepo::get_by_id(&*db, &task_id, false)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                db::DomainEventRepo::append_event(
+                    &*db,
+                    CreateDomainEvent::task_interruption_changed(&task),
+                )
+                .await
+                .unwrap();
+                service.project_once(100).await.unwrap();
+                task
+            }
+        };
+        let integration =
+            |reason: api_types::IntegrationReason| db::ConditionStatement::Integration { reason };
+        let cleared = |attempt: &str| db::ConditionStatement::IntegrationCleared {
+            attempt_id: api_types::IntegrationAttemptId::new(attempt),
+        };
+        for condition in crate::task_actions::tests::integration_conditions()
+            .into_iter()
+            .filter(|c| !db::material_blocker(c).requires_intervention)
+        {
+            let reason = condition.integration_reason().unwrap().clone();
+            let stated = state(integration(reason.clone())).await;
+            assert_eq!(stated.condition.integration_wait(), Some(&reason));
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM attention_projection")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap(),
+                baseline,
+                "{reason:?} raises no incident"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM domain_event WHERE event_type='attention.wake_requested'"
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+                0
+            );
+        }
+        let mut digests = Vec::new();
+        let mut owner = "attempt";
+        for (attempt, message) in [
+            ("attempt", "target dirty"),
+            ("replacement", "target dirty"),
+            ("replacement", "different owner failure"),
+            ("replacement", "different owner failure"),
+        ] {
+            if attempt != owner {
+                // Another attempt takes the row only once its owner is cleared.
+                state(cleared(owner)).await;
+                owner = attempt;
+            }
+            let stated = state(integration(api_types::IntegrationReason::Deferred {
+                attempt_id: api_types::IntegrationAttemptId::new(attempt),
+                cause: api_types::IntegrationDeferralCause::TargetDirty,
+                owner_id: Some("owner".into()),
+                message: message.into(),
+            }))
+            .await;
+            assert!(db::material_blocker(&stated.condition).requires_intervention);
+            let raw: String = sqlx::query_scalar("SELECT id FROM attention_projection WHERE json_extract(details_json,'$.entity_id')=? ORDER BY updated_at DESC LIMIT 1").bind(&task.id).fetch_one(db.pool()).await.unwrap();
+            let attention = db::AttentionRepo::get_attention(&**db, &raw)
+                .await
+                .unwrap()
+                .unwrap();
+            digests.push(db::canonical_attention_incident_digest(&attention));
+        }
+        assert_eq!(digests[0], digests[1], "the attempt is not material");
+        assert_ne!(
+            digests[1], digests[2],
+            "a changed owner failure changes the digest once"
+        );
+        assert_eq!(
+            digests[2], digests[3],
+            "unchanged failure stays the same incident"
+        );
+    }
+
+    #[tokio::test]
     async fn material_blocker_keeps_the_real_incident_digest() {
         let service = health_service().await;
         let db = &service.db;

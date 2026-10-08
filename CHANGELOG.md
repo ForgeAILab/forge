@@ -19,6 +19,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   works as before. No other previously accepted input is refused:
   `project.charter` already rejected nested arguments, and `skill.section`
   already failed without a known `section`. MCP is unchanged.
+- **Task condition enums grew for integration ownership (3.2 stage A).**
+  Four nested enums of the public Task `condition` have new values. Nothing
+  emits them yet (the merge path is unchanged), but a client that matches these
+  enums exhaustively must handle them:
+  - `ConditionReason` adds `integration`, shaped
+    `{ "kind": "integration", "reason": { ... } }`. The nested `reason.kind` is
+    one of `waiting`, `owned`, `repair`, `review_required`,
+    `candidate_check_failed`, `deferred` or `applied`. `owned.phase` is one of
+    `validating`, `rebasing`, `checking`, `awaiting_carry`,
+    `awaiting_authorization`, `fast_forwarding` or `reconciling`.
+    `deferred.cause` is one of `infrastructure`, `owner_offline`,
+    `target_dirty`, `budget_exhausted`, `owner_required` or
+    `unresolved_result`. `repair` carries path samples
+    (`{ count, paths, truncated }`, at most 32 paths), not whole path sets.
+  - `ConditionContinuation` adds `integration` with an opaque `attempt_id`.
+    The existing `integrate` continuation is unchanged and still means the
+    legacy paused-integration retry.
+  - `ConditionOwner` adds `integration_worker`.
+  - `ConditionRecovery` adds `wait_for_integration` and `repair_integration`.
+- **New HTTP 409 code `task_condition_quarantined`.** Holding or releasing a
+  Task whose stored condition was written by a newer Forge build now fails
+  with this code and `details.task_id`, and changes nothing. Before, the call
+  returned success and the Task stayed parked. MCP returns error `-32010` with
+  `data.code = "task_condition_quarantined"`. See the entry under Fixed.
 
 - **Task condition replaces raw interruption fields (3.1 stage 4).**
   - REST Task detail, lists and mutation results, and `forge-ctl --output json`,
@@ -544,6 +568,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     `if`/`then`/`else`, `$ref`, `$defs`, `dependentSchemas` or
     `patternProperties`, or if any native surface grows past its recorded size.
 
+- **Integration can state Task conditions directly (3.2 stage A, foundation
+  only).** A Task step can state that integration owns a Task's wait, hand a
+  repair or review back to its role, and clear its own attempt. These
+  statements write only the condition: no legacy column, no version and no
+  event. An ordinary integration wait keeps the Task's active Project slot,
+  admits no agent, raises no incident and wakes no agent. A Task with a live
+  execution is still shown as running. A settled Task keeps only the id of the
+  attempt that integrated it. Nothing in production states these conditions
+  yet, so merge, rebase, CI and fast-forward behave as before.
+- **The scheduler leaves a self-clearing wait alone when integration is waiting
+  behind it.** A capacity wait, a dispatch refusal, an offline owner, an
+  environment wait, a placement refresh or an owner-wait expiry keeps its normal
+  step, so it can clear; integration then becomes the Task's wait. Integration
+  decides the next step only when it is the primary reason, or when it waits
+  behind a hold, a blocked entry, a failure or a human decision.
+- **Operator status reports quarantined Task conditions.** `recent_errors`
+  gains a `task_condition_quarantined` entry with the count and the first 20
+  Task ids while any exist.
 - **Native tool arguments are normalized before schema validation.** Native
   Forge read and proposal tools now normalize provider arguments first and
   validate the result against the tool schema. Each field is advertised once,
@@ -1226,6 +1268,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A corrupt Task condition repairs itself again.** A stored condition that
+  is empty or corrupt (`{}`, `[]`, a bare number, invalid JSON, a known kind
+  with a broken body) is restated from the Task's own fields by the next write
+  to the Task, by a hold or release, and by the background check.
+- **A Task condition written by a newer Forge build is quarantined, and says
+  so.** Its stored bytes are never rewritten by an older build. Holding or
+  releasing such a Task returns 409 `task_condition_quarantined` and writes
+  nothing; it no longer reports success while leaving the Task parked. The
+  background check counts these Tasks and names them once per pass instead of
+  logging each one on every lap, and a database whose recorded mapping revision
+  is newer than the build is not backfilled. The way out is to run a build that
+  understands the condition.
 
 - **Tool wrappers forward argument normalization.** The terminal-denial,
   result-filter and result-observer wrappers now pass a wrapped tool's

@@ -4008,16 +4008,16 @@ parsed once per distinct definition text, not per write.
 | Project workflow edit | `Entry` for Tasks whose status classifies differently under the new definition, `Children` for flagged roots | per change |
 | Task insert, `sync_condition_in_tx`, backfill, invariant check | `Full` | everything |
 
-A producer that finds a status epoch the stored condition never saw carries
-nothing and recomputes in full, so a writer that under-claims cannot leave a
-stale entry behind a later write.
+A producer that finds a status epoch the stored condition never saw recomputes
+lifecycle facts in full, carrying only independently owned integration lineage,
+so a writer that under-claims cannot leave a stale entry behind a later write.
 
 The workflow engine and the worker's step settlement have already fenced
 their step lease, and state their condition through `SqliteDb::set_condition`
 when the Task's step is current. That strict entry requires the claimed step
 and live lease, rejects an expected-version mismatch, compares all five source
-values and refuses a condition that is not the legacy mapping under the
-witnesses it states. It does not re-read those witnesses: verifying them is
+values and refuses a condition that disagrees with legacy-derived reasons or
+its typed integration witness. It does not re-read those witnesses: verifying them is
 the invariant check's job, so stating a condition costs no fact query. When
 the step is no longer live (the transaction has already settled it), the
 legacy write still stands and the condition is written under the version
@@ -4032,8 +4032,8 @@ the invariant check.
 
 A new direct SQL writer of a legacy column or of a witnessed fact must call
 the seam; nothing in the schema enforces it. The test safety net is
-`SqliteDb::task_condition_violations()`, the full recompute, which shares no
-carried state with the producers: the writer-family and producer tests and
+`SqliteDb::task_condition_violations()`, the full recompute, which independently reloads lifecycle facts and carries
+only the direct integration statement witness: the writer-family and producer tests and
 the `happy_path`, `e2e` and `remove_machine` api cases assert it is empty.
 
 **Mappings that follow legacy.**
@@ -4145,7 +4145,7 @@ REST and forge-ctl Task JSON replace `error_annotation`, `blocked`, `failed` wit
 raw import evidence, metadata and witnesses. Named health, exception, human wait
 and offers stay. Entry owners show `Entering`; observer parks show `Needs Owner`.
 Failed Review history after a newer entry or live continuation is not a current
-exception. Unsupported stored encodings return a typed unknown diagnosis while invariant repair rebuilds them; private historical Task receipts import their condition at the archive boundary. Normalized diagnostic strings are bounded to 1,024 bytes and arrays to
+exception. An undecodable stored condition returns a typed unknown diagnosis: corrupt or empty values are restated from the legacy columns, a recognisably newer encoding is quarantined (see "Undecodable stored condition"); private historical Task receipts import their condition at the archive boundary. Normalized diagnostic strings are bounded to 1,024 bytes and arrays to
 16 entries; legacy storage retains full originals during this stage.
 
 `task.interruption_changed` retains its type and carries `condition` plus the typed
@@ -4195,8 +4195,9 @@ byte for byte what the annotation held before.
 Every other writer still goes through the mapping (`map_legacy_condition`
 under `ConditionFacts`), including the other hold paths: stopping a running
 execution (`persist_manual_stop_annotation`) and releasing a stopped run. A
-mapped write over a stated condition replaces it with the mapping of the
-legacy fields, which agrees with it by construction (the per-writer
+mapped write over a stated condition remaps legacy-derived reasons and carries
+independent integration ownership. For legacy-only conditions the result agrees
+with the mapping by construction (the per-writer
 equivalence tests in `db/src/task_condition/statement_tests.rs` compare the
 two after every converted write).
 
@@ -4209,16 +4210,162 @@ stale copy of the legacy fields, and holds on its typed presentation
 (`interruption_present`, `hard_failure`, `entry_recorded`) where it held on
 the copies.
 
-**Unreadable stored condition.** A statement cannot edit a stored condition
-that does not decode; that write restates the row whole from the mapping, so
-an ordinary hold or release on such a row leaves it readable. Between writes
-the 120-second check still rebuilds an undecodable condition from the legacy
-fields. Both stop being possible in 5b; what replaces them is not decided.
+**Undecodable stored condition.** `task_condition::classify` puts a stored
+value this build cannot decode into one of two classes. Row readers expose
+either as an `UnknownCondition(ConditionJson)` park whose `problem` names the
+class.
+
+- *Corrupt or empty* (`malformed_json`, `non_object`, `invalid_shape`,
+  `non_text`): invalid JSON, a scalar, `[]`, `{}`, a known tag with a broken
+  body, and anything else that is not recognisably a newer encoding. It is
+  **restated** from the legacy columns and durable facts, which every legacy
+  writer still writes: by any producer, by a Hold, Release or integration
+  statement (which falls back to the mapping, having nothing to edit), by the
+  migration backfill, by the invariant check, and by the scheduler, which
+  resolves such a Task from its legacy fields and asks the check to repair it.
+- *Recognisably newer* (`unknown_kind`): a well-formed tagged value naming a
+  variant this build does not know (the condition's own tag, or the tag of a
+  reason, continuation, witness or integration reason inside it), or any
+  undecodable value in a database whose recorded mapping revision is higher
+  than this build's. It is **quarantined**: no producer, statement, backfill or
+  check rewrites the bytes. A Hold, Release or integration statement over it
+  returns `DbError::TaskConditionQuarantined` from inside the writer's
+  transaction, so the legacy annotation and the version bump roll back with it;
+  the error maps to `ServiceError::TaskConditionQuarantined` and HTTP 409
+  `task_condition_quarantined`. A legacy writer that states nothing still
+  lands, with its producer skipped. Each completed check pass counts the
+  quarantined Tasks and keeps the first 20 ids; one warning per pass names
+  them (not repeated while the set is unchanged), the backfill warns the same
+  way, and operator status reports the count and ids. A database whose
+  recorded revision is newer is not backfilled and its marker is not lowered.
+  There is no repair path in this build: the exit is running a build that
+  understands the encoding.
+
+A readable but stale encoding remains repairable under the usual
+version-and-stored-text fence.
 
 **Size.** A stated condition holds typed fields and presentation text cut at
 1,024 bytes: 8 KiB is the tested ceiling for a hold with a 200,000-byte
 reason. A mapped condition still copies each legacy field into `evidence`
 cut at 4,096 bytes; 24 KiB is its tested ceiling for the same reason.
+
+### Integration-owned conditions (3.2 stage A)
+
+Stage A extends the statement seam only. No production caller emits these reasons;
+merge/rebase/CI/fast-forward, legacy writers, budgets and completion semantics are
+unchanged. There are no queue/attempt tables, queue worker or path guards yet.
+`IntegrationAttemptId` is an opaque typed string, never queue rank or worker token.
+
+`ConditionStatement::Integration { reason }` replaces only integration's reason,
+and is fenced on its attempt: an attempt restates its own reason, and a
+different attempt is refused unless no attempt owns the row (none stated, the
+previous one cleared, or handed off to a role).
+`IntegrationCleared { attempt_id }` clears only the matching attempt.
+`IntegrationHandedOff { attempt_id }` makes a repair/review continuation ready
+for ordinary role admission and recovery while retaining its lineage. All go
+through `SqliteDb::state_integration_condition_in_tx` and `set_condition` under a
+live Task-step lease, with version, legacy-source and status-epoch fences. They
+write only condition JSON, never the legacy pause/deferral/diagnostic/barrier fields.
+No queue worker acquires Task-write authority through this seam. The lease
+check is the generic step fence's: a claimed step with an expired stored lease
+is refused unless this process still holds the step as active.
+
+**A statement writes no event (stage D requirement).** A statement changes no
+Task version and appends no `domain_event`, while incidents and agent wakes key
+off `task.interruption_changed`, which only legacy column writes emit today. So
+an intervention-grade `Deferred` (dirty target, exhausted budget, owner
+required) stated on its own raises nothing. The stage D consumer that states
+such a reason must emit `task.interruption_changed` in the same transaction,
+under the Task step lease.
+
+The seven typed `IntegrationReason` variants are Waiting (the attempt only),
+Owned (typed phase), Repair (predecessor attempt, and a bounded sample of the
+conflict paths and of the repair-touched paths), ReviewRequired (authority
+reason), CandidateCheckFailed (check and message), Deferred
+(infrastructure/owner/offline/dirty-target/budget/unresolved-result cause, with
+owner and message) and Applied (result awaiting Task-step consumption).
+
+What a reason deliberately does not carry, so stage B does not have to take it
+back out:
+
+- **No queue position in any form.** Waiting names no earlier attempts: every
+  queue advance would otherwise rewrite every waiter's condition.
+- **No clock.** Deferred says that it is deferred and why. Retry times and
+  deadlines live on the attempt row.
+- **Bounded lineage.** A path set is `IntegrationPaths { count, paths,
+  truncated }`: the size of the whole set and at most 32 of its paths. The full
+  set lives on the attempt row. Unknown conflict paths are an explicit `None`.
+- **A settled Task keeps only the attempt id**, as an `IntegrationLineage`
+  witness; the reason, its paths and its cause are dropped at settlement.
+
+There is no guard expiry or lease metadata in a reason. Stage B owns operational
+state and must bind these identities to its attempts; stage D owns effects and
+Task-step acknowledgments.
+
+A typed Integration witness survives every producer, even a full recompute or
+status-epoch change. Legacy, Human, Hooks, Budget, Entry, Execution, Operations
+and Children refresh their own fact families and carry integration. Hold/Release
+carry integration independently of their diagnostic cleanup. Invariant repair
+loads the supported stored witness and remaps only legacy and other durable
+facts. Terminal settlement remains Settled, keeping only the attempt id. A live
+execution always reads as Running, handed off or not: the Task is never
+presented as parked on integration while it runs, the reason stays on the
+evidence, and it is the park again when the run ends. An entry hooks step and a
+retry timer are the Task step's own bookkeeping with nothing running, so an
+integration wait parks over them (Entering and Deferred become
+Parked-on-integration); the step keeps its witness and the timer its legacy
+column, and each is the condition again once integration is cleared. Actual
+coder/reviewer execution or hooks after a Repair, ReviewRequired or
+CandidateCheckFailed handoff owns Running/Entering; those handoffs
+retain the witness rather than pretending the integration worker runs an agent.
+The explicit handoff-ready witness also keeps an idle role ready after its hooks
+or execution finish: it does not revert to a queue-owned wait. Changing phase or attempt resets that handoff; updating repair paths keeps it.
+Hold/Release and all producers carry it.
+Other owners' parks remain primary, with integration secondary.
+
+The material mapping revision is **5**. After upgrade the bounded background
+backfill visits every row, settled ones included, once and records revision
+5. Existing legacy rows acquire the current witnesses; existing integration
+statements survive; corrupt rows are restated and rows a newer build wrote
+remain quarantined rather than overwritten.
+No migration is needed because condition JSON already stores typed statements.
+Legacy equivalence is required for legacy-derived reasons, while integration is
+validated from its statement witness, never inferred from legacy merge markers.
+
+`next_step` returns a named IntegrationWorker wait when integration is the
+primary reason, before ordinary recovery/admission. It never chooses
+paused-integration's `Step::Integrate`, fake Running, fake Entering or a
+capacity-unpark demand. The snapshot carries the condition witness without
+stage-B reads. `next_step::integration_decides` is the one predicate for this,
+shared with reconciliation's admission skip:
+
+- integration primary: the IntegrationWorker park;
+- a real owner blocker primary (a hold, a blocked entry, a failure, a human
+  decision) with integration behind it: the blocker's own park and owner, e.g.
+  User/ReleaseHold. Nothing the scheduler does clears those;
+- a self-clearing primary (a capacity wait, a dispatch refusal, an offline
+  owner, an environment wait, a pending placement refresh or owner-wait expiry)
+  with integration behind it: the Task resolves exactly as it would without the
+  integration reason, so the step that clears the primary runs and admission is
+  observed. Integration stays as a retained secondary reason and becomes the
+  primary, and the IntegrationWorker park, once the primary clears. A capacity
+  park in this case is the capacity reason's own; an integration wait raises
+  none.
+
+The reconciliation sweep counts any integration wait as owned. Custom workflow
+states, including an extra state and a merge state under another name, have the
+same named park, preserving totality.
+
+Ordinary queued/head/path/repair/review/result/infrastructure waits have
+`slot_blocker=false`, keep an **active Project slot**, and consume no execution
+capacity. OwnerOffline parks its Project slot quietly. TargetDirty,
+BudgetExhausted and OwnerRequired are actual intervention blockers and count
+parked. Their material inputs are cause, failure kind, owner and message only.
+Attempt IDs, path sets, phase, rank, queue revision, lease deadline, worker token,
+phase timestamps and retry deadlines/ticks never change incident identity.
+Ordinary progress raises no incident or agent wake. Stage A emits no condition
+events; later Task-step consumers must atomically emit a changed material blocker
+when applying a real owner failure. Pushing remains explicit repository sync.
 
 ### Task condition actions
 
@@ -5791,8 +5938,8 @@ in its own bounded slices.
 **Failures stay with their Task.** The legacy fields stay authoritative: when
 a stored condition does not match the legacy fields read in the same snapshot
 (a writer missed its sync), the pass resolves from the legacy fields and
-repairs the stored copy. A Task whose stored condition cannot be decoded is
-recomputed from its legacy fields and reconciled in the same pass.
+repairs the stored copy. A Task whose stored condition cannot be decoded is quarantined as a named
+unknown park; its raw condition is preserved for a server that understands it.
 A Task whose reconciliation fails is logged, counted and retried at the scan
 interval; the pass continues, and only a pass that completed records the
 commit generation it saw.

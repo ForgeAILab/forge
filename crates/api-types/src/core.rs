@@ -5,6 +5,9 @@ use ts_rs::TS;
 
 pub type TaskStatus = String;
 pub const TASK_BUSY: &str = "task_busy";
+/// HTTP 409: the Task's stored condition was written by a newer Forge build.
+/// A hold, a release or an integration statement on it is refused whole.
+pub const TASK_CONDITION_QUARANTINED: &str = "task_condition_quarantined";
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
