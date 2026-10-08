@@ -1395,6 +1395,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A full machine no longer lets a second waiting Task leave its initial state in the same dispatcher pass. For a moment after a Task's transition step settled, its queued role entry was not counted as an admission in flight, so the next waiter was moved to its work state and parked there on machine capacity. No second run started, the run cap held.
 - **A corrupt Task condition repairs itself again.** A stored condition that
   is empty or corrupt (`{}`, `[]`, a bare number, invalid JSON, a known kind
   with a broken body) is restated from the Task's own fields by the next write
