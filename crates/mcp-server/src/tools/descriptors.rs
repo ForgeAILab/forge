@@ -496,3 +496,28 @@ fn tool_descriptor(name: &str, description: &str, properties: Value, required: &
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialized_mcp_tool_definitions() {
+        for (name, scoped) in [("mcp_account", false), ("mcp_project", true)] {
+            let definitions = tool_descriptors(scoped);
+            let baseline: Value = serde_json::from_str(include_str!(
+                "../../tests/fixtures/mcp_tool_definitions.json"
+            ))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&definitions).unwrap(),
+                serde_json::to_vec(&baseline[name]).unwrap(),
+                "MCP names and schemas must stay byte-identical to 6695a256"
+            );
+            println!(
+                "TOOL_DEFINITIONS {name} {}",
+                serde_json::to_string(&definitions).unwrap()
+            );
+        }
+    }
+}

@@ -141,7 +141,7 @@ impl From<agent_runtime::core::event::LimitKind> for AgentTurnLimit {
 }
 
 /// The immutable revision Forge is built and tested against.
-pub const AGENT_RUNTIME_REVISION: &str = "b3f966b0e108e6d4683c0a9c94055aaa6aa7d919";
+pub const AGENT_RUNTIME_REVISION: &str = "5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894";
 pub const AGENT_RUNTIME_MINIMUM_RUST: &str = "1.86";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

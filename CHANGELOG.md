@@ -553,6 +553,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - **Operator status reports quarantined Task conditions.** `recent_errors`
   gains a `task_condition_quarantined` entry with the count and the first 20
   Task ids while any exist.
+- **Native tool arguments are normalized before schema validation.** Native
+  Forge read and proposal tools now normalize provider arguments first and
+  validate the result against the tool schema. Each field is advertised once,
+  with its real required list; the duplicate `parameters` copy of the schema
+  is gone. The wrapped (`{"parameters": {...}}`), mixed and flat argument
+  forms a model could send before are still accepted. One error changes: a
+  `forge_scope_propose` call with no `payload` and no flat fields to build one
+  from is now refused by schema validation instead of by the server's payload
+  hint; it never succeeded.
+  The tool-definition prefix shrinks: Project Agent from about 11.4k to 6.0k
+  estimated tokens, Main from 3.5k to 2.2k, Task worker from 2.4k to 1.5k.
+  The prompt-cache prefix changes once after upgrade, so the first request of
+  each existing session misses the cache.
+- **CLI chat tool calls are validated against the tool schema.** The CLI chat
+  callback now normalizes and validates arguments with the same schema as the
+  native path. Inputs it used to pass through unvalidated are refused, for
+  example an unknown root property on `forge_scope_propose`,
+  `"arguments": null` on `forge_scope_read`, or an out-of-range
+  `causation_depth`. The refusal is returned to the CLI as a tool error.
 
 - **Internal typed Task condition, shadow only (plan 3.1 stage 1).** Tasks gain
   a `condition_json` column filled by a data-preserving backfill and kept in
@@ -1230,6 +1249,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   is newer than the build is not backfilled. The way out is to run a build that
   understands the condition.
 
+- **Tool wrappers forward argument normalization.** The terminal-denial,
+  result-filter and result-observer wrappers now pass a wrapped tool's
+  argument normalization through, so a wrapped tool accepts the same argument
+  forms as the bare one.
+- **Runtime revision metadata matches the pinned revision.** The agent-runtime
+  revision recorded in new agent profiles named an older revision than the
+  one Forge builds against.
 - **A chat with a leftover suspended session answers again.** Since the topic
   working set change on `next/v0.14` (`31fdf478`, unreleased), every turn in a
   native Agent Chat that had both a live session and an older suspended one

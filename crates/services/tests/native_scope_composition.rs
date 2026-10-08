@@ -678,6 +678,11 @@ async fn invoke_tool(
         .into_iter()
         .find(|tool| tool.spec().name == tool_name)
         .unwrap_or_else(|| panic!("composed tool {tool_name} is missing"));
+    let mut registry = agent_runtime::tool::ToolRegistry::new();
+    registry.register(tool.clone())?;
+    let registry = registry.seal();
+    let arguments = tool.normalize_arguments(arguments)?;
+    registry.validate_arguments(tool_name, &arguments)?;
     let prepared = tool
         .prepare(arguments, &preparation_context(call_id))
         .await?;

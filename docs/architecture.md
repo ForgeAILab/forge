@@ -2890,14 +2890,46 @@ permission, and an `allowed`, `approval_required`, or `denied` policy result.
 Protected actions cannot be self-approved. Task proposals enter the existing
 Task service/workflow and do not become authoritative work before persistence.
 
-The provider-facing generic coordination tool accepts the canonical nested
-`payload` and optional flat aliases for its declared operation fields, whether
-they arrive at the root or inside the tolerated `parameters` wrapper.
-Preparation merges those shapes, rejects conflicting duplicates, drops null
-aliases, and sends only the canonical envelope to policy and service
-validation. Required fields remain enforced there so a malformed model call
-returns a correctable tool error instead of terminating at provider schema
-validation.
+Forge read/proposal tools normalize arguments through the runtime's
+`Tool::normalize_arguments` hook before validation against the frozen schema.
+The CLI Chat callback uses that same hook and runtime schema validator. All
+result/denial wrappers forward the hook. A normalization error is a tool error;
+there is no retry with raw arguments. Advertised schemas contain the real root
+fields and required lists, with no duplicate `parameters` envelope schema.
+
+Accepted forms (preserved from the previous preparation code) are:
+
+- Canonical root fields, with or without the optional read `arguments` object.
+- A complete `{"parameters": {...}}` wrapper.
+- Canonical fields split between the root and `parameters`, including identical
+  duplicates or an empty wrapper. Conflicting duplicates or a non-object
+  wrapper are errors.
+- Generic proposals with nested `payload`, flat payload aliases, or a mixture
+  of matching/disjoint nested and flat fields. Flat aliases can accompany an
+  absent or null payload; non-null aliases build the canonical payload.
+- Null flat aliases, which mean omission. Nulls already inside a payload remain
+  unchanged; conflicting flat/nested values are errors. Existing nullable
+  generic `causation_id` and `causation_depth` fields are preserved.
+
+Only Forge read/proposal tools interpret a top-level `parameters` envelope.
+Properties literally named `parameters` inside read `arguments` or proposal
+`payload`, and such properties on other tools, remain data. The provider-facing
+flat aliases and nullable generic fields remain advertised for all providers,
+including Gemini; schema-dialect selection is a later change. Required fields
+are now checked by the runtime after normalization, followed by the existing
+preparation and domain checks. These failures remain correctable tool results.
+
+Already-prepared checkpoint calls and pending approvals retain their exact
+arguments, fingerprints, effects, and authority: recovery reauthorizes the
+stored preparation without normalizing or preparing it again. Approval edits
+are new arguments and go through normalization, schema validation, preparation,
+and authorization again. A pre-upgrade session retains its stored history,
+admitted doctrine and receipts. On restart, Forge composes the current tools
+for its existing server-bound scope; subsequent provider requests use the
+smaller schemas. In-flight runtimes retain their frozen registry until they
+stop. The changed tool prefix changes the next provider request's cache
+fingerprint. No session migration, effect replay, or authority widening is
+introduced.
 
 Attention is a deterministic, rebuildable projection of human input,
 validation/review state, stalls, health, budget thresholds, and overdue
