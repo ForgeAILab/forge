@@ -386,6 +386,7 @@ impl From<ServiceError> for McpToolError {
         let protected_cause = error.to_string();
         let mapped = match error {
             ServiceError::TaskBusy {pending_steps,retry_after_ms} => Self::new(-32010,"Task has pending steps; accepted work remains queued").with_data(json!({"code":api_types::TASK_BUSY,"pending_steps":pending_steps,"retry_after_ms":retry_after_ms,"retry_hint":"Refetch the Task after pending steps settle"})),
+            ServiceError::TaskConditionQuarantined { task_id } => Self::new(-32010, "Task condition was written by a newer Forge build and is quarantined; nothing was changed").with_data(json!({"code":api_types::TASK_CONDITION_QUARANTINED,"task_id":task_id})),
             ServiceError::TurnFailure { error, .. } => return Self::from(*error),
 
             ServiceError::PlacementUnavailable(error) => {

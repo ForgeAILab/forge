@@ -324,6 +324,14 @@ pub fn outcome_for_service_error_with_correction(
         ServiceError::TurnFailure { error, .. } => {
             return outcome_for_service_error_with_correction(error, context, current, retry)
         }
+        // Not retryable from here: only a build that understands the
+        // stored condition can act on this Task.
+        ServiceError::TaskConditionQuarantined { .. } => (
+            OutcomeCode::ActionUnavailable,
+            "the Task's stored condition was written by a newer Forge build and is quarantined; nothing was changed",
+            None,
+            None,
+        ),
         ServiceError::Db(db::DbError::TurnNotRetryable | db::DbError::ChatTurnLive) => (
             OutcomeCode::ValidationError,
             "Agent Chat turn cannot be retried in its current state",

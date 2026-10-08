@@ -158,19 +158,31 @@ impl TaskDispatcher {
         let stale = |stored: &TaskCondition, task: &db::Task| {
             // A writer stated this condition in the transaction of its write:
             // it is not a copy of the legacy fields and cannot lag them.
-            if stored.reasons().any(|reason| {
-                matches!(
-                    reason,
-                    ParkReason::UnknownCondition {
-                        source: db::ConditionSource {
+            let unreadable = stored.reasons().find_map(|reason| match reason {
+                ParkReason::UnknownCondition {
+                    source:
+                        db::ConditionSource {
                             field: db::LegacyConditionField::ConditionJson,
                             ..
                         },
-                        ..
-                    }
-                )
-            }) || stored.evidence().stated
-            {
+                    problem,
+                } => Some(problem),
+                _ => None,
+            });
+            match unreadable {
+                // A newer build's encoding is quarantined: this build neither
+                // resolves around it nor repairs it.
+                Some(db::UnknownConditionProblem::UnknownKind) => return None,
+                // Corrupt or empty: the legacy fields are intact, so resolve
+                // from them and let the check restate the stored copy.
+                Some(_) => {
+                    return Some(db::map_legacy_condition(&db::LegacyConditionInput::from(
+                        task,
+                    )))
+                }
+                None => {}
+            }
+            if stored.evidence().stated {
                 return None;
             }
             let legacy = stored.restate_legacy(&db::LegacyConditionInput::from(task));

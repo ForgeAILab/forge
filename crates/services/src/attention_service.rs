@@ -4749,7 +4749,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut task = db::TaskRepo::create(
+        let task = db::TaskRepo::create(
             &**db,
             db::CreateTask {
                 id: "integration-task".into(),
@@ -4778,32 +4778,103 @@ mod tests {
             .fetch_one(db.pool())
             .await
             .unwrap();
+        // The condition is driven through the statement seam under a claimed
+        // Task step, as stage B's consumer will. A statement writes no event
+        // and no version (asserted below), and `task.interruption_changed`
+        // is deduplicated by Task version, so the consumer's own commit is
+        // modelled by the version bump and the event appended after each
+        // statement: emitting that event is a stage D requirement.
+        use db::TaskStepRepo as _;
+        let step_id = db::new_uuid_v4();
+        db.enqueue_step(&db::EnqueueTaskStep {
+            id: step_id.clone(),
+            task_id: task.id.clone(),
+            kind: "command".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: step_id.clone(),
+            chain_id: step_id,
+            chain_position: 1,
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "fast".into(),
+            available_at: now_rfc3339(),
+        })
+        .await
+        .unwrap();
+        let step = db
+            .claim_step(
+                "attention-tests",
+                Some(&task.id),
+                &db::task_writer::lease_deadline(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let task_id = task.id.clone();
+        let state = |statement: db::ConditionStatement| {
+            let (db, service, step, task_id) =
+                (db.clone(), &service, step.clone(), task_id.clone());
+            async move {
+                let events = |db: Arc<db::SqliteDb>| async move {
+                    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM domain_event")
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap()
+                };
+                let before = events(db.clone()).await;
+                db::task_writer::in_task_step(step, async {
+                    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+                    db.state_integration_condition_in_tx(&mut tx, &task_id, &statement)
+                        .await
+                        .unwrap();
+                    tx.commit().await.unwrap();
+                })
+                .await;
+                assert_eq!(
+                    events(db.clone()).await,
+                    before,
+                    "a statement writes no event"
+                );
+                sqlx::query("UPDATE task SET version=version+1 WHERE id=?")
+                    .bind(&task_id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                let task = db::TaskRepo::get_by_id(&*db, &task_id, false)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                db::DomainEventRepo::append_event(
+                    &*db,
+                    CreateDomainEvent::task_interruption_changed(&task),
+                )
+                .await
+                .unwrap();
+                service.project_once(100).await.unwrap();
+                task
+            }
+        };
+        let integration =
+            |reason: api_types::IntegrationReason| db::ConditionStatement::Integration { reason };
+        let cleared = |attempt: &str| db::ConditionStatement::IntegrationCleared {
+            attempt_id: api_types::IntegrationAttemptId::new(attempt),
+        };
         for condition in crate::task_actions::tests::integration_conditions()
             .into_iter()
             .filter(|c| !db::material_blocker(c).requires_intervention)
         {
-            task.condition = condition;
-            task.version += 1;
-            // interruption_changed is deduped by Task version. Model each
-            // synthetic consumer commit with its own version, as real writers do.
-            sqlx::query("UPDATE task SET condition_json=?,version=? WHERE id=?")
-                .bind(serde_json::to_string(&task.condition).unwrap())
-                .bind(task.version)
-                .bind(&task.id)
-                .execute(db.pool())
-                .await
-                .unwrap();
-            let event = CreateDomainEvent::task_interruption_changed(&task);
-            db::DomainEventRepo::append_event(&**db, event)
-                .await
-                .unwrap();
-            service.project_once(100).await.unwrap();
+            let reason = condition.integration_reason().unwrap().clone();
+            let stated = state(integration(reason.clone())).await;
+            assert_eq!(stated.condition.integration_wait(), Some(&reason));
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT count(*) FROM attention_projection")
                     .fetch_one(db.pool())
                     .await
                     .unwrap(),
-                baseline
+                baseline,
+                "{reason:?} raises no incident"
             );
             assert_eq!(
                 sqlx::query_scalar::<_, i64>(
@@ -4815,57 +4886,27 @@ mod tests {
                 0
             );
         }
-        task.condition = crate::task_actions::tests::integration_conditions()
-            .pop()
-            .unwrap();
-        sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
-            .bind(serde_json::to_string(&task.condition).unwrap())
-            .bind(&task.id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let material = db::material_blocker(&task.condition);
-        assert!(material.requires_intervention);
         let mut digests = Vec::new();
-        for (attempt, retry_at, message) in [
-            ("attempt", None, "target dirty"),
-            ("replacement", Some("2099-01-01T00:00:00Z"), "target dirty"),
-            (
-                "replacement",
-                Some("2099-01-02T00:00:00Z"),
-                "different owner failure",
-            ),
-            ("replacement", None, "different owner failure"),
+        let mut owner = "attempt";
+        for (attempt, message) in [
+            ("attempt", "target dirty"),
+            ("replacement", "target dirty"),
+            ("replacement", "different owner failure"),
+            ("replacement", "different owner failure"),
         ] {
-            let condition = db::ConditionFacts {
-                task_id: task.id.clone(),
-                state: task.status.clone(),
-                integration: Some(api_types::IntegrationReason::Deferred {
-                    attempt_id: api_types::IntegrationAttemptId::new(attempt),
-                    cause: api_types::IntegrationDeferralCause::TargetDirty,
-                    owner_id: Some("owner".into()),
-                    message: message.into(),
-                    retry_at: retry_at.map(str::to_owned),
-                }),
-                ..Default::default()
+            if attempt != owner {
+                // Another attempt takes the row only once its owner is cleared.
+                state(cleared(owner)).await;
+                owner = attempt;
             }
-            .condition(&db::LegacyConditionInput::default());
-            task.condition = condition;
-            task.version += 1;
-            sqlx::query("UPDATE task SET condition_json=?,version=? WHERE id=?")
-                .bind(serde_json::to_string(&task.condition).unwrap())
-                .bind(task.version)
-                .bind(&task.id)
-                .execute(db.pool())
-                .await
-                .unwrap();
-            db::DomainEventRepo::append_event(
-                &**db,
-                CreateDomainEvent::task_interruption_changed(&task),
-            )
-            .await
-            .unwrap();
-            service.project_once(100).await.unwrap();
+            let stated = state(integration(api_types::IntegrationReason::Deferred {
+                attempt_id: api_types::IntegrationAttemptId::new(attempt),
+                cause: api_types::IntegrationDeferralCause::TargetDirty,
+                owner_id: Some("owner".into()),
+                message: message.into(),
+            }))
+            .await;
+            assert!(db::material_blocker(&stated.condition).requires_intervention);
             let raw: String = sqlx::query_scalar("SELECT id FROM attention_projection WHERE json_extract(details_json,'$.entity_id')=? ORDER BY updated_at DESC LIMIT 1").bind(&task.id).fetch_one(db.pool()).await.unwrap();
             let attention = db::AttentionRepo::get_attention(&**db, &raw)
                 .await
@@ -4873,10 +4914,7 @@ mod tests {
                 .unwrap();
             digests.push(db::canonical_attention_incident_digest(&attention));
         }
-        assert_eq!(
-            digests[0], digests[1],
-            "attempt and retry time are not material"
-        );
+        assert_eq!(digests[0], digests[1], "the attempt is not material");
         assert_ne!(
             digests[1], digests[2],
             "a changed owner failure changes the digest once"

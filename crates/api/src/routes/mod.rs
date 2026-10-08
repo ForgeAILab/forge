@@ -646,7 +646,6 @@ mod retry_projection_tests {
             state: task.status.clone(),
             integration: Some(api_types::IntegrationReason::Waiting {
                 attempt_id: api_types::IntegrationAttemptId::new("attempt"),
-                blocked_by: vec![],
             }),
             ..Default::default()
         }

@@ -319,12 +319,24 @@ impl OperatorStatusService {
         }
         // A clean pass is a log line. Only a completed pass that had to
         // repair a row is an operator issue: a producer missed its write.
-        if let Some(pass) = self
-            .db
-            .condition_check_status()
-            .last_pass
-            .filter(|pass| pass.repaired > 0)
-        {
+        let last_pass = self.db.condition_check_status().last_pass;
+        // Quarantined conditions stay reported for as long as they exist:
+        // nothing in this build repairs them.
+        if let Some(pass) = last_pass.as_ref().filter(|pass| pass.quarantined > 0) {
+            recent_errors.push(RecentErrorSummary {
+                severity: api_types::OperatorSeverity::Attention,
+                entity_type: "task_condition_quarantined".into(),
+                entity_id: "task-dispatcher".into(),
+                error: format!(
+                    "{} Task condition(s) were written by a newer Forge build and are quarantined ({}{}). They are not repaired, and holds and releases on them are refused. Run a build that understands them",
+                    pass.quarantined,
+                    pass.quarantined_ids.join(", "),
+                    if pass.quarantined as usize > pass.quarantined_ids.len() { ", ..." } else { "" },
+                ),
+                occurred_at: pass.completed_at.clone(),
+            });
+        }
+        if let Some(pass) = last_pass.filter(|pass| pass.repaired > 0) {
             recent_errors.push(RecentErrorSummary {
                 severity: api_types::OperatorSeverity::Attention,
                 entity_type: "task_condition_invariant".into(),
@@ -2288,7 +2300,8 @@ mod condition_check_tests {
             .await
             .unwrap();
         }
-        sqlx::query("UPDATE task SET condition_json='{\"kind\":\"corrupt\"}' WHERE id='a'")
+        // Corrupt, not a newer encoding: the check restates it.
+        sqlx::query("UPDATE task SET condition_json='{}' WHERE id='a'")
             .execute(db.pool())
             .await
             .unwrap();
@@ -2320,5 +2333,36 @@ mod condition_check_tests {
             .await
             .unwrap();
         assert!(status(&db).await.recent_errors.is_empty());
+
+        // A condition a newer build wrote is quarantined: never repaired, and
+        // reported with its Task id for as long as it exists.
+        let newer = r#"{"kind":"from_a_newer_build"}"#;
+        sqlx::query("UPDATE task SET condition_json=? WHERE id='b'")
+            .bind(newer)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            db.check_task_conditions(db::CONDITION_CHECK_PAGE)
+                .await
+                .unwrap();
+            let reported = status(&db).await;
+            let rows: Vec<_> = reported.recent_errors.iter().collect();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].entity_type, "task_condition_quarantined");
+            assert_eq!(rows[0].severity, api_types::OperatorSeverity::Attention);
+            assert!(
+                rows[0].error.starts_with("1 Task condition(s)") && rows[0].error.contains("(b)"),
+                "{}",
+                rows[0].error
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id='b'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            newer
+        );
     }
 }

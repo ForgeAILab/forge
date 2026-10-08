@@ -1844,19 +1844,18 @@ pub(crate) mod tests {
         };
         let id = || IntegrationAttemptId::new("attempt");
         let reasons = vec![
-            IntegrationReason::Waiting {
-                attempt_id: id(),
-                blocked_by: vec![],
-            },
+            IntegrationReason::Waiting { attempt_id: id() },
             IntegrationReason::Owned {
                 attempt_id: id(),
                 phase: IntegrationPhase::Checking,
             },
             IntegrationReason::Repair {
                 attempt_id: id(),
-                conflict_paths: Some(vec!["src/a.rs".into()]),
-                repair_paths: vec![],
                 predecessor_attempt_id: None,
+                conflict_paths: Some(api_types::IntegrationPaths::bounded(
+                    ["src/a.rs".to_owned()],
+                )),
+                repair_paths: api_types::IntegrationPaths::default(),
             },
             IntegrationReason::ReviewRequired {
                 attempt_id: id(),
@@ -1872,7 +1871,6 @@ pub(crate) mod tests {
                 cause: IntegrationDeferralCause::Infrastructure,
                 owner_id: Some("owner".into()),
                 message: "transport down".into(),
-                retry_at: Some("2099-01-01T00:00:00Z".into()),
             },
             IntegrationReason::Applied { attempt_id: id() },
             IntegrationReason::Deferred {
@@ -1880,7 +1878,6 @@ pub(crate) mod tests {
                 cause: IntegrationDeferralCause::TargetDirty,
                 owner_id: Some("owner".into()),
                 message: "target dirty".into(),
-                retry_at: None,
             },
         ];
         reasons

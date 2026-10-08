@@ -66,18 +66,23 @@ pub(crate) async fn derive(
     let Some(mut snapshot) = Snapshot::read(c, task_id, families).await? else {
         return Ok(None);
     };
-    // Unsupported stored state is quarantined. A legacy write still lands,
-    // but no producer or statement guesses away a future owner's reason.
-    let stored = match std::str::from_utf8(&snapshot.stored)
-        .ok()
-        .and_then(|raw| decode(raw).ok())
-    {
-        Some(stored) => stored,
-        None => {
-            tracing::warn!(
-                task_id,
-                "stored Task condition quarantined; producer skipped"
-            );
+    let stored = match stored_condition(c, &snapshot.stored).await {
+        Stored::Readable(stored) => Some(*stored),
+        // Corrupt or empty: nothing can be carried from it. The mapping and
+        // the durable facts restate the row below, statement or not.
+        Stored::Corrupt(_) => None,
+        // A newer build's encoding is never guessed at or overwritten. A
+        // statement over it is refused whole, so its writer's transaction
+        // (the legacy fields and the version bump) rolls back with it. A
+        // legacy writer that states nothing still lands; its producer is
+        // skipped and readers keep the typed unknown park.
+        Stored::Newer => {
+            if stated.is_some() {
+                return Err(DbError::TaskConditionQuarantined {
+                    task_id: task_id.to_owned(),
+                });
+            }
+            tracing::debug!(task_id, "Task condition is quarantined; producer skipped");
             return Ok(None);
         }
     };
@@ -88,10 +93,10 @@ pub(crate) async fn derive(
             .non_text
             .retain(|field| *field != LegacyConditionField::MetadataJson);
     }
-    // A writer that states its condition edits the supported stored one.
-    // Unsupported state was quarantined above.
+    // A writer that states its condition edits the stored one. Only a stored
+    // condition that is corrupt falls back to the mapping.
     let statement = stated;
-    let stated = statement.map(|statement| statement.apply(&stored));
+    let stated = statement.and_then(|statement| Some(statement.apply(stored.as_ref()?)));
     let from_statement = stated.is_some();
     let mapped = stated.unwrap_or_else(|| map_view(&snapshot.input.view()));
     let exhausted = mapped.budget_exhausted();
@@ -139,6 +144,19 @@ pub(crate) async fn derive(
     if let Some(statement) = statement {
         match statement {
             ConditionStatement::Integration { reason } => {
+                // The attempt fence: an attempt restates its own reason. A
+                // different attempt takes the row over only when no attempt
+                // owns it: none was stated, the previous one was cleared, or
+                // it was handed off to a role. A stale Task step holding an
+                // older attempt cannot replace its successor's reason.
+                if facts.integration.as_ref().is_some_and(|prior| {
+                    prior.attempt_id() != reason.attempt_id() && !facts.integration_handoff_ready
+                }) {
+                    return Err(DbError::Check(
+                        "another integration attempt owns this Task condition".into(),
+                    ));
+                }
+                facts.integration_lineage = None;
                 // Updating a delegated repair's paths keeps its role ready;
                 // a new phase or attempt returns ownership to integration.
                 facts.integration_handoff_ready &=

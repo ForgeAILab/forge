@@ -208,6 +208,36 @@ fn condition_park(condition: &TaskCondition) -> Next {
     park(Reason::Condition(reason.clone()), owner, action)
 }
 
+/// Whether an integration wait decides this Task's next step.
+///
+/// It does when integration is the primary reason, or when the primary is a
+/// real owner blocker (a hold, a blocked entry, a failure, a human decision):
+/// nothing the scheduler does clears those, and the integration wait stays
+/// behind them. It does not under a self-clearing primary: a capacity wait,
+/// a dispatch refusal, an offline owner, an environment wait, a placement
+/// refresh or an owner-wait expiry. Those keep their normal step, which is
+/// what clears them, with integration retained as a secondary reason. So a
+/// capacity park is only ever the capacity reason's own, never one an
+/// integration wait raised.
+pub fn integration_decides(condition: &TaskCondition, f: &Facts) -> bool {
+    if condition.integration_wait().is_none() {
+        return false;
+    }
+    let primary = match condition {
+        TaskCondition::Parked { primary, .. } => primary,
+        TaskCondition::Failed { .. } => return true,
+        _ => return false,
+    };
+    match primary {
+        ParkReason::Integration { .. } => true,
+        ParkReason::Capacity { .. }
+        | ParkReason::DispatchRefusal { .. }
+        | ParkReason::OwnerOffline { .. }
+        | ParkReason::Environment { .. } => false,
+        _ => !(f.refresh_placement || f.owner_expired),
+    }
+}
+
 /// Every effective status, including malformed/custom definitions, resolves.
 /// Priority mirrors the dispatcher: identity effects precede Project pause;
 /// active recovery precedes new admission; arbitrary custom hooks never replay.
@@ -233,9 +263,11 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     if f.paused {
         return park(Reason::ProjectPaused, Owner::User, Action::ResumeProject);
     }
-    // Integration owns this wait, with other owners' primary reasons intact.
-    // It is never an execution, entry-hooks lease or paused-integration retry.
-    if s.condition.integration_wait().is_some() {
+    // Integration owns this wait, or waits behind a real owner blocker: the
+    // park names the primary's owner. It is never an execution, entry-hooks
+    // lease or paused-integration retry. A self-clearing primary falls
+    // through to its normal step (see `integration_decides`).
+    if integration_decides(s.condition, f) {
         return condition_park(s.condition);
     }
     if f.queue_owned {
@@ -605,12 +637,27 @@ mod tests {
     #[test]
     fn integration_waits_have_an_integration_owner_in_every_custom_state() {
         let default = WorkflowEngine::resolve_workflow("{}");
+        // A workflow that differs in structure, not in spelling: one more
+        // working state ahead of the merge, and a merge state by another name.
         let mut custom = default.clone();
-        for state in &mut custom.states {
-            if state.kind != StateKind::Terminal {
-                state.name = format!("custom_{}", state.name);
-            }
-        }
+        let merge = custom
+            .states
+            .iter()
+            .position(|state| state.name == "merging")
+            .expect("the default workflow merges in `merging`");
+        custom.states[merge].name = "ship".into();
+        let mut extra = custom
+            .states
+            .iter()
+            .find(|state| state.kind == StateKind::Active)
+            .expect("an active state")
+            .clone();
+        extra.name = "qa".into();
+        extra.display_name = "QA".into();
+        custom.states.insert(merge, extra);
+        assert_eq!(custom.states.len(), default.states.len() + 1);
+        assert!(custom.state_kind("merging").is_none());
+        assert_eq!(custom.state_kind("qa"), Some(StateKind::Active));
         for workflow in [&default, &custom] {
             for state in workflow
                 .states
@@ -618,11 +665,17 @@ mod tests {
                 .filter(|state| state.kind != StateKind::Terminal)
             {
                 for condition in crate::task_actions::tests::integration_conditions() {
+                    // Everything that would otherwise pick a step or a
+                    // capacity park is set: integration-primary ignores it.
                     let f = Facts {
                         integrate: true,
                         queued_recovery: true,
                         missing_merge_entry: true,
                         role_target: Some(("coder".into(), "agent".into())),
+                        refresh_placement: true,
+                        owner_expired: true,
+                        agent_full: true,
+                        disposition_current: true,
                         ..Default::default()
                     };
                     assert!(matches!(
@@ -650,6 +703,13 @@ mod tests {
                             actor: "user".into(),
                         };
                     }
+                    // A real owner blocker is not cleared by a placement
+                    // refresh or an owner-wait expiry of its own.
+                    let f = Facts {
+                        refresh_placement: false,
+                        owner_expired: false,
+                        ..f
+                    };
                     assert!(matches!(
                         next_step(&Snapshot {
                             state: &state.name,
@@ -666,6 +726,203 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// M2: integration retained as a secondary reason does not freeze a
+    /// self-clearing primary. The Task resolves exactly as it would without
+    /// the integration reason, so the step that clears the primary runs, and
+    /// a capacity park is only ever the capacity reason's own.
+    #[test]
+    fn integration_behind_a_self_clearing_primary_keeps_the_primarys_step() {
+        use db::{ConditionCapacityScope, ConditionEnvironmentKind, ConditionSource};
+        let workflow = WorkflowEngine::resolve_workflow("{}");
+        let source = || ConditionSource {
+            field: db::LegacyConditionField::MetadataJson,
+            key: None,
+        };
+        let self_clearing = [
+            ParkReason::Capacity {
+                scope: ConditionCapacityScope::Agent,
+            },
+            ParkReason::DispatchRefusal {
+                capability: None,
+                blocker_digest: None,
+            },
+            ParkReason::OwnerOffline {
+                daemon_id: Some("daemon".into()),
+                started_at: None,
+            },
+            ParkReason::Environment {
+                wait_kind: ConditionEnvironmentKind::EnvironmentNotReady,
+                source: source(),
+            },
+        ];
+        let facts = [
+            Facts::default(),
+            Facts {
+                refresh_placement: true,
+                ..Default::default()
+            },
+            Facts {
+                owner_expired: true,
+                ..Default::default()
+            },
+            Facts {
+                disposition_current: true,
+                ..Default::default()
+            },
+            Facts {
+                placement_unavailable: true,
+                ..Default::default()
+            },
+            Facts {
+                agent_full: true,
+                child_ready: true,
+                ..Default::default()
+            },
+            Facts {
+                role_target: Some(("coder".into(), "agent".into())),
+                child_ready: true,
+                reviewer_ready: true,
+                ..Default::default()
+            },
+        ];
+        let secondary = |condition: &TaskCondition, primary: &ParkReason, keep: bool| {
+            let mut condition = condition.clone();
+            let TaskCondition::Parked {
+                primary: integration,
+                additional,
+                ..
+            } = &mut condition
+            else {
+                panic!("an integration wait parks");
+            };
+            let integration = std::mem::replace(integration, primary.clone());
+            if keep {
+                additional.push(integration);
+            }
+            condition
+        };
+        let mut steps = 0;
+        for integration in crate::task_actions::tests::integration_conditions() {
+            for primary in &self_clearing {
+                let with = secondary(&integration, primary, true);
+                let without = secondary(&integration, primary, false);
+                assert!(with.integration_wait().is_some(), "integration is retained");
+                for f in &facts {
+                    assert!(!integration_decides(&with, f));
+                    let resolve = |condition: &TaskCondition| {
+                        next_step(&Snapshot {
+                            state: "in_progress",
+                            condition,
+                            workflow: &workflow,
+                            facts: f,
+                        })
+                    };
+                    let next = resolve(&with);
+                    assert_eq!(next, resolve(&without), "{primary:?} {f:?}");
+                    assert!(
+                        !matches!(
+                            &next,
+                            Next::Park(Park {
+                                owner: Owner::IntegrationWorker,
+                                ..
+                            })
+                        ),
+                        "{primary:?}: the primary's owner, not integration's"
+                    );
+                    steps += usize::from(matches!(next, Next::Step(_)));
+                    // A capacity park here is the capacity reason's own: the
+                    // same Task with integration as its primary raises none.
+                    assert!(!matches!(
+                        next_step(&Snapshot {
+                            state: "in_progress",
+                            condition: &integration,
+                            workflow: &workflow,
+                            facts: f,
+                        }),
+                        Next::Park(Park {
+                            recovery: Action::FreeCapacity,
+                            ..
+                        }) | Next::Step(_)
+                    ));
+                }
+            }
+            // Real owner blockers keep integration waiting behind them, and
+            // name their own owner.
+            for blocker in [
+                ParkReason::EntryBlocked {
+                    state: Some("in_progress".into()),
+                    source: source(),
+                },
+                ParkReason::Failure {
+                    failure_kind: api_types::FailureKind::ManualStop,
+                },
+                ParkReason::HumanDecision {
+                    boundary: db::HumanBoundary::Legacy,
+                    source: source(),
+                },
+            ] {
+                let with = secondary(&integration, &blocker, true);
+                let f = Facts {
+                    integrate: true,
+                    queued_recovery: true,
+                    role_target: Some(("coder".into(), "agent".into())),
+                    child_ready: true,
+                    reviewer_ready: true,
+                    ..Default::default()
+                };
+                assert!(integration_decides(&with, &f));
+                let next = next_step(&Snapshot {
+                    state: "in_progress",
+                    condition: &with,
+                    workflow: &workflow,
+                    facts: &f,
+                });
+                assert!(
+                    matches!(&next, Next::Park(Park { reason: Reason::Condition(reason), owner, .. })
+                        if *reason == blocker && *owner != Owner::IntegrationWorker),
+                    "{blocker:?}: {next:?}"
+                );
+            }
+            // A placement refresh or an owner-wait expiry clears its own
+            // park even behind a denial: those steps still run.
+            let denied = secondary(
+                &integration,
+                &ParkReason::PlacementDenied { source: source() },
+                true,
+            );
+            for (f, step) in [
+                (
+                    Facts {
+                        refresh_placement: true,
+                        ..Default::default()
+                    },
+                    Step::RefreshPlacement,
+                ),
+                (
+                    Facts {
+                        owner_expired: true,
+                        ..Default::default()
+                    },
+                    Step::ExpireOwnerWait,
+                ),
+            ] {
+                assert_eq!(
+                    next_step(&Snapshot {
+                        state: "in_progress",
+                        condition: &denied,
+                        workflow: &workflow,
+                        facts: &f,
+                    }),
+                    Next::Step(step)
+                );
+            }
+        }
+        assert!(
+            steps > 0,
+            "a self-clearing primary reaches its clearing step"
+        );
     }
 
     #[test]

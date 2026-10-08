@@ -380,34 +380,274 @@ async fn a_200_000_byte_reason_keeps_the_stored_condition_small() {
     println!("condition_json bytes: stated hold {stated}, mapped failure {mapped}");
 }
 
-/// Unsupported stored state is quarantined even when a legacy hold/release
-/// succeeds. Neither statement may guess away another version's ownership.
+/// Item 6: a stored condition that cannot be read is not edited by a
+/// statement. The writer's write still lands and the condition is restated
+/// whole, so an ordinary hold or release never leaves the Task unreadable.
+/// This is the corrupt-or-empty class: nothing in it is a newer encoding.
 #[tokio::test]
-async fn a_statement_over_an_unreadable_condition_quarantines_it() {
+async fn a_statement_over_an_unreadable_condition_restates_it() {
     let db = db().await;
     task(&db, "broken").await;
-    for corrupt in ["{\"kind\":\"nope\",\"evidence\":{}}", "{}", "[]", "7"] {
+    // The column only admits JSON, so "unreadable" is JSON no decoder accepts:
+    // empty, a scalar, an array, and a known tag with a broken body.
+    for corrupt in ["{}", "[]", "7", "{\"kind\":\"clear\"}", "{\"kind\":7}"] {
+        assert!(matches!(classify(corrupt.as_bytes()), Stored::Corrupt(_)));
         sqlx::query("UPDATE task SET condition_json=? WHERE id='broken'")
             .bind(corrupt)
             .execute(db.pool())
             .await
             .unwrap();
-        hold(&db, "broken", "hold").await;
-        release(&db, "broken").await;
-        db.check_task_conditions(CONDITION_CHECK_PAGE)
-            .await
-            .unwrap();
-        let stored: String =
-            sqlx::query_scalar("SELECT condition_json FROM task WHERE id='broken'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(stored, corrupt);
+        let held = hold(&db, "broken", "hold").await;
+        assert!(
+            matches!(
+                &held.condition,
+                TaskCondition::Parked {
+                    primary: ParkReason::Held { .. },
+                    ..
+                }
+            ),
+            "{corrupt:?}: {:?}",
+            held.condition
+        );
         assert_eq!(
             db.task_condition_violations().await.unwrap(),
-            vec!["broken"]
+            Vec::<String>::new()
+        );
+        sqlx::query("UPDATE task SET condition_json=? WHERE id='broken'")
+            .bind(corrupt)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let released = release(&db, "broken").await;
+        assert!(
+            matches!(released.condition, TaskCondition::Clear { .. }),
+            "{corrupt:?}"
+        );
+        assert_eq!(
+            db.task_condition_violations().await.unwrap(),
+            Vec::<String>::new()
         );
     }
+}
+
+/// The classes, pinned: a serde message change must fail here, not silently
+/// move a newer encoding into the class that is overwritten.
+#[test]
+fn stored_conditions_classify_as_readable_corrupt_or_newer() {
+    use UnknownConditionProblem as Problem;
+    for (raw, expected) in [
+        ("not json", Some(Problem::MalformedJson)),
+        ("7", Some(Problem::NonObject)),
+        ("[]", Some(Problem::NonObject)),
+        ("{}", Some(Problem::InvalidShape)),
+        (r#"{"kind":7}"#, Some(Problem::InvalidShape)),
+        (r#"{"kind":"clear"}"#, Some(Problem::InvalidShape)),
+        (
+            r#"{"kind":"parked","primary":{"kind":"held"},"additional":[],"resume":{"kind":"reconcile"},"since":null,"evidence":{}}"#,
+            Some(Problem::InvalidShape),
+        ),
+        // A well-formed tagged value naming a variant this build lacks.
+        (r#"{"kind":"nope","evidence":{}}"#, None),
+        (
+            r#"{"kind":"parked","primary":{"kind":"future_integration"},"additional":[],"resume":{"kind":"reconcile"},"since":null,"evidence":{}}"#,
+            None,
+        ),
+        (
+            r#"{"kind":"parked","primary":{"kind":"integration","reason":{"kind":"future_reason","attempt_id":"a"}},"additional":[],"resume":{"kind":"reconcile"},"since":null,"evidence":{}}"#,
+            None,
+        ),
+        (
+            r#"{"kind":"deferred","until":null,"reason":"legacy","resume":{"kind":"future_resume"},"evidence":{}}"#,
+            None,
+        ),
+        (
+            r#"{"kind":"clear","evidence":{"witnesses":[{"kind":"future_witness"}]}}"#,
+            None,
+        ),
+    ] {
+        match (classify(raw.as_bytes()), expected.clone()) {
+            (Stored::Corrupt(problem), Some(expected)) => assert_eq!(problem, expected, "{raw}"),
+            (Stored::Newer, None) => {}
+            (other, _) => panic!("{raw}: {other:?}"),
+        }
+        let unknown_kind = matches!(
+            decode_or_unknown(raw),
+            TaskCondition::Parked {
+                primary: ParkReason::UnknownCondition {
+                    problem: Problem::UnknownKind,
+                    ..
+                },
+                ..
+            }
+        );
+        assert_eq!(unknown_kind, expected.is_none(), "{raw}");
+    }
+    assert!(matches!(
+        classify(encode(&TaskCondition::default()).as_bytes()),
+        Stored::Readable(_)
+    ));
+}
+
+/// A recognisably newer encoding is quarantined. A hold or a release over it
+/// is an error that writes nothing: no annotation, no version, no timestamp,
+/// no event, and the stored bytes stay as they were. No check repairs it; the
+/// pass counts it and names the Task.
+#[tokio::test]
+async fn a_statement_over_a_newer_encoding_is_refused_and_writes_nothing() {
+    let db = db().await;
+    task(&db, "newer").await;
+    let row = |db: &SqliteDb| {
+        let pool = db.pool().clone();
+        async move {
+            sqlx::query_as::<_, (i64, Option<String>, Option<String>, String, String, i64)>(
+                "SELECT version,error_annotation,blocked_json,updated_at,condition_json,(SELECT count(*) FROM domain_event) FROM task WHERE id='newer'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    for newer in [
+        r#"{"kind":"nope","evidence":{}}"#,
+        r#"{"kind":"parked","primary":{"kind":"future_integration"},"additional":[],"resume":{"kind":"reconcile"},"since":null,"evidence":{}}"#,
+    ] {
+        sqlx::query("UPDATE task SET condition_json=? WHERE id='newer'")
+            .bind(newer)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let before = row(&db).await;
+        for statement in [
+            ConditionStatement::Hold {
+                actor: "user".into(),
+                reason: "hold".into(),
+                at: AT.into(),
+            },
+            ConditionStatement::Release,
+        ] {
+            let held = matches!(statement, ConditionStatement::Hold { .. });
+            let refused = TaskRepo::update_recovery_metadata_if_no_running_execution(
+                &db,
+                "newer",
+                before.0,
+                held.then(|| ConditionStatement::hold_operator_text("user", "hold", AT)),
+                held.then(|| {
+                    json!({"kind":"manual_stop","reason":"hold","created_at":AT}).to_string()
+                }),
+                None,
+                AT,
+                None,
+                vec!["coder".into()],
+                Vec::new(),
+                Some(statement),
+            )
+            .await;
+            assert!(
+                matches!(&refused, Err(DbError::TaskConditionQuarantined { task_id }) if task_id == "newer"),
+                "{newer}: {refused:?}"
+            );
+            assert!(!refused.unwrap_err().is_transient());
+            assert_eq!(row(&db).await, before, "{newer}: nothing was written");
+        }
+        // Readers keep the typed unknown park.
+        assert!(matches!(
+            TaskRepo::get_by_id(&db, "newer", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .condition,
+            TaskCondition::Parked {
+                primary: ParkReason::UnknownCondition {
+                    problem: UnknownConditionProblem::UnknownKind,
+                    ..
+                },
+                ..
+            }
+        ));
+        // No check, sync or backfill rewrites it.
+        assert_eq!(
+            db.check_task_conditions_of(&["newer".to_owned()])
+                .await
+                .unwrap(),
+            0
+        );
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        db.sync_condition_in_tx(&mut tx, "newer").await.unwrap();
+        backfill(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(row(&db).await, before, "{newer}");
+    }
+    // A whole pass reports the quarantined Task by id.
+    while db
+        .check_task_conditions(CONDITION_CHECK_PAGE)
+        .await
+        .unwrap()
+        .last_pass
+        .is_none_or(|pass| pass.quarantined == 0)
+    {}
+    let pass = db.condition_check_status().last_pass.unwrap();
+    assert_eq!(
+        (pass.quarantined, pass.quarantined_ids, pass.repaired),
+        (1, vec!["newer".to_owned()], 0)
+    );
+}
+
+/// The other newer class: a database a newer build has recorded its mapping
+/// revision in. Every undecodable value there is that build's encoding, even
+/// one this build would otherwise call empty, and the marker is not lowered.
+#[tokio::test]
+async fn an_undecodable_condition_under_a_newer_recorded_revision_is_quarantined() {
+    let db = db().await;
+    task(&db, "ahead").await;
+    let newer = (MAPPING_REVISION + 1).to_string();
+    crate::SystemSettingRepo::set_setting(&db, MAPPING_REVISION_KEY, &newer, AT)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task SET condition_json='{}' WHERE id='ahead'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let version = TaskRepo::get_by_id(&db, "ahead", false)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    let refused = TaskRepo::update_recovery_metadata_if_no_running_execution(
+        &db,
+        "ahead",
+        version,
+        None,
+        None,
+        None,
+        AT,
+        None,
+        vec!["coder".into()],
+        Vec::new(),
+        Some(ConditionStatement::Release),
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(DbError::TaskConditionQuarantined { .. })
+    ));
+    assert_eq!(
+        db.check_task_conditions_of(&["ahead".to_owned()])
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(!db.backfill_task_conditions_if_stale().await.unwrap());
+    assert_eq!(
+        crate::SystemSettingRepo::get_setting(&db, MAPPING_REVISION_KEY)
+            .await
+            .unwrap(),
+        Some(newer)
+    );
+    let stored: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id='ahead'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored, "{}");
 }
 
 /// A queued hold written before writers stated conditions still applies.

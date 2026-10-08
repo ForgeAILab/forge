@@ -1,6 +1,5 @@
 import type { TaskListItem as Task } from '@/types/generated'
 import type {
-  IntegrationReason,
   StateKind,
   TaskBlockingAnnotation,
   TaskExecutionObservability,
@@ -45,15 +44,6 @@ export function groupByColumns(tasks: Task[], cols: BoardColumn[]): Record<strin
 
 type TaskAnnotationSummary = Pick<TaskResponse, 'condition'> & {
   execution_observability?: Pick<TaskExecutionObservability, 'latest_execution_id'>
-}
-
-/** A scheduling park owned by integration; an independent user hold stays primary. */
-export function taskIntegrationWait(task: TaskAnnotationSummary): IntegrationReason | null {
-  const condition = task.condition
-  if (condition.kind !== 'parked' && condition.kind !== 'failed') return null
-  const primary = condition.kind === 'parked' ? condition.primary : condition.failure
-  const reason = [primary, ...condition.additional].find((reason) => reason.kind === 'integration')
-  return reason?.kind === 'integration' ? reason.reason : null
 }
 
 export function taskHasError(task: TaskAnnotationSummary): boolean {

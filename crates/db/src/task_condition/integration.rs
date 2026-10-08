@@ -19,6 +19,28 @@ pub(super) fn validate(condition: &TaskCondition) -> Result<()> {
     if witnesses.next().is_some() {
         return Err(DbError::Check("duplicate integration witness".into()));
     }
+    let mut lineage = condition
+        .evidence()
+        .witnesses
+        .iter()
+        .filter_map(|w| match w {
+            ConditionWitness::IntegrationLineage { attempt_id } => Some(attempt_id),
+            _ => None,
+        });
+    if let Some(attempt_id) = lineage.next() {
+        if witness.is_some()
+            || lineage.next().is_some()
+            || attempt_id.as_str().is_empty()
+            || attempt_id.as_str().len() > TYPED_TEXT_LIMIT
+        {
+            return Err(DbError::Check("invalid integration lineage".into()));
+        }
+    }
+    if witness.is_some() && matches!(condition, TaskCondition::Settled { .. }) {
+        return Err(DbError::Check(
+            "a settled Task keeps only its integration attempt identity".into(),
+        ));
+    }
     if let Some((reason, handoff_ready)) = witness {
         if handoff_ready && !reason.hands_off() {
             return Err(DbError::Check(
@@ -55,50 +77,39 @@ pub(super) fn validate(condition: &TaskCondition) -> Result<()> {
                 "integration statement text exceeds its bound".into(),
             ));
         }
-        match reason {
-            IntegrationReason::Waiting { blocked_by, .. }
-                if blocked_by
-                    .iter()
-                    .any(|id| !valid_id(id) || id == reason.attempt_id()) =>
-            {
-                return Err(DbError::Check("invalid integration wait lineage".into()));
-            }
-            IntegrationReason::Repair {
-                conflict_paths,
-                repair_paths,
-                predecessor_attempt_id,
-                ..
-            } => {
-                let paths: Vec<&String> = conflict_paths
-                    .iter()
-                    .flatten()
-                    .chain(repair_paths)
-                    .collect();
-                if predecessor_attempt_id
-                    .as_ref()
-                    .is_some_and(|id| !valid_id(id) || id == reason.attempt_id())
-                    || paths.len() > 4096
-                    || paths.iter().map(|p| p.len()).sum::<usize>() > 64 * 1024
-                    || paths.iter().any(|p| {
-                        p.is_empty()
-                            || p.len() > 4096
-                            || p.starts_with('/')
-                            || p.contains('\0')
-                            || p.split('/')
+        if let IntegrationReason::Repair {
+            conflict_paths,
+            repair_paths,
+            predecessor_attempt_id,
+            ..
+        } = reason
+        {
+            // Bounded lineage: a count and a small sample per path set. The
+            // whole set is the attempt record's.
+            let bounded = |set: &IntegrationPaths| {
+                set.paths.len() <= INTEGRATION_PATH_SAMPLE
+                    && set.count as usize >= set.paths.len()
+                    && set.truncated == (set.count as usize > set.paths.len())
+                    && set.paths.iter().all(|p| {
+                        !p.is_empty()
+                            && p.len() <= TYPED_TEXT_LIMIT
+                            && !p.starts_with('/')
+                            && !p.contains('\0')
+                            && !p
+                                .split('/')
                                 .any(|part| part == ".." || part == "." || part.is_empty())
                     })
-                {
-                    return Err(DbError::Check(
-                        "invalid integration repair paths or lineage".into(),
-                    ));
-                }
+            };
+            if predecessor_attempt_id
+                .as_ref()
+                .is_some_and(|id| !valid_id(id) || id == reason.attempt_id())
+                || !conflict_paths.as_ref().is_none_or(bounded)
+                || !bounded(repair_paths)
+            {
+                return Err(DbError::Check(
+                    "invalid integration repair paths or lineage".into(),
+                ));
             }
-            IntegrationReason::Deferred {
-                retry_at: Some(at), ..
-            } if chrono::DateTime::parse_from_rfc3339(at).is_err() => {
-                return Err(DbError::Check("invalid integration retry deadline".into()));
-            }
-            _ => {}
         }
     }
     let mut reasons = condition.reasons().filter_map(|r| match r {
@@ -132,6 +143,15 @@ impl TaskCondition {
                     ..
                 }
             )
+        })
+    }
+    /// The attempt this Task is or was integrated by: the stated reason's,
+    /// or the identity a settled Task keeps.
+    pub fn integration_attempt(&self) -> Option<&IntegrationAttemptId> {
+        self.evidence().witnesses.iter().find_map(|w| match w {
+            ConditionWitness::Integration { reason, .. } => Some(reason.attempt_id()),
+            ConditionWitness::IntegrationLineage { attempt_id } => Some(attempt_id),
+            _ => None,
         })
     }
     /// An actual scheduling wait; handoff lineage on a live run is not a wait.
@@ -204,9 +224,28 @@ pub(super) fn overlay(
     reason: &IntegrationReason,
     handoff_ready: bool,
 ) -> TaskCondition {
-    // Real lifecycle ownership wins after repair/review handoff. The witness
-    // stays on the evidence, including after terminal settlement.
-    if handoff_ready || matches!(condition, TaskCondition::Settled { .. }) {
+    // A settled Task keeps the attempt identity alone: paths, phase and cause
+    // are the attempt record's, and nothing is waiting any more.
+    if matches!(condition, TaskCondition::Settled { .. }) {
+        for witness in &mut condition.evidence_mut().witnesses {
+            if matches!(witness, ConditionWitness::Integration { .. }) {
+                *witness = ConditionWitness::IntegrationLineage {
+                    attempt_id: reason.attempt_id().clone(),
+                };
+            }
+        }
+        return condition;
+    }
+    // Real lifecycle ownership wins after repair/review handoff, and a live
+    // execution is never presented as parked on integration: the Task reads
+    // as Running while it runs, and the integration reason stays on the
+    // evidence, to become the park again when the run ends.
+    //
+    // `Entering` and `Deferred` are replaced below. Both are the Task step's
+    // own bookkeeping with nothing running: the entry hooks step keeps its
+    // witness and the retry timer stays in the legacy column, so each reads
+    // again as itself once integration is cleared.
+    if handoff_ready || matches!(condition, TaskCondition::Running { .. }) {
         return condition;
     }
     let integration = ParkReason::Integration {

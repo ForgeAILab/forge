@@ -16,7 +16,44 @@ const BACKFILL_SLICE: Duration = Duration::from_millis(250);
 pub struct ConditionCheckPass {
     pub checked: u64,
     pub repaired: u64,
+    /// Tasks whose stored condition is a newer build's encoding. They are
+    /// read, counted and left byte for byte; nothing here repairs them.
+    pub quarantined: u64,
+    /// The first [`QUARANTINE_REPORT_LIMIT`] of them.
+    pub quarantined_ids: Vec<String>,
     pub completed_at: String,
+}
+impl ConditionCheckPass {
+    fn add(&mut self, page: &Page) {
+        self.checked += page.checked;
+        self.repaired += page.repaired;
+        // A Task the scheduler re-checks within one pass is counted once
+        // (exactly, while the named list has room for it).
+        for id in &page.quarantined {
+            if self.quarantined_ids.contains(id) {
+                continue;
+            }
+            self.quarantined += 1;
+            if self.quarantined_ids.len() < QUARANTINE_REPORT_LIMIT {
+                self.quarantined_ids.push(id.clone());
+            }
+        }
+    }
+    /// One warning per completed pass, naming the Tasks, and none for a
+    /// steady pass that found the same Tasks as the pass before it.
+    fn report_quarantine(&self, previous: Option<&Self>, backfill: bool) {
+        if self.quarantined == 0
+            || (!backfill && previous.is_some_and(|p| p.quarantined_ids == self.quarantined_ids))
+        {
+            return;
+        }
+        tracing::warn!(
+            quarantined = self.quarantined,
+            task_ids = ?self.quarantined_ids,
+            backfill,
+            "Task conditions written by a newer build are quarantined: not repaired, and holds, releases and integration statements on them are refused. Run a build that understands them"
+        );
+    }
 }
 #[derive(Debug, Clone, Default)]
 pub struct ConditionCheckStatus {
@@ -48,6 +85,8 @@ impl Drop for CheckGuard {
 struct Page {
     checked: u64,
     repaired: u64,
+    /// Ids on this page left quarantined.
+    quarantined: Vec<String>,
     /// The cursor after this page; `None` once the last Task was read.
     next: Option<String>,
 }
@@ -60,6 +99,7 @@ impl SqliteDb {
         let mut pass = std::mem::take(&mut state.pass);
         pass.repaired += schedule_repairs;
         pass.completed_at = crate::now_rfc3339();
+        pass.report_quarantine(state.status.last_pass.as_ref(), false);
         state.status.repaired += schedule_repairs;
         // A lap is one run of the check, also when it found no open Task.
         state.status.ticks += 1;
@@ -72,7 +112,10 @@ impl SqliteDb {
         state.status.last_pass = Some(pass);
     }
     /// Recompute and repair exactly these Tasks: the page the scheduler sweep
-    /// is on, or one Task whose stored condition could not be decoded.
+    /// is on, or one Task the scheduler found stale. A corrupt or empty
+    /// stored condition is restated from the legacy columns and facts. One
+    /// that is recognisably a newer build's encoding is quarantined: counted
+    /// in the pass, never rewritten, and repaired by nothing in this build.
     pub async fn check_task_conditions_of(&self, ids: &[String]) -> Result<u64> {
         if ids.is_empty() {
             return Ok(0);
@@ -90,8 +133,7 @@ impl SqliteDb {
         state.status.repaired += page.repaired;
         state.status.ticks += 1;
         state.status.last_at = Some(crate::now_rfc3339());
-        state.pass.checked += page.checked;
-        state.pass.repaired += page.repaired;
+        state.pass.add(&page);
         drop(state);
         if page.repaired != 0 {
             tracing::warn!(
@@ -131,13 +173,13 @@ impl SqliteDb {
             state.status.repaired += page.repaired;
             state.status.ticks += 1;
             state.status.last_at = Some(crate::now_rfc3339());
-            state.pass.checked += page.checked;
-            state.pass.repaired += page.repaired;
+            state.pass.add(&page);
             state.after = page.next.clone();
             let backfilling = state.backfill == Some(true);
             let completed = (limit != 0 && page.next.is_none()).then(|| {
                 let mut pass = std::mem::take(&mut state.pass);
                 pass.completed_at = crate::now_rfc3339();
+                pass.report_quarantine(state.status.last_pass.as_ref(), backfilling);
                 if !backfilling {
                     // Rewriting after a mapping change is the expected
                     // result of an upgrade, not a missed producer.
@@ -193,7 +235,12 @@ impl SqliteDb {
             None => {
                 let recorded =
                     crate::SystemSettingRepo::get_setting(self, MAPPING_REVISION_KEY).await?;
-                let stale = recorded.as_deref() != Some(MAPPING_REVISION.to_string().as_str());
+                // A revision a newer build recorded is not stale: this build
+                // neither rewrites that build's rows nor lowers its marker.
+                let stale = recorded
+                    .as_deref()
+                    .and_then(|recorded| recorded.parse::<i64>().ok())
+                    .is_none_or(|recorded| recorded < MAPPING_REVISION);
                 let mut state = self.condition_checks.lock().expect("condition checks");
                 state.backfill = Some(stale);
                 if stale {
@@ -248,6 +295,7 @@ impl SqliteDb {
             return Ok(Page {
                 checked: 0,
                 repaired: 0,
+                quarantined: Vec::new(),
                 next: after.map(str::to_owned),
             });
         }
@@ -278,15 +326,14 @@ impl SqliteDb {
             .fetch_all(&mut *reader)
             .await?;
         let mut stale = Vec::new();
+        let mut quarantined = Vec::new();
         for row in &rows {
             let id: String = row.try_get(6)?;
             let stored: Vec<u8> = row.try_get(5)?;
-            if std::str::from_utf8(&stored)
-                .ok()
-                .and_then(|raw| decode(raw).ok())
-                .is_none()
-            {
-                tracing::warn!(task_id = %id, "stored Task condition quarantined; invariant repair skipped");
+            // A newer encoding is counted and left; corruption is recomputed
+            // below like any other stale row.
+            if matches!(stored_condition(&mut reader, &stored).await, Stored::Newer) {
+                quarantined.push(id);
                 continue;
             }
             let expected = async {
@@ -319,6 +366,7 @@ impl SqliteDb {
         Ok(Page {
             checked: rows.len() as u64,
             repaired,
+            quarantined,
             next: rows.last().map(|row| row.try_get(6)).transpose()?,
         })
     }

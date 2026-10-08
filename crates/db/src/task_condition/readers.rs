@@ -110,8 +110,14 @@ impl TaskCondition {
                             field: LegacyConditionField::ConditionJson,
                             ..
                         },
-                    ..
+                    problem,
                 } => {
+                    // `unknown_kind` is a newer build's encoding: quarantined,
+                    // never rewritten here, and holds, releases and
+                    // integration statements over it are refused. Anything
+                    // else is corruption the next write or check restates
+                    // from the legacy columns.
+                    let quarantined = *problem == UnknownConditionProblem::UnknownKind;
                     read.failure_kind = Some(FailureKind::Unknown);
                     read.diagnostic_present = true;
                     read.diagnostic = Some(TaskBlockingAnnotation {
@@ -122,8 +128,12 @@ impl TaskCondition {
                         blocked_execution_id: None,
                         artifact: None,
                         message: Some(
-                            "Stored Task condition is unsupported and quarantined; upgrade the server or repair it explicitly"
-                                .into(),
+                            if quarantined {
+                                "Stored Task condition was written by a newer Forge build and is quarantined; run a build that understands it. Holding or releasing this Task is refused until then"
+                            } else {
+                                "Stored Task condition is unreadable; the next write or invariant check restates it from the Task's fields"
+                            }
+                            .into(),
                         ),
                         hook: None,
                     });

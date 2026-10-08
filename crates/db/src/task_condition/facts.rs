@@ -16,6 +16,11 @@ pub enum ConditionWitness {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         handoff_ready: bool,
     },
+    /// What a settled Task keeps of integration: the attempt identity alone.
+    /// Paths, phases and causes are the attempt record's.
+    IntegrationLineage {
+        attempt_id: IntegrationAttemptId,
+    },
     /// Always first. `since` is the entry's time, or the Task's creation.
     Entry {
         task_id: String,
@@ -243,6 +248,8 @@ impl Terminals {
 pub struct ConditionFacts {
     pub integration: Option<IntegrationReason>,
     pub integration_handoff_ready: bool,
+    /// The attempt a settled Task was integrated by, once its reason is gone.
+    pub integration_lineage: Option<IntegrationAttemptId>,
     pub human_wait: bool,
     pub review_wait: bool,
     pub review_failure: bool,
@@ -566,6 +573,10 @@ impl ConditionFacts {
             integration_handoff_ready: stored
                 .as_ref()
                 .is_some_and(TaskCondition::integration_handoff_ready),
+            integration_lineage: stored
+                .as_ref()
+                .filter(|stored| stored.integration_reason().is_none())
+                .and_then(|stored| stored.integration_attempt().cloned()),
             ..Self::default()
         };
         snapshot.refresh(c, &mut facts).await?;
@@ -692,6 +703,15 @@ impl ConditionFacts {
                         return None;
                     }
                 }
+                ConditionWitness::IntegrationLineage { attempt_id } => {
+                    if facts
+                        .integration_lineage
+                        .replace(attempt_id.clone())
+                        .is_some()
+                    {
+                        return None;
+                    }
+                }
                 ConditionWitness::Entry { .. } => return None,
                 ConditionWitness::Step { step_id, .. } => facts.hooks = Some(step_id.clone()),
                 ConditionWitness::Execution { execution_id, role } => {
@@ -732,6 +752,10 @@ impl ConditionFacts {
             witnesses.push(ConditionWitness::Integration {
                 reason: reason.clone(),
                 handoff_ready: self.integration_handoff_ready,
+            });
+        } else if let Some(attempt_id) = &self.integration_lineage {
+            witnesses.push(ConditionWitness::IntegrationLineage {
+                attempt_id: attempt_id.clone(),
             });
         }
         if let Some(step) = &self.hooks {

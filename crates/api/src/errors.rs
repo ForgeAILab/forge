@@ -220,6 +220,11 @@ impl From<ServiceError> for ApiError {
                 "Task has pending steps; accepted work remains queued",serde_json::to_value(api_types::TaskBusyDetails {
                     pending_steps,retry_after_ms,retry_hint:"Retry after pending steps settle; refetch the Task version first".to_owned(),
                 }).expect("Task busy details serialize")),
+            ServiceError::TaskConditionQuarantined { task_id } => Self::conflict_with_code_and_details(
+                api_types::TASK_CONDITION_QUARANTINED,
+                "This Task's stored condition was written by a newer Forge build and is quarantined. Nothing was changed. Run a build that understands it",
+                json!({ "task_id": task_id }),
+            ),
             ServiceError::PlacementUnavailable(error) => Self::conflict_with_code_and_details(
                 if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED } else { "placement_unavailable" },
                 error.to_string(),
@@ -456,6 +461,7 @@ impl From<DbError> for ApiError {
     fn from(error: DbError) -> Self {
         match error {
             DbError::TaskBusy {pending_steps,retry_after_ms} => ServiceError::TaskBusy {pending_steps,retry_after_ms}.into(),
+            DbError::TaskConditionQuarantined { task_id } => ServiceError::TaskConditionQuarantined { task_id }.into(),
             DbError::NotFound => Self {
                 status: StatusCode::NOT_FOUND,
                 code: "not_found",

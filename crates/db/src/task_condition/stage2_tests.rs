@@ -306,7 +306,7 @@ async fn bounded_repair_changes_only_shadow_and_reports_counts() {
     for i in 0..12 {
         task(&db, &format!("r{i:02}")).await;
     }
-    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"clear\",\"evidence\":{\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{},\"unparsed_metadata\":null}}'")
+    sqlx::query("UPDATE task SET condition_json='{}'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -602,7 +602,7 @@ async fn check_reads_without_the_writer_and_survives_a_cancelled_repair() {
     assert_eq!((status.checked, status.repaired, status.ticks), (1, 0, 1));
     lock.rollback().await.unwrap();
 
-    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"clear\",\"evidence\":{\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{},\"unparsed_metadata\":null}}'")
+    sqlx::query("UPDATE task SET condition_json='{}'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -676,7 +676,7 @@ async fn completed_pass_is_recorded_with_its_own_counts() {
     db.check_task_conditions(2).await.unwrap();
     let pass = db.condition_check_status().last_pass.unwrap();
     assert_eq!((pass.checked, pass.repaired), (3, 0));
-    sqlx::query("UPDATE task SET condition_json='{\"kind\":\"clear\",\"evidence\":{\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{},\"unparsed_metadata\":null}}' WHERE id='pass1'")
+    sqlx::query("UPDATE task SET condition_json='{}' WHERE id='pass1'")
         .execute(db.pool())
         .await
         .unwrap();
@@ -776,50 +776,64 @@ async fn stale_mapping_revision_reruns_the_backfill_once() {
 #[tokio::test]
 async fn opaque_metadata_values_preserve_shadow_until_the_bounded_check() {
     let db = db().await;
-    let t = task(&db, "opaque-value").await;
-    let corrupt = r#"{"kind":"future_tag"}"#;
-    sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
-        .bind(corrupt)
-        .bind(&t.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let step = claim(&db, &t.id).await;
-    crate::task_writer::in_task_step(step, async {
-        TaskRepo::mutate_metadata(
-            &db,
-            &t.id,
-            None,
-            vec![crate::TaskMetadataMutation::Set {
-                key: "custom".into(),
-                value: json!({"Budget":"awaiting_human queued_recovery"}),
-            }],
-            &crate::now_rfc3339(),
-        )
-        .await
-        .unwrap();
-    })
-    .await;
-    let stored: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
-        .bind(&t.id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        stored, corrupt,
-        "an opaque value is not a condition producer"
-    );
-    db.check_task_conditions(1).await.unwrap();
-    assert_eq!(
-        db.task_condition_violations().await.unwrap(),
-        vec![t.id.clone()]
-    );
-    let after: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
-        .bind(&t.id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert_eq!(after, corrupt, "unsupported state remains quarantined");
+    // An unreadable stored value of either class: corrupt (the bounded check
+    // restates it) and a newer encoding (quarantined, never rewritten).
+    for (id, corrupt, quarantined) in [
+        ("opaque-corrupt", "{}", false),
+        ("opaque-newer", r#"{"kind":"future_tag"}"#, true),
+    ] {
+        let t = task(&db, id).await;
+        sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+            .bind(corrupt)
+            .bind(&t.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let step = claim(&db, &t.id).await;
+        crate::task_writer::in_task_step(step, async {
+            TaskRepo::mutate_metadata(
+                &db,
+                &t.id,
+                None,
+                vec![crate::TaskMetadataMutation::Set {
+                    key: "custom".into(),
+                    value: json!({"Budget":"awaiting_human queued_recovery"}),
+                }],
+                &crate::now_rfc3339(),
+            )
+            .await
+            .unwrap();
+        })
+        .await;
+        let stored = || async {
+            sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id=?")
+                .bind(&t.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            stored().await,
+            corrupt,
+            "an opaque value is not a condition producer"
+        );
+        db.check_task_conditions_of(std::slice::from_ref(&t.id))
+            .await
+            .unwrap();
+        if quarantined {
+            assert_eq!(
+                db.task_condition_violations().await.unwrap(),
+                vec![t.id.clone()]
+            );
+            assert_eq!(
+                stored().await,
+                corrupt,
+                "a newer encoding stays quarantined"
+            );
+        } else {
+            assert!(db.task_condition_violations().await.unwrap().is_empty());
+        }
+    }
 }
 
 /// The scheduler admits a Task from an initial state without reading its

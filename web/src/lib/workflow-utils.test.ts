@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest'
 
 import {
   blockedInterruption,
-  taskIntegrationWait,
   deriveColumns,
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
@@ -264,12 +263,11 @@ describe('integration conditions', () => {
     const task = taskListItem({
       condition: {
         kind: 'parked',
-        primary: { kind: 'integration', reason: { kind: 'waiting', attempt_id: 'attempt', blocked_by: [] } },
+        primary: { kind: 'integration', reason: { kind: 'waiting', attempt_id: 'attempt' } },
         additional: [], resume: { kind: 'integration', attempt_id: 'attempt' }, since: null,
         details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false, owner: 'integration_worker', recovery: 'wait_for_integration' },
       },
     })
-    expect(taskIntegrationWait(task)?.kind).toBe('waiting')
     expect(isTaskBlocked(task)).toBe(false)
     expect(taskHasError(task)).toBe(false)
     expect(blockedInterruption(task)).toBeNull()
@@ -280,12 +278,11 @@ describe('integration conditions', () => {
     const task = taskListItem({
       condition: {
         kind: 'parked', primary: { kind: 'held', actor: 'user' },
-        additional: [{ kind: 'integration', reason: { kind: 'deferred', attempt_id: 'attempt', cause: 'target_dirty', owner_id: 'owner', message: 'target dirty', retry_at: null } }],
+        additional: [{ kind: 'integration', reason: { kind: 'deferred', attempt_id: 'attempt', cause: 'target_dirty', owner_id: 'owner', message: 'target dirty' } }],
         resume: { kind: 'reconcile' }, since: null,
         details: { failure_kind: 'manual_stop', diagnostic: null, interruption: { kind: 'manual_stop', reason: 'held', created_at: '' }, failed: false, blocked: true, human_wait: true, entry_wait: false },
       },
     })
-    expect(taskIntegrationWait(task)?.kind).toBe('deferred')
     expect(isTaskBlocked(task)).toBe(true)
     expect(taskHasError(task)).toBe(true)
     expect(blockedInterruption(task)?.reason).toBe('held')

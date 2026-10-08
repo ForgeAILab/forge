@@ -15,6 +15,9 @@ use api_types::{FailureKind, InterruptionMetadata, TaskBlockingAnnotation};
 #[serde(tag = "statement", rename_all = "snake_case")]
 pub enum ConditionStatement {
     /// Replace only integration's reason, preserving every other owner.
+    /// Fenced on the attempt: the owning attempt restates freely; another
+    /// attempt is refused unless none owns the row (never stated, cleared,
+    /// or handed off to a role).
     Integration { reason: IntegrationReason },
     /// The Task step has sent repair/review back to its configured role.
     /// Retain lineage while allowing ordinary role admission and recovery.
