@@ -14,7 +14,7 @@ use api_types::{
     WorkspaceCleanupSummary,
 };
 use chrono::{DateTime, Duration, Utc};
-use db::{IntegrationQueueRepo, SqliteDb, WorkspaceRepo};
+use db::{CheckRunRepo, IntegrationQueueRepo, SqliteDb, WorkspaceRepo};
 use serde_json::Value;
 use sqlx::Row;
 
@@ -361,6 +361,11 @@ impl OperatorStatusService {
             current_attempts_by_state: integration_counts.current_attempts_by_state,
             quarantined_imports: integration_counts.quarantined_imports,
         };
+        let check_counts = self.db.check_run_counts().await?;
+        let check_runs = api_types::CheckRunStatus {
+            by_state: check_counts.by_state,
+            reusable_results: check_counts.reusable_results,
+        };
         Ok(OperatorStatusResponse {
             overall_severity,
             active_executions,
@@ -377,6 +382,7 @@ impl OperatorStatusService {
             periodic_workers,
             task_steps,
             integration_queues,
+            check_runs,
             pending_remote_cancels,
             event_relay,
             database,

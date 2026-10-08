@@ -665,6 +665,7 @@ fn trusted_web_origins_use_the_public_base_url_origin_when_configured() {
 
 fn clear_forge_env() {
     for key in [
+        "FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS",
         "FORGE_SERVER_USAGE_INDEX_BUDGET_MB",
         "FORGE_EVENT_CONSUMER_STALL_SECONDS",
         "FORGE_SERVER_BIND",
@@ -915,4 +916,49 @@ fn working_set_file_and_env_settings_are_validated() {
     env::set_var("FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS", "16000");
     assert!(ForgeConfig::load(Some(&path), test_overrides(directory.path())).is_err());
     env::remove_var("FORGE_SERVER_MAIN_WORKING_SET_HARD_TOKENS");
+}
+
+#[test]
+fn check_run_timeout_obeys_file_env_cli_precedence_and_rejects_zero() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("forge.yaml");
+    let load = |seconds| {
+        ForgeConfig::load(
+            Some(&path),
+            ConfigOverrides {
+                server_check_run_timeout_seconds: seconds,
+                ..test_overrides(dir.path())
+            },
+        )
+    };
+    assert_eq!(
+        load(None).unwrap().server.check_run_timeout_seconds,
+        crate::DEFAULT_CHECK_RUN_TIMEOUT_SECONDS
+    );
+    fs::write(&path, "server:\n  check_run_timeout_seconds: 90\n").unwrap();
+    assert_eq!(load(None).unwrap().server.check_run_timeout_seconds, 90);
+    env::set_var("FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS", "120");
+    assert_eq!(load(None).unwrap().server.check_run_timeout_seconds, 120);
+    assert_eq!(
+        load(Some(180)).unwrap().server.check_run_timeout_seconds,
+        180
+    );
+    assert!(load(Some(0)).is_err());
+    for invalid in ["0", "-1", "1.5", "4294967296", "no"] {
+        env::set_var("FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS", invalid);
+        assert!(load(None).is_err(), "{invalid}");
+    }
+    env::remove_var("FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS");
+    fs::write(&path, "server:\n  check_run_timeout_seconds: 0\n").unwrap();
+    assert!(load(None).is_err());
+    // A partial serde config retains the same default as the loader.
+    let config: crate::ServerConfig =
+        serde_yaml::from_str("bind: '127.0.0.1:0'\njwt_secret: null").unwrap();
+    assert_eq!(
+        config.check_run_timeout_seconds,
+        crate::DEFAULT_CHECK_RUN_TIMEOUT_SECONDS
+    );
+    clear_forge_env();
 }

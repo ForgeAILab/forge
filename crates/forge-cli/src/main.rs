@@ -35,6 +35,9 @@ struct Cli {
     /// Usage observation index budget in MiB (default: 128; 0: memoized full reads).
     #[arg(long)]
     usage_index_budget_mb: Option<u32>,
+    /// Whole-check bundle wall timeout in seconds (default: 1800; passive until runner cutover).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    check_run_timeout_seconds: Option<u32>,
     #[arg(long)]
     demo: bool,
     #[arg(long = "no-mcp")]
@@ -72,6 +75,7 @@ async fn run() {
             server_build_jobs_per_run: cli.build_jobs_per_run,
             server_run_nice: cli.run_nice,
             server_usage_index_budget_mb: cli.usage_index_budget_mb,
+            server_check_run_timeout_seconds: cli.check_run_timeout_seconds,
             mcp_enabled: if cli.no_mcp { Some(false) } else { None },
             data_dir: cli.data_dir,
             event_consumer_stall_seconds: cli.event_consumer_stall_seconds,
@@ -648,5 +652,26 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:49152".parse().expect("addr parses");
 
         assert_eq!(server_url_for_addr(addr), "http://127.0.0.1:49152");
+    }
+}
+
+#[cfg(test)]
+mod check_timeout_tests {
+    use super::*;
+    #[test]
+    fn flag_accepts_seconds_and_rejects_zero() {
+        assert_eq!(
+            Cli::try_parse_from(["forge", "--check-run-timeout-seconds", "90"])
+                .unwrap()
+                .check_run_timeout_seconds,
+            Some(90)
+        );
+        assert!(Cli::try_parse_from(["forge", "--check-run-timeout-seconds", "0"]).is_err());
+        assert_eq!(
+            Cli::try_parse_from(["forge"])
+                .unwrap()
+                .check_run_timeout_seconds,
+            None
+        );
     }
 }

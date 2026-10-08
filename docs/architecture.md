@@ -6522,3 +6522,244 @@ Stage four must compose these owner results into the public condition DTO and
 switch all projections together, replace the visible park annotation with the
 condition's own park, preserve the material-blocker digest and slot
 classification, regenerate bindings and document the single public beta break.
+
+### Passive canonical checks (3.3 stage A)
+
+**Nothing executes through this contract or these repositories yet.** Entry
+hooks, `ReviewRunner`, conformance, lifecycle scripts and environment probes
+retain their existing commands, scheduling, timeout, output and cleanup
+behavior. No legacy Review or check evidence is imported into a trusted cache.
+The new server timeout setting is defined but no execution reads it.
+
+`api-types::check_spec` is the shared, dependency-free contract location.
+`review::check_spec::build_check_spec` builds `CheckSpec` from the same review
+source snapshot used for admission, the current hook state’s effective config
+(for entry CI in custom workflows), the selected Project environment, selected
+lifecycle event/hooks and role. `review` already depends on `api-types`, as do
+`services` and `db`; this introduces no crate cycle. Conformance reuses
+`contract::context_from_source`, including governing requirement selection and
+read-only filtering. The existing persistence-free 3.2 `CheckRunInput` and
+`CheckRunOutcome` remain the execution primitive's input and outcome.
+`CheckCommandOutcome` moves verbatim to `api-types` so the effect and stored
+step evidence share one type; no second CI outcome representation is introduced.
+
+`CheckSpec` contains `schema_revision`, `purpose`, ordered `commands`,
+`whole_run_timeout_seconds` and `execution_policy`. Each `CheckCommandSpec`
+contains `id`, exact `shell_text`, explicit `shell` (`bash -lc` today),
+`working_directory`, sorted `environment_keys`, `timeout_seconds` (`None` for
+unbounded legacy CI), `failure_policy`, `cacheability` and sorted
+`requirement_ids`. The policy revision distinguishes today's server and daemon
+semantics, including inherited environment, Git-variable removals and machine
+build policy. Keys describe explicit inputs passed to the command; inherited
+host inputs must additionally be controlled by the owner attestation before
+reuse is possible. The builder never copies Project environment values into a
+spec. Every existing configured command defaults to `uncacheable`; a future
+configuration declaration must explicitly establish controlled inputs before
+using `declared_controlled_inputs`.
+
+| Execution family | Characterized bundle, cwd, environment and timeout |
+|---|---|
+| Review-entry CI | Effective workflow/Project/Task CI in order; Task root; Project keys; no per-command limit; stop at first failure. |
+| Manual `ReviewRunner` CI | Same effective CI resolution and command semantics; separate `review_ci` purpose. |
+| Conformance | Effective setup followed by CI-derived and requirement-linked checks, using the admitted governing context; Task root; Project keys; configured 1–14,400-second per-command limit, default 1800. Setup failure stops the bundle; required-check failure does not stop later checks. |
+| Blocking before-work | Selected event's blocking scripts only, original hook indices; Task root or existing lifecycle fallback; Project keys plus the eleven `FORGE_*` context keys; configured limit or legacy 30-second zero fallback; stop at failure. |
+| Other lifecycle / hook test | Selected script hooks; the asynchronous before-work path excludes blocking scripts; existing workspace/fallback cwd and context keys; same timeout fallback; continue between scripts. Plugins have no shell-check contract. Owner hook tests select an original hook index and bypass the asynchronous blocking-hook filter. |
+| Environment preflight | Role-applicable environment checks in order; Task root; Project keys; limits clamped to 1–300 seconds; stop at failure. |
+| Project/machine readiness | Already selected readiness probe set in order; repository or owner probe scratch; Project keys; 1–300 seconds; collect all checks. Selection and owner routing remain outside the builder. |
+| Exported environment helpers | Role-applicable selected checks; supplied directory; Project keys; 1–300 seconds; stop at failure. The single-check helper supplies `single_environment_check` and ignores role filtering, as today. |
+| Agent-selected commands | No configured authoritative bundle exists. The builder returns an empty `agent_selected` spec; it does not manufacture reusable CI from arbitrary agent tool calls. |
+| Future queue-head CI | `queue_head_ci` can describe CI-only or conformance bundles. The caller must explicitly supply `QueueHeadCheckBundle`; there is no default and no execution. This leaves the later gating decision open. |
+
+Characterization tests pin each configured family's command order, IDs, cwd,
+explicit environment keys and per-command limits. Existing CI primitive tests
+also compare the built spec with the actual commands yielded by `CheckRun`.
+The whole-run field does not change those per-command limits in this stage.
+
+**Execution digest.** `CheckDigestInput::encoding` validates the input, then
+produces compact UTF-8 JSON in a `forge.check-execution/1` schema envelope.
+Object keys are recursively sorted lexically, arrays preserve order, and no
+Unicode normalization or command whitespace normalization is applied. SHA-256
+of those bytes, lowercase hex, is the digest. The fixture under
+`crates/api-types/src/check_spec/fixtures/` pins the input, exact encoding and
+hash; permutation and exhaustive semantic-leaf mutation tests pin invariance
+and invalidation.
+
+Included:
+
+- the complete spec: command order, IDs, shell text and shell semantics, cwd
+  rule, environment key names, timeout and stop/continue policy, cacheability,
+  requirement links, purpose, schema revision and execution-policy revision;
+- each declared key's classified identity: a controlled non-secret value, an
+  opaque owner-maintained secret revision, an explicit removal, or a `volatile`
+  marker (never the per-run value);
+- the audited execution revision **number** (nonzero requires an audit ref);
+- attested execution-input digest, or the distinct `not_attested` value.
+
+Excluded:
+
+- secret bytes and public hashes of secret bytes; secret changes use opaque
+  private revisions rather than exposing a low-entropy secret hash;
+- volatile values such as run/operation IDs, timestamps, lease values, output,
+  Task epoch, execution ID and per-run directory paths; volatile declared keys
+  prevent reuse rather than making a misleading stable cache key;
+- audit-reference location (it proves why the revision advanced, not what ran);
+- consumer origin/delivery metadata and semantic review authority; a mechanical
+  pass cannot grant semantic approval or bypass human review.
+
+Only full lowercase 40- or 64-hex commit object IDs are accepted; mutable refs
+and abbreviations are refused. The future owner must additionally verify that
+the object exists. Project ID, repo ID and exact commit are outside the spec digest and inside the
+separate `forge.check-scope/1` identity key. This prevents sharing evidence
+across repository or Project security boundaries. The owner attestation binds
+inputs outside the commit: `ServerCheckExecutionInputs::identity` hashes an
+explicit toolchain revision, environment revision, asset target-to-revision map,
+secret key-to-opaque-revision map, shell revision, runner revision, server OS and
+architecture in a `forge.check-server-inputs/1` envelope. All revision strings
+are non-secret owner identifiers. Runtime ID alone is never an attestation.
+This function is pure; stage A does not probe tools or infer that today's
+inherited environment is controlled. Daemons use `NotAttested` until the owner
+protocol can attest the same inputs. Uncontrolled network, clock, ambient files
+or mutable dependencies require `uncacheable`; attestation cannot turn such a
+spec into a reusable check.
+
+**Tables.** `V202610080851__check_runs.sql` is additive, has no triggers or
+legacy DML, and preserves existing data. Only fields read/written by the passive
+repositories, or required by constraints/indexes, are included. All JSON limits
+are UTF-8 bytes, enforced in code and with SQLite BLOB-length CHECKs.
+
+| `check_run` column | Constraint / meaning |
+|---|---|
+| `id` | TEXT primary key, application UUID. |
+| `project_id` | NOT NULL Project FK, ON DELETE CASCADE. |
+| `repo_id` | NOT NULL repo FK, ON DELETE CASCADE; repository verifies Project ownership. |
+| `commit_sha` | NOT NULL exact commit witness. |
+| `spec_digest` | NOT NULL execution digest, computed from validated inputs. |
+| `identity_key` | NOT NULL scoped identity digest. |
+| `input_json` | NOT NULL complete typed digest inputs, including audit ref; valid JSON, maximum 131,072 bytes. |
+| `cacheable` | NOT NULL boolean, computed from all command declarations, attestation and absence of volatile inputs. |
+| `state` | NOT NULL enum: queued, running, cancelling, cleaning, uncertain, succeeded, failed, cancelled. |
+| `operation_id` | NOT NULL UNIQUE application UUID, allocated before claim and preserved on takeover. |
+| `workspace_id` | Optional workspace FK, ON DELETE SET NULL. |
+| `machine_id` | Optional physical-owner daemon FK, ON DELETE SET NULL. No capacity admission occurs. |
+| `lease_owner`, `lease_until` | Optional text, both null or both populated; expiry comparisons use SQLite julianday. |
+| `lease_generation` | INTEGER NOT NULL DEFAULT 0, nonnegative; advances on every claim/takeover. |
+| `version` | INTEGER NOT NULL DEFAULT 1, positive; every mutation uses and increments CAS version. |
+| `created_at`, `updated_at` | NOT NULL timestamps. |
+| `finished_at` | Optional timestamp; uncertainty never records terminal completion. |
+
+Run keys/indexes: UNIQUE `(id, identity_key)` supports result's composite FK;
+partial UNIQUE `check_run_live_identity(identity_key)` covers queued, running,
+cancelling, cleaning and uncertain; `check_run_state_lease(state, lease_until)`;
+`check_run_machine_state(machine_id, state)`; UNIQUE operation ID.
+
+| `check_result` column | Constraint / meaning |
+|---|---|
+| `id` | TEXT primary key, application UUID. |
+| `run_id`, `identity_key` | NOT NULL; composite FK to check_run `(id, identity_key)`, ON DELETE CASCADE. |
+| `outcome` | NOT NULL enum: pass, fail, timed_out, cancelled, infrastructure_failed. |
+| `cleanup` | NOT NULL enum: success, failed, uncertain, not_performed. |
+| `certified` | NOT NULL boolean; may be true only for pass plus successful cleanup; repository requires all ordered commands to have passed. |
+| `cacheable` | NOT NULL boolean copied from validated run eligibility. |
+| `steps_json` | NOT NULL ordered existing CheckCommandOutcome array, valid JSON, maximum 262,144 bytes. |
+| `output_truncated` | NOT NULL boolean; supplied capture truncation OR storage tail truncation. |
+| `created_at` | NOT NULL timestamp. |
+
+Result indexes: `check_result_run(run_id, created_at)` and partial UNIQUE
+`check_result_reusable_identity(identity_key)` for pass + successful cleanup +
+certified + cacheable. Results are insert-only through the repository. Uncertain
+cleanup can retain an immutable receipt followed by a separate reconciled
+receipt; the first is never overwritten or reused. Each stderr/combined output
+is redacted using transient values, then retained as at most a 4096-byte UTF-8
+tail. Actual redaction values are never serialized. The row-level JSON cap also
+bounds IDs, command text and timing evidence; oversize JSON is refused, not
+silently shortened into a different result.
+
+| `check_consumer` column | Constraint / meaning |
+|---|---|
+| `id` | TEXT primary key, application UUID. |
+| `project_id`, `repo_id` | NOT NULL owning FKs, ON DELETE CASCADE. |
+| `task_id` | Optional Task FK, ON DELETE SET NULL. |
+| `status_epoch` | INTEGER NOT NULL, nonnegative consumer fence. |
+| `origin` | NOT NULL enum: entry, manual_review, conformance, before_work, lifecycle, environment, integration. |
+| `request_key` | NOT NULL UNIQUE idempotency key; contradictory identity/Task/epoch/origin is refused. |
+| `identity_key` | NOT NULL requested scoped identity witness. |
+| `run_id` | Optional run FK, ON DELETE SET NULL. |
+| `result_id` | Optional result FK, ON DELETE SET NULL; settlement attaches the latest receipt to joined consumers. |
+| `created_at` | NOT NULL timestamp. |
+
+Consumer indexes: `(task_id, status_epoch)`, `run_id`, `result_id`, plus the
+unique request key. No application/delivery worker exists. Deleting Project or
+repo cascades evidence; deleting Task, workspace or machine detaches optional
+references. Machine removal's existing tombstone behavior still works. There
+are no ON DELETE RESTRICT references. Tests cover each deletion and fresh and
+upgrade migration replay without promoting old review rows.
+
+Relative to the inventory: the spec/environment/schema/execution revision and
+audit reference are stored once in the bounded input manifest; result identity
+joins the scoped run instead of duplicating repo/commit/spec data. Attempt
+counters, runtime/placement witnesses, start/deadline/cancel/cleanup timestamps,
+run result pointer, delivery/application/contract/review mappings,
+HEAD/tracked-change witnesses, drain flags and legacy provenance are deferred:
+no stage-A caller reads/writes them. Cleanup and outcome enums can represent
+success, failure and uncertainty without selecting later cleanup policy. Nullable
+columns can be added when the owner effect, durable runner and Task-step delivery
+actually use them. No legacy cache is seeded.
+
+**State machine and repository fencing.** `CHECK_RUN_TRANSITIONS` is data, with
+a totality test ensuring every nonterminal has an exit and terminals have none:
+
+| From | Exits |
+|---|---|
+| queued | running, cancelled, uncertain |
+| running | cancelling, cleaning, uncertain |
+| cancelling | cleaning, uncertain |
+| cleaning | succeeded, failed, cancelled, uncertain |
+| uncertain | cleaning, cancelled (owner reconciliation required before either) |
+| succeeded / failed / cancelled | None |
+
+Claim changes queued to running; expired running/cancelling/cleaning leases keep
+the same state and operation ID while advancing generation. An expired uncertain
+run can acquire a **reconciliation** lease, remaining uncertain; claim never
+changes uncertainty back to running. Renew and transition require current
+version, generation, owner and an unexpired lease. Final settlement inserts
+immutable evidence and changes the run atomically. Version/generation/lease
+mismatch returns `DbError::VersionConflict`. A storage caller must supply owner
+reconciliation proof before exiting uncertainty; stage C owns that proof and
+must reconcile retained operations before issuing a new effect. Storage alone
+never proves process termination.
+
+Request uses a SQLite immediate transaction: an existing consumer key is
+idempotent, a reusable pass attaches a result, otherwise a matching live run is
+joined or a new queued run is inserted. Uncertain runs remain in the partial
+unique index and block duplicate scheduling. Uncacheable runs can share the
+same in-flight operation, but completed evidence is never reused: a later
+request schedules a fresh run. The real concurrency test uses a file-backed WAL
+pool and four runtime threads with simultaneous requests and claims.
+
+**Reuse rule.** Exact Project/repo/commit/semantic digest identity; every command
+explicitly declares controlled inputs; all declared identity values are present;
+no volatile input; owner-computed environment attestation; complete ordered
+passing commands; certified pass; successful cleanup; and the source run is
+`succeeded`. Different execution revisions or environment identities miss.
+Failed, timed-out, cancelled, uncertain, unattested, uncacheable and failed or
+unperformed cleanup evidence never yields a hit. The partial result index admits
+at most one certified reusable pass per exact identity. A forced rerun must
+advance the audited execution revision rather than duplicating that identity.
+Consumer authority and current attestation must be revalidated by the future
+Task-step consumer before applying any hit; these tables confer no authority.
+
+Operator status adds `check_runs.by_state` (all eight states, zeros included)
+and `check_runs.reusable_results`. These are read-only observations, separate
+from machine occupancy and severity; no worker or capacity behavior is enabled.
+
+Stage B must share the existing 3.2 CI sequence/result types and extend its
+persistence-free owner process/transport seam with bounded process-tree
+supervision, output/truncation, owner input attestation, exact-commit build
+checkout, cancellation and cleanup receipts. It should be built with 3.2 stage
+C part 2's receipt/transport work, preserving stable operation IDs and placement
+fences, without introducing a second DB-writing CI pipeline. Stage C supplies
+admission/capacity, wall-deadline clamping, reconciliation and Task-step-only
+request/application. It consumes these identities/repositories, adds only the
+fields it actually needs, and rechecks current authority on every hit/join.
+Queue-head gating, reviewer dependency layout and capacity borrowing remain
+later-stage decisions.

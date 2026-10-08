@@ -84,3 +84,6 @@ pub use repository::{
     ProjectReviewSummary, RefreshTokenRepo, SystemSettingRepo, TaskRoleAssignmentRepo,
     TerminalSessionRepo, TransitionLogRepo, UserRepo,
 };
+
+pub mod check_run;
+pub use check_run::*;

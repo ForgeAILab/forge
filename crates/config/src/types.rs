@@ -109,6 +109,9 @@ pub struct ForgePaths {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// Passive stage-A setting; no execution reads this deadline yet.
+    #[serde(default = "default_check_run_timeout_seconds")]
+    pub check_run_timeout_seconds: u32,
     #[serde(default = "default_main_working_set_target_tokens")]
     pub main_working_set_target_tokens: u32,
     #[serde(default = "default_main_working_set_hard_tokens")]
@@ -256,6 +259,7 @@ pub struct ProjectSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigOverrides {
+    pub server_check_run_timeout_seconds: Option<u32>,
     pub server_max_concurrent_runs: Option<u32>,
     pub server_build_jobs_per_run: Option<u32>,
     pub server_run_nice: Option<u32>,
@@ -383,6 +387,11 @@ impl ForgeConfig {
             }
         }
 
+        if self.server.check_run_timeout_seconds == 0 {
+            return Err(ConfigError::InvalidConfig {
+                message: "server.check_run_timeout_seconds must be positive".to_owned(),
+            });
+        }
         if self.server.run_nice > 19 {
             return Err(ConfigError::InvalidConfig {
                 message: "server.run_nice must be between 0 and 19".to_owned(),
@@ -422,6 +431,7 @@ impl ForgeConfig {
         Self {
             forge: ForgePaths { data_dir },
             server: ServerConfig {
+                check_run_timeout_seconds: default_check_run_timeout_seconds(),
                 main_working_set_target_tokens: 48000,
                 main_working_set_hard_tokens: 64000,
                 project_working_set_target_tokens: 96000,
@@ -651,4 +661,8 @@ fn default_project_working_set_target_tokens() -> u32 {
 }
 fn default_project_working_set_hard_tokens() -> u32 {
     128000
+}
+
+fn default_check_run_timeout_seconds() -> u32 {
+    crate::DEFAULT_CHECK_RUN_TIMEOUT_SECONDS
 }

@@ -81,6 +81,10 @@ const usageSummary: UsageAggregate = {
 }
 
 const degradedStatus: OperatorStatusResponse = {
+  check_runs: {
+    by_state: { queued: 0, running: 0, cancelling: 0, cleaning: 0, uncertain: 0, succeeded: 0, failed: 0, cancelled: 0 },
+    reusable_results: 0,
+  },
   integration_queues: {
     queues_by_state: {},
     current_attempts_by_state: {},

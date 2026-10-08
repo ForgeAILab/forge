@@ -12,3 +12,5 @@ pub mod contract;
 pub mod follow_up;
 mod runner;
 mod workspace;
+
+pub mod check_spec;

@@ -51,6 +51,7 @@ pub(crate) struct FileForgePaths {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct FileServerConfig {
+    pub check_run_timeout_seconds: Option<u32>,
     pub main_working_set_target_tokens: Option<u32>,
     pub main_working_set_hard_tokens: Option<u32>,
     pub project_working_set_target_tokens: Option<u32>,

@@ -83,6 +83,7 @@ pub struct OperatorStatusResponse {
     pub periodic_workers: Vec<PeriodicWorkerStatus>,
     pub task_steps: TaskStepQueueStatus,
     pub integration_queues: IntegrationQueueStatus,
+    pub check_runs: CheckRunStatus,
     #[ts(type = "number")]
     pub pending_remote_cancels: i64,
     pub event_relay: EventRelayStatus,
@@ -456,4 +457,14 @@ impl std::fmt::Display for DeadLetterState {
             Self::Resolved => "resolved",
         })
     }
+}
+
+/// Passive check evidence counts; no durable check worker is active yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckRunStatus {
+    #[ts(type = "Record<string, number>")]
+    pub by_state: std::collections::BTreeMap<String, i64>,
+    #[ts(type = "number")]
+    pub reusable_results: i64,
 }

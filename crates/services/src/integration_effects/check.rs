@@ -1,6 +1,7 @@
 //! Command effects and the CI sequence; all storage belongs to the consumer.
 use super::{EffectWorkspace, RunResult, RunSpec};
 use crate::{workspace_backend::Result, ServiceError};
+use api_types::CheckCommandOutcome;
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -142,17 +143,6 @@ pub struct CheckCommand {
     pub index: usize,
     pub spec: RunSpec,
     pub started_at: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CheckCommandOutcome {
-    pub index: usize,
-    pub command: String,
-    pub exit_code: i32,
-    pub stderr_tail: String,
-    pub output_tail: String,
-    pub started_at: String,
-    pub finished_at: String,
 }
 
 pub struct CheckRunFailure {

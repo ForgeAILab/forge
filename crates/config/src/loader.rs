@@ -58,6 +58,9 @@ impl ForgeConfig {
         }
 
         if let Some(server) = file.server {
+            if let Some(seconds) = server.check_run_timeout_seconds {
+                self.server.check_run_timeout_seconds = seconds;
+            }
             if let Some(value) = server.main_working_set_target_tokens {
                 self.server.main_working_set_target_tokens = value;
             }
@@ -243,6 +246,10 @@ impl ForgeConfig {
         if let Some(value) = env_value("FORGE_SERVER_RUN_NICE") {
             self.server.run_nice = parse_env_u32("FORGE_SERVER_RUN_NICE", &value)?;
         }
+        if let Some(value) = env_value("FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS") {
+            self.server.check_run_timeout_seconds =
+                parse_env_u32("FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS", &value)?;
+        }
         if let Some(value) = env_value("FORGE_SERVER_USAGE_INDEX_BUDGET_MB") {
             self.server.usage_index_budget_mb =
                 Some(parse_env_u32("FORGE_SERVER_USAGE_INDEX_BUDGET_MB", &value)?);
@@ -322,6 +329,9 @@ impl ForgeConfig {
     }
 
     fn apply_overrides(&mut self, overrides: ConfigOverrides) {
+        if let Some(seconds) = overrides.server_check_run_timeout_seconds {
+            self.server.check_run_timeout_seconds = seconds;
+        }
         if let Some(jobs) = overrides.server_build_jobs_per_run {
             self.server.build_jobs_per_run = Some(jobs);
         }

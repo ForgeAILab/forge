@@ -773,3 +773,9 @@ nonzero; it remains open for another manual action. Dismiss returns `dismissed`
 and retains the optional reason. Unknown IDs return 404; resolved rows or a lost
 race return 409. Resolved rows are retained for audit and omitted from open counts.
 There is no automatic replay, bulk command or dead-letter retention job.
+
+The server also accepts `--check-run-timeout-seconds N` (positive integer,
+1800 seconds by default), overriding `FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`
+and `server.check_run_timeout_seconds` in `forge.yaml`. This defines the future
+whole-check bundle deadline; no execution reads it in 3.3 stage A. It does not
+change today's per-command review timeout or unbounded entry CI.

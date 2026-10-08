@@ -260,3 +260,96 @@ fn rebase_head_facts_keep_the_observed_object_or_the_existing_missing_head_error
         matches!(rebase::rebase_head_facts(state(None)), Err(crate::ServiceError::InvalidOperation { message }) if message == "rebased workspace has no HEAD")
     );
 }
+
+#[test]
+fn canonical_ci_spec_matches_the_existing_check_run_input_and_sequence() {
+    let source = serde_json::json!({
+        "task_id":"task", "project_id":"project", "repo_id":"repo",
+        "task_scope":{"task_type":"task", "config":{"review":{"ci_steps":["first","second"]}}}
+    });
+    let env = std::collections::BTreeMap::from([("LANG".into(), "C".into())]);
+    let environment = api_types::ProjectEnvironment {
+        env: env.clone(),
+        ..Default::default()
+    };
+    let spec = review::check_spec::build_check_spec(
+        api_types::CheckPurpose::EntryCi,
+        &review::check_spec::CheckSpecConfiguration {
+            source: &source,
+            entry_state_config: None,
+            environment: &environment,
+            hooks: &[],
+            hook_test_index: None,
+            single_environment_check: None,
+            event: api_types::LifecycleEvent::BeforeWork,
+            role: "coder",
+            owner_is_daemon: false,
+            has_workspace: true,
+            whole_run_timeout_seconds: 1800,
+            queue_head_bundle: None,
+        },
+    )
+    .unwrap();
+    let workspace = EffectWorkspace {
+        workspace_id: "workspace".into(),
+        placement_id: "placement".into(),
+        generation: 1,
+        owner: EffectOwner::Server,
+        handle: "handle".into(),
+    };
+    let commands = vec!["first".into(), "second".into()];
+    let mut run = check::CheckRun::new(check::CheckRunInput {
+        workspace: &workspace,
+        commands: &commands,
+        purpose: api_types::WorkspaceRunPurpose::CiStep,
+        environment: &env,
+        deadline: None,
+        max_output_bytes: usize::MAX,
+    });
+    for expected in &spec.commands {
+        let actual = run.next_command().unwrap();
+        assert_eq!(actual.spec.command, expected.shell_text);
+        assert_eq!(
+            actual
+                .spec
+                .env
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected.environment_keys
+        );
+        assert_eq!(
+            actual.spec.timeout_secs,
+            expected.timeout_seconds.unwrap_or(0)
+        );
+        assert_eq!(
+            expected.working_directory,
+            api_types::CheckWorkingDirectory::TaskRoot
+        );
+        assert_eq!(
+            expected.failure_policy,
+            api_types::CheckFailurePolicy::StopBundle
+        );
+        run.completed(
+            actual,
+            RunResult {
+                exit_code: 0,
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                duration_ms: 0,
+            },
+        );
+    }
+    assert!(run.next_command().is_none());
+    let outcome = run.outcome();
+    // Storage consumes the very same command outcome array, with no conversion
+    // into a competing CI representation and no write from the effect itself.
+    let evidence = db::CheckResultEvidence {
+        outcome: db::CheckResultOutcome::Pass,
+        cleanup: db::CheckCleanup::Success,
+        commands: outcome.commands,
+        output_truncated: false,
+        redaction_values: vec![],
+    };
+    assert_eq!(evidence.commands.len(), spec.commands.len());
+}

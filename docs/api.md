@@ -3439,6 +3439,8 @@ capacity, cleanup, retry, usage, and error summaries now also include:
 | `integration_queues.queues_by_state` | Passive integration queues counted by `open`, `suspended`, `quarantined`, `closed` (zero states included). |
 | `integration_queues.current_attempts_by_state` | Current membership counted by attempt state; terminal history is excluded. Zero states are included. |
 | `integration_queues.quarantined_imports` | Import rows with an explicit `quarantined` disposition, including rows with no resolvable queue. |
+| `check_runs.by_state` | Passive check runs counted by `queued`, `running`, `cancelling`, `cleaning`, `uncertain`, `succeeded`, `failed`, `cancelled`; all zero states included. No check worker executes through these tables yet. |
+| `check_runs.reusable_results` | Certified passing results with successful cleanup and cacheable attested inputs whose source run succeeded; exact-identity reuse only. Zero on a fresh or upgraded database; no legacy cache is seeded. |
 | `task_steps` | Cascade step queue health. No consumer cursor or dead-letter actions. |
 | `task_steps.pending`, `.claimed` | Current pending and claimed step rows. |
 | `task_steps.failed`, `.parked` | Unresolved failed and parked (loop-detected) steps: rows the Task's error annotation still references. Resolved history does not count. |

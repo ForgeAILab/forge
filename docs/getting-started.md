@@ -1474,3 +1474,21 @@ or before the next user turn following eight hours idle; CLI chats never rotate
 automatically. An explicit topic request during a live turn is saved and completed
 at that same idle admission boundary. A rotation that fails three times is
 abandoned with a visible notice, and the chat continues on its current topic.
+
+### Whole-check wall timeout (passive contract setting)
+
+`server.check_run_timeout_seconds` defines the whole mechanical-check bundle
+wall limit, default **1800 seconds**, positive integer. Precedence is
+`forge --check-run-timeout-seconds N`, then
+`FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`, then `server.check_run_timeout_seconds`
+in `forge.yaml`, then the default. For example:
+
+```yaml
+server:
+  check_run_timeout_seconds: 1800
+```
+
+This stage only defines the setting and the canonical spec field. No execution
+reads it yet: existing CI and per-command `review.check_timeout_seconds` behavior
+is unchanged. The durable runner will start wall timing at actual admission and
+clamp each separate command limit to the remaining wall time.
