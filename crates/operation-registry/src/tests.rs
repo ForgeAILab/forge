@@ -5,13 +5,17 @@ use scope_reads::NoArguments;
 #[test]
 fn catalog_is_complete_unique_and_deterministic() {
     let ids = READ_CATALOG.iter().map(|s| s.id).collect::<Vec<_>>();
-    assert_eq!(ids, registered_operations());
+    assert_eq!(ids, registered_reads());
+    assert_eq!(
+        registered_operations().len(),
+        registered_reads().len() + main_proposals::IDS.len()
+    );
     assert_eq!(
         ids.len(),
         scope_reads::IDS.len() + project_reads::IDS.len() + main_reads::IDS.len()
     );
     assert!(READ_CATALOG.lookup("project.current_state").is_none());
-    assert!(OperationCatalog::<()>::new(scope_reads::specs(), &registered_operations()).is_err());
+    assert!(OperationCatalog::<()>::new(scope_reads::specs(), &registered_reads()).is_err());
     assert!(OperationCatalog::<()>::new(
         scope_reads::specs().into_iter().chain(scope_reads::specs()),
         &["account.summary", "agent_chat.summary"]
@@ -225,10 +229,7 @@ async fn typed_dispatch_selects_each_handler_and_never_dispatches_invalid_input(
             Err(DispatchError::InvalidInput(_))
         ));
     }
-    assert_eq!(
-        context.0.lock().unwrap().len(),
-        registered_operations().len()
-    );
+    assert_eq!(context.0.lock().unwrap().len(), registered_reads().len());
 }
 
 fn valid_input(id: &str) -> Value {
@@ -581,4 +582,170 @@ fn inputs_that_stay_refused() {
     .unwrap();
     spec.validate_arguments(&inquiry("  ".into(), "  ".into(), Some(String::new())))
         .unwrap();
+}
+
+#[async_trait::async_trait]
+impl main_proposals::MainProposalContext<&'static str> for RecordingContext {
+    async fn select_project_agent(
+        &self,
+        input: main_proposals::ProjectAgentSelection,
+    ) -> Result<Value, &'static str> {
+        self.record_decoded(
+            "genesis.project_agent.select",
+            input.expected_session_version,
+        )
+    }
+    async fn propose_project_create(
+        &self,
+        _: main_proposals::ProjectCreate,
+    ) -> Result<Value, &'static str> {
+        self.record("project.create")
+    }
+}
+
+#[test]
+fn main_proposal_schemas_and_contract_lines_match_gate_fixtures() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../tests/main_proposal_contracts.json")).unwrap();
+    let catalog = &main_proposals::CATALOG;
+    assert_eq!(
+        catalog.iter().map(|s| s.id).collect::<Vec<_>>(),
+        main_proposals::IDS
+    );
+    for spec in catalog.iter() {
+        assert_eq!(spec.canonical_schema(), fixture[spec.id]);
+        assert!(spec
+            .surfaces
+            .iter()
+            .all(|s| s.projection == FieldProjection::ProposalPayload));
+    }
+    assert_eq!(catalog.lookup("genesis.project_agent.select").unwrap().contract_line(), "genesis.project_agent.select: {expected_session_version, genesis_session_id?, project_agent_identity_id}");
+    assert_eq!(
+        catalog.lookup("project.create").unwrap().contract_line(),
+        "project.create: {approval_id}"
+    );
+}
+fn proposal_input(id: &str) -> Value {
+    match id {
+        "genesis.project_agent.select" => {
+            json!({"action":"select","expected_session_version":1,"project_agent_identity_id":"project-agent"})
+        }
+        "project.create" => json!({"action":"create_from_approval","approval_id":"approval"}),
+        _ => unreachable!(),
+    }
+}
+#[tokio::test]
+async fn main_proposal_contracts_check_every_field_and_dispatch_typed_inputs() {
+    let catalog = main_proposals::catalog();
+    let context = RecordingContext(std::sync::Mutex::new(Vec::new()));
+    for spec in catalog.iter() {
+        let input = proposal_input(spec.id);
+        assert_eq!(
+            spec.dispatch(&context, input.clone()).await.unwrap()["handler"],
+            spec.id
+        );
+        let mut invalids = vec![
+            ("arguments".to_owned(), json!(null)),
+            ("arguments".to_owned(), json!([])),
+        ];
+        for field in spec.input.schema["properties"].as_object().unwrap().keys() {
+            for value in [json!([]), json!({}), json!(false), json!(1.5)] {
+                let mut invalid = input.clone();
+                invalid[field] = value;
+                invalids.push((field.clone(), invalid));
+            }
+            if spec.input.is_required(field) {
+                let mut invalid = input.clone();
+                invalid.as_object_mut().unwrap().remove(field);
+                invalids.push((field.clone(), invalid));
+            }
+        }
+        for (field, input) in invalids {
+            let error = spec.normalize_arguments(&input).unwrap_err();
+            assert!(
+                error.starts_with(spec.id)
+                    && error.contains(&field)
+                    && error.ends_with(&format!("; expected {}", spec.contract_line())),
+                "{error}"
+            );
+        }
+        for field in ["unexpected", "ignored", "name", "slug"] {
+            let mut invalid = input.clone();
+            invalid[field] = json!("ignored before");
+            if spec.id == "project.create" {
+                spec.validate_arguments(&invalid).unwrap();
+            } else {
+                assert!(spec
+                    .validate_arguments(&invalid)
+                    .unwrap_err()
+                    .contains(field));
+            }
+        }
+    }
+    let select = catalog.lookup("genesis.project_agent.select").unwrap();
+    for value in [json!(1), json!("1"), json!(1.0)] {
+        let mut input = proposal_input(select.id);
+        input["expected_session_version"] = value;
+        assert_eq!(
+            select.dispatch(&context, input).await.unwrap()["integer"],
+            1
+        );
+    }
+    let create = catalog.lookup("project.create").unwrap();
+    let mut old = proposal_input("project.create");
+    old["ignored"] = json!("historic");
+    assert!(create.validate_arguments(&old).is_ok());
+    assert_eq!(
+        create.dispatch_prepared(&context, old).await.unwrap()["handler"],
+        "project.create"
+    );
+    // A blank reference is refused on a new call. An action prepared before
+    // this contract replays its stored arguments without the contract check,
+    // and the unchanged user executor still refuses it at execution.
+    for stored in [
+        json!({}),
+        json!({"approval_id":null}),
+        json!({"approval_id":""}),
+    ] {
+        let error = create.normalize_arguments(&stored).unwrap_err();
+        assert!(
+            error.starts_with("project.create: argument `approval_id`")
+                && error.ends_with("; expected project.create: {approval_id}"),
+            "{error}"
+        );
+        assert_eq!(
+            create.dispatch_prepared(&context, stored).await.unwrap()["handler"],
+            "project.create"
+        );
+    }
+}
+
+#[test]
+fn ignored_action_fields_preserve_the_base_handler_acceptance_set() {
+    for id in main_proposals::IDS {
+        let spec = main_proposals::CATALOG.lookup(id).unwrap();
+        assert!(spec.canonical_schema()["properties"]
+            .get("action")
+            .is_none());
+        let mut without = proposal_input(id);
+        without.as_object_mut().unwrap().remove("action");
+        spec.validate_arguments(&without).unwrap();
+        for value in [
+            json!(null),
+            json!(false),
+            json!(12),
+            json!([]),
+            json!({"ignored":true}),
+            json!("other action"),
+        ] {
+            let mut input = without.clone();
+            input["action"] = value;
+            let normalized = spec.normalize_arguments(&input).unwrap();
+            if *id == "genesis.project_agent.select" {
+                assert_eq!(normalized, without);
+            } else {
+                assert_eq!(normalized, input);
+            }
+        }
+    }
 }

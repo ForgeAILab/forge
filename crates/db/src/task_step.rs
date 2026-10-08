@@ -585,7 +585,7 @@ impl SqliteDb {
              WHERE s.task_id<>? AND json_extract(s.payload_json,'$.admission_agent_id') IS NOT NULL \
              AND ((s.status='pending' AND s.lane='fast' AND s.available_at<=? \
                    AND NOT EXISTS(SELECT 1 FROM task_step p WHERE p.task_id=s.task_id AND p.seq<s.seq AND p.status IN ('pending','claimed')) \
-                   AND NOT EXISTS(SELECT 1 FROM task_step p WHERE p.task_id=s.task_id AND p.id!=s.id AND p.lease_until>?)) \
+                   AND NOT EXISTS(SELECT 1 FROM task_step p WHERE p.task_id=s.task_id AND p.id!=s.id AND p.status='claimed' AND p.lease_until>?)) \
                OR (s.status='claimed' AND s.lane='fast' AND s.lease_until>?)) \
              AND EXISTS(SELECT 1 FROM task t WHERE t.id=s.task_id AND t.status=s.expected_status AND t.status_epoch=s.expected_epoch AND t.deleted_at IS NULL) \
              AND NOT EXISTS(SELECT 1 FROM task_hook_checkpoint h WHERE h.step_id=s.id AND (h.hook_index=json_extract(s.payload_json,'$.dispatch_index') AND h.result_json IS NOT NULL OR (json_extract(s.payload_json,'$.dispatch_index') IS NOT NULL AND json_type(h.result_json,'$.Cascade') IS NOT NULL) OR json_type(h.result_json,'$.Failed') IS NOT NULL)) \
@@ -1209,6 +1209,37 @@ mod tests {
         db.start_hook(&hook_step, 0).await.unwrap();
         db.finish_hook(&hook_step, 0, "\"Ok\"").await.unwrap();
         assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (2, 2));
+    }
+    /// A cascade settles in its commit but keeps its lease until its owner
+    /// releases it. The entry it queued is already the Task's imminent
+    /// admission: hiding it for that window let a second waiter past a full
+    /// machine in the same dispatcher pass.
+    #[tokio::test]
+    async fn queued_admissions_count_an_entry_behind_a_settled_leased_step() {
+        let db = fixture().await;
+        let mut cascade = input("a", "cascade");
+        cascade.payload_json = serde_json::json!({"admission_agent_id":"agent"}).to_string();
+        db.enqueue_step(&cascade).await.unwrap();
+        let settled = db
+            .claim_step("owner", Some("a"), &later())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (1, 1));
+        let mut tx = begin_immediate(db.pool()).await.unwrap();
+        db.finish_step_in_tx(&mut tx, &settled, "done", None)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut entry = input("a", "entry");
+        entry.kind = "hooks".into();
+        entry.payload_json =
+            serde_json::json!({"admission_agent_id":"agent", "dispatch_index":0}).to_string();
+        db.enqueue_step(&entry).await.unwrap();
+        // Settled, lease not yet released.
+        assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (1, 1));
+        db.release_step(&settled.id, "owner").await.unwrap();
+        assert_eq!(db.queued_admissions("agent", "z").await.unwrap(), (1, 1));
     }
     #[tokio::test]
     async fn hook_and_script_checkpoints_reject_stale_owners_and_serialize_writers() {

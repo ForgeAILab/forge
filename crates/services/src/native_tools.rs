@@ -6,6 +6,7 @@
 //! call their shared command services, while approval-required mutations
 //! retain an `AgentAction` envelope.
 
+mod registered_proposals;
 mod registered_reads;
 
 use std::{
@@ -67,8 +68,7 @@ use crate::{
         TaskProposalPayload,
     },
     MainGenesisCharterDraftRequest, MainGenesisCommandService, MainGenesisDraftCommandInput,
-    MainGenesisDraftPrincipal, MainGenesisProjectAgentSelectCommandInput,
-    MainGenesisProjectAgentSelectRequest, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
+    MainGenesisDraftPrincipal, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
     MainGenesisStartRequest, MainOrchestrationQueryService, OrchestrationAuthorizationService,
     ProjectOrchestrationActionService, TaskService,
 };
@@ -2658,6 +2658,11 @@ impl CoordinationToolProvider {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
+        if registered_proposals::CATALOG.lookup(operation).is_some() {
+            return self
+                .registered_proposal(actor_identity_id, scope, operation, arguments, false)
+                .await;
+        }
         let payload = arguments
             .get("payload")
             .filter(|value| value.is_object())
@@ -2712,16 +2717,6 @@ impl CoordinationToolProvider {
         if operation == MAIN_GENESIS_START_OPERATION {
             return self
                 .execute_main_genesis_start(actor_identity_id, scope, arguments, payload)
-                .await;
-        }
-        if operation == MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION {
-            return self
-                .execute_main_genesis_project_agent_select(
-                    actor_identity_id,
-                    scope,
-                    arguments,
-                    payload,
-                )
                 .await;
         }
         if operation == MAIN_CHARTER_DRAFT_OPERATION {
@@ -2853,14 +2848,6 @@ impl CoordinationToolProvider {
                 )
             })?;
         let (target_type, target_id) = match operation {
-            MAIN_PROJECT_CREATE_OPERATION => {
-                let account_id = self
-                    .authorization
-                    .main_account_id(actor_identity_id, scope)
-                    .await
-                    .map_err(native_scope_error)?;
-                (Some("account".to_owned()), Some(account_id))
-            }
             PROJECT_CHARTER_ADOPTION_OPERATION => {
                 let project_id = self
                     .authorization
@@ -2942,6 +2929,31 @@ impl CoordinationToolProvider {
                 ));
             }
         };
+        self.enqueue_action(
+            actor_identity_id,
+            scope,
+            operation,
+            arguments,
+            payload,
+            requested_permission,
+            target_type,
+            target_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn enqueue_action(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: Value,
+        payload: Value,
+        requested_permission: &str,
+        target_type: Option<String>,
+        target_id: Option<String>,
+    ) -> Result<Value, AgentHostError> {
         let dedupe_key = required_argument(&arguments, "dedupe_key")?;
         let correlation_id = required_argument(&arguments, "correlation_id")?;
         let causation_id = arguments
@@ -3471,83 +3483,6 @@ impl CoordinationToolProvider {
         Ok(json!({
             "operation": MAIN_CHARTER_DRAFT_OPERATION,
             "status": "succeeded",
-            "materialized": true,
-            "domain_committed": true,
-            "receipt_id": result.receipt_id,
-            "event_id": result.event_id,
-            "domain_result": result.result,
-        }))
-    }
-
-    async fn execute_main_genesis_project_agent_select(
-        &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
-        arguments: Value,
-        mut payload: Value,
-    ) -> Result<Value, AgentHostError> {
-        if let Some(object) = payload.as_object_mut() {
-            object.remove("action");
-        }
-        let correlation_id = required_argument(&arguments, "correlation_id")?;
-        let request: MainGenesisProjectAgentSelectRequest = typed_command_payload(
-            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-            scope,
-            &correlation_id,
-            payload.clone(),
-        )?;
-        let requested_permission = operation_permission(
-            scope.scope_type,
-            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-        )
-        .ok_or_else(|| {
-            AgentHostError::Authority(
-                "Project Agent selection has no canonical permission descriptor".to_owned(),
-            )
-        })?;
-        let (policy_result, policy_reason) = self
-            .actions
-            .evaluate_direct_command_policy(
-                actor_identity_id,
-                scope_type_name(scope.scope_type),
-                &scope.scope_id,
-                requested_permission,
-                MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-                Some(&payload.to_string()),
-            )
-            .await
-            .map_err(service_error)?;
-        if policy_result != AgentActionPolicyResult::Allowed {
-            return Err(AgentHostError::Authority(policy_reason.unwrap_or_else(
-                || "Project Agent selection policy did not admit this command".to_owned(),
-            )));
-        }
-        let result = MainGenesisCommandService::new(self.db.clone())
-            .select_project_agent(MainGenesisProjectAgentSelectCommandInput {
-                principal: MainGenesisDraftPrincipal::MainAgent {
-                    identity_id: actor_identity_id.to_owned(),
-                    scope: scope.clone(),
-                },
-                request,
-                idempotency_key: required_argument(&arguments, "dedupe_key")?,
-                correlation_id,
-                causation_id: arguments
-                    .get("causation_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                causation_depth: arguments
-                    .get("causation_depth")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
-                policy_result: policy_result.to_string(),
-                requested_permission: requested_permission.to_owned(),
-            })
-            .await
-            .map_err(service_error)?;
-        Ok(json!({
-            "operation": MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-            "status": "succeeded",
-            "replayed": result.replayed,
             "materialized": true,
             "domain_committed": true,
             "receipt_id": result.receipt_id,
@@ -4172,6 +4107,82 @@ impl CoordinationToolProvider {
         }
         AgentHostError::StructuredOutcome(Box::new(outcome))
     }
+    async fn proposal_boundary(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        runtime_session_id: &str,
+        operation: &str,
+        arguments: Value,
+        prepared: bool,
+    ) -> Result<Value, AgentHostError> {
+        let correlation = correlation_id(&arguments, operation, scope);
+        let payload = arguments.get("payload");
+        let approval_required = payload
+            .map(|payload| {
+                matches!(
+                    operation_descriptor(scope.scope_type, operation, Some(payload)).classification,
+                    OperationClassification::ApprovalRequiredAction
+                )
+            })
+            .unwrap_or(false);
+        let result = if prepared && registered_proposals::CATALOG.lookup(operation).is_some() {
+            self.registered_proposal(actor_identity_id, scope, operation, arguments.clone(), true)
+                .await
+        } else {
+            self.propose(
+                actor_identity_id,
+                scope,
+                runtime_session_id,
+                operation,
+                arguments.clone(),
+            )
+            .await
+        };
+        if operation_contract(operation).is_some() {
+            match result {
+                Ok(result) => Self::structured_success(
+                    operation,
+                    scope,
+                    &correlation,
+                    result,
+                    approval_required,
+                ),
+                Err(error) => Err(self
+                    .structured_boundary_error(
+                        actor_identity_id,
+                        scope,
+                        operation,
+                        &arguments,
+                        error,
+                    )
+                    .await),
+            }
+        } else {
+            match result {
+                Err(error)
+                    if matches!(&error, AgentHostError::Authority(_))
+                        || matches!(
+                            &error,
+                            AgentHostError::StructuredOutcome(_)
+                                | AgentHostError::AgentPaused { .. }
+                                | AgentHostError::ProjectPaused { .. }
+                        ) =>
+                {
+                    Err(self
+                        .structured_boundary_error(
+                            actor_identity_id,
+                            scope,
+                            operation,
+                            &arguments,
+                            error,
+                        )
+                        .await)
+                }
+                other => other,
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -4381,6 +4392,7 @@ impl ForgeToolProvider for CoordinationToolProvider {
                 provider: self,
                 actor_identity_id,
                 scope,
+                proposal_arguments: None,
             };
             match spec.dispatch(&context, arguments).await {
                 Ok(result) => Ok(result),
@@ -4478,6 +4490,15 @@ impl ForgeToolProvider for CoordinationToolProvider {
         }
     }
 
+    async fn proposal_denial(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        self.main_proposal_admission(actor_identity_id, scope, operation)
+            .await
+    }
     async fn propose(
         &self,
         actor_identity_id: &str,
@@ -4486,68 +4507,33 @@ impl ForgeToolProvider for CoordinationToolProvider {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
-        let correlation = correlation_id(&arguments, operation, scope);
-        let payload = arguments.get("payload");
-        let approval_required = payload
-            .map(|payload| {
-                matches!(
-                    operation_descriptor(scope.scope_type, operation, Some(payload)).classification,
-                    OperationClassification::ApprovalRequiredAction
-                )
-            })
-            .unwrap_or(false);
-        let result = self
-            .propose(
-                actor_identity_id,
-                scope,
-                runtime_session_id,
-                operation,
-                arguments.clone(),
-            )
-            .await;
-        if operation_contract(operation).is_some() {
-            match result {
-                Ok(result) => Self::structured_success(
-                    operation,
-                    scope,
-                    &correlation,
-                    result,
-                    approval_required,
-                ),
-                Err(error) => Err(self
-                    .structured_boundary_error(
-                        actor_identity_id,
-                        scope,
-                        operation,
-                        &arguments,
-                        error,
-                    )
-                    .await),
-            }
-        } else {
-            match result {
-                Err(error)
-                    if matches!(&error, AgentHostError::Authority(_))
-                        || matches!(
-                            &error,
-                            AgentHostError::StructuredOutcome(_)
-                                | AgentHostError::AgentPaused { .. }
-                                | AgentHostError::ProjectPaused { .. }
-                        ) =>
-                {
-                    Err(self
-                        .structured_boundary_error(
-                            actor_identity_id,
-                            scope,
-                            operation,
-                            &arguments,
-                            error,
-                        )
-                        .await)
-                }
-                other => other,
-            }
-        }
+        self.proposal_boundary(
+            actor_identity_id,
+            scope,
+            runtime_session_id,
+            operation,
+            arguments,
+            false,
+        )
+        .await
+    }
+    async fn propose_prepared(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        runtime_session_id: &str,
+        operation: &str,
+        arguments: Value,
+    ) -> Result<Value, AgentHostError> {
+        self.proposal_boundary(
+            actor_identity_id,
+            scope,
+            runtime_session_id,
+            operation,
+            arguments,
+            true,
+        )
+        .await
     }
 }
 

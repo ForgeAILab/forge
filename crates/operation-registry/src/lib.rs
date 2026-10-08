@@ -2,6 +2,7 @@
 //! handlers; consumers use the same catalog for schemas, decoding and dispatch.
 
 mod input_check;
+pub mod main_proposals;
 pub mod main_reads;
 pub mod project_reads;
 pub mod scope_reads;
@@ -17,9 +18,9 @@ use std::{
 };
 
 pub type HandlerFuture<'a, E> = Pin<Box<dyn Future<Output = Result<Value, E>> + Send + 'a>>;
-pub type TypedHandler<I, E> = for<'a> fn(&'a dyn ReadContext<E>, I) -> HandlerFuture<'a, E>;
+pub type TypedHandler<I, E> = for<'a> fn(&'a dyn OperationContext<E>, I) -> HandlerFuture<'a, E>;
 type ErasedHandler<E> = dyn for<'a> Fn(
-        &'a dyn ReadContext<E>,
+        &'a dyn OperationContext<E>,
         Value,
     ) -> Pin<Box<dyn Future<Output = Result<Value, DispatchError<E>>> + Send + 'a>>
     + Send
@@ -27,18 +28,20 @@ type ErasedHandler<E> = dyn for<'a> Fn(
 
 /// A service context implements the domain interfaces in this catalog.
 /// This marker has no operation declarations or domain behaviour.
-pub trait ReadContext<E>:
+pub trait OperationContext<E>:
     scope_reads::ScopeReadContext<E>
     + project_reads::ProjectReadContext<E>
     + main_reads::MainReadContext<E>
+    + main_proposals::MainProposalContext<E>
 {
 }
 impl<
         E,
         T: scope_reads::ScopeReadContext<E>
             + project_reads::ProjectReadContext<E>
-            + main_reads::MainReadContext<E>,
-    > ReadContext<E> for T
+            + main_reads::MainReadContext<E>
+            + main_proposals::MainProposalContext<E>,
+    > OperationContext<E> for T
 {
 }
 
@@ -76,6 +79,7 @@ impl AuthorityRule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldProjection {
     ReadArguments,
+    ProposalPayload,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct SurfaceBinding {
@@ -85,6 +89,8 @@ pub struct SurfaceBinding {
 #[derive(Debug, Clone, Copy)]
 pub enum StructuralConstraint {
     ClosedObject,
+    /// A field the existing transport adapter discards before decoding.
+    IgnoredField(&'static str),
     Required(&'static str),
     StringEnum {
         field: &'static str,
@@ -191,6 +197,9 @@ impl<E: Send + 'static> OperationSpec<E> {
         for constraint in constraints {
             match constraint {
                 StructuralConstraint::ClosedObject => schema["additionalProperties"] = json!(false),
+                StructuralConstraint::IgnoredField(field) => {
+                    schema["properties"].as_object_mut().unwrap().remove(*field);
+                }
                 StructuralConstraint::Required(field) => {
                     let required = schema["required"].as_array_mut().unwrap();
                     if !required.contains(&json!(field)) {
@@ -202,6 +211,10 @@ impl<E: Send + 'static> OperationSpec<E> {
                 }
             }
         }
+        schema["required"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|a, b| a.as_str().cmp(&b.as_str()));
         Self {
             id,
             authority,
@@ -220,8 +233,9 @@ impl<E: Send + 'static> OperationSpec<E> {
                         .map_err(|e| e.to_string())
                 },
             },
-            handler: Box::new(move |context, value| {
+            handler: Box::new(move |context, mut value| {
                 Box::pin(async move {
+                    input_check::strip_ignored_fields(&mut value, constraints);
                     let input = serde_json::from_value::<I>(value)
                         .map_err(|e| DispatchError::InvalidInput(e.to_string()))?;
                     handler(context, input)
@@ -256,12 +270,21 @@ impl<E: Send + 'static> OperationSpec<E> {
     }
     pub async fn dispatch(
         &self,
-        context: &dyn ReadContext<E>,
+        context: &dyn OperationContext<E>,
         input: Value,
     ) -> Result<Value, DispatchError<E>> {
         let input = self
             .normalize_arguments(&input)
             .map_err(DispatchError::InvalidInput)?;
+        self.dispatch_prepared(context, input).await
+    }
+    /// Invoke exact stored arguments without rechecking the current contract.
+    /// Domain checks and the typed decoder still run.
+    pub async fn dispatch_prepared(
+        &self,
+        context: &dyn OperationContext<E>,
+        input: Value,
+    ) -> Result<Value, DispatchError<E>> {
         (self.handler)(context, input).await
     }
 }
@@ -298,11 +321,17 @@ impl<E: Send + 'static> OperationCatalog<E> {
     }
 }
 
-/// Every registered read operation, from the domain modules' own id lists.
+/// Every registered read, from the domain modules' own id lists.
 /// A domain module adds its ids next to its specs; the catalog refuses a
 /// module whose specs and ids disagree and any id declared twice.
-pub fn registered_operations() -> Vec<&'static str> {
+pub fn registered_reads() -> Vec<&'static str> {
     let mut ids = [scope_reads::IDS, project_reads::IDS, main_reads::IDS].concat();
+    ids.sort_unstable();
+    ids
+}
+/// Every operation in the registry, independent of effect class.
+pub fn registered_operations() -> Vec<&'static str> {
+    let mut ids = [registered_reads(), main_proposals::IDS.to_vec()].concat();
     ids.sort_unstable();
     ids
 }
@@ -312,7 +341,7 @@ pub fn read_catalog<E: Send + 'static>() -> OperationCatalog<E> {
             .into_iter()
             .chain(project_reads::specs())
             .chain(main_reads::specs()),
-        &registered_operations(),
+        &registered_reads(),
     )
     .expect("complete read catalog")
 }

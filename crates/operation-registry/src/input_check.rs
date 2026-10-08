@@ -39,6 +39,16 @@ fn integer_spelling(value: &Value) -> Option<Value> {
     }
 }
 
+pub(crate) fn strip_ignored_fields(value: &mut Value, constraints: &[StructuralConstraint]) {
+    if let Some(object) = value.as_object_mut() {
+        for constraint in constraints {
+            if let StructuralConstraint::IgnoredField(field) = constraint {
+                object.remove(*field);
+            }
+        }
+    }
+}
+
 impl TypedInputContract {
     /// Validate envelope-normalized arguments and return their canonical
     /// form: an integer field sent as an integer-valued string or float
@@ -46,6 +56,8 @@ impl TypedInputContract {
     /// widened; the field stays an integer. The error names the offending
     /// field; [`crate::OperationSpec::normalize_arguments`] adds the operation.
     pub(crate) fn normalize(&self, value: &Value) -> Result<Value, String> {
+        let mut value = value.clone();
+        strip_ignored_fields(&mut value, self.constraints);
         let mut object = value
             .as_object()
             .ok_or("arguments must be an object")?

@@ -42,6 +42,31 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   (`{"limit":"10"}` and `{"limit":10.0}` are `10`), a `limit` of `0` or above
   `20` (clamped as before), an omitted or `null` `limit`, and an omitted or
   `null` `context`. MCP is unchanged.
+- **`project.create` and `genesis.project_agent.select` refuse two kinds of
+  input they used to accept (3.8 slice C).** A refused call returns a tool
+  error the model can correct in the same turn. These inputs used to succeed
+  and are now refused:
+  - *A `project.create` call without a usable Charter approval reference.*
+    `{"operation":"project.create","payload":{"action":"create_from_approval"},
+    "dedupe_key":"k","correlation_id":"c"}`, and the same call with
+    `"approval_id":null`, `"approval_id":""` or `"approval_id":7`, used to
+    queue a pending action. The owner could approve that action, and its
+    execution then always failed with `approval_id is required`. The call is
+    now refused before anything is queued (``project.create: argument
+    `approval_id` is required; expected project.create: {approval_id}``).
+    Actions queued or prepared before this change are not rechecked.
+  - *An authority or scope field outside the payload, on a direct provider
+    call.* `{"operation":"project.create","payload":{"approval_id":"a"},
+    "dedupe_key":"k","correlation_id":"c","identity_id":"other"}` used to
+    ignore the extra root field. It is now a policy denial, and so is the same
+    name nested in other ignored envelope data
+    (`"extra":{"authority":"forged"}`). The refused names are
+    `actor_identity_id`, `identity_id`, `scope_type`, `scope_id`, `project_id`,
+    `authority`, `permission`, `workspace`, `workspace_path`, `workspace_lease`,
+    `repository_path`, `repository_url`, `credential`, `target_type` and
+    `target_id`. Calls through `forge_main_orchestration_propose` were already
+    refused, and these names were already refused inside the payload. Only
+    these two operations run the check; every other operation is unchanged.
 - **Native `account.summary` and `agent_chat.summary` refuse nested arguments
   (3.8 slice B).** Through `forge_scope_read` these two reads used to ignore
   whatever was passed in `arguments`; a call such as
@@ -586,6 +611,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   writes no rows and publishes no events, and the existing Task-step code
   records their results in the same order and transactions as before. No
   behaviour, timeout, REST, MCP or daemon protocol change.
+- **`genesis.project_agent.select` and `project.create` moved onto the
+  operation registry (3.8 slice C).** Each has one typed contract that
+  produces its advertised payload line, its argument check and its dispatch;
+  the hand-written schema, validator and dispatch arm are deleted. The
+  contract lines are
+  `genesis.project_agent.select: {expected_session_version, genesis_session_id?, project_agent_identity_id}`
+  and `project.create: {approval_id}`. The `action` field is no longer
+  advertised for either operation. A call that still sends it is accepted and
+  the field is ignored, whatever its value. `expected_session_version` also
+  accepts an integer-valued string or float (`"3"` and `3.0` are `3`).
+  `project.create` still only queues an approval-required action: the Project
+  is created only after the owner approves that action and the user executes
+  it. Receipts, dedupe keys, and calls prepared or queued before this change
+  behave as before. The Main tool definitions shrink from 8,814 to 8,558
+  bytes. `genesis.start` and `charter.draft` are unchanged.
 
 - **Passive integration queues and shadow observations (3.2 stage B).** Two
   new tables, `integration_queue` (one per repository and target branch) and
@@ -1361,6 +1401,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A full machine no longer lets a second waiting Task leave its initial state in the same dispatcher pass. For a moment after a Task's transition step settled, its queued role entry was not counted as an admission in flight, so the next waiter was moved to its work state and parked there on machine capacity. No second run started, the run cap held.
 - **A corrupt Task condition repairs itself again.** A stored condition that
   is empty or corrupt (`{}`, `[]`, a bare number, invalid JSON, a known kind
   with a broken body) is restated from the Task's own fields by the next write

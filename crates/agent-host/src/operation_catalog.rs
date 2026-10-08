@@ -928,30 +928,36 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
     }
 }
 
+/// Field names whose values Forge derives from the authenticated binding.
+/// Every authority guard starts from this one list: the dispatch guard below
+/// adds `project_id`, and native preparation adds its prompt-injection names
+/// (`typed_tools::reject_authority_overrides`).
+pub(crate) const SERVER_DERIVED_FIELDS: &[&str] = &[
+    "actor_identity_id",
+    "identity_id",
+    "scope_type",
+    "scope_id",
+    "authority",
+    "permission",
+    "workspace",
+    "workspace_path",
+    "workspace_lease",
+    "repository_path",
+    "repository_url",
+    "credential",
+    "target_type",
+    "target_id",
+];
+
 /// Return whether a payload attempts to supply authority or scope that Forge
 /// must derive from the authenticated binding.
 #[must_use]
 pub fn contains_authority_override(value: &Value) -> bool {
-    const FORBIDDEN_FIELDS: &[&str] = &[
-        "actor_identity_id",
-        "identity_id",
-        "scope_type",
-        "scope_id",
-        "project_id",
-        "authority",
-        "permission",
-        "workspace",
-        "workspace_path",
-        "workspace_lease",
-        "repository_path",
-        "repository_url",
-        "credential",
-        "target_type",
-        "target_id",
-    ];
     match value {
         Value::Object(object) => object.iter().any(|(key, nested)| {
-            FORBIDDEN_FIELDS.contains(&key.as_str()) || contains_authority_override(nested)
+            key == "project_id"
+                || SERVER_DERIVED_FIELDS.contains(&key.as_str())
+                || contains_authority_override(nested)
         }),
         Value::Array(values) => values.iter().any(contains_authority_override),
         _ => false,

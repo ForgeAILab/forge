@@ -186,6 +186,14 @@ async fn fixture_with_db(db: Arc<SqliteDb>) -> Fixture {
 /// immutable once created, so a test that needs a deterministic non-provider
 /// backend must select it here.
 async fn fixture_with_project_backend(db: Arc<SqliteDb>, project_backend_kind: &str) -> Fixture {
+    fixture_with_policies(db, project_backend_kind, "{}").await
+}
+
+async fn fixture_with_policies(
+    db: Arc<SqliteDb>,
+    project_backend_kind: &str,
+    main_policy: &str,
+) -> Fixture {
     let authorization_now = now_rfc3339();
     UserRepo::create_user(
         &*db,
@@ -207,7 +215,7 @@ async fn fixture_with_project_backend(db: Arc<SqliteDb>, project_backend_kind: &
         MAIN_IDENTITY_ID,
         MAIN_PROFILE_ID,
         "Main Agent",
-        "{}",
+        main_policy,
         "native",
     )
     .await;
@@ -1580,5 +1588,204 @@ async fn project_turn_uses_issued_handoff_without_rewalking_mutable_main_history
             message.contains(expected),
             "{label}: expected {expected:?}, got {message:?}"
         );
+    }
+}
+
+/// Literal pre-change AgentAction payloads from gate.md. New-call contracts
+/// must never be applied by the approved action executor. Each case drives
+/// approval/status transitions, user execution, receipt replay and one effect.
+#[tokio::test]
+async fn pre_change_main_create_prepared_pending_and_edited_actions_execute_exactly_once() {
+    use db::AgentActionApprovalDecision;
+    for (form, payload) in [
+        ("prepared", r#"{"approval_id":"main-command-approval"}"#),
+        (
+            "approval_pending",
+            r#"{"action":"create_from_approval","approval_id":"main-command-approval","ignored":"pre-change"}"#,
+        ),
+        (
+            "approval_edited",
+            r#"{"action":"create_from_approval","approval_id":"main-command-approval","ignored":"approved edit"}"#,
+        ),
+    ] {
+        let mut f = fixture().await;
+        // Preserve exact old JSON bytes; no new registry/prepare writes this row.
+        sqlx::query("UPDATE agent_action SET payload_json = ?, policy_result = 'approval_required', status = 'pending_approval' WHERE id = ?")
+            .bind(payload).bind(ACTION_ID).execute(f.db.pool()).await.unwrap();
+        let service = MainOrchestrationActionService::new(f.db.clone());
+        let denied = service.execute(command_input(&f)).await.unwrap_err();
+        assert!(
+            denied
+                .to_string()
+                .contains("requires an admitted policy result and status"),
+            "{form}: {denied}"
+        );
+        // Drive the real independent approval service, separate from Charter approval.
+        create_identity(
+            &f.db,
+            "pre-change-approver",
+            "pre-change-approver-profile",
+            "Independent approver",
+            r#"{"permissions":["approve_actions"]}"#,
+            "native",
+        )
+        .await;
+        sqlx::query("UPDATE agent_identity SET account_permission_ceiling = ? WHERE id = 'pre-change-approver'")
+            .bind(r#"{"permissions":["approve_actions"]}"#).execute(f.db.pool()).await.unwrap();
+        services::AgentActionService::new(f.db.clone())
+            .approve(services::ApproveActionInput {
+                action_id: ACTION_ID.into(),
+                expected_version: f.action_version,
+                approver_identity_id: "pre-change-approver".into(),
+                decision: AgentActionApprovalDecision::Approved,
+                reason: Some("Approve recorded action".into()),
+            })
+            .await
+            .unwrap();
+        f.action_version += 1;
+        let mut agent = command_input(&f);
+        agent.executed_by_type = "agent".into();
+        agent.executed_by_id = MAIN_IDENTITY_ID.into();
+        let denied = service.execute(agent).await.unwrap_err();
+        assert!(denied.to_string().contains("user-only"), "{form}: {denied}");
+        let first = service.execute(command_input(&f)).await.unwrap();
+        let receipt = sqlx::query("SELECT id, event_id, outcome_json FROM command_receipt WHERE operation = 'project.create'").fetch_one(f.db.pool()).await.unwrap();
+        let replay = service.execute(command_input(&f)).await.unwrap();
+        assert_eq!(first.id, replay.id);
+        assert_eq!(first.result_json, replay.result_json);
+        let replay_receipt = sqlx::query("SELECT id, event_id, outcome_json FROM command_receipt WHERE operation = 'project.create'").fetch_one(f.db.pool()).await.unwrap();
+        for field in ["id", "event_id", "outcome_json"] {
+            assert_eq!(
+                receipt.get::<String, _>(field),
+                replay_receipt.get::<String, _>(field),
+                "{form} {field}"
+            );
+        }
+        let stored = AgentActionRepo::get_action(&*f.db, ACTION_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.payload_json, payload);
+        for query in [
+            "SELECT COUNT(*) FROM project",
+            "SELECT COUNT(*) FROM command_receipt WHERE operation = 'project.create'",
+            "SELECT COUNT(*) FROM agent_action_execution WHERE status = 'succeeded'",
+            "SELECT COUNT(*) FROM agent_handoff",
+        ] {
+            let count: i64 = sqlx::query_scalar(query)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 1, "{form} {query}");
+        }
+    }
+}
+
+#[path = "common/pre_change_main_runtime.rs"]
+mod pre_change_main_runtime;
+
+#[tokio::test]
+async fn main_create_literal_checkpoints_resume_real_provider_then_approve_execute_and_replay() {
+    use forge_agent_host::{CanonicalScope, CanonicalScopeType, WorkspaceAccess};
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "common/main_proposal_checkpoints_pre_change.json"
+    ))
+    .unwrap();
+    for form in ["prepared", "approval_pending", "approval_edited"] {
+        let fixture_bytes = &fixtures[format!("project.create:{form}")];
+        let policy = r#"{"permissions":["read_account","read_agent_chat","propose_project"]}"#;
+        let mut f = fixture_with_policies(database().await, "native", policy).await;
+        sqlx::query("UPDATE agent_identity SET account_permission_ceiling = ? WHERE id = ?")
+            .bind(policy)
+            .bind(MAIN_IDENTITY_ID)
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        // Exact gate-authored row bytes, including payload hash and pending status.
+        sqlx::query("UPDATE agent_action SET scope_type = 'account', scope_id = ?, target_type = 'account', target_id = ?, payload_json = ?, payload_hash = ?, policy_result = 'approval_required', status = 'pending_approval' WHERE id = ?")
+            .bind(ACCOUNT_ID).bind(ACCOUNT_ID).bind(fixture_bytes["payload_json"].as_str().unwrap()).bind(fixture_bytes["payload_hash"].as_str().unwrap()).bind(ACTION_ID).execute(f.db.pool()).await.unwrap();
+        let before = AgentActionRepo::get_action(&*f.db, ACTION_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let provider = services::CoordinationToolProvider::new(f.db.clone());
+        let scope = CanonicalScope {
+            scope_type: CanonicalScopeType::Account,
+            scope_id: ACCOUNT_ID.into(),
+            workspace_access: WorkspaceAccess::Deny,
+        };
+        let composition = forge_agent_host::ScopeToolComposition::for_scope_with_permissions(
+            MAIN_IDENTITY_ID,
+            scope,
+            None,
+            None,
+            &std::collections::BTreeSet::from(["propose_project".into()]),
+            Some(Arc::new(provider)),
+        )
+        .unwrap();
+        pre_change_main_runtime::resume(composition, &fixture_bytes["checkpoint"]).await;
+        let after = AgentActionRepo::get_action(&*f.db, ACTION_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "{form}: resume/dedupe preserves the exact pending action"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let service = MainOrchestrationActionService::new(f.db.clone());
+        assert!(service
+            .execute(command_input(&f))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("requires an admitted policy result and status"));
+        create_identity(
+            &f.db,
+            "runtime-approver",
+            "runtime-approver-profile",
+            "Independent approver",
+            r#"{"permissions":["approve_actions"]}"#,
+            "native",
+        )
+        .await;
+        sqlx::query("UPDATE agent_identity SET account_permission_ceiling = ? WHERE id = 'runtime-approver'").bind(r#"{"permissions":["approve_actions"]}"#).execute(f.db.pool()).await.unwrap();
+        services::AgentActionService::new(f.db.clone())
+            .approve(services::ApproveActionInput {
+                action_id: ACTION_ID.into(),
+                expected_version: f.action_version,
+                approver_identity_id: "runtime-approver".into(),
+                decision: db::AgentActionApprovalDecision::Approved,
+                reason: None,
+            })
+            .await
+            .unwrap();
+        f.action_version += 1;
+        let first = service.execute(command_input(&f)).await.unwrap();
+        let receipt: (String, String) = sqlx::query_as(
+            "SELECT id, outcome_json FROM command_receipt WHERE operation = 'project.create'",
+        )
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+        let replay = service.execute(command_input(&f)).await.unwrap();
+        assert_eq!(first.id, replay.id);
+        assert_eq!(first.result_json, replay.result_json);
+        let frozen: (String, String) = sqlx::query_as(
+            "SELECT id, outcome_json FROM command_receipt WHERE operation = 'project.create'",
+        )
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt, frozen);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project")
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
