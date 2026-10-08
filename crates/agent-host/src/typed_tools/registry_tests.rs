@@ -254,6 +254,16 @@ fn main_registered_reads_have_no_hand_schema_validator_or_dispatch_arm() {
         .split("pub(crate) fn orchestration_read_schema")
         .next()
         .unwrap();
+    // Read-classified operations never reach the proposal payload schema;
+    // an arm for one there would be a second, unreachable contract.
+    let payloads = include_str!("../operation_contract.rs")
+        .split("pub(crate) fn orchestration_payload_schema")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) fn portable_const_schema")
+        .next()
+        .unwrap();
+    assert!(payloads.contains("MAIN_CHARTER_DRAFT_OPERATION =>"));
     let validators = include_str!("../typed_tools.rs")
         .split("fn validate_orchestration_read_arguments")
         .nth(1)
@@ -278,7 +288,7 @@ fn main_registered_reads_have_no_hand_schema_validator_or_dispatch_arm() {
         "\"discovery.read\"",
         "\"portfolio.read\"",
     ] {
-        for source in [schemas, validators, dispatcher] {
+        for source in [schemas, payloads, validators, dispatcher] {
             assert!(!source.contains(marker), "remaining hand layer: {marker}");
         }
     }
@@ -293,8 +303,13 @@ fn main_registered_reads_have_no_hand_schema_validator_or_dispatch_arm() {
     }
 }
 
+/// A forged authority field is refused exactly as before the operation was
+/// registered: by the generic guard, before any contract detail is returned.
+/// The generic scope surface never ran that guard; there the closed contract
+/// is what refuses the field.
 #[tokio::test]
-async fn main_contract_errors_name_authority_fields_before_the_generic_guard() {
+async fn authority_fields_are_refused_by_the_guard_before_the_main_contract() {
+    const GUARD: &str = "Forge orchestration scope and authority are server-derived";
     let inputs: Value = serde_json::from_str(include_str!(
         "../../../operation-registry/tests/read_inputs.json"
     ))
@@ -302,24 +317,33 @@ async fn main_contract_errors_name_authority_fields_before_the_generic_guard() {
     for id in operation_registry::main_reads::IDS {
         let spec = READ_CATALOG.lookup(id).unwrap();
         let provider = Arc::new(RecordingProvider::default());
-        let mut tool = ForgeScopeReadTool::named(
-            "actor".into(),
-            scope(CanonicalScopeType::AgentChat, WorkspaceAccess::Deny),
-            vec![id.to_string()],
-            provider.clone(),
-            spec.surfaces[0].native_aggregate,
-            "Main scope",
-        );
-        // These two use the generic scope surface in production.
-        if spec.surfaces[0].native_aggregate == "forge_scope_read" {
-            tool.reject_authority_overrides = false;
-        }
-        let mut cases = vec![("identity_id".to_owned(), inputs[*id].clone())];
-        cases[0].1["identity_id"] = json!("forged");
+        let aggregate = spec.surfaces[0].native_aggregate;
+        let guarded = aggregate == FORGE_MAIN_ORCHESTRATION_READ_TOOL;
+        let tool = if guarded {
+            ForgeScopeReadTool::named(
+                "actor".into(),
+                scope(CanonicalScopeType::AgentChat, WorkspaceAccess::Deny),
+                vec![id.to_string()],
+                provider.clone(),
+                aggregate,
+                "Main scope",
+            )
+        } else {
+            assert_eq!(aggregate, "forge_scope_read");
+            ForgeScopeReadTool::new(
+                "actor".into(),
+                scope(CanonicalScopeType::AgentChat, WorkspaceAccess::Deny),
+                vec![id.to_string()],
+                provider.clone(),
+            )
+        };
+        let mut forged_field = inputs[*id].clone();
+        forged_field["identity_id"] = json!("forged");
+        let mut cases = vec![("identity_id".to_owned(), forged_field)];
         for field in spec.input.schema["properties"].as_object().unwrap().keys() {
-            let mut input = inputs[*id].clone();
-            input[field] = json!({"authority":"forged"});
-            cases.push((field.clone(), input));
+            let mut nested = inputs[*id].clone();
+            nested[field] = json!({"authority":"forged"});
+            cases.push((field.clone(), nested));
         }
         for (field, input) in cases {
             for raw in [
@@ -332,12 +356,89 @@ async fn main_contract_errors_name_authority_fields_before_the_generic_guard() {
                     .await
                     .unwrap_err()
                     .to_string();
-                assert!(
-                    error.contains(id) && error.contains(&field) && error.contains("expected"),
-                    "{error}"
-                );
+                if guarded {
+                    assert!(
+                        error.contains(GUARD) && !error.contains("expected"),
+                        "{id} {field}: {error}"
+                    );
+                } else {
+                    assert!(
+                        error.contains(id) && error.contains(&field) && error.contains("expected"),
+                        "{id} {field}: {error}"
+                    );
+                }
             }
         }
+        // An operation this tool was not granted is denied before either.
+        let error = tool
+            .prepare(
+                json!({"operation":"task.summary","arguments":{"unexpected":true}}),
+                &test_preparation_context("ungranted"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Forge read operation is outside this scope")
+                && !error.contains("expected"),
+            "{error}"
+        );
         assert!(provider.0.lock().unwrap().is_empty());
+    }
+}
+
+/// An integer sent as a string or a float is admitted at preparation; the
+/// advertised aggregate schema still carries no per-field types to widen.
+#[tokio::test]
+async fn integer_spellings_are_admitted_at_preparation() {
+    for (id, field, base) in [
+        ("discovery.read", "limit", json!({})),
+        ("portfolio.read", "limit", json!({})),
+        (
+            "charter.readiness",
+            "expected_charter_version",
+            json!({"charter_id":"c","revision_id":"r","content_digest":"d","render_digest":"d"}),
+        ),
+    ] {
+        let spec = READ_CATALOG.lookup(id).unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let tool = ForgeScopeReadTool::named(
+            "actor".into(),
+            scope(CanonicalScopeType::AgentChat, WorkspaceAccess::Deny),
+            vec![id.to_string()],
+            provider.clone(),
+            spec.surfaces[0].native_aggregate,
+            "test scope",
+        );
+        assert_eq!(
+            tool.spec().input_schema["properties"]["arguments"]["type"],
+            "object"
+        );
+        for spelling in [json!(3), json!("3"), json!(3.0)] {
+            let mut input = base.clone();
+            input[field] = spelling.clone();
+            tool.prepare(
+                json!({"operation":id,"arguments":input}),
+                &test_preparation_context("integer-spelling"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{id} {spelling}: {error}"));
+        }
+        for malformed in [json!("three"), json!(1.5), json!(-1), json!(true)] {
+            let mut input = base.clone();
+            input[field] = malformed.clone();
+            let error = tool
+                .prepare(
+                    json!({"operation":id,"arguments":input}),
+                    &test_preparation_context("integer-malformed"),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(id) && error.contains(field) && error.contains("expected"),
+                "{id} {malformed}: {error}"
+            );
+        }
     }
 }

@@ -1100,6 +1100,9 @@ a positive Charter version; diff requires both revision references.
 optional nullable context (at most 8000). Only a Main Chat exposes inquiry
 execution. The scope-read `discovery.read` and `portfolio.read` accept only an
 optional nullable unsigned `limit`; defaults and clamping are unchanged.
+An integer field of a registered operation also accepts an integer-valued
+string or float (`"10"` and `10.0` are `10`); any other malformed integer
+(`"ten"`, `1.5`, `-1` for an unsigned field, a boolean) is refused.
 Contract violations return an in-turn tool error naming the operation, field
 and expected contract. Proposal/approval and MCP contracts are unchanged.
 

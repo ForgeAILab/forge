@@ -1943,18 +1943,18 @@ impl CoordinationToolProvider {
     /// Agent that cannot run anything still has to be able to read what the run
     /// found before it cites that run as authority, and before it decides the
     /// outcome needs a corrective Task.
-    /// Dispatch one ephemeral inquiry sub-agent and block on its findings.
+    /// Whether this caller may dispatch an inquiry: the runner, the owning
+    /// account and the chat the run record hangs off.
     ///
     /// `main_account_id` is what confines this to a Main Chat: it rejects a
     /// Project Chat outright and requires an Account scope's id to be the
     /// caller's own, so an inquiry can only ever be run against the account
     /// that dispatched it.
-    async fn inquiry_run(
+    async fn inquiry_admission(
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        input: operation_registry::main_reads::InquiryQuery,
-    ) -> Result<Value, AgentHostError> {
+    ) -> Result<(Arc<dyn InquiryRunner>, String, String), AgentHostError> {
         let runner = self.inquiry_runner_handle().ok_or_else(|| {
             AgentHostError::Unsupported("inquiries are not available on this server".to_owned())
         })?;
@@ -1966,14 +1966,23 @@ impl CoordinationToolProvider {
         // The run record hangs off the conversation the user is watching, so
         // an inquiry is only dispatchable from a chat, never from a bare
         // Account session (which is what an inquiry sub-agent itself holds).
-        let chat_id = match scope.scope_type {
-            CanonicalScopeType::AgentChat => scope.scope_id.clone(),
-            _ => {
-                return Err(AgentHostError::Authority(
-                    "inquiries are dispatched from a Main Chat".to_owned(),
-                ));
-            }
-        };
+        match scope.scope_type {
+            CanonicalScopeType::AgentChat => Ok((runner, account_id, scope.scope_id.clone())),
+            _ => Err(AgentHostError::Authority(
+                "inquiries are dispatched from a Main Chat".to_owned(),
+            )),
+        }
+    }
+
+    /// Dispatch one ephemeral inquiry sub-agent and block on its findings.
+    async fn inquiry_run(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        input: operation_registry::main_reads::InquiryQuery,
+    ) -> Result<Value, AgentHostError> {
+        let (runner, account_id, chat_id) =
+            self.inquiry_admission(actor_identity_id, scope).await?;
         let title = input.title.trim().to_owned();
         let question = input.question.trim().to_owned();
         // Preserve semantic whitespace checks and trimming in the handler.
@@ -4368,21 +4377,24 @@ impl ForgeToolProvider for CoordinationToolProvider {
             }
         }
         let result = if let Some(spec) = registered_reads::CATALOG.lookup(operation) {
-            spec.dispatch(
-                &registered_reads::Context {
-                    provider: self,
-                    actor_identity_id,
-                    scope,
-                },
-                arguments,
-            )
-            .await
-            .map_err(|error| match error {
-                operation_registry::DispatchError::InvalidInput(message) => {
-                    invalid_arguments(message)
+            let context = registered_reads::Context {
+                provider: self,
+                actor_identity_id,
+                scope,
+            };
+            match spec.dispatch(&context, arguments).await {
+                Ok(result) => Ok(result),
+                Err(operation_registry::DispatchError::Handler(error)) => Err(error),
+                // The contract is checked before the handler authorizes the
+                // caller. A caller the handler would deny gets that denial,
+                // not the contract.
+                Err(operation_registry::DispatchError::InvalidInput(message)) => {
+                    Err(match context.main_read_denial(operation).await {
+                        Some(denial) => denial,
+                        None => invalid_arguments(message),
+                    })
                 }
-                operation_registry::DispatchError::Handler(error) => error,
-            })
+            }
         } else {
             match operation {
                 PROJECT_CURRENT_STATE_OPERATION => {

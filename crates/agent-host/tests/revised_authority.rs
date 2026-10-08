@@ -842,11 +842,14 @@ fn every_advertised_read_argument_is_admitted_by_the_read_path() {
             .any(|operation| operation == "inquiry.run"),
         "inquiry.run must be advertised before its arguments can matter"
     );
+    // The registry enforces the whole contract, so each advertised field is
+    // probed inside an otherwise complete call.
     for field in ["title", "question", "context"] {
-        let arguments = serde_json::json!({
+        let mut arguments = serde_json::json!({
             "operation": "inquiry.run",
-            "arguments": { field: "x" },
+            "arguments": {"title": "x", "question": "x"},
         });
+        arguments["arguments"][field] = serde_json::json!("y");
         assert!(
             forge_agent_host::admits_orchestration_read_argument("inquiry.run", &arguments),
             "`{field}` is advertised for inquiry.run but refused by the read path"

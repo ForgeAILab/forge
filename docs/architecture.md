@@ -85,7 +85,19 @@ type, so a mismatch does not compile.
   the arguments against the spec: in tool preparation, which native execution
   and the CLI chat callback both run, and again at dispatch in `services`. A
   violation is an ordinary in-turn tool error naming the operation, the
-  offending field and the expected contract.
+  offending field and the expected contract. The check lives in one place,
+  `input_check.rs`, and is driven by the canonical schema: closed object,
+  required fields, scalar types, string lengths, numeric bounds, then the
+  Serde decode. Before the type check an integer field sent as an
+  integer-valued string (`"10"`) or float (`10.0`) is rewritten to the
+  integer, because several providers emit numbers that way; the handler
+  receives the integer. Nothing else is coerced (`"ten"`, `1.5`, `true` and a
+  negative value for an unsigned field are refused), and neither the
+  advertised line nor the canonical schema is widened. Denial comes before
+  contract detail: the read tool rejects an operation outside the session's
+  grant, then a forged scope or authority field, and only then reports a
+  contract violation; at dispatch, a caller the Main handler would deny gets
+  that denial even when the arguments are malformed.
 - *Canonical.* The full per-operation JSON Schema stays in the registry for
   validation, documentation and the `read_contracts.json` fixture. It is not
   what providers are sent.
@@ -104,9 +116,7 @@ Registered reads are `account.summary`, `agent_chat.summary`, `project.charter`,
 `charter.readiness`, `charter.diff`, `charter.approval_target`, `discovery.read`,
 `portfolio.read`, and `inquiry.run`. Main query handlers accept the registry's
 input types directly; their former dispatcher and handwritten decoders are
-removed. String lengths, scalar types, required fields and numeric bounds are
-enforced from the same canonical schema before decoding. Discovery/portfolio
-defaults and clamping remain in the handlers. Inquiry remains a query: its run log and
+removed. Discovery/portfolio defaults and clamping remain in the handlers. Inquiry remains a query: its run log and
 bounded findings do not grant proposal authority. Its `MainChatOnly`
 availability records the existing exclusion from account inquiry sessions.
 The scope-read aggregate adds no contract prose where the base had none.

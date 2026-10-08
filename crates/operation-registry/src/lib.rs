@@ -1,6 +1,7 @@
 //! Transport-neutral operation contracts. Domain modules bind typed inputs to
 //! handlers; consumers use the same catalog for schemas, decoding and dispatch.
 
+mod input_check;
 pub mod main_reads;
 pub mod project_reads;
 pub mod scope_reads;
@@ -139,113 +140,6 @@ impl TypedInputContract {
             format!("{{{}}}", fields.join(", "))
         }
     }
-    /// Structural validation of already-normalized arguments. The error names
-    /// the offending field; [`OperationSpec::validate_arguments`] adds the
-    /// operation.
-    fn validate(&self, value: &Value) -> Result<(), String> {
-        let object = value.as_object().ok_or("arguments must be an object")?;
-        for constraint in self.constraints {
-            match constraint {
-                StructuralConstraint::ClosedObject => {
-                    if let Some(key) = object
-                        .keys()
-                        .find(|key| !self.fields().any(|(name, _)| name == *key))
-                    {
-                        return Err(format!("argument `{key}` is not admitted"));
-                    }
-                }
-                StructuralConstraint::Required(field) if !object.contains_key(*field) => {
-                    return Err(format!("argument `{field}` is required"))
-                }
-                StructuralConstraint::StringEnum { field, values }
-                    if !object
-                        .get(*field)
-                        .and_then(Value::as_str)
-                        .is_some_and(|v| values.contains(&v)) =>
-                {
-                    return Err(format!(
-                        "argument `{field}` must be one of: {}",
-                        values.join(", ")
-                    ));
-                }
-                _ => {}
-            }
-        }
-        for required in self.schema["required"].as_array().into_iter().flatten() {
-            let field = required.as_str().expect("schema field name");
-            if !object.contains_key(field) {
-                return Err(format!("argument `{field}` is required"));
-            }
-        }
-        for (field, schema) in self.fields() {
-            let Some(value) = object.get(field) else {
-                continue;
-            };
-            let accepts_type = |kind: &str| match kind {
-                "null" => value.is_null(),
-                "string" => value.is_string(),
-                "boolean" => value.is_boolean(),
-                "array" => value.is_array(),
-                "object" => value.is_object(),
-                "number" => value.is_number(),
-                "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
-                _ => false,
-            };
-            let type_ok = match &schema["type"] {
-                Value::String(kind) => accepts_type(kind),
-                Value::Array(kinds) => kinds
-                    .iter()
-                    .any(|kind| kind.as_str().is_some_and(accepts_type)),
-                _ => true,
-            };
-            if !type_ok {
-                return Err(format!(
-                    "argument `{field}` must have type {}",
-                    schema["type"]
-                ));
-            }
-            if !value.is_null()
-                && match schema["format"].as_str() {
-                    Some("int64") => value.as_i64().is_none(),
-                    Some("uint64") => value.as_u64().is_none(),
-                    _ => false,
-                }
-            {
-                return Err(format!(
-                    "argument `{field}` is outside {}",
-                    schema["format"]
-                ));
-            }
-            if let Some(text) = value.as_str() {
-                let length = text.chars().count() as u64;
-                for (keyword, violates) in [("minLength", true), ("maxLength", false)] {
-                    if let Some(bound) = schema[keyword].as_u64() {
-                        if if violates {
-                            length < bound
-                        } else {
-                            length > bound
-                        } {
-                            return Err(format!("argument `{field}` violates {keyword} {bound}"));
-                        }
-                    }
-                }
-            }
-            if let Some(number) = value.as_f64() {
-                for (keyword, lower) in [("minimum", true), ("maximum", false)] {
-                    if let Some(bound) = schema[keyword].as_f64() {
-                        if if lower {
-                            number < bound
-                        } else {
-                            number > bound
-                        } {
-                            return Err(format!("argument `{field}` violates {keyword} {bound}"));
-                        }
-                    }
-                }
-            }
-        }
-        (self.decode)(value.clone())
-    }
 }
 
 pub struct OperationSpec<E> {
@@ -348,20 +242,25 @@ impl<E: Send + 'static> OperationSpec<E> {
     pub fn contract_line(&self) -> String {
         format!("{}: {}", self.id, self.input.contract_line())
     }
-    /// Enforce the argument contract on normalized arguments. A violation
-    /// names the operation, the offending field and the expected contract, and
-    /// is returned to the model as an ordinary tool error.
-    pub fn validate_arguments(&self, arguments: &Value) -> Result<(), String> {
+    /// Enforce the argument contract on envelope-normalized arguments and
+    /// return them in canonical form (see [`TypedInputContract::normalize`]).
+    /// A violation names the operation, the offending field and the expected
+    /// contract, and is returned to the model as an ordinary tool error.
+    pub fn normalize_arguments(&self, arguments: &Value) -> Result<Value, String> {
         self.input
-            .validate(arguments)
+            .normalize(arguments)
             .map_err(|error| format!("{}: {error}; expected {}", self.id, self.contract_line()))
+    }
+    pub fn validate_arguments(&self, arguments: &Value) -> Result<(), String> {
+        self.normalize_arguments(arguments).map(|_| ())
     }
     pub async fn dispatch(
         &self,
         context: &dyn ReadContext<E>,
         input: Value,
     ) -> Result<Value, DispatchError<E>> {
-        self.validate_arguments(&input)
+        let input = self
+            .normalize_arguments(&input)
             .map_err(DispatchError::InvalidInput)?;
         (self.handler)(context, input).await
     }

@@ -10,16 +10,15 @@ use agent_runtime::core::prelude::RuntimeError;
 use serde_json::{Value, json};
 
 use crate::operation_catalog::{
-    MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
-    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
-    MAIN_PROJECT_CREATE_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
-    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
+    PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -281,43 +280,6 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "maturity",
                 "content",
                 "provenance",
-            ],
-        ),
-        MAIN_CHARTER_READINESS_OPERATION => object_schema(
-            json!({"action":{"const":"evaluate"},"charter_id":{"type":"string","minLength":1},"revision_id":{"type":"string","minLength":1},"content_digest":{"type":"string","minLength":1},"render_digest":{"type":"string","minLength":1},"expected_charter_version":{"type":"integer","minimum":1}}),
-            &[
-                "action",
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-            ],
-        ),
-        MAIN_CHARTER_DIFF_OPERATION => object_schema(
-            json!({"action":{"const":"compare_revisions"},"charter_id":{"type":"string","minLength":1},"base_revision_id":{"type":"string","minLength":1},"candidate_revision_id":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "charter_id",
-                "base_revision_id",
-                "candidate_revision_id",
-            ],
-        ),
-        MAIN_CHARTER_APPROVAL_TARGET_OPERATION => object_schema(
-            json!({"action":{"const":"present"},"charter_id":{"type":"string","minLength":1},"revision_id":{"type":"string","minLength":1},"content_digest":{"type":"string","minLength":1},"render_digest":{"type":"string","minLength":1},"expected_charter_version":{"type":"integer","minimum":1},"approved_project_name":{"type":"string","minLength":1},"approved_project_slug":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"selected_project_agent_identity_id":{"type":"string","minLength":1},"selected_project_agent_profile_revision_id":{"type":"string","minLength":1},"selected_project_agent_operating_skill_revision":{"type":"string","minLength":1},"selected_project_agent_policy_digest":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "approved_project_name",
-                "project_mode",
-                "selected_project_agent_identity_id",
-                "selected_project_agent_profile_revision_id",
-                "selected_project_agent_operating_skill_revision",
-                "selected_project_agent_policy_digest",
             ],
         ),
         MAIN_PROJECT_CREATE_OPERATION => object_schema(

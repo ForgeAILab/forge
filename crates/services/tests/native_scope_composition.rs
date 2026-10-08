@@ -2278,17 +2278,31 @@ async fn main_registry_reads_preserve_payloads_and_scope_on_each_surface() {
                 .read(AGENT_ID, &scope, id, input.clone())
                 .await
                 .unwrap();
-            let unwrap_result = |mut result: Value| {
-                // Each read gets a fresh server correlation id; compare the
-                // domain payload, not that transport join key.
-                if result.get("result").is_some() {
-                    result = result["result"].clone();
+            // The only two values excluded from equality: the fresh server
+            // correlation id each read mints for its outcome envelope, and a
+            // readiness evaluation's wall-clock timestamp. Everything else in
+            // the envelope and the domain payload must be equal.
+            let comparable = |mut outcome: Value| {
+                if outcome.get("result").is_some() {
+                    assert!(outcome["correlation_id"].as_str().is_some(), "{id}");
+                    outcome.as_object_mut().unwrap().remove("correlation_id");
                 }
-                // Readiness evaluations retain their wall-clock timestamp.
-                if let Some(value) = result.get_mut("readiness").and_then(Value::as_object_mut) {
-                    value.remove("evaluated_at");
+                let payload = if outcome.get("result").is_some() {
+                    &mut outcome["result"]
+                } else {
+                    &mut outcome
+                };
+                if let Some(readiness) = payload.get_mut("readiness") {
+                    assert!(readiness["evaluated_at"].as_str().is_some(), "{id}");
+                    readiness.as_object_mut().unwrap().remove("evaluated_at");
                 }
-                result
+                outcome
+            };
+            // The domain payload inside the outcome envelope, where the
+            // operation has one.
+            let payload = |outcome: &Value| match outcome.get("result") {
+                Some(result) => result.clone(),
+                None => outcome.clone(),
             };
             // Call the same domain handlers the base dispatcher selected,
             // independently of the registry's handler binding.
@@ -2357,8 +2371,8 @@ async fn main_registry_reads_preserve_payloads_and_scope_on_each_surface() {
             };
             if let Some(reference) = reference {
                 assert_eq!(
-                    unwrap_result(direct.clone()),
-                    unwrap_result(reference),
+                    comparable(payload(&direct)),
+                    comparable(reference),
                     "{id} handler parity"
                 );
             }
@@ -2371,8 +2385,8 @@ async fn main_registry_reads_preserve_payloads_and_scope_on_each_surface() {
                     .unwrap();
                 assert!(!outcome.is_error, "{id}: {}", outcome.value);
                 assert_eq!(
-                    unwrap_result(outcome.value),
-                    unwrap_result(direct.clone()),
+                    comparable(outcome.value),
+                    comparable(direct.clone()),
                     "{id}"
                 );
             }
@@ -2393,15 +2407,38 @@ async fn main_registry_reads_preserve_payloads_and_scope_on_each_surface() {
                     "{id}"
                 );
             }
-            // Same owner, but no active Main binding for this identity.
-            assert!(
+            // Same owner, but no active Main binding for this identity. The
+            // denial is the same whether or not the arguments satisfy the
+            // contract: a denied caller is told nothing about it.
+            let denial = |error: forge_agent_host::AgentHostError| match error {
+                forge_agent_host::AgentHostError::StructuredOutcome(outcome) => {
+                    let mut outcome = serde_json::to_value(&*outcome).unwrap();
+                    outcome.as_object_mut().unwrap().remove("correlation_id");
+                    outcome.to_string()
+                }
+                other => format!("{other:?}"),
+            };
+            let denied = denial(
                 fixture
                     .provider
                     .read(PROJECT_AGENT_CANDIDATE_ID, &scope, id, input.clone())
                     .await
-                    .is_err(),
-                "{id}"
+                    .unwrap_err(),
             );
+            for malformed in [json!({"foreign_project":"x"}), json!(null), json!([])] {
+                let probed = denial(
+                    fixture
+                        .provider
+                        .read(PROJECT_AGENT_CANDIDATE_ID, &scope, id, malformed)
+                        .await
+                        .unwrap_err(),
+                );
+                assert!(
+                    !probed.contains("expected") && !probed.contains("foreign_project"),
+                    "{id}: {probed}"
+                );
+                assert_eq!(probed, denied, "{id}");
+            }
             let error = invoke_tool(
                 &composition,
                 tool_name,
@@ -2429,6 +2466,35 @@ async fn main_registry_reads_preserve_payloads_and_scope_on_each_surface() {
                     && error.contains("expected"),
                 "{error}"
             );
+        }
+    }
+    // An integer sent as a string or a float reaches the real handler as the
+    // integer: one row, as `limit: 1` returns, not the default page.
+    for id in ["discovery.read", "portfolio.read"] {
+        let page = |limit: Value| {
+            let provider = fixture.provider.clone();
+            let scope = fixture.main_scope.clone();
+            async move {
+                provider
+                    .read(AGENT_ID, &scope, id, json!({"limit":limit}))
+                    .await
+            }
+        };
+        let one = page(json!(1)).await.unwrap();
+        assert_eq!(one["items"].as_array().unwrap().len(), 1, "{id}");
+        for spelling in [json!("1"), json!(1.0)] {
+            assert_eq!(page(spelling).await.unwrap(), one, "{id}");
+        }
+        for malformed in [json!("one"), json!(1.5), json!(-1), json!(true)] {
+            let error = format!("{:?}", page(malformed).await.unwrap_err());
+            assert!(
+                error.contains(id) && error.contains("limit") && error.contains("expected"),
+                "{error}"
+            );
+        }
+        // Clamping is the handler's: 0 and 1000 are admitted.
+        for clamped in [json!(0), json!(1000), json!(null)] {
+            page(clamped).await.unwrap();
         }
     }
     {

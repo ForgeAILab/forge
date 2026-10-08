@@ -1827,21 +1827,12 @@ impl Tool for ForgeScopeReadTool {
                 "Forge read operation is outside this scope",
             ));
         }
-        let registered = operation_registry::READ_CATALOG.lookup(operation);
-        let registered_main_read = registered.is_some_and(|spec| {
-            spec.surfaces
-                .iter()
-                .any(|surface| surface.native_aggregate == FORGE_MAIN_ORCHESTRATION_READ_TOOL)
-        });
-        // Main inputs are closed and scalar. Report their contract violation
-        // before the recursive authority guard can hide the field/operation.
-        if registered_main_read {
-            validate_orchestration_read_arguments(operation, &arguments)?;
-        }
         if self.reject_authority_overrides {
             reject_authority_overrides(&arguments)?;
         }
-        if !registered_main_read && (self.reject_authority_overrides || registered.is_some()) {
+        if self.reject_authority_overrides
+            || operation_registry::READ_CATALOG.lookup(operation).is_some()
+        {
             validate_orchestration_read_arguments(operation, &arguments)?;
         }
         let resource = SecurityResource::other(
@@ -3325,9 +3316,6 @@ fn bound_chat_tool_error(message: String, limit: usize) -> String {
 }
 
 #[cfg(test)]
-use crate::MAIN_CHARTER_READ_OPERATION;
-
-#[cfg(test)]
 mod tests {
 
     /// A Project Agent proposes this Project's Tasks from its Chat scope, so
@@ -3356,9 +3344,9 @@ mod tests {
 
     use super::*;
     use crate::operation_catalog::{
-        MAIN_PROJECT_CREATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-        PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
-        PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
+        MAIN_CHARTER_READ_OPERATION, MAIN_PROJECT_CREATE_OPERATION, PROJECT_DECISION_OPERATION,
+        PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
+        PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
     };
     use crate::operation_contract::{
         orchestration_payload_schema, orchestration_read_arguments_schema,

@@ -120,3 +120,33 @@ impl operation_registry::main_reads::MainReadContext<AgentHostError> for Context
             .await
     }
 }
+
+impl Context<'_> {
+    /// The denial a Main read's handler would give this caller, if any. Each
+    /// handler authorizes the caller first, with these same checks and error
+    /// mappings; this runs them when the arguments never reach the handler.
+    pub(super) async fn main_read_denial(&self, operation: &str) -> Option<AgentHostError> {
+        if !operation_registry::main_reads::IDS.contains(&operation) {
+            return None;
+        }
+        if operation == forge_agent_host::MAIN_INQUIRY_RUN_OPERATION {
+            return self
+                .provider
+                .inquiry_admission(self.actor_identity_id, self.scope)
+                .await
+                .err();
+        }
+        let denied = self
+            .provider
+            .authorization
+            .main_account_id(self.actor_identity_id, self.scope)
+            .await
+            .err()?;
+        Some(match operation {
+            "charter.read" | "discovery.read" | "portfolio.read" => {
+                super::native_scope_error(denied)
+            }
+            _ => super::service_error(denied),
+        })
+    }
+}

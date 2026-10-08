@@ -8,6 +8,40 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Main native reads refuse malformed arguments instead of ignoring them
+  (3.8 slice C).** The eight Main reads are checked against a closed contract
+  before they run. A refused call returns a tool error the model can correct
+  in the same turn, naming the operation, the field and the contract
+  (``discovery.read: argument `limit` must have type ["integer","null"];
+  expected discovery.read: {limit?}``). These inputs used to succeed and are
+  now refused:
+  - *An unknown field on `discovery.read` or `portfolio.read`.*
+    `{"operation":"discovery.read","arguments":{"unexpected":true}}` used to
+    ignore the field.
+  - *A malformed `limit` on `discovery.read` or `portfolio.read`.*
+    `{"limit":"ten"}`, `{"limit":1.5}`, `{"limit":-1}` and `{"limit":true}`
+    used to return the default page.
+  - *Over-length `inquiry.run` text.* A `title` of 121 characters, a
+    `question` of 4,001 or a `context` of 8,001 used to be dispatched. The
+    limits are 120, 4,000 and 8,000.
+  - *A `context` that is not a string on `inquiry.run`.*
+    `{"title":"Q","question":"Q","context":42}` used to run the inquiry
+    without context.
+  - *Arguments that are not an object, on a direct provider call.*
+    `"arguments":null`, `"arguments":"text"` and the sequence form
+    `"arguments":[]` used to fall back to the defaults for `discovery.read`
+    and `portfolio.read`. The tool schema already declared `arguments` an
+    object.
+  - *An undeclared field on a direct provider call.* `charter.read` with
+    `{"limit":1}` used to honour the never-advertised limit, and
+    `inquiry.run` with `{"title":"Q","question":"Q","unexpected":true}` used
+    to ignore the field. Through `forge_main_orchestration_read` both were
+    already refused.
+
+  Still accepted: an integer sent as an integer-valued string or float
+  (`{"limit":"10"}` and `{"limit":10.0}` are `10`), a `limit` of `0` or above
+  `20` (clamped as before), an omitted or `null` `limit`, and an omitted or
+  `null` `context`. MCP is unchanged.
 - **Native `account.summary` and `agent_chat.summary` refuse nested arguments
   (3.8 slice B).** Through `forge_scope_read` these two reads used to ignore
   whatever was passed in `arguments`; a call such as
@@ -546,6 +580,32 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Main reads moved onto the operation registry (3.8 slice C).**
+  `genesis.project_agents.read`, `charter.read`, `charter.readiness`,
+  `charter.diff`, `charter.approval_target`, `discovery.read`,
+  `portfolio.read` and `inquiry.run` are now registered operations with one
+  typed contract each, used for the description, the validation and the
+  dispatch. Their hand-written schemas, validators and dispatch arms are
+  deleted. Results, permissions and availability are unchanged; `inquiry.run`
+  is still a query that needs `propose_discovery` and is offered only in a
+  Main Chat.
+  - The Main and inquiry tool definitions are smaller: 8,860 to 8,814 bytes
+    and 4,127 to 4,089 bytes. Each argument line now says which fields are
+    required (`charter.diff: {base_revision_id, candidate_revision_id,
+    charter_id, genesis_session_id?}`, where `?` marks an optional field)
+    instead of calling every field optional. The byte ceilings are lowered
+    to the new sizes.
+  - Registered operations accept an integer sent as an integer-valued string
+    or float. `{"limit":"5"}` on `discovery.read` used to be ignored and
+    return the default page; it now limits the page to five.
+    `expected_charter_version` accepts `"3"` and `3.0` the same way. The
+    advertised contract still says integer.
+  - A call that already failed can fail with a different message. A missing
+    or empty `title` or `question` on `inquiry.run`, an empty Charter or
+    revision reference, and an `expected_charter_version` below 1 are refused
+    by the contract before the handler runs, where the handler used to report
+    them. A title or question that is only whitespace is still refused by the
+    handler with the same message as before.
 - **Typed operation registry for the first native reads (3.8 slice B).**
   `account.summary`, `agent_chat.summary`, `project.charter` and
   `skill.section` are now declared once, as typed specifications in the new
