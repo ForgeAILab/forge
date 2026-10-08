@@ -1,0 +1,191 @@
+{
+  "genesis.project_agent.select:prepared": {
+    "call_id": "call",
+    "tool": "forge_main_orchestration_propose",
+    "canonical_arguments": {
+      "operation": "genesis.project_agent.select",
+      "payload": {
+        "action": "select",
+        "genesis_session_id": "genesis",
+        "expected_session_version": 1,
+        "project_agent_identity_id": "project-agent"
+      },
+      "dedupe_key": "select-key",
+      "correlation_id": "corr",
+      "causation_id": "cause",
+      "causation_depth": 1
+    },
+    "required_permissions": [
+      {
+        "other": "forge.scope.propose"
+      }
+    ],
+    "resource": {
+      "resource_kind": "other",
+      "kind": "forge.scope",
+      "id": "agent_chat:chat"
+    },
+    "effects": [],
+    "display": {
+      "title": "Propose Forge action"
+    },
+    "preparation_fingerprint": "3032fa7620c830ceccab57b83ac2c424"
+  },
+  "genesis.project_agent.select:approval_pending": {
+    "call_id": "call",
+    "tool": "forge_main_orchestration_propose",
+    "canonical_arguments": {
+      "operation": "genesis.project_agent.select",
+      "payload": {
+        "action": "select",
+        "genesis_session_id": "genesis",
+        "expected_session_version": 1,
+        "project_agent_identity_id": "project-agent"
+      },
+      "dedupe_key": "select-key",
+      "correlation_id": "corr",
+      "causation_id": "cause",
+      "causation_depth": 1
+    },
+    "required_permissions": [
+      {
+        "other": "forge.scope.propose"
+      }
+    ],
+    "resource": {
+      "resource_kind": "other",
+      "kind": "forge.scope",
+      "id": "agent_chat:chat"
+    },
+    "effects": [],
+    "display": {
+      "title": "Propose Forge action"
+    },
+    "preparation_fingerprint": "3032fa7620c830ceccab57b83ac2c424"
+  },
+  "genesis.project_agent.select:approval_edited": {
+    "call_id": "call",
+    "tool": "forge_main_orchestration_propose",
+    "canonical_arguments": {
+      "operation": "genesis.project_agent.select",
+      "payload": {
+        "action": "select",
+        "genesis_session_id": "genesis",
+        "expected_session_version": 1,
+        "project_agent_identity_id": "project-agent"
+      },
+      "dedupe_key": "select-key",
+      "correlation_id": "edited-corr",
+      "causation_id": "cause",
+      "causation_depth": 1
+    },
+    "required_permissions": [
+      {
+        "other": "forge.scope.propose"
+      }
+    ],
+    "resource": {
+      "resource_kind": "other",
+      "kind": "forge.scope",
+      "id": "agent_chat:chat"
+    },
+    "effects": [],
+    "display": {
+      "title": "Propose Forge action"
+    },
+    "preparation_fingerprint": "360210c75d82be264d90c979c6af6577"
+  },
+  "project.create:prepared": {
+    "call_id": "call",
+    "tool": "forge_main_orchestration_propose",
+    "canonical_arguments": {
+      "operation": "project.create",
+      "payload": {
+        "action": "create_from_approval",
+        "approval_id": "approval",
+        "ignored": "old prepared data"
+      },
+      "dedupe_key": "create-key",
+      "correlation_id": "corr",
+      "causation_id": "cause",
+      "causation_depth": 1
+    },
+    "required_permissions": [
+      {
+        "other": "forge.scope.propose"
+      }
+    ],
+    "resource": {
+      "resource_kind": "other",
+      "kind": "forge.scope",
+      "id": "agent_chat:chat"
+    },
+    "effects": [],
+    "display": {
+      "title": "Propose Forge action"
+    },
+    "preparation_fingerprint": "5858a8a0f624ff05efcd59dfdcc74974"
+  },
+  "project.create:approval_pending": {
+    "call_id": "call",
+    "tool": "forge_main_orchestration_propose",
+    "canonical_arguments": {
+      "operation": "project.create",
+      "payload": {
+        "action": "create_from_approval",
+        "approval_id": "approval",
+        "ignored": "old prepared data"
+      },
+      "dedupe_key": "create-key",
+      "correlation_id": "corr",
+      "causation_id": "cause",
+      "causation_depth": 1
+    },
+    "required_permissions": [
+      {
+        "other": "forge.scope.propose"
+      }
+    ],
+    "resource": {
+      "resource_kind": "other",
+      "kind": "forge.scope",
+      "id": "agent_chat:chat"
+    },
+    "effects": [],
+    "display": {
+      "title": "Propose Forge action"
+    },
+    "preparation_fingerprint": "5858a8a0f624ff05efcd59dfdcc74974"
+  },
+  "project.create:approval_edited": {
+    "call_id": "call",
+    "tool": "forge_main_orchestration_propose",
+    "canonical_arguments": {
+      "operation": "project.create",
+      "payload": {
+        "action": "create_from_approval",
+        "approval_id": "approval",
+        "ignored": "old prepared data"
+      },
+      "dedupe_key": "create-key",
+      "correlation_id": "edited-corr",
+      "causation_id": "cause",
+      "causation_depth": 1
+    },
+    "required_permissions": [
+      {
+        "other": "forge.scope.propose"
+      }
+    ],
+    "resource": {
+      "resource_kind": "other",
+      "kind": "forge.scope",
+      "id": "agent_chat:chat"
+    },
+    "effects": [],
+    "display": {
+      "title": "Propose Forge action"
+    },
+    "preparation_fingerprint": "6aefd05d1488917d3df104df0bfb0743"
+  }
+}

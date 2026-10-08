@@ -1104,7 +1104,28 @@ An integer field of a registered operation also accepts an integer-valued
 string or float (`"10"` and `10.0` are `10`); any other malformed integer
 (`"ten"`, `1.5`, `-1` for an unsigned field, a boolean) is refused.
 Contract violations return an in-turn tool error naming the operation, field
-and expected contract. Proposal/approval and MCP contracts are unchanged.
+and expected contract. MCP contracts are unchanged.
+
+Main proposal payload guidance is generated for `genesis.project_agent.select`
+and `project.create`. Selection advertises
+`{expected_session_version, genesis_session_id?, project_agent_identity_id}`;
+Project-create advertises `{approval_id?}`. Both omit the former `action` field
+because the handler discards or ignores it; existing calls carrying it remain
+accepted. Selection strips that field before closed typed checking and accepts
+integer-valued strings/floats for the session version. Project-create continues
+accepting incomplete/malformed approval references and preserving ignored extra
+payload fields; its user executor still requires a nonblank `approval_id`.
+Dedupe, correlation and
+causation remain in the common proposal envelope. Scope/current-authority denial
+and forged-authority-field rejection precede contract diagnostics. Stored
+preparations and already-approved action payloads are not checked against the
+new contract on continuation. Project-create remains approval-required and its
+domain execution remains user-only; a native proposal only queues its action.
+Direct provider dispatch also rejects authority/scope field names anywhere in
+ignored envelope data outside the payload, including `identity_id`, `authority`,
+`scope_id`, and `project_id`; the named native preparation already rejected
+these root fields. This is separate from the payload's accepted field set.
+Genesis start and Charter draft retain their hand contracts.
 
 Project Agent validation results use the typed `project.validation` operation.
 A `record` payload must include the current positive

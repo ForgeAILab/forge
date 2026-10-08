@@ -58,7 +58,7 @@ forge-solo → services → db / events / agent-host / executors / workspace →
 which the workspace already resolved. Both `agent-host` and `services` depend
 on it; it imports neither, so typed service handler registration does not
 create a dependency cycle. Specifications live in domain modules of that crate
-(`scope_reads`, `project_reads`, `main_reads`), below `agent-host`, because `agent-host`
+(`scope_reads`, `project_reads`, `main_reads`, `main_proposals`), below `agent-host`, because `agent-host`
 builds the advertised schema and cannot depend on `services`. Each module owns
 its specs, its id list and the small context trait its handlers need;
 `services` implements the traits. `lib.rs` only concatenates the modules,
@@ -100,7 +100,7 @@ type, so a mismatch does not compile.
   authority field, and only then reports a contract violation; at dispatch, a caller the Main handler would deny gets
   that denial even when the arguments are malformed.
 - *Canonical.* The full per-operation JSON Schema stays in the registry for
-  validation, documentation and the `read_contracts.json` fixture. It is not
+  validation, documentation and the read/proposal canonical fixtures. It is not
   what providers are sent.
 
 Why: function-declaration schema dialects (OpenAI Chat Completions and
@@ -121,9 +121,42 @@ removed. Discovery/portfolio defaults and clamping remain in the handlers. Inqui
 bounded findings do not grant proposal authority. Its `MainChatOnly`
 availability records the existing exclusion from account inquiry sessions.
 The scope-read aggregate adds no contract prose where the base had none.
-Main proposals remain on their existing path, including all approval receipts,
-dedupe/causation fields and prepared-action continuation; proposal projection
-is deferred. All other operations keep their hand paths; an operation never
+Main proposal projection registers `genesis.project_agent.select` (direct
+command) and `project.create` (approval-required). The named Main propose
+aggregate and the generic scope-propose aggregate generate their payload
+contract lines from those specs, retaining the portable envelope
+`{operation, payload, dedupe_key, correlation_id, causation_id?, causation_depth?}`.
+The envelope owns provenance; the spec owns only the payload. Selection's line
+is `{expected_session_version, genesis_session_id?, project_agent_identity_id}`;
+Project-create's is `{approval_id?}`. The old `action` fields were discarded or
+ignored by their handlers, so they are omitted from advertisement. Selection
+declaratively strips its ignored discriminator before checking/decoding and
+keeps its closed request; Project-create keeps an open payload because its
+executor ignores extra fields, preserving their exact bytes for action dedupe.
+The proposal enqueuer also accepts incomplete or malformed approval references;
+the unchanged user executor requires a nonblank `approval_id` at execution.
+No previously successful payload is refused. Selection uses the same integer
+coercion as reads and the same receipt-backed command service.
+
+Fresh proposals check current Main binding/policy first, then forged authority
+fields, then their payload contract, then the typed handler. The provider's
+preparation denial check also runs before payload diagnostics. Dispatch now
+checks the entire envelope for authority/scope replacements; direct provider
+calls previously ignored such root fields, while named preparation already
+rejected them. Payload acceptance is preserved. Exact prepared
+invocations use `propose_prepared` and `dispatch_prepared`: they reauthorize and
+run existing domain checks, but never revalidate stored arguments against the
+current contract. Runtime prepared, approval-pending and recorded edited calls
+retain their serialized arguments and fingerprints. `project.create` only
+queues its existing approval-required AgentAction; the unchanged user executor
+parses the stored action payload, consumes the exact Charter approval and
+atomically records the Project/handoff/receipt. It cannot execute by proposing
+or by an agent executor. Dedupe keys, correlation/causation, immutable receipts,
+protected checkpoint encryption and approval storage are unchanged.
+
+`genesis.start` and `charter.draft` remain on their hand paths: this checkpoint
+has not proved their leased-source control-transfer and nested Charter edited
+preparation continuation, respectively. All other operations keep their hand paths; an operation never
 has both. Existing permission/binding checks enforce
 authority; spec/check parity is tested pending EffectiveAuthority. Domain
 semantic validation, transactions, workspace preparation, MCP projections and
@@ -134,9 +167,10 @@ constraints in its domain module, add its id to that module's `IDS`, and bind
 a typed context handler. Delete its former schema fragment, validator branch
 and dispatch branch, implement the context method in `services`, and test
 schema, contract line, dispatch, constraints and authority parity. Adding an
-operation to an existing domain module needs no edit to `lib.rs`. A new domain
-module adds four lines there: its `mod`, its specs and its ids in the two
-concatenations, and its context trait as a bound on `ReadContext`.
+operation to an existing domain module needs no edit to `lib.rs`. A new domain module joins the composed `OperationContext` and contributes its
+specs and id list to the appropriate effect catalog. Reads and Main proposals
+use the same `OperationSpec` and typed decoding/dispatch machinery; registered
+operation inventory includes both catalogs.
 
 ### Repository trait pattern
 

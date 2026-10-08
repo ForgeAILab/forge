@@ -146,9 +146,8 @@ fn serialized_tool_definitions() {
 /// A surface may shrink freely. Raise a ceiling only deliberately, in the
 /// change that explains why the prefix has to grow.
 const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
-    // 8,860 and 4,127 at 8bc736f5, less 46 and 38: the Main read lines state
-    // which fields are required instead of `optional {...}` for all of them.
-    ("main", 8_814),
+    // Main proposal contract lines replace duplicated hand summaries.
+    ("main", 8_559),
     ("inquiry", 4_089),
     // 24,048 and 25,297 at 172338b3, plus 56 each: the `skill.section`
     // argument line states the required enum instead of `optional {section}`.
@@ -1204,4 +1203,94 @@ async fn nullable_generic_causation_fields_survive_both_paths() {
         *provider.0.lock().unwrap(),
         vec![arguments.clone(), arguments]
     );
+}
+
+/// Hand-written gate forms, including literal prepared/checkpoint fingerprints
+/// calculated with the unchanged runtime pin. No current Tool.prepare or
+/// normalization implementation is used to manufacture historical authority.
+#[tokio::test]
+async fn main_proposals_resume_pre_change_prepared_pending_and_edited_checkpoint_bytes() {
+    use agent_runtime::core::{
+        catalog::{ModelLimits, ResolvedModelProfile},
+        provider::ModelId,
+    };
+    use agent_runtime::provider::fake::FakeProvider;
+    use agent_runtime::runtime::StartSession;
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/main_proposal_checkpoints_pre_change.json"
+    ))
+    .unwrap();
+    for (name, bytes) in fixtures.as_object().unwrap() {
+        let checkpoint: TurnCheckpoint = serde_json::from_value(bytes.clone()).unwrap();
+        checkpoint
+            .validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let prepared = match &checkpoint.state {
+            TurnState::LocalActionPrepared { prepared, .. } => prepared.clone(),
+            TurnState::AwaitingApproval { slots, .. } => match &slots[0] {
+                agent_runtime::core::checkpoint::ToolSlotCheckpoint::Prepared(prepared) => {
+                    prepared.clone()
+                }
+                _ => unreachable!(),
+            },
+            _ => unreachable!(),
+        };
+        assert!(prepared.verify_fingerprint(), "{name}");
+        let provider = Arc::new(EchoProvider::default());
+        let inner = ForgeScopeProposeTool::named(
+            "identity".into(),
+            CanonicalScope {
+                scope_type: CanonicalScopeType::AgentChat,
+                scope_id: "chat".into(),
+                workspace_access: WorkspaceAccess::Deny,
+            },
+            vec![prepared.arguments()["operation"].as_str().unwrap().into()],
+            provider.clone(),
+            FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL,
+            "Main scope",
+        );
+        let store = Arc::new(PreparedCheckpointStore {
+            saved: Mutex::new(checkpoint),
+            terminal: Default::default(),
+        });
+        let mut composition = composition(provider.clone());
+        composition.tools = vec![Arc::new(FailingHook {
+            inner: Arc::new(inner),
+        })];
+        composition.security_check = Arc::new(ApprovalCheck(composition.coverage()));
+        let approval = Arc::new(ApproveExact(Mutex::new(Vec::new())));
+        let fake = Arc::new(FakeProvider::text_reply("Recorded action completed."));
+        let runtime = composition
+            .apply(RuntimeBuilder::new(ModelId::new("fake")))
+            .provider(fake.clone())
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(128_000, 128_000, 4_096),
+            ))
+            .checkpoint_store(store.clone())
+            .approval(approval.clone())
+            .build()
+            .unwrap();
+        let session = runtime
+            .start_session(StartSession::resume(SessionId::new("session")))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), store.terminal.notified())
+            .await
+            .unwrap();
+        assert!(session.resumed(), "{name}");
+        assert!(store.saved.lock().unwrap().state.is_terminal(), "{name}");
+        assert_eq!(
+            provider.0.lock().unwrap().as_slice(),
+            &[prepared.arguments().clone()],
+            "{name}"
+        );
+        assert_eq!(
+            approval.0.lock().unwrap().as_slice(),
+            &[prepared],
+            "{name}: approve exact recorded authority"
+        );
+        session.shutdown().await.unwrap();
+    }
 }

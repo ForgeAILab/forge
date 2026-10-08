@@ -181,6 +181,38 @@ pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
         arguments: Value,
     ) -> Result<Value, AgentHostError>;
 
+    /// Check current Main proposal authority before revealing payload contracts.
+    async fn proposal_denial(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        let _ = (actor_identity_id, scope, operation);
+        Ok(())
+    }
+
+    /// Execute a fingerprinted preparation, including one restored from storage.
+    /// Its arguments have already been admitted; do not validate them against a
+    /// newer contract. Implementations still enforce current authority/domain rules.
+    async fn propose_prepared(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        runtime_session_id: &str,
+        operation: &str,
+        arguments: Value,
+    ) -> Result<Value, AgentHostError> {
+        self.propose(
+            actor_identity_id,
+            scope,
+            runtime_session_id,
+            operation,
+            arguments,
+        )
+        .await
+    }
+
     /// Records one command a Project Agent verification session ran and
     /// returns `{"observation_id": ...}`. Surfaces without a verification
     /// workspace never compose the tool that calls this.
@@ -2136,6 +2168,16 @@ impl Tool for ForgeScopeProposeTool {
                 "Forge proposal operation is outside this scope",
             ));
         }
+        let registered = operation_registry::main_proposals::CATALOG.lookup(operation);
+        if registered.is_some() {
+            self.provider
+                .proposal_denial(&self.actor_identity_id, &self.scope, operation)
+                .await
+                .map_err(|error| RuntimeError::tool(error.to_string()))?;
+        }
+        if registered.is_some() {
+            reject_authority_overrides(&arguments)?;
+        }
         if operation == MAIN_CHARTER_DRAFT_OPERATION
             || operation == PROJECT_CHARTER_ADOPTION_OPERATION
         {
@@ -2152,9 +2194,16 @@ impl Tool for ForgeScopeProposeTool {
                 return Err(RuntimeError::tool(format!("{field} cannot be empty")));
             }
         }
-        if self.reject_authority_overrides {
-            reject_authority_overrides(&arguments)?;
+        if self.reject_authority_overrides || registered.is_some() {
+            if registered.is_none() {
+                reject_authority_overrides(&arguments)?;
+            }
             validate_orchestration_proposal_arguments(operation, &arguments)?;
+        }
+        if let Some(spec) = registered {
+            arguments["payload"] = spec
+                .normalize_arguments(&arguments["payload"])
+                .map_err(RuntimeError::tool)?;
         }
         let resource = SecurityResource::other(
             "forge.scope",
@@ -2183,7 +2232,7 @@ impl Tool for ForgeScopeProposeTool {
         let runtime_session_id = ctx.session.to_string();
         provider_result_to_tool_outcome(
             self.provider
-                .propose(
+                .propose_prepared(
                     &self.actor_identity_id,
                     &self.scope,
                     &runtime_session_id,
@@ -4419,11 +4468,9 @@ mod tests {
                 .any(|value| value == MAIN_PROJECT_CREATE_OPERATION)
         );
         let create_payload = orchestration_payload_schema(MAIN_PROJECT_CREATE_OPERATION);
-        assert_eq!(create_payload["required"], json!(["action", "approval_id"]));
-        assert_eq!(
-            create_payload["properties"]["action"]["const"],
-            "create_from_approval"
-        );
+        assert_eq!(create_payload["required"], json!([]));
+        assert!(create_payload["properties"].get("action").is_none());
+        assert_ne!(create_payload["additionalProperties"], false);
     }
 
     #[test]
@@ -4747,7 +4794,7 @@ mod tests {
             result.is_err(),
             "authority-shaped prompt injection must be denied"
         );
-        let mismatched_action = tool
+        let ignored_action = tool
             .prepare(
                 json!({
                     "operation": MAIN_PROJECT_CREATE_OPERATION,
@@ -4759,8 +4806,8 @@ mod tests {
             )
             .await;
         assert!(
-            mismatched_action.is_err(),
-            "typed orchestration prepare must enforce the action discriminant"
+            ignored_action.is_ok(),
+            "The base enqueuer accepts ignored action and missing approval references; user execution still enforces approval_id"
         );
     }
 
@@ -5696,3 +5743,6 @@ mod normalization_tests;
 #[cfg(test)]
 #[path = "typed_tools/registry_tests.rs"]
 mod registry_tests;
+
+#[cfg(test)]
+mod proposal_registry_tests;

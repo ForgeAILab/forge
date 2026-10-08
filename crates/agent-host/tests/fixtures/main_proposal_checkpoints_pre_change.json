@@ -1,0 +1,626 @@
+{
+  "genesis.project_agent.select:prepared": {
+    "schema_version": 3,
+    "transition_revision": 4,
+    "session": "session",
+    "turn": "turn",
+    "state_revision": 1,
+    "operation_fingerprint": "aaea13c93a1be6be2d7db68efd5f039e",
+    "active_history_start": 0,
+    "visible_output": false,
+    "state": {
+      "state": "local_action_prepared",
+      "request_id": "request",
+      "call": {
+        "id": "call",
+        "name": "forge_main_orchestration_propose",
+        "arguments": {
+          "parameters": {
+            "causation_depth": 1,
+            "causation_id": "cause",
+            "correlation_id": "corr",
+            "dedupe_key": "select-key",
+            "operation": "genesis.project_agent.select",
+            "payload": {
+              "action": "select",
+              "expected_session_version": 1,
+              "genesis_session_id": "genesis",
+              "project_agent_identity_id": "project-agent"
+            }
+          }
+        }
+      },
+      "prepared": {
+        "call_id": "call",
+        "tool": "forge_main_orchestration_propose",
+        "canonical_arguments": {
+          "causation_depth": 1,
+          "causation_id": "cause",
+          "correlation_id": "corr",
+          "dedupe_key": "select-key",
+          "operation": "genesis.project_agent.select",
+          "payload": {
+            "action": "select",
+            "expected_session_version": 1,
+            "genesis_session_id": "genesis",
+            "project_agent_identity_id": "project-agent"
+          }
+        },
+        "required_permissions": [
+          {
+            "other": "forge.scope.propose"
+          }
+        ],
+        "resource": {
+          "resource_kind": "other",
+          "kind": "forge.scope",
+          "id": "agent_chat:chat"
+        },
+        "effects": [],
+        "display": {
+          "title": "Propose Forge action"
+        },
+        "preparation_fingerprint": "3032fa7620c830ceccab57b83ac2c424"
+      }
+    },
+    "snapshot": {
+      "id": "session",
+      "history": [],
+      "updated": 0
+    },
+    "deadline": {
+      "at": null
+    },
+    "watermark": {
+      "checkpoint_sequence": 2,
+      "event_sequence": 0
+    },
+    "updated": 0
+  },
+  "genesis.project_agent.select:approval_pending": {
+    "schema_version": 3,
+    "transition_revision": 4,
+    "session": "session",
+    "turn": "turn",
+    "state_revision": 1,
+    "operation_fingerprint": "90c4cae67b7f608045f151adf8b41fbf",
+    "active_history_start": 0,
+    "visible_output": false,
+    "state": {
+      "state": "awaiting_approval",
+      "request_id": "request",
+      "source_calls": [
+        {
+          "id": "call",
+          "name": "forge_main_orchestration_propose",
+          "arguments": {
+            "parameters": {
+              "causation_depth": 1,
+              "causation_id": "cause",
+              "correlation_id": "corr",
+              "dedupe_key": "select-key",
+              "operation": "genesis.project_agent.select",
+              "payload": {
+                "action": "select",
+                "expected_session_version": 1,
+                "genesis_session_id": "genesis",
+                "project_agent_identity_id": "project-agent"
+              }
+            }
+          }
+        }
+      ],
+      "slots": [
+        {
+          "slot": "prepared",
+          "call_id": "call",
+          "tool": "forge_main_orchestration_propose",
+          "canonical_arguments": {
+            "causation_depth": 1,
+            "causation_id": "cause",
+            "correlation_id": "corr",
+            "dedupe_key": "select-key",
+            "operation": "genesis.project_agent.select",
+            "payload": {
+              "action": "select",
+              "expected_session_version": 1,
+              "genesis_session_id": "genesis",
+              "project_agent_identity_id": "project-agent"
+            }
+          },
+          "required_permissions": [
+            {
+              "other": "forge.scope.propose"
+            }
+          ],
+          "resource": {
+            "resource_kind": "other",
+            "kind": "forge.scope",
+            "id": "agent_chat:chat"
+          },
+          "effects": [],
+          "display": {
+            "title": "Propose Forge action"
+          },
+          "preparation_fingerprint": "3032fa7620c830ceccab57b83ac2c424"
+        }
+      ],
+      "step": 0
+    },
+    "snapshot": {
+      "id": "session",
+      "history": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Continue the recorded Main action."
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_call",
+              "id": "call",
+              "name": "forge_main_orchestration_propose",
+              "arguments": {
+                "parameters": {
+                  "causation_depth": 1,
+                  "causation_id": "cause",
+                  "correlation_id": "corr",
+                  "dedupe_key": "select-key",
+                  "operation": "genesis.project_agent.select",
+                  "payload": {
+                    "action": "select",
+                    "expected_session_version": 1,
+                    "genesis_session_id": "genesis",
+                    "project_agent_identity_id": "project-agent"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "updated": 0
+    },
+    "deadline": {
+      "at": null
+    },
+    "watermark": {
+      "checkpoint_sequence": 2,
+      "event_sequence": 0
+    },
+    "updated": 0
+  },
+  "genesis.project_agent.select:approval_edited": {
+    "schema_version": 3,
+    "transition_revision": 4,
+    "session": "session",
+    "turn": "turn",
+    "state_revision": 1,
+    "operation_fingerprint": "1f783a81a13af0806851090647b1351e",
+    "active_history_start": 0,
+    "visible_output": false,
+    "state": {
+      "state": "awaiting_approval",
+      "request_id": "request",
+      "source_calls": [
+        {
+          "id": "call",
+          "name": "forge_main_orchestration_propose",
+          "arguments": {
+            "parameters": {
+              "causation_depth": 1,
+              "causation_id": "cause",
+              "correlation_id": "corr",
+              "dedupe_key": "select-key",
+              "operation": "genesis.project_agent.select",
+              "payload": {
+                "action": "select",
+                "expected_session_version": 1,
+                "genesis_session_id": "genesis",
+                "project_agent_identity_id": "project-agent"
+              }
+            }
+          }
+        }
+      ],
+      "slots": [
+        {
+          "slot": "prepared",
+          "call_id": "call",
+          "tool": "forge_main_orchestration_propose",
+          "canonical_arguments": {
+            "causation_depth": 1,
+            "causation_id": "cause",
+            "correlation_id": "edited-corr",
+            "dedupe_key": "select-key",
+            "operation": "genesis.project_agent.select",
+            "payload": {
+              "action": "select",
+              "expected_session_version": 1,
+              "genesis_session_id": "genesis",
+              "project_agent_identity_id": "project-agent"
+            }
+          },
+          "required_permissions": [
+            {
+              "other": "forge.scope.propose"
+            }
+          ],
+          "resource": {
+            "resource_kind": "other",
+            "kind": "forge.scope",
+            "id": "agent_chat:chat"
+          },
+          "effects": [],
+          "display": {
+            "title": "Propose Forge action"
+          },
+          "preparation_fingerprint": "360210c75d82be264d90c979c6af6577"
+        }
+      ],
+      "step": 0
+    },
+    "snapshot": {
+      "id": "session",
+      "history": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Continue the recorded Main action."
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_call",
+              "id": "call",
+              "name": "forge_main_orchestration_propose",
+              "arguments": {
+                "parameters": {
+                  "causation_depth": 1,
+                  "causation_id": "cause",
+                  "correlation_id": "corr",
+                  "dedupe_key": "select-key",
+                  "operation": "genesis.project_agent.select",
+                  "payload": {
+                    "action": "select",
+                    "expected_session_version": 1,
+                    "genesis_session_id": "genesis",
+                    "project_agent_identity_id": "project-agent"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "updated": 0
+    },
+    "deadline": {
+      "at": null
+    },
+    "watermark": {
+      "checkpoint_sequence": 2,
+      "event_sequence": 0
+    },
+    "updated": 0
+  },
+  "project.create:prepared": {
+    "schema_version": 3,
+    "transition_revision": 4,
+    "session": "session",
+    "turn": "turn",
+    "state_revision": 1,
+    "operation_fingerprint": "898e0d70f9abaea3122047015428f8eb",
+    "active_history_start": 0,
+    "visible_output": false,
+    "state": {
+      "state": "local_action_prepared",
+      "request_id": "request",
+      "call": {
+        "id": "call",
+        "name": "forge_main_orchestration_propose",
+        "arguments": {
+          "parameters": {
+            "causation_depth": 1,
+            "causation_id": "cause",
+            "correlation_id": "corr",
+            "dedupe_key": "create-key",
+            "operation": "project.create",
+            "payload": {
+              "action": "create_from_approval",
+              "approval_id": "approval",
+              "ignored": "old prepared data"
+            }
+          }
+        }
+      },
+      "prepared": {
+        "call_id": "call",
+        "tool": "forge_main_orchestration_propose",
+        "canonical_arguments": {
+          "causation_depth": 1,
+          "causation_id": "cause",
+          "correlation_id": "corr",
+          "dedupe_key": "create-key",
+          "operation": "project.create",
+          "payload": {
+            "action": "create_from_approval",
+            "approval_id": "approval",
+            "ignored": "old prepared data"
+          }
+        },
+        "required_permissions": [
+          {
+            "other": "forge.scope.propose"
+          }
+        ],
+        "resource": {
+          "resource_kind": "other",
+          "kind": "forge.scope",
+          "id": "agent_chat:chat"
+        },
+        "effects": [],
+        "display": {
+          "title": "Propose Forge action"
+        },
+        "preparation_fingerprint": "5858a8a0f624ff05efcd59dfdcc74974"
+      }
+    },
+    "snapshot": {
+      "id": "session",
+      "history": [],
+      "updated": 0
+    },
+    "deadline": {
+      "at": null
+    },
+    "watermark": {
+      "checkpoint_sequence": 2,
+      "event_sequence": 0
+    },
+    "updated": 0
+  },
+  "project.create:approval_pending": {
+    "schema_version": 3,
+    "transition_revision": 4,
+    "session": "session",
+    "turn": "turn",
+    "state_revision": 1,
+    "operation_fingerprint": "83dc9c49551e112c270c7859bf2b6756",
+    "active_history_start": 0,
+    "visible_output": false,
+    "state": {
+      "state": "awaiting_approval",
+      "request_id": "request",
+      "source_calls": [
+        {
+          "id": "call",
+          "name": "forge_main_orchestration_propose",
+          "arguments": {
+            "parameters": {
+              "causation_depth": 1,
+              "causation_id": "cause",
+              "correlation_id": "corr",
+              "dedupe_key": "create-key",
+              "operation": "project.create",
+              "payload": {
+                "action": "create_from_approval",
+                "approval_id": "approval",
+                "ignored": "old prepared data"
+              }
+            }
+          }
+        }
+      ],
+      "slots": [
+        {
+          "slot": "prepared",
+          "call_id": "call",
+          "tool": "forge_main_orchestration_propose",
+          "canonical_arguments": {
+            "causation_depth": 1,
+            "causation_id": "cause",
+            "correlation_id": "corr",
+            "dedupe_key": "create-key",
+            "operation": "project.create",
+            "payload": {
+              "action": "create_from_approval",
+              "approval_id": "approval",
+              "ignored": "old prepared data"
+            }
+          },
+          "required_permissions": [
+            {
+              "other": "forge.scope.propose"
+            }
+          ],
+          "resource": {
+            "resource_kind": "other",
+            "kind": "forge.scope",
+            "id": "agent_chat:chat"
+          },
+          "effects": [],
+          "display": {
+            "title": "Propose Forge action"
+          },
+          "preparation_fingerprint": "5858a8a0f624ff05efcd59dfdcc74974"
+        }
+      ],
+      "step": 0
+    },
+    "snapshot": {
+      "id": "session",
+      "history": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Continue the recorded Main action."
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_call",
+              "id": "call",
+              "name": "forge_main_orchestration_propose",
+              "arguments": {
+                "parameters": {
+                  "causation_depth": 1,
+                  "causation_id": "cause",
+                  "correlation_id": "corr",
+                  "dedupe_key": "create-key",
+                  "operation": "project.create",
+                  "payload": {
+                    "action": "create_from_approval",
+                    "approval_id": "approval",
+                    "ignored": "old prepared data"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "updated": 0
+    },
+    "deadline": {
+      "at": null
+    },
+    "watermark": {
+      "checkpoint_sequence": 2,
+      "event_sequence": 0
+    },
+    "updated": 0
+  },
+  "project.create:approval_edited": {
+    "schema_version": 3,
+    "transition_revision": 4,
+    "session": "session",
+    "turn": "turn",
+    "state_revision": 1,
+    "operation_fingerprint": "ccfe1d7a34374a0818cf1fad74007524",
+    "active_history_start": 0,
+    "visible_output": false,
+    "state": {
+      "state": "awaiting_approval",
+      "request_id": "request",
+      "source_calls": [
+        {
+          "id": "call",
+          "name": "forge_main_orchestration_propose",
+          "arguments": {
+            "parameters": {
+              "causation_depth": 1,
+              "causation_id": "cause",
+              "correlation_id": "corr",
+              "dedupe_key": "create-key",
+              "operation": "project.create",
+              "payload": {
+                "action": "create_from_approval",
+                "approval_id": "approval",
+                "ignored": "old prepared data"
+              }
+            }
+          }
+        }
+      ],
+      "slots": [
+        {
+          "slot": "prepared",
+          "call_id": "call",
+          "tool": "forge_main_orchestration_propose",
+          "canonical_arguments": {
+            "causation_depth": 1,
+            "causation_id": "cause",
+            "correlation_id": "edited-corr",
+            "dedupe_key": "create-key",
+            "operation": "project.create",
+            "payload": {
+              "action": "create_from_approval",
+              "approval_id": "approval",
+              "ignored": "old prepared data"
+            }
+          },
+          "required_permissions": [
+            {
+              "other": "forge.scope.propose"
+            }
+          ],
+          "resource": {
+            "resource_kind": "other",
+            "kind": "forge.scope",
+            "id": "agent_chat:chat"
+          },
+          "effects": [],
+          "display": {
+            "title": "Propose Forge action"
+          },
+          "preparation_fingerprint": "6aefd05d1488917d3df104df0bfb0743"
+        }
+      ],
+      "step": 0
+    },
+    "snapshot": {
+      "id": "session",
+      "history": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Continue the recorded Main action."
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_call",
+              "id": "call",
+              "name": "forge_main_orchestration_propose",
+              "arguments": {
+                "parameters": {
+                  "causation_depth": 1,
+                  "causation_id": "cause",
+                  "correlation_id": "corr",
+                  "dedupe_key": "create-key",
+                  "operation": "project.create",
+                  "payload": {
+                    "action": "create_from_approval",
+                    "approval_id": "approval",
+                    "ignored": "old prepared data"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "updated": 0
+    },
+    "deadline": {
+      "at": null
+    },
+    "watermark": {
+      "checkpoint_sequence": 2,
+      "event_sequence": 0
+    },
+    "updated": 0
+  }
+}

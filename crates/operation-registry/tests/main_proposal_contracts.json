@@ -1,0 +1,34 @@
+{
+  "genesis.project_agent.select": {
+    "type": "object",
+    "properties": {
+      "expected_session_version": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 1.0
+      },
+      "genesis_session_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "project_agent_identity_id": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "expected_session_version",
+      "project_agent_identity_id"
+    ],
+    "additionalProperties": false
+  },
+  "project.create": {
+    "type": "object",
+    "properties": {
+      "approval_id": true
+    },
+    "required": []
+  }
+}

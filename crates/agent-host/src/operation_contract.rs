@@ -10,15 +10,13 @@ use agent_runtime::core::prelude::RuntimeError;
 use serde_json::{Value, json};
 
 use crate::operation_catalog::{
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
-    PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_START_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
+    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
+    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
+    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
+    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -241,6 +239,9 @@ pub(crate) fn document_content_schema() -> Value {
 }
 
 pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
+    if let Some(spec) = operation_registry::main_proposals::CATALOG.lookup(operation) {
+        return spec.canonical_schema();
+    }
     match operation {
         MAIN_GENESIS_START_OPERATION => object_schema(
             json!({
@@ -249,20 +250,6 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "preferred_project_agent_identity_id":string_or_null_schema()
             }),
             &["action"],
-        ),
-        MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"select"},
-                "genesis_session_id":string_or_null_schema(),
-                "expected_session_version":{"type":"integer","minimum":1},
-                "project_agent_identity_id":{"type":"string","minLength":1}
-            }),
-            &[
-                "action",
-                "expected_session_version",
-                "project_agent_identity_id",
-            ],
-            "Persist the exact structured Project Agent preference for the active Product Genesis session. Read genesis.project_agents.read first; Charter approval will freeze this identity's current profile, operating-skill revision, and policy digest. This operation never changes Charter prose.",
         ),
         MAIN_CHARTER_DRAFT_OPERATION => object_schema(
             json!({
@@ -281,10 +268,6 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "content",
                 "provenance",
             ],
-        ),
-        MAIN_PROJECT_CREATE_OPERATION => object_schema(
-            json!({"action":{"const":"create_from_approval"},"approval_id":{"type":"string","minLength":1}}),
-            &["action", "approval_id"],
         ),
         PROJECT_CHARTER_ADOPTION_OPERATION => described_object_schema(
             json!({
@@ -1105,6 +1088,10 @@ pub(crate) fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Va
     let mut guidance =
         vec!["Payload shape by operation (exact contract enforced server-side):".to_owned()];
     for operation in operations {
+        if let Some(spec) = operation_registry::main_proposals::CATALOG.lookup(operation) {
+            guidance.push(format!("- {}", spec.contract_line()));
+            continue;
+        }
         let summary = orchestration_payload_summary(&orchestration_payload_schema(operation));
         guidance.push(format!("- {operation}: {summary}"));
     }
@@ -1223,54 +1210,61 @@ pub(crate) fn validate_orchestration_proposal_arguments(
             "Forge orchestration proposal field `{field}` is not admitted"
         )));
     }
-    let payload = object
-        .get("payload")
-        .and_then(Value::as_object)
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration payload must be an object"))?;
-    if operation == PROJECT_ESCALATE_OPERATION {
-        let request: api_types::ProjectEscalateRequest =
-            serde_json::from_value(Value::Object(payload.clone()))
-                .map_err(|error| RuntimeError::tool(error.to_string()))?;
-        if request.need.trim().is_empty()
-            || request.need.chars().count() > 4096
-            || request.task_ids.len() > 100
-            || request.task_ids.iter().any(|id| id.is_empty())
-        {
-            return Err(RuntimeError::tool(
-                "escalation need and Task IDs must be bounded and nonblank",
-            ));
-        }
-    } else {
-        let action = payload
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| RuntimeError::tool("Forge orchestration payload action is required"))?;
-        let schema = orchestration_payload_schema(operation);
-        let action_schema = schema
-            .get("properties")
-            .and_then(|properties| properties.get("action"))
-            .ok_or_else(|| {
-                RuntimeError::tool("Forge orchestration action schema is unavailable")
-            })?;
-        if let Some(expected) = action_schema.get("const").and_then(Value::as_str) {
-            if action != expected {
-                return Err(RuntimeError::tool(format!(
-                    "Forge orchestration action must be {expected}"
-                )));
-            }
-        } else if let Some(actions) = action_schema.get("enum").and_then(Value::as_array) {
-            if !actions
-                .iter()
-                .any(|candidate| candidate.as_str() == Some(action))
+    if operation_registry::main_proposals::CATALOG
+        .lookup(operation)
+        .is_none()
+    {
+        let payload = object
+            .get("payload")
+            .and_then(Value::as_object)
+            .ok_or_else(|| RuntimeError::tool("Forge orchestration payload must be an object"))?;
+        if operation == PROJECT_ESCALATE_OPERATION {
+            let request: api_types::ProjectEscalateRequest =
+                serde_json::from_value(Value::Object(payload.clone()))
+                    .map_err(|error| RuntimeError::tool(error.to_string()))?;
+            if request.need.trim().is_empty()
+                || request.need.chars().count() > 4096
+                || request.task_ids.len() > 100
+                || request.task_ids.iter().any(|id| id.is_empty())
             {
                 return Err(RuntimeError::tool(
-                    "Forge orchestration action is outside this typed contract",
+                    "escalation need and Task IDs must be bounded and nonblank",
                 ));
             }
         } else {
-            return Err(RuntimeError::tool(
-                "Forge orchestration action schema is not closed",
-            ));
+            let action = payload
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RuntimeError::tool("Forge orchestration payload action is required")
+                })?;
+            let schema = orchestration_payload_schema(operation);
+            let action_schema = schema
+                .get("properties")
+                .and_then(|properties| properties.get("action"))
+                .ok_or_else(|| {
+                    RuntimeError::tool("Forge orchestration action schema is unavailable")
+                })?;
+            if let Some(expected) = action_schema.get("const").and_then(Value::as_str) {
+                if action != expected {
+                    return Err(RuntimeError::tool(format!(
+                        "Forge orchestration action must be {expected}"
+                    )));
+                }
+            } else if let Some(actions) = action_schema.get("enum").and_then(Value::as_array) {
+                if !actions
+                    .iter()
+                    .any(|candidate| candidate.as_str() == Some(action))
+                {
+                    return Err(RuntimeError::tool(
+                        "Forge orchestration action is outside this typed contract",
+                    ));
+                }
+            } else {
+                return Err(RuntimeError::tool(
+                    "Forge orchestration action schema is not closed",
+                ));
+            }
         }
     }
     if let Some(value) = object.get("causation_id") {
@@ -1294,10 +1288,12 @@ pub(crate) fn validate_orchestration_proposal_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION;
     use crate::operation_catalog::{
         MIGRATED_OPERATION_CONTRACTS, OperationInputContract, OperationOutputContract,
         SHARED_ORCHESTRATION_OUTCOME,
+    };
+    use crate::{
+        MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
     };
 
     #[test]
@@ -1324,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn every_migrated_contract_resolves_to_a_closed_input_and_shared_output() {
+    fn every_migrated_contract_resolves_to_its_input_and_shared_output() {
         for contract in MIGRATED_OPERATION_CONTRACTS {
             let schema = match contract.input {
                 OperationInputContract::ReadArguments => {
@@ -1337,12 +1333,27 @@ mod tests {
             };
 
             assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
-            assert_eq!(
-                schema.get("additionalProperties").and_then(Value::as_bool),
-                Some(false),
-                "{} must remain a closed input contract",
-                contract.operation
-            );
+            if contract.operation == crate::MAIN_PROJECT_CREATE_OPERATION {
+                // The base enqueuer accepts arbitrary/incomplete payload objects;
+                // only the unchanged user executor validates the approval reference.
+                assert!(schema.get("additionalProperties").is_none());
+                assert_eq!(schema["required"], json!([]));
+                assert_eq!(schema["properties"]["approval_id"], json!(true));
+                operation_registry::main_proposals::CATALOG
+                    .lookup(contract.operation)
+                    .unwrap()
+                    .validate_arguments(
+                        &json!({"action":"ignored", "approval_id":null, "unknown":"preserved"}),
+                    )
+                    .unwrap();
+            } else {
+                assert_eq!(
+                    schema.get("additionalProperties").and_then(Value::as_bool),
+                    Some(false),
+                    "{} must remain a closed input contract",
+                    contract.operation
+                );
+            }
             // Every contract must resolve past the unhandled-operation
             // fallthrough: either operation-specific properties or an
             // explicit root description marking a deliberate zero-argument
@@ -1428,14 +1439,10 @@ mod tests {
 
         let select = orchestration_payload_schema(MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION);
         assert_eq!(select["additionalProperties"], false);
-        assert_eq!(select["properties"]["action"]["const"], "select");
+        assert!(select["properties"].get("action").is_none());
         assert_eq!(
             select["required"],
-            json!([
-                "action",
-                "expected_session_version",
-                "project_agent_identity_id"
-            ])
+            json!(["expected_session_version", "project_agent_identity_id"])
         );
         let properties = select["properties"].as_object().expect("properties");
         assert!(!properties.contains_key("charter_content"));
