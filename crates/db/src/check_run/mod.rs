@@ -34,10 +34,13 @@ stored_enum!(CheckCleanup { Success => "success", Failed => "failed", Uncertain 
 stored_enum!(CheckConsumerOrigin { Entry => "entry", ManualReview => "manual_review", Conformance => "conformance", BeforeWork => "before_work", Lifecycle => "lifecycle", Environment => "environment", Integration => "integration" });
 
 /// State-machine DATA; lease renew/takeover are fenced self transitions.
+/// Every edge is performed by exactly one repository method: the first claim
+/// (queued to running), `finish_check_run` (cleaning to succeeded or failed,
+/// and any settlement that carries evidence) or `transition_check_run`.
+/// A queued run has never been dispatched, so it cannot become uncertain.
 pub const CHECK_RUN_TRANSITIONS: &[(CheckRunState, CheckRunState)] = &[
     (CheckRunState::Queued, CheckRunState::Running),
     (CheckRunState::Queued, CheckRunState::Cancelled),
-    (CheckRunState::Queued, CheckRunState::Uncertain),
     (CheckRunState::Running, CheckRunState::Cancelling),
     (CheckRunState::Running, CheckRunState::Cleaning),
     (CheckRunState::Running, CheckRunState::Uncertain),
@@ -172,12 +175,15 @@ pub struct CheckResultEvidence {
     /// Never serialized, stored, or included in an identity.
     pub redaction_values: Vec<String>,
 }
+/// The caller's last read of a run. `lease_owner` is None only for a queued
+/// run nobody has claimed; that fence is version-only and can do nothing but
+/// cancel it. Every other mutation needs the current, unexpired lease.
 #[derive(Debug, Clone)]
 pub struct CheckRunFence {
     pub run_id: String,
     pub version: i64,
     pub lease_generation: i64,
-    pub lease_owner: String,
+    pub lease_owner: Option<String>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct CheckRunCounts {
@@ -300,6 +306,18 @@ fn map_result(row: SqliteRow) -> Result<StoredCheckResult> {
 }
 const LIVE: &str = "SELECT * FROM check_run WHERE identity_key=? AND state IN ('queued','running','cancelling','cleaning','uncertain')";
 const REUSABLE: &str = "SELECT result.* FROM check_result result JOIN check_run run ON run.id=result.run_id WHERE result.identity_key=? AND result.outcome='pass' AND result.cleanup='success' AND result.certified=1 AND result.cacheable=1 AND run.cacheable=1 AND run.state='succeeded'";
+/// Keep at most `budget` trailing bytes on a character boundary.
+fn keep_tail(text: &mut String, budget: usize) -> bool {
+    if text.len() <= budget {
+        return false;
+    }
+    let mut offset = text.len() - budget;
+    while !text.is_char_boundary(offset) {
+        offset += 1;
+    }
+    text.drain(..offset);
+    true
+}
 fn validate_times(now: &str, until: &str) -> Result<()> {
     let start =
         chrono::DateTime::parse_from_rfc3339(now).map_err(|e| DbError::Check(e.to_string()))?;
@@ -325,16 +343,18 @@ impl CheckRunRepo for SqliteDb {
         // Reject contradictory scope even though individual FK references exist.
         let project: String = sqlx::query_scalar("SELECT project_id FROM repo WHERE id=?")
             .bind(&request.identity.repo_id)
-            .fetch_one(&mut *tx)
-            .await?;
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DbError::NotFound)?;
         if project != request.identity.project_id {
             return Err(DbError::Check("check repo is outside Project".into()));
         }
         if let Some(task) = &request.task_id {
             let project: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id=?")
                 .bind(task)
-                .fetch_one(&mut *tx)
-                .await?;
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DbError::NotFound)?;
             if project != request.identity.project_id {
                 return Err(DbError::Check("check Task is outside Project".into()));
             }
@@ -342,8 +362,9 @@ impl CheckRunRepo for SqliteDb {
         if let Some(workspace) = &request.workspace_id {
             let repo: String = sqlx::query_scalar("SELECT repo_id FROM workspace WHERE id=?")
                 .bind(workspace)
-                .fetch_one(&mut *tx)
-                .await?;
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DbError::NotFound)?;
             if repo != request.identity.repo_id {
                 return Err(DbError::Check("check workspace is outside repo".into()));
             }
@@ -482,14 +503,17 @@ impl CheckRunRepo for SqliteDb {
         )?;
         if run.version != fence.version
             || run.lease_generation != fence.lease_generation
-            || run.lease_owner.as_deref() != Some(&fence.lease_owner)
+            || run.lease_owner != fence.lease_owner
         {
             return Err(DbError::VersionConflict);
         }
-        if !CHECK_RUN_TRANSITIONS.contains(&(run.state, state)) {
+        // The first claim is the only way out of queued into running.
+        if !CHECK_RUN_TRANSITIONS.contains(&(run.state, state)) || state == CheckRunState::Running {
             return Err(DbError::InvalidTransition);
         }
-        let row = sqlx::query("UPDATE check_run SET state=?,version=version+1,updated_at=?,finished_at=CASE WHEN ?='cancelled' THEN ? ELSE NULL END WHERE id=? AND version=? AND lease_generation=? AND lease_owner=? AND julianday(lease_until)>julianday(?) RETURNING *")
+        // An unclaimed queued run has no lease to expire; its fence is the
+        // version alone. A leased run still needs an unexpired lease.
+        let row = sqlx::query("UPDATE check_run SET state=?,version=version+1,updated_at=?,finished_at=CASE WHEN ?='cancelled' THEN ? ELSE NULL END WHERE id=? AND version=? AND lease_generation=? AND lease_owner IS ? AND (lease_until IS NULL OR julianday(lease_until)>julianday(?)) RETURNING *")
             .bind(state.to_string()).bind(now).bind(state.to_string()).bind(now).bind(&fence.run_id).bind(fence.version).bind(fence.lease_generation).bind(&fence.lease_owner).bind(now)
             .fetch_optional(&mut *tx).await?.ok_or(DbError::VersionConflict)?;
         let run = map_run(row)?;
@@ -518,9 +542,10 @@ impl CheckRunRepo for SqliteDb {
                 .await?
                 .ok_or(DbError::NotFound)?,
         )?;
-        if run.version != fence.version
+        if fence.lease_owner.is_none()
+            || run.version != fence.version
             || run.lease_generation != fence.lease_generation
-            || run.lease_owner.as_deref() != Some(&fence.lease_owner)
+            || run.lease_owner != fence.lease_owner
         {
             return Err(DbError::VersionConflict);
         }
@@ -545,14 +570,7 @@ impl CheckRunRepo for SqliteDb {
                 for secret in evidence.redaction_values.iter().filter(|s| !s.is_empty()) {
                     *text = text.replace(secret, "[REDACTED]");
                 }
-                if text.len() > CHECK_OUTPUT_TAIL_BYTES {
-                    evidence.output_truncated = true;
-                    let mut offset = text.len() - CHECK_OUTPUT_TAIL_BYTES;
-                    while !text.is_char_boundary(offset) {
-                        offset += 1;
-                    }
-                    *text = text[offset..].to_owned();
-                }
+                evidence.output_truncated |= keep_tail(text, CHECK_OUTPUT_TAIL_BYTES);
             }
         }
         if evidence.outcome == CheckResultOutcome::Pass
@@ -576,7 +594,24 @@ impl CheckRunRepo for SqliteDb {
         };
         // Uncertain cleanup cannot release the single-flight key. A result is
         // immutable evidence; reconciliation can append a later cleanup receipt.
-        let steps = json(&evidence.commands, CHECK_STEPS_BYTES)?;
+        // A long bundle with full tails can exceed the row budget. Output is
+        // evidence, not the verdict: halve every tail until the row fits, so a
+        // finished run can always settle. Only command text alone can refuse.
+        let mut budget = CHECK_OUTPUT_TAIL_BYTES;
+        let steps = loop {
+            match json(&evidence.commands, CHECK_STEPS_BYTES) {
+                Ok(steps) => break steps,
+                Err(error) if budget == 0 => return Err(error),
+                Err(_) => {
+                    budget /= 2;
+                    for step in &mut evidence.commands {
+                        for text in [&mut step.stderr_tail, &mut step.output_tail] {
+                            evidence.output_truncated |= keep_tail(text, budget);
+                        }
+                    }
+                }
+            }
+        };
         let updated = sqlx::query("UPDATE check_run SET state=?,version=version+1,updated_at=?,finished_at=CASE WHEN ?='uncertain' THEN NULL ELSE ? END WHERE id=? AND version=? AND lease_generation=? AND lease_owner=? AND julianday(lease_until)>julianday(?)")
             .bind(state.to_string()).bind(now).bind(state.to_string()).bind(now).bind(&fence.run_id).bind(fence.version).bind(fence.lease_generation).bind(&fence.lease_owner).bind(now)
             .execute(&mut *tx).await?;

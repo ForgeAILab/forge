@@ -75,7 +75,7 @@ fn fence(run: &StoredCheckRun) -> CheckRunFence {
         run_id: run.id.clone(),
         version: run.version,
         lease_generation: run.lease_generation,
-        lease_owner: run.lease_owner.clone().unwrap(),
+        lease_owner: run.lease_owner.clone(),
     }
 }
 fn evidence(outcome: CheckResultOutcome, cleanup: CheckCleanup) -> CheckResultEvidence {
@@ -139,6 +139,234 @@ fn state_machine_is_total_and_terminals_have_no_exit() {
             .all(|(from, to)| from != to && CheckRunState::ALL.contains(to)));
     }
     assert!(!CHECK_RUN_TRANSITIONS.contains(&(CheckRunState::Uncertain, CheckRunState::Running)));
+}
+/// A fresh run driven to `state` through the repository alone.
+async fn run_in(db: &SqliteDb, state: CheckRunState) -> StoredCheckRun {
+    let id = db
+        .request_check_run(request("edge"))
+        .await
+        .unwrap()
+        .consumer
+        .run_id
+        .unwrap();
+    if state == CheckRunState::Queued {
+        return db.check_run(&id).await.unwrap().unwrap();
+    }
+    let run = db
+        .claim_check_run(&id, 1, "worker", NOW, UNTIL)
+        .await
+        .unwrap();
+    if state == CheckRunState::Running {
+        return run;
+    }
+    db.transition_check_run(&fence(&run), state, NOW)
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn every_listed_transition_is_performed_by_the_repository_and_no_other_is() {
+    for (from, to) in CHECK_RUN_TRANSITIONS {
+        let db = fixture().await;
+        let run = run_in(&db, *from).await;
+        let reached = match (from, to) {
+            (CheckRunState::Queued, CheckRunState::Running) => {
+                db.claim_check_run(&run.id, run.version, "worker", NOW, UNTIL)
+                    .await
+                    .unwrap()
+                    .state
+            }
+            (CheckRunState::Cleaning, CheckRunState::Succeeded | CheckRunState::Failed) => {
+                let outcome = if *to == CheckRunState::Succeeded {
+                    CheckResultOutcome::Pass
+                } else {
+                    CheckResultOutcome::Fail
+                };
+                db.finish_check_run(&fence(&run), evidence(outcome, CheckCleanup::Success), NOW)
+                    .await
+                    .unwrap();
+                db.check_run(&run.id).await.unwrap().unwrap().state
+            }
+            _ => {
+                db.transition_check_run(&fence(&run), *to, NOW)
+                    .await
+                    .unwrap()
+                    .state
+            }
+        };
+        assert_eq!(reached, *to, "{from} -> {to}");
+    }
+    for from in CheckRunState::ALL.iter().filter(|state| !state.terminal()) {
+        let db = fixture().await;
+        let run = run_in(&db, *from).await;
+        for to in CheckRunState::ALL {
+            // Evidence-bearing and claim-only edges are refused here too.
+            let listed = CHECK_RUN_TRANSITIONS.contains(&(*from, *to))
+                && !matches!(
+                    to,
+                    CheckRunState::Running | CheckRunState::Succeeded | CheckRunState::Failed
+                );
+            if listed {
+                continue;
+            }
+            assert!(
+                matches!(
+                    db.transition_check_run(&fence(&run), *to, NOW).await,
+                    Err(DbError::InvalidTransition)
+                ),
+                "{from} -> {to}"
+            );
+        }
+        assert_eq!(db.check_run(&run.id).await.unwrap().unwrap().state, *from);
+    }
+}
+#[tokio::test]
+async fn queued_run_is_cancelled_by_version_alone_and_frees_its_identity() {
+    let db = fixture().await;
+    let queued = run_in(&db, CheckRunState::Queued).await;
+    assert_eq!(queued.lease_owner, None);
+    let mut stale = fence(&queued);
+    stale.version += 1;
+    assert!(matches!(
+        db.transition_check_run(&stale, CheckRunState::Cancelled, NOW)
+            .await,
+        Err(DbError::VersionConflict)
+    ));
+    // A fence that invents an owner for an unclaimed run is not this run's.
+    let mut invented = fence(&queued);
+    invented.lease_owner = Some("worker".into());
+    assert!(matches!(
+        db.transition_check_run(&invented, CheckRunState::Cancelled, NOW)
+            .await,
+        Err(DbError::VersionConflict)
+    ));
+    // An unleased fence cannot settle or renew anything.
+    assert!(matches!(
+        db.finish_check_run(
+            &fence(&queued),
+            evidence(CheckResultOutcome::Pass, CheckCleanup::Success),
+            NOW
+        )
+        .await,
+        Err(DbError::VersionConflict)
+    ));
+    assert!(matches!(
+        db.renew_check_run(&fence(&queued), NOW, UNTIL).await,
+        Err(DbError::VersionConflict)
+    ));
+    let cancelled = db
+        .transition_check_run(&fence(&queued), CheckRunState::Cancelled, NOW)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.state, CheckRunState::Cancelled);
+    assert_eq!(cancelled.finished_at.as_deref(), Some(NOW));
+    assert!(db.find_live_check_run(&identity()).await.unwrap().is_none());
+    let next = db.request_check_run(request("two")).await.unwrap();
+    assert!(matches!(
+        next.disposition,
+        CheckRequestDisposition::Scheduled
+    ));
+    assert_ne!(next.consumer.run_id.as_deref(), Some(queued.id.as_str()));
+}
+#[tokio::test]
+async fn expired_lease_cannot_transition_and_unknown_scope_is_not_found() {
+    let db = fixture().await;
+    let run = run_in(&db, CheckRunState::Running).await;
+    assert!(matches!(
+        db.transition_check_run(&fence(&run), CheckRunState::Cleaning, UNTIL)
+            .await,
+        Err(DbError::VersionConflict)
+    ));
+    for change in [
+        |r: &mut CheckRunRequest| r.identity.repo_id = "missing".into(),
+        |r: &mut CheckRunRequest| r.task_id = Some("missing".into()),
+        |r: &mut CheckRunRequest| r.workspace_id = Some("missing".into()),
+    ] {
+        let mut missing = request("missing");
+        change(&mut missing);
+        assert!(matches!(
+            db.request_check_run(missing).await,
+            Err(DbError::NotFound)
+        ));
+    }
+}
+#[tokio::test]
+async fn unique_indexes_refuse_a_second_live_run_and_a_second_reusable_result() {
+    let db = fixture().await;
+    let result = complete(
+        &db,
+        request("one"),
+        CheckResultOutcome::Pass,
+        CheckCleanup::Success,
+    )
+    .await;
+    // The repository serializes requests, so only raw rows reach the indexes.
+    let copy_run = "INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,created_at,updated_at) SELECT ?,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,?,?,created_at,updated_at FROM check_run WHERE id=?";
+    for (id, state, accepted) in [
+        ("live-1", "queued", true),
+        ("live-2", "uncertain", false),
+        ("done-2", "succeeded", true),
+    ] {
+        let inserted = sqlx::query(copy_run)
+            .bind(id)
+            .bind(state)
+            .bind(format!("operation-{id}"))
+            .bind(&result.run_id)
+            .execute(db.pool())
+            .await;
+        match inserted {
+            Ok(_) => assert!(accepted, "{id}"),
+            Err(error) => assert!(
+                !accepted
+                    && error
+                        .to_string()
+                        .contains("UNIQUE constraint failed: check_run.identity_key"),
+                "{id}: {error}"
+            ),
+        }
+    }
+    let second_pass = sqlx::query("INSERT INTO check_result(id,run_id,identity_key,outcome,cleanup,certified,cacheable,steps_json,output_truncated,created_at) SELECT 'second',?,identity_key,outcome,cleanup,certified,cacheable,steps_json,output_truncated,created_at FROM check_result WHERE id=?")
+        .bind("done-2")
+        .bind(&result.id)
+        .execute(db.pool())
+        .await;
+    assert!(second_pass
+        .unwrap_err()
+        .to_string()
+        .contains("UNIQUE constraint failed: check_result.identity_key"));
+}
+#[tokio::test]
+async fn a_long_bundle_shrinks_its_tails_to_fit_the_row_instead_of_refusing_to_settle() {
+    let db = fixture().await;
+    let mut req = request("many");
+    let template = req.identity.inputs.spec.commands[0].clone();
+    req.identity.inputs.spec.commands = (0..64)
+        .map(|index| CheckCommandSpec {
+            id: format!("ci:{index}"),
+            ..template.clone()
+        })
+        .collect();
+    let run = cleaning(&db, req).await;
+    let mut output = evidence(CheckResultOutcome::Pass, CheckCleanup::Success);
+    let step = output.commands[0].clone();
+    output.commands = (0..64)
+        .map(|index| CheckCommandOutcome {
+            index,
+            output_tail: "o".repeat(CHECK_OUTPUT_TAIL_BYTES),
+            stderr_tail: format!("{}end-{index}", "e".repeat(CHECK_OUTPUT_TAIL_BYTES)),
+            ..step.clone()
+        })
+        .collect();
+    let result = db
+        .finish_check_run(&fence(&run), output, NOW)
+        .await
+        .unwrap();
+    assert!(result.output_truncated && result.certified);
+    assert_eq!(result.commands.len(), 64);
+    assert!(serde_json::to_string(&result.commands).unwrap().len() <= CHECK_STEPS_BYTES);
+    for (index, step) in result.commands.iter().enumerate() {
+        assert_eq!(step.output_tail.len(), CHECK_OUTPUT_TAIL_BYTES / 4);
+        assert!(step.stderr_tail.ends_with(&format!("end-{index}")));
+    }
 }
 #[tokio::test]
 async fn sql_check_enums_equal_rust_enums() {

@@ -6581,8 +6581,9 @@ Object keys are recursively sorted lexically, arrays preserve order, and no
 Unicode normalization or command whitespace normalization is applied. SHA-256
 of those bytes, lowercase hex, is the digest. The fixture under
 `crates/api-types/src/check_spec/fixtures/` pins the input, exact encoding and
-hash; permutation and exhaustive semantic-leaf mutation tests pin invariance
-and invalidation.
+hash; a key-permutation test pins invariance, and a test that changes one typed
+field at a time (every spec and command field, each environment value kind, the
+attestation and the revision number) pins invalidation.
 
 Included:
 
@@ -6671,8 +6672,10 @@ cleanup can retain an immutable receipt followed by a separate reconciled
 receipt; the first is never overwritten or reused. Each stderr/combined output
 is redacted using transient values, then retained as at most a 4096-byte UTF-8
 tail. Actual redaction values are never serialized. The row-level JSON cap also
-bounds IDs, command text and timing evidence; oversize JSON is refused, not
-silently shortened into a different result.
+bounds IDs, command text and timing evidence. When a long bundle's tails exceed
+that cap, every tail is halved until the row fits and `output_truncated` is set:
+output is evidence, not the verdict, so a finished run can always settle. Only
+command text that alone exceeds the cap is refused.
 
 | `check_consumer` column | Constraint / meaning |
 |---|---|
@@ -6710,18 +6713,22 @@ a totality test ensuring every nonterminal has an exit and terminals have none:
 
 | From | Exits |
 |---|---|
-| queued | running, cancelled, uncertain |
+| queued | running (first claim only), cancelled |
 | running | cancelling, cleaning, uncertain |
 | cancelling | cleaning, uncertain |
 | cleaning | succeeded, failed, cancelled, uncertain |
 | uncertain | cleaning, cancelled (owner reconciliation required before either) |
 | succeeded / failed / cancelled | None |
 
+Every listed exit is performed by one repository method, and a test drives each
+one and refuses every unlisted one. A queued run was never dispatched, so it has
+no exit to uncertain; it has no lease either, so it is cancelled with a
+version-only fence (`lease_owner: None`) that can do nothing else.
 Claim changes queued to running; expired running/cancelling/cleaning leases keep
 the same state and operation ID while advancing generation. An expired uncertain
 run can acquire a **reconciliation** lease, remaining uncertain; claim never
-changes uncertainty back to running. Renew and transition require current
-version, generation, owner and an unexpired lease. Final settlement inserts
+changes uncertainty back to running. Renew, settlement and every transition of a claimed run require
+current version, generation, owner and an unexpired lease. Final settlement inserts
 immutable evidence and changes the run atomically. Version/generation/lease
 mismatch returns `DbError::VersionConflict`. A storage caller must supply owner
 reconciliation proof before exiting uncertainty; stage C owns that proof and

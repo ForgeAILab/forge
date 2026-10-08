@@ -243,6 +243,19 @@ fn entry_ci_uses_the_current_custom_workflow_hook_state_not_the_review_state() {
         commands(&build_check_spec(CheckPurpose::ReviewCi, &cfg).unwrap()),
         ["task-one", "task-two"]
     );
+    // The hook reads a nested `review` object before the state's own keys.
+    let nested = json!({"ci_steps":["outer"],"review":{"ci_steps":["nested-ci"]}});
+    cfg.entry_state_config = Some(&nested);
+    assert_eq!(
+        commands(&build_check_spec(CheckPurpose::EntryCi, &cfg).unwrap()),
+        ["nested-ci"]
+    );
+    let not_strings = json!({"ci_steps":[1]});
+    cfg.entry_state_config = Some(&not_strings);
+    assert_eq!(
+        build_check_spec(CheckPurpose::EntryCi, &cfg).unwrap_err(),
+        "review ci_steps entries must be strings"
+    );
 }
 
 #[test]

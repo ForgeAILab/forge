@@ -605,6 +605,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Passive check contract, digest and storage (3.3 stage A).** Nothing runs
+  through it yet: entry CI, review CI, conformance, lifecycle scripts and
+  environment checks keep their commands, timeouts, output handling and
+  results. Added: a canonical check spec with a versioned execution digest;
+  the tables `check_run`, `check_result` and `check_consumer` (new migration,
+  existing rows untouched, no cache seeded from old reviews); and fenced
+  repositories for them. Every check configured today builds as uncacheable.
+- **New server setting `server.check_run_timeout_seconds`** (default 1800,
+  positive integer; `--check-run-timeout-seconds`, then
+  `FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`, then `forge.yaml`). It defines the
+  future whole-bundle wall limit and is read by nothing yet.
+- **`GET /api/v1/operations/status` adds `check_runs`**: `by_state` (all eight
+  run states, zeros included) and `reusable_results`. Additive; both are zero
+  until a later stage runs checks through the new storage.
 - **Merge, rebase, CI and daemon RPC effects split from their persistence
   (3.2 stage C, part 1).** Internal only: the Git, command and socket effects
   of today's merge path move into `services::integration_effects`, which

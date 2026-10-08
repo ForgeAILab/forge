@@ -2,7 +2,7 @@
 use crate::contract::DEFAULT_CHECK_TIMEOUT_SECONDS;
 use api_types::*;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// Uses the same source snapshot as `contract::context_from_source` and the
 /// effective workflow/Project/Task merge. Lifecycle hooks are the already
@@ -91,7 +91,8 @@ pub fn build_check_spec(
                 if task_scope_is_read_only(config.source) {
                     serde_json::json!({})
                 } else if let Some(state) = config.entry_state_config {
-                    state.clone()
+                    // `review_ci_steps` reads a nested `review` object first.
+                    state.get("review").unwrap_or(state).clone()
                 } else {
                     effective_review_config(config.source)?
                 }
@@ -107,8 +108,7 @@ pub fn build_check_spec(
                 {
                     let command = step
                         .as_str()
-                        .filter(|s| !s.trim().is_empty())
-                        .ok_or("invalid required CI command")?;
+                        .ok_or("review ci_steps entries must be strings")?;
                     add(
                         format!("ci:{index}"),
                         command.into(),
@@ -259,16 +259,6 @@ pub fn build_check_spec(
     }
     spec.validate()?;
     Ok(spec)
-}
-
-/// Values for a future identity builder are explicit and classified. Project
-/// environment values are NOT copied here: today they have no secret metadata.
-pub fn declared_identity_keys(spec: &CheckSpec) -> BTreeMap<String, CheckEnvironmentValue> {
-    spec.commands
-        .iter()
-        .flat_map(|c| c.environment_keys.iter().cloned())
-        .map(|key| (key, CheckEnvironmentValue::Volatile))
-        .collect()
 }
 
 #[cfg(test)]
