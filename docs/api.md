@@ -4551,6 +4551,15 @@ operator diagnostics and redacted from the envelope. `safe_message` is bounded
 guidance, and `correlation_id` is the handle for authorized support/log
 correlation.
 
+The native read aggregates retain their names. Registry-backed
+`account.summary`, `agent_chat.summary`, and `project.charter` accept no nested
+arguments (omit `arguments` or pass `{}`). `skill.section` requires
+`arguments.section`, one of `research`, `documents`, `scope_change`, `tasks`,
+`milestones`, or `release`. These operation-specific contracts are now
+conditional JSON schemas in the aggregate; unknown nested fields are rejected.
+The remaining read operations retain their current schemas. Provider-wrapped
+`parameters` calls still normalize before validation. MCP schemas are unchanged.
+
 Native agent tools return domain failures in-band as the structured tool value
 with the runtime error marker (`is_error: true`), so the model can branch on
 the envelope without receiving free-form provider or database errors. MCP

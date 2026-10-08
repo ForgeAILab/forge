@@ -2049,3 +2049,99 @@ async fn a_task_worker_reaches_documentation_only_with_its_read_permission() {
         "a Task without read authority does not get a network tool"
     );
 }
+
+#[tokio::test]
+async fn registry_reads_use_real_handlers_and_unmoved_reads_keep_the_hand_path() {
+    let fixture = fixture(false).await;
+    let permissions = broad_permissions();
+    for (scope, operation, input, tool_name, expected_field, expected_value) in [
+        (
+            fixture.main_scope.clone(),
+            "account.summary",
+            json!({}),
+            "forge_scope_read",
+            "id",
+            AGENT_ID,
+        ),
+        (
+            CanonicalScope {
+                scope_type: CanonicalScopeType::AgentChat,
+                scope_id: MAIN_CHAT_ID.to_owned(),
+                workspace_access: WorkspaceAccess::Deny,
+            },
+            "agent_chat.summary",
+            json!({}),
+            "forge_scope_read",
+            "id",
+            MAIN_CHAT_ID,
+        ),
+        (
+            fixture.project_scope.clone(),
+            "project.charter",
+            json!({}),
+            FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+            "charter_id",
+            PROJECT_CHARTER_ID,
+        ),
+        (
+            fixture.project_scope.clone(),
+            "skill.section",
+            json!({"section":"research"}),
+            FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+            "section",
+            "research",
+        ),
+    ] {
+        assert!(operation_registry::READ_CATALOG.lookup(operation).is_some());
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            AGENT_ID,
+            scope,
+            None,
+            None,
+            &permissions,
+            Some(Arc::new(fixture.provider.clone())),
+        )
+        .unwrap();
+        for arguments in [
+            json!({"operation":operation,"arguments":input}),
+            json!({"parameters":{"operation":operation,"arguments":input}}),
+        ] {
+            let outcome = invoke_tool(&composition, tool_name, arguments, operation)
+                .await
+                .unwrap();
+            assert!(!outcome.is_error, "{operation}: {}", outcome.value);
+            let result = if matches!(operation, "project.charter" | "skill.section") {
+                &outcome.value["result"]
+            } else {
+                &outcome.value
+            };
+            assert_eq!(
+                result[expected_field], expected_value,
+                "{operation}: {}",
+                outcome.value
+            );
+        }
+    }
+    assert!(operation_registry::READ_CATALOG
+        .lookup("discovery.read")
+        .is_none());
+    let composition = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        fixture.main_scope,
+        None,
+        None,
+        &permissions,
+        Some(Arc::new(fixture.provider)),
+    )
+    .unwrap();
+    let outcome = invoke_tool(
+        &composition,
+        "forge_scope_read",
+        json!({"operation":"discovery.read","arguments":{"limit":1}}),
+        "unmoved",
+    )
+    .await
+    .unwrap();
+    assert!(!outcome.is_error);
+    assert!(outcome.value["items"].is_array());
+}

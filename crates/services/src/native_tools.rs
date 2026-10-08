@@ -6,6 +6,8 @@
 //! call their shared command services, while approval-required mutations
 //! retain an `AgentAction` envelope.
 
+mod registered_reads;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -39,13 +41,12 @@ use forge_agent_host::{
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
     MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
-    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
+    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -2219,7 +2220,7 @@ impl CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        input: operation_registry::project_reads::SectionArguments,
     ) -> Result<Value, AgentHostError> {
         // Doctrine text is static server-owned content, but the read still
         // authenticates the Project binding so the operation cannot become an
@@ -2229,10 +2230,7 @@ impl CoordinationToolProvider {
             .project_orchestration_target(actor_identity_id, scope)
             .await
             .map_err(native_scope_error)?;
-        let section = arguments
-            .get("section")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let section = input.section.as_str();
         let body = crate::operating_skills::project_skill_section(section).ok_or_else(|| {
             AgentHostError::Unsupported(format!(
                 "unknown doctrine section `{section}`; sections: {}",
@@ -4380,71 +4378,83 @@ impl ForgeToolProvider for CoordinationToolProvider {
                 ));
             }
         }
-        let result = match operation {
-            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION
-            | MAIN_CHARTER_READINESS_OPERATION
-            | MAIN_CHARTER_DIFF_OPERATION
-            | MAIN_CHARTER_APPROVAL_TARGET_OPERATION => self
-                .main_queries
-                .execute(actor_identity_id, scope, operation, arguments)
-                .await
-                .map_err(service_error),
-            MAIN_CHARTER_READ_OPERATION => self
-                .main_queries
-                .execute(actor_identity_id, scope, operation, arguments)
-                .await
-                .map_err(native_scope_error),
-            MAIN_INQUIRY_RUN_OPERATION => {
-                self.inquiry_run(actor_identity_id, scope, arguments).await
-            }
-            PROJECT_CURRENT_STATE_OPERATION => {
-                self.project_current_state_read(actor_identity_id, scope, arguments)
-                    .await
-            }
-            PROJECT_OBSERVATIONS_OPERATION => {
-                self.project_observations_read(actor_identity_id, scope, arguments)
-                    .await
-            }
-            PROJECT_CHARTER_READ_OPERATION => {
-                self.project_charter_read(actor_identity_id, scope).await
-            }
-            PROJECT_SKILL_SECTION_OPERATION => {
-                self.project_skill_section_read(actor_identity_id, scope, arguments)
-                    .await
-            }
-            "memory.read" => {
-                self.memory_read(actor_identity_id, scope, arguments, false)
-                    .await
-            }
-            "account.summary" | "project.summary" | "agent_chat.summary" | "task.summary" => {
-                if operation == "project.summary"
-                    && scope.scope_type == CanonicalScopeType::AgentChat
-                {
-                    self.project_summary_read(actor_identity_id, scope, arguments)
-                        .await
-                } else {
-                    self.summary(actor_identity_id, scope).await
+        let result = if let Some(spec) = registered_reads::CATALOG.lookup(operation) {
+            spec.dispatch(
+                &registered_reads::Context {
+                    provider: self,
+                    actor_identity_id,
+                    scope,
+                },
+                arguments,
+            )
+            .await
+            .map_err(|error| match error {
+                operation_registry::DispatchError::InvalidInput(message) => {
+                    invalid_arguments(message)
                 }
-            }
-            "discovery.read" => {
-                self.discovery_read(actor_identity_id, scope, arguments)
+                operation_registry::DispatchError::Handler(error) => error,
+            })
+        } else {
+            match operation {
+                MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION
+                | MAIN_CHARTER_READINESS_OPERATION
+                | MAIN_CHARTER_DIFF_OPERATION
+                | MAIN_CHARTER_APPROVAL_TARGET_OPERATION => self
+                    .main_queries
+                    .execute(actor_identity_id, scope, operation, arguments)
                     .await
-            }
-            "portfolio.read" => {
-                self.portfolio_read(actor_identity_id, scope, arguments)
+                    .map_err(service_error),
+                MAIN_CHARTER_READ_OPERATION => self
+                    .main_queries
+                    .execute(actor_identity_id, scope, operation, arguments)
                     .await
+                    .map_err(native_scope_error),
+                MAIN_INQUIRY_RUN_OPERATION => {
+                    self.inquiry_run(actor_identity_id, scope, arguments).await
+                }
+                PROJECT_CURRENT_STATE_OPERATION => {
+                    self.project_current_state_read(actor_identity_id, scope, arguments)
+                        .await
+                }
+                PROJECT_OBSERVATIONS_OPERATION => {
+                    self.project_observations_read(actor_identity_id, scope, arguments)
+                        .await
+                }
+                "memory.read" => {
+                    self.memory_read(actor_identity_id, scope, arguments, false)
+                        .await
+                }
+                "project.summary" | "task.summary" => {
+                    if operation == "project.summary"
+                        && scope.scope_type == CanonicalScopeType::AgentChat
+                    {
+                        self.project_summary_read(actor_identity_id, scope, arguments)
+                            .await
+                    } else {
+                        self.summary(actor_identity_id, scope).await
+                    }
+                }
+                "discovery.read" => {
+                    self.discovery_read(actor_identity_id, scope, arguments)
+                        .await
+                }
+                "portfolio.read" => {
+                    self.portfolio_read(actor_identity_id, scope, arguments)
+                        .await
+                }
+                "decisions.read" => {
+                    self.memory_read(actor_identity_id, scope, arguments, true)
+                        .await
+                }
+                "work.read" | "events.read" | "inbox.read" | "commitments.read"
+                | "delivery.read" => {
+                    self.scoped_rows(actor_identity_id, scope, operation, arguments)
+                        .await
+                }
+                _ => Err(AgentHostError::Unsupported(
+                    "Forge read operation is not implemented".to_owned(),
+                )),
             }
-            "decisions.read" => {
-                self.memory_read(actor_identity_id, scope, arguments, true)
-                    .await
-            }
-            "work.read" | "events.read" | "inbox.read" | "commitments.read" | "delivery.read" => {
-                self.scoped_rows(actor_identity_id, scope, operation, arguments)
-                    .await
-            }
-            _ => Err(AgentHostError::Unsupported(
-                "Forge read operation is not implemented".to_owned(),
-            )),
         };
         if operation_contract(operation).is_some() {
             match result {

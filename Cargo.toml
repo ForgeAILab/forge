@@ -17,6 +17,7 @@ members = [
     "crates/mcp-server",
     "crates/config",
     "crates/agent-host",
+    "crates/operation-registry",
 ]
 resolver = "2"
 

@@ -52,8 +52,7 @@ use crate::{
         MAIN_CHARTER_READINESS_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
         MAIN_INQUIRY_RUN_OPERATION, OperationExposure, OperationSurface,
         PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-        PROJECT_OBSERVATIONS_OPERATION, PROJECT_SKILL_SECTION_NAMES,
-        PROJECT_SKILL_SECTION_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+        PROJECT_OBSERVATIONS_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
         TASK_WORKLOG_OPERATION, operation_names_for_surface,
     },
     operation_contract::{
@@ -1787,6 +1786,11 @@ impl ForgeScopeReadTool {
                 "additionalProperties": false
             })
         };
+        let schema = operation_registry::READ_CATALOG.project_aggregate(
+            schema,
+            self.tool_name,
+            &self.operations,
+        );
         ToolSpec::new(
             self.tool_name,
             description,
@@ -1833,6 +1837,10 @@ impl Tool for ForgeScopeReadTool {
         }
         if self.reject_authority_overrides {
             reject_authority_overrides(&arguments)?;
+        }
+        if self.reject_authority_overrides
+            || operation_registry::READ_CATALOG.lookup(operation).is_some()
+        {
             validate_orchestration_read_arguments(operation, &arguments)?;
         }
         let resource = SecurityResource::other(
@@ -2924,6 +2932,20 @@ fn validate_orchestration_read_arguments(
     let object = arguments.as_object().ok_or_else(|| {
         RuntimeError::tool("Forge orchestration read arguments must be an object")
     })?;
+    if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
+        if let Some(field) = object
+            .keys()
+            .find(|field| !matches!(field.as_str(), "operation" | "arguments"))
+        {
+            return Err(RuntimeError::tool(format!(
+                "Forge orchestration read field `{field}` is not admitted"
+            )));
+        }
+        return spec
+            .input
+            .validate(object.get("arguments").unwrap_or(&json!({})))
+            .map_err(RuntimeError::tool);
+    }
     let allowed = match operation {
         MAIN_CHARTER_READ_OPERATION => &["operation", "arguments"][..],
         PROJECT_CURRENT_STATE_OPERATION => &["operation", "arguments"][..],
@@ -2963,7 +2985,6 @@ fn validate_orchestration_read_arguments(
             ],
             PROJECT_CURRENT_STATE_OPERATION => &["limit"],
             PROJECT_OBSERVATIONS_OPERATION => &["task_id", "limit"],
-            PROJECT_SKILL_SECTION_OPERATION => &["section"],
             MAIN_INQUIRY_RUN_OPERATION => &["title", "question", "context"],
             _ => &[],
         };
@@ -2986,17 +3007,6 @@ fn validate_orchestration_read_arguments(
                 return Err(RuntimeError::tool(
                     "Project state read limit must be an integer",
                 ));
-            }
-        }
-        if operation == PROJECT_SKILL_SECTION_OPERATION {
-            match nested.get("section").and_then(Value::as_str) {
-                Some(section) if PROJECT_SKILL_SECTION_NAMES.contains(&section) => {}
-                _ => {
-                    return Err(RuntimeError::tool(format!(
-                        "skill.section requires `section` from: {}",
-                        PROJECT_SKILL_SECTION_NAMES.join(", ")
-                    )));
-                }
             }
         }
     }
@@ -5434,7 +5444,7 @@ mod tests {
         assert_eq!(provider.evaluations.load(Ordering::SeqCst), 2);
     }
 
-    fn test_preparation_context(call_id: &str) -> PreparationContext {
+    pub(super) fn test_preparation_context(call_id: &str) -> PreparationContext {
         PreparationContext {
             session: agent_runtime::core::ids::SessionId::new("session"),
             turn: None,
@@ -5447,7 +5457,7 @@ mod tests {
         }
     }
 
-    fn test_invocation_context(call_id: &str) -> InvocationContext {
+    pub(super) fn test_invocation_context(call_id: &str) -> InvocationContext {
         InvocationContext {
             session: agent_runtime::core::ids::SessionId::new("session"),
             turn: None,
@@ -5717,3 +5727,7 @@ mod bounded_command_tests {
 #[cfg(test)]
 #[path = "typed_tools/normalization_tests.rs"]
 mod normalization_tests;
+
+#[cfg(test)]
+#[path = "typed_tools/registry_tests.rs"]
+mod registry_tests;

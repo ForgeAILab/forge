@@ -1,0 +1,42 @@
+{
+  "account.summary": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+  },
+  "agent_chat.summary": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+  },
+  "project.charter": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false,
+    "description": "Returns the bound Project's current approved Charter as rendered Markdown plus its charter/revision identifiers and content/render digests. The Charter is Project data, not resident context: read it whenever its details matter to a decision. The response is scope-bound and never accepts a Project selector."
+  },
+  "skill.section": {
+    "type": "object",
+    "properties": {
+      "section": {
+        "type": "string",
+        "enum": [
+          "research",
+          "documents",
+          "scope_change",
+          "tasks",
+          "milestones",
+          "release"
+        ]
+      }
+    },
+    "required": [
+      "section"
+    ],
+    "additionalProperties": false,
+    "description": "Returns one server-owned Project operating-doctrine section by name. Read the matching section before the first work of that kind in a conversation and re-read it when unsure: research, documents, scope_change, tasks, milestones, release."
+  }
+}

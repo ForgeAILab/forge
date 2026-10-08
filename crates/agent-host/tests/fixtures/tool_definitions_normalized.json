@@ -90,6 +90,30 @@
       "description": "Read one bounded Forge resource from the current canonical scope.",
       "input_schema": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "agent_chat.summary"
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            },
+            "then": {
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "arguments": {
             "type": "object"
@@ -346,6 +370,30 @@
       "description": "Read one bounded Forge resource from the current canonical scope.",
       "input_schema": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "account.summary"
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            },
+            "then": {
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "arguments": {
             "type": "object"
@@ -464,6 +512,30 @@
       "description": "Read one bounded Forge resource from the current canonical scope.",
       "input_schema": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "agent_chat.summary"
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            },
+            "then": {
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "arguments": {
             "type": "object"
@@ -1082,9 +1154,72 @@
       "description": "Read one bounded Forge orchestration resource from the authenticated single-Project Project Agent scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
       "input_schema": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "project.charter"
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            },
+            "then": {
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "skill.section"
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            },
+            "then": {
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "section": {
+                      "enum": [
+                        "research",
+                        "documents",
+                        "scope_change",
+                        "tasks",
+                        "milestones",
+                        "release"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "section"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "arguments"
+              ]
+            }
+          }
+        ],
         "properties": {
           "arguments": {
-            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: optional {limit}\n- project.observations: optional {limit, task_id}\n- skill.section: optional {section}",
+            "description": "Arguments by operation:\n- project.current_state: optional {limit}\n- project.observations: optional {limit, task_id}",
             "type": "object"
           },
           "operation": {
@@ -1248,6 +1383,30 @@
       "description": "Read one bounded Forge resource from the current canonical scope.",
       "input_schema": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "agent_chat.summary"
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            },
+            "then": {
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "arguments": {
             "type": "object"
@@ -1866,9 +2025,72 @@
       "description": "Read one bounded Forge orchestration resource from the authenticated single-Project Project Agent scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
       "input_schema": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "project.charter"
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            },
+            "then": {
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "skill.section"
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            },
+            "then": {
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "section": {
+                      "enum": [
+                        "research",
+                        "documents",
+                        "scope_change",
+                        "tasks",
+                        "milestones",
+                        "release"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "section"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "arguments"
+              ]
+            }
+          }
+        ],
         "properties": {
           "arguments": {
-            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: optional {limit}\n- project.observations: optional {limit, task_id}\n- skill.section: optional {section}",
+            "description": "Arguments by operation:\n- project.current_state: optional {limit}\n- project.observations: optional {limit, task_id}",
             "type": "object"
           },
           "operation": {
@@ -1947,6 +2169,30 @@
       "description": "Read one bounded Forge resource from the current canonical scope.",
       "input_schema": {
         "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "agent_chat.summary"
+                }
+              },
+              "required": [
+                "operation"
+              ]
+            },
+            "then": {
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {},
+                  "required": [],
+                  "type": "object"
+                }
+              }
+            }
+          }
+        ],
         "properties": {
           "arguments": {
             "type": "object"

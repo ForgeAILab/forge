@@ -21,6 +21,7 @@ crates/
 ├── api/           # Axum REST endpoints, SSE, middleware
 ├── api-types/     # Shared request/response types (zero internal deps)
 ├── agent-host/    # Forge-owned direct Agent Runtime composition and protected stores
+├── operation-registry/ # Typed native operation specs and generated projections
 ├── db/            # SQLite schema, migrations, repository implementations
 ├── services/      # Business logic (task state machine, workflow engine)
 ├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
@@ -50,6 +51,36 @@ forge-solo → services → db / events / agent-host / executors / workspace →
 ```
 
 ## Architectural patterns
+
+### Native operation registry
+
+`operation-registry` depends only on Serde, schemars and async-trait. Both
+`agent-host` and `services` depend on it; it imports neither consumer, so typed
+service handler registration does not create a dependency cycle. Specifications
+live in domain modules (`scope_reads`, `project_reads`); the catalog concatenates
+those registries, checks exact membership and collisions, and iterates by ID.
+
+An `OperationSpec` owns its Serde input type and derived JSON schema, declared
+structural constraints, authority facts, effect class, availability, native
+aggregate and field projection, short summary, bounded guidance, and typed
+handler binding. Generic functions generate the canonical schema, structural
+validation/decoding, dispatch lookup, and conditional argument contracts inside
+already authority-filtered native aggregates. Service contexts implement the
+small typed domain interfaces; handler errors keep their existing mapping.
+
+The first registered reads are `account.summary`, `agent_chat.summary`,
+`project.charter`, and `skill.section`. All other operations keep their hand
+paths. Existing permission/binding checks enforce authority; spec/check parity
+is tested pending EffectiveAuthority. Domain semantic validation, transactions,
+workspace preparation, MCP projections and doctrine remain hand-written.
+
+To add an operation, declare a closed Serde/JsonSchema input and its constraints
+in its domain module, bind a typed context handler, and add its ID to the catalog
+completeness receipt. Replace its former schema/validator/dispatch path, supply
+its service context implementation, and test schema, dispatch, constraints,
+authority parity and aggregate snapshots. Update advertised-schema docs when
+contracts change. Required read arguments are projected structurally rather
+than described as optional prose.
 
 ### Repository trait pattern
 

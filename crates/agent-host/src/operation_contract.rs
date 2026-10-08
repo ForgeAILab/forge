@@ -14,11 +14,10 @@ use crate::operation_catalog::{
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
     MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
     PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
     TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
     TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
@@ -1181,6 +1180,9 @@ pub(crate) fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Va
 }
 
 pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
+    if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
+        return spec.canonical_schema();
+    }
     match operation {
         MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => described_object_schema(
             json!({"genesis_session_id":string_or_null_schema()}),
@@ -1258,18 +1260,6 @@ pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
             &[],
             "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector.",
         ),
-        PROJECT_CHARTER_READ_OPERATION => described_object_schema(
-            json!({}),
-            &[],
-            "Returns the bound Project's current approved Charter as rendered Markdown plus its charter/revision identifiers and content/render digests. The Charter is Project data, not resident context: read it whenever its details matter to a decision. The response is scope-bound and never accepts a Project selector.",
-        ),
-        PROJECT_SKILL_SECTION_OPERATION => described_object_schema(
-            json!({
-                "section":{"type":"string","enum":PROJECT_SKILL_SECTION_NAMES}
-            }),
-            &["section"],
-            "Returns one server-owned Project operating-doctrine section by name. Read the matching section before the first work of that kind in a conversation and re-read it when unsure: research, documents, scope_change, tasks, milestones, release.",
-        ),
         _ => object_schema(json!({}), &[]),
     }
 }
@@ -1277,6 +1267,9 @@ pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
 pub(crate) fn orchestration_read_schema(operations: &BTreeSet<String>) -> Value {
     let mut guidance = vec!["Arguments by operation:".to_owned()];
     for operation in operations {
+        if operation_registry::READ_CATALOG.lookup(operation).is_some() {
+            continue;
+        }
         let arguments = orchestration_read_arguments_schema(operation);
         let keys = arguments
             .get("properties")
