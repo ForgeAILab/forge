@@ -3,14 +3,14 @@ use crate::{create_sqlite_pool, run_migrations, TaskStepRepo};
 use sha2::{Digest, Sha256};
 
 pub(super) const FIXED_TIME: &str = "2026-10-07T00:00:00Z";
-async fn fixture() -> SqliteDb {
+pub(super) async fn fixture() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
     run_migrations(&pool).await.unwrap();
     let db = SqliteDb::new(pool);
     seed(db.pool()).await;
     db
 }
-async fn seed(pool: &crate::SqlitePool) {
+pub(super) async fn seed(pool: &crate::SqlitePool) {
     sqlx::query("INSERT INTO project(id,name,settings,workflow_definition,created_at,updated_at) VALUES('p','project','{}','{}',?,?)").bind(FIXED_TIME).bind(FIXED_TIME).execute(pool).await.unwrap();
     let path = std::env::temp_dir()
         .join("integration-target")
@@ -23,7 +23,7 @@ async fn seed(pool: &crate::SqlitePool) {
         sqlx::query("INSERT INTO task(id,project_id,title,status,review_passed_at,created_at,updated_at) VALUES(?,'p',?,'merging',?,?,?)").bind(id).bind(id).bind(FIXED_TIME).bind(FIXED_TIME).bind(FIXED_TIME).execute(pool).await.unwrap();
     }
 }
-fn admission(q: &IntegrationQueue, task: &str, key: &str) -> IntegrationAttempt {
+pub(super) fn admission(q: &IntegrationQueue, task: &str, key: &str) -> IntegrationAttempt {
     IntegrationAttempt::new(
         Some(q.id.clone()),
         task.into(),
@@ -67,7 +67,6 @@ fn stored_enums_round_trip_and_reject_unknown_values() {
         IntegrationOwnerKind,
         IntegrationOperationKind,
         IntegrationOperationState,
-        IntegrationEffectKind,
         IntegrationImportDisposition,
         IntegrationNeededFact
     );
@@ -508,7 +507,7 @@ async fn importer_is_bounded_resumable_idempotent_and_writes_only_two_tables() {
     );
 }
 
-async fn seed_delivery(db: &SqliteDb, task: &str) {
+pub(super) async fn seed_delivery(db: &SqliteDb, task: &str) {
     let path = std::env::temp_dir()
         .join("integration-worktree")
         .to_str()
@@ -814,7 +813,7 @@ async fn shadow_five_result_transactions_preserve_every_other_table_when_recordi
             let step = db.task_steps("a").await.unwrap().pop().unwrap();
             if let Some(key) = key {
                 crate::task_writer::in_task_step(step.clone(), async {
-                    note_integration_target("a", 0, Some("candidate"), "target");
+                    note_integration_target(&step.id, 0, Some("candidate"), "target");
                     db.record_hook_effect(&step, 0, key, &value.to_string())
                         .await
                         .unwrap();

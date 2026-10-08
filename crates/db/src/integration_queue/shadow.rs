@@ -1,45 +1,65 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-// Facts stay in the current Task-step's memory until its existing result
-// transaction records them. Reading a target adds no database transaction,
-// Git command, checkpoint, event, lease or queue action to the merge path.
-tokio::task_local! { static TARGET_OBSERVATIONS: std::cell::RefCell<Vec<(String,i64,IntegrationObservation)>>; }
+/// An attempt keeps its first observation and the most recent
+/// `INTEGRATION_OBSERVATION_RECENT`; older ones are counted in
+/// `observations_dropped`. A Task that loops through rebase or review cannot
+/// grow the row without limit.
+pub const INTEGRATION_OBSERVATION_RECENT: i64 = 15;
+/// Path lists inside one observation are evidence, not the full set.
+pub const INTEGRATION_OBSERVATION_PATHS: usize = 256;
+/// Serialized bound of one observation; larger ones lose their path lists.
+pub const INTEGRATION_OBSERVATION_BYTES: usize = 16 * 1024;
+
+/// The append is ONE statement: no read of the row into Rust, no rewrite of
+/// the other columns. Binds, in order: cap, observation JSON, cap.
+const APPEND_SET: &str = "observations_json=json_insert(CASE WHEN json_array_length(observations_json)>=? THEN json_remove(observations_json,'$[1]') ELSE observations_json END,'$[#]',json(?)),observations_dropped=observations_dropped+(json_array_length(observations_json)>=?)";
+/// Replay guard. Bind: observation identity.
+const NOT_RECORDED: &str = "NOT EXISTS(SELECT 1 FROM json_each(integration_attempt.observations_json) WHERE json_extract(value,'$.identity')=?)";
+
+// The latest target read stays in the current Task step's memory until that
+// step's existing result transaction records it. Reading a target adds no
+// database transaction, Git command, checkpoint, event, lease or queue action
+// to the merge path. One slot: a step runs one hook at a time.
+struct TargetRead {
+    step_id: String,
+    hook_index: i64,
+    candidate_sha: Option<String>,
+    target_tip_sha: String,
+}
+tokio::task_local! { static TARGET_READ: std::cell::RefCell<Option<TargetRead>>; }
 pub(crate) async fn with_observation_buffer<T>(future: impl std::future::Future<Output = T>) -> T {
-    TARGET_OBSERVATIONS
-        .scope(std::cell::RefCell::new(Vec::new()), future)
+    TARGET_READ
+        .scope(std::cell::RefCell::new(None), future)
         .await
 }
+/// Remember the target tip the merge path just read for `step_id`'s hook.
+/// A no-op outside that step's own scope; never touches the database.
 pub fn note_integration_target(
-    task_id: &str,
-    index: i64,
+    step_id: &str,
+    hook_index: i64,
     candidate_sha: Option<&str>,
     target_tip_sha: &str,
 ) {
-    let Some(step) = crate::task_writer::current_task_step().filter(|step| step.task_id == task_id)
-    else {
+    if !crate::task_writer::owns_step(step_id) {
         return;
-    };
-    let mut observation = IntegrationObservation::new(
-        format!("{}:{index}:merge_target", step.id),
-        IntegrationOutcomeKind::TargetTip,
-    );
-    observation.step_id = Some(step.id.clone());
-    observation.candidate_sha = candidate_sha.map(str::to_owned);
-    observation.target_tip_sha = Some(target_tip_sha.to_owned());
-    let _ = TARGET_OBSERVATIONS.try_with(|buffer| {
-        let mut buffer = buffer.borrow_mut();
-        buffer.retain(|(id, hook, _)| id != &step.id || *hook != index);
-        buffer.push((step.id.clone(), index, observation));
+    }
+    let _ = TARGET_READ.try_with(|slot| {
+        *slot.borrow_mut() = Some(TargetRead {
+            step_id: step_id.to_owned(),
+            hook_index,
+            candidate_sha: candidate_sha.map(str::to_owned),
+            target_tip_sha: target_tip_sha.to_owned(),
+        });
     });
 }
-fn target_observation(step: &crate::TaskStep, index: i64) -> Option<IntegrationObservation> {
-    TARGET_OBSERVATIONS
-        .try_with(|buffer| {
-            buffer
-                .borrow()
-                .iter()
-                .find(|(id, hook, _)| id == &step.id && *hook == index)
-                .map(|(_, _, o)| o.clone())
+fn target_read(step_id: &str, hook_index: i64) -> Option<(Option<String>, String)> {
+    TARGET_READ
+        .try_with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|read| read.step_id == step_id && read.hook_index == hook_index)
+                .map(|read| (read.candidate_sha.clone(), read.target_tip_sha.clone()))
         })
         .ok()
         .flatten()
@@ -57,6 +77,9 @@ pub struct IntegrationObservation {
     pub target_tip_sha: Option<String>,
     pub changed_paths: Option<Vec<String>>,
     pub conflict_paths: Option<Vec<String>>,
+    /// A path list was cut to the observation bound; it is not the full set.
+    #[serde(default)]
+    pub paths_truncated: bool,
     pub recorded_at: String,
 }
 impl IntegrationObservation {
@@ -69,57 +92,120 @@ impl IntegrationObservation {
             target_tip_sha: None,
             changed_paths: None,
             conflict_paths: None,
+            paths_truncated: false,
             recorded_at: now_rfc3339(),
         }
     }
+    /// Validate and bound the observation; returns the JSON that is stored.
+    fn stored(&self) -> Result<String> {
+        if self.identity.is_empty() {
+            return Err(DbError::Check("observation identity missing".into()));
+        }
+        let mut bounded = self.clone();
+        for paths in [&mut bounded.changed_paths, &mut bounded.conflict_paths]
+            .into_iter()
+            .flatten()
+        {
+            if paths.len() > INTEGRATION_OBSERVATION_PATHS {
+                paths.truncate(INTEGRATION_OBSERVATION_PATHS);
+                bounded.paths_truncated = true;
+            }
+            validate_integration_paths(&serde_json::json!(paths))?;
+        }
+        let mut json = serde_json::to_string(&bounded).expect("observation serializes");
+        if json.len() > INTEGRATION_OBSERVATION_BYTES {
+            bounded.changed_paths = None;
+            bounded.conflict_paths = None;
+            bounded.paths_truncated = true;
+            json = serde_json::to_string(&bounded).expect("observation serializes");
+        }
+        if json.len() > INTEGRATION_OBSERVATION_BYTES {
+            return Err(DbError::Check("observation exceeds bound".into()));
+        }
+        Ok(json)
+    }
 }
+/// Repository form, by attempt id. A replayed identity is a no-op when the
+/// retained content matches and an `IdempotencyConflict` when it differs.
 pub(super) async fn record_observation_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     attempt_id: &str,
     observation: &IntegrationObservation,
 ) -> Result<()> {
-    if observation.identity.is_empty() {
-        return Err(DbError::Check("observation identity missing".into()));
-    }
-    for paths in [&observation.changed_paths, &observation.conflict_paths]
-        .into_iter()
-        .flatten()
-    {
-        validate_integration_paths(&serde_json::json!(paths))?;
-    }
-    let mut a = attempt_in_tx(tx, attempt_id).await?;
-    let observations = a
-        .observations_json
-        .as_array_mut()
-        .ok_or_else(|| DbError::Check("observations are not an array".into()))?;
-    if let Some(existing) = observations
-        .iter()
-        .find(|v| v["identity"].as_str() == Some(&observation.identity))
-    {
-        let mut existing = existing.clone();
-        let mut next = serde_json::to_value(observation).expect("observation serializes");
-        existing
-            .as_object_mut()
-            .expect("typed observation")
-            .remove("recorded_at");
-        next.as_object_mut()
-            .expect("typed observation")
-            .remove("recorded_at");
-        if existing != next {
-            return Err(DbError::IdempotencyConflict);
-        }
+    let json = observation.stored()?;
+    // Observations never grant authority, claim a slot, or drive state.
+    let recorded = sqlx::query(&format!("UPDATE integration_attempt SET {APPEND_SET},updated_at=?,revision=revision+1 WHERE id=? AND {NOT_RECORDED}"))
+        .bind(INTEGRATION_OBSERVATION_RECENT + 1)
+        .bind(&json)
+        .bind(INTEGRATION_OBSERVATION_RECENT + 1)
+        .bind(&observation.recorded_at)
+        .bind(attempt_id)
+        .bind(&observation.identity)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    if recorded == 1 {
         return Ok(());
     }
-    observations.push(serde_json::to_value(observation).expect("observation serializes"));
-    a.updated_at = observation.recorded_at.clone();
-    // Observations never grant authority, claim a slot, or drive state.
-    update_attempt(tx, &a).await
+    let retained: String =
+        sqlx::query_scalar("SELECT observations_json FROM integration_attempt WHERE id=?")
+            .bind(attempt_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(DbError::NotFound)?;
+    let mut next = parse_json(json)?;
+    next.as_object_mut()
+        .expect("typed observation")
+        .remove("recorded_at");
+    let same = parse_json(retained)?
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| o["identity"].as_str() == Some(&observation.identity))
+        .any(|o| {
+            let mut existing = o.clone();
+            if let Some(object) = existing.as_object_mut() {
+                object.remove("recorded_at");
+            }
+            existing == next
+        });
+    if same {
+        Ok(())
+    } else {
+        Err(DbError::IdempotencyConflict)
+    }
+}
+/// Shadow form: one statement on the Task's current attempt, found through
+/// the `integration_attempt_current_task` partial unique index. Returns
+/// whether a row took the observation (false: no current attempt, or replay).
+async fn append_for_task(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    observation: &IntegrationObservation,
+    candidate_sha: Option<&str>,
+) -> Result<bool> {
+    let json = observation.stored()?;
+    Ok(sqlx::query(&format!("UPDATE integration_attempt SET {APPEND_SET},candidate_sha=COALESCE(?,candidate_sha),updated_at=?,revision=revision+1 WHERE task_ref=? AND current=1 AND {NOT_RECORDED}"))
+        .bind(INTEGRATION_OBSERVATION_RECENT + 1)
+        .bind(&json)
+        .bind(INTEGRATION_OBSERVATION_RECENT + 1)
+        .bind(candidate_sha)
+        .bind(&observation.recorded_at)
+        .bind(task_id)
+        .bind(&observation.identity)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected()
+        == 1)
 }
 
-/// Isolate every optional shadow write. SQLite constraint/statement failures
-/// roll back this savepoint while the authoritative result still commits.
-/// One invocation produces at most one warning; replay identities deduplicate
-/// successful observations. There is no runtime feature flag.
+/// Every shadow write is optional. A site records with ONE statement, so a
+/// constraint or statement failure undoes only that statement (SQLite's
+/// statement atomicity) and the authoritative result still commits; only the
+/// once-per-merge-entry admission needs several statements and a savepoint.
+/// Each site has already written in its transaction, so it holds the write
+/// lock and a recording statement cannot wait on another writer. There is no
+/// runtime feature flag.
 impl SqliteDb {
     pub(crate) async fn observe_integration_hook_best_effort(
         &self,
@@ -135,46 +221,41 @@ impl SqliteDb {
         ) {
             return;
         }
-        let result = async {
-            sqlx::query("SAVEPOINT integration_shadow")
-                .execute(&mut **tx)
-                .await?;
-            observe_hook_in_tx(tx, step, index, key, value).await
+        if let Err(error) = observe_hook_in_tx(tx, step, index, key, value).await {
+            log_shadow_failure(key, &step.task_id, &error);
         }
-        .await;
-        finish_shadow(
-            tx,
-            &step.task_id,
-            &format!("{}:{index}:{key}", step.id),
-            result,
-        )
-        .await;
     }
+    /// Runs in every step settlement, so it is exactly one indexed statement
+    /// that matches nothing unless the Task has a current attempt and is
+    /// terminal. An uncertain effect, or a reserved queue head, stays pinned:
+    /// a Task's status alone never proves a non-effect.
     pub(crate) async fn observe_integration_terminal_best_effort(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         step: &crate::TaskStep,
     ) {
+        const RESOLVED: &str = "state NOT IN ('reconciling','ff_inflight','quarantined') AND COALESCE(current_operation_state,'') NOT IN ('running','uncertain') AND NOT EXISTS(SELECT 1 FROM integration_queue q WHERE q.head_attempt_id=integration_attempt.id)";
+        let mut observation = IntegrationObservation::new(
+            format!("{}:terminal", step.id),
+            IntegrationOutcomeKind::Done,
+        );
+        observation.step_id = Some(step.id.clone());
         let result = async {
-            sqlx::query("SAVEPOINT integration_shadow").execute(&mut **tx).await?;
-            let status: String = sqlx::query_scalar("SELECT status FROM task WHERE id=?").bind(&step.task_id).fetch_one(&mut **tx).await?;
-            let kind = match status.as_str() { "cancelled" => IntegrationOutcomeKind::Cancelled, "done" => IntegrationOutcomeKind::Done, _ => return Ok(()) };
-            let id: Option<String> = sqlx::query_scalar("SELECT id FROM integration_attempt WHERE task_ref=? AND current=1").bind(&step.task_id).fetch_optional(&mut **tx).await?;
-            if let Some(id) = id {
-                let mut observation = IntegrationObservation::new(format!("{}:terminal", step.id),kind);
-                observation.step_id = Some(step.id.clone());
-                record_observation_in_tx(tx, &id, &observation).await?;
-                // An uncertain effect remains pinned even if a legacy Task
-                // is terminal. Its status alone never proves a non-effect.
-                let a=attempt_in_tx(tx,&id).await?;
-                if matches!(a.state,IntegrationAttemptState::Reconciling|IntegrationAttemptState::FfInflight|IntegrationAttemptState::Quarantined) || matches!(a.current_operation_state,Some(IntegrationOperationState::Running|IntegrationOperationState::Uncertain)) {return Ok(());}
-                // Only resolved terminal history follows the legacy result.
-                sqlx::query("UPDATE integration_attempt SET state=?,current=0,completed_at=?,revision=revision+1 WHERE id=?")
-                    .bind(if status == "done" { "completed" } else { "cancelled" }).bind(&observation.recorded_at).bind(&id).execute(&mut **tx).await?;
-            }
+            let json = observation.stored()?;
+            sqlx::query(&format!("UPDATE integration_attempt SET observations_json=json_insert(CASE WHEN json_array_length(observations_json)>=?1 THEN json_remove(observations_json,'$[1]') ELSE observations_json END,'$[#]',json_set(json(?2),'$.kind',(SELECT status FROM task WHERE id=?3))),observations_dropped=observations_dropped+(json_array_length(observations_json)>=?1),state=CASE WHEN {RESOLVED} THEN (SELECT CASE status WHEN 'done' THEN 'completed' ELSE 'cancelled' END FROM task WHERE id=?3) ELSE state END,current=CASE WHEN {RESOLVED} THEN 0 ELSE current END,completed_at=CASE WHEN {RESOLVED} THEN ?4 ELSE completed_at END,updated_at=?4,revision=revision+1 WHERE task_ref=?3 AND current=1 AND (SELECT status FROM task WHERE id=?3) IN ('done','cancelled') AND NOT EXISTS(SELECT 1 FROM json_each(integration_attempt.observations_json) WHERE json_extract(value,'$.identity')=?5)"))
+                .bind(INTEGRATION_OBSERVATION_RECENT + 1)
+                .bind(&json)
+                .bind(&step.task_id)
+                .bind(&observation.recorded_at)
+                .bind(&observation.identity)
+                .execute(&mut **tx)
+                .await?;
             Ok(())
-        }.await;
-        finish_shadow(tx, &step.task_id, &format!("{}:terminal", step.id), result).await;
+        }
+        .await;
+        if let Err(error) = result {
+            log_shadow_failure("terminal", &step.task_id, &error);
+        }
     }
     pub(crate) async fn observe_integration_review_best_effort(
         &self,
@@ -188,83 +269,58 @@ impl SqliteDb {
         if !crate::task_writer::owns_task(task_id) {
             return;
         }
-        let result = async {
-            sqlx::query("SAVEPOINT integration_shadow")
-                .execute(&mut **tx)
-                .await?;
-            let id: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM integration_attempt WHERE task_ref=? AND current=1",
-            )
-            .bind(task_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            if let Some(id) = id {
-                // CI completion is independent of the later semantic or
-                // human verdict: running/awaiting-human Reviews can already
-                // contain the finished check result.
-                if details.get("ci_steps").is_some() {
-                    let Some(checks) = details["ci_steps"]
-                        .as_array()
-                        .filter(|checks| !checks.is_empty())
-                    else {
-                        return Ok(());
-                    };
-                    let codes = checks
-                        .iter()
-                        .map(|check| check["exit_code"].as_i64())
-                        .collect::<Option<Vec<_>>>();
-                    let Some(codes) = codes else {
-                        return Ok(());
-                    };
-                    let kind = if codes.iter().any(|code| *code != 0) {
-                        IntegrationOutcomeKind::CiFailed
-                    } else {
-                        IntegrationOutcomeKind::CiPassed
-                    };
-                    let mut observation =
-                        IntegrationObservation::new(format!("review:{review_id}:{status}"), kind);
-                    observation.step_id = crate::task_writer::current_task_step().map(|s| s.id);
-                    if let Some(carry) = carry {
-                        observation.candidate_sha = Some(carry.commit_sha.clone());
-                        observation.target_tip_sha = Some(carry.base_sha.clone());
-                        observation.changed_paths = Some(carry.changed_paths.clone());
-                    }
-                    record_observation_in_tx(tx, &id, &observation).await?;
-                }
-            }
-            Ok(())
+        // CI completion is independent of the later semantic or human
+        // verdict: running/awaiting-human Reviews can already contain the
+        // finished check result. No finished check, no statement.
+        let Some(codes) = details
+            .get("ci_steps")
+            .and_then(Value::as_array)
+            .filter(|checks| !checks.is_empty())
+            .and_then(|checks| {
+                checks
+                    .iter()
+                    .map(|check| check["exit_code"].as_i64())
+                    .collect::<Option<Vec<_>>>()
+            })
+        else {
+            return;
+        };
+        let kind = if codes.iter().any(|code| *code != 0) {
+            IntegrationOutcomeKind::CiFailed
+        } else {
+            IntegrationOutcomeKind::CiPassed
+        };
+        let mut observation =
+            IntegrationObservation::new(format!("review:{review_id}:{status}"), kind);
+        observation.step_id = crate::task_writer::current_step_id();
+        if let Some(carry) = carry {
+            observation.candidate_sha = Some(carry.commit_sha.clone());
+            observation.target_tip_sha = Some(carry.base_sha.clone());
+            observation.changed_paths = Some(carry.changed_paths.clone());
         }
-        .await;
-        finish_shadow(tx, task_id, &format!("review:{review_id}:{status}"), result).await;
+        if let Err(error) = append_for_task(tx, task_id, &observation, None).await {
+            log_shadow_failure("review", task_id, &error);
+        }
     }
 }
-async fn finish_shadow(
-    tx: &mut Transaction<'_, Sqlite>,
-    task_id: &str,
-    identity: &str,
-    result: Result<()>,
-) {
-    if let Err(error) = result {
-        let _ = sqlx::query("ROLLBACK TO integration_shadow")
-            .execute(&mut **tx)
-            .await;
-        log_shadow_failure(identity, task_id, &error);
-    }
-    let _ = sqlx::query("RELEASE integration_shadow")
-        .execute(&mut **tx)
-        .await;
+/// "Logged once" without remembering identities: the first failure and then
+/// every power of two is a warning, the rest are debug lines. One counter.
+static SHADOW_FAILURES: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(super) fn shadow_failure_count() -> u64 {
+    SHADOW_FAILURES.load(Ordering::Relaxed)
 }
-fn log_shadow_failure(identity: &str, task_id: &str, error: &DbError) {
-    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    if WARNED
-        .get_or_init(Default::default)
-        .lock()
-        .expect("shadow warning identities")
-        .insert(identity.to_owned())
-    {
-        tracing::warn!(task_id, observation_identity=identity, %error, "integration shadow observation failed; legacy result retained");
+fn log_shadow_failure(site: &str, task_id: &str, error: &DbError) {
+    let failures = SHADOW_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if failures.is_power_of_two() {
+        tracing::warn!(task_id, site, failures, %error, "integration shadow observation failed; legacy result retained");
+    } else {
+        tracing::debug!(task_id, site, failures, %error, "integration shadow observation failed; legacy result retained");
     }
+}
+fn observed_paths(paths: &Value) -> Result<Vec<String>> {
+    serde_json::from_value(paths.clone())
+        .map_err(|_| DbError::Check("unsupported path encoding".into()))
 }
 async fn observe_hook_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
@@ -274,92 +330,28 @@ async fn observe_hook_in_tx(
     value: &str,
 ) -> Result<()> {
     let value = parse_json(value.to_owned())?;
-    let mut id: Option<String> =
-        sqlx::query_scalar("SELECT id FROM integration_attempt WHERE task_ref=? AND current=1")
-            .bind(&step.task_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    if key == "merge_intent" {
-        let task = sqlx::query(
-            "SELECT project_id,status,status_epoch,version,parent_task_id FROM task WHERE id=?",
-        )
-        .bind(&step.task_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        if task
-            .try_get::<Option<String>, _>("parent_task_id")?
-            .is_some()
-        {
-            return Ok(());
-        }
-        let workspace_id = value["workspace_id"]
-            .as_str()
-            .ok_or_else(|| DbError::Check("merge intent has no workspace".into()))?;
-        let repo_id: String = sqlx::query_scalar("SELECT repo_id FROM workspace WHERE id=?")
-            .bind(workspace_id)
-            .fetch_one(&mut **tx)
-            .await?;
-        let branch = value["target_branch"]
-            .as_str()
-            .ok_or_else(|| DbError::Check("merge intent has no target".into()))?;
-        let q = create_queue_in_tx(tx, &repo_id, branch).await?;
-        if let Some(id) = &id {
-            let mut a = attempt_in_tx(tx, id).await?;
-            a.candidate_sha = value["candidate_sha"].as_str().map(str::to_owned);
-            update_attempt(tx, &a).await?;
-        }
-        if id.is_none() {
-            let mut a = IntegrationAttempt::new(
-                Some(q.id),
-                step.task_id.clone(),
-                task.try_get("project_id")?,
-                format!(
-                    "shadow:{}:{}",
-                    step.task_id,
-                    task.try_get::<i64, _>("status_epoch")?
-                ),
-                task.try_get("status")?,
-                task.try_get("status_epoch")?,
-                task.try_get("version")?,
-            );
-            a.original_candidate_sha = value["candidate_sha"].as_str().map(str::to_owned);
-            a.candidate_sha = a.original_candidate_sha.clone();
-            a.execution_id = value["execution_id"].as_str().map(str::to_owned);
-            a.execution_ref = a.execution_id.clone();
-            a.workspace_id = Some(workspace_id.to_owned());
-            a.workspace_ref = a.workspace_id.clone();
-            let a = admit_in_tx(tx, a).await?;
-            id = Some(a.id);
-        }
-    }
-    let Some(id) = id else {
-        return Ok(());
-    };
-    if let Some(target) = target_observation(step, index) {
-        record_observation_in_tx(tx, &id, &target).await?;
-    }
-
     let mut observation = IntegrationObservation::new(
         format!("{}:{index}:{key}", step.id),
         IntegrationOutcomeKind::Admission,
     );
     observation.step_id = Some(step.id.clone());
+    // The target tip this hook's merge path read, if it read one. Done's
+    // before_sha can be the checkout's HEAD or the candidate of a
+    // reconstructed result, so it is never used as a target-tip witness.
+    let read = target_read(&step.id, index);
     match key {
         "merge_intent" => {
-            observation.candidate_sha = value["candidate_sha"].as_str().map(str::to_owned)
+            observation.candidate_sha = value["candidate_sha"].as_str().map(str::to_owned);
         }
         "rebase_target" => {
             observation.kind = IntegrationOutcomeKind::TargetTip;
             observation.target_tip_sha = value.as_str().map(str::to_owned);
         }
         "merge_outcome" => {
-            let object = value
+            let (kind, facts) = value
                 .as_object()
+                .and_then(|object| object.iter().next())
                 .ok_or_else(|| DbError::Check("invalid merge outcome".into()))?;
-            let (kind, facts) = object
-                .iter()
-                .next()
-                .ok_or_else(|| DbError::Check("empty merge outcome".into()))?;
             observation.kind = match kind.as_str() {
                 "Done" => IntegrationOutcomeKind::Done,
                 "ReviewRequired" => IntegrationOutcomeKind::ReviewRequired,
@@ -370,24 +362,8 @@ async fn observe_hook_in_tx(
                 "UnresolvedConflictMarkers" => IntegrationOutcomeKind::Markers,
                 _ => return Err(DbError::Check("unknown merge outcome".into())),
             };
-            // Done.before_sha can be the checkout's HEAD, or the candidate
-            // in a reconstructed result. It is not a target-tip witness.
-            let a = attempt_in_tx(tx, &id).await?;
-            observation.target_tip_sha = a
-                .observations_json
-                .as_array()
-                .and_then(|all| {
-                    all.iter().rev().find(|o| {
-                        o["kind"] == serde_json::json!("target_tip")
-                            && o["step_id"].as_str() == Some(&step.id)
-                    })
-                })
-                .and_then(|o| o["target_tip_sha"].as_str().map(str::to_owned));
             if let Some(paths) = facts.get("conflict_paths").or_else(|| facts.get("paths")) {
-                observation.conflict_paths = Some(
-                    serde_json::from_value(paths.clone())
-                        .map_err(|_| DbError::Check("unsupported path encoding".into()))?,
-                );
+                observation.conflict_paths = Some(observed_paths(paths)?);
             }
         }
         "rebase_outcome" => {
@@ -399,24 +375,92 @@ async fn observe_hook_in_tx(
                 _ => return Err(DbError::Check("unknown rebase outcome".into())),
             };
             if let Some(paths) = value.get("conflict_paths") {
-                observation.conflict_paths = Some(
-                    serde_json::from_value(paths.clone())
-                        .map_err(|_| DbError::Check("unsupported path encoding".into()))?,
-                );
+                observation.conflict_paths = Some(observed_paths(paths)?);
             }
         }
-        _ => unreachable!(),
+        _ => unreachable!("filtered by the caller"),
     }
-    let a = attempt_in_tx(tx, &id).await?;
-    if observation.candidate_sha.is_none() && key == "merge_outcome" {
-        observation.candidate_sha = a.candidate_sha;
+    if matches!(key, "merge_intent" | "merge_outcome") {
+        if let Some((candidate, target)) = read {
+            observation.candidate_sha = observation.candidate_sha.or(candidate);
+            observation.target_tip_sha = Some(target);
+        }
     }
-    if observation.target_tip_sha.is_none() && key == "rebase_outcome" {
-        let target: Option<String> = sqlx::query_scalar("SELECT json_extract(effects_json,'$.rebase_target') FROM task_hook_checkpoint WHERE step_id=? AND hook_index=?").bind(&step.id).bind(index).fetch_optional(&mut **tx).await?.flatten();
-        observation.target_tip_sha = target
-            .map(parse_json)
-            .transpose()?
-            .and_then(|v| v.as_str().map(str::to_owned));
+    let intent_candidate = (key == "merge_intent")
+        .then(|| observation.candidate_sha.clone())
+        .flatten();
+    if append_for_task(tx, &step.task_id, &observation, intent_candidate.as_deref()).await?
+        || key != "merge_intent"
+    {
+        return Ok(());
     }
-    record_observation_in_tx(tx, &id, &observation).await
+    // Admission, once per merge entry: no row took the intent.
+    let replay: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM integration_attempt WHERE task_ref=? AND current=1)",
+    )
+    .bind(&step.task_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if replay {
+        return Ok(());
+    }
+    let task = sqlx::query(
+        "SELECT project_id,status,status_epoch,version,parent_task_id FROM task WHERE id=?",
+    )
+    .bind(&step.task_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    // A subtask merges into its parent's branch: no orphan queue for it.
+    if task
+        .try_get::<Option<String>, _>("parent_task_id")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let workspace_id = value["workspace_id"]
+        .as_str()
+        .ok_or_else(|| DbError::Check("merge intent has no workspace".into()))?;
+    let branch = value["target_branch"]
+        .as_str()
+        .ok_or_else(|| DbError::Check("merge intent has no target".into()))?;
+    let repo_id: String = sqlx::query_scalar("SELECT repo_id FROM workspace WHERE id=?")
+        .bind(workspace_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let epoch: i64 = task.try_get("status_epoch")?;
+    let mut a = IntegrationAttempt::new(
+        None,
+        step.task_id.clone(),
+        task.try_get("project_id")?,
+        format!("shadow:{}:{epoch}", step.task_id),
+        task.try_get("status")?,
+        epoch,
+        task.try_get("version")?,
+    );
+    a.original_candidate_sha = observation.candidate_sha.clone();
+    a.candidate_sha = a.original_candidate_sha.clone();
+    a.execution_id = value["execution_id"].as_str().map(str::to_owned);
+    a.execution_ref = a.execution_id.clone();
+    a.workspace_id = Some(workspace_id.to_owned());
+    a.workspace_ref = a.workspace_id.clone();
+    a.observations_json = serde_json::json!([parse_json(observation.stored()?)?]);
+    sqlx::query("SAVEPOINT integration_shadow")
+        .execute(&mut **tx)
+        .await?;
+    let admitted = async {
+        let queue = create_queue_in_tx(tx, &repo_id, branch).await?;
+        a.queue_id = Some(queue.id);
+        admit_in_tx(tx, a).await
+    }
+    .await;
+    if admitted.is_err() {
+        let _ = sqlx::query("ROLLBACK TO integration_shadow")
+            .execute(&mut **tx)
+            .await;
+    }
+    let _ = sqlx::query("RELEASE integration_shadow")
+        .execute(&mut **tx)
+        .await;
+    admitted.map(|_| ())
 }

@@ -943,6 +943,10 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM task WHERE project_id = ?)",
             "DELETE FROM pr_provider_config WHERE repo_id IN
                  (SELECT id FROM repo WHERE project_id = ?)",
+            // Integration queues and their attempts leave with the Project's
+            // repos by cascade. Import evidence that never resolved a queue
+            // has no parent to cascade from, so it is removed here.
+            "DELETE FROM integration_attempt WHERE queue_id IS NULL AND project_ref = ?",
             "DELETE FROM agent_lcm_node WHERE timeline_id IN (
                  SELECT l.id FROM agent_lcm_timeline l
                  JOIN project_deletion_guard g ON g.project_id = ?

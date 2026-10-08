@@ -228,6 +228,32 @@ PY"# }
         listed_tasks.items.iter().any(|task| task.id == task_id),
         "normal non-automation task remains visible in project task list"
     );
+    // 3.2 stage B: the live merge path, not only a database fixture, records
+    // its passive shadow attempt, and the settled Task closes it.
+    let (shadow_state, shadow_current, shadow_observations): (String, bool, String) =
+        sqlx::query_as(
+            "SELECT state, current, observations_json FROM integration_attempt WHERE task_ref = ?",
+        )
+        .bind(&task_id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .expect("the merge recorded exactly one shadow integration attempt");
+    let shadow_observations: Vec<Value> = serde_json::from_str(&shadow_observations).unwrap();
+    assert_eq!(
+        (shadow_state.as_str(), shadow_current),
+        ("completed", false),
+        "{shadow_observations:?}"
+    );
+    assert_eq!(shadow_observations[0]["kind"], "admission");
+    let landed = shadow_observations
+        .iter()
+        .find(|o| o["kind"] == "done" && o["identity"].as_str().unwrap().ends_with("merge_outcome"))
+        .unwrap_or_else(|| panic!("no merge outcome observed: {shadow_observations:?}"));
+    assert!(
+        landed["target_tip_sha"].is_string() && landed["candidate_sha"].is_string(),
+        "the live merge's target read reached its step: {landed}"
+    );
+
     let persisted_task = TaskRepo::get_by_id(&*harness.state.db, &task_id, false)
         .await
         .expect("task loads")

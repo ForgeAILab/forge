@@ -31,9 +31,10 @@ stored_enum!(IntegrationFailureKind { Infrastructure => "infrastructure", Target
 stored_enum!(IntegrationOwnerKind { Server => "server", Daemon => "daemon" });
 stored_enum!(IntegrationOperationKind { Merge => "merge", Rebase => "rebase", Check => "check", FastForward => "fast_forward", Reconcile => "reconcile" });
 stored_enum!(IntegrationOperationState { Pending => "pending", Running => "running", Succeeded => "succeeded", Failed => "failed", Uncertain => "uncertain", Acknowledged => "acknowledged" });
-stored_enum!(IntegrationEffectKind { Advance => "advance", Park => "park", SendBack => "send_back" });
 stored_enum!(IntegrationImportDisposition { Classified => "classified", NeedsFact => "needs_fact", Quarantined => "quarantined", Obsolete => "obsolete", History => "history" });
 
+#[cfg(test)]
+mod audit_tests;
 mod importer;
 pub(crate) mod shadow;
 #[cfg(test)]
@@ -120,56 +121,33 @@ pub struct IntegrationAttempt {
     pub placement_generation: Option<i64>,
     pub original_candidate_sha: Option<String>,
     pub candidate_sha: Option<String>,
-    pub fork_base_sha: Option<String>,
     pub target_tip_sha: Option<String>,
     pub contract_execution_id: Option<String>,
     pub review_id: Option<String>,
-    pub carry_id: Option<String>,
-    pub authority_digest: Option<String>,
-    pub source_digest_version: Option<i64>,
     pub reviewed_paths_json: Option<Value>,
     pub changed_paths_json: Option<Value>,
     pub conflict_paths_json: Option<Value>,
     pub repair_paths_json: Option<Value>,
     pub guard_paths_json: Option<Value>,
-    pub blocked_by_attempt_ids_json: Option<Value>,
-    pub paths_commit_sha: Option<String>,
-    pub paths_base_sha: Option<String>,
     pub state: IntegrationAttemptState,
     pub resume_state: Option<IntegrationAttemptState>,
-    pub outcome_kind: Option<IntegrationOutcomeKind>,
     pub failure_kind: Option<IntegrationFailureKind>,
     pub failure_message: Option<String>,
     pub slot_generation: i64,
-    pub critical_started_at: Option<String>,
     pub permit_json: Option<Value>,
-    pub cancel_requested_at: Option<String>,
-    pub hold_requested_at: Option<String>,
     pub operation_kind: Option<IntegrationOperationKind>,
     pub operation_id: Option<String>,
-    pub request_digest: Option<String>,
     pub current_operation_state: Option<IntegrationOperationState>,
     pub operation_receipts_json: Value,
-    pub rebase_result_json: Option<Value>,
-    pub checks_digest: Option<String>,
     pub checks_json: Option<Value>,
-    pub check_index: i64,
     pub checks_commit_sha: Option<String>,
-    pub checks_started_at: Option<String>,
-    pub checks_finished_at: Option<String>,
-    pub interruption_count: i64,
     pub deadline: Option<String>,
     pub effect_seq: i64,
-    pub effect_kind: Option<IntegrationEffectKind>,
-    pub effect_payload_json: Option<Value>,
-    pub effect_step_id: Option<String>,
     pub effect_ack_json: Option<Value>,
     pub acknowledged_at: Option<String>,
     pub integrated_before_sha: Option<String>,
     pub integrated_sha: Option<String>,
-    pub target_observed_sha: Option<String>,
     pub available_at: Option<String>,
-    pub retry_count: i64,
     pub last_error_kind: Option<IntegrationFailureKind>,
     pub last_error: Option<String>,
     pub started_at: Option<String>,
@@ -178,6 +156,7 @@ pub struct IntegrationAttempt {
     pub completed_at: Option<String>,
     pub import_source_json: Option<Value>,
     pub observations_json: Value,
+    pub observations_dropped: i64,
     pub revision: i64,
 }
 fn map_attempt(row: sqlx::sqlite::SqliteRow) -> Result<IntegrationAttempt> {
@@ -214,13 +193,9 @@ fn map_attempt(row: sqlx::sqlite::SqliteRow) -> Result<IntegrationAttempt> {
         placement_generation: row.try_get("placement_generation")?,
         original_candidate_sha: row.try_get("original_candidate_sha")?,
         candidate_sha: row.try_get("candidate_sha")?,
-        fork_base_sha: row.try_get("fork_base_sha")?,
         target_tip_sha: row.try_get("target_tip_sha")?,
         contract_execution_id: row.try_get("contract_execution_id")?,
         review_id: row.try_get("review_id")?,
-        carry_id: row.try_get("carry_id")?,
-        authority_digest: row.try_get("authority_digest")?,
-        source_digest_version: row.try_get("source_digest_version")?,
         reviewed_paths_json: row
             .try_get::<Option<String>, _>("reviewed_paths_json")?
             .map(parse_json)
@@ -241,19 +216,9 @@ fn map_attempt(row: sqlx::sqlite::SqliteRow) -> Result<IntegrationAttempt> {
             .try_get::<Option<String>, _>("guard_paths_json")?
             .map(parse_json)
             .transpose()?,
-        blocked_by_attempt_ids_json: row
-            .try_get::<Option<String>, _>("blocked_by_attempt_ids_json")?
-            .map(parse_json)
-            .transpose()?,
-        paths_commit_sha: row.try_get("paths_commit_sha")?,
-        paths_base_sha: row.try_get("paths_base_sha")?,
         state: row.try_get::<String, _>("state")?.parse()?,
         resume_state: row
             .try_get::<Option<String>, _>("resume_state")?
-            .map(|s| s.parse())
-            .transpose()?,
-        outcome_kind: row
-            .try_get::<Option<String>, _>("outcome_kind")?
             .map(|s| s.parse())
             .transpose()?,
         failure_kind: row
@@ -262,49 +227,27 @@ fn map_attempt(row: sqlx::sqlite::SqliteRow) -> Result<IntegrationAttempt> {
             .transpose()?,
         failure_message: row.try_get("failure_message")?,
         slot_generation: row.try_get("slot_generation")?,
-        critical_started_at: row.try_get("critical_started_at")?,
         permit_json: row
             .try_get::<Option<String>, _>("permit_json")?
             .map(parse_json)
             .transpose()?,
-        cancel_requested_at: row.try_get("cancel_requested_at")?,
-        hold_requested_at: row.try_get("hold_requested_at")?,
         operation_kind: row
             .try_get::<Option<String>, _>("operation_kind")?
             .map(|s| s.parse())
             .transpose()?,
         operation_id: row.try_get("operation_id")?,
-        request_digest: row.try_get("request_digest")?,
         current_operation_state: row
             .try_get::<Option<String>, _>("current_operation_state")?
             .map(|s| s.parse())
             .transpose()?,
         operation_receipts_json: parse_json(row.try_get("operation_receipts_json")?)?,
-        rebase_result_json: row
-            .try_get::<Option<String>, _>("rebase_result_json")?
-            .map(parse_json)
-            .transpose()?,
-        checks_digest: row.try_get("checks_digest")?,
         checks_json: row
             .try_get::<Option<String>, _>("checks_json")?
             .map(parse_json)
             .transpose()?,
-        check_index: row.try_get("check_index")?,
         checks_commit_sha: row.try_get("checks_commit_sha")?,
-        checks_started_at: row.try_get("checks_started_at")?,
-        checks_finished_at: row.try_get("checks_finished_at")?,
-        interruption_count: row.try_get("interruption_count")?,
         deadline: row.try_get("deadline")?,
         effect_seq: row.try_get("effect_seq")?,
-        effect_kind: row
-            .try_get::<Option<String>, _>("effect_kind")?
-            .map(|s| s.parse())
-            .transpose()?,
-        effect_payload_json: row
-            .try_get::<Option<String>, _>("effect_payload_json")?
-            .map(parse_json)
-            .transpose()?,
-        effect_step_id: row.try_get("effect_step_id")?,
         effect_ack_json: row
             .try_get::<Option<String>, _>("effect_ack_json")?
             .map(parse_json)
@@ -312,9 +255,7 @@ fn map_attempt(row: sqlx::sqlite::SqliteRow) -> Result<IntegrationAttempt> {
         acknowledged_at: row.try_get("acknowledged_at")?,
         integrated_before_sha: row.try_get("integrated_before_sha")?,
         integrated_sha: row.try_get("integrated_sha")?,
-        target_observed_sha: row.try_get("target_observed_sha")?,
         available_at: row.try_get("available_at")?,
-        retry_count: row.try_get("retry_count")?,
         last_error_kind: row
             .try_get::<Option<String>, _>("last_error_kind")?
             .map(|s| s.parse())
@@ -329,6 +270,7 @@ fn map_attempt(row: sqlx::sqlite::SqliteRow) -> Result<IntegrationAttempt> {
             .map(parse_json)
             .transpose()?,
         observations_json: parse_json(row.try_get("observations_json")?)?,
+        observations_dropped: row.try_get("observations_dropped")?,
         revision: row.try_get("revision")?,
     })
 }
@@ -377,56 +319,33 @@ impl IntegrationAttempt {
             placement_generation: None,
             original_candidate_sha: None,
             candidate_sha: None,
-            fork_base_sha: None,
             target_tip_sha: None,
             contract_execution_id: None,
             review_id: None,
-            carry_id: None,
-            authority_digest: None,
-            source_digest_version: None,
             reviewed_paths_json: None,
             changed_paths_json: None,
             conflict_paths_json: None,
             repair_paths_json: None,
             guard_paths_json: None,
-            blocked_by_attempt_ids_json: None,
-            paths_commit_sha: None,
-            paths_base_sha: None,
             state: IntegrationAttemptState::Queued,
             resume_state: None,
-            outcome_kind: None,
             failure_kind: None,
             failure_message: None,
             slot_generation: 0,
-            critical_started_at: None,
             permit_json: None,
-            cancel_requested_at: None,
-            hold_requested_at: None,
             operation_kind: None,
             operation_id: None,
-            request_digest: None,
             current_operation_state: None,
             operation_receipts_json: serde_json::json!([]),
-            rebase_result_json: None,
-            checks_digest: None,
             checks_json: None,
-            check_index: 0,
             checks_commit_sha: None,
-            checks_started_at: None,
-            checks_finished_at: None,
-            interruption_count: 0,
             deadline: None,
             effect_seq: 0,
-            effect_kind: None,
-            effect_payload_json: None,
-            effect_step_id: None,
             effect_ack_json: None,
             acknowledged_at: None,
             integrated_before_sha: None,
             integrated_sha: None,
-            target_observed_sha: None,
             available_at: None,
-            retry_count: 0,
             last_error_kind: None,
             last_error: None,
             started_at: None,
@@ -435,13 +354,14 @@ impl IntegrationAttempt {
             completed_at: None,
             import_source_json: None,
             observations_json: serde_json::json!([]),
+            observations_dropped: 0,
             revision: 1,
         }
     }
 }
 async fn insert_attempt(tx: &mut Transaction<'_, Sqlite>, a: &IntegrationAttempt) -> Result<()> {
     validate_attempt(a)?;
-    sqlx::query("INSERT INTO integration_attempt (id,queue_id,task_id,task_ref,project_ref,queue_seq,attempt_number,predecessor_attempt_id,current,admission_key,expected_status,expected_epoch,observed_task_version,workflow_ref_id,enqueued_at,execution_id,execution_ref,workspace_id,workspace_ref,placement_id,placement_ref,repo_location_id,repo_location_ref,owner_kind,daemon_id,runtime_id,placement_generation,original_candidate_sha,candidate_sha,fork_base_sha,target_tip_sha,contract_execution_id,review_id,carry_id,authority_digest,source_digest_version,reviewed_paths_json,changed_paths_json,conflict_paths_json,repair_paths_json,guard_paths_json,blocked_by_attempt_ids_json,paths_commit_sha,paths_base_sha,state,resume_state,outcome_kind,failure_kind,failure_message,slot_generation,critical_started_at,permit_json,cancel_requested_at,hold_requested_at,operation_kind,operation_id,request_digest,current_operation_state,operation_receipts_json,rebase_result_json,checks_digest,checks_json,check_index,checks_commit_sha,checks_started_at,checks_finished_at,interruption_count,deadline,effect_seq,effect_kind,effect_payload_json,effect_step_id,effect_ack_json,acknowledged_at,integrated_before_sha,integrated_sha,target_observed_sha,available_at,retry_count,last_error_kind,last_error,started_at,updated_at,created_at,completed_at,import_source_json,observations_json,revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO integration_attempt (id,queue_id,task_id,task_ref,project_ref,queue_seq,attempt_number,predecessor_attempt_id,current,admission_key,expected_status,expected_epoch,observed_task_version,workflow_ref_id,enqueued_at,execution_id,execution_ref,workspace_id,workspace_ref,placement_id,placement_ref,repo_location_id,repo_location_ref,owner_kind,daemon_id,runtime_id,placement_generation,original_candidate_sha,candidate_sha,target_tip_sha,contract_execution_id,review_id,reviewed_paths_json,changed_paths_json,conflict_paths_json,repair_paths_json,guard_paths_json,state,resume_state,failure_kind,failure_message,slot_generation,permit_json,operation_kind,operation_id,current_operation_state,operation_receipts_json,checks_json,checks_commit_sha,deadline,effect_seq,effect_ack_json,acknowledged_at,integrated_before_sha,integrated_sha,available_at,last_error_kind,last_error,started_at,updated_at,created_at,completed_at,import_source_json,observations_json,observations_dropped,revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&a.id)
         .bind(&a.queue_id)
         .bind(&a.task_id)
@@ -471,56 +391,33 @@ async fn insert_attempt(tx: &mut Transaction<'_, Sqlite>, a: &IntegrationAttempt
         .bind(a.placement_generation)
         .bind(&a.original_candidate_sha)
         .bind(&a.candidate_sha)
-        .bind(&a.fork_base_sha)
         .bind(&a.target_tip_sha)
         .bind(&a.contract_execution_id)
         .bind(&a.review_id)
-        .bind(&a.carry_id)
-        .bind(&a.authority_digest)
-        .bind(a.source_digest_version)
         .bind(a.reviewed_paths_json.as_ref().map(ToString::to_string))
         .bind(a.changed_paths_json.as_ref().map(ToString::to_string))
         .bind(a.conflict_paths_json.as_ref().map(ToString::to_string))
         .bind(a.repair_paths_json.as_ref().map(ToString::to_string))
         .bind(a.guard_paths_json.as_ref().map(ToString::to_string))
-        .bind(a.blocked_by_attempt_ids_json.as_ref().map(ToString::to_string))
-        .bind(&a.paths_commit_sha)
-        .bind(&a.paths_base_sha)
         .bind(a.state.to_string())
         .bind(a.resume_state.as_ref().map(ToString::to_string))
-        .bind(a.outcome_kind.as_ref().map(ToString::to_string))
         .bind(a.failure_kind.as_ref().map(ToString::to_string))
         .bind(&a.failure_message)
         .bind(a.slot_generation)
-        .bind(&a.critical_started_at)
         .bind(a.permit_json.as_ref().map(ToString::to_string))
-        .bind(&a.cancel_requested_at)
-        .bind(&a.hold_requested_at)
         .bind(a.operation_kind.as_ref().map(ToString::to_string))
         .bind(&a.operation_id)
-        .bind(&a.request_digest)
         .bind(a.current_operation_state.as_ref().map(ToString::to_string))
         .bind(a.operation_receipts_json.to_string())
-        .bind(a.rebase_result_json.as_ref().map(ToString::to_string))
-        .bind(&a.checks_digest)
         .bind(a.checks_json.as_ref().map(ToString::to_string))
-        .bind(a.check_index)
         .bind(&a.checks_commit_sha)
-        .bind(&a.checks_started_at)
-        .bind(&a.checks_finished_at)
-        .bind(a.interruption_count)
         .bind(&a.deadline)
         .bind(a.effect_seq)
-        .bind(a.effect_kind.as_ref().map(ToString::to_string))
-        .bind(a.effect_payload_json.as_ref().map(ToString::to_string))
-        .bind(&a.effect_step_id)
         .bind(a.effect_ack_json.as_ref().map(ToString::to_string))
         .bind(&a.acknowledged_at)
         .bind(&a.integrated_before_sha)
         .bind(&a.integrated_sha)
-        .bind(&a.target_observed_sha)
         .bind(&a.available_at)
-        .bind(a.retry_count)
         .bind(a.last_error_kind.as_ref().map(ToString::to_string))
         .bind(&a.last_error)
         .bind(&a.started_at)
@@ -529,13 +426,16 @@ async fn insert_attempt(tx: &mut Transaction<'_, Sqlite>, a: &IntegrationAttempt
         .bind(&a.completed_at)
         .bind(a.import_source_json.as_ref().map(ToString::to_string))
         .bind(a.observations_json.to_string())
+        .bind(a.observations_dropped)
         .bind(a.revision)
         .execute(&mut **tx).await?;
     Ok(())
 }
+/// Never writes `observations_json` / `observations_dropped`: only the
+/// single-statement observation append owns those two columns.
 async fn update_attempt(tx: &mut Transaction<'_, Sqlite>, a: &IntegrationAttempt) -> Result<()> {
     validate_attempt(a)?;
-    let n = sqlx::query("UPDATE integration_attempt SET current=?,execution_id=?,execution_ref=?,workspace_id=?,workspace_ref=?,placement_id=?,placement_ref=?,repo_location_id=?,repo_location_ref=?,owner_kind=?,daemon_id=?,runtime_id=?,placement_generation=?,original_candidate_sha=?,candidate_sha=?,fork_base_sha=?,target_tip_sha=?,contract_execution_id=?,review_id=?,carry_id=?,authority_digest=?,source_digest_version=?,reviewed_paths_json=?,changed_paths_json=?,conflict_paths_json=?,repair_paths_json=?,guard_paths_json=?,blocked_by_attempt_ids_json=?,paths_commit_sha=?,paths_base_sha=?,state=?,resume_state=?,outcome_kind=?,failure_kind=?,failure_message=?,slot_generation=?,critical_started_at=?,permit_json=?,cancel_requested_at=?,hold_requested_at=?,operation_kind=?,operation_id=?,request_digest=?,current_operation_state=?,operation_receipts_json=?,rebase_result_json=?,checks_digest=?,checks_json=?,check_index=?,checks_commit_sha=?,checks_started_at=?,checks_finished_at=?,interruption_count=?,deadline=?,effect_seq=?,effect_kind=?,effect_payload_json=?,effect_step_id=?,effect_ack_json=?,acknowledged_at=?,integrated_before_sha=?,integrated_sha=?,target_observed_sha=?,available_at=?,retry_count=?,last_error_kind=?,last_error=?,started_at=?,updated_at=?,completed_at=?,import_source_json=?,observations_json=?,revision=revision+1 WHERE id=? AND revision=?")
+    let n = sqlx::query("UPDATE integration_attempt SET current=?,execution_id=?,execution_ref=?,workspace_id=?,workspace_ref=?,placement_id=?,placement_ref=?,repo_location_id=?,repo_location_ref=?,owner_kind=?,daemon_id=?,runtime_id=?,placement_generation=?,original_candidate_sha=?,candidate_sha=?,target_tip_sha=?,contract_execution_id=?,review_id=?,reviewed_paths_json=?,changed_paths_json=?,conflict_paths_json=?,repair_paths_json=?,guard_paths_json=?,state=?,resume_state=?,failure_kind=?,failure_message=?,slot_generation=?,permit_json=?,operation_kind=?,operation_id=?,current_operation_state=?,operation_receipts_json=?,checks_json=?,checks_commit_sha=?,deadline=?,effect_seq=?,effect_ack_json=?,acknowledged_at=?,integrated_before_sha=?,integrated_sha=?,available_at=?,last_error_kind=?,last_error=?,started_at=?,updated_at=?,completed_at=?,import_source_json=?,revision=revision+1 WHERE id=? AND revision=?")
         .bind(a.current)
         .bind(&a.execution_id)
         .bind(&a.execution_ref)
@@ -551,63 +451,39 @@ async fn update_attempt(tx: &mut Transaction<'_, Sqlite>, a: &IntegrationAttempt
         .bind(a.placement_generation)
         .bind(&a.original_candidate_sha)
         .bind(&a.candidate_sha)
-        .bind(&a.fork_base_sha)
         .bind(&a.target_tip_sha)
         .bind(&a.contract_execution_id)
         .bind(&a.review_id)
-        .bind(&a.carry_id)
-        .bind(&a.authority_digest)
-        .bind(a.source_digest_version)
         .bind(a.reviewed_paths_json.as_ref().map(ToString::to_string))
         .bind(a.changed_paths_json.as_ref().map(ToString::to_string))
         .bind(a.conflict_paths_json.as_ref().map(ToString::to_string))
         .bind(a.repair_paths_json.as_ref().map(ToString::to_string))
         .bind(a.guard_paths_json.as_ref().map(ToString::to_string))
-        .bind(a.blocked_by_attempt_ids_json.as_ref().map(ToString::to_string))
-        .bind(&a.paths_commit_sha)
-        .bind(&a.paths_base_sha)
         .bind(a.state.to_string())
         .bind(a.resume_state.as_ref().map(ToString::to_string))
-        .bind(a.outcome_kind.as_ref().map(ToString::to_string))
         .bind(a.failure_kind.as_ref().map(ToString::to_string))
         .bind(&a.failure_message)
         .bind(a.slot_generation)
-        .bind(&a.critical_started_at)
         .bind(a.permit_json.as_ref().map(ToString::to_string))
-        .bind(&a.cancel_requested_at)
-        .bind(&a.hold_requested_at)
         .bind(a.operation_kind.as_ref().map(ToString::to_string))
         .bind(&a.operation_id)
-        .bind(&a.request_digest)
         .bind(a.current_operation_state.as_ref().map(ToString::to_string))
         .bind(a.operation_receipts_json.to_string())
-        .bind(a.rebase_result_json.as_ref().map(ToString::to_string))
-        .bind(&a.checks_digest)
         .bind(a.checks_json.as_ref().map(ToString::to_string))
-        .bind(a.check_index)
         .bind(&a.checks_commit_sha)
-        .bind(&a.checks_started_at)
-        .bind(&a.checks_finished_at)
-        .bind(a.interruption_count)
         .bind(&a.deadline)
         .bind(a.effect_seq)
-        .bind(a.effect_kind.as_ref().map(ToString::to_string))
-        .bind(a.effect_payload_json.as_ref().map(ToString::to_string))
-        .bind(&a.effect_step_id)
         .bind(a.effect_ack_json.as_ref().map(ToString::to_string))
         .bind(&a.acknowledged_at)
         .bind(&a.integrated_before_sha)
         .bind(&a.integrated_sha)
-        .bind(&a.target_observed_sha)
         .bind(&a.available_at)
-        .bind(a.retry_count)
         .bind(a.last_error_kind.as_ref().map(ToString::to_string))
         .bind(&a.last_error)
         .bind(&a.started_at)
         .bind(&a.updated_at)
         .bind(&a.completed_at)
         .bind(a.import_source_json.as_ref().map(ToString::to_string))
-        .bind(a.observations_json.to_string())
         .bind(&a.id).bind(a.revision).execute(&mut **tx).await?.rows_affected();
     if n != 1 {
         return Err(DbError::VersionConflict);
@@ -943,6 +819,21 @@ async fn resolve_integration_target_in_tx(
     })
 }
 
+/// A queue whose target location is being deleted keeps its members and
+/// history but names no location: `suspended` with `target_unconfigured`.
+/// The foreign key alone would only null the column (`ON DELETE SET NULL`).
+pub(crate) async fn suspend_queues_for_deleted_location(
+    tx: &mut Transaction<'_, Sqlite>,
+    location_id: &str,
+) -> Result<u64> {
+    Ok(sqlx::query("UPDATE integration_queue SET target_location_id=NULL,target_owner_json=NULL,state=CASE WHEN state IN ('open','suspended') THEN 'suspended' ELSE state END,last_error_kind='target_unconfigured',last_error='target repo location deleted',revision=revision+1,updated_at=? WHERE target_location_id=?")
+        .bind(now_rfc3339())
+        .bind(location_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected())
+}
+
 #[async_trait]
 pub trait IntegrationQueueRepo: Send + Sync {
     async fn create_or_get_integration_queue(
@@ -1190,6 +1081,7 @@ impl IntegrationQueueRepo for SqliteDb {
                 q.state,
                 IntegrationQueueState::Open | IntegrationQueueState::Quarantined
             )
+            || q.target_location_id.is_none()
             || (q.state == IntegrationQueueState::Quarantined && q.head_attempt_id.is_none())
             || q.lease_until
                 .as_deref()
@@ -1408,7 +1300,7 @@ impl IntegrationQueueRepo for SqliteDb {
                 .insert(state.to_string(), 0);
         }
         // A single read statement gives the counts one SQLite snapshot.
-        for row in sqlx::query("SELECT 'queue' kind,state,COUNT(*) n FROM integration_queue GROUP BY state UNION ALL SELECT 'attempt',state,COUNT(*) FROM integration_attempt WHERE current=1 GROUP BY state UNION ALL SELECT 'quarantine','quarantined',COUNT(*) FROM integration_attempt WHERE json_extract(import_source_json,'$.disposition')='quarantined'").fetch_all(self.pool()).await? {
+        for row in sqlx::query("SELECT 'queue' kind,state,COUNT(*) n FROM integration_queue GROUP BY state UNION ALL SELECT 'attempt',state,COUNT(*) FROM integration_attempt WHERE current=1 GROUP BY state UNION ALL SELECT 'quarantine','quarantined',COUNT(*) FROM integration_attempt WHERE import_source_json IS NOT NULL AND json_extract(import_source_json,'$.disposition')='quarantined'").fetch_all(self.pool()).await? {
             let kind: String = row.try_get("kind")?;
             let state: String = row.try_get("state")?;
             let n: i64 = row.try_get("n")?;

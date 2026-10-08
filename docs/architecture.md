@@ -4323,15 +4323,56 @@ local configuration and non-ready targets suspend the queue with a typed
 placement and mere daemon presence never choose the target. This conservative
 selection can be replaced in one function when the authoritative setting is
 settled. The witness stores location/owner/runtime/generation, never a path or
-token. Repo and target-location deletion are restricted by foreign keys while
-these retained queue records reference them; resolved evidence detachment and
-retention are later-stage work.
+token.
+
+How the resolver decides (queue state, `target_location_id`, typed reason):
+
+| Repo configuration | Result |
+|---|---|
+| Server only: `repo.local_path` set, one default `primary_checkout` server location at that path, `ready` | `open`, that location |
+| Daemon only: no `local_path`, one default `primary_checkout` daemon location, `ready` | `open`, that location |
+| Both, the server checkout is the default (daemon copies are not default) | `open`, the server location; a non-default copy never selects |
+| Both, the default is a daemon location while `local_path` is set | `suspended`, none, `target_ambiguous` |
+| `local_path` set, default server location at a different path | `suspended`, none, `target_ambiguous` |
+| No default `primary_checkout` location (including a pre-location legacy repo with no `local_path`) | `suspended`, none, `target_unconfigured` |
+| Two or more default `primary_checkout` locations | `suspended`, none, `target_ambiguous` |
+| The one configured location is not `ready` | `suspended`, that location, `target_unavailable` |
+
+The resolution is taken once, when the queue row is created; stage B never
+refreshes it. A queue with no `target_location_id` is never claimable.
+
+**Deletion.** In this passive stage the queue tables are evidence, not
+authority, and they restrict no deletion:
+
+- deleting a Repo, or the Project that owns it, removes that repo's queues and
+  their attempts by `ON DELETE CASCADE` (`repo` → `integration_queue` →
+  `integration_attempt`), the same rule the other repo-owned tables in this
+  schema use. Project deletion also removes import evidence that never resolved
+  a queue (`queue_id IS NULL`), which has no parent to cascade from;
+- deleting a repo location (`RepoLocationRepo::delete`) nulls
+  `target_location_id` and `target_owner_json` and leaves the queue `suspended`
+  with `target_unconfigured` in the same transaction; members and history stay.
+  The foreign key itself is `ON DELETE SET NULL`;
+- deleting a Task nulls `task_id` and keeps `task_ref`/`project_ref`;
+  workspace, placement, execution, location, workflow-reference and
+  predecessor foreign keys are `SET NULL` beside their opaque refs;
+- removing a machine tombstones the daemon and deletes none of these rows.
+
+**Stage D requirement (owner decision needed).** "Deletion is refused while an
+integration effect is uncertain" is NOT implemented here. When the queue starts
+driving Git, stage D must decide explicitly whether a Repo, repo location or
+Project with an unresolved (`reconciling`, `ff_inflight`, quarantined-head or
+running/uncertain-operation) attempt may be deleted, enforce it in the service
+delete paths with a typed refusal the owner can act on, and record the public
+break in the changelog. It must not come back as a silent foreign-key
+`RESTRICT`.
 
 The migration is additive SQL only: two tables and their indexes, no data DML,
-no logic triggers, no changes to historical migrations. Task deletion nulls the
-attempt's Task FK while retaining `task_ref`/`project_ref`. Delivery FKs are
+no logic triggers, no changes to historical migrations. Delivery FKs are
 nullable with separate opaque refs, so workspace/execution cleanup cannot erase
-recorded identity. `daemon_id`/`runtime_id` and contract/Review/carry identifiers
+recorded identity. Columns that nothing in stage B reads or writes were left
+out; a later stage adds each one it needs with `ALTER TABLE ... ADD COLUMN`
+(all are nullable or constant-default, so no table rebuild). `daemon_id`/`runtime_id` and contract/Review/carry identifiers
 are retained opaque witnesses rather than cascading foreign keys.
 
 `integration_queue` columns (the SQL is authoritative):
@@ -4339,12 +4380,12 @@ are retained opaque witnesses rather than cascading foreign keys.
 | Column | SQL type / constraints |
 |---|---|
 | `id` | `TEXT PRIMARY KEY` |
-| `repo_id` | `TEXT NOT NULL REFERENCES repo(id) ON DELETE RESTRICT` |
+| `repo_id` | `TEXT NOT NULL REFERENCES repo(id) ON DELETE CASCADE` |
 | `target_branch` | `TEXT NOT NULL` |
-| `target_location_id` | `TEXT REFERENCES repo_location(id) ON DELETE RESTRICT` |
+| `target_location_id` | `TEXT REFERENCES repo_location(id) ON DELETE SET NULL` |
 | `target_owner_json` | `TEXT CHECK(target_owner_json IS NULL OR json_valid(target_owner_json))` |
 | `next_seq` | `INTEGER NOT NULL DEFAULT 1 CHECK(next_seq >= 1)` |
-| `head_attempt_id` | `TEXT REFERENCES integration_attempt(id) DEFERRABLE INITIALLY DEFERRED` |
+| `head_attempt_id` | `TEXT REFERENCES integration_attempt(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED` |
 | `lease_owner` | `TEXT` |
 | `lease_until` | `TEXT` |
 | `fence_generation` | `INTEGER NOT NULL DEFAULT 0 CHECK(fence_generation >= 0)` |
@@ -4361,13 +4402,13 @@ are retained opaque witnesses rather than cascading foreign keys.
 | Column | SQL type / constraints |
 |---|---|
 | `id` | `TEXT PRIMARY KEY` |
-| `queue_id` | `TEXT REFERENCES integration_queue(id) ON DELETE RESTRICT` |
+| `queue_id` | `TEXT REFERENCES integration_queue(id) ON DELETE CASCADE` |
 | `task_id` | `TEXT REFERENCES task(id) ON DELETE SET NULL` |
 | `task_ref` | `TEXT NOT NULL` |
 | `project_ref` | `TEXT NOT NULL` |
 | `queue_seq` | `INTEGER NOT NULL CHECK(queue_seq >= 1)` |
 | `attempt_number` | `INTEGER NOT NULL DEFAULT 1 CHECK(attempt_number >= 1)` |
-| `predecessor_attempt_id` | `TEXT REFERENCES integration_attempt(id) ON DELETE RESTRICT` |
+| `predecessor_attempt_id` | `TEXT REFERENCES integration_attempt(id) ON DELETE SET NULL` |
 | `current` | `INTEGER NOT NULL CHECK(current IN (0,1))` |
 | `admission_key` | `TEXT NOT NULL` |
 | `expected_status` | `TEXT NOT NULL` |
@@ -4389,56 +4430,33 @@ are retained opaque witnesses rather than cascading foreign keys.
 | `placement_generation` | `INTEGER` |
 | `original_candidate_sha` | `TEXT` |
 | `candidate_sha` | `TEXT` |
-| `fork_base_sha` | `TEXT` |
 | `target_tip_sha` | `TEXT` |
 | `contract_execution_id` | `TEXT` |
 | `review_id` | `TEXT` |
-| `carry_id` | `TEXT` |
-| `authority_digest` | `TEXT` |
-| `source_digest_version` | `INTEGER` |
 | `reviewed_paths_json` | `TEXT CHECK(reviewed_paths_json IS NULL OR json_valid(reviewed_paths_json))` |
 | `changed_paths_json` | `TEXT CHECK(changed_paths_json IS NULL OR json_valid(changed_paths_json))` |
 | `conflict_paths_json` | `TEXT CHECK(conflict_paths_json IS NULL OR json_valid(conflict_paths_json))` |
 | `repair_paths_json` | `TEXT CHECK(repair_paths_json IS NULL OR json_valid(repair_paths_json))` |
 | `guard_paths_json` | `TEXT CHECK(guard_paths_json IS NULL OR json_valid(guard_paths_json))` |
-| `blocked_by_attempt_ids_json` | `TEXT CHECK(blocked_by_attempt_ids_json IS NULL OR json_valid(blocked_by_attempt_ids_json))` |
-| `paths_commit_sha` | `TEXT` |
-| `paths_base_sha` | `TEXT` |
 | `state` | `TEXT NOT NULL CHECK(state IN ('queued','path_wait','validating','rebasing','checking','awaiting_task_step','ready_ff','ff_inflight','reconciling','applied','ejected','needs_review','parked','quarantined','completed','cancelled','superseded'))` |
 | `resume_state` | `TEXT CHECK(resume_state IN ('queued','path_wait','validating','rebasing','checking','awaiting_task_step','ready_ff','ff_inflight','reconciling','applied','ejected','needs_review','parked','quarantined','completed','cancelled','superseded'))` |
-| `outcome_kind` | `TEXT CHECK(outcome_kind IN ('admission','candidate','target_tip','clean_rebase','conflict_handoff','conflict','review_required','target_moved','dirty','target_dirty','markers','ci_passed','ci_failed','owner_offline','workspace_lost','done','cancelled','unsupported_conflict'))` |
 | `failure_kind` | `TEXT CHECK(failure_kind IN ('infrastructure','target_unconfigured','target_ambiguous','target_unavailable','owner_required','unsupported_path','corrupt_import','contradictory_proof','needs_fact','timeout','workspace_lost','candidate_check_failed'))` |
 | `failure_message` | `TEXT CHECK(length(CAST(failure_message AS BLOB)) <= 4096)` |
 | `slot_generation` | `INTEGER NOT NULL DEFAULT 0 CHECK(slot_generation >= 0)` |
-| `critical_started_at` | `TEXT` |
 | `permit_json` | `TEXT CHECK(permit_json IS NULL OR json_valid(permit_json))` |
-| `cancel_requested_at` | `TEXT` |
-| `hold_requested_at` | `TEXT` |
 | `operation_kind` | `TEXT CHECK(operation_kind IN ('merge','rebase','check','fast_forward','reconcile'))` |
 | `operation_id` | `TEXT` |
-| `request_digest` | `TEXT` |
 | `current_operation_state` | `TEXT CHECK(current_operation_state IN ('pending','running','succeeded','failed','uncertain','acknowledged'))` |
 | `operation_receipts_json` | `TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(operation_receipts_json))` |
-| `rebase_result_json` | `TEXT CHECK(rebase_result_json IS NULL OR json_valid(rebase_result_json))` |
-| `checks_digest` | `TEXT` |
 | `checks_json` | `TEXT CHECK(checks_json IS NULL OR json_valid(checks_json))` |
-| `check_index` | `INTEGER NOT NULL DEFAULT 0 CHECK(check_index >= 0)` |
 | `checks_commit_sha` | `TEXT` |
-| `checks_started_at` | `TEXT` |
-| `checks_finished_at` | `TEXT` |
-| `interruption_count` | `INTEGER NOT NULL DEFAULT 0 CHECK(interruption_count >= 0)` |
 | `deadline` | `TEXT` |
 | `effect_seq` | `INTEGER NOT NULL DEFAULT 0 CHECK(effect_seq >= 0)` |
-| `effect_kind` | `TEXT CHECK(effect_kind IN ('advance','park','send_back'))` |
-| `effect_payload_json` | `TEXT CHECK(effect_payload_json IS NULL OR json_valid(effect_payload_json))` |
-| `effect_step_id` | `TEXT REFERENCES task_step(id) ON DELETE SET NULL` |
 | `effect_ack_json` | `TEXT CHECK(effect_ack_json IS NULL OR json_valid(effect_ack_json))` |
 | `acknowledged_at` | `TEXT` |
 | `integrated_before_sha` | `TEXT` |
 | `integrated_sha` | `TEXT` |
-| `target_observed_sha` | `TEXT` |
 | `available_at` | `TEXT` |
-| `retry_count` | `INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0)` |
 | `last_error_kind` | `TEXT CHECK(last_error_kind IN ('infrastructure','target_unconfigured','target_ambiguous','target_unavailable','owner_required','unsupported_path','corrupt_import','contradictory_proof','needs_fact','timeout','workspace_lost','candidate_check_failed'))` |
 | `last_error` | `TEXT CHECK(length(CAST(last_error AS BLOB)) <= 4096)` |
 | `started_at` | `TEXT` |
@@ -4446,7 +4464,8 @@ are retained opaque witnesses rather than cascading foreign keys.
 | `created_at` | `TEXT NOT NULL` |
 | `completed_at` | `TEXT` |
 | `import_source_json` | `TEXT CHECK(import_source_json IS NULL OR json_valid(import_source_json))` |
-| `observations_json` | `TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(observations_json))` |
+| `observations_json` | `TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(observations_json) AND length(CAST(observations_json AS BLOB)) <= 1048576)` |
+| `observations_dropped` | `INTEGER NOT NULL DEFAULT 0 CHECK(observations_dropped >= 0)` |
 | `revision` | `INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1)` |
 
 Keys: queue `UNIQUE(repo_id,target_branch)`; attempts
@@ -4467,6 +4486,7 @@ Indexes:
 - `CREATE UNIQUE INDEX integration_attempt_operation ON integration_attempt(operation_id) WHERE operation_id IS NOT NULL`
 - `CREATE INDEX integration_attempt_retention ON integration_attempt(state,completed_at)`
 - `CREATE INDEX integration_attempt_import ON integration_attempt(task_ref,expected_epoch) WHERE import_source_json IS NOT NULL`
+- `CREATE INDEX integration_attempt_import_disposition ON integration_attempt(json_extract(import_source_json,'$.disposition')) WHERE import_source_json IS NOT NULL`
 
 Nullable JSON path sets distinguish an unknown set (`NULL`) from a known empty
 set (`[]`). They keep exact repo-relative UTF-8 identity, including both rename
@@ -4593,15 +4613,45 @@ into terminal history. A terminal legacy Task does not release an uncertain
 operation or its quarantined head. Unobserved fields remain null; notably Done.before_sha is
 not re-labelled as a target-tip fact.
 
-Every optional observer uses a savepoint. A failed insert/update rolls back only
-its queue/attempt writes, logs once per observation identity and leaves the real
-result to commit. The shadow emits no event, states no condition, schedules no
-worker, changes no ordering/retry timing/budget and drives no Git or CI. Five
-result-transaction differential fixtures (Done, clean rebase, conflict handoff,
-CI failure, cancellation) compare the literal values of every other table,
-including nonempty Task, step, transition, event and budget history, against the
-same database image with observation recording forced to fail. Existing merge
-and workflow/API targets continue to exercise actual Git and Task outcomes.
+An attempt created by the shadow stays `queued` and current while its Task
+lives; it is closed straight to `completed`/`cancelled` when the Task settles.
+That close is the one write that does not go through
+`INTEGRATION_TRANSITIONS`: the table governs the future worker
+(`transition_integration_attempt`), not this mirror of the legacy result.
+
+Recording is one SQL statement per observation: a JSON append on the Task's
+current attempt, found through the `integration_attempt_current_task` partial
+unique index, with no read of the row into Rust and no rewrite of its other
+columns. `observations_json` is bounded: an attempt keeps its first observation
+and the 15 most recent, counts the rest in `observations_dropped`, keeps at
+most 256 paths per list (`paths_truncated`) and at most 16 KiB per observation
+(1 MiB per row, by CHECK). Replay of a retained identity is a no-op. Step
+settlement, which every step of every Task passes, pays exactly one indexed
+statement that matches nothing unless the Task is terminal and has a current
+attempt. Only the first merge intent of a merge entry needs several statements
+(create-or-get queue, admit attempt) and they run inside a savepoint.
+
+A recording failure never fails or rolls back the real result. A failed single
+statement undoes only itself (SQLite statement atomicity); a failed admission
+rolls back to its savepoint. Each site has already written in its transaction,
+so it holds the write lock and a recording statement cannot wait on another
+writer. Failures are counted in one process-wide counter: the first and every
+power of two is a warning, the rest are debug lines; no identity set is kept.
+The shadow emits no event, states no condition, schedules no worker, changes
+no ordering/retry timing/budget and drives no Git or CI. The target-read
+buffer is one slot in the Task step's task-local scope: created empty by
+`in_task_step`, keyed by step id and hook index, dropped with the step.
+
+**Stage B rows are disposable.** Nothing reads these tables to make a
+decision, and the importer has no production caller. Before stage D's first
+import it must discard every stage B row (`DELETE FROM integration_attempt;
+DELETE FROM integration_queue;`) or version its admission key: import progress
+is the existence of an `import:<Task>:<status_epoch>` row, so a changed
+classification is not re-applied over existing rows; a current shadow attempt
+makes the importer retain its row non-current with
+`existing_attempt_identity`; and queue rows keep the target resolution and any
+quarantine pin they were created with.
+
 Operator status adds only read-only counts by queue/current-attempt state and
 quarantined imports; there are no queue REST/MCP/web/CLI reads yet.
 

@@ -129,6 +129,9 @@ impl RepoLocationRepo for SqliteDb {
         if in_use {
             return Err(DbError::VersionConflict);
         }
+        // Passive integration queues never block this deletion; the queue
+        // that targeted the location is left without one, suspended.
+        crate::integration_queue::suspend_queues_for_deleted_location(&mut transaction, id).await?;
         let result = sqlx::query("DELETE FROM repo_location WHERE id = ?")
             .bind(id)
             .execute(&mut *transaction)
