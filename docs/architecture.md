@@ -58,7 +58,7 @@ forge-solo → services → db / events / agent-host / executors / workspace →
 which the workspace already resolved. Both `agent-host` and `services` depend
 on it; it imports neither, so typed service handler registration does not
 create a dependency cycle. Specifications live in domain modules of that crate
-(`scope_reads`, `project_reads`), below `agent-host`, because `agent-host`
+(`scope_reads`, `project_reads`, `main_reads`), below `agent-host`, because `agent-host`
 builds the advertised schema and cannot depend on `services`. Each module owns
 its specs, its id list and the small context trait its handlers need;
 `services` implements the traits. `lib.rs` only concatenates the modules,
@@ -99,9 +99,21 @@ advertised native definition for the forbidden keywords, one pins a byte
 ceiling per surface (`SURFACE_BYTE_CEILINGS`, the unit
 `scripts/measure-tool-definitions.py` prints). Raise a ceiling only on purpose.
 
-The first registered reads are `account.summary`, `agent_chat.summary`,
-`project.charter`, and `skill.section`. All other operations keep their hand
-paths; an operation never has both. Existing permission/binding checks enforce
+Registered reads are `account.summary`, `agent_chat.summary`, `project.charter`,
+`skill.section`, `genesis.project_agents.read`, `charter.read`,
+`charter.readiness`, `charter.diff`, `charter.approval_target`, `discovery.read`,
+`portfolio.read`, and `inquiry.run`. Main query handlers accept the registry's
+input types directly; their former dispatcher and handwritten decoders are
+removed. String lengths, scalar types, required fields and numeric bounds are
+enforced from the same canonical schema before decoding. Discovery/portfolio
+defaults and clamping remain in the handlers. Inquiry remains a query: its run log and
+bounded findings do not grant proposal authority. Its `MainChatOnly`
+availability records the existing exclusion from account inquiry sessions.
+The scope-read aggregate adds no contract prose where the base had none.
+Main proposals remain on their existing path, including all approval receipts,
+dedupe/causation fields and prepared-action continuation; proposal projection
+is deferred. All other operations keep their hand paths; an operation never
+has both. Existing permission/binding checks enforce
 authority; spec/check parity is tested pending EffectiveAuthority. Domain
 semantic validation, transactions, workspace preparation, MCP projections and
 doctrine remain hand-written.
@@ -6012,4 +6024,3 @@ Stage four must compose these owner results into the public condition DTO and
 switch all projections together, replace the visible park annotation with the
 condition's own park, preserve the material-blocker digest and slot
 classification, regenerate bindings and document the single public beta break.
-

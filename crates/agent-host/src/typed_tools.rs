@@ -47,11 +47,8 @@ use agent_runtime::harness::{FetchTool, FetchTransport};
 use crate::{
     AgentHostError, CanonicalScope, CanonicalScopeType, CommandAllowlist, WorkspaceAccess,
     operation_catalog::{
-        MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-        MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
-        MAIN_CHARTER_READINESS_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
-        MAIN_INQUIRY_RUN_OPERATION, OperationExposure, OperationSurface,
-        PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+        MAIN_CHARTER_DRAFT_OPERATION, MAIN_INQUIRY_RUN_OPERATION, OperationExposure,
+        OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
         PROJECT_OBSERVATIONS_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
         TASK_WORKLOG_OPERATION, operation_names_for_surface,
     },
@@ -1830,12 +1827,21 @@ impl Tool for ForgeScopeReadTool {
                 "Forge read operation is outside this scope",
             ));
         }
+        let registered = operation_registry::READ_CATALOG.lookup(operation);
+        let registered_main_read = registered.is_some_and(|spec| {
+            spec.surfaces
+                .iter()
+                .any(|surface| surface.native_aggregate == FORGE_MAIN_ORCHESTRATION_READ_TOOL)
+        });
+        // Main inputs are closed and scalar. Report their contract violation
+        // before the recursive authority guard can hide the field/operation.
+        if registered_main_read {
+            validate_orchestration_read_arguments(operation, &arguments)?;
+        }
         if self.reject_authority_overrides {
             reject_authority_overrides(&arguments)?;
         }
-        if self.reject_authority_overrides
-            || operation_registry::READ_CATALOG.lookup(operation).is_some()
-        {
+        if !registered_main_read && (self.reject_authority_overrides || registered.is_some()) {
             validate_orchestration_read_arguments(operation, &arguments)?;
         }
         let resource = SecurityResource::other(
@@ -2941,7 +2947,6 @@ fn validate_orchestration_read_arguments(
             .map_err(RuntimeError::tool);
     }
     let allowed = match operation {
-        MAIN_CHARTER_READ_OPERATION => &["operation", "arguments"][..],
         PROJECT_CURRENT_STATE_OPERATION => &["operation", "arguments"][..],
         _ => &["operation", "arguments"][..],
     };
@@ -2953,33 +2958,8 @@ fn validate_orchestration_read_arguments(
             .as_object()
             .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
         let nested_allowed: &[&str] = match operation {
-            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => &["genesis_session_id"],
-            MAIN_CHARTER_READ_OPERATION => &["charter_id", "revision_id", "genesis_session_id"],
-            MAIN_CHARTER_READINESS_OPERATION => &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "genesis_session_id",
-            ],
-            MAIN_CHARTER_DIFF_OPERATION => &[
-                "charter_id",
-                "base_revision_id",
-                "candidate_revision_id",
-                "genesis_session_id",
-            ],
-            MAIN_CHARTER_APPROVAL_TARGET_OPERATION => &[
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "genesis_session_id",
-            ],
             PROJECT_CURRENT_STATE_OPERATION => &["limit"],
             PROJECT_OBSERVATIONS_OPERATION => &["task_id", "limit"],
-            MAIN_INQUIRY_RUN_OPERATION => &["title", "question", "context"],
             _ => &[],
         };
         if let Some(field) = nested
@@ -3343,6 +3323,9 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
 fn bound_chat_tool_error(message: String, limit: usize) -> String {
     message.chars().take(limit).collect()
 }
+
+#[cfg(test)]
+use crate::MAIN_CHARTER_READ_OPERATION;
 
 #[cfg(test)]
 mod tests {

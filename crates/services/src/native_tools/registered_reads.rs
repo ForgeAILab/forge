@@ -42,3 +42,81 @@ impl operation_registry::project_reads::ProjectReadContext<AgentHostError> for C
             .await
     }
 }
+
+#[async_trait]
+impl operation_registry::main_reads::MainReadContext<AgentHostError> for Context<'_> {
+    async fn genesis_project_agents(
+        &self,
+        input: operation_registry::main_reads::GenesisProjectAgentsQuery,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .main_queries
+            .project_agents(self.actor_identity_id, self.scope, input)
+            .await
+            .map_err(super::service_error)
+    }
+    async fn charter_read(
+        &self,
+        input: operation_registry::main_reads::CharterReadQuery,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .main_queries
+            .charter_read(self.actor_identity_id, self.scope, input)
+            .await
+            .map_err(super::native_scope_error)
+    }
+    async fn charter_readiness(
+        &self,
+        input: operation_registry::main_reads::CharterProjectionQuery,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .main_queries
+            .charter_readiness(self.actor_identity_id, self.scope, input)
+            .await
+            .map_err(super::service_error)
+    }
+    async fn charter_diff(
+        &self,
+        input: operation_registry::main_reads::CharterDiffQuery,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .main_queries
+            .charter_diff(self.actor_identity_id, self.scope, input)
+            .await
+            .map_err(super::service_error)
+    }
+    async fn charter_approval_target(
+        &self,
+        input: operation_registry::main_reads::CharterProjectionQuery,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .main_queries
+            .charter_approval_target(self.actor_identity_id, self.scope, input)
+            .await
+            .map_err(super::service_error)
+    }
+    async fn discovery_read(
+        &self,
+        input: operation_registry::main_reads::BoundedListQuery,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .discovery_read(self.actor_identity_id, self.scope, input)
+            .await
+    }
+    async fn portfolio_read(
+        &self,
+        input: operation_registry::main_reads::BoundedListQuery,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .portfolio_read(self.actor_identity_id, self.scope, input)
+            .await
+    }
+    async fn inquiry_run(
+        &self,
+        input: operation_registry::main_reads::InquiryQuery,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .inquiry_run(self.actor_identity_id, self.scope, input)
+            .await
+    }
+}

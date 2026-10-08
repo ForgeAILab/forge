@@ -6,7 +6,10 @@ use scope_reads::NoArguments;
 fn catalog_is_complete_unique_and_deterministic() {
     let ids = READ_CATALOG.iter().map(|s| s.id).collect::<Vec<_>>();
     assert_eq!(ids, registered_operations());
-    assert_eq!(ids.len(), scope_reads::IDS.len() + project_reads::IDS.len());
+    assert_eq!(
+        ids.len(),
+        scope_reads::IDS.len() + project_reads::IDS.len() + main_reads::IDS.len()
+    );
     assert!(READ_CATALOG.lookup("project.current_state").is_none());
     assert!(OperationCatalog::<()>::new(scope_reads::specs(), &registered_operations()).is_err());
     assert!(OperationCatalog::<()>::new(
@@ -32,11 +35,7 @@ impl<E> ErrorMessage for Result<OperationCatalog<E>, String> {
 #[test]
 fn every_declared_constraint_matches_schema_and_decoder() {
     for spec in READ_CATALOG.iter() {
-        let valid = if spec.id == "skill.section" {
-            json!({"section":"research"})
-        } else {
-            json!({})
-        };
+        let valid = valid_input(spec.id);
         let validator = jsonschema::validator_for(&spec.canonical_schema()).unwrap();
         assert!(validator.is_valid(&valid), "{}", spec.id);
         spec.validate_arguments(&valid).unwrap();
@@ -88,6 +87,14 @@ fn contract_lines_are_generated_from_the_spec() {
         [
             "account.summary: no arguments",
             "agent_chat.summary: no arguments",
+            "charter.approval_target: {charter_id, content_digest, expected_charter_version, genesis_session_id?, render_digest, revision_id}",
+            "charter.diff: {base_revision_id, candidate_revision_id, charter_id, genesis_session_id?}",
+            "charter.read: {charter_id?, genesis_session_id?, revision_id?}",
+            "charter.readiness: {charter_id, content_digest, expected_charter_version, genesis_session_id?, render_digest, revision_id}",
+            "discovery.read: {limit?}",
+            "genesis.project_agents.read: {genesis_session_id?}",
+            "inquiry.run: {context?, question, title}",
+            "portfolio.read: {limit?}",
             "project.charter: no arguments",
             "skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
         ]
@@ -192,11 +199,7 @@ async fn typed_dispatch_selects_each_handler_and_never_dispatches_invalid_input(
     let catalog = read_catalog();
     let context = RecordingContext(std::sync::Mutex::new(Vec::new()));
     for spec in catalog.iter() {
-        let input = if spec.id == "skill.section" {
-            json!({"section":"research"})
-        } else {
-            json!({})
-        };
+        let input = valid_input(spec.id);
         let expected = if spec.id == "skill.section" {
             "skill.section:research"
         } else {
@@ -216,4 +219,115 @@ async fn typed_dispatch_selects_each_handler_and_never_dispatches_invalid_input(
         context.0.lock().unwrap().len(),
         registered_operations().len()
     );
+}
+
+fn valid_input(id: &str) -> Value {
+    let inputs: Value = serde_json::from_str(include_str!("../tests/read_inputs.json")).unwrap();
+    inputs[id].clone()
+}
+
+#[async_trait::async_trait]
+impl main_reads::MainReadContext<&'static str> for RecordingContext {
+    async fn genesis_project_agents(
+        &self,
+        _: main_reads::GenesisProjectAgentsQuery,
+    ) -> Result<Value, &'static str> {
+        self.record("genesis.project_agents.read")
+    }
+    async fn charter_read(&self, _: main_reads::CharterReadQuery) -> Result<Value, &'static str> {
+        self.record("charter.read")
+    }
+    async fn charter_readiness(
+        &self,
+        _: main_reads::CharterProjectionQuery,
+    ) -> Result<Value, &'static str> {
+        self.record("charter.readiness")
+    }
+    async fn charter_diff(&self, _: main_reads::CharterDiffQuery) -> Result<Value, &'static str> {
+        self.record("charter.diff")
+    }
+    async fn charter_approval_target(
+        &self,
+        _: main_reads::CharterProjectionQuery,
+    ) -> Result<Value, &'static str> {
+        self.record("charter.approval_target")
+    }
+    async fn discovery_read(&self, _: main_reads::BoundedListQuery) -> Result<Value, &'static str> {
+        self.record("discovery.read")
+    }
+    async fn portfolio_read(&self, _: main_reads::BoundedListQuery) -> Result<Value, &'static str> {
+        self.record("portfolio.read")
+    }
+    async fn inquiry_run(&self, _: main_reads::InquiryQuery) -> Result<Value, &'static str> {
+        self.record("inquiry.run")
+    }
+}
+
+#[test]
+fn scalar_contract_violations_name_each_field_and_never_widen_the_schema() {
+    for spec in READ_CATALOG.iter() {
+        let valid = valid_input(spec.id);
+        let schema = spec.canonical_schema();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for (field, property) in schema["properties"].as_object().unwrap() {
+            let mut cases = vec![json!([]), json!({}), json!(false), json!(1.5)];
+            if property["type"] == "string" {
+                cases.extend([json!(null), json!(42)]);
+            }
+            if let Some(min) = property["minLength"].as_u64() {
+                if min > 0 {
+                    cases.push(json!(""));
+                }
+            }
+            if let Some(max) = property["maxLength"].as_u64() {
+                cases.push(json!("é".repeat(max as usize + 1)));
+            }
+            if let Some(min) = property["minimum"].as_f64() {
+                cases.push(json!(min as i64 - 1));
+            }
+            if property["format"] == "int64" {
+                cases.push(json!(u64::MAX));
+            }
+            for value in cases {
+                let mut invalid = valid.clone();
+                invalid[field] = value;
+                if validator.is_valid(&invalid) && property["format"] != "int64" {
+                    continue;
+                }
+                let error = spec.validate_arguments(&invalid).unwrap_err();
+                assert!(
+                    error.contains(spec.id) && error.contains(field) && error.contains("expected"),
+                    "{error}"
+                );
+            }
+            if schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field))
+            {
+                let mut invalid = valid.clone();
+                invalid.as_object_mut().unwrap().remove(field);
+                let error = spec.validate_arguments(&invalid).unwrap_err();
+                assert!(
+                    error.contains(spec.id) && error.contains(field) && error.contains("expected"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn main_list_limits_preserve_defaults_null_and_clamping_inputs() {
+    for id in ["discovery.read", "portfolio.read"] {
+        let spec = READ_CATALOG.lookup(id).unwrap();
+        for input in [
+            json!({}),
+            json!({"limit":null}),
+            json!({"limit":0}),
+            json!({"limit":100}),
+        ] {
+            spec.validate_arguments(&input).unwrap();
+        }
+    }
 }

@@ -2170,7 +2170,7 @@ async fn registry_reads_use_real_handlers_and_unmoved_reads_keep_the_hand_path()
     );
 
     assert!(operation_registry::READ_CATALOG
-        .lookup("discovery.read")
+        .lookup("inbox.read")
         .is_none());
     let composition = ScopeToolComposition::for_scope_with_permissions(
         AGENT_ID,
@@ -2184,11 +2184,284 @@ async fn registry_reads_use_real_handlers_and_unmoved_reads_keep_the_hand_path()
     let outcome = invoke_tool(
         &composition,
         "forge_scope_read",
-        json!({"operation":"discovery.read","arguments":{"limit":1}}),
+        json!({"operation":"inbox.read","arguments":{"limit":1}}),
         "unmoved",
     )
     .await
     .unwrap();
     assert!(!outcome.is_error);
     assert!(outcome.value["items"].is_array());
+}
+
+#[derive(Debug, Default)]
+struct RegistryInquiryRunner(std::sync::Mutex<Vec<services::InquiryRequest>>);
+#[async_trait::async_trait]
+impl services::InquiryRunner for RegistryInquiryRunner {
+    async fn dispatch(
+        &self,
+        request: services::InquiryRequest,
+        _: tokio_util::sync::CancellationToken,
+    ) -> services::Result<services::InquiryOutcome> {
+        self.0.lock().unwrap().push(request);
+        Ok(services::InquiryOutcome {
+            inquiry_id: "registry-inquiry".into(),
+            status: db::AgentInquiryStatus::Succeeded,
+            findings: "Bounded findings".into(),
+            findings_path: Some("inquiries/registry-inquiry/findings.md".into()),
+            input_tokens: 11,
+            output_tokens: 12,
+            cache_read_tokens: 13,
+            cache_write_tokens: 14,
+            duration_ms: 15,
+        })
+    }
+    async fn cancel_inquiry(&self, _: &str) -> bool {
+        false
+    }
+}
+
+fn main_registered_input(id: &str) -> Value {
+    match id {
+        "genesis.project_agents.read" => json!({"genesis_session_id":MAIN_GENESIS_ID}),
+        "charter.read" => {
+            json!({"charter_id":MAIN_CHARTER_ID,"revision_id":MAIN_REVISION_ID,"genesis_session_id":MAIN_GENESIS_ID})
+        }
+        "charter.readiness" | "charter.approval_target" => {
+            json!({"charter_id":MAIN_CHARTER_ID,"revision_id":MAIN_REVISION_ID,"content_digest":"main-content-1","render_digest":"main-render-1","expected_charter_version":1,"genesis_session_id":MAIN_GENESIS_ID})
+        }
+        "charter.diff" => {
+            json!({"charter_id":MAIN_CHARTER_ID,"base_revision_id":MAIN_REVISION_ID,"candidate_revision_id":MAIN_REVISION_ID,"genesis_session_id":MAIN_GENESIS_ID})
+        }
+        "discovery.read" | "portfolio.read" => json!({"limit":1}),
+        "inquiry.run" => {
+            json!({"title":"  Question  ","question":"  Find the answer  ","context":"  Supporting material  "})
+        }
+        _ => panic!("unexpected Main operation {id}"),
+    }
+}
+
+#[tokio::test]
+async fn main_registry_reads_preserve_payloads_and_scope_on_each_surface() {
+    use forge_agent_host::ForgeToolProvider;
+    let fixture = fixture(false).await;
+    let runner = Arc::new(RegistryInquiryRunner::default());
+    fixture.provider.set_inquiry_runner(runner.clone());
+    for scope in [
+        fixture.main_scope.clone(),
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: MAIN_CHAT_ID.to_owned(),
+            workspace_access: WorkspaceAccess::Deny,
+        },
+    ] {
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            AGENT_ID,
+            scope.clone(),
+            None,
+            None,
+            &broad_permissions(),
+            Some(Arc::new(fixture.provider.clone())),
+        )
+        .unwrap();
+        for id in operation_registry::main_reads::IDS {
+            if *id == "inquiry.run" && scope.scope_type == CanonicalScopeType::Account {
+                continue;
+            }
+            let input = main_registered_input(id);
+            let tool_name = operation_registry::READ_CATALOG
+                .lookup(id)
+                .unwrap()
+                .surfaces[0]
+                .native_aggregate;
+            let direct = fixture
+                .provider
+                .read(AGENT_ID, &scope, id, input.clone())
+                .await
+                .unwrap();
+            let unwrap_result = |mut result: Value| {
+                // Each read gets a fresh server correlation id; compare the
+                // domain payload, not that transport join key.
+                if result.get("result").is_some() {
+                    result = result["result"].clone();
+                }
+                // Readiness evaluations retain their wall-clock timestamp.
+                if let Some(value) = result.get_mut("readiness").and_then(Value::as_object_mut) {
+                    value.remove("evaluated_at");
+                }
+                result
+            };
+            // Call the same domain handlers the base dispatcher selected,
+            // independently of the registry's handler binding.
+            let queries = services::MainOrchestrationQueryService::new(fixture.db.clone());
+            let reference = match *id {
+                "genesis.project_agents.read" => Some(
+                    queries
+                        .project_agents(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "charter.read" => Some(
+                    queries
+                        .charter_read(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "charter.readiness" => Some(
+                    queries
+                        .charter_readiness(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "charter.diff" => Some(
+                    queries
+                        .charter_diff(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "charter.approval_target" => Some(
+                    queries
+                        .charter_approval_target(
+                            AGENT_ID,
+                            &scope,
+                            serde_json::from_value(input.clone()).unwrap(),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                "discovery.read" => {
+                    assert_eq!(direct["items"][0]["id"], MAIN_GENESIS_ID);
+                    None
+                }
+                "portfolio.read" => {
+                    assert_eq!(direct["items"][0]["id"], PROJECT_ID);
+                    None
+                }
+                "inquiry.run" => None,
+                _ => unreachable!(),
+            };
+            if let Some(reference) = reference {
+                assert_eq!(
+                    unwrap_result(direct.clone()),
+                    unwrap_result(reference),
+                    "{id} handler parity"
+                );
+            }
+            for raw in [
+                json!({"operation":id,"arguments":input}),
+                json!({"parameters":{"operation":id,"arguments":input}}),
+            ] {
+                let outcome = invoke_tool(&composition, tool_name, raw, "main-registry")
+                    .await
+                    .unwrap();
+                assert!(!outcome.is_error, "{id}: {}", outcome.value);
+                assert_eq!(
+                    unwrap_result(outcome.value),
+                    unwrap_result(direct.clone()),
+                    "{id}"
+                );
+            }
+            for denied_scope in [
+                fixture.project_scope.clone(),
+                CanonicalScope {
+                    scope_type: CanonicalScopeType::Task,
+                    scope_id: "foreign-task".into(),
+                    workspace_access: WorkspaceAccess::Deny,
+                },
+            ] {
+                assert!(
+                    fixture
+                        .provider
+                        .read(AGENT_ID, &denied_scope, id, input.clone())
+                        .await
+                        .is_err(),
+                    "{id}"
+                );
+            }
+            // Same owner, but no active Main binding for this identity.
+            assert!(
+                fixture
+                    .provider
+                    .read(PROJECT_AGENT_CANDIDATE_ID, &scope, id, input.clone())
+                    .await
+                    .is_err(),
+                "{id}"
+            );
+            let error = invoke_tool(
+                &composition,
+                tool_name,
+                json!({"operation":id,"arguments":{"foreign_project":"x"}}),
+                "invalid-registry",
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(id)
+                    && error.contains("foreign_project")
+                    && error.contains("expected"),
+                "{error}"
+            );
+            let error = fixture
+                .provider
+                .read(AGENT_ID, &scope, id, json!({"foreign_project":"x"}))
+                .await
+                .unwrap_err();
+            let error = format!("{error:?}");
+            assert!(
+                error.contains(id)
+                    && error.contains("foreign_project")
+                    && error.contains("expected"),
+                "{error}"
+            );
+        }
+    }
+    {
+        let requests = runner.0.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests.iter() {
+            assert_eq!(request.chat_id, MAIN_CHAT_ID);
+            assert_eq!(request.identity_id, AGENT_ID);
+            assert_eq!(request.account_id, USER_ID);
+            assert_eq!(request.title, "Question");
+            assert_eq!(request.question, "Find the answer");
+            assert_eq!(request.context.as_deref(), Some("Supporting material"));
+        }
+    }
+    assert_eq!(
+        fixture
+            .provider
+            .read(
+                AGENT_ID,
+                &CanonicalScope {
+                    scope_type: CanonicalScopeType::AgentChat,
+                    scope_id: MAIN_CHAT_ID.into(),
+                    workspace_access: WorkspaceAccess::Deny
+                },
+                "inquiry.run",
+                main_registered_input("inquiry.run")
+            )
+            .await
+            .unwrap()["result"],
+        json!({
+            "inquiry_id":"registry-inquiry","status":"succeeded","findings":"Bounded findings",
+            "findings_path":"inquiries/registry-inquiry/findings.md","duration_ms":15,
+            "token_usage":{"input_tokens":11,"output_tokens":12,"cache_read_tokens":13,"cache_write_tokens":14}
+        })
+    );
 }

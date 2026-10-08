@@ -1,6 +1,7 @@
 //! Transport-neutral operation contracts. Domain modules bind typed inputs to
 //! handlers; consumers use the same catalog for schemas, decoding and dispatch.
 
+pub mod main_reads;
 pub mod project_reads;
 pub mod scope_reads;
 
@@ -26,11 +27,17 @@ type ErasedHandler<E> = dyn for<'a> Fn(
 /// A service context implements the domain interfaces in this catalog.
 /// This marker has no operation declarations or domain behaviour.
 pub trait ReadContext<E>:
-    scope_reads::ScopeReadContext<E> + project_reads::ProjectReadContext<E>
+    scope_reads::ScopeReadContext<E>
+    + project_reads::ProjectReadContext<E>
+    + main_reads::MainReadContext<E>
 {
 }
-impl<E, T: scope_reads::ScopeReadContext<E> + project_reads::ProjectReadContext<E>> ReadContext<E>
-    for T
+impl<
+        E,
+        T: scope_reads::ScopeReadContext<E>
+            + project_reads::ProjectReadContext<E>
+            + main_reads::MainReadContext<E>,
+    > ReadContext<E> for T
 {
 }
 
@@ -45,6 +52,7 @@ pub enum AvailabilityRule {
     Always,
     ReadyOnly,
     SetupOnly,
+    MainChatOnly,
 }
 /// The existing permission checks enforce these facts until EffectiveAuthority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +169,79 @@ impl TypedInputContract {
                     ));
                 }
                 _ => {}
+            }
+        }
+        for required in self.schema["required"].as_array().into_iter().flatten() {
+            let field = required.as_str().expect("schema field name");
+            if !object.contains_key(field) {
+                return Err(format!("argument `{field}` is required"));
+            }
+        }
+        for (field, schema) in self.fields() {
+            let Some(value) = object.get(field) else {
+                continue;
+            };
+            let accepts_type = |kind: &str| match kind {
+                "null" => value.is_null(),
+                "string" => value.is_string(),
+                "boolean" => value.is_boolean(),
+                "array" => value.is_array(),
+                "object" => value.is_object(),
+                "number" => value.is_number(),
+                "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+                _ => false,
+            };
+            let type_ok = match &schema["type"] {
+                Value::String(kind) => accepts_type(kind),
+                Value::Array(kinds) => kinds
+                    .iter()
+                    .any(|kind| kind.as_str().is_some_and(accepts_type)),
+                _ => true,
+            };
+            if !type_ok {
+                return Err(format!(
+                    "argument `{field}` must have type {}",
+                    schema["type"]
+                ));
+            }
+            if !value.is_null()
+                && match schema["format"].as_str() {
+                    Some("int64") => value.as_i64().is_none(),
+                    Some("uint64") => value.as_u64().is_none(),
+                    _ => false,
+                }
+            {
+                return Err(format!(
+                    "argument `{field}` is outside {}",
+                    schema["format"]
+                ));
+            }
+            if let Some(text) = value.as_str() {
+                let length = text.chars().count() as u64;
+                for (keyword, violates) in [("minLength", true), ("maxLength", false)] {
+                    if let Some(bound) = schema[keyword].as_u64() {
+                        if if violates {
+                            length < bound
+                        } else {
+                            length > bound
+                        } {
+                            return Err(format!("argument `{field}` violates {keyword} {bound}"));
+                        }
+                    }
+                }
+            }
+            if let Some(number) = value.as_f64() {
+                for (keyword, lower) in [("minimum", true), ("maximum", false)] {
+                    if let Some(bound) = schema[keyword].as_f64() {
+                        if if lower {
+                            number < bound
+                        } else {
+                            number > bound
+                        } {
+                            return Err(format!("argument `{field}` violates {keyword} {bound}"));
+                        }
+                    }
+                }
             }
         }
         (self.decode)(value.clone())
@@ -322,7 +403,7 @@ impl<E: Send + 'static> OperationCatalog<E> {
 /// A domain module adds its ids next to its specs; the catalog refuses a
 /// module whose specs and ids disagree and any id declared twice.
 pub fn registered_operations() -> Vec<&'static str> {
-    let mut ids = [scope_reads::IDS, project_reads::IDS].concat();
+    let mut ids = [scope_reads::IDS, project_reads::IDS, main_reads::IDS].concat();
     ids.sort_unstable();
     ids
 }
@@ -330,7 +411,8 @@ pub fn read_catalog<E: Send + 'static>() -> OperationCatalog<E> {
     OperationCatalog::new(
         scope_reads::specs()
             .into_iter()
-            .chain(project_reads::specs()),
+            .chain(project_reads::specs())
+            .chain(main_reads::specs()),
         &registered_operations(),
     )
     .expect("complete read catalog")

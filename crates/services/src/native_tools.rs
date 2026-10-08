@@ -37,10 +37,8 @@ use forge_agent_host::{
     contains_adaptive_authority_override, contains_authority_override, operation_contract,
     operation_descriptor, operation_permission, AgentHostError, CanonicalScope, CanonicalScopeType,
     CommandObservation, ForgeToolProvider, OperationClassification, PublicSearchScope,
-    WorkspaceAccess, MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
-    MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
+    WorkspaceAccess, MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
@@ -637,18 +635,14 @@ impl CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        input: operation_registry::main_reads::BoundedListQuery,
     ) -> Result<Value, AgentHostError> {
         let account_id = self
             .authorization
             .main_account_id(actor_identity_id, scope)
             .await
             .map_err(native_scope_error)?;
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(10)
-            .clamp(1, 20) as i64;
+        let limit = input.limit.unwrap_or(10).clamp(1, 20) as i64;
         let rows = sqlx::query(
             "SELECT id, maturity, lifecycle, project_id, handoff_id, version,
                     created_at, updated_at
@@ -679,18 +673,14 @@ impl CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        input: operation_registry::main_reads::BoundedListQuery,
     ) -> Result<Value, AgentHostError> {
         let account_id = self
             .authorization
             .main_account_id(actor_identity_id, scope)
             .await
             .map_err(native_scope_error)?;
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(20)
-            .clamp(1, 20) as i64;
+        let limit = input.limit.unwrap_or(20).clamp(1, 20) as i64;
         let rows = sqlx::query(
             "SELECT id, name, paused_at, created_at, updated_at
              FROM project WHERE owner_id = ? ORDER BY updated_at DESC, id DESC LIMIT ?",
@@ -1963,7 +1953,7 @@ impl CoordinationToolProvider {
         &self,
         actor_identity_id: &str,
         scope: &CanonicalScope,
-        arguments: Value,
+        input: operation_registry::main_reads::InquiryQuery,
     ) -> Result<Value, AgentHostError> {
         let runner = self.inquiry_runner_handle().ok_or_else(|| {
             AgentHostError::Unsupported("inquiries are not available on this server".to_owned())
@@ -1984,23 +1974,22 @@ impl CoordinationToolProvider {
                 ));
             }
         };
-        let title = arguments
-            .get("title")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AgentHostError::Unsupported("an inquiry needs a title".to_owned()))?
-            .to_owned();
-        let question = arguments
-            .get("question")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| AgentHostError::Unsupported("an inquiry needs a question".to_owned()))?
-            .to_owned();
-        let context = arguments
-            .get("context")
-            .and_then(Value::as_str)
+        let title = input.title.trim().to_owned();
+        let question = input.question.trim().to_owned();
+        // Preserve semantic whitespace checks and trimming in the handler.
+        if title.is_empty() {
+            return Err(AgentHostError::Unsupported(
+                "an inquiry needs a title".to_owned(),
+            ));
+        }
+        if question.is_empty() {
+            return Err(AgentHostError::Unsupported(
+                "an inquiry needs a question".to_owned(),
+            ));
+        }
+        let context = input
+            .context
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
@@ -4396,22 +4385,6 @@ impl ForgeToolProvider for CoordinationToolProvider {
             })
         } else {
             match operation {
-                MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION
-                | MAIN_CHARTER_READINESS_OPERATION
-                | MAIN_CHARTER_DIFF_OPERATION
-                | MAIN_CHARTER_APPROVAL_TARGET_OPERATION => self
-                    .main_queries
-                    .execute(actor_identity_id, scope, operation, arguments)
-                    .await
-                    .map_err(service_error),
-                MAIN_CHARTER_READ_OPERATION => self
-                    .main_queries
-                    .execute(actor_identity_id, scope, operation, arguments)
-                    .await
-                    .map_err(native_scope_error),
-                MAIN_INQUIRY_RUN_OPERATION => {
-                    self.inquiry_run(actor_identity_id, scope, arguments).await
-                }
                 PROJECT_CURRENT_STATE_OPERATION => {
                     self.project_current_state_read(actor_identity_id, scope, arguments)
                         .await
@@ -4433,14 +4406,6 @@ impl ForgeToolProvider for CoordinationToolProvider {
                     } else {
                         self.summary(actor_identity_id, scope).await
                     }
-                }
-                "discovery.read" => {
-                    self.discovery_read(actor_identity_id, scope, arguments)
-                        .await
-                }
-                "portfolio.read" => {
-                    self.portfolio_read(actor_identity_id, scope, arguments)
-                        .await
                 }
                 "decisions.read" => {
                     self.memory_read(actor_identity_id, scope, arguments, true)

@@ -4,13 +4,14 @@ use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
     CreateAgentProfile, SqliteDb,
 };
+use forge_agent_host::ForgeToolProvider;
 use forge_agent_host::{
     CanonicalScope, CanonicalScopeType, WorkspaceAccess, MAIN_CHARTER_APPROVAL_TARGET_OPERATION,
     MAIN_CHARTER_DIFF_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
     MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
 };
 use serde_json::{json, Value};
-use services::MainOrchestrationQueryService;
+use services::CoordinationToolProvider;
 
 const ACCOUNT_ID: &str = "query-account";
 const MAIN_IDENTITY_ID: &str = "query-main-agent";
@@ -261,19 +262,20 @@ fn projection_arguments() -> Value {
 #[tokio::test]
 async fn main_charter_queries_do_not_create_action_or_receipt_rows() {
     let db = fixture().await;
-    let service = MainOrchestrationQueryService::new(Arc::clone(&db));
+    let service = CoordinationToolProvider::new(Arc::clone(&db));
     let scope = main_scope();
     let before = counts(&db).await;
 
     let project_agents = service
-        .execute(
+        .read(
             MAIN_IDENTITY_ID,
             &scope,
             MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
             json!({"genesis_session_id": GENESIS_ID}),
         )
         .await
-        .expect("Project Agent candidates query");
+        .expect("Project Agent candidates query")["result"]
+        .clone();
     assert_eq!(
         project_agents["operation"],
         MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION
@@ -282,7 +284,7 @@ async fn main_charter_queries_do_not_create_action_or_receipt_rows() {
     assert_eq!(project_agents["items"][0]["identity_id"], MAIN_IDENTITY_ID);
 
     let read = service
-        .execute(
+        .read(
             MAIN_IDENTITY_ID,
             &scope,
             MAIN_CHARTER_READ_OPERATION,
@@ -293,23 +295,25 @@ async fn main_charter_queries_do_not_create_action_or_receipt_rows() {
             }),
         )
         .await
-        .expect("charter read query");
+        .expect("charter read query")["result"]
+        .clone();
     assert_eq!(read["scope"], "main");
     assert_eq!(read["items"][0]["id"], CHARTER_ID);
 
     let readiness = service
-        .execute(
+        .read(
             MAIN_IDENTITY_ID,
             &scope,
             MAIN_CHARTER_READINESS_OPERATION,
             projection_arguments(),
         )
         .await
-        .expect("readiness query");
+        .expect("readiness query")["result"]
+        .clone();
     assert_eq!(readiness["operation"], MAIN_CHARTER_READINESS_OPERATION);
 
     let diff = service
-        .execute(
+        .read(
             MAIN_IDENTITY_ID,
             &scope,
             MAIN_CHARTER_DIFF_OPERATION,
@@ -321,18 +325,20 @@ async fn main_charter_queries_do_not_create_action_or_receipt_rows() {
             }),
         )
         .await
-        .expect("diff query");
+        .expect("diff query")["result"]
+        .clone();
     assert_eq!(diff["operation"], MAIN_CHARTER_DIFF_OPERATION);
 
     let target = service
-        .execute(
+        .read(
             MAIN_IDENTITY_ID,
             &scope,
             MAIN_CHARTER_APPROVAL_TARGET_OPERATION,
             projection_arguments(),
         )
         .await
-        .expect("approval target query");
+        .expect("approval target query")["result"]
+        .clone();
     assert_eq!(target["operation"], MAIN_CHARTER_APPROVAL_TARGET_OPERATION);
     assert_eq!(counts(&db).await, before);
 }
@@ -340,11 +346,11 @@ async fn main_charter_queries_do_not_create_action_or_receipt_rows() {
 #[tokio::test]
 async fn main_charter_queries_reject_cross_scope_and_unbound_identities() {
     let db = fixture().await;
-    let service = MainOrchestrationQueryService::new(Arc::clone(&db));
+    let service = CoordinationToolProvider::new(Arc::clone(&db));
     let mut wrong_scope = main_scope();
     wrong_scope.scope_id = "other-account".to_owned();
     assert!(service
-        .execute(
+        .read(
             MAIN_IDENTITY_ID,
             &wrong_scope,
             MAIN_CHARTER_READINESS_OPERATION,
@@ -353,7 +359,7 @@ async fn main_charter_queries_reject_cross_scope_and_unbound_identities() {
         .await
         .is_err());
     assert!(service
-        .execute(
+        .read(
             UNBOUND_IDENTITY_ID,
             &main_scope(),
             MAIN_CHARTER_APPROVAL_TARGET_OPERATION,

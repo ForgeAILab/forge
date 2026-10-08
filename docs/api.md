@@ -1090,6 +1090,19 @@ structured Project Agent candidates plus the persisted/resolved selection.
 requiring `propose_discovery`; it accepts the Genesis session/version and one
 identity id, mutates no Charter prose, and freezes no approval by itself.
 
+Main reads use closed registry contracts after envelope normalization and again
+at dispatch. `forge_main_orchestration_read` keeps the portable
+`{operation, arguments}` shape; its generated argument lines mark optional
+fields with `?` rather than describing every field as optional. Charter
+readiness/approval-target queries require exact revision/digest references and
+a positive Charter version; diff requires both revision references.
+`inquiry.run` requires title (1–120 characters) and question (1–4000), with
+optional nullable context (at most 8000). Only a Main Chat exposes inquiry
+execution. The scope-read `discovery.read` and `portfolio.read` accept only an
+optional nullable unsigned `limit`; defaults and clamping are unchanged.
+Contract violations return an in-turn tool error naming the operation, field
+and expected contract. Proposal/approval and MCP contracts are unchanged.
+
 Project Agent validation results use the typed `project.validation` operation.
 A `record` payload must include the current positive
 `expected_milestone_version` alongside `milestone_id`, `check_id`,

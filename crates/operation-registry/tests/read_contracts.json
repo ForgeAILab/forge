@@ -1,28 +1,234 @@
 {
   "account.summary": {
-    "type": "object",
+    "additionalProperties": false,
     "properties": {},
     "required": [],
-    "additionalProperties": false
+    "type": "object"
   },
   "agent_chat.summary": {
-    "type": "object",
+    "additionalProperties": false,
     "properties": {},
     "required": [],
-    "additionalProperties": false
+    "type": "object"
+  },
+  "charter.approval_target": {
+    "additionalProperties": false,
+    "properties": {
+      "charter_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "content_digest": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "expected_charter_version": {
+        "format": "int64",
+        "minimum": 1.0,
+        "type": "integer"
+      },
+      "genesis_session_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "render_digest": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "revision_id": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "charter_id",
+      "content_digest",
+      "expected_charter_version",
+      "render_digest",
+      "revision_id"
+    ],
+    "type": "object"
+  },
+  "charter.diff": {
+    "additionalProperties": false,
+    "properties": {
+      "base_revision_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "candidate_revision_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "charter_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "genesis_session_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "base_revision_id",
+      "candidate_revision_id",
+      "charter_id"
+    ],
+    "type": "object"
+  },
+  "charter.read": {
+    "additionalProperties": false,
+    "properties": {
+      "charter_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "genesis_session_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "revision_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
+  "charter.readiness": {
+    "additionalProperties": false,
+    "properties": {
+      "charter_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "content_digest": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "expected_charter_version": {
+        "format": "int64",
+        "minimum": 1.0,
+        "type": "integer"
+      },
+      "genesis_session_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "render_digest": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "revision_id": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "charter_id",
+      "content_digest",
+      "expected_charter_version",
+      "render_digest",
+      "revision_id"
+    ],
+    "type": "object"
+  },
+  "discovery.read": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
+  "genesis.project_agents.read": {
+    "additionalProperties": false,
+    "description": "List the exact account-owned Project Agent identities eligible for explicit selection in the active Product Genesis session, plus the currently persisted preference and resolved approval selection.",
+    "properties": {
+      "genesis_session_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
+  },
+  "inquiry.run": {
+    "additionalProperties": false,
+    "description": "Dispatch one ephemeral read-only sub-agent to answer a bounded question, and wait for its findings. Use this for a research excursion whose working material you do not want to carry for the rest of this conversation -- reading across many Projects, reconciling a long event history, comparing options. The sub-agent gets the account read surface and its own scratch directory; it cannot propose anything, touch a repository, or dispatch further sub-agents. `title` is what the user sees in the inquiry list while it runs, so name the question, not the activity. `question` is the sub-agent's entire brief: it does not see this conversation, so state everything it needs. Put supporting material in `context`. You get back a bounded abstract plus the path to the sub-agent's full findings file, which you can read with the file tools if the abstract is not enough.",
+    "properties": {
+      "context": {
+        "maxLength": 8000,
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "question": {
+        "maxLength": 4000,
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": {
+        "maxLength": 120,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "question",
+      "title"
+    ],
+    "type": "object"
+  },
+  "portfolio.read": {
+    "additionalProperties": false,
+    "properties": {
+      "limit": {
+        "format": "uint64",
+        "minimum": 0.0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "type": "object"
   },
   "project.charter": {
-    "type": "object",
+    "additionalProperties": false,
+    "description": "Returns the bound Project's current approved Charter as rendered Markdown plus its charter/revision identifiers and content/render digests. The Charter is Project data, not resident context: read it whenever its details matter to a decision. The response is scope-bound and never accepts a Project selector.",
     "properties": {},
     "required": [],
-    "additionalProperties": false,
-    "description": "Returns the bound Project's current approved Charter as rendered Markdown plus its charter/revision identifiers and content/render digests. The Charter is Project data, not resident context: read it whenever its details matter to a decision. The response is scope-bound and never accepts a Project selector."
+    "type": "object"
   },
   "skill.section": {
-    "type": "object",
+    "additionalProperties": false,
+    "description": "Returns one server-owned Project operating-doctrine section by name. Read the matching section before the first work of that kind in a conversation and re-read it when unsure: research, documents, scope_change, tasks, milestones, release.",
     "properties": {
       "section": {
-        "type": "string",
         "enum": [
           "research",
           "documents",
@@ -30,13 +236,13 @@
           "tasks",
           "milestones",
           "release"
-        ]
+        ],
+        "type": "string"
       }
     },
     "required": [
       "section"
     ],
-    "additionalProperties": false,
-    "description": "Returns one server-owned Project operating-doctrine section by name. Read the matching section before the first work of that kind in a conversation and re-read it when unsure: research, documents, scope_change, tasks, milestones, release."
+    "type": "object"
   }
 }

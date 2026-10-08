@@ -185,7 +185,7 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "description": "Arguments by operation:\n- charter.approval_target: optional {charter_id, content_digest, expected_charter_version, genesis_session_id, render_digest, revision_id}\n- charter.diff: optional {base_revision_id, candidate_revision_id, charter_id, genesis_session_id}\n- charter.read: optional {charter_id, genesis_session_id, revision_id}\n- charter.readiness: optional {charter_id, content_digest, expected_charter_version, genesis_session_id, render_digest, revision_id}\n- genesis.project_agents.read: optional {genesis_session_id}\n- inquiry.run: optional {context, question, title}",
+            "description": "Arguments by operation:\n- charter.approval_target: {charter_id, content_digest, expected_charter_version, genesis_session_id?, render_digest, revision_id}\n- charter.diff: {base_revision_id, candidate_revision_id, charter_id, genesis_session_id?}\n- charter.read: {charter_id?, genesis_session_id?, revision_id?}\n- charter.readiness: {charter_id, content_digest, expected_charter_version, genesis_session_id?, render_digest, revision_id}\n- genesis.project_agents.read: {genesis_session_id?}\n- inquiry.run: {context?, question, title}",
             "type": "object"
           },
           "operation": {
@@ -437,7 +437,7 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "description": "Arguments by operation:\n- charter.approval_target: optional {charter_id, content_digest, expected_charter_version, genesis_session_id, render_digest, revision_id}\n- charter.diff: optional {base_revision_id, candidate_revision_id, charter_id, genesis_session_id}\n- charter.read: optional {charter_id, genesis_session_id, revision_id}\n- charter.readiness: optional {charter_id, content_digest, expected_charter_version, genesis_session_id, render_digest, revision_id}\n- genesis.project_agents.read: optional {genesis_session_id}",
+            "description": "Arguments by operation:\n- charter.approval_target: {charter_id, content_digest, expected_charter_version, genesis_session_id?, render_digest, revision_id}\n- charter.diff: {base_revision_id, candidate_revision_id, charter_id, genesis_session_id?}\n- charter.read: {charter_id?, genesis_session_id?, revision_id?}\n- charter.readiness: {charter_id, content_digest, expected_charter_version, genesis_session_id?, render_digest, revision_id}\n- genesis.project_agents.read: {genesis_session_id?}",
             "type": "object"
           },
           "operation": {
