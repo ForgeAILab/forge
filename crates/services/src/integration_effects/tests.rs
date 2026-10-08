@@ -34,7 +34,61 @@ fn effects_have_no_persistence_or_task_capability_imports() {
                 "{name} acquired forbidden capability {forbidden}"
             );
         }
+        // Substrings miss a capability imported by name through an allowed
+        // module (`workspace_backend::ResolvedWorkspace`), so also check
+        // identifiers in the code, without its comments.
+        let code = source
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for glob in ["crate::*", "super::super", "workspace_backend::*"] {
+            assert!(!code.contains(glob), "{name} widens its imports: {glob}");
+        }
+        for token in code.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            assert!(
+                ![
+                    "db",
+                    "sqlx",
+                    "events",
+                    "pool",
+                    "task_writer",
+                    "task_service",
+                    "workflow",
+                    "HookContext",
+                    "ResolvedWorkspace",
+                    "WorkspaceBackend",
+                    "DaemonWorkspaceBackend",
+                    "EmbeddedWorkspaceBackend",
+                    "ReviewRunner",
+                ]
+                .contains(&token)
+                    && !token.ends_with("Repo")
+                    && !token.ends_with("Service"),
+                "{name} acquired forbidden capability {token}"
+            );
+        }
     }
+    // The connection registry also carries the event bus and the execution
+    // handlers. The socket exchange may only look a connection up and ask
+    // whether it is still the current one.
+    let rpc: String = include_str!("rpc.rs").split_whitespace().collect();
+    let mut used: Vec<&str> = rpc
+        .split("registry.")
+        .skip(1)
+        .map(|rest| {
+            rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or_default()
+        })
+        .collect();
+    used.sort_unstable();
+    used.dedup();
+    assert_eq!(
+        used,
+        ["ensure_protocol_dispatchable", "get", "is_current"],
+        "rpc reaches beyond connection lookup on the registry"
+    );
 }
 
 #[test]

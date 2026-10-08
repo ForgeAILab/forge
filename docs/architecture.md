@@ -4750,7 +4750,12 @@ read-only facts used by today's Task-step consumer. It accepts an explicit
 `EffectWorkspace` witness (owner, workspace, placement, generation and handle),
 Git paths/branches and candidate/target objects, command purpose/environment,
 and caller-supplied command/transport deadlines. Its functions receive no
-repository, database, event publisher or Task service. The witness is input
+repository, database, event publisher or Task service. Two inputs are wider
+than the effect needs and are narrow by contract only: `RpcExchange` holds the
+`DaemonConnectionRegistry` (which also carries the event bus and execution
+handlers) and may only look a connection up and ask whether it is current;
+`GitFacts` is implemented by `ResolvedWorkspace`, whose daemon path sends the
+owner inspection through the workspace client. The witness is input
 provenance; the current consumers still perform placement and review authority
 checks. It is not a new owner-side or queue-generation fence.
 
@@ -4770,7 +4775,7 @@ The split is phased to preserve the existing transaction and read order:
   materialization and unsupported-conflict abort behavior. `recover_rebase`
   checks for an interrupted rebase before ancestry;
   `finish_rebase_recovery` preserves the union and order of previously
-  committed marker paths. Their `GitFacts` port can only query Git. The hook
+  committed marker paths. Their `GitFacts` port exposes only a Git query. The hook
   consumer still reads/writes `rebase_target` and `rebase_outcome`, records
   Forge-established HEAD evidence, and applies comments, typed bridges and
   Task results. The existing owner HEAD probe produces `RebaseHeadFacts`;
@@ -4809,7 +4814,11 @@ The split is phased to preserve the existing transaction and read order:
 **Boundary rule.** Production files in `integration_effects/` must not import
 or reference database repositories, SQL, the event bus, Task services or the
 workflow engine. `effects_have_no_persistence_or_task_capability_imports`
-checks every production source in this module for those capabilities. This is
+checks every production source in this module for those capabilities: the
+forbidden paths, the identifiers of the repository, service, backend and hook
+types (so one cannot arrive through an allowed module), glob imports, and the
+registry methods `rpc.rs` calls. It reads source text, so it cannot see a
+capability reached through a handle the caller passes in. This is
 an enforced module/source boundary, not a new crate boundary: existing service
 error and transport types are retained. Direct server and real-daemon primitive
 tests compare digests of every SQLite table before/after and assert no event;

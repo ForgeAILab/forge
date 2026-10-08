@@ -580,6 +580,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Merge, rebase, CI and daemon RPC effects split from their persistence
+  (3.2 stage C, part 1).** Internal only: the Git, command and socket effects
+  of today's merge path move into `services::integration_effects`, which
+  writes no rows and publishes no events, and the existing Task-step code
+  records their results in the same order and transactions as before. No
+  behaviour, timeout, REST, MCP or daemon protocol change.
+
 - **Passive integration queues and shadow observations (3.2 stage B).** Two
   new tables, `integration_queue` (one per repository and target branch) and
   `integration_attempt` (a Task's membership, candidate and history), are
