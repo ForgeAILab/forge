@@ -2176,7 +2176,12 @@ impl Tool for ForgeScopeProposeTool {
                 .map_err(|error| RuntimeError::tool(error.to_string()))?;
         }
         if registered.is_some() {
+            // Preparation refuses everything the registered dispatch guard
+            // refuses, so a call never prepares and then fails at dispatch.
             reject_authority_overrides(&arguments)?;
+            if crate::contains_authority_override(&arguments) {
+                return Err(authority_override_refusal());
+            }
         }
         if operation == MAIN_CHARTER_DRAFT_OPERATION
             || operation == PROJECT_CHARTER_ADOPTION_OPERATION
@@ -2909,22 +2914,11 @@ fn required_string<'a>(arguments: &'a Value, field: &str) -> Result<&'a str, Run
         .ok_or_else(|| RuntimeError::tool(format!("{field} must be a string")))
 }
 
+/// Refuse a server-derived field name or a prompt-injection field name
+/// anywhere in the arguments. `project_id` is not in this guard: reads and
+/// hand-path proposals take a real `project_id` argument.
 fn reject_authority_overrides(arguments: &Value) -> Result<(), RuntimeError> {
-    const FORBIDDEN_FIELDS: &[&str] = &[
-        "actor_identity_id",
-        "identity_id",
-        "scope_type",
-        "scope_id",
-        "authority",
-        "permission",
-        "workspace",
-        "workspace_path",
-        "workspace_lease",
-        "repository_path",
-        "repository_url",
-        "credential",
-        "target_type",
-        "target_id",
+    const PROMPT_INJECTION_FIELDS: &[&str] = &[
         "instruction",
         "instructions",
         "system_prompt",
@@ -2933,25 +2927,26 @@ fn reject_authority_overrides(arguments: &Value) -> Result<(), RuntimeError> {
         "role",
     ];
 
-    fn contains_forbidden(value: &Value, forbidden_fields: &[&str]) -> bool {
+    fn contains_forbidden(value: &Value) -> bool {
         match value {
             Value::Object(object) => object.iter().any(|(key, nested)| {
-                forbidden_fields.contains(&key.as_str())
-                    || contains_forbidden(nested, forbidden_fields)
+                crate::operation_catalog::SERVER_DERIVED_FIELDS.contains(&key.as_str())
+                    || PROMPT_INJECTION_FIELDS.contains(&key.as_str())
+                    || contains_forbidden(nested)
             }),
-            Value::Array(values) => values
-                .iter()
-                .any(|value| contains_forbidden(value, forbidden_fields)),
+            Value::Array(values) => values.iter().any(contains_forbidden),
             _ => false,
         }
     }
 
-    if contains_forbidden(arguments, FORBIDDEN_FIELDS) {
-        return Err(RuntimeError::tool(
-            "Forge orchestration scope and authority are server-derived",
-        ));
+    if contains_forbidden(arguments) {
+        return Err(authority_override_refusal());
     }
     Ok(())
+}
+
+fn authority_override_refusal() -> RuntimeError {
+    RuntimeError::tool("Forge orchestration scope and authority are server-derived")
 }
 
 /// Whether the read path admits this operation's arguments envelope.
@@ -4468,7 +4463,11 @@ mod tests {
                 .any(|value| value == MAIN_PROJECT_CREATE_OPERATION)
         );
         let create_payload = orchestration_payload_schema(MAIN_PROJECT_CREATE_OPERATION);
-        assert_eq!(create_payload["required"], json!([]));
+        assert_eq!(create_payload["required"], json!(["approval_id"]));
+        assert_eq!(
+            create_payload["properties"]["approval_id"],
+            json!({"type":"string","minLength":1})
+        );
         assert!(create_payload["properties"].get("action").is_none());
         assert_ne!(create_payload["additionalProperties"], false);
     }
@@ -4794,7 +4793,7 @@ mod tests {
             result.is_err(),
             "authority-shaped prompt injection must be denied"
         );
-        let ignored_action = tool
+        let missing_approval = tool
             .prepare(
                 json!({
                     "operation": MAIN_PROJECT_CREATE_OPERATION,
@@ -4804,11 +4803,25 @@ mod tests {
                 }),
                 &context,
             )
-            .await;
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
-            ignored_action.is_ok(),
-            "The base enqueuer accepts ignored action and missing approval references; user execution still enforces approval_id"
+            missing_approval.contains("argument `approval_id` is required"),
+            "{missing_approval}"
         );
+        // The former `action` discriminator is ignored, whatever its value.
+        tool.prepare(
+            json!({
+                "operation": MAIN_PROJECT_CREATE_OPERATION,
+                "payload": {"action": "approve", "approval_id": "approval-1"},
+                "dedupe_key": "create-3",
+                "correlation_id": "create-correlation-3"
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
     }
 
     #[test]

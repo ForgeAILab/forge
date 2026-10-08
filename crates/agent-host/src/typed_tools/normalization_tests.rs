@@ -146,8 +146,11 @@ fn serialized_tool_definitions() {
 /// A surface may shrink freely. Raise a ceiling only deliberately, in the
 /// change that explains why the prefix has to grow.
 const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
-    // Main proposal contract lines replace duplicated hand summaries.
-    ("main", 8_559),
+    // 8,860 and 4,127 at 8bc736f5, less 46 and 38: the Main read lines state
+    // which fields are required instead of `optional {...}` for all of them.
+    // Main less 256 more: generated proposal contract lines replace the hand
+    // summaries of `genesis.project_agent.select` and `project.create`.
+    ("main", 8_558),
     ("inquiry", 4_089),
     // 24,048 and 25,297 at 172338b3, plus 56 each: the `skill.section`
     // argument line states the required enum instead of `optional {section}`.

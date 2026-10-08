@@ -828,11 +828,13 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         ),
         (
             MAIN_PROJECT_CREATE_OPERATION,
-            project_proposal_arguments(
-                MAIN_PROJECT_CREATE_OPERATION,
-                "create_from_approval",
-                "matrix-main-project",
-            ),
+            // A new Project-create call must name its Charter approval.
+            json!({
+                "operation": MAIN_PROJECT_CREATE_OPERATION,
+                "payload": {"action": "create_from_approval", "approval_id": "matrix-approval"},
+                "dedupe_key": "matrix-main-project",
+                "correlation_id": "correlation-matrix-main-project"
+            }),
         ),
     ];
     for (operation, arguments) in main_proposals {
@@ -2917,5 +2919,193 @@ async fn main_proposal_root_authority_fields_are_denied_before_payload_contracts
                 assert!(!outcome.safe_message.contains("expected "));
             }
         }
+    }
+}
+
+/// Selection through the provider: the former `action` is optional, an
+/// integer spelling of the session version reaches the command as the integer,
+/// both forms hit the one receipt, and a stale version is refused by the
+/// unchanged command service with no second receipt.
+#[tokio::test]
+async fn main_selection_dispatch_accepts_spellings_and_refuses_a_stale_version() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    let call = |version: Value, action: Option<&str>, key: &str| {
+        let mut payload = json!({
+            "genesis_session_id": MAIN_GENESIS_ID,
+            "expected_session_version": version,
+            "project_agent_identity_id": PROJECT_AGENT_CANDIDATE_ID
+        });
+        if let Some(action) = action {
+            payload["action"] = json!(action);
+        }
+        json!({"operation":MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,"payload":payload,"dedupe_key":key,"correlation_id":"spelling-correlation"})
+    };
+    let mut receipts = Vec::new();
+    for (version, action) in [
+        (json!(1), None),
+        (json!("1"), Some("select")),
+        (json!(1.0), Some("anything")),
+    ] {
+        let outcome = ForgeToolProvider::propose(
+            &f.provider,
+            AGENT_ID,
+            &f.main_scope,
+            "session",
+            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+            call(version, action, "spelling-key"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome["code"], "ok", "{outcome}");
+        receipts.push((
+            outcome["receipt_id"].clone(),
+            outcome["result"]["event_id"].clone(),
+        ));
+    }
+    assert!(receipts[0].0.is_string());
+    assert!(receipts.iter().all(|receipt| receipt == &receipts[0]));
+    // The session moved to version 2. A new key at version 1 is stale.
+    let stale = ForgeToolProvider::propose(
+        &f.provider,
+        AGENT_ID,
+        &f.main_scope,
+        "session",
+        MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+        call(json!("1"), None, "stale-key"),
+    )
+    .await
+    .unwrap_err();
+    let text = format!("{stale:?}");
+    assert!(
+        !text.contains("expected genesis.project_agent.select"),
+        "{text}"
+    );
+    for malformed in [json!("one"), json!(1.5), json!(true), json!(0)] {
+        let error = ForgeToolProvider::propose(
+            &f.provider,
+            AGENT_ID,
+            &f.main_scope,
+            "session",
+            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+            call(malformed, None, "malformed-key"),
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{error:?}");
+        assert!(text.contains("expected_session_version"), "{text}");
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_receipt WHERE operation = 'genesis.project_agent.select'",
+    )
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'product_genesis.project_agent_selected'").fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(count, 1);
+}
+
+/// A new Project-create call without a usable Charter approval reference is
+/// refused at preparation and at dispatch and queues nothing. A reference the
+/// caller invents still only queues a pending action: nothing executes.
+#[tokio::test]
+async fn main_create_requires_an_approval_reference_and_only_ever_queues() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    let composition = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        f.main_scope.clone(),
+        None,
+        None,
+        &broad_permissions(),
+        Some(Arc::new(f.provider.clone())),
+    )
+    .unwrap();
+    let tool = composition
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL)
+        .unwrap();
+    for payload in [
+        json!({}),
+        json!({"action":"create_from_approval"}),
+        json!({"approval_id":null}),
+        json!({"approval_id":""}),
+        json!({"approval_id":7}),
+    ] {
+        let arguments = json!({"operation":MAIN_PROJECT_CREATE_OPERATION,"payload":payload,"dedupe_key":"no-reference","correlation_id":"no-reference"});
+        let error = tool
+            .prepare(arguments.clone(), &preparation_context("no-reference"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("argument `approval_id`")
+                && error.ends_with("expected project.create: {approval_id}"),
+            "{error}"
+        );
+        let error = ForgeToolProvider::propose(
+            &f.provider,
+            AGENT_ID,
+            &f.main_scope,
+            "session",
+            MAIN_PROJECT_CREATE_OPERATION,
+            arguments,
+        )
+        .await
+        .unwrap_err();
+        let text = format!("{error:?}");
+        assert!(text.contains("approval_id"), "{text}");
+    }
+    let queued = |f: &Fixture| {
+        let pool = f.db.pool().clone();
+        async move {
+            sqlx::query_as::<_, (String, String)>(
+                "SELECT status, policy_result FROM agent_action WHERE operation = 'project.create'",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert!(queued(&f).await.is_empty());
+    // `project_id` is refused at preparation too, not only at dispatch.
+    let error = tool
+        .prepare(
+            json!({"operation":MAIN_PROJECT_CREATE_OPERATION,"payload":{"approval_id":"invented","project_id":"forged"},"dedupe_key":"forged","correlation_id":"forged"}),
+            &preparation_context("forged-project"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("server-derived"), "{error}");
+    let outcome = ForgeToolProvider::propose(
+        &f.provider,
+        AGENT_ID,
+        &f.main_scope,
+        "session",
+        MAIN_PROJECT_CREATE_OPERATION,
+        json!({"operation":MAIN_PROJECT_CREATE_OPERATION,"payload":{"approval_id":"invented"},"dedupe_key":"invented","correlation_id":"invented"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome["code"], "approval_required", "{outcome}");
+    assert_eq!(
+        queued(&f).await,
+        vec![(
+            "pending_approval".to_owned(),
+            "approval_required".to_owned()
+        )]
+    );
+    for query in [
+        "SELECT COUNT(*) FROM project_charter_approval",
+        "SELECT COUNT(*) FROM command_receipt WHERE operation = 'project.create'",
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{query}");
     }
 }

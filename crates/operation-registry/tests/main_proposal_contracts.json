@@ -27,8 +27,13 @@
   "project.create": {
     "type": "object",
     "properties": {
-      "approval_id": true
+      "approval_id": {
+        "type": "string",
+        "minLength": 1
+      }
     },
-    "required": []
+    "required": [
+      "approval_id"
+    ]
   }
 }

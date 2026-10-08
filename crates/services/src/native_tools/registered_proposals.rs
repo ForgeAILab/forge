@@ -73,8 +73,13 @@ impl CoordinationToolProvider {
             spec.normalize_arguments(&arguments["payload"])
                 .map_err(invalid_arguments)?
         };
-        // Preserve the existing serialized payload ceiling and domain guards.
-        validate_proposal_payload(operation, &payload)?;
+        // Preserve the existing serialized payload ceiling and its refusal: an
+        // oversized payload is a malformed call, not a policy denial.
+        validate_proposal_payload(operation, &payload).map_err(|_| {
+            AgentHostError::Unsupported(
+                "proposal payload does not match the typed operation schema".to_owned(),
+            )
+        })?;
         arguments["payload"] = payload.clone();
         let context = super::registered_reads::Context {
             provider: self,

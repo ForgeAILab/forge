@@ -14,8 +14,12 @@ pub struct ProjectAgentSelection {
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ProjectCreate {
-    // The proposal enqueuer accepts incomplete/malformed references. The
-    // unchanged user executor requires a nonblank string at domain execution.
+    // The id of the user's Charter approval. The agent is its only source: the
+    // user executor reads it from the stored action payload and refuses a
+    // missing, non-string or blank value, so a new call must carry it.
+    // Decoding stays lenient because an action prepared before this contract
+    // replays its exact stored arguments.
+    #[schemars(with = "String", length(min = 1))]
     pub approval_id: Option<Value>,
     // The executor ignores these fields, including the former action discriminator.
     // Preserve their bytes for dedupe and approval while advertising only approval_id.

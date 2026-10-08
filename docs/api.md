@@ -1109,22 +1109,25 @@ and expected contract. MCP contracts are unchanged.
 Main proposal payload guidance is generated for `genesis.project_agent.select`
 and `project.create`. Selection advertises
 `{expected_session_version, genesis_session_id?, project_agent_identity_id}`;
-Project-create advertises `{approval_id?}`. Both omit the former `action` field
+Project-create advertises `{approval_id}`. Both omit the former `action` field
 because the handler discards or ignores it; existing calls carrying it remain
 accepted. Selection strips that field before closed typed checking and accepts
-integer-valued strings/floats for the session version. Project-create continues
-accepting incomplete/malformed approval references and preserving ignored extra
-payload fields; its user executor still requires a nonblank `approval_id`.
+integer-valued strings/floats for the session version. `approval_id` is the id
+of the user's Charter approval. The agent is its only source, so a new
+Project-create call must carry it as a non-empty string; a call without it is
+refused instead of queueing an action that could never execute. Extra payload
+fields are still accepted and stored unchanged.
 Dedupe, correlation and
 causation remain in the common proposal envelope. Scope/current-authority denial
 and forged-authority-field rejection precede contract diagnostics. Stored
 preparations and already-approved action payloads are not checked against the
 new contract on continuation. Project-create remains approval-required and its
 domain execution remains user-only; a native proposal only queues its action.
-Direct provider dispatch also rejects authority/scope field names anywhere in
-ignored envelope data outside the payload, including `identity_id`, `authority`,
-`scope_id`, and `project_id`; the named native preparation already rejected
-these root fields. This is separate from the payload's accepted field set.
+For these two operations, direct provider dispatch also rejects authority/scope
+field names anywhere in the envelope outside the payload, including
+`identity_id`, `authority`, `scope_id`, and `project_id`; the named native
+preparation already rejected these root fields. Operations on the hand path are
+not affected. This is separate from the payload's accepted field set.
 Genesis start and Charter draft retain their hand contracts.
 
 Project Agent validation results use the typed `project.validation` operation.

@@ -128,22 +128,29 @@ contract lines from those specs, retaining the portable envelope
 `{operation, payload, dedupe_key, correlation_id, causation_id?, causation_depth?}`.
 The envelope owns provenance; the spec owns only the payload. Selection's line
 is `{expected_session_version, genesis_session_id?, project_agent_identity_id}`;
-Project-create's is `{approval_id?}`. The old `action` fields were discarded or
+Project-create's is `{approval_id}`. The old `action` fields were discarded or
 ignored by their handlers, so they are omitted from advertisement. Selection
 declaratively strips its ignored discriminator before checking/decoding and
 keeps its closed request; Project-create keeps an open payload because its
 executor ignores extra fields, preserving their exact bytes for action dedupe.
-The proposal enqueuer also accepts incomplete or malformed approval references;
-the unchanged user executor requires a nonblank `approval_id` at execution.
-No previously successful payload is refused. Selection uses the same integer
+`approval_id` names the user's Charter approval; the user executor reads it
+from the stored action payload, so the agent is its only source. A new call
+must carry it as a non-empty string: the base enqueuer queued a call without
+it, and the owner then approved an action that could never execute. Supplying
+an id grants nothing: execution still needs the owner's independent approval
+of the action, the user executor, and a Charter approval that belongs to the
+account and is not consumed. Selection uses the same integer
 coercion as reads and the same receipt-backed command service.
 
 Fresh proposals check current Main binding/policy first, then forged authority
 fields, then their payload contract, then the typed handler. The provider's
-preparation denial check also runs before payload diagnostics. Dispatch now
-checks the entire envelope for authority/scope replacements; direct provider
-calls previously ignored such root fields, while named preparation already
-rejected them. Payload acceptance is preserved. Exact prepared
+preparation denial check also runs before payload diagnostics. Dispatch of the two registered
+proposals checks the entire envelope for authority/scope replacements; direct
+provider calls previously ignored such root fields, while named preparation
+already rejected them. Hand-path operations do not run this envelope check.
+The guards share one name list (`operation_catalog::SERVER_DERIVED_FIELDS`):
+dispatch adds `project_id`, preparation adds its prompt-injection names, and
+preparation of a registered proposal runs both. Exact prepared
 invocations use `propose_prepared` and `dispatch_prepared`: they reauthorize and
 run existing domain checks, but never revalidate stored arguments against the
 current contract. Runtime prepared, approval-pending and recorded edited calls

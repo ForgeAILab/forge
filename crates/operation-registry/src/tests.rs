@@ -622,7 +622,7 @@ fn main_proposal_schemas_and_contract_lines_match_gate_fixtures() {
     assert_eq!(catalog.lookup("genesis.project_agent.select").unwrap().contract_line(), "genesis.project_agent.select: {expected_session_version, genesis_session_id?, project_agent_identity_id}");
     assert_eq!(
         catalog.lookup("project.create").unwrap().contract_line(),
-        "project.create: {approval_id?}"
+        "project.create: {approval_id}"
     );
 }
 fn proposal_input(id: &str) -> Value {
@@ -661,10 +661,6 @@ async fn main_proposal_contracts_check_every_field_and_dispatch_typed_inputs() {
             }
         }
         for (field, input) in invalids {
-            if spec.id == "project.create" && input.is_object() {
-                spec.normalize_arguments(&input).unwrap();
-                continue;
-            }
             let error = spec.normalize_arguments(&input).unwrap_err();
             assert!(
                 error.starts_with(spec.id)
@@ -695,22 +691,33 @@ async fn main_proposal_contracts_check_every_field_and_dispatch_typed_inputs() {
             1
         );
     }
+    let create = catalog.lookup("project.create").unwrap();
     let mut old = proposal_input("project.create");
     old["ignored"] = json!("historic");
-    assert!(catalog
-        .lookup("project.create")
-        .unwrap()
-        .validate_arguments(&old)
-        .is_ok());
+    assert!(create.validate_arguments(&old).is_ok());
     assert_eq!(
-        catalog
-            .lookup("project.create")
-            .unwrap()
-            .dispatch_prepared(&context, old)
-            .await
-            .unwrap()["handler"],
+        create.dispatch_prepared(&context, old).await.unwrap()["handler"],
         "project.create"
     );
+    // A blank reference is refused on a new call. An action prepared before
+    // this contract replays its stored arguments without the contract check,
+    // and the unchanged user executor still refuses it at execution.
+    for stored in [
+        json!({}),
+        json!({"approval_id":null}),
+        json!({"approval_id":""}),
+    ] {
+        let error = create.normalize_arguments(&stored).unwrap_err();
+        assert!(
+            error.starts_with("project.create: argument `approval_id`")
+                && error.ends_with("; expected project.create: {approval_id}"),
+            "{error}"
+        );
+        assert_eq!(
+            create.dispatch_prepared(&context, stored).await.unwrap()["handler"],
+            "project.create"
+        );
+    }
 }
 
 #[test]

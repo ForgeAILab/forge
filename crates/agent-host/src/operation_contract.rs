@@ -1334,18 +1334,34 @@ mod tests {
 
             assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
             if contract.operation == crate::MAIN_PROJECT_CREATE_OPERATION {
-                // The base enqueuer accepts arbitrary/incomplete payload objects;
-                // only the unchanged user executor validates the approval reference.
+                // The enqueuer keeps extra payload fields (the user executor
+                // ignores them), so this one contract is open. The Charter
+                // approval reference itself is required: the agent is its
+                // only source and the executor refuses an action without it.
                 assert!(schema.get("additionalProperties").is_none());
-                assert_eq!(schema["required"], json!([]));
-                assert_eq!(schema["properties"]["approval_id"], json!(true));
-                operation_registry::main_proposals::CATALOG
+                assert_eq!(schema["required"], json!(["approval_id"]));
+                assert_eq!(
+                    schema["properties"]["approval_id"],
+                    json!({"type":"string","minLength":1})
+                );
+                let spec = operation_registry::main_proposals::CATALOG
                     .lookup(contract.operation)
-                    .unwrap()
-                    .validate_arguments(
-                        &json!({"action":"ignored", "approval_id":null, "unknown":"preserved"}),
-                    )
                     .unwrap();
+                spec.validate_arguments(
+                    &json!({"action":"ignored", "approval_id":"approval", "unknown":"preserved"}),
+                )
+                .unwrap();
+                for refused in [
+                    json!({}),
+                    json!({"approval_id":null}),
+                    json!({"approval_id":""}),
+                ] {
+                    assert!(
+                        spec.validate_arguments(&refused)
+                            .unwrap_err()
+                            .contains("approval_id")
+                    );
+                }
             } else {
                 assert_eq!(
                     schema.get("additionalProperties").and_then(Value::as_bool),
