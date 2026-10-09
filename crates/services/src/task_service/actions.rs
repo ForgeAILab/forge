@@ -384,6 +384,41 @@ impl TaskService {
                                 .await?
                                 .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?
                         }
+                        TaskAction::SendBack { guidance }
+                            if offer.reason == "root_review_reopen" =>
+                        {
+                            // The root leaves review for its working state
+                            // with a fresh review budget, and held: unheld,
+                            // a root whose subtasks are all finished goes
+                            // straight back to the review that just failed.
+                            // The hold is the visible wait; its release runs
+                            // the corrective subtask and then the review.
+                            let reopened = TASK_ACTION_COMMAND
+                                .scope(
+                                    (),
+                                    Box::pin(async {
+                                        let cleared = self
+                                            .reset_root_review_budget_for_reopen(&task, guidance)
+                                            .await?;
+                                        self.apply_gate_decision(
+                                            &cleared,
+                                            &snapshot.workflow,
+                                            WorkflowTrigger::Reject,
+                                            Some(guidance.clone()),
+                                            actor.clone(),
+                                            false,
+                                        )
+                                        .await
+                                    }),
+                                )
+                                .await?;
+                            let fresh = self.task_action_snapshot(&reopened.id, &actor).await?;
+                            self.hold_waiting_task(
+                                &fresh,
+                                Some("sent back for corrective work: add a subtask, then release"),
+                            )
+                            .await?
+                        }
                         TaskAction::SendBack { guidance } => {
                             let task = TASK_ACTION_COMMAND
                                 .scope(
@@ -798,47 +833,37 @@ impl TaskService {
         reason: Option<&str>,
     ) -> Result<Task> {
         let task = &snapshot.task;
-        // The release is the owner's decision on the run the hold stopped:
-        // it may run again as soon as an Agent can take it. Left `Manual`,
-        // the stopped run kept the dispatcher away from a Task that showed
-        // no hold, no park and no run. The hold still parks the Task if the
-        // release below loses its version race.
-        for execution in snapshot.executions.iter().filter(|execution| {
-            execution.task_id == task.id
-                && execution.role != "interactive"
-                && matches!(
-                    execution.status,
-                    ExecutionStatus::Failed | ExecutionStatus::Cancelled
-                )
-                && matches!(
-                    execution.resume_policy,
-                    None | Some(db::ResumePolicy::Manual)
-                )
-        }) {
-            ExecutionRepo::update(
-                &*self.db,
-                db::UpdateExecution {
-                    id: execution.id.clone(),
-                    status: None,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: Some(Some(db::ResumePolicy::Auto)),
-                    stopped_at: None,
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    summary: None,
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json: None,
-                    updated_at: now_rfc3339(),
-                },
-            )
-            .await?;
+        // The release is the owner's decision on the run the hold stopped,
+        // and on no other: only the latest run of the Task, and only when
+        // the user stopped it (the hold's own stop). A run that failed or
+        // was stopped for any other reason keeps its `Manual` policy and
+        // its own recovery. Left `Manual`, the stopped run kept the
+        // dispatcher away from a Task that showed no hold, no park and no
+        // run. The flip is written before the release (whose version bump
+        // is what wakes the scheduler) and undone if the release loses its
+        // version race, so a hold that stays never sits over a run marked
+        // resumable.
+        let stopped_by_hold: Vec<String> = snapshot
+            .executions
+            .iter()
+            .filter(|execution| execution.task_id == task.id && execution.role != "interactive")
+            .max_by(|left, right| (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id)))
+            .filter(|execution| {
+                execution.status == ExecutionStatus::Cancelled
+                    && execution.stop_reason == Some(db::StopReason::UserCancelled)
+                    && matches!(
+                        execution.resume_policy,
+                        None | Some(db::ResumePolicy::Manual)
+                    )
+            })
+            .map(|execution| execution.id.clone())
+            .into_iter()
+            .collect();
+        for execution_id in &stopped_by_hold {
+            self.set_execution_resume_policy(execution_id, db::ResumePolicy::Auto)
+                .await?;
         }
-        let released = TaskRepo::update_recovery_metadata_if_no_running_execution(
+        let released = match TaskRepo::update_recovery_metadata_if_no_running_execution(
             &*self.db,
             &task.id,
             task.version,
@@ -851,7 +876,17 @@ impl TaskService {
             Vec::new(),
             Some(db::ConditionStatement::Release),
         )
-        .await?;
+        .await
+        {
+            Ok(released) => released,
+            Err(error) => {
+                for execution_id in &stopped_by_hold {
+                    self.set_execution_resume_policy(execution_id, db::ResumePolicy::Manual)
+                        .await?;
+                }
+                return Err(error.into());
+            }
+        };
         self.create_system_comment(
             &task.id,
             reason
@@ -860,6 +895,36 @@ impl TaskService {
         )
         .await?;
         Ok(released)
+    }
+
+    async fn set_execution_resume_policy(
+        &self,
+        execution_id: &str,
+        resume_policy: db::ResumePolicy,
+    ) -> Result<()> {
+        ExecutionRepo::update(
+            &*self.db,
+            db::UpdateExecution {
+                id: execution_id.to_owned(),
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: Some(Some(resume_policy)),
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     async fn retry_recorded_placement(

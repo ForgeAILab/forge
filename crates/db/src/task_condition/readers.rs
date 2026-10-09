@@ -511,6 +511,18 @@ pub(crate) fn owner_park(raw: &Value) -> Option<(ParkReason, TaskBlockingAnnotat
             park_diagnostic("agent_wait", &message),
         ));
     }
+    if let Some(v) = r.get("AgentCapacity") {
+        let agent_id = v["agent_id"].as_str()?;
+        let message = format!(
+            "This Task waits for a free run of its Agent {agent_id}, which is busy with other Tasks."
+        );
+        return Some((
+            ParkReason::Capacity {
+                scope: ConditionCapacityScope::Agent,
+            },
+            park_diagnostic("agent_capacity", &message),
+        ));
+    }
     let owner = r.get("UnknownCondition")?["owner"].as_str()?;
     if !matches!(owner, "plan publication cleanup" | "entry hooks") {
         return None;
@@ -544,7 +556,14 @@ pub(super) fn apply_owner_park(mut condition: TaskCondition, raw: Option<&Value>
     {
         return condition;
     }
-    if matches!(reason, ParkReason::Parent { .. } | ParkReason::Agent { .. }) {
+    if matches!(
+        reason,
+        ParkReason::Parent { .. }
+            | ParkReason::Agent { .. }
+            | ParkReason::Capacity {
+                scope: ConditionCapacityScope::Agent
+            }
+    ) {
         // A wait, not a failure: the Task shows what it waits for and
         // nothing about it needs repair. Its exit is on the parent or on
         // the Agent the reason names.
@@ -552,6 +571,7 @@ pub(super) fn apply_owner_park(mut condition: TaskCondition, raw: Option<&Value>
             ParkReason::Parent { cause, .. } if cause != "held" => {
                 api_types::ConditionOwner::ProjectAgent
             }
+            ParkReason::Capacity { .. } => api_types::ConditionOwner::Scheduler,
             _ => api_types::ConditionOwner::User,
         };
         return match condition {

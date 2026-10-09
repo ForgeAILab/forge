@@ -739,6 +739,24 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Override Failed Review",
             );
         }
+        // A parent Task whose aggregate review cannot pass needs corrective
+        // work, and a parent in review accepts no new subtask. Sending it
+        // back reopens it, held, so a corrective subtask can be added; its
+        // release runs that subtask and the aggregate review after it.
+        if task.status == "review"
+            && snapshot.coordination_root
+            && target(WorkflowTrigger::Reject).is_some()
+        {
+            offer(
+                TaskAction::SendBack {
+                    guidance: String::new(),
+                },
+                &["guidance"],
+                &[Owner],
+                "root_review_reopen",
+                "Reopen for a Corrective Subtask",
+            );
+        }
         if !(task.status == "review"
             && state
                 .gate_config

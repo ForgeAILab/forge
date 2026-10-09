@@ -1511,6 +1511,40 @@ impl TaskService {
         Ok(updated)
     }
 
+    /// Clear a coordination root's exhausted review budget without running
+    /// anything: the first half of sending the root back for a corrective
+    /// subtask. The marker is the new counting boundary, so the aggregate
+    /// review that follows the corrective work starts a fresh budget.
+    pub(crate) async fn reset_root_review_budget_for_reopen(
+        &self,
+        task: &Task,
+        reason: &str,
+    ) -> Result<Task> {
+        let (gate_state, _budget, _count) = self.current_gate_retry_budget(task).await?;
+        let mut transition_log = recovery_marker(
+            &task.id,
+            &gate_state,
+            "retry",
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::retry()),
+            )),
+            reason,
+        );
+        transition_log.bridge = api_types::TransitionBridge::recovery("retry", true);
+        transition_log.hook_results_json = Some(
+            serde_json::to_string(&vec![api_types::HookResultEntry {
+                action: "retry".to_owned(),
+                phase: "action".to_owned(),
+                outcome: "reset_budget".to_owned(),
+                duration_ms: None,
+                error: None,
+            }])
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+        );
+        self.clear_retry_exhausted_blocking_metadata_with_marker(task, transition_log)
+            .await
+    }
+
     pub(crate) async fn permit_one_task_retry(
         &self,
         task: Task,

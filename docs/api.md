@@ -3076,7 +3076,27 @@ can take work again (resume the Agent, reconnect its machine, or assign the
 role to another Agent). The reason `dependencies` carries `cancelled` and
 `dependency_ids` (at most 16): the cancelled prerequisites of a
 `dependency_cancelled` blocker, or the unfinished ones an accepted action
-waits behind.
+waits behind. The reason `capacity` with `scope: "agent"` is shown by a Task
+that already started (it is past its initial state), has no run, and whose
+Agent is at its run limit, for example a Task sent back by review while the
+coder runs other Tasks. It is the same kind of wait and clears when one of the
+Agent's runs ends; a Task still waiting for its first run shows no reason.
+
+A parent Task (one with subtasks) parked in `review` on an exhausted review
+budget offers three exits besides `cancel`: `retry` (reset the budget and
+re-run the aggregate review in place), `approve` with `override_checks: true`
+(the owner passes the failed review; see below) and `send_back` (offer reason
+`root_review_reopen`, `guidance` required). `send_back` returns the parent to
+its working state with a fresh review budget and places a hold on it; in that
+state it accepts new subtasks again (no `SUBTASK_PARENT_CLOSED`). A subtask
+added now waits on `parent` / `held`; `release` on the parent runs it, and the
+aggregate review follows when every subtask is finished.
+
+An owner's manual pass of a failed review (`approve` with
+`override_checks: true`, or the `review_needs_owner` deferral) is the review
+authority for integration: the Task merges on it. Previously integration
+answered "fresh conformance review required" whenever a reviewer Agent was
+assigned and sent the Task back, for a parent Task and for any other Task.
 
 A stored condition this build cannot decode projects a `parked` condition whose
 primary reason is `unknown_condition` with `source.field = condition_json`. Its

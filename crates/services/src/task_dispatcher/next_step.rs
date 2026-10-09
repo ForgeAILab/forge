@@ -70,6 +70,12 @@ pub enum Reason {
         status: String,
     },
     Capacity,
+    /// A started Task whose Agent is at its run limit. Visible: the stored
+    /// condition is the `capacity` reason with the `agent` scope. A Task
+    /// still waiting for its first slot keeps the unstored `Capacity`.
+    AgentCapacity {
+        agent_id: String,
+    },
     ExecutionStopped,
     ReviewChecks,
     WorkflowInvalid {
@@ -127,7 +133,8 @@ pub struct Facts {
     pub queue_owned: bool,
     pub in_flight: bool,
     pub agent_unavailable: bool,
-    /// The unavailable Agent and its effective status.
+    /// The Agent that cannot take the Task now (unavailable, or at its run
+    /// limit) and its effective status.
     pub agent_wait: Option<(String, String)>,
     /// An accepted action waits behind an unfinished dependency.
     pub dependency_wait: bool,
@@ -439,6 +446,17 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         );
     }
     if f.agent_full {
+        // A Task that already started and has no run must show why: its
+        // Agent is busy with other Tasks. It is dispatched when a run ends.
+        if let (Some((agent_id, _)), false) = (&f.agent_wait, kind == Some(StateKind::Initial)) {
+            return park(
+                Reason::AgentCapacity {
+                    agent_id: agent_id.clone(),
+                },
+                Owner::Scheduler,
+                Action::FreeCapacity,
+            );
+        }
         return park(Reason::Capacity, Owner::Scheduler, Action::FreeCapacity);
     }
     match kind {

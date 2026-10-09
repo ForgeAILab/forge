@@ -1009,3 +1009,248 @@ async fn remove_machine_fails_the_live_run_and_retries_the_task_on_another_machi
     assert_ne!(running[0].id, lost.id);
     assert_eq!(running[0].workspace_id.as_deref(), Some("live-workspace"));
 }
+
+async fn seed_stopped_run(
+    fixture: &Fixture,
+    status: ExecutionStatus,
+    stop_reason: db::StopReason,
+    created_at: &str,
+) -> Execution {
+    ExecutionRepo::create(
+        &*fixture.db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: fixture.task.id.clone(),
+            agent_id: None,
+            role: "coder".to_owned(),
+            status,
+            stop_reason: Some(stop_reason),
+            stopped_by: Some("test".to_owned()),
+            resume_policy: Some(db::ResumePolicy::Manual),
+            stopped_at: Some(created_at.to_owned()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+            ),
+            workspace_id: None,
+            created_at: created_at.to_owned(),
+            updated_at: created_at.to_owned(),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn resume_policy_of(fixture: &Fixture, execution: &Execution) -> Option<db::ResumePolicy> {
+    ExecutionRepo::get_by_id(&*fixture.db, &execution.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .resume_policy
+}
+
+/// Releasing a hold while no Agent can take the Task decides the run the
+/// hold stopped, and only that run: the latest run of the Task, stopped by
+/// the user. A run that failed, or an older run, keeps its `Manual` policy,
+/// so a release never makes a failure resume by itself.
+#[tokio::test]
+async fn release_under_a_paused_agent_resumes_only_the_run_the_hold_stopped() {
+    for (latest_status, latest_stop, resumes) in [
+        (
+            ExecutionStatus::Cancelled,
+            db::StopReason::UserCancelled,
+            true,
+        ),
+        (
+            ExecutionStatus::Failed,
+            db::StopReason::ExecutorFailed,
+            false,
+        ),
+        (
+            ExecutionStatus::Failed,
+            db::StopReason::DaemonDisconnected,
+            false,
+        ),
+        (
+            ExecutionStatus::Cancelled,
+            db::StopReason::ExecutorCancelled,
+            false,
+        ),
+    ] {
+        let fixture = fixture().await;
+        sqlx::query("UPDATE agent_identity SET paused = 1")
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        let owner = Actor::user(UserActionSource::Test);
+        let older = seed_stopped_run(
+            &fixture,
+            ExecutionStatus::Cancelled,
+            db::StopReason::UserCancelled,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        let latest = seed_stopped_run(
+            &fixture,
+            latest_status,
+            latest_stop.clone(),
+            "2026-01-02T00:00:00Z",
+        )
+        .await;
+        for action in [
+            TaskAction::Hold { reason: None },
+            TaskAction::Release { reason: None },
+        ] {
+            let current = reload(&fixture).await;
+            fixture
+                .service
+                .perform_task_action_as(&fixture.task.id, action, current.version, owner.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{latest_stop:?}: {error}"));
+        }
+        assert_eq!(
+            resume_policy_of(&fixture, &latest).await,
+            Some(if resumes {
+                db::ResumePolicy::Auto
+            } else {
+                db::ResumePolicy::Manual
+            }),
+            "{latest_stop:?}"
+        );
+        assert_eq!(
+            resume_policy_of(&fixture, &older).await,
+            Some(db::ResumePolicy::Manual),
+            "{latest_stop:?}: an older run is not the one the hold stopped"
+        );
+    }
+}
+
+/// Cancel against a settling plan publication, really concurrent. Both go
+/// through the Task's single writer: exactly one wins. Whichever does, the
+/// Task is left with no publication claim, and a cancel that won leaves the
+/// Task cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_and_a_settling_plan_publication_have_exactly_one_winner() {
+    let mut cancel_wins = 0;
+    for _ in 0..6 {
+        let fixture = fixture().await;
+        let owner = Actor::user(UserActionSource::Test);
+        let run = seed_execution(
+            &fixture.db,
+            &fixture.task.id,
+            None,
+            "coder",
+            ExecutionStatus::Completed,
+            None,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
+            .bind(&fixture.project)
+            .fetch_one(fixture.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+            .bind(
+                json!({"plan_publication_claim": {
+                    "execution_id": run.id,
+                    "state": "in_progress",
+                    "state_entry_token": null,
+                    "project_version": project_version,
+                }})
+                .to_string(),
+            )
+            .bind(&fixture.task.id)
+            .execute(fixture.db.pool())
+            .await
+            .unwrap();
+        let current = reload(&fixture).await;
+        let (cancelled, settled) = tokio::join!(
+            fixture.service.cancel_task_at_version_as(
+                &fixture.task.id,
+                current.version,
+                "cancel during publication".to_owned(),
+                owner.clone(),
+            ),
+            fixture.service.transition_with_plan_publication(
+                &fixture.task.id,
+                "review".to_owned(),
+                current.version,
+                &run.id,
+            ),
+        );
+        assert_ne!(
+            cancelled.is_ok(),
+            settled.is_ok(),
+            "exactly one wins: cancel {:?}, settle {:?}",
+            cancelled.as_ref().map(|task| task.status.clone()),
+            settled.as_ref().map(|result| result.task.status.clone()),
+        );
+        let after = reload(&fixture).await;
+        if cancelled.is_ok() {
+            cancel_wins += 1;
+            assert_eq!(after.status, "cancelled");
+            assert!(
+                !after
+                    .metadata_json
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("plan_publication_claim"),
+                "an abandoned publication leaves no claim: {:?}",
+                after.metadata_json
+            );
+        } else {
+            assert_eq!(after.status, "review");
+        }
+        // The owner's exit still works after a settle that won.
+        if after.status != "cancelled" {
+            let after = fixture
+                .service
+                .cancel_task_as(&fixture.task.id, owner.clone())
+                .await
+                .expect("cancel after the settle");
+            assert_eq!(after.status, "cancelled");
+        }
+    }
+    assert!(cancel_wins > 0, "cancel never won against the settle");
+}
+
+/// A claim whose transition already committed names another state. It
+/// authorizes nothing, and it must not refuse the owner's cancel.
+#[tokio::test]
+async fn cancel_is_not_refused_by_a_stale_plan_publication_claim() {
+    let fixture = fixture().await;
+    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+        .bind(
+            json!({"plan_publication_claim": {
+                "execution_id": "gone",
+                "state": "planning",
+                "state_entry_token": null,
+                "project_version": 1,
+            }})
+            .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let cancelled = fixture
+        .service
+        .cancel_task_as(&fixture.task.id, Actor::user(UserActionSource::Test))
+        .await
+        .expect("cancel is the owner's exit");
+    assert_eq!(cancelled.status, "cancelled");
+    assert!(!cancelled
+        .metadata_json
+        .as_deref()
+        .unwrap_or_default()
+        .contains("plan_publication_claim"));
+}

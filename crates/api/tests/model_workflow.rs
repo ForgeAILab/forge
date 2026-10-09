@@ -1477,6 +1477,7 @@ impl World {
         self.trace.push(format!("pauses lifted: {last}"));
         let mut unchanged = 0;
         let mut attempts: HashMap<usize, usize> = HashMap::new();
+        let mut reopened: std::collections::HashSet<usize> = Default::default();
         for round in 0..SETTLE_ROUNDS {
             let mut open = 0;
             let mut moves = 0;
@@ -1543,17 +1544,37 @@ impl World {
                 // was accepted and changed nothing, the next round takes the
                 // next one: a park is a wedge only when none of them helps.
                 let (version, offers) = self.offers(index).await?;
-                let forward: Vec<&Value> = ["release", "retry", "send_back", "restart", "approve"]
+                // Reopening a parent for corrective work is taken once per
+                // parent: it changes state every time (the parent leaves
+                // review, held, and comes back), so the rotation below would
+                // never get past it to the owner's override.
+                let forward: Vec<Value> = ["release", "retry", "send_back", "restart", "approve"]
                     .iter()
                     .filter_map(|verb| offers.iter().find(|offer| offer["action"]["verb"] == *verb))
+                    .filter(|offer| {
+                        offer["reason"] != "root_review_reopen" || !reopened.contains(&index)
+                    })
+                    .cloned()
                     .collect();
                 if !forward.is_empty() {
                     let turn = attempts.entry(index).or_insert(0);
-                    let offer = forward[*turn % forward.len()];
+                    let offer = &forward[*turn % forward.len()];
                     *turn += 1;
                     let verb = self.apply_offer(index, version, offer).await?;
                     taken.push(format!("{verb}({index})"));
                     moves += 1;
+                    if offer["reason"] == "root_review_reopen" {
+                        // What the reopening is for: the parent must now
+                        // accept a corrective subtask.
+                        reopened.insert(index);
+                        let created = self.create(Some(index)).await?;
+                        if created.starts_with("refused") {
+                            return Err(format!(
+                                "(b) task {index} was sent back for corrective work and refuses a subtask: {created}"
+                            ));
+                        }
+                        taken.push(format!("corrective child of {index}"));
+                    }
                 }
             }
             if open == 0 {
@@ -2203,18 +2224,18 @@ async fn a_task_released_after_a_crash_under_a_paused_agent_runs_again() {
     .await;
 }
 
-/// OPEN, UNTRIAGED: reached by `FORGE_MODEL_LONG=1 FORGE_MODEL_SEED=951857209`
-/// on the build that typed the parent, Agent and dependency waits; minimized
-/// below. Not established whether it predates that build. Task 3's review is
-/// rejected (scripted) while other Tasks hold the coder's runs; it goes back
-/// to `in_progress` and stays there with a `clear` condition, no run, no
-/// deferral and no park, offering `cancel`, `retry` and `approve`. A started
-/// Task waiting for a busy Agent is the suspected cause: the dispatcher's
-/// capacity park (`Reason::Capacity`, `task_dispatcher/next_step.rs`,
-/// `agent_full`) is a scheduling decision nothing stores, like the parent
-/// and Agent waits were.
+/// Reached by `FORGE_MODEL_LONG=1 FORGE_MODEL_SEED=951857209` and fixed;
+/// minimized below. Task 3's review is rejected (scripted) while other Tasks
+/// hold the coder's runs; it goes back to `in_progress` and stayed there with
+/// a `clear` condition, no run, no deferral and no park. It was waiting for a
+/// free run of its busy Agent: the dispatcher's capacity park
+/// (`Reason::Capacity`, `task_dispatcher/next_step.rs`, `agent_full`) was a
+/// scheduling decision nothing stored. For a Task that already started it is
+/// now the visible schedule park `AgentCapacity`: the Task is `parked` on the
+/// typed reason `capacity` with scope `agent`, and runs when a run ends. The
+/// capacity park is code the parent, Agent and dependency waits did not
+/// touch, so the stall predates them (read, not re-run on the older build).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open stall, untriaged: a Task sent back by review while its Agent is busy is idle with a clear condition"]
 async fn a_task_sent_back_by_review_under_a_busy_agent_shows_why_it_waits() {
     use Action::{Create, Finish, Offer, Verdict};
     run_cases(vec![(
@@ -2255,34 +2276,28 @@ async fn a_subtask_of_a_settled_parent_is_scheduled_or_refused() {
     .await;
 }
 
-/// PARTLY FIXED, STILL OPEN. Found by a random run with `CreateChild`
-/// generated; minimized below. A coordination root whose aggregate review
-/// check fails ends in `review` parked on `review retry budget exhausted`.
+/// Found by a random run with `CreateChild` generated and fixed; minimized
+/// below. A coordination root whose aggregate review check fails ends in
+/// `review` parked on `review retry budget exhausted`. It used to have no
+/// exit but `cancel`:
 ///
-/// Fixed: the offered `retry` used to move the root to `in_progress` and park
-/// it on "coordination root <id> is not in its aggregate review state"
-/// (`services/src/task_service/execution/guards.rs`), and `restart` put it
-/// back, for ever. `retry` on a root is now review-only: it resets the budget
-/// and re-runs the aggregate review in place
-/// (`reset_task_retry_budget`, `services/src/task_service/execution/recovery.rs`),
-/// and no role is queued for a root in a working state
-/// (`queue_deferred_action_role`, `services/src/task_service/actions.rs`).
-///
-/// Open: when the aggregate check can never pass (here the finished subtask
-/// did not write the root's deliverable) the root has no exit but `cancel`.
-/// The offered owner `approve` (override) is accepted, moves the root to
-/// `merging`, and integration sends it back: "conformance review required:
-/// fresh conformance review required before integration"
-/// (`db/src/review_conformance.rs`, `verified_passed_contract`, reached from
-/// `services/src/workflow/actions/merge.rs`). An owner override of a failed
-/// review is not review authority for integration while a reviewer Agent is
-/// assigned, and a corrective subtask cannot be added to a root in `review`
-/// (`SUBTASK_PARENT_CLOSED`) while `send_back` is not offered on an exhausted
-/// budget. Deciding which of those is the owner's exit (override counts as
-/// authority, or `send_back` reopens the root for a corrective subtask) is a
-/// product decision in integration-owned code.
+/// - `retry` moved the root to `in_progress`, parked it on "coordination root
+///   <id> is not in its aggregate review state"
+///   (`services/src/task_service/execution/guards.rs`), and `restart` put it
+///   back, for ever. `retry` on a root is now review-only: it resets the
+///   budget and re-runs the aggregate review in place
+///   (`reset_task_retry_budget`, `services/src/task_service/execution/recovery.rs`).
+/// - The owner's `approve` (override) moved the root to `merging`, where
+///   integration sent it back: "fresh conformance review required before
+///   integration". A manual pass was not review authority while a reviewer
+///   Agent was assigned, for a root or for any other Task. It now is
+///   (`lock_review_integration`, `db/src/review_conformance.rs`).
+/// - A corrective subtask could not be added (`SUBTASK_PARENT_CLOSED` in
+///   `review`) and `send_back` was not offered on an exhausted budget. It is
+///   now (`root_review_reopen`, `services/src/task_actions.rs`): the root
+///   goes back to its working state with a fresh budget, held, and accepts
+///   the subtask; its release runs the subtask and the review after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open: a root whose aggregate check cannot pass has no exit; the owner's override is bounced by the integration conformance gate"]
 async fn a_coordination_root_that_fails_aggregate_review_can_recover() {
     use Action::{Create, CreateChild, Finish};
     run_cases(vec![(
