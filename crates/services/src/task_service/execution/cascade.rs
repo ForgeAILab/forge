@@ -1162,9 +1162,6 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
-            return Ok(());
-        }
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
@@ -1307,6 +1304,12 @@ impl TaskService {
         Ok(())
     }
 
+    /// A failed run is retried or blocks its Task under the Project as it is
+    /// now, whichever Project revision dispatched the run. The revision
+    /// fence belongs to completions, which advance the workflow; a failure
+    /// advances nothing, its retry is a new run admitted under current
+    /// authority, and dropping it here left the Task active with no run, no
+    /// retry and no park after any Project edit, pause or resume.
     async fn annotate_executor_failure_block_with_retry(
         &self,
         execution: &Execution,
@@ -1318,9 +1321,6 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
-            return Ok(());
-        }
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
@@ -1375,9 +1375,6 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(());
         };
-        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
-            return Ok(());
-        }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ExecutorFailed,
             blocking_reason: "executor_failed".to_owned(),
@@ -1474,11 +1471,6 @@ impl TaskService {
             // Interactive runs are user-prompted and do not have a durable dispatcher target yet.
             return Ok(ExecutionRetryDisposition::NotScheduled(
                 "automatic retry is unavailable for interactive executions",
-            ));
-        }
-        if super::super::execution_dispatch_project_version(execution) != Some(project_version) {
-            return Ok(ExecutionRetryDisposition::NotScheduled(
-                "automatic retry was skipped because the project version changed",
             ));
         }
 

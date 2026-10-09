@@ -1387,19 +1387,7 @@ pub async fn load_snapshot(
     let dependencies_satisfied = TaskDependencyRepo::unsatisfied_dependencies(db, &task.id)
         .await?
         .is_empty();
-    let selected_role = role.or_else(|| {
-        workflow
-            .outgoing_trigger_targets(&task.status)
-            .filter_map(|(_, target)| {
-                workflow
-                    .states
-                    .iter()
-                    .find(|state| state.name == target)
-                    .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
-                    .and_then(crate::workflow::effective_role)
-            })
-            .next()
-    });
+    let selected_role = crate::workflow::action_role(&workflow, &task.status);
     let action_agent_id = select_action_agent(db, &task, selected_role, connections).await?;
     let has_agent = action_agent_id.is_some();
     let project = db::ProjectRepo::get_by_id(db, &task.project_id).await?;

@@ -5206,7 +5206,7 @@ Known limits before activation:
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
 
-The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Each offer carries meaningful parameters, allowed boolean values, authority, reason, label, cancellation propagation, and a pinned resumable execution. Required operator reasons and send-back guidance are supplied by the caller and retained in review records, comments, follow-up Tasks and transition logs. Commands check the version and select a current offer. A missing offer produces one `action_unavailable` error with current offers. Gate overrides remain owner-only.
+The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Each offer carries meaningful parameters, allowed boolean values, authority, reason, label, cancellation propagation, and a pinned resumable execution. Required operator reasons and send-back guidance are supplied by the caller and retained in review records, comments, follow-up Tasks and transition logs. Commands check the version and select a current offer. A missing offer produces one `action_unavailable` error with current offers. Gate overrides remain owner-only. A role-launching offer (`start`, role `retry`, `release`) is made for one role, resolved in one place (`workflow::action_role`): the role of the Task's state, else the role of the state a claim would enter (the first outgoing Active state, else the first Gate). The Agent the offer needs, the role stored with the queued action, its replay and the claim all use that role, so `start` on a `todo` Task runs its coder, waits for capacity when the coder is busy, and is not offered while that Agent is paused or offline.
 
 Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Legacy annotation, blocked, failed and entry-barrier columns remain private dual-write storage until stage five.
 
@@ -5711,10 +5711,14 @@ cascade was interrupted even if sibling merges subsequently moved the target.
 Terminal execution settlement uses its existing durable claims and CAS authority;
 its post-commit hook effects are serialized and resumed by the per-Task queue.
 Workflow hook dispatch uses the originating TaskService's provider/outbox dependencies.
-Recovery treats a terminal workflow-role result
+Recovery treats a completed workflow-role result
 whose immutable Project revision is missing or superseded as unsettled and
 dispatches a replacement under current authority; it never converts the
-cascade's intentional no-op into a reconciliation receipt.
+cascade's intentional no-op into a reconciliation receipt. A failed coder or
+planner run is not fenced this way: a failure advances nothing, so it is
+retried (or blocks the Task) under the current Project revision whichever
+revision dispatched it. A Project edit, pause or resume therefore never
+leaves an active Task with no run, no pending retry and no park.
 
 **Dispatch failure entering an active state:** when a dispatch hook
 (`dispatch_role_agent` / `dispatch_fix_agent` / `dispatch_executor`) fails
@@ -6396,7 +6400,10 @@ candidate route instead of a single adapter:
   retry, and duplicate terminal delivery does not consume another. Exhaustion
   blocks with explicit recovery actions. A zero execution retry budget blocks
   with a disabled-retries message; an exhausted budget is identified separately.
-  Stale project versions cannot settle the Task or schedule retries.
+  A completion from a stale Project version cannot settle the Task. A
+  failure is retried or blocks under the current Project version, so a run
+  that fails after a Project edit, pause or resume still spends the budget
+  and backs off.
   Workflow health shows `Retry Scheduled`
   or `Retry Queued` with the capacity/usage-limit reason while waiting;
   permanent unavailability (auth/install failure everywhere) blocks the task

@@ -18,8 +18,12 @@
 //! ("quiescence"), and every coder execution waits on a gate that only a model
 //! action opens.
 //!
-//! Reproduce one case with `FORGE_MODEL_SEED=<n>` (a comma list runs several); run more and longer cases
-//! with `FORGE_MODEL_LONG=1` (`FORGE_MODEL_CASES`, `FORGE_MODEL_STEPS` tune it).
+//! The default run is deterministic: the fixed seeds and the corpus below,
+//! nothing drawn from the clock, so it cannot turn an unrelated change red.
+//! Random seeds are drawn only when `FORGE_MODEL_CASES=<n>` (n > 0) asks for
+//! them; every seed is printed. Reproduce one case with
+//! `FORGE_MODEL_SEED=<n>` (a comma list runs several). `FORGE_MODEL_LONG=1`
+//! runs longer sequences (`FORGE_MODEL_STEPS` sets the length).
 #![allow(dead_code)]
 mod common;
 
@@ -107,6 +111,8 @@ enum Action {
     Take(usize, &'static str),
     PauseProject,
     ResumeProject,
+    /// Save the Project unchanged: any edit moves its version.
+    EditProject,
     /// Pause and resume the coder Agent.
     PauseAgent,
     ResumeAgent,
@@ -158,6 +164,7 @@ fn generate(seed: u64, steps: usize) -> Vec<Step> {
             // `CreateChild` is not generated yet: a long run with it enabled
             // reaches the open subtask findings pinned by the ignored tests
             // at the end of this file within a few dozen seeds.
+            14 => Action::EditProject,
             18..=22 => Action::Depend(task, rng.below(tasks) as usize),
             23..=26 => Action::Claim(task),
             0..=57 => Action::Finish(
@@ -407,12 +414,9 @@ struct World {
     agent_paused: bool,
     /// Random runs step around the open findings pinned by the ignored
     /// tests at the end of this file, so they keep finding other things:
-    /// they do not fail a run that was in flight across a Project pause or
-    /// resume.
+    /// both former guards (cancelled dependencies, Project pause) are
+    /// fixed and removed; the flag stays for the next one.
     avoid_open_findings: bool,
-    /// Executions that were running when the Project was last paused or
-    /// resumed (see `a_run_that_fails_after_a_project_pause_is_retried`).
-    stale_runs: Vec<String>,
     tasks: Vec<String>,
     /// Model index -> the terminal state the Task was first seen in.
     settled: BTreeMap<usize, String>,
@@ -420,6 +424,7 @@ struct World {
 }
 
 const QUIESCENCE_BOUND: usize = 400;
+const QUIESCENCE_FLOOR: Duration = Duration::from_millis(60);
 const SETTLE_ROUNDS: usize = 20;
 const INITIAL: [&str; 2] = ["backlog", "todo"];
 const TERMINAL: [&str; 2] = ["done", "cancelled"];
@@ -547,7 +552,6 @@ impl World {
             project_paused: false,
             agent_paused: false,
             avoid_open_findings: false,
-            stale_runs: Vec::new(),
             tasks: Vec::new(),
             settled: BTreeMap::new(),
             trace: Vec::new(),
@@ -905,20 +909,6 @@ impl World {
                 else {
                     return Ok("skipped".to_owned());
                 };
-                let stale = self
-                    .live()
-                    .script
-                    .waiting
-                    .lock()
-                    .unwrap()
-                    .get(&self.tasks[task])
-                    .is_some_and(|(execution, _)| self.stale_runs.contains(execution));
-                if self.avoid_open_findings
-                    && stale
-                    && matches!(outcome, Outcome::Fail | Outcome::UsageLimit)
-                {
-                    return Ok("skipped".to_owned());
-                }
                 let gate = self
                     .live()
                     .script
@@ -979,17 +969,26 @@ impl World {
                     return Err(format!("(b) project {verb} was refused: {status} {body}"));
                 }
                 self.project_paused = pause;
-                let running: Vec<String> = self
-                    .live()
-                    .script
-                    .waiting
-                    .lock()
-                    .unwrap()
-                    .values()
-                    .map(|(execution, _)| execution.clone())
-                    .collect();
-                self.stale_runs.extend(running);
                 Ok(verb.to_owned())
+            }
+            Action::EditProject => {
+                let uri = format!("/api/v1/projects/{}", self.project_id);
+                let (_, project) = self.request(Method::GET, &uri, None).await?;
+                let version = project["version"].as_i64().unwrap_or_default();
+                let body = json!({ "version": version, "name": project["name"] });
+                let (status, saved) = self.request(Method::PATCH, &uri, Some(body)).await?;
+                if !status.is_success() {
+                    return Err(format!(
+                        "(b) saving the Project was refused: {status} {saved}"
+                    ));
+                }
+                if saved["version"].as_i64().unwrap_or_default() <= version {
+                    return Err(format!(
+                        "the model expects a Project edit to move its version: {version} -> {}",
+                        saved["version"]
+                    ));
+                }
+                Ok("saved".to_owned())
             }
             Action::PauseAgent | Action::ResumeAgent => {
                 let pause = *action == Action::PauseAgent;
@@ -1078,6 +1077,7 @@ impl World {
         let mut stable = 0;
         let mut unowned = Vec::new();
         let mut history = Vec::new();
+        let mut changed = std::time::Instant::now();
         for round in 0..QUIESCENCE_BOUND {
             self.move_deadlines(false).await?;
             for (index, id) in self.tasks.iter().enumerate() {
@@ -1105,11 +1105,17 @@ impl World {
             unowned = running;
             if print == last {
                 stable += 1;
-                if stable >= 3 && unowned.is_empty() {
+                // Work a finished run leaves to its spawned task (recording
+                // the failure, scheduling the retry) has no row to watch
+                // while it is pending, so "unchanged" also has to last: three
+                // rounds pass in microseconds of scheduler time on a loaded
+                // runner.
+                if stable >= 3 && unowned.is_empty() && changed.elapsed() >= QUIESCENCE_FLOOR {
                     return Ok(());
                 }
             } else {
                 stable = 0;
+                changed = std::time::Instant::now();
                 history.push(print.clone());
                 last = print;
             }
@@ -1270,7 +1276,11 @@ impl World {
                         .fetch_all(&self.live().pool)
                         .await
                         .map_err(|error| error.to_string())?;
-                let capacity_held = (0..self.tasks.len()).any(|other| self.waiting(other));
+                // Another Task's run excuses only a Task still waiting for
+                // its first slot. A started Task with no run of its own must
+                // show why (a deferral, a park), whatever the others do.
+                let capacity_held = INITIAL.contains(&status)
+                    && (0..self.tasks.len()).any(|other| self.waiting(other));
                 if capacity_held
                     || self.project_paused
                     || self.agent_paused
@@ -1718,7 +1728,8 @@ async fn random_sequences_keep_every_task_live() {
         })
         .unwrap_or_default();
     let seeds = if chosen.is_empty() {
-        let extra = env_number("FORGE_MODEL_CASES").unwrap_or(if long { 40 } else { 2 });
+        // Random seeds only on request: see the header.
+        let extra = env_number("FORGE_MODEL_CASES").unwrap_or(0);
         let mut clock = Rng(std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos() as u64));
@@ -1839,12 +1850,14 @@ async fn a_held_task_always_offers_its_release() {
     let outcome: Result<(), String> = async {
         world.apply(&Action::Create).await?;
         world.quiesce().await?;
+        let mut held = 0;
         for stage in ["initial", "claimed"] {
             let (version, offers) = world.offers(0).await?;
             if let Some(hold) = offers
                 .iter()
                 .find(|offer| offer["action"]["verb"] == "hold")
             {
+                held += 1;
                 world.apply_offer(0, version, hold).await?;
                 world.quiesce().await?;
                 world.check_quiescent().await?;
@@ -1862,6 +1875,9 @@ async fn a_held_task_always_offers_its_release() {
             world.apply(&Action::Claim(0)).await?;
             world.quiesce().await?;
         }
+        if held == 0 {
+            return Err("`hold` was never offered, so this test checked nothing".to_owned());
+        }
         world.drive_to_settlement().await
     }
     .await;
@@ -1870,48 +1886,53 @@ async fn a_held_task_always_offers_its_release() {
     }
 }
 
-/// OPEN FINDING found by a random run of this model; minimized below.
+/// Found by a random run of this model and fixed with it; minimized below.
 ///
-/// `start` is offered on a Task waiting in `todo` (for capacity, or because
-/// its coder is paused). In a Project whose planning gate is unassigned and
-/// skipped, applying it parks the Task as `recovery_required` with "role
-/// 'coder' is assigned to a different agent". The `retry` then offered is
-/// accepted and restores the same park every time; only `restart` (or
-/// `cancel`) gets the Task out.
+/// `start` was offered on a Task waiting in `todo` (for capacity, or because
+/// its coder was paused) for the Agent of the planning gate's role, which
+/// with no planner assigned fell back to any available Agent, while the
+/// claim it then made entered `in_progress` for the coder role. The claim
+/// was refused ("role 'coder' is assigned to a different agent"), the Task
+/// was parked as `recovery_required`, and the `retry` then offered restored
+/// the same park every time.
 ///
-/// Cause: `services::task_actions::load_snapshot` picks the action Agent for
-/// the role of the first outgoing Active/Gate target (`planning`, role
-/// `planner`); with no planner assigned `select_action_agent` falls back to
-/// any available Agent. `TaskService::claim` (`resolve_claim_target`) lands
-/// on the Active target first (`in_progress`, role `coder`) and refuses that
-/// Agent. The queued-action replay
-/// (`task_service/execution/recovery.rs`, `dispatch_queued_task_action_inner`)
-/// resolves the role the first way too, so the three must change together.
-/// Run with `-- --ignored`.
+/// The offer, the queued action and its replay now resolve the role the way
+/// the claim does (`services::workflow::action_role`). So `start` on a Task
+/// queued for capacity is accepted and waits for that capacity, and `start`
+/// is not offered while the Agent it would run on is paused: resuming the
+/// Agent is that Task's exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open: start on a queued Task picks the wrong Agent, parks it as failed, and retry repeats the refusal"]
 async fn start_on_a_queued_task_does_not_park_it_as_failed() {
     use Action::{Create, PauseAgent, Take};
-    for sequence in [
-        vec![Create, Create, Create, Take(2, "start")],
-        vec![PauseAgent, Create, Take(0, "start")],
+    for (sequence, expected) in [
+        (vec![Create, Create, Create, Take(2, "start")], "start"),
+        (
+            vec![PauseAgent, Create, Take(0, "start")],
+            "start not offered",
+        ),
     ] {
         let mut world = World::new().await;
         let outcome: Result<(), String> = async {
+            let mut applied = String::new();
             for action in &sequence {
-                let applied = world.apply(action).await?;
+                applied = world.apply(action).await?;
                 world.quiesce().await?;
                 let state = world.check_quiescent().await?;
                 world
                     .trace
                     .push(format!("{action:?} -> {applied}: {state}"));
             }
+            if applied != expected {
+                return Err(format!(
+                    "taking `start` answered `{applied}`, expected `{expected}`"
+                ));
+            }
             let started = world.tasks.len() - 1;
             let task = world.task(started).await?;
-            if task["condition"]["kind"] == "parked" {
+            if task["status"] != "todo" || task["condition"]["kind"] == "parked" {
                 return Err(format!(
-                    "(b) the offered `start` was accepted and parked the Task as failed: {}",
-                    task["condition"]
+                    "(b) `start` on a queued Task must leave it queued, not parked or moved: {} {}",
+                    task["status"], task["condition"]
                 ));
             }
             world.drive_to_settlement().await
@@ -1974,45 +1995,76 @@ async fn a_parked_task_names_its_cancelled_dependency() {
     .await;
 }
 
-/// OPEN STALL found by a random run of this model; minimized below.
+/// Found by a random run of this model and fixed with it; minimized below.
 ///
-/// A coder run that fails after the Project's version changed (a pause, a
-/// resume, any settings edit) is dropped: the Task stays in `in_progress`
+/// A coder run that failed after the Project's version changed (a pause, a
+/// resume, any settings edit) was dropped: the Task stayed in `in_progress`
 /// with a `clear` condition, no retry deadline, no blocker and no park, and
-/// nothing relaunches it. `retry` is offered and recovers it.
+/// nothing relaunched it.
 ///
-/// Cause: the live failure path refuses to schedule the retry when
-/// `execution_dispatch_project_version(execution) != Some(project_version)`
-/// ("automatic retry was skipped because the project version changed",
-/// `services/src/task_service/execution/cascade.rs`), and the dispatcher's
-/// healer for exactly this stranded shape skips it on the same comparison
-/// (`task_dispatcher/snapshot.rs`, the `ExecutionStatus::Failed` fact, and
-/// `task_dispatcher/active_recovery.rs`, `reconcile_failed_role_execution`).
-/// Those dispatcher files are being edited by other work, so this is pinned
-/// here and not fixed.
+/// The failure path and the dispatcher's healer both refused to act on a run
+/// dispatched under an older Project version. That fence is for completions,
+/// which advance the workflow. A failure is now retried (or blocks the Task)
+/// under the current Project whichever version dispatched the run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open stall: a run that fails after a Project pause or resume is neither retried nor parked"]
 async fn a_run_that_fails_after_a_project_pause_is_retried() {
-    use Action::{Create, Finish, PauseProject, ResumeProject};
-    run_cases(vec![
-        (
-            "run fails while the Project is paused".to_owned(),
-            vec![
-                step(Create),
-                step(PauseProject),
-                step(Finish(0, Outcome::Fail)),
-            ],
-        ),
-        (
-            "run fails after the Project was paused and resumed".to_owned(),
-            vec![
-                step(Create),
-                step(PauseProject),
-                step(ResumeProject),
-                step(Finish(0, Outcome::Fail)),
-            ],
-        ),
-    ])
+    use Action::{Create, EditProject, Finish, PauseProject, ResumeProject};
+    let mut cases = Vec::new();
+    for outcome in [Outcome::Fail, Outcome::UsageLimit] {
+        for (name, edits) in [
+            ("while the Project is paused", vec![PauseProject]),
+            (
+                "after the Project was paused and resumed",
+                vec![PauseProject, ResumeProject],
+            ),
+            ("after the Project was edited", vec![EditProject]),
+        ] {
+            let mut sequence = vec![step(Create)];
+            sequence.extend(edits.into_iter().map(step));
+            sequence.push(step(Finish(0, outcome)));
+            cases.push((format!("run ends {outcome:?} {name}"), sequence));
+        }
+    }
+    // The failed run must leave a pending retry behind, not only settle
+    // because the final drive pokes the Task.
+    for (name, sequence) in &cases {
+        if name.contains("paused") && !name.contains("resumed") {
+            continue; // a paused Project legitimately waits.
+        }
+        let trace = run(sequence, false)
+            .await
+            .unwrap_or_else(|failure| panic!("{}", report(name, sequence, &failure)));
+        let after_failure = &trace[sequence.len() - 1];
+        assert!(
+            after_failure.contains("0:in_progress/deferred/")
+                || after_failure.contains("0:in_progress/running/"),
+            "{name}: the failed run left no pending retry and no new run: {after_failure}\n{}",
+            trace.join("\n")
+        );
+    }
+    run_cases(cases).await;
+}
+
+/// OPEN, UNTRIAGED: found by a random run once the generator stopped stepping
+/// around failures after a Project pause (`FORGE_MODEL_SEED=45233331
+/// FORGE_MODEL_LONG=1`); minimized below. The coder Agent is paused, the
+/// running Task is held, the server crashes before the hold's steps run, and
+/// the Task is released. Once the Agent resumes the Task stays in
+/// `in_progress` with a `clear` condition and no run; `retry` is offered.
+/// The same crash under a paused Agent without the hold recovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "open stall: hold, crash and release under a paused Agent leave the Task idle once the Agent resumes"]
+async fn a_task_released_after_a_crash_under_a_paused_agent_runs_again() {
+    use Action::{Create, PauseAgent, Take};
+    run_cases(vec![(
+        "hold, crash and release under a paused Agent".to_owned(),
+        vec![
+            step(Create),
+            step(PauseAgent),
+            crash_after(Take(0, "hold")),
+            step(Take(0, "release")),
+        ],
+    )])
     .await;
 }
 

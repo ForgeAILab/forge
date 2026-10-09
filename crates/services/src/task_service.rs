@@ -1915,7 +1915,10 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(());
         };
+        // A failure is not fenced: it is retried or blocks its Task under the
+        // current Project revision (`annotate_executor_failure_block`).
         if execution.role != crate::workflow::default_roles::INTERACTIVE
+            && execution.status != ExecutionStatus::Failed
             && execution_dispatch_project_version(execution) != Some(project.version)
         {
             tracing::info!(

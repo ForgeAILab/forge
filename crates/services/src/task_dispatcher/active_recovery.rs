@@ -586,7 +586,7 @@ impl TaskDispatcher {
         };
         if execution.status == ExecutionStatus::Failed && claimed_execution_id.is_none() {
             return self
-                .reconcile_failed_role_execution(task, role_name, &execution, project_version)
+                .reconcile_failed_role_execution(task, role_name, &execution)
                 .await;
         }
         if execution.status != ExecutionStatus::Completed {
@@ -658,15 +658,12 @@ impl TaskDispatcher {
         task: &Task,
         role_name: &str,
         execution: &db::Execution,
-        project_version: i64,
     ) -> Result<ReviewerReconciliation> {
         if crate::project_environment::is_environment_pre_dispatch_failure(execution)
             || !crate::task_service::execution::should_block_task_for_failed_execution(execution)
             || role_name == crate::workflow::default_roles::REVIEWER
             || helpers::has_blocking_annotation(task)
             || deferred_dispatch::is_pending(task, chrono::Utc::now())
-            || crate::task_service::execution_dispatch_project_version(execution)
-                != Some(project_version)
         {
             return Ok(ReviewerReconciliation::None);
         }

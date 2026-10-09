@@ -1,6 +1,6 @@
 use super::*;
 use crate::workflow::{actions::DispatchRoleAgent, HookAction, HookContext};
-use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
+use api_types::{Actor, SystemComponent, WorkflowDefinition};
 
 impl TaskService {
     /// The accepted claim owns startup even when its HTTP waiter times out.
@@ -516,26 +516,8 @@ impl TaskService {
 }
 
 fn resolve_claim_target(workflow: &WorkflowDefinition, current_status: &str) -> Result<String> {
-    let source_kind = workflow.state_kind(current_status);
-    let targets = workflow
-        .outgoing_trigger_targets(current_status)
-        .filter(|(trigger, _)| {
-            !trigger.system_only()
-                || matches!(source_kind, Some(StateKind::Initial | StateKind::Custom))
-        })
-        .filter_map(|(_, target_name)| {
-            workflow
-                .states
-                .iter()
-                .find(|target| target.name == target_name)
-                .map(|target| (target.name.clone(), target.kind))
-        })
-        .collect::<Vec<_>>();
-    let target = targets
-        .iter()
-        .find(|(_, kind)| *kind == StateKind::Active)
-        .or_else(|| targets.iter().find(|(_, kind)| *kind == StateKind::Gate))
-        .map(|(name, _)| name.clone());
+    let target = crate::workflow::claim_target_state(workflow, current_status)
+        .map(|state| state.name.clone());
 
     target.ok_or_else(|| {
         ServiceError::invalid_operation(format!(
