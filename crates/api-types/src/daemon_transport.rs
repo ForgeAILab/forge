@@ -1190,7 +1190,7 @@ mod tests {
             super::DAEMON_PROTOCOL_REVISION,
             &old
         ));
-        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 5);
+        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 6);
         let probe: super::MachineProbeParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_location_id":null,"commands":[{"name":"cargo","command":"cargo --version","timeout_seconds":10}],"env":{}})).unwrap();
         assert_eq!(probe.commands[0].name, "cargo");
         let provision: super::RepoLocationProvisionParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_id":"repo","remote_url":"file:///repository","default_branch":"main","timeout_seconds":1800})).unwrap();
@@ -1458,8 +1458,8 @@ mod tests {
             DAEMON_PROTOCOL_REVISION,
             &revision_2_capabilities
         ));
-        assert_eq!(DAEMON_PROTOCOL_REVISION, 5);
-        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 5);
+        assert_eq!(DAEMON_PROTOCOL_REVISION, 6);
+        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 6);
     }
 
     #[test]
@@ -1791,8 +1791,32 @@ mod tests {
         assert_round_trip::<WorkspaceReconcileParams>(request);
         assert_round_trip::<WorkspaceReconcileResult>(
             json!({"entry_id":"entry", "operation_id":"operation",
-            "outcome":{"kind":"error", "error":{"code":DAEMON_UNAVAILABLE,"message":"interrupted","details":null}}}),
+            "outcome":{"kind":"error", "error":{"code":DAEMON_UNAVAILABLE,"message":"interrupted","details":null}},
+            "owner_fence":null}),
         );
+        let lookup = assert_round_trip::<WorkspaceReconcileResult>(
+            json!({"entry_id":"entry", "operation_id":"operation",
+            "outcome":{"kind":"result", "result":{}},
+            "owner_fence":{"queue_id":"queue","generation":null,"attempt_id":null,"intent":"unknown"}}),
+        );
+        assert_eq!(
+            lookup.owner_fence.unwrap().intent,
+            IntegrationIntentRecord::Unknown
+        );
+        assert_round_trip::<IntegrationAnnounceParams>(
+            json!({"daemon_id":"d","runtime_id":"r","fence":{"queue_id":"queue","attempt_id":"attempt","generation":2,"lease_owner":"worker","target_owner":{}},"live_queue_ids":["queue"]}),
+        );
+        assert_round_trip::<ImportObjectsResult>(
+            json!({"kind":"imported","receipt":{"key":"a-1-out","tip_sha":"abc","ref_name":"refs/forge/integration/a-1-out","replayed":true}}),
+        );
+        assert_round_trip::<ObjectTransferRefusal>(
+            json!({"kind":"too_large","bytes":3,"max_bytes":2}),
+        );
+        assert_eq!(
+            object_transfer_key("attempt", 7, ObjectTransferDirection::Inbound),
+            "attempt-7-in"
+        );
+        assert_eq!(MAX_OBJECT_TRANSFER_BYTES, 256 * 1024 * 1024);
     }
 
     #[test]
