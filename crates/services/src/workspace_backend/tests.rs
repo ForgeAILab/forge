@@ -107,7 +107,9 @@ async fn workspace_backend_large_ci_tail_preserves_server_placement_verdict() {
     );
     for (index, exit) in [0, 7].into_iter().enumerate() {
         let server = embedded.run(&server_placement, &spec(exit)).await.unwrap();
-        assert!(server.stdout_tail.len() > 1024 * 1024);
+        // The shared check executor keeps the last 1 MiB per stream.
+        assert_eq!(server.stdout_tail.len(), 1024 * 1024);
+        assert!(server.stdout_tail.ends_with("last failure line\n"));
         assert_eq!(remote_results[index].exit_code, server.exit_code);
         assert_eq!(remote_results[index].exit_code == 0, server.exit_code == 0);
         assert!(remote_results[index]
