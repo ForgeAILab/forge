@@ -4884,13 +4884,13 @@ Critical and uncertain states cannot be cancelled merely by a timeout.
 |---|---|
 | `queued` | `path_wait`, `validating`, `parked`, `cancelled`, `superseded` |
 | `path_wait` | `queued`, `validating`, `parked`, `cancelled`, `superseded` |
-| `validating` | `applied`, `needs_review`, `parked`, `rebasing`, `cancelled`, `superseded` |
+| `validating` | `applied`, `needs_review`, `parked`, `rebasing`, `awaiting_task_step`, `cancelled`, `superseded` |
 | `rebasing` | `checking`, `ejected`, `parked`, `reconciling`, `cancelled` |
 | `checking` | `awaiting_task_step`, `ejected`, `parked`, `cancelled` |
 | `awaiting_task_step` | `ready_ff`, `needs_review`, `ejected`, `parked`, `cancelled` |
 | `ready_ff` | `awaiting_task_step`, `ff_inflight`, `needs_review`, `parked`, `cancelled` |
 | `ff_inflight` | `applied`, `rebasing`, `reconciling` |
-| `reconciling` | `applied`, `rebasing`, `ready_ff`, `parked`, `quarantined` |
+| `reconciling` | `applied`, `rebasing`, `ready_ff`, `queued` (effect settled, nothing landed), `parked`, `quarantined` |
 | `applied` | `completed` |
 | `ejected` | `needs_review`, `parked`, `cancelled`, `superseded` |
 | `needs_review` | `parked`, `cancelled`, `superseded` |
@@ -5258,6 +5258,104 @@ Known limits before activation:
   policy must preserve replay fencing when the future worker starts using them.
 - The existing local Review/Project authority guard remains separate from queue
   owner serialization.
+
+### Integration activation storage (3.2 stage D, part 1a; not called until D2)
+
+Migration `V202610091612__integration_activation.sql` and
+`db::integration_queue::activation` add the storage the queue worker will use.
+Nothing in production calls it until D2: `merging` still runs today's merge
+hooks, and existing rows read both new columns as `NULL`.
+
+New `integration_attempt` columns:
+
+| Column | Type / constraint | Meaning |
+|---|---|---|
+| `cancel_requested_at` | `TEXT` | Set once by `request_integration_cancel`. An ordinary attempt transition can neither set nor clear it. |
+| `phase_timings_json` | `TEXT`, JSON object, at most 16384 bytes | The head's timings (`IntegrationPhaseTimings`), written only by `record_integration_head_timings`. |
+
+`IntegrationPhaseTimings` is cumulative over an attempt's rounds: `rounds`,
+`queued_ms`, `validate_ms`, `transfer_ms`, `rebase_ms`, `check` (either
+`ran {slot_wait_ms, run_ms}` or `skipped {reason}` with reason
+`target_unchanged` or `no_checks_configured`), `step_wait_ms`, `ff_ms`,
+`head_total_ms`, `lost_races` (the newest 32 entries of `{kind, round, at}`,
+kind `queue_member` or `external`) and `lost_races_folded` (`{queue_member,
+external}` counts of older entries). A write with more than 32 lost races is
+not refused: the repository folds the oldest into the counts, so a timings
+write can never stop a head and the document stays far below its bound. Only
+an `external` lost race spends the "target moved" allowance;
+`external_target_moves()` counts listed and folded ones. Timings are
+measurements: a stored document this build cannot read reads as absent (the
+attempt stays readable) and the next write replaces it.
+
+New indexes, all partial: `integration_attempt_timed (state, id)` for current
+attempts with an `available_at`; `integration_attempt_cancel_requested (id)`
+for current attempts with a cancel request; `integration_attempt_prunable
+(completed_at, id)` for finished attempts that still hold receipts or
+observations. No trigger is added.
+
+Operations (trait `IntegrationActivationRepo`; all not called until D2). Every
+write compares the row's `revision` and bumps it, so a caller holding an older
+copy gets `VersionConflict` and must re-read:
+
+| Operation | Rule |
+|---|---|
+| `request_integration_cancel` | Legal exactly where the attempt graph can reach `cancelled`: `queued`, `path_wait`, `validating`, `rebasing`, `checking`, `awaiting_task_step`, `ready_ff`, `ejected`, `needs_review`, `parked`. Refused (`InvalidTransition`) in `ff_inflight`, `reconciling`, `applied`, `quarantined` and terminal states. It only sets the flag; the worker performs the transition. Repeating it keeps the first time. A queued member carrying the flag is never selected as head by a claim, so a cancel and a claim racing for the same member have exactly one winner. |
+| `record_integration_head_timings` | Head of its queue only. Replaces the whole document. |
+| `start_integration_round` | The live lease holder, at its current fence generation, takes a new generation and lease for the same head, with the claim's takeover rules. One generation admits one receipt per effect kind, so another rebase or fast-forward of the same head needs a new round. |
+| `claimable_integration_queues` | Unleased queues a worker must act on: open or suspended with a due queued member (not asked to cancel) or a reserved head, and every quarantined queue. Keyset by queue id, `LIMIT` at most 500. |
+| `expired_integration_heads` | Queues whose lease ended at or before the given time. Keyset by queue id. |
+| `due_parked_integration_attempts` | Current `parked` attempts whose `available_at` is due. A parked attempt without `available_at` waits for its owner. Keyset by attempt id. |
+| `cancel_requested_integration_attempts` | Current attempts carrying a cancel request. Keyset by attempt id. |
+| `quarantine_integration_queue` | Lease holder only; needs a head that is `ff_inflight`, `reconciling`, `quarantined` or has an unsettled effect. |
+| `reopen_integration_queue` | The only exit from `quarantined`. Needs a witness that is re-verified against stored rows: `settled_effect` names a succeeded or failed (never uncertain) receipt of this queue, and no current member may still have an intent or a running / uncertain operation. While the queue still has its head, the witness must be that head's own receipt and the head must have left `ff_inflight` / `reconciling` (the worker applies the receipt to the attempt first, then re-opens); once the head has finished and released the slot, its receipt remains a valid witness, and pruning never removes it while the queue is quarantined. The lease and the head are not touched. An owner's reconnect lookup and a machine or location removal settlement both produce such a receipt; a timeout does not. An attempt that never had an effect admitted can have no receipt (an imported uncertain merge that the worker resolved by lookup, or a head that stopped before its intent): the witness for it is `no_effect`, accepted only when that attempt's stored row has no intent, no receipt and no pending / running / uncertain operation, under the same head rules. Whatever the witness, a queue with any current member still in `ff_inflight` / `reconciling`, or with an intent or a running / uncertain operation, does not re-open. With a target that is not ready the queue becomes `suspended` instead of `open`. A `suspended` queue re-opens with `target_ready` naming the repo's one ready default checkout and its version (a claim also still re-opens it). |
+| `prune_integration_evidence` | Empties `effect_receipts_json`, `operation_receipts_json` and `observations_json` of at most `limit` attempts that finished before the cutoff. Never touches a current attempt, an attempt with an intent, a pending / running / uncertain operation or an uncertain receipt, an attempt whose Task has a live successor, or any attempt of a quarantined queue. Rows, SHAs and outcomes stay. A settled intent needs no pruning: its receipt already cleared it. |
+| `integration_queue_ages` | Count and oldest age for queued members, heads, expired heads, parked members, pending cancel requests and unsettled effects. |
+| `integration_timing_samples` | Timings of recently completed attempts, newest first, for percentiles. |
+
+Time comparisons in the sweeps and in pruning use the instant, not the text, so
+a timestamp written with an offset is handled. Where an index range needs a
+text comparison on `completed_at` (pruning, timing samples) the caller's bound
+is first rewritten to the UTC form `completed_at` is stored in; pruning also
+re-checks the instant.
+
+Plans: the due-parked, cancel-requested, claimable and timing-sample reads
+carry no index hint and are held to their index by `EXPLAIN QUERY PLAN` tests.
+The expired-lease sweep and the prune statement keep `INDEXED BY`, because the
+planner otherwise walks the queue primary key or every old terminal attempt. A
+named index is refused when the statement is prepared, from the schema and the
+statement text alone (never from data or statistics), and a test prepares both
+statements on the migrated schema and pins both index definitions, so a later
+migration that changes either index fails that test.
+
+What moves each new durable mark forward (the worker is D1d / D2):
+
+| Mark | Moved by |
+|---|---|
+| `cancel_requested_at` on a queued member | Never claimed as head; the cancel-requested sweep returns it and the worker writes `queued → cancelled`. |
+| `cancel_requested_at` on a head | The head driver sees it (its next attempt write fails the revision check and it re-reads) or the sweep returns it; the worker stops its own effect, waits for the receipt, then writes `cancelled`. If the attempt has meanwhile entered `ff_inflight`, `reconciling`, `applied` or `quarantined`, the mark stays and is acted on only after that result is known; the sweep keeps returning the row until it is terminal. |
+| `cancel_requested_at` on `ejected` / `needs_review` / `parked` | Not a head; only the cancel-requested sweep finds it. |
+| Queue `quarantined` | `reopen_integration_queue` with a settled receipt, or with `no_effect` when the pinning attempt never had an effect admitted (every imported uncertain merge). A head that went `reconciling → queued` while its queue is still quarantined is not claimable until the worker re-opens the queue; it then continues with `start_integration_round`. With a `reconciling` / `ff_inflight` head it is still claimable, so the worker can keep asking the owner; every unleased quarantined queue is in the claimable sweep. A machine or location removal settles the receipt. No timer opens it. |
+| Queue `suspended` (also after a re-open with no ready target) | The next claim re-resolves the target and opens it, or `reopen_integration_queue` with `target_ready`. The claimable sweep returns it while it has a due queued member or a head. |
+| Head left in any state by a dead worker | Expired-lease sweep, then a claim (takeover rules). After a machine removal the head can be `parked` or `quarantined` with no lease; the claimable sweep returns every unleased queue that has a head. |
+
+A cancel request is refused in `ff_inflight`, `reconciling`, `applied` and
+`quarantined`: the Git result is in flight, unknown or already landed, and a
+flag cannot undo it. The Task-level cancel is not the storage's decision: from
+the permit on, the Task-step consumer (D1b) keeps the Cancel command waiting
+behind the protected result step, and for a quarantined attempt it must leave
+the attempt and its queue as they are until the result is settled.
+
+Queue states are data too (`INTEGRATION_QUEUE_TRANSITIONS`): `open` →
+`suspended`, `quarantined`, `closed`; `suspended` → `open`, `closed`;
+`quarantined` → `open`, `suspended`, `closed`; `closed` is terminal. The
+attempt graph gains two edges. `validating` → `awaiting_task_step`: with an
+unchanged target there is nothing to rebase or re-check. `reconciling` →
+`queued`: a result proven not landed goes back to validation in place (a head
+keeps its slot and lease); going through `parked` would release the slot, wait
+for `available_at` and spend one of the Task's infrastructure retries. Any
+move to `queued` from `reconciling` or `quarantined` is refused while the
+attempt has an effect intent or a running / uncertain operation, so `queued`
+is never a way around an unknown result.
 
 ### Task condition actions
 
