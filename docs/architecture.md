@@ -5275,21 +5275,70 @@ blocked child stops the sequence at that child so the Project Agent can inspect
 evidence, reassign it, or otherwise coordinate recovery.
 
 Forge owns Task workspace cleanup. Entering a terminal workflow state schedules
-cleanup without waiting for filesystem deletion. The deadline worker removes
-the Task's exact worktree through `git worktree remove --force` and removes its
-build output. Built-in `done` Tasks are eligible promptly; `cancelled` Tasks
-retain their worktrees and managed homes for 24 hours to preserve uncommitted
-work. Broad Git worktree pruning runs only in Forge-owned `.repos/` caches;
-user-owned repositories retain all unrelated worktree registrations.
-Task branches and execution logs are retained; only
-`.codex-managed-home` (including task scratch) is removed from the Task's logs
-directory. Cleanup is deferred while any execution or WorkspaceLease is active.
+cleanup without waiting for filesystem deletion. Built-in `done` Tasks are
+eligible promptly; `cancelled` Tasks retain their worktrees and managed homes
+for 24 hours to preserve uncommitted work. Cleanup is deferred while any
+execution or WorkspaceLease is active, and a root shared by subtasks is kept
+until every child is terminal.
+
+Reclaiming one Task root is one sequence in the `workspace` crate
+(`WorkspaceManager::cleanup_worktree`), used by the server backend and by the
+daemon `cleanup` handler:
+
+1. Make the Task root owner-writable (`u+rwx` on directories, `u+rw` on files),
+   recursively. Symbolic links are never followed or changed, so nothing
+   outside the root is touched. Toolchains leave read-only trees behind (a Go
+   module cache, for one); without this step every retry failed the same way.
+2. `git worktree remove --force` for the Task's exact worktree.
+3. Remove what is left of the Task root: build output, execution outboxes,
+   `plan.md`, and any `<name>.broken-<ms>` copy an earlier worktree recovery
+   moved aside.
+4. Prune. Registrations under this Task root that still point at a missing
+   directory are removed one by one. A broad `git worktree prune` runs only in
+   Forge-owned `.repos/` caches; a user-owned repository keeps every worktree
+   registration Forge did not create.
+
+Every step is idempotent: a missing directory, a missing registration and a
+repository that no longer exists are all success. A directory at the recorded
+path that still has Git metadata but no registration is removed when it is a
+leftover of the workspace's own repository, and refused when it is a checkout
+of some other repository.
+
+After the Task root is gone, and only for a terminal Task on a server-owned
+workspace, Forge deletes the Task branch when the change is delivered. Delivery
+is decided by Git at that moment, never by a stored flag: the branch tip must
+be an ancestor of the Task's target branch (`merge_config.target_branch`, else
+the repository default branch; `refs/heads/<target>` or
+`refs/remotes/origin/<target>`). A branch that Git does not report as contained
+is kept: an undelivered or cancelled Task with commits of its own, a squash or
+rebase delivery, a target that was moved back. A branch is also kept when it
+is checked out in another worktree, when its name is not the `task/<id8>` name
+Forge gave that Task, or when another workspace of the repository that is not
+yet cleaned uses the same name (the name carries only eight characters of the
+Task id). A workspace reset on a live Task never deletes the branch. Branches
+on daemon-owned workspaces are not deleted yet. Execution logs are retained;
+only `.codex-managed-home` (including task scratch) is removed from the Task's
+logs directory.
+
+Project lifecycle script hooks run in the Task worktree. When a server-owned
+workspace is on record and its worktree is missing or is a directory without
+Git metadata, the hook is not run and the emitter reports
+`workspace reset required`; it never runs in the user's own checkout instead.
+The primary-checkout context is used only where no worktree is expected: before
+the workspace is prepared, and after Forge has reclaimed it (`cleaned`).
 A bounded sweep runs on startup and every ten minutes to backfill terminal Tasks,
 including missing worktrees and managed homes left by older installs. The
 deadline worker snapshots a bounded set of due rows before processing them, so
 rescheduling one failed cleanup does not remove later due rows from that tick.
 Ordinary failures persist an attempt count and bounded error tail, then retry
-with exponential backoff from one minute up to one hour. An unreachable daemon
+with exponential backoff from one minute up to one hour, with no attempt limit.
+A failed branch deletion counts as a failed cleanup: the workspace stays
+`cleaning` and is retried. After five failed attempts (about half an hour)
+Forge raises one Project-scoped attention item (`progress_warning`, dedupe key
+`workspace-cleanup:<workspace id>`, with the path, the attempt count and the
+last error) and appends one `workspace.cleanup_failed` domain event. Later
+retries do not add or reopen items. A successful cleanup, or the Task leaving
+cleanup eligibility, resolves the item. An unreachable daemon
 owner keeps the fixed one-minute retry without increasing the failure count.
 The sweep honors cleanup deadlines and grace periods, and ineligible scheduled
 rows have their deadlines and retry state cleared so they cannot starve later
@@ -6396,8 +6445,9 @@ candidate route instead of a single adapter:
   equality is not sufficient).
 - **mcp-server** — JSON-RPC dispatch over `POST /mcp` with its own `McpState`.
   Does not depend on the `api` crate.
-- **workspace** — `.forge.lock` records task-worktree lock state; keyed in-process
-  locks serialize repository-cache/integration and Workspace execution operations.
+- **workspace** — Task worktree mechanics and Task-root reclamation, shared by
+  the server and the daemon. There are no lock files: keyed in-process locks
+  serialize repository-cache/integration and Workspace execution operations.
   Path validation prevents traversal escapes.
 - **config** — `ForgeConfig` with precedence: CLI flags > env vars > config
   file > defaults. Default bind uses loopback with an OS-selected port, then

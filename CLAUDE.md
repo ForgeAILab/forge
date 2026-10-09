@@ -106,7 +106,7 @@ forge-cli → api → services → db
 - **Claim auto-dispatches** — `api::routes::tasks::claim_task` spawns the executor via `tokio::spawn`. There is no separate "dispatch" endpoint.
 - **Review** — workflow entry hooks run configured checks and dispatch ordinary reviewers; `ReviewRunner` owns explicit reviewer/auditor reruns.
 - **MCP server** — `POST /mcp`, JSON-RPC, has its own `McpState`, does not depend on the `api` crate.
-- **Workspace** — `.forge.lock` records task-worktree lock state; keyed in-process locks serialize repository-cache/integration and Workspace execution operations; path validation prevents traversal escapes.
+- **Workspace** — no lock files: keyed in-process locks serialize repository-cache/integration and Workspace execution operations; path validation prevents traversal escapes. The `workspace` crate owns Task-root reclamation (permission repair, exact worktree removal, delivered-branch deletion) for the server and the daemon.
 - **Config precedence** — CLI flags > env vars > config file > defaults. Default bind `127.0.0.1:8080`.
 
 ## Database

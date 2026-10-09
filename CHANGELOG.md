@@ -8,6 +8,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Forge deletes a Task branch once its change is delivered (3.4 stage
+  A).** Task branches (`task/<first 8 characters of the Task id>`) used to
+  stay in the repository forever. Now, when a server-owned workspace of a
+  terminal Task is cleaned up (promptly after `done`, 24 hours after
+  `cancelled`), Forge deletes that Task's branch if, and only if, Git reports
+  at that moment that the branch tip is an ancestor of the Task's target
+  branch (`merge_config.target_branch`, else the repository default branch;
+  the local branch or `origin/<target>`). Every commit of a deleted branch is
+  therefore still reachable from the target. This includes a branch that never
+  got a commit of its own. Kept as before: a branch with commits the target
+  does not contain (undelivered or cancelled work, a squash or rebase
+  delivery, a target that was moved back), a branch checked out in any other
+  worktree, a branch whose name another not-yet-cleaned workspace of the
+  repository shares, any branch Forge did not name, and every branch of a
+  daemon-owned workspace. A workspace reset never deletes a branch. To keep a
+  delivered Task branch, point another ref at it before the Task finishes
+  (`git branch keep/<name> task/<id8>` or a tag), or check it out in a
+  worktree of your own. Branches of Tasks cleaned up before this release are
+  not touched.
 - **Daemon protocol revision 5 (3.3 stage B).** The daemon command stream
   adds `check.run`, `check.lookup` and `check.cancel`, and the minimum
   revision is 5: a revision-4 or older daemon is refused at the handshake
@@ -735,6 +754,28 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Workspace cleanup finishes instead of failing the same way forever (3.4
+  stage A).** Before removing a Task root, on the server and on a daemon,
+  Forge makes it owner-writable (never following a symbolic link out of it),
+  so read-only files and directories left by a toolchain are removed.
+  `<name>.broken-<ms>` copies from an earlier worktree recovery go with the
+  Task root. A worktree directory whose registration is gone, a registration
+  whose directory is gone, and a repository that no longer exists are all
+  cleaned up rather than reported as errors; a checkout of a different
+  repository at the recorded path is still refused. Stale registrations under
+  the Task root are removed one by one; a broad `git worktree prune` still
+  runs only in Forge's own `.repos/` caches.
+- **A cleanup that keeps failing becomes one attention item (3.4 stage A).**
+  After five failed attempts Forge raises a single Project attention item
+  (category `progress_warning`, with the path, attempt count and last error)
+  and records one `workspace.cleanup_failed` domain event. It keeps retrying
+  with the existing backoff (hourly at the cap) without adding items, and
+  resolves the item when cleanup succeeds.
+- **Server workspaces no longer report `locked` from a `.forge.lock` file.**
+  Nothing ever created that file; the `workspace` crate's `acquire_lock`,
+  `release_lock`, `detect_orphans` and `WorkspaceError::Locked` are removed.
+  The `locked` field stays in the daemon describe result.
 
 - **One execution primitive for CI steps (3.3 stage B).** The merge-path
   check, review-entry CI and manual review CI run each step through the
@@ -1671,6 +1712,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A lifecycle script hook no longer runs in your own checkout when the
+  Task worktree is gone (3.4 stage A).** If a server-owned workspace was on
+  record but its directory was missing, a Project lifecycle hook silently ran
+  in the repository's `local_path` (or the server's working directory)
+  instead; a directory without Git metadata also passed as a worktree. The
+  hook is now not run and the failure is reported as `workspace reset
+  required`. Hooks that fire before the workspace is prepared, or after Forge
+  has reclaimed it, keep the primary-checkout context they had.
 
 - **A CI step can no longer hang on its own output (3.3 stage B).** On the
   server, a step that left a process holding its output pipe (a dev server

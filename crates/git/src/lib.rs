@@ -142,18 +142,130 @@ pub async fn create_worktree(
 }
 
 /// Remove a worktree.
+///
+/// A tree that holds read-only directories (a Go module cache, a vendored
+/// dependency tree) cannot be unlinked by Git, which then drops the
+/// registration and leaves the directory behind. For a path that was a
+/// registered worktree of `repo_path`, the tree is made owner-writable and the
+/// removal is finished, so one read-only directory does not make every later
+/// attempt fail the same way. Any other path keeps Git's own error.
 pub async fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
-    run_git(
-        repo_path,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            &worktree_path.to_string_lossy(),
-        ],
-    )
-    .await?;
-    Ok(())
+    let path = worktree_path.to_string_lossy();
+    let args = ["worktree", "remove", "--force", path.as_ref()];
+    let was_registered = worktree_is_registered(repo_path, worktree_path).await;
+    let Err(error) = run_git(repo_path, &args).await else {
+        return Ok(());
+    };
+    if !was_registered || tokio::fs::symlink_metadata(worktree_path).await.is_err() {
+        return Err(error);
+    }
+    // Best effort: the removal below reports whatever is still wrong.
+    let _ = make_tree_owner_writable(worktree_path).await;
+    if worktree_is_registered(repo_path, worktree_path).await {
+        run_git(repo_path, &args).await?;
+    }
+    match tokio::fs::remove_dir_all(worktree_path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn worktree_is_registered(repo_path: &Path, worktree_path: &Path) -> bool {
+    let Ok(listed) = run_git(repo_path, &["worktree", "list", "--porcelain"]).await else {
+        return false;
+    };
+    let canonical = tokio::fs::canonicalize(worktree_path).await.ok();
+    listed
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(Path::new)
+        .any(|path| path == worktree_path || Some(path) == canonical.as_deref())
+}
+
+/// Give the owner write access to every directory and file under `root`
+/// (`u+rwx` on directories, `u+rw` on files), so the tree can be deleted.
+///
+/// Symbolic links are never followed and never changed: a link that points
+/// out of `root` leaves its target untouched. A `root` that is itself a link,
+/// or does not exist, is left alone. The walk continues past entries it cannot
+/// change and returns the first error it met.
+pub async fn make_tree_owner_writable(root: &Path) -> std::io::Result<()> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || make_tree_owner_writable_blocking(&root))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn make_tree_owner_writable_blocking(root: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let mut first_error = None;
+    let mut keep = |result: std::io::Result<()>| {
+        if let Err(error) = result {
+            if error.kind() != std::io::ErrorKind::NotFound && first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    };
+    let mut pending = vec![(root.to_path_buf(), metadata)];
+    while let Some((path, metadata)) = pending.pop() {
+        // A directory must be writable and searchable before it is read.
+        keep(grant_owner_write(&path, &metadata));
+        if !metadata.is_dir() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                keep(Err(error));
+                continue;
+            }
+        };
+        for entry in entries {
+            // `DirEntry::metadata` does not traverse symbolic links.
+            let child = match entry.and_then(|entry| Ok((entry.path(), entry.metadata()?))) {
+                Ok(child) => child,
+                Err(error) => {
+                    keep(Err(error));
+                    continue;
+                }
+            };
+            if !child.1.file_type().is_symlink() {
+                pending.push(child);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(unix)]
+fn grant_owner_write(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode();
+    let wanted = mode | if metadata.is_dir() { 0o700 } else { 0o600 };
+    if wanted == mode {
+        return Ok(());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(wanted))
+}
+
+#[cfg(not(unix))]
+fn grant_owner_write(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    let mut permissions = metadata.permissions();
+    if !permissions.readonly() {
+        return Ok(());
+    }
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions)
 }
 
 /// Get the current HEAD SHA.
@@ -934,6 +1046,76 @@ mod tests {
         assert!(!repo_path.join("reviewer.tmp").exists());
         assert!(!repo_path.join("leftover.tmp").exists());
         assert!(is_worktree_clean(&repo_path).await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_worktree_reclaims_read_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, repo_path) = setup_repo().await;
+        let worktree = dir.path().join("wt-read-only");
+        create_worktree(&repo_path, "read-only", &worktree)
+            .await
+            .unwrap();
+        let cache = worktree.join("pkg/mod");
+        fs::create_dir_all(&cache).await.unwrap();
+        fs::write(cache.join("module.go"), "package module\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(
+            cache.join("module.go"),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(worktree.join("pkg"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+
+        remove_worktree(&repo_path, &worktree).await.unwrap();
+
+        assert!(!worktree.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn make_tree_owner_writable_never_follows_links_out_of_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).await.unwrap();
+        fs::write(outside.join("kept"), "kept").await.unwrap();
+        std::fs::set_permissions(outside.join("kept"), std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("locked")).await.unwrap();
+        fs::write(root.join("locked/file"), "file").await.unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("locked/escape")).unwrap();
+        std::fs::set_permissions(
+            root.join("locked/file"),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+
+        make_tree_owner_writable(&root).await.unwrap();
+        // A second pass over an already writable tree, and a missing root.
+        make_tree_owner_writable(&root).await.unwrap();
+        make_tree_owner_writable(&dir.path().join("missing"))
+            .await
+            .unwrap();
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root.join("locked")), 0o700);
+        assert_eq!(mode(&root.join("locked/file")), 0o600);
+        assert_eq!(mode(&outside), 0o500);
+        assert_eq!(mode(&outside.join("kept")), 0o400);
+        fs::remove_dir_all(&root).await.unwrap();
+        assert!(outside.join("kept").exists());
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[tokio::test]
