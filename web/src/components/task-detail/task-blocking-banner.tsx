@@ -2,6 +2,7 @@ import type { InterruptionMetadata, Task } from '@/types/generated'
 import {
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
+  checkWaitNotice,
   getTaskWaitNotice,
   getTaskWorkflowWarning,
 } from '@/lib/workflow-utils'
@@ -79,6 +80,24 @@ export function TaskBlockingBanner({ task }: { task: Task }) {
               {staleAnnotation.blocked_execution_id}
             </p>
           ) : null}
+        </div>
+      </section>
+    )
+  }
+
+  const checkNotice = checkWaitNotice(task)
+  if (checkNotice) {
+    return (
+      <section
+        className={
+          checkNotice.needsOwner
+            ? 'rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200'
+            : 'rounded-lg border border-border bg-muted/40 p-4 text-foreground'
+        }
+      >
+        <div className="space-y-1.5">
+          <p className="text-sm font-semibold">{checkNotice.title}</p>
+          <p className="text-sm">{checkNotice.message}</p>
         </div>
       </section>
     )

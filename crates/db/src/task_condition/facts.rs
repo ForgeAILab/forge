@@ -63,6 +63,12 @@ pub enum ConditionWitness {
         status: String,
         settled: bool,
     },
+    // --- durable check runner (plan 3.3 stage D) ---
+    /// The check the status entry `epoch` asked for and still waits on.
+    Check {
+        wait: CheckWait,
+        epoch: i64,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterialBlocker {
@@ -274,6 +280,9 @@ pub struct ConditionFacts {
     pub children_pending: bool,
     /// `(id, status, settled)` in sequence order, while the flag is pending.
     pub children: Vec<(String, String, bool)>,
+    /// The check a status entry waits on, and that entry's epoch. It is a
+    /// wait only while that entry is still the Task's.
+    pub check: Option<(CheckWait, i64)>,
 }
 impl TaskCondition {
     pub fn evidence(&self) -> &ConditionEvidence {
@@ -577,6 +586,10 @@ impl ConditionFacts {
                 .as_ref()
                 .filter(|stored| stored.integration_reason().is_none())
                 .and_then(|stored| stored.integration_attempt().cloned()),
+            check: stored
+                .as_ref()
+                .and_then(|stored| stored.check_witness())
+                .map(|(wait, epoch)| (wait.clone(), epoch)),
             ..Self::default()
         };
         snapshot.refresh(c, &mut facts).await?;
@@ -733,6 +746,11 @@ impl ConditionFacts {
                 } => facts
                     .children
                     .push((task_id.clone(), status.clone(), *settled)),
+                ConditionWitness::Check { wait, epoch } => {
+                    if facts.check.replace((wait.clone(), *epoch)).is_some() {
+                        return None;
+                    }
+                }
             }
         }
         Some(facts)
@@ -794,6 +812,12 @@ impl ConditionFacts {
                 }
             }));
         }
+        if let Some(wait) = self.check_wait() {
+            witnesses.push(ConditionWitness::Check {
+                wait: wait.clone(),
+                epoch: self.epoch,
+            });
+        }
         witnesses
     }
     /// The condition these facts and the legacy fields state together.
@@ -807,13 +831,25 @@ impl ConditionFacts {
     /// a condition parks exactly where today's readers hold the Task.
     pub fn apply(&self, condition: TaskCondition) -> TaskCondition {
         let condition = self.apply_lifecycle(super::readers::apply_owner_park(
-            integration::without_reason(condition),
+            check::without_reason(integration::without_reason(condition)),
             self.owner_park.as_ref(),
         ));
-        match &self.integration {
+        let condition = match &self.integration {
             Some(reason) => integration::overlay(condition, reason, self.integration_handoff_ready),
             None => condition,
+        };
+        match self.check_wait() {
+            Some(wait) => check::overlay(condition, wait),
+            None => condition,
         }
+    }
+    /// The check the Task's current status entry waits on. One an earlier
+    /// entry asked for is nobody's wait, and neither is any on a settled Task.
+    pub(super) fn check_wait(&self) -> Option<&CheckWait> {
+        self.check
+            .as_ref()
+            .filter(|(_, epoch)| *epoch == self.epoch && self.terminal.is_none())
+            .map(|(wait, _)| wait)
     }
     fn apply_lifecycle(&self, mut condition: TaskCondition) -> TaskCondition {
         let exhausted = condition.budget_exhausted();

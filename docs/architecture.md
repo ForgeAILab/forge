@@ -7861,13 +7861,78 @@ then marked applied; a redelivered step returns `already_applied`. A crash
 between the family's write and that mark redelivers once more, so a family's
 `apply` is idempotent on `consumer_id`.
 
-**No family is registered yet, and no execution family requests the runner.**
-Merge-path and review-entry CI, manual `ReviewRunner`, conformance,
-before-work and other checks retain their current orchestration, limits and
-verdicts. The 3.2 integration queue stays inactive. Still pending: the typed
-Task conditions for a check wait, a check-slot wait and exhausted check
-retries (with their `is_blocked`, offer and dispatcher rules), the
-review-entry and merge-path cutovers, canonical PATH/HOME declaration and
+#### Typed check conditions (3.3 stage D part 1)
+
+A Task that asked for a check has a direct typed condition, stated with the
+3.2 A mechanism: a `check` witness on the stored condition, written under the
+Task's claimed step through `state_integration_condition_in_tx`
+(`ConditionStatement::Check` / `CheckCleared`). No legacy column or metadata
+marker is written, no version is bumped and no event is emitted. The reason is
+`ParkReason::Check { wait: { phase, consumer_id, origin } }`, public as
+`ConditionReason::Check`.
+
+| Phase | Entered by | `is_blocked` | Owner / recovery | Offers | Exit |
+|---|---|---|---|---|---|
+| `result` | `TaskCheckConsumers::request` (inside the asking step) | no | `check_runner` / `wait_for_check` | `cancel` | the delivery step applies the result (`CheckCleared`), or parks it as exhausted |
+| `slot` | the `apply_check_progress` step for the worker's slot-wait note; also `request` when it joins a run already queued behind a full machine | no | `check_runner` / `wait_for_check` | `cancel` | the slot frees: admission enqueues the `admitted` note and its step restates `result`; or the result itself arrives |
+| `infrastructure_exhausted` | the delivery step, when the answer is "no verdict after the automatic retries" | yes | `user` / `retry_check` | `retry` (reason `check_infrastructure_exhausted`), `cancel` | `retry`: the same consumer is re-armed with a fresh infrastructure budget (`rearm_exhausted_check_consumer`), the sweep's infrastructure retry schedules its run and the condition returns to `result`; `cancel` ends the status entry |
+
+Rules:
+
+- **The worker writes no condition.** A full machine is stated through a
+  progress step: `admit_check_run` enqueues one `apply_check_progress` Task
+  step per live consumer, in the admission transaction, the first time a run
+  is refused a slot (`capacity_wait_since` goes from NULL to set) and once more
+  when that run is admitted. The causation key is
+  `check-slot-wait:<consumer>:<run>` / `check-slot-freed:<consumer>:<run>`, so
+  a run is announced once per wait, not once per sweep. The step
+  (`TaskCheckConsumers::progress`) restates the wait only for the consumer and
+  authority still in charge; a note the answer overtook is `stale`.
+- **A wait belongs to the status entry that asked.** The witness records that
+  entry's epoch. Once the Task leaves it (sent back, cancelled, advanced) the
+  consumer is stale, and the next write of the Task drops the witness; nothing
+  has to clear it. A settled Task never carries one.
+- **Preservation.** Every other producer (legacy fields, hooks, executions,
+  budgets, remote cancellations, children, the full recompute and the
+  invariant repair) carries the witness. Another owner's park (a hold, a
+  blocked entry) stays primary with the check wait as an additional reason. A
+  consumer clears only its own wait: `CheckCleared` names the consumer and is
+  a no-op for any other.
+- **Dispatcher.** `next_step::check_decides` follows the integration rule: as
+  the primary reason, or behind a real owner blocker, the check wait decides
+  the Task's next step and parks it (`Worker` / `WaitForOwner`, or `User` /
+  `RetryChecks` when exhausted). It is never a dispatch, an entry-hooks replay,
+  a review-CI retry or a capacity-unpark demand, and reconciliation counts the
+  Task as owned. Under a self-clearing primary (capacity, dispatch refusal,
+  offline owner, environment) that primary keeps its own step.
+- **Requests come from the Task's step.** `TaskCheckConsumers::request` refuses
+  a caller outside the Task's claimed step: its wait could not be stated.
+- **One delivery per answer.** The delivery step's causation key is
+  `check-result:<consumer>:<result>`, so a consumer re-armed by `retry` is
+  answered again by its next result and never twice for one.
+- **Retry names the identity still in charge.** `retry_exhausted` re-arms the
+  consumer only while the family's `current_authority` is the one that asked.
+  When the candidate moved on inside the same status entry, the retry lifts
+  the stale park (`CheckCleared`) and runs nothing: the old commit is never
+  checked again, and the family in charge asks for its own identity. A
+  repeated `retry` (double click, redelivered step) re-arms nothing twice.
+- **One wait per status entry.** The condition holds a single check witness.
+  A later request in the same entry replaces it (that is how a newer attempt
+  takes over from a stale one), so a family must not keep two live consumers
+  for one Task entry at once: the second would hide the first, and its answer
+  would end the visible wait while the first is still running.
+- **Operator visibility.** `GET /api/v1/operations/status` lists every Task
+  parked as `infrastructure_exhausted` in `recent_errors` (entity type
+  `task_check_exhausted`, severity `attention`) until it is retried, cancelled
+  or leaves the status entry.
+
+**No production family is registered yet, and no execution family requests
+the runner.** Merge-path and review-entry CI, manual `ReviewRunner`,
+conformance, before-work and other checks retain their current inline
+orchestration, limits and verdicts; the conditions above are therefore
+produced only by tests until a family moves. The 3.2 integration queue stays
+inactive. Still pending: the review-entry cutover (3.3 stage D part 1, scope
+2), the merge-path cutover (3.2 D1b), canonical PATH/HOME declaration and
 managed-checkout/canonical-policy activation. Current owner dispatch uses the
 frozen legacy workspace policy and supplies no new server input attestation;
 configured checks remain uncacheable. A reusable result has no expiry: reuse

@@ -148,6 +148,37 @@ impl IntegrationReason {
     }
 }
 
+/// Where a Task's requested check stands. A slot wait and a result wait are
+/// owned work that ends on its own; exhausted infrastructure retries are not a
+/// verdict on the candidate and wait for `retry` or `cancel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum CheckWaitPhase {
+    /// The check is admitted (or about to be) and no result exists yet.
+    Result,
+    /// The checkout's machine has no free run slot for the check.
+    Slot,
+    /// The check produced no verdict after its automatic retries.
+    InfrastructureExhausted,
+}
+/// The check a Task waits on, named by the consumer that asked for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct CheckWait {
+    pub phase: CheckWaitPhase,
+    /// Opaque identity of the Task's request for this check.
+    pub consumer_id: String,
+    /// The family that asked: `entry`, `integration`, ...
+    pub origin: String,
+}
+impl CheckWait {
+    pub fn requires_intervention(&self) -> bool {
+        self.phase == CheckWaitPhase::InfrastructureExhausted
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[ts(tag = "kind", rename_all = "snake_case")]
@@ -303,6 +334,13 @@ pub enum ConditionReason {
         definition_digest: String,
         cause: String,
     },
+    // --- durable check runner (plan 3.3 stage D) ---
+    /// The Task waits on a durable check run: for its result, for a slot on
+    /// the checkout's machine, or parked after the automatic infrastructure
+    /// retries were used up.
+    Check {
+        wait: CheckWait,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -386,6 +424,8 @@ pub enum ConditionOwner {
     Workflow,
     Machine,
     Scheduler,
+    // --- durable check runner (plan 3.3 stage D) ---
+    CheckRunner,
 }
 
 /// Recovery guidance for an owner park, separate from authorized Task offers.
@@ -397,6 +437,9 @@ pub enum ConditionRecovery {
     RepairIntegration,
     EditWorkflow,
     ReconcileEntry,
+    // --- durable check runner (plan 3.3 stage D) ---
+    WaitForCheck,
+    RetryCheck,
 }
 
 impl TaskCondition {

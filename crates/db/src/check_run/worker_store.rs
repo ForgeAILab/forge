@@ -162,6 +162,12 @@ impl CheckWorkerRepo for SqliteDb {
         if current.version != run.version || current.state != CheckRunState::Queued {
             return Err(DbError::VersionConflict);
         }
+        // Whether this run already told its consumers it waits for a slot.
+        let waited: bool =
+            sqlx::query_scalar("SELECT capacity_wait_since IS NOT NULL FROM check_run WHERE id=?")
+                .bind(&run.id)
+                .fetch_one(&mut *tx)
+                .await?;
         let embedded = self.server_run_cap.embedded_machine_id();
         let (machine, cap, removed) = if let Some(id) = run.machine_id.as_deref() {
             let row: Option<(String, Option<i64>, Option<u32>, Option<String>)> = sqlx::query_as(
@@ -206,8 +212,19 @@ impl CheckWorkerRepo for SqliteDb {
                 )
                 .await?
             {
+                // The first refusal of this run starts its one slot wait: its
+                // consumers' Tasks are told once, not on every sweep.
                 sqlx::query("UPDATE check_run SET capacity_wait_since=COALESCE(capacity_wait_since,?),version=version+1,updated_at=? WHERE id=? AND version=? AND state='queued'").bind(now).bind(now).bind(&run.id).bind(run.version).execute(&mut *tx).await?;
+                let told = if !waited {
+                    enqueue_check_progress_in_tx(self, &mut tx, &run.id, CheckProgress::SlotWait)
+                        .await?
+                } else {
+                    0
+                };
                 tx.commit().await?;
+                if told != 0 {
+                    self.domain_event_notify().notify_waiters();
+                }
                 return Ok(CheckAdmission::Waiting);
             }
         }
@@ -216,8 +233,17 @@ impl CheckWorkerRepo for SqliteDb {
         .to_rfc3339();
         let row=sqlx::query("UPDATE check_run SET state='running',lease_owner=?,lease_until=?,lease_generation=lease_generation+1,version=version+1,updated_at=?,admitted_at=?,deadline_at=?,capacity_wait_since=NULL WHERE id=? AND version=? AND state='queued' RETURNING *")
             .bind(owner).bind(until).bind(now).bind((!removed && !expired).then_some(now)).bind(deadline).bind(&run.id).bind(run.version).fetch_optional(&mut *tx).await?.ok_or(DbError::VersionConflict)?;
+        // A run that waited for its slot tells its consumers the wait ended.
         let run = map_run(row)?;
+        let told = if waited && !removed && !expired {
+            enqueue_check_progress_in_tx(self, &mut tx, &run.id, CheckProgress::Admitted).await?
+        } else {
+            0
+        };
         tx.commit().await?;
+        if told != 0 {
+            self.domain_event_notify().notify_waiters();
+        }
         Ok(CheckAdmission::Admitted(Box::new(run)))
     }
     async fn runnable_check_runs(&self, now: &str, limit: i64) -> Result<Vec<StoredCheckRun>> {

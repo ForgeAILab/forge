@@ -279,6 +279,39 @@ impl OperatorStatusService {
             });
         }
 
+        // A Task parked because its checks produced no verdict is an
+        // infrastructure problem the operator must see: it is not a failure
+        // of the change, and only `retry` or `cancel` ends it.
+        for row in sqlx::query(
+            "SELECT id, title, condition_json, updated_at FROM task
+             WHERE condition_json LIKE '%infrastructure_exhausted%'
+               AND deleted_at IS NULL AND archived_at IS NULL
+               AND status NOT IN ('done', 'cancelled')
+             ORDER BY updated_at DESC, id ASC LIMIT 50",
+        )
+        .fetch_all(self.db.pool())
+        .await?
+        {
+            let condition =
+                db::task_condition::decode_or_unknown(&row.try_get::<String, _>("condition_json")?);
+            if !condition
+                .check_wait()
+                .is_some_and(|wait| wait.requires_intervention())
+            {
+                continue;
+            }
+            recent_errors.push(RecentErrorSummary {
+                entity_type: "task_check_exhausted".to_owned(),
+                entity_id: row.try_get("id")?,
+                error: format!(
+                    "Checks for Task \"{}\" produced no result after the automatic retries. Retry the Task's checks or cancel it",
+                    row.try_get::<String, _>("title")?
+                ),
+                occurred_at: row.try_get("updated_at")?,
+                severity: OperatorSeverity::Attention,
+            });
+        }
+
         let event_relay = self.event_relay_status().await?;
         // A process that declares the relay but has not attached one (a
         // service built without the runtime) has nothing to report on.
