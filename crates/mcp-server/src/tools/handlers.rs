@@ -18,11 +18,18 @@ use db::{
     AgentChatTurnJob, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
     AgentHandoffStatus as DbHandoffStatus, AgentListQuery, AgentProfileRepo, AgentRepo,
     AgentSessionRepo, CreateAccountMainAgentBinding, CreateProject, ExecutionRepo,
-    MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
-    ProjectRepo, ReplaceAccountMainAgentBinding, SortBy, SortOrder, TaskDependencyRepo,
-    TaskListQuery, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateTask, UserRepo,
+    MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectRepo,
+    ReplaceAccountMainAgentBinding, SortBy, SortOrder, TaskDependencyRepo, TaskListQuery, TaskRepo,
+    TaskRoleAssignmentRepo, UpdateProject, UpdateTask, UserRepo,
 };
 use executors::ExecutionOverrides;
+use operation_registry::mcp::{
+    BindMainAgentParams, BindProjectAgentParams, CreateAgentHandoffParams, CreateProjectParams,
+    GetAgentChatParams, GetAgentHandoffParams, GetAgentSessionParams, GetMainAgentParams,
+    GetProjectAgentParams, ListAgentChatMessagesParams, ListAgentChatsParams,
+    ListAgentHandoffsParams, ListAgentProfilesParams, ListAgentSessionsParams, ListAgentsParams,
+    ListProjectsParams, RegisterAgentParams, SendAgentChatMessageParams,
+};
 use serde_json::{json, Map, Value};
 use services::{
     workflow::engine::WorkflowEngine, DiffService, MemoryAccessContext, MemorySearchResult,
@@ -34,16 +41,11 @@ use crate::{
     error::McpToolError,
     params::{
         page_request, parse_params, task_page_request, AddTaskDependencyParams, AssignAgentParams,
-        BindMainAgentParams, BindProjectAgentParams, CreateAgentHandoffParams, CreateProjectParams,
-        CreateSubTasksParams, CreateTaskParams, GetAgentChatParams, GetAgentHandoffParams,
-        GetAgentSessionParams, GetProjectAgentParams, GetProjectParams, GetTaskParams,
-        ListAgentChatMessagesParams, ListAgentChatsParams, ListAgentHandoffsParams,
-        ListAgentProfilesParams, ListAgentSessionsParams, ListAgentsParams, ListExecutionsParams,
-        ListProjectsParams, ListSubTasksParams, ListTaskDependenciesParams, ListTasksParams,
-        MemoryGetParams, MemorySearchParams, PreviewPromptParams, RegisterAgentParams,
-        RemoveTaskDependencyParams, ReorderSubTasksParams, SendAgentChatMessageParams,
-        TransitionTaskParams, UpdateProjectLifecycleHooksParams, UpdateProjectParams,
-        UpdateTaskParams,
+        CreateSubTasksParams, CreateTaskParams, GetProjectParams, GetTaskParams,
+        ListExecutionsParams, ListSubTasksParams, ListTaskDependenciesParams, ListTasksParams,
+        MemoryGetParams, MemorySearchParams, PreviewPromptParams, RemoveTaskDependencyParams,
+        ReorderSubTasksParams, TransitionTaskParams, UpdateProjectLifecycleHooksParams,
+        UpdateProjectParams, UpdateTaskParams,
     },
     protocol::McpContext,
     state::AppState,
@@ -803,13 +805,13 @@ async fn transition_task_value(
 
 pub(super) async fn forge_register_agent(
     state: &AppState,
-    params: Value,
+    params: RegisterAgentParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
-    let params: RegisterAgentParams = parse_params(params)?;
     let user = authenticated_user_record(state, context).await?;
     let is_admin = user.is_admin;
+    // Effect-time re-check of the registry's conditional field authority:
+    // the administrator flag is read again here, next to the write.
     if !is_admin && params.daemon_id.is_some() {
         return Err(
             McpToolError::new(-32003, "Admin access required to pin an agent to a daemon")
@@ -829,7 +831,7 @@ pub(super) async fn forge_register_agent(
             "[]".to_owned(),
             "{}".to_owned(),
             None,
-            params.daemon_id.filter(|_| is_admin),
+            params.daemon_id,
             None,
             None,
             None,
@@ -843,17 +845,19 @@ pub(super) async fn forge_register_agent(
 
 pub(super) async fn forge_list_agents(
     state: &AppState,
-    params: Value,
+    params: ListAgentsParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
-    let params: ListAgentsParams = parse_params(params)?;
     let user = authenticated_user_record(state, context).await?;
     let page = AgentRepo::list_visible(
         &*state.db,
         &user.id,
         AgentListQuery {
-            status: params.status.map(Into::into),
+            status: params
+                .status
+                .map(|value| value.parse::<db::AgentStatus>())
+                .transpose()
+                .map_err(|error| McpToolError::new(-32602, error))?,
             executor_type: None,
             capabilities: Vec::new(),
             page: page_request(params.cursor, params.limit, None)?,
@@ -865,10 +869,9 @@ pub(super) async fn forge_list_agents(
 
 pub(super) async fn forge_list_projects(
     state: &AppState,
-    params: Value,
+    params: ListProjectsParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: ListProjectsParams = parse_params(params)?;
     if let Some(project_id) = context.project_id.as_deref() {
         let page = state
             .db
@@ -891,12 +894,10 @@ pub(super) async fn forge_list_projects(
 
 pub(super) async fn forge_create_project(
     state: &AppState,
-    params: Value,
+    params: CreateProjectParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
     let user = authenticated_user_record(state, context).await?;
-    let params: CreateProjectParams = parse_params(params)?;
     if params.name.trim().is_empty() {
         return Err(McpToolError::new(-32602, "name must not be empty"));
     }
@@ -1339,11 +1340,9 @@ pub(super) async fn forge_reorder_sub_tasks(
 
 pub(super) async fn forge_list_agent_profiles(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: ListAgentProfilesParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: ListAgentProfilesParams = parse_params(params)?;
-    require_owned_identity(state, context, &params.identity_id).await?;
     let profiles = AgentProfileRepo::list_profiles(&*state.db, &params.identity_id).await?;
     Ok(json!({
         "items": profiles.into_iter().map(agent_profile_value).collect::<Vec<_>>(),
@@ -1352,11 +1351,9 @@ pub(super) async fn forge_list_agent_profiles(
 
 pub(super) async fn forge_list_agent_sessions(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: ListAgentSessionsParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: ListAgentSessionsParams = parse_params(params)?;
-    require_owned_identity(state, context, &params.identity_id).await?;
     let sessions = AgentSessionRepo::list_agent_sessions(&*state.db, &params.identity_id).await?;
     Ok(json!({
         "items": sessions.into_iter().map(agent_session_value).collect::<Vec<_>>(),
@@ -1365,23 +1362,20 @@ pub(super) async fn forge_list_agent_sessions(
 
 pub(super) async fn forge_get_agent_session(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: GetAgentSessionParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let params: GetAgentSessionParams = parse_params(params)?;
     let session = AgentSessionRepo::get_agent_session(&*state.db, &params.session_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("agent_session", params.session_id.clone()))?;
-    require_owned_identity(state, context, &session.identity_id).await?;
     Ok(agent_session_value(session))
 }
 
 pub(super) async fn forge_get_main_agent(
     state: &AppState,
-    _params: Value,
+    _params: GetMainAgentParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
     let user_id = authenticated_user(context)?;
     let binding = AccountMainAgentBindingRepo::get_active_main_binding(&*state.db, user_id)
         .await?
@@ -1395,13 +1389,16 @@ pub(super) async fn forge_get_main_agent(
 
 pub(super) async fn forge_set_main_agent(
     state: &AppState,
-    params: Value,
+    params: BindMainAgentParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    require_account_scope(context)?;
     let user_id = authenticated_user(context)?;
-    let params: BindMainAgentParams = parse_params(params)?;
-    let identity = require_owned_identity_for_user(state, user_id, &params.identity_id).await?;
+    // Effect-time ownership re-check on the decoded identity. A missing and
+    // a foreign identity are the same answer.
+    let identity = AgentRepo::get_by_id(&*state.db, &params.identity_id)
+        .await?
+        .filter(|identity| identity.owner_id.as_deref() == Some(user_id))
+        .ok_or_else(|| McpToolError::not_found("agent_identity", params.identity_id.clone()))?;
     let now = now_rfc3339();
     let replacement = CreateAccountMainAgentBinding {
         id: new_uuid_v4(),
@@ -1447,12 +1444,9 @@ pub(super) async fn forge_set_main_agent(
 
 pub(super) async fn forge_get_project_agent(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: GetProjectAgentParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: GetProjectAgentParams = parse_params(params)?;
-    require_project_member(state, &params.project_id, user_id).await?;
     let binding =
         ProjectAgentBindingRepo::get_active_project_binding(&*state.db, &params.project_id)
             .await?
@@ -1468,12 +1462,10 @@ pub(super) async fn forge_get_project_agent(
 
 pub(super) async fn forge_set_project_agent(
     state: &AppState,
-    params: Value,
+    params: BindProjectAgentParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: BindProjectAgentParams = parse_params(params)?;
-    require_project_admin(state, &params.project_id, user_id).await?;
     if params.wake_budget < 0 {
         return Err(invalid_field_error(
             "wake_budget",
@@ -1508,11 +1500,10 @@ pub(super) async fn forge_set_project_agent(
 
 pub(super) async fn forge_list_agent_chats(
     state: &AppState,
-    params: Value,
+    params: ListAgentChatsParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: ListAgentChatsParams = parse_params(params)?;
     let _ = (params.cursor, params.limit);
     let chats = AgentChatRepo::list_agent_chats(&*state.db, user_id)
         .await?
@@ -1532,16 +1523,14 @@ pub(super) async fn forge_list_agent_chats(
 
 pub(super) async fn forge_get_agent_chat(
     state: &AppState,
-    params: Value,
+    params: GetAgentChatParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: GetAgentChatParams = parse_params(params)?;
     let chat = state
         .agent_chat_service
         .get_authorized_chat(user_id, &params.chat_id)
         .await?;
-    ensure_chat_scope(context, &chat)?;
     let main_binding = if chat.kind == "account_main" {
         AccountMainAgentBindingRepo::get_active_main_binding(&*state.db, user_id)
             .await?
@@ -1567,16 +1556,9 @@ pub(super) async fn forge_get_agent_chat(
 
 pub(super) async fn forge_list_agent_chat_messages(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: ListAgentChatMessagesParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: ListAgentChatMessagesParams = parse_params(params)?;
-    let chat = state
-        .agent_chat_service
-        .get_authorized_chat(user_id, &params.chat_id)
-        .await?;
-    ensure_chat_scope(context, &chat)?;
     let page = AgentChatMessageRepo::list_agent_chat_messages(
         &*state.db,
         AgentChatMessageListQuery {
@@ -1605,11 +1587,10 @@ pub(super) async fn forge_list_agent_chat_messages(
 
 pub(super) async fn forge_send_agent_chat_message(
     state: &AppState,
-    params: Value,
+    params: SendAgentChatMessageParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: SendAgentChatMessageParams = parse_params(params)?;
     if params
         .dedupe_key
         .as_deref()
@@ -1621,11 +1602,6 @@ pub(super) async fn forge_send_agent_chat_message(
             Some(json!({ "type": "string", "non_empty": true })),
         ));
     }
-    let chat = state
-        .agent_chat_service
-        .get_authorized_chat(user_id, &params.chat_id)
-        .await?;
-    ensure_chat_scope(context, &chat)?;
     let admitted = state
         .agent_chat_service
         .send_message(services::SendAgentChatMessageInput {
@@ -1643,14 +1619,11 @@ pub(super) async fn forge_send_agent_chat_message(
 
 pub(super) async fn forge_list_agent_handoffs(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: ListAgentHandoffsParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: ListAgentHandoffsParams = parse_params(params)?;
     let project_id = params.project_id;
     let _ = (params.cursor, params.limit);
-    require_project_member(state, &project_id, user_id).await?;
     let chat = AgentChatRepo::get_project_chat(&*state.db, &project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("agent_chat", project_id.clone()))?;
@@ -1665,18 +1638,12 @@ pub(super) async fn forge_list_agent_handoffs(
 
 pub(super) async fn forge_get_agent_handoff(
     state: &AppState,
-    params: Value,
-    context: &McpContext,
+    params: GetAgentHandoffParams,
+    _context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let user_id = authenticated_user(context)?;
-    let params: GetAgentHandoffParams = parse_params(params)?;
     let handoff = AgentHandoffRepo::get_agent_handoff(&*state.db, &params.handoff_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("agent_handoff", params.handoff_id.clone()))?;
-    let target = authorized_chat(state, user_id, &handoff.target_chat_id).await?;
-    if target.project_id.as_deref() != Some(params.project_id.as_str()) {
-        return Err(McpToolError::not_found("agent_handoff", params.handoff_id));
-    }
     Ok(serialize_public(handoff_response(
         handoff,
         params.project_id,
@@ -1685,11 +1652,10 @@ pub(super) async fn forge_get_agent_handoff(
 
 pub(super) async fn forge_create_agent_handoff(
     state: &AppState,
-    params: Value,
+    params: CreateAgentHandoffParams,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
-    let params: CreateAgentHandoffParams = parse_params(params)?;
     let project_id = params.project_id.clone();
     if params.dedupe_key.trim().is_empty() {
         return Err(invalid_field_error(
@@ -1698,7 +1664,6 @@ pub(super) async fn forge_create_agent_handoff(
             Some(json!({ "type": "string", "non_empty": true })),
         ));
     }
-    require_project_member(state, &project_id, user_id).await?;
     let source = state.agent_chat_service.ensure_main_chat(user_id).await?;
     let outcome = state
         .agent_chat_service
@@ -1735,129 +1700,6 @@ async fn authenticated_user_record(
     UserRepo::get_user_by_id(&*state.db, user_id)
         .await?
         .ok_or_else(|| McpToolError::new(-32001, "authenticated MCP user is required"))
-}
-
-async fn require_owned_identity(
-    state: &AppState,
-    context: &McpContext,
-    identity_id: &str,
-) -> Result<db::Agent, McpToolError> {
-    let actor_user_id = authenticated_user(context)?;
-    let identity = AgentRepo::get_by_id(&*state.db, identity_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("agent_identity", identity_id.to_owned()))?;
-    if identity.owner_id.as_deref() != Some(actor_user_id) {
-        // Do not reveal whether another account owns the identity.
-        return Err(McpToolError::not_found(
-            "agent_identity",
-            identity_id.to_owned(),
-        ));
-    }
-    Ok(identity)
-}
-
-async fn require_owned_identity_for_user(
-    state: &AppState,
-    user_id: &str,
-    identity_id: &str,
-) -> Result<db::Agent, McpToolError> {
-    require_owned_identity(
-        state,
-        &McpContext {
-            project_id: None,
-            user_id: Some(user_id.to_owned()),
-        },
-        identity_id,
-    )
-    .await
-}
-
-fn require_account_scope(context: &McpContext) -> Result<(), McpToolError> {
-    if context.project_id.is_some() {
-        return Err(McpToolError::new(
-            -32001,
-            "account-level Agent binding is unavailable in a project-scoped MCP session",
-        ));
-    }
-    Ok(())
-}
-
-fn ensure_chat_scope(context: &McpContext, chat: &AgentChat) -> Result<(), McpToolError> {
-    let Some(project_id) = context.project_id.as_deref() else {
-        return Ok(());
-    };
-    if chat.kind != "project" || chat.project_id.as_deref() != Some(project_id) {
-        return Err(McpToolError::new(
-            -32602,
-            "Agent Chat is outside the scoped MCP project",
-        ));
-    }
-    Ok(())
-}
-
-async fn require_project_member(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> Result<(), McpToolError> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user_id) {
-        return Ok(());
-    }
-    if ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .is_some()
-    {
-        return Ok(());
-    }
-    Err(McpToolError::new(-32001, "project not accessible"))
-}
-
-async fn require_project_admin(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> Result<(), McpToolError> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user_id) {
-        return Ok(());
-    }
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| McpToolError::new(-32001, "project not accessible"))?;
-    if member.role != "owner" && member.role != "admin" {
-        return Err(McpToolError::new(
-            -32001,
-            "project owner or admin role is required",
-        ));
-    }
-    Ok(())
-}
-
-async fn authorized_chat(
-    state: &AppState,
-    user_id: &str,
-    chat_id: &str,
-) -> Result<AgentChat, McpToolError> {
-    let chat = AgentChatRepo::get_agent_chat(&*state.db, chat_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("agent_chat", chat_id.to_owned()))?;
-    match chat.kind.as_str() {
-        "account_main" if chat.account_id.as_deref() == Some(user_id) => Ok(chat),
-        "project" => {
-            let project_id = chat
-                .project_id
-                .as_deref()
-                .ok_or_else(|| McpToolError::not_found("agent_chat", chat_id.to_owned()))?;
-            require_project_member(state, project_id, user_id).await?;
-            Ok(chat)
-        }
-        _ => Err(McpToolError::not_found("agent_chat", chat_id.to_owned())),
-    }
 }
 
 fn setup_required(message: &str) -> McpToolError {

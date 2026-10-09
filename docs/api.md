@@ -1077,10 +1077,10 @@ mutation.
 
 The Main-only native `genesis.start` operation is a direct typed proposal under
 the account/Main Chat scope and requires `propose_discovery`. Its payload is
-closed: `action` must be `"start"`, with optional `maturity` and
-`preferred_project_agent_identity_id`. It deliberately accepts no account,
-chat, source-message, source-turn, or initial-idea authority; Forge derives those
-from the leased Main turn. The operation is absent from Project Agent, Worker,
+closed: optional `maturity` and `preferred_project_agent_identity_id`. `action`
+is not required; it and `initial_idea` are accepted and discarded. No account,
+chat, source-message, source-turn, or initial-idea value in the payload has any
+authority; Forge derives those from the leased Main turn. The operation is absent from Project Agent, Worker,
 and reviewer catalogs. Starting discovery is not Charter approval and does not
 create a Project.
 
@@ -4700,7 +4700,8 @@ field and the expected contract, for example ``skill.section: argument
 `section` is required; expected skill.section: {section: one of ...}``. The
 remaining read operations retain their current schemas and validation.
 Provider-wrapped `parameters` calls still normalize before validation. MCP
-schemas are unchanged.
+Task/Project schemas remain unchanged; the account, identity and Chat MCP
+projection below derives schemas and strict typed decoding from the registry.
 
 Native agent tools return domain failures in-band as the structured tool value
 with the runtime error marker (`is_error: true`), so the model can branch on
@@ -4848,6 +4849,69 @@ continuation cursor; account grants retain the account-visible listing.
 Project/Chat/handoff/Task references remain restricted to that same bound
 Project. The credential acts as the authenticated delegated user, not the
 bound Project Agent.
+
+The account, identity, Agent binding, Chat and handoff tools use typed contracts
+in `operation-registry::mcp`. Each description is one generated summary line
+with the admitted fields. Names and result shapes are unchanged. Unknown fields
+on these 18 tools map to one `-32602` contract error. The in-band result has
+`structuredContent.code = "validation_error"` and bounded `details` carrying
+`code = "mcp_contract_invalid"`, the operation name and the expected contract. A
+mistyped value is described by its JSON type and never quoted back. Arguments
+must be a JSON object. The
+registry checks delegated authority before reporting contract details. Required
+integer arguments retain MCP's strict JSON integer spelling; native integer
+coercions do not apply.
+
+The same evaluator determines the moved tools' connection-level advertisement
+and call admission. For a Project-constrained grant it loads the bound Project's
+current role on each list/call; a global administrator does not acquire a Project
+role through that status alone:
+
+| Grant / role | Moved tools offered |
+|---|---|
+| Account grant | All 18 names; each referenced identity, Project, Chat and handoff is authorized on call |
+| Project owner or Project `owner` / `admin` member | All ten Project-classified moved tools |
+| Project ordinary member | Those ten except `forge_set_project_agent` |
+| Visible Project without owner/member authority | `forge_list_projects`, `forge_list_agent_chats` |
+| Project not visible to the user | No moved tools |
+
+The eight account-wide names above are never offered to a constrained grant.
+For an account grant, the referenced Project determines member/owner/admin
+permissions; an authorized reference is still required even though the tool
+name is offered. `forge_register_agent.daemon_id` advertises nullable strings to
+account administrators and only the existing null no-op to other users.
+Its conditional field authority is also evaluated before
+contract decoding; a non-null value from a non-admin still returns `-32003`
+`admin_required`. A null or omitted daemon field retains its former meaning.
+The 24 unmoved Task/Project descriptors and their grant filtering retain the
+base behavior, including `forge_project_escalate`'s separate owner check.
+
+A role denial on a moved tool is `-32001` with `data.code = "mcp_scope_denied"`
+for both grant kinds. A reference the user may not use answers exactly like a
+missing one: an identity or session of another account is `-32004`
+(`agent_identity not found` / `agent_session not found`, naming only the id
+that was sent), and a handoff of another Project is `-32004`
+`agent_handoff not found`. `forge_set_main_agent` re-reads identity ownership
+and `forge_register_agent` re-reads the administrator flag in the handler,
+next to the write; the Chat service re-checks Project role for
+`forge_set_project_agent` and Chat access for `forge_send_agent_chat_message`.
+
+Fields that were silently ignored before and are now refused as undeclared:
+`project_id` on `forge_list_projects`, `forge_list_agent_chats`,
+`forge_get_agent_chat`, `forge_list_agent_chat_messages`,
+`forge_send_agent_chat_message` and the eight account-wide tools; `cursor` /
+`limit` on `forge_list_agent_profiles`, `forge_list_agent_sessions` and
+`forge_get_agent_session`; `executor_type` / `capabilities` on
+`forge_list_agents`; any argument on `forge_get_main_agent`.
+
+The generated schemas now describe accepted nullable optional strings/integers,
+opaque JSON `autonomy_policy` and `permission_ceiling` values, and registration's
+executor string rather than its incomplete executor enum. Domain rules still
+refuse protected embedded registration and malformed permission documents.
+`forge_set_project_agent.wake_budget` advertises and enforces its existing
+non-negative constraint. `forge_list_agent_chats` and
+`forge_list_agent_handoffs` retain their reserved, ignored `cursor` / `limit`
+fields and return all authorized records, with their existing result shapes.
 
 `forge_get_project` and `forge_list_projects` expose the current Project
 `version`. Both `forge_update_project` and
@@ -5548,3 +5612,45 @@ setup completes name `charter_adoption_not_applicable`.
 These changes affect native tool contracts and agent-action admission; REST
 resource shapes and MCP projections are unchanged. Charter adoption, evidence
 and readiness retain their hand paths in this slice.
+
+
+### Native Main command contracts (3.8 E2)
+
+`charter.draft` and `genesis.start` use registry-generated contracts on the same
+native Main proposal tool. The public REST request/response types and MCP
+projections are unchanged. Main binding and domain authorization retain the base
+behavior: `project.create` and Project-Agent selection keep `main_account_id`,
+and the two direct commands keep `authorize_current_principal` for fresh effects.
+An owned former Main identity can replay its exact receipt but cannot issue a
+fresh command.
+
+The transport-only `action` is ignored and no longer required or advertised.
+Genesis accepts optional nullable `maturity` and
+`preferred_project_agent_identity_id`; its user idea and source message/turn are
+server-derived, and a caller's `initial_idea` is accepted and discarded as it was
+before. Main draft declares every field its command reads, including the
+previously unadvertised `genesis_session_id`, `expected_charter_version`,
+`change_summary`, `source_refs`, `content_digest` and `render_digest`. Its
+advertised line still spells out every Charter section and the provenance
+object, now generated from the registry schema; those nested types are checked
+at registry decode. Every field either command accepted before is still
+accepted. A field or envelope violation produces one correction naming the
+operation, field and contract line, after current authority and forged-scope
+checks. Integer spellings normalize as for other registered operations;
+`payload: null` is read as `{}`. Payloads retain the 65,536 serialized UTF-8
+byte ceiling. Native preparation still drops caller renderer fields, while
+direct command adapters retain their existing round-trip validation.
+
+Main tool definitions are 8,551 bytes (8,558 before), Inquiry 3,971 (4,089),
+Project 23,870 (24,252), Project verification 25,119 (25,501) and Project setup
+15,517 (15,766).
+
+Pending proposals advertise their contract once, without registered root field
+aliases. Existing flat inputs still normalize from canonical registry field
+names: arguments are normalized before the tool schema is applied, and no
+provider request marks these tools strict. A `project.release.request` refused
+for a missing permission is recorded as a `denied` agent action, like the
+pending proposals. Task payload declarations and legacy pending materialization are unchanged.
+Charter adoption and evidence remain on their hand paths because their historical
+receipt retrieval after pause/ceiling changes would be narrowed by registry
+admission. Readiness also remains on its hand path.

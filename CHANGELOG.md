@@ -18,6 +18,50 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   integration intents and attempt receipts, are read unchanged. No check
   timeout changed: review-entry CI, manual review CI and the merge-path
   check keep the limits they had (none for a whole run).
+- **Eighteen MCP account, identity, binding, Chat and handoff tools refuse
+  undeclared arguments (3.8 slice G).** `forge_register_agent`,
+  `forge_list_agents`, `forge_list_projects`, `forge_create_project`,
+  `forge_list_agent_profiles`, `forge_list_agent_sessions`,
+  `forge_get_agent_session`, `forge_get_main_agent`, `forge_set_main_agent`,
+  `forge_get_project_agent`, `forge_set_project_agent`,
+  `forge_list_agent_chats`, `forge_get_agent_chat`,
+  `forge_list_agent_chat_messages`, `forge_send_agent_chat_message`,
+  `forge_list_agent_handoffs`, `forge_get_agent_handoff` and
+  `forge_create_agent_handoff` used to ignore any field they did not read.
+  They now answer `-32602` with `data.code = "mcp_contract_invalid"`, the
+  operation and the expected fields. Fields a client may have been sending
+  that are now refused: `project_id` on `forge_list_projects`,
+  `forge_list_agent_chats`, `forge_get_agent_chat`,
+  `forge_list_agent_chat_messages`, `forge_send_agent_chat_message` and the
+  eight account-wide tools (it was never read there, also with a
+  Project-constrained credential); `cursor` and `limit` on
+  `forge_list_agent_profiles`, `forge_list_agent_sessions` and
+  `forge_get_agent_session`; `executor_type` and `capabilities` filters on
+  `forge_list_agents`; any argument on `forge_get_main_agent`. Every field the
+  old schemas advertised is still accepted, including the reserved, ignored
+  `cursor` / `limit` on `forge_list_agent_chats` and
+  `forge_list_agent_handoffs`, `null` for every optional string or integer,
+  and strict JSON integers (a numeric string was already refused).
+- **A Project-constrained MCP credential is offered only the moved tools its
+  Project role can use (3.8 slice G).** `forge_set_project_agent` is absent
+  from `tools/list` for an ordinary member; without owner or member authority
+  in the bound Project only `forge_list_projects` and `forge_list_agent_chats`
+  remain of the ten Project-classified moved tools. A call to an omitted tool
+  is refused with `-32001` and `data.code = "mcp_scope_denied"`. These calls
+  were already refused, later and with other codes (`project not accessible`,
+  `project owner or admin role is required`); nothing that worked is removed.
+- **Role and ownership denials on the moved MCP tools precede argument
+  diagnostics and use one code (3.8 slice G).** With an account credential, a
+  Project the user holds no role in answers `forge_get_project_agent`,
+  `forge_set_project_agent` and the three handoff tools with `-32001`
+  `mcp_scope_denied` (previously `-32001` with a role-specific message), and a
+  malformed call to a Project, identity, Chat or handoff the user cannot use
+  gets the denial instead of the `-32602` field error.
+  `forge_get_agent_handoff` answers a handoff of another Project with
+  `-32004` not found, as for a missing one (previously `-32001`, which
+  revealed that it exists). `forge_get_agent_session` answers another
+  account's session as `agent_session not found: <the id sent>` instead of
+  naming that account's identity id.
 
 - **Registered native Project calls refuse undeclared fields (3.8 slice E).**
   `project.current_state`, `project.observations`, `project.review_config`,
@@ -44,6 +88,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - **A Project Agent cannot queue `project.create` (3.8 slice E).** The
   agent-action policy refuses it from a Project scope or Project Chat, where
   it was never offered; it used to be queued for approval.
+- **Native `charter.draft` and `genesis.start` answer a malformed call
+  differently (3.8 slice E2).** Both Main commands are checked against one
+  registry contract. Every field either command accepted before is still
+  accepted, so a call that worked keeps working. A call with an unknown
+  payload or envelope field, which used to return a `validation_error`
+  outcome, now returns one tool error naming the operation, the field and the
+  expected contract, and the caller's authority is checked before its payload.
+  The `action` discriminator is no longer required or advertised: a call
+  without it used to be refused, and one that still sends it is accepted
+  whatever its value.
 - **Daemon protocol revision 4 (3.2 stage C, part 2b).** Workspace mutation
   and reconciliation messages now carry a required tagged `integration`
   binding (`task_step`, `task_step_effect` or `attempt`), and merge / rebase
@@ -698,6 +752,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   outcome, owner and input identity) and can run a commit-scoped check in a
   managed exact-commit checkout. Nothing uses either yet: no check is
   cached, deduplicated or moved to the managed checkout in this release.
+- **MCP account, identity, binding, Chat and handoff tools are generated from
+  registry contracts (3.8 slice G).** The 18 tools listed under Breaking take
+  their descriptor, typed decoder, required role and resource rule from
+  `operation-registry::mcp`; names, argument names, results and effects are
+  unchanged. `tools/list` is built per connection with the evaluator that
+  admits the call. Descriptions are one generated line with the fields, and
+  `required` arrays are sorted. The other 24 MCP tools are listed and handled
+  exactly as before.
 
 - **Project operations and pending proposals use generated registry contracts
   (3.8 slice E).** Two Project reads, seven Project proposals and six pending
@@ -715,6 +777,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   milestone and validation fields that stay accepted), Project setup 15,572
   to 15,766 (the pending `message.send` contract line and its `body` /
   `content` aliases).
+
+- **The two Main direct commands use generated registry contracts (3.8
+  slice E2).** `charter.draft` and `genesis.start` moved from hand-written
+  branches and schemas to the operation registry; domain authorization,
+  receipts and replay are unchanged, including replay of receipts written
+  before this change. The Charter draft line is generated from the registry
+  schema and still spells out every Charter section and the provenance
+  object; it now also names six fields the command always read
+  (`genesis_session_id`, `expected_charter_version`, `change_summary`,
+  `source_refs`, `content_digest`, `render_digest`). `genesis.start` still
+  accepts and discards `initial_idea`. The pending proposals no longer
+  declare their fields a second time at the root of `forge_scope_propose`;
+  flat calls are still accepted. The orchestration tools state their purpose
+  in one sentence. Tool definitions: Main 8,558 to 8,551 bytes, Inquiry 4,089
+  to 3,971, Project 24,252 to 23,870, Project verification 25,501 to 25,119,
+  Project setup 15,766 to 15,517. `project.charter.adoption`,
+  `project.evidence` and `project.readiness` keep their hand paths.
 
 - **Authority is resolved once per turn and pinned (3.8 slice D).** A native
   or CLI turn fixes its Agent Profile and permission ceiling at admission.
@@ -1599,10 +1678,28 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   seconds after the step's shell exits, as a daemon already did, and the
   step keeps its exit status. A step stopped by its deadline has its whole
   process group stopped (SIGTERM, 500 ms, SIGKILL), not only the shell.
+- **Moved MCP schemas advertise what the handlers accept (3.8 slice G).**
+  Optional strings and integers are declared nullable;
+  `forge_set_main_agent.autonomy_policy` and
+  `forge_set_project_agent.autonomy_policy` / `permission_ceiling` are opaque
+  JSON instead of object-only; `forge_register_agent.executor_type` is a
+  string instead of an incomplete enum; `forge_set_project_agent.wake_budget`
+  declares its existing minimum of 0. `forge_register_agent.daemon_id` is
+  advertised as a nullable string to account administrators and as `null`
+  only to everyone else, matching the existing `-32003` `admin_required`
+  refusal.
+- **MCP contract errors reach the client in-band without argument values
+  (3.8 slice G).** A refused call to a moved tool carries
+  `details = {code: "mcp_contract_invalid", operation, details}` in the
+  in-band result, at most 4096 characters. A mistyped value is described by
+  its JSON type and never quoted back.
 
 - **A setup-only operation refused after setup completed names the real
   cause (3.8 slice E).** The denial is `charter_adoption_not_applicable`
   instead of `charter_not_adopted`.
+- **A registered proposal's envelope error names what to fix (3.8 slice
+  E2).** An undeclared envelope field is answered with the operation, the
+  field and the expected contract instead of only "is not admitted".
 - **A pending proposal never reports a completed effect (3.8 slice E).**
   Replaying a legacy message, commitment, memory, review or session proposal
   whose ledger row was marked `executed` without a receipt is refused instead

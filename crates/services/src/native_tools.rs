@@ -2694,16 +2694,6 @@ impl CoordinationToolProvider {
                 "proposal payload does not match the typed operation schema".to_owned(),
             )
         })?;
-        if operation == MAIN_GENESIS_START_OPERATION {
-            return self
-                .execute_main_genesis_start(actor_identity_id, scope, arguments, payload)
-                .await;
-        }
-        if operation == MAIN_CHARTER_DRAFT_OPERATION {
-            return self
-                .execute_main_genesis_charter_draft(actor_identity_id, scope, arguments, payload)
-                .await;
-        }
         if operation == TASK_WORKLOG_OPERATION {
             return self
                 .execute_task_worklog_append(actor_identity_id, scope, &arguments, &payload)

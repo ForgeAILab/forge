@@ -10,15 +10,15 @@ use agent_runtime::core::prelude::RuntimeError;
 use serde_json::{Value, json};
 
 use crate::operation_catalog::{
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_START_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
-    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_READINESS_OPERATION,
-    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION,
+    PROJECT_READINESS_OPERATION, TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
 };
 #[cfg(test)]
 use crate::{
-    PROJECT_DOCUMENT_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
-    PROJECT_VALIDATION_OPERATION,
+    MAIN_GENESIS_START_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_MILESTONE_OPERATION,
+    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -201,34 +201,37 @@ pub(crate) fn charter_content_schema() -> Value {
     )
 }
 
-/// A flat alias is a provider transport aid. Full nested constraints are
-/// evaluated from the canonical spec, never conditional provider keywords.
-fn portable_property(mut value: Value) -> Value {
-    if value == true {
-        return json!({});
-    }
-    if let Some(object) = value.as_object_mut() {
-        for keyword in [
-            "oneOf", "anyOf", "allOf", "not", "if", "then", "else", "$ref", "$defs",
-        ] {
-            object.remove(keyword);
-        }
-        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
-            for property in properties.values_mut() {
-                *property = portable_property(property.clone());
-            }
-        }
-        if let Some(items) = object.get_mut("items") {
-            *items = portable_property(items.clone());
-        }
-    }
-    value
+/// Whether a property is an object with declared fields, directly, as a
+/// nullable alternative, or as the item of an array.
+fn declares_structure(schema: &Value) -> bool {
+    schema.get("properties").is_some()
+        || schema.get("items").is_some_and(declares_structure)
+        || ["anyOf", "oneOf"].iter().any(|keyword| {
+            schema
+                .get(*keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|variants| variants.iter().any(declares_structure))
+        })
 }
 
 fn advertised_proposal_line(
     spec: &operation_registry::OperationSpec<std::convert::Infallible>,
 ) -> String {
-    if operation_registry::main_proposals::IDS.contains(&spec.id) {
+    if spec
+        .surfaces
+        .iter()
+        .any(|surface| surface.native_aggregate == "forge_main_orchestration_propose")
+    {
+        // Field names alone cannot be called when a field is itself a
+        // structure: a Charter draft needs every section's shape, and the
+        // tool description is the only place a Main model is shown it.
+        let schema = &spec.input.schema;
+        let nested = schema["properties"]
+            .as_object()
+            .is_some_and(|properties| properties.values().any(declares_structure));
+        if nested {
+            return format!("{}: {}", spec.id, schema_signature(schema, 0));
+        }
         return spec.contract_line();
     }
     format!(
@@ -243,32 +246,6 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
         return spec.canonical_schema();
     }
     match operation {
-        MAIN_GENESIS_START_OPERATION => object_schema(
-            json!({
-                "action":{"const":"start"},
-                "maturity":{"type":["string","null"],"enum":["prototype","mvp","production","critical",null]},
-                "preferred_project_agent_identity_id":string_or_null_schema()
-            }),
-            &["action"],
-        ),
-        MAIN_CHARTER_DRAFT_OPERATION => object_schema(
-            json!({
-                "action":{"const":"save_revision"},"charter_id":{"type":"string","minLength":1},"base_revision_id":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},"content":charter_content_schema(),"rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical view from content; provide only to round-trip an exact server-rendered value."},"render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version; provide only to round-trip an exact server value."},"provenance":revision_provenance_schema()
-            }),
-            // `rendered_view`/`render_version` stay optional: the server
-            // renders the canonical view itself and only verifies these
-            // fields when a caller round-trips them. Requiring them forces
-            // the model to reproduce the server renderer byte-for-byte,
-            // which always fails.
-            &[
-                "action",
-                "charter_id",
-                "project_mode",
-                "maturity",
-                "content",
-                "provenance",
-            ],
-        ),
         PROJECT_CHARTER_ADOPTION_OPERATION => described_object_schema(
             json!({
                 "action":{"const":"draft_revision"},
@@ -511,7 +488,11 @@ fn schema_signature(schema: &Value, depth: usize) -> String {
     if depth > MAX_DEPTH {
         return "object".to_owned();
     }
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+    // Derived registry schemas spell a nullable structure as `anyOf`.
+    if let Some(variants) = ["oneOf", "anyOf"]
+        .iter()
+        .find_map(|keyword| schema.get(*keyword).and_then(Value::as_array))
+    {
         return variants
             .iter()
             .map(|variant| schema_signature(variant, depth))
@@ -762,18 +743,13 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
                 .lookup(operation)
                 .is_none()
     });
-    let has_registered = operations.iter().any(|operation| {
-        operation_registry::PROPOSAL_CATALOG
-            .lookup(operation)
-            .is_some()
-    });
     let has_task_execution_command = operations.iter().any(|operation| {
         matches!(
             operation.as_str(),
             TASK_PLAN_OPERATION | TASK_WORKLOG_OPERATION | TASK_EVIDENCE_OPERATION
         )
     });
-    if !has_generic_coordination && !has_task_execution_command && !has_registered {
+    if !has_generic_coordination && !has_task_execution_command {
         return None;
     }
     let mut properties = if has_generic_coordination {
@@ -942,16 +918,6 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             "items": {"type":"string","minLength":1}
         });
     }
-    for operation in operations {
-        let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) else {
-            continue;
-        };
-        for (name, property) in spec.input.schema["properties"].as_object().unwrap() {
-            if properties.get(name).is_none() {
-                properties[name] = portable_property(property.clone());
-            }
-        }
-    }
     Some(properties)
 }
 
@@ -1068,9 +1034,15 @@ pub(crate) fn validate_orchestration_proposal_arguments(
         .keys()
         .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
     {
-        return Err(RuntimeError::tool(format!(
-            "Forge orchestration proposal field `{field}` is not admitted"
-        )));
+        return Err(RuntimeError::tool(
+            match operation_registry::PROPOSAL_CATALOG.lookup(operation) {
+                Some(spec) => format!(
+                    "{operation}: envelope field `{field}` is not admitted; expected {}",
+                    spec.contract_line()
+                ),
+                None => format!("Forge orchestration proposal field `{field}` is not admitted"),
+            },
+        ));
     }
     if operation_registry::PROPOSAL_CATALOG
         .lookup(operation)
@@ -1282,16 +1254,57 @@ mod tests {
         );
     }
 
+    /// The Main description is the only place a model is shown the Charter
+    /// structure, so the generated draft line must carry every nested shape,
+    /// and the same shapes the hand adoption schema declares.
+    #[test]
+    fn main_charter_draft_line_advertises_the_nested_charter_shape() {
+        let operations = BTreeSet::from(["charter.draft".to_owned(), "genesis.start".to_owned()]);
+        let schema = orchestration_proposal_schema(&operations);
+        let description = schema["properties"]["payload"]["description"]
+            .as_str()
+            .expect("payload description");
+        let line = |operation: &str| {
+            description
+                .lines()
+                .find(|line| line.starts_with(&format!("- {operation}: ")))
+                .unwrap_or_else(|| panic!("{operation} line"))
+        };
+        let draft = line("charter.draft");
+        for (field, hand) in [
+            ("content", charter_content_schema()),
+            ("provenance", revision_provenance_schema()),
+        ] {
+            assert!(
+                draft.contains(&format!("{field}: {}", schema_signature(&hand, 0))),
+                "{field} shape is missing from: {draft}"
+            );
+        }
+        for field in [
+            "charter_id: string",
+            "expected_charter_version?: integer|null",
+            "project_mode: compact|standard",
+            "source_refs?: [{",
+        ] {
+            assert!(draft.contains(field), "{field}");
+        }
+        assert!(!draft.contains("{action") && !draft.contains(" action"));
+        assert_eq!(
+            line("genesis.start"),
+            "- genesis.start: {maturity?: one of prototype|mvp|production|critical, \
+             preferred_project_agent_identity_id?}"
+        );
+    }
+
     #[test]
     fn genesis_start_contract_is_closed_and_carries_no_source_authority() {
         let schema = orchestration_payload_schema(MAIN_GENESIS_START_OPERATION);
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"]["action"]["const"], "start");
+        assert!(schema["properties"].get("action").is_none());
         let properties = schema["properties"].as_object().expect("properties");
         assert_eq!(
             properties.keys().cloned().collect::<Vec<_>>(),
             [
-                "action".to_owned(),
                 "maturity".to_owned(),
                 "preferred_project_agent_identity_id".to_owned(),
             ]

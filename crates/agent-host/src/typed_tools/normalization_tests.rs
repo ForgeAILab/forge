@@ -144,30 +144,29 @@ fn serialized_tool_definitions() {
 /// A surface may shrink freely. Raise a ceiling only deliberately, in the
 /// change that explains why the prefix has to grow.
 const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
-    // 8,860 and 4,127 at 8bc736f5, less 46 and 38: the Main read lines state
-    // which fields are required instead of `optional {...}` for all of them.
-    // Main less 256 more: generated proposal contract lines replace the hand
-    // summaries of `genesis.project_agent.select` and `project.create`.
-    ("main", 8_558),
-    ("inquiry", 4_089),
-    // 24,048 and 25,297 at 172338b3, plus 56 each: the `skill.section`
-    // argument line states the required enum instead of `optional {section}`.
-    // Less 12 each: generated contract lines for the registered Project
-    // operations (-1,007) outweigh the pending legacy proposals' contract
-    // lines and flat aliases (+995). Hand Task operations keep their payload
-    // fields declared; that duplication is theirs to remove.
-    // Plus 160 each: the contract lines name the fields that were advertised
-    // before the registry move and are accepted again (Document approve
-    // `envelope_digest`, `kind`, `title`: 33; milestone cross-action
-    // `milestone_id`, `display_label`, `primary_milestone_id`, `content`:
-    // 102; validation `governing_revision_ids`: 25).
-    ("project", 24_252),
-    ("project_verify_solo", 25_501),
-    // Setup gains 194 bytes: the required truthful PENDING message contract
-    // and its body/content aliases add 200; the amendment wording adds 2; the new
-    // current-state line saves 8. The unchanged hand Charter dominates
-    // (12,526 bytes); no unrelated Task fields are added.
-    ("project_setup", 15_766),
+    // Main was 8,558 and Inquiry 4,089 at 33e2a974. The orchestration read
+    // tool states its purpose once (-118 on both). The Main propose tool
+    // nets +111: its description is shorter and the unadvertised `action`
+    // discriminator is gone, but the generated Charter draft line now names
+    // the six fields its handler always read (`genesis_session_id`,
+    // `expected_charter_version`, `change_summary`, `source_refs`,
+    // `content_digest`, `render_digest`). That line keeps the whole nested
+    // Charter shape (about 3,000 bytes): the description is the only place
+    // a Main model is shown it, so it is not a saving to take.
+    ("main", 8_551),
+    ("inquiry", 3_971),
+    // 24,252 and 25,501 at 435ff088, less 382: the pending proposals' eleven
+    // root aliases are no longer declared (-156; arguments are normalized
+    // before schema validation, and the flat fields are still lifted by
+    // registry field name), and the two Project orchestration descriptions
+    // state their purpose once (-226). Hand Task operations keep their
+    // payload fields declared.
+    ("project", 23_870),
+    ("project_verify_solo", 25_119),
+    // 15,766 at 435ff088, less 249: the `body`/`content` root aliases (-23)
+    // and the same two descriptions (-226). The hand Charter adoption
+    // schema dominates (12,418 bytes).
+    ("project_setup", 15_517),
     ("worker", 6_062),
     ("reviewer", 4_829),
     ("planner", 5_437),

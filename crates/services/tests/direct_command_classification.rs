@@ -998,6 +998,88 @@ async fn approval_required_release_candidate_stays_pending_without_domain_result
     );
 }
 
+/// Before the release request was registered its queueing step wrote the
+/// action row first, so a request the policy denies stayed on the ledger as
+/// `denied`. The registered path refuses it at admission and must still
+/// leave that row; a refused call that was never queueable leaves none.
+#[tokio::test]
+async fn denied_release_request_is_recorded_on_the_action_ledger() {
+    let fixture = fixture().await;
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET permission_ceiling_json = '{\"allowed\":[\"read_project\"]}'
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(PROJECT_ID)
+    .execute(fixture.db.pool())
+    .await
+    .expect("restrict Project policy");
+
+    let mut malformed = approval_required_release_arguments("denied-release-malformed");
+    malformed["payload"]["unexpected"] = json!(true);
+    for (arguments, rows) in [
+        (malformed, 0),
+        (approval_required_release_arguments("denied-release-key"), 1),
+        // A retry of the same denied call does not add a second row.
+        (approval_required_release_arguments("denied-release-key"), 1),
+    ] {
+        let denied = fixture
+            .provider
+            .propose(
+                AGENT_ID,
+                &fixture.project_scope,
+                RUNTIME_SESSION_ID,
+                "project.release.request",
+                arguments,
+            )
+            .await
+            .expect_err("a release request without propose_project is denied");
+        let denied = structured_error(denied);
+        assert_eq!(denied.code, api_types::OutcomeCode::PolicyDenied);
+        assert_eq!(
+            denied.denied_by,
+            Some(api_types::DeniedBy::PermissionMissing(
+                "propose_project".to_owned()
+            ))
+        );
+        assert_eq!(
+            count(
+                &fixture.db,
+                "SELECT COUNT(*) FROM agent_action WHERE operation = 'project.release.request'",
+            )
+            .await,
+            rows
+        );
+    }
+    let (status, policy_result, permission, target_type, target_id): (
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT status, policy_result, requested_permission, target_type, target_id
+         FROM agent_action WHERE dedupe_key = 'denied-release-key'",
+    )
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("denied release request row");
+    assert_eq!(
+        (
+            status.as_str(),
+            policy_result.as_str(),
+            permission.as_str(),
+            target_type.as_str(),
+            target_id.as_str()
+        ),
+        ("denied", "denied", "propose_project", "project", PROJECT_ID)
+    );
+    assert_eq!(
+        count(&fixture.db, "SELECT COUNT(*) FROM command_receipt").await,
+        0
+    );
+}
+
 #[tokio::test]
 async fn denied_operation_is_not_admitted_and_cannot_mutate() {
     let fixture = fixture().await;

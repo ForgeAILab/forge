@@ -180,7 +180,7 @@
     },
     {
       "name": "forge_main_orchestration_read",
-      "description": "Read one bounded Forge orchestration resource from the authenticated global Main Agent account/Chat scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+      "description": "Read one Forge orchestration resource from the authenticated global Main Agent account/Chat scope.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -208,7 +208,7 @@
     },
     {
       "name": "forge_main_orchestration_propose",
-      "description": "Submit a typed Forge orchestration proposal in the authenticated global Main Agent account/Chat scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+      "description": "Submit one typed Forge orchestration proposal in the authenticated global Main Agent account/Chat scope.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -241,7 +241,7 @@
             "type": "string"
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- charter.draft: action=save_revision; required: [action, charter_id, project_mode, maturity, content, provenance]; shape: {action: \"save_revision\", base_revision_id?: string|null, charter_id: string, content: {constraints_and_risks: {accessibility?: [string], agent_authority?: [string], data?: [string], integrations?: [string], launch?: [string], migration?: [string], operations?: [string], product?: [string], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], security_privacy_compliance?: [string], technology?: [string], time_and_budget?: [string]}, core_experience: {core_loop?: string|null, primary_outcome: string, principal_journeys?: [string]}, handoff_note?: {bounded_summary?: string|null, recommended_first_action?: string|null, unresolved_item_ids?: [string]}|null, identity: {lifecycle_intent?: string|null, maturity: prototype|mvp|production|critical, one_line_vision: string, project_type?: string|null, slug_proposal?: string|null, value_proposition?: string|null, working_name: string}, knowledge_ledger: {items?: [{blocking?: boolean, confidence?: low|medium|high|not_applicable, default_value?: string|null, falsification_evidence?: string|null, freshness_expires_at?: string|null, id: string, impact?: string|null, kind: observed_fact|user_decision|research_finding|assumption|hypothesis|open_decision|research_queue, normative: boolean, observed_at?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, provenance?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}], revisit_trigger?: string|null, statement: string, transfer_approved: boolean}]}, problem_and_people: {beneficiaries?: [string], current_alternatives?: [string], excluded_audiences?: [string], jobs_pains_opportunity?: [string], problem_or_opportunity: string, stakeholders?: [string], target_users?: [string]}, scaffold?: {packs?: [string], template: string}|null, scope: {explicit_non_goals?: [string], later_possibilities?: [string], must_have_outcomes?: [string], required_deliverables?: [string]}, success: {acceptance_statements?: [string], non_claims?: [string], qualitative_outcome?: string|null, required_evidence?: [string], success_signals?: [string]}}, maturity: prototype|mvp|production|critical, project_mode: compact|standard, provenance: {author: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}, change_summary: string, material_diff?: string|null, operating_skill_revision?: string|null, profile_revision?: string|null, source_refs?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}]}, render_version?: string, rendered_view?: string}\n- genesis.project_agent.select: {expected_session_version, genesis_session_id?, project_agent_identity_id}\n- genesis.start: action=start; required: [action]; shape: {action: \"start\", maturity?: prototype|mvp|production|critical, preferred_project_agent_identity_id?: string|null}\n- project.create: {approval_id}",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- charter.draft: {base_revision_id?: string|null, change_summary?: string|null, charter_id: string, content: {constraints_and_risks: {accessibility?: [string], agent_authority?: [string], data?: [string], integrations?: [string], launch?: [string], migration?: [string], operations?: [string], product?: [string], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], security_privacy_compliance?: [string], technology?: [string], time_and_budget?: [string]}, core_experience: {core_loop?: string|null, primary_outcome: string, principal_journeys?: [string]}, handoff_note?: {bounded_summary?: string|null, recommended_first_action?: string|null, unresolved_item_ids?: [string]}|null, identity: {lifecycle_intent?: string|null, maturity: prototype|mvp|production|critical, one_line_vision: string, project_type?: string|null, slug_proposal?: string|null, value_proposition?: string|null, working_name: string}, knowledge_ledger: {items?: [{blocking?: boolean, confidence?: low|medium|high|not_applicable, default_value?: string|null, falsification_evidence?: string|null, freshness_expires_at?: string|null, id: string, impact?: string|null, kind: observed_fact|user_decision|research_finding|assumption|hypothesis|open_decision|research_queue, normative: boolean, observed_at?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, provenance?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}], revisit_trigger?: string|null, statement: string, transfer_approved: boolean}]}, problem_and_people: {beneficiaries?: [string], current_alternatives?: [string], excluded_audiences?: [string], jobs_pains_opportunity?: [string], problem_or_opportunity: string, stakeholders?: [string], target_users?: [string]}, scaffold?: {packs?: [string], template: string}|null, scope: {explicit_non_goals?: [string], later_possibilities?: [string], must_have_outcomes?: [string], required_deliverables?: [string]}, success: {acceptance_statements?: [string], non_claims?: [string], qualitative_outcome?: string|null, required_evidence?: [string], success_signals?: [string]}}, content_digest?: string|null, expected_charter_version?: integer|null, genesis_session_id?: string|null, maturity: prototype|mvp|production|critical, project_mode: compact|standard, provenance: {author: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}, change_summary: string, material_diff?: string|null, operating_skill_revision?: string|null, profile_revision?: string|null, source_refs?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}]}, render_digest?: string|null, render_version?: string|null, rendered_view?: string|null, source_refs?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}]}\n- genesis.project_agent.select: {expected_session_version, genesis_session_id?, project_agent_identity_id}\n- genesis.start: {maturity?: one of prototype|mvp|production|critical, preferred_project_agent_identity_id?}\n- project.create: {approval_id}",
             "type": "object"
           }
         },
@@ -432,7 +432,7 @@
     },
     {
       "name": "forge_main_orchestration_read",
-      "description": "Read one bounded Forge orchestration resource from the authenticated global Main Agent account/Chat scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+      "description": "Read one Forge orchestration resource from the authenticated global Main Agent account/Chat scope.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -553,7 +553,6 @@
               "null"
             ]
           },
-          "body": {},
           "capability_class": {
             "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\").",
             "type": [
@@ -575,8 +574,6 @@
               "null"
             ]
           },
-          "commitment_id": {},
-          "content": {},
           "correlation_id": {
             "description": "Required non-null correlation id",
             "minLength": 1,
@@ -612,7 +609,6 @@
               "null"
             ]
           },
-          "due_at": {},
           "expected_board_revision": {
             "description": "task.adaptive: Project board revision precondition (work.read returns it as board_revision).",
             "type": [
@@ -627,7 +623,6 @@
               "null"
             ]
           },
-          "expected_version": {},
           "items": {
             "description": "task.adaptive split: non-empty ordered direct-child list; creates children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
             "items": {
@@ -660,8 +655,6 @@
               "null"
             ]
           },
-          "kind": {},
-          "memory_id": {},
           "milestone_id": {
             "description": "task.propose: optional; defaults to the active baseline's primary milestone.",
             "type": [
@@ -968,7 +961,6 @@
               "null"
             ]
           },
-          "session_id": {},
           "source_task_id": {
             "description": "task.adaptive: source Task id in the bound Project.",
             "type": [
@@ -976,7 +968,6 @@
               "null"
             ]
           },
-          "status": {},
           "task_id": {
             "description": "task.action/task.dependency: required Task id in this Project.",
             "type": [
@@ -998,15 +989,13 @@
               "null"
             ]
           },
-          "value": {},
           "version": {
             "description": "task.action: required current Task version from the offered actions.",
             "type": [
               "integer",
               "null"
             ]
-          },
-          "visibility": {}
+          }
         },
         "required": [
           "operation",
@@ -1081,7 +1070,7 @@
     },
     {
       "name": "forge_project_orchestration_read",
-      "description": "Read one bounded Forge orchestration resource from the authenticated single-Project Project Agent scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+      "description": "Read one Forge orchestration resource from the authenticated single-Project Project Agent scope.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -1107,7 +1096,7 @@
     },
     {
       "name": "forge_project_orchestration_propose",
-      "description": "Submit a typed Forge orchestration proposal in the authenticated single-Project Project Agent scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+      "description": "Submit one typed Forge orchestration proposal in the authenticated single-Project Project Agent scope.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -1340,7 +1329,6 @@
               "null"
             ]
           },
-          "body": {},
           "capability_class": {
             "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\").",
             "type": [
@@ -1362,8 +1350,6 @@
               "null"
             ]
           },
-          "commitment_id": {},
-          "content": {},
           "correlation_id": {
             "description": "Required non-null correlation id",
             "minLength": 1,
@@ -1399,7 +1385,6 @@
               "null"
             ]
           },
-          "due_at": {},
           "expected_board_revision": {
             "description": "task.adaptive: Project board revision precondition (work.read returns it as board_revision).",
             "type": [
@@ -1414,7 +1399,6 @@
               "null"
             ]
           },
-          "expected_version": {},
           "items": {
             "description": "task.adaptive split: non-empty ordered direct-child list; creates children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
             "items": {
@@ -1447,8 +1431,6 @@
               "null"
             ]
           },
-          "kind": {},
-          "memory_id": {},
           "milestone_id": {
             "description": "task.propose: optional; defaults to the active baseline's primary milestone.",
             "type": [
@@ -1755,7 +1737,6 @@
               "null"
             ]
           },
-          "session_id": {},
           "source_task_id": {
             "description": "task.adaptive: source Task id in the bound Project.",
             "type": [
@@ -1763,7 +1744,6 @@
               "null"
             ]
           },
-          "status": {},
           "task_id": {
             "description": "task.action/task.dependency: required Task id in this Project.",
             "type": [
@@ -1785,15 +1765,13 @@
               "null"
             ]
           },
-          "value": {},
           "version": {
             "description": "task.action: required current Task version from the offered actions.",
             "type": [
               "integer",
               "null"
             ]
-          },
-          "visibility": {}
+          }
         },
         "required": [
           "operation",
@@ -1868,7 +1846,7 @@
     },
     {
       "name": "forge_project_orchestration_read",
-      "description": "Read one bounded Forge orchestration resource from the authenticated single-Project Project Agent scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+      "description": "Read one Forge orchestration resource from the authenticated single-Project Project Agent scope.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -1894,7 +1872,7 @@
     },
     {
       "name": "forge_project_orchestration_propose",
-      "description": "Submit a typed Forge orchestration proposal in the authenticated single-Project Project Agent scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+      "description": "Submit one typed Forge orchestration proposal in the authenticated single-Project Project Agent scope.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -1983,7 +1961,6 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
-          "body": {},
           "causation_depth": {
             "maximum": 8,
             "minimum": 0,
@@ -1998,7 +1975,6 @@
               "null"
             ]
           },
-          "content": {},
           "correlation_id": {
             "description": "Required non-null correlation id",
             "minLength": 1,
@@ -2093,7 +2069,7 @@
     },
     {
       "name": "forge_project_orchestration_read",
-      "description": "Read one bounded Forge orchestration resource from the authenticated single-Project Project Agent scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+      "description": "Read one Forge orchestration resource from the authenticated single-Project Project Agent scope.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
@@ -2116,7 +2092,7 @@
     },
     {
       "name": "forge_project_orchestration_propose",
-      "description": "Submit a typed Forge orchestration proposal in the authenticated single-Project Project Agent scope. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+      "description": "Submit one typed Forge orchestration proposal in the authenticated single-Project Project Agent scope.",
       "input_schema": {
         "additionalProperties": false,
         "properties": {
