@@ -29,7 +29,7 @@ describe('placement admission errors', () => {
     const message = getApiErrorMessage(error)
     expect(message).toContain('Daemon old-daemon, location checkout')
     expect(message).toContain(
-      'Upgrade the daemon to the server release (protocol revision 4 or newer) (daemon_upgrade_required)',
+      'Upgrade the daemon to the server release (protocol revision 5 or newer) (daemon_upgrade_required)',
     )
     expect(message).toContain('Executor lacks required capabilities (capability_missing)')
   })

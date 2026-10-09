@@ -20,12 +20,22 @@ pub enum Capture {
 }
 #[derive(Debug, Clone, Copy)]
 pub enum CompletionPolicy {
+    /// Wait for the leader and for both pipes to close; stop nothing after a
+    /// normal exit (Git: a hook that outlives Git is not ours to stop).
     Drain,
+    /// Stop the leader's process group once the leader exits, then drain for
+    /// at most [`POST_EXIT_DRAIN`]: a descendant that left the group (`setsid`)
+    /// and still holds a pipe can neither stall the command nor turn a
+    /// finished command into a timeout.
     StopDescendants,
-    /// Existing daemon helpers bound post-exit drainage independently of the
-    /// command limit. Incomplete drain is evidence, never size truncation.
+    /// Leave descendants running after a normal exit and bound only the
+    /// post-exit drain, independently of the command limit. Incomplete drain
+    /// is evidence, never size truncation.
     DrainFor(Duration),
 }
+/// How long a finished command's pipes are read when a descendant keeps them
+/// open.
+pub const POST_EXIT_DRAIN: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Termination {
     Exited,
@@ -139,9 +149,15 @@ async fn drain(
     }
 }
 
-/// The deadline includes draining. A full pipe never changes the verdict.
-/// Checks stop descendants even after a normal leader exit. Git keeps its
-/// established normal-exit semantics via `output` below.
+/// Output is drained continuously, so a full pipe never stalls the command or
+/// changes its verdict. The deadline bounds the leader; what happens to
+/// descendants after a normal exit is the caller's [`CompletionPolicy`]. Git
+/// keeps its established normal-exit semantics via `output` below.
+///
+/// Limits: the group is the child's own (`process_group(0)`), never the
+/// caller's, and ids 0 and 1 are never signalled. A descendant that moved to
+/// another session or group (`setsid`) is outside the group and is not
+/// signalled; it is only detached from the pipes.
 pub async fn run(
     command: &mut Command,
     capture: Capture,
@@ -167,22 +183,27 @@ pub async fn run(
     let stop_descendants = matches!(completion, CompletionPolicy::StopDescendants);
     let leader_exited = AtomicBool::new(false);
     let (exited, finished) = tokio::sync::oneshot::channel::<()>();
+    let post_exit_bound = match completion {
+        CompletionPolicy::Drain => None,
+        CompletionPolicy::StopDescendants => Some(POST_EXIT_DRAIN),
+        CompletionPolicy::DrainFor(bound) => Some(bound),
+    };
     let post_exit_timeout = async {
-        match completion {
-            CompletionPolicy::DrainFor(bound) => {
+        match post_exit_bound {
+            Some(bound) => {
                 let _ = finished.await;
                 tokio::time::sleep(bound).await;
             }
-            _ => std::future::pending::<()>().await,
+            None => std::future::pending::<()>().await,
         }
     };
     let timeout = async {
         match deadline {
             Some(deadline) => {
                 tokio::time::sleep_until(deadline.into()).await;
-                if matches!(completion, CompletionPolicy::DrainFor(_))
-                    && leader_exited.load(Ordering::Acquire)
-                {
+                // A leader that already exited keeps its exit status: only
+                // the bounded post-exit drain is still pending.
+                if post_exit_bound.is_some() && leader_exited.load(Ordering::Acquire) {
                     std::future::pending::<()>().await;
                 }
             }
@@ -276,3 +297,6 @@ pub async fn output_bounded(command: &mut Command, limit: Option<usize>) -> io::
         stderr: result.stderr,
     })
 }
+
+#[cfg(all(test, unix))]
+mod tests;

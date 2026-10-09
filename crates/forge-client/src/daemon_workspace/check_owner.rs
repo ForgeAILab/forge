@@ -3,6 +3,9 @@ use super::*;
 use crate::daemon_persistence::JournalCheckOperation;
 use tokio_util::sync::CancellationToken;
 
+/// The furthest deadline a check request may carry.
+const MAX_CHECK_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+
 impl DaemonWorkspaceBackend {
     pub(super) async fn check_lookup(
         &self,
@@ -82,6 +85,14 @@ impl DaemonWorkspaceBackend {
         let remaining = (deadline.with_timezone(&chrono::Utc) - chrono::Utc::now())
             .to_std()
             .unwrap_or_default();
+        // The key is retained until the deadline has passed: an unbounded
+        // deadline would be an unbounded journal entry.
+        if remaining > MAX_CHECK_DEADLINE {
+            return Err(error(
+                INVALID_INPUT,
+                "check deadline is more than 24 hours ahead",
+            ));
+        }
         let deadline = Instant::now().checked_add(remaining).ok_or_else(|| {
             error(
                 INVALID_INPUT,
@@ -94,6 +105,11 @@ impl DaemonWorkspaceBackend {
         // A duplicate never queues behind the process or acquires its checkout.
         let admission = self.owner_lock(&format!("check-operation:{}", params.operation_id));
         let admitted = admission.lock().await;
+        // Expired keys leave before the lookup and before the journal bound is
+        // tested. A failed prune only delays retention.
+        if let Err(error) = self.journal.prune_checks_when_due() {
+            tracing::warn!(%error, "could not prune expired check journal entries");
+        }
         if let Some(operation) = self
             .journal
             .check_operation(&params.operation_id)
@@ -174,6 +190,7 @@ impl DaemonWorkspaceBackend {
             operation_id: params.operation_id.clone(),
             request: raw,
             receipt: None,
+            acknowledged: false,
         };
         self.journal
             .retain_entry(&JournalEntry::Check {
@@ -206,15 +223,62 @@ impl DaemonWorkspaceBackend {
         // A cancelled request cannot clean beneath another live checkout
         // owner. Wait for the mutation guard, then let the primitive settle
         // without launching any run command if its deadline/token expired.
-        let checkout = checkout_lock.lock().await;
-        if *cancelled.borrow_and_update() {
-            token.cancel();
-        }
-        // Revalidate workspace ownership/generation after the checkout lock.
-        if let DaemonCheckTarget::Workspace { workspace } = &params.target {
-            self.live_workspace(workspace).await?;
-        }
-        let build = self.confined_path(&self.workspace_root.join(".forge/build/checks"))?;
+        let owner = CheckOwnerIdentity {
+            owner_kind: "daemon".into(),
+            machine_id: Some(self.daemon_id.clone()),
+            runtime_id: owner_runtime,
+        };
+        // From here the key is retained: every way out writes its receipt.
+        // Waiting for the checkout is bounded by the run's own deadline and
+        // by cancellation; a run that never got its checkout spawned nothing
+        // and runs no cleanup beneath the checkout's current owner.
+        let waited = tokio::select! {
+            biased;
+            _ = cancelled.wait_for(|cancelled| *cancelled) => Err((CheckExecutionOutcome::Cancelled, None)),
+            _ = tokio::time::sleep_until(deadline.into()) => Err((
+                CheckExecutionOutcome::TimedOut,
+                Some("checkout was busy until the check deadline".to_owned()),
+            )),
+            checkout = checkout_lock.lock() => Ok(checkout),
+        };
+        let prepared = match waited {
+            Ok(checkout) => {
+                // Revalidate workspace ownership/generation after the checkout lock.
+                let live = match &params.target {
+                    DaemonCheckTarget::Workspace { workspace } => {
+                        self.live_workspace(workspace).await.map(|_| ())
+                    }
+                    DaemonCheckTarget::ExactCommit { .. } => Ok(()),
+                };
+                match live.and_then(|()| {
+                    self.confined_path(&self.workspace_root.join(".forge/build/checks"))
+                }) {
+                    Ok(build) => Ok((checkout, build)),
+                    Err(error) => Err((CheckExecutionOutcome::Infrastructure, Some(error.message))),
+                }
+            }
+            Err(unstarted) => Err(unstarted),
+        };
+        let (checkout, build) = match prepared {
+            Ok(prepared) => prepared,
+            Err((outcome, message)) => {
+                operation.receipt = Some(check_executor::unstarted_receipt(
+                    &params.operation_id,
+                    owner,
+                    outcome,
+                    message,
+                ));
+                let retained = self
+                    .journal
+                    .finish_check(&operation)
+                    .map_err(storage_error)?;
+                guard.state = WorkspaceCancelState::AlreadyFinished;
+                drop(guard);
+                return Ok(DaemonCheckResult::Completed {
+                    receipt: Box::new(retained.receipt.expect("retained receipt")),
+                });
+            }
+        };
         let environment = params.env.iter().cloned().collect::<BTreeMap<_, _>>();
         let input = check_executor::CheckExecution {
             operation_id: &params.operation_id,
@@ -227,11 +291,7 @@ impl DaemonWorkspaceBackend {
                 },
                 None => check_executor::CheckoutTarget::Workspace(&path),
             },
-            owner: CheckOwnerIdentity {
-                owner_kind: "daemon".into(),
-                machine_id: Some(self.daemon_id.clone()),
-                runtime_id: owner_runtime,
-            },
+            owner,
             input_revisions: None,
             environment: &environment,
             deadline: Some(deadline),

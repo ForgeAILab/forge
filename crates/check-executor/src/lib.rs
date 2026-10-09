@@ -10,6 +10,31 @@ use tokio_util::sync::CancellationToken;
 
 pub const OUTPUT_TAIL_BYTES: usize = 4096;
 pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// A piece of a secret cut by the tail boundary or by an interruption is
+/// masked only from this length up. Shorter pieces disclose nothing useful,
+/// and masking them would rewrite ordinary output that happens to start or end
+/// with the same few bytes as some environment value.
+const SECRET_FRAGMENT_BYTES: usize = 4;
+const WITNESS_TIMEOUT: Duration = Duration::from_secs(2);
+const LEGACY_SERVER: &str = "legacy-server/1";
+const LEGACY_DAEMON: &str = "legacy-daemon/1";
+fn legacy(policy: &str) -> bool {
+    matches!(policy, LEGACY_SERVER | LEGACY_DAEMON)
+}
+/// What happens to a command's descendants once it exits normally.
+///
+/// Neither the server nor the daemon ever stopped a CI step's descendants: a
+/// step may start a service that a later step uses. Both frozen policies keep
+/// that, with the post-exit drain bounded (as the daemon's always was) so a
+/// service that kept the output pipe cannot stall the step. Every canonical
+/// policy stops the step's process group.
+fn completion(policy: &str) -> process_supervisor::CompletionPolicy {
+    if legacy(policy) {
+        process_supervisor::CompletionPolicy::DrainFor(process_supervisor::POST_EXIT_DRAIN)
+    } else {
+        process_supervisor::CompletionPolicy::StopDescendants
+    }
+}
 
 /// A borrowed admission seam; stage C supplies machine occupancy before calling.
 /// Legacy callers already hold their Task/execution admission. No slot acquired here.
@@ -84,6 +109,9 @@ fn redacted(
     for value in values {
         if truncated {
             for (offset, _) in value.char_indices() {
+                if value.len() - offset < SECRET_FRAGMENT_BYTES {
+                    break;
+                }
                 if text.starts_with(&value[offset..]) {
                     text.replace_range(..value.len() - offset, "[REDACTED]");
                     break;
@@ -95,7 +123,11 @@ fn redacted(
                 text.replace_range(text.len() - value.len().., "[REDACTED]");
                 continue;
             }
-            for (offset, _) in value.char_indices().rev().filter(|(offset, _)| *offset > 0) {
+            for (offset, _) in value
+                .char_indices()
+                .rev()
+                .filter(|(offset, _)| *offset >= SECRET_FRAGMENT_BYTES)
+            {
                 if text.ends_with(&value[..offset]) {
                     text.replace_range(text.len() - offset.., "[REDACTED]");
                     break;
@@ -132,7 +164,7 @@ pub fn command(
         return Err("missing declared check environment key".into());
     }
     let mut command = Command::new("bash");
-    if !matches!(policy, "legacy-server/1" | "legacy-daemon/1") {
+    if !legacy(policy) {
         command.env_clear().arg("--noprofile");
     }
     command
@@ -142,13 +174,13 @@ pub fn command(
         .envs(&env);
     executors::run_process::apply(&mut command, &env);
     // Legacy unbounded server CI inherited these; bounded CI and daemon did not.
-    if policy != "legacy-server/1" || spec.timeout_seconds.is_some() {
+    if policy != LEGACY_SERVER || spec.timeout_seconds.is_some() {
         command
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE");
     }
-    if policy == "legacy-daemon/1" {
+    if policy == LEGACY_DAEMON {
         command.env("PWD", path);
     }
     Ok((command, env))
@@ -188,6 +220,8 @@ pub async fn run_command(
             stderr_tail: String::new(),
             stdout_truncated: false,
             stderr_truncated: false,
+            stdout_drain_incomplete: false,
+            stderr_drain_incomplete: false,
             process_tree_stopped: true,
             started_at,
             finished_at: now(),
@@ -198,7 +232,7 @@ pub async fn run_command(
         process_supervisor::Capture::Tail(limit),
         deadline,
         cancel,
-        process_supervisor::CompletionPolicy::StopDescendants,
+        completion(policy),
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -227,26 +261,43 @@ pub async fn run_command(
     Ok(CheckCommandReceipt {
         id: spec.id.clone(),
         command: spec.shell_text.clone(),
-        exit_code: output.status.code(),
+        // A command stopped by its limit or by cancellation has no verdict of
+        // its own, even when its TERM trap exits 0.
+        exit_code: output
+            .status
+            .code()
+            .filter(|_| output.termination == process_supervisor::Termination::Exited),
         outcome,
         duration_ms: milliseconds(start.elapsed()),
         stdout_tail,
         stderr_tail,
         stdout_truncated,
         stderr_truncated,
+        stdout_drain_incomplete: output.stdout_drain_incomplete,
+        stderr_drain_incomplete: output.stderr_drain_incomplete,
         process_tree_stopped: output.descendants_stopped,
         started_at,
         finished_at: now(),
     })
 }
 
-pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
-    let mut receipt = CheckReceipt {
-        operation_id: input.operation_id.to_owned(),
-        owner: input.owner.clone(),
+/// The receipt of a run that never reached its checkout: nothing was spawned
+/// and no cleanup ran. An owner settles an admitted key with this when it
+/// cannot start (checkout busy until the deadline, cancelled while waiting,
+/// workspace gone), so the key never stays without an outcome.
+pub fn unstarted_receipt(
+    operation_id: &str,
+    owner: CheckOwnerIdentity,
+    outcome: CheckExecutionOutcome,
+    message: Option<String>,
+) -> CheckReceipt {
+    let at = now();
+    CheckReceipt {
+        operation_id: operation_id.to_owned(),
+        owner,
         execution_inputs: CheckEnvironmentIdentity::NotAttested,
         commands: Vec::new(),
-        outcome: CheckExecutionOutcome::Passed,
+        outcome,
         cleanup: CheckCleanupReceipt {
             outcome: CheckCleanupOutcome::NotPerformed,
             commands: Vec::new(),
@@ -256,10 +307,25 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
         prepared_head: None,
         finished_head: None,
         tracked_changes: None,
-        started_at: now(),
-        finished_at: String::new(),
-        infrastructure_message: None,
-    };
+        started_at: at.clone(),
+        finished_at: at,
+        infrastructure_message: message,
+    }
+}
+
+pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
+    let mut receipt = unstarted_receipt(
+        input.operation_id,
+        input.owner.clone(),
+        CheckExecutionOutcome::Passed,
+        None,
+    );
+    receipt.finished_at = String::new();
+    // The frozen CI callers ran nothing but the step in the Task worktree and
+    // read no receipt witness: no Git command is added beside their steps.
+    // A managed checkout is always witnessed: its pass depends on it.
+    let witnessed = !legacy(&input.spec.execution_policy)
+        || matches!(input.target, CheckoutTarget::ExactCommit { .. });
     let mut scratch = None;
     let mut path = match input.target {
         CheckoutTarget::Workspace(path) => Some(path.to_owned()),
@@ -267,12 +333,7 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
     };
     let prepared = async {
         input.spec.validate()?;
-        if input.deadline.is_none()
-            && !matches!(
-                input.spec.execution_policy.as_str(),
-                "legacy-server/1" | "legacy-daemon/1"
-            )
-        {
+        if input.deadline.is_none() && !legacy(&input.spec.execution_policy) {
             return Err("a canonical check requires a whole-run wall deadline".into());
         }
         if input.output_limit == 0 || input.cleanup.timeout.is_zero() {
@@ -364,7 +425,13 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
     }
     if receipt.outcome == CheckExecutionOutcome::Passed {
         if let Some(path) = path.as_ref() {
-            receipt.prepared_head = git::get_current_sha(path).await.ok();
+            if witnessed {
+                receipt.prepared_head =
+                    tokio::time::timeout(WITNESS_TIMEOUT, git::get_current_sha(path))
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+            }
             let mut sequence = CheckSequence::new(input.spec.clone());
             while let Some((_, spec)) = sequence.next_command() {
                 match run_command(
@@ -395,8 +462,8 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
             }
         }
     }
-    if let Some(path) = path.as_ref() {
-        let evidence = tokio::time::timeout(Duration::from_secs(2), async {
+    if let Some(path) = path.as_ref().filter(|_| witnessed) {
+        let evidence = tokio::time::timeout(WITNESS_TIMEOUT, async {
             (
                 git::get_current_sha(path).await.ok(),
                 git::command_output(path, &["diff", "--quiet", "HEAD", "--"])
@@ -410,6 +477,8 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
             receipt.finished_head = head;
             receipt.tracked_changes = tracked;
         }
+    }
+    if let Some(path) = path.as_ref() {
         if scratch.is_some()
             && receipt.outcome == CheckExecutionOutcome::Passed
             && (receipt.finished_head != receipt.prepared_head

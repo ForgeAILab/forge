@@ -242,7 +242,7 @@ impl WorkspaceIntegrationRequest {
 }
 
 /// Task-step authority remains distinct from the passive queue's lease. Both
-/// use the same owner effects. Revision 4 always carries this tagged field.
+/// use the same owner effects. Since revision 4 every request carries this tagged field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]

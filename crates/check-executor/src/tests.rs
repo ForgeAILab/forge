@@ -496,3 +496,73 @@ async fn an_undeclared_cleanup_plan_never_executes_a_command() {
     assert!(receipt.commands.is_empty());
     assert!(!temp.path().join("ran").exists() && !temp.path().join("cleaned").exists());
 }
+
+/// Neither owner ever stopped what a CI step left running: a later step may
+/// depend on it. A service that kept the step's output pipe open does not
+/// stall the step either.
+#[cfg(unix)]
+#[tokio::test]
+async fn frozen_ci_policies_keep_a_background_service_for_the_next_step() {
+    for daemon in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let env = BTreeMap::new();
+        let run = |text: &'static str| {
+            let path = temp.path().to_owned();
+            let env = env.clone();
+            async move {
+                execute(CheckExecution {
+                    operation_id: "legacy",
+                    spec: &legacy_ci_spec(text, &env, 0, daemon),
+                    target: CheckoutTarget::Workspace(&path),
+                    owner: owner(),
+                    input_revisions: None,
+                    environment: &env,
+                    deadline: None,
+                    cancel: &CancellationToken::new(),
+                    permit: &CheckPermit::already_admitted(),
+                    cleanup: CleanupPlan {
+                        commands: &[],
+                        timeout: CLEANUP_TIMEOUT,
+                    },
+                    output_limit: 4096,
+                })
+                .await
+            }
+        };
+        let started = Instant::now();
+        // The service inherits stdout and stderr and outlives the step.
+        let first = run("sleep 30 & echo $! > service.pid; echo started").await;
+        assert_eq!(first.outcome, CheckExecutionOutcome::Passed, "{first:?}");
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert_eq!(first.commands[0].stdout_tail, "started\n");
+        assert!(first.commands[0].stdout_drain_incomplete);
+        assert!(!first.commands[0].process_tree_stopped);
+        // No witness Git command runs beside a frozen CI step.
+        assert!(first.prepared_head.is_none() && first.tracked_changes.is_none());
+        let second = run("kill -0 \"$(cat service.pid)\"").await;
+        let pid = std::fs::read_to_string(temp.path().join("service.pid")).unwrap();
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status();
+        assert_eq!(second.outcome, CheckExecutionOutcome::Passed, "{second:?}");
+    }
+}
+
+#[test]
+fn redaction_leaves_short_edge_matches_alone_and_masks_cut_secrets() {
+    let env = BTreeMap::from([
+        ("MODE".into(), "production".into()),
+        ("FLAG".into(), "x1".into()),
+        ("TOKEN".into(), "0123456789abcdef".into()),
+    ]);
+    // Truncated and interrupted output that merely starts or ends with a few
+    // bytes of some value is not rewritten.
+    assert_eq!(
+        redacted(b"1 test failed: pro", true, true, &env, 512).0,
+        "1 test failed: pro"
+    );
+    assert_eq!(
+        redacted(b"cdef failed 0123", true, true, &env, 512).0,
+        "[REDACTED] failed [REDACTED]"
+    );
+}

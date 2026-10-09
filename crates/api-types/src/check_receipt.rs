@@ -38,6 +38,10 @@ pub struct CheckCommandReceipt {
     pub stderr_tail: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// The command finished while something outside its process group still
+    /// held the pipe: the tail is what was read within the post-exit bound.
+    pub stdout_drain_incomplete: bool,
+    pub stderr_drain_incomplete: bool,
     /// The group was stopped before this receipt was returned.
     pub process_tree_stopped: bool,
     pub started_at: String,

@@ -28,6 +28,8 @@ crates/
 ├── cli-adapters/  # Codex, Claude, Cursor, Gemini, opencode, shell, null adapters
 ├── workspace/     # Git worktree lifecycle, locking, path guardrails
 ├── git/           # Low-level git operations
+├── process-supervisor/ # Process-group ownership, kill sequence, drained bounded output
+├── check-executor/ # Persistence-free owner execution of a CheckSpec, typed receipt
 ├── review/        # CI runner, auditor orchestration
 ├── events/        # In-memory event bus (tokio broadcast)
 ├── mcp-server/    # MCP JSON-RPC tools for agent integration
@@ -48,7 +50,18 @@ forge-cli → api → services → db
 
 forge-solo → services → db / events / agent-host / executors / workspace → git
            → config / api-types / review / cli-adapters
+
+services / review / forge-client → check-executor → process-supervisor
+                                                  → git → process-supervisor
+                                                  → executors / api-types
 ```
+
+`process-supervisor` is a leaf (tokio only): `git` cannot depend on `executors`
+or `review`, and `forge-client` must not pull in `services`, so the one
+process-group implementation that Git, CI steps and daemon helpers share lives
+below all of them. `check-executor` sits between: it needs `git` (managed
+checkout), `executors` (run budget, redaction) and `api-types`, and is called by
+`services`, `review` and `forge-client`; it depends on neither `services` nor `db`.
 
 ## Architectural patterns
 
@@ -3502,7 +3515,7 @@ CLI adapter, streams
 execution logs back as `execution.log` notifications, and reports final status
 through `execution.terminal`.
 
-Protocol revision 4 independently negotiates `machine_probe.v1` for
+Protocol revision 5 independently negotiates `machine_probe.v1` for
 `machine.probe` and `repo_provision.v1` for `repo_location.provision`.
 A probe accepts named commands, 1–300 second timeouts, Project env, and an
 optional verified location ID. It returns exit status, timeout and a redacted
@@ -3524,21 +3537,21 @@ local policy purposes, `environment_probe` and `repo_provision`, and refusal is
 Upgrade the server first: a daemon that opts into these new purposes needs a
 server from this release; an older server rejects the handshake because its
 run-purpose enum does not recognize them. These capabilities did not change
-the protocol revision; the current revision is 4.
+the protocol revision; the current revision is 5.
 
-Protocol revision 4 negotiates `workspace.v1` for `repo_location.verify`,
+Protocol revision 5 negotiates `workspace.v1` for `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
 `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
 Plan-writing roles on a daemon-owned workspace require `execution.plan_transport`.
-A revision-4 daemon without it can still run reviewers, interactive executions,
+A revision-5 daemon without it can still run reviewers, interactive executions,
 server-owned shared-mount executions, filesystem requests and PTYs. Deterministic
 placement refusals record a structured Task annotation naming the machine and
 missing capability. Dispatch waits until eligibility facts change, then clears
 the refusal and retries.
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 4 or newer), restarting each with its existing
+release (protocol revision 5 or newer), restarting each with its existing
 `--workspace-root`.
-A connection below revision 4 receives `daemon_upgrade_required` and cannot use any
+A connection below revision 5 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -3549,7 +3562,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 4, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 5, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
@@ -7112,9 +7125,21 @@ bounded redacted UTF-8 tails and sets truncation flags. Output size cannot fail 
 check. The command limit is clamped to the remaining absolute run deadline;
 wall exhaustion is `timed_out`. Cancellation, timeout and dropped futures stop
 the entire group with SIGTERM, a 500 ms grace period, then SIGKILL; the leader is
-reaped. Checks also stop descendants after normal shell exit. Git retains its
-normal-exit behavior; untouched daemon helpers retain their independent two-second
-post-exit drain bound and explicit incomplete-drain evidence. Declared cleanup always runs after settled run commands,
+reaped. The group is the command's own, never the owner's: ids 0 and 1 are
+never signalled. A descendant that moved to another session or group (`setsid`)
+is outside the group and is not signalled; that is the platform limit. It is
+detached from the pipes instead: after the leader exits, output is read for at
+most two more seconds and the receipt carries `stdout_drain_incomplete` /
+`stderr_drain_incomplete`; a finished command keeps its exit status even when
+its limit expires during that drain.
+
+What outlives a normal exit depends on the policy. Canonical policies stop the
+command's group after every command. The two frozen CI policies do not: neither
+the server nor the daemon ever stopped what a CI step left running, and a step
+may start a service that the next step uses. Those processes are not stopped at
+the end of the run either, exactly as before. Git retains its normal-exit
+behavior (a hook that outlives Git is not stopped); daemon helpers keep their
+two-second post-exit drain bound. Declared cleanup always runs after settled run commands,
 using a fresh token and a separate bounded phase, including after failure,
 timeout and cancellation. Each cleanup command's own limit is also clamped.
 Tree termination grace is additional to the execution/cleanup deadline.
@@ -7125,7 +7150,12 @@ New execution policies clear ambient environment, disable login-profile loading
 and pass only declared keys plus the receiving machine's existing five build
 budget variables and niceness. The explicit frozen `legacy-server/1` and
 `legacy-daemon/1` policies preserve existing login-shell/environment/Git-variable
-behavior during caller migration. Project build overrides retain precedence.
+behavior during caller migration: the child inherits the owner process
+environment (PATH, HOME, toolchain variables), then the Project environment and
+secrets, then the run budget; no variable is removed except `GIT_DIR`,
+`GIT_WORK_TREE` and `GIT_INDEX_FILE` where the caller already removed them
+(daemon steps and server steps with a deadline). They also run no witness Git
+command beside a step and take no whole-run deadline. Project build overrides retain precedence.
 Attestation is computed on the owner from `ServerCheckExecutionInputs` before
 preparation; revision metadata must bind tools, assets, secrets and any declared
 cleanup policy. Owners without that evidence, including today's daemon, return
@@ -7152,8 +7182,26 @@ and retains sanitized check intents/results. An exact duplicate returns the
 same receipt or `running`; a different request under the key is refused. Lookup
 after reconnect returns the retained result; an unfinished intent without a live
 handler after restart returns `interrupted`. Cancellation uses the existing
-persistent operation tombstones and waits for process/cleanup settlement. Check
-keys survive journal acknowledgment, so acknowledged results cannot be relaunched.
+persistent operation tombstones and waits for process/cleanup settlement.
+
+Every check state has an end. A `running` operation ends with a receipt when its
+commands and cleanup settle, at the latest at its deadline plus the cleanup
+bound and the kill grace; waiting for a busy checkout is bounded by the same
+deadline and by cancellation, and settles the key as `timed_out` / `cancelled`
+with nothing spawned. A key that was admitted but could not start (workspace
+gone) settles as `infrastructure`. An intent whose handler was dropped or whose
+daemon restarted is `interrupted` and holds no journal headroom. A check key
+outlives `journal.ack` only until its request deadline has passed: before it a
+duplicate must find the receipt, after it a duplicate settles as `timed_out`
+before any command starts, so the key is no longer needed. The deadline may be
+at most 24 hours ahead. Acknowledged receipts are deleted once their deadline
+has passed; unacknowledged receipts and interrupted intents 24 hours after it
+(at admission of a later check, at most once a minute, and at daemon start).
+The headroom reserved for a running check is sized from its own command count
+(about 51 KiB per declared command), not a fixed worst case. On the server, a
+`check.run` call returns `DaemonUnavailable` as soon as the connection goes
+stale and `DaemonTimeout` after the remaining deadline plus the cleanup bound
+plus the RPC timeout; the caller then asks `check.lookup`.
 Upgrade the server first, then every daemon from that release and restart using
 the same workspace root. Revision-4 and older daemons are refused before dispatch.
 

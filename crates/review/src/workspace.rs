@@ -231,6 +231,36 @@ mod tests {
         ));
     }
 
+    /// The step's whole environment, as the shell sees it, is what the
+    /// pre-primitive builder (`workspace_command(..).output()`) produced:
+    /// inherited process environment, Project environment and run budget.
+    #[tokio::test]
+    async fn ci_step_environment_is_identical_to_the_direct_shell_command() {
+        let workspace = tempfile::tempdir().unwrap();
+        let env = BTreeMap::from([
+            ("PROJECT_TOKEN".to_owned(), "project-secret".to_owned()),
+            ("CARGO_BUILD_JOBS".to_owned(), "13".to_owned()),
+            ("EMPTY_VALUE".to_owned(), String::new()),
+        ]);
+        let command = "env | sort; pwd";
+        let direct = crate::workspace_command(workspace.path(), command, &env)
+            .output()
+            .await
+            .unwrap();
+        let moved = workspace.path().run(command, &env, None).await.unwrap();
+        assert!(direct.status.success());
+        assert_eq!(moved.exit_code, Some(0));
+        // The primitive returns the tail already redacted; the runner applied
+        // the same redaction to the direct output before using it.
+        let direct = executors::environment::redact_environment_values(
+            &String::from_utf8_lossy(&direct.stdout),
+            &env,
+        );
+        assert!(direct.contains("PROJECT_TOKEN=[REDACTED]") && direct.contains("PATH="));
+        // Not `assert_eq!`: a failure must not print the process environment.
+        assert!(moved.stdout == direct, "the step environment differs");
+    }
+
     #[tokio::test]
     async fn unbounded_ci_steps_keep_output_that_bounded_conformance_rejects() {
         let workspace = tempfile::tempdir().unwrap();

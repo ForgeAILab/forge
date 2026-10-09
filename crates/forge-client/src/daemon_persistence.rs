@@ -55,6 +55,38 @@ pub struct JournalCheckOperation {
     pub operation_id: String,
     pub request: Value,
     pub receipt: Option<api_types::CheckReceipt>,
+    /// The server recorded the receipt. The key is kept until the request's
+    /// deadline has passed, so a late duplicate still starts nothing.
+    #[serde(default)]
+    pub acknowledged: bool,
+}
+
+/// A check key is kept this long past its deadline when the server never
+/// acknowledged it (or the owner restarted mid-run and nobody asked).
+pub const CHECK_RETENTION: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const CHECK_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl JournalCheckOperation {
+    /// The request's absolute wall deadline. After it a duplicate request
+    /// settles as timed out before any command starts, so the key is no
+    /// longer needed to prevent a second process tree.
+    fn deadline(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(self.request.get("deadline")?.as_str()?)
+            .ok()
+            .map(|deadline| deadline.with_timezone(&chrono::Utc))
+    }
+    fn expired(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let Some(deadline) = self.deadline() else {
+            return true;
+        };
+        if self.acknowledged && self.receipt.is_some() {
+            return now > deadline;
+        }
+        chrono::Duration::from_std(CHECK_RETENTION)
+            .ok()
+            .and_then(|retention| deadline.checked_add_signed(retention))
+            .is_none_or(|until| now > until)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +152,7 @@ pub struct DaemonJournal {
     temp_sequence: AtomicU64,
     write_lock: Mutex<()>,
     usage: Mutex<Option<JournalUsage>>,
+    last_check_prune: Mutex<Option<std::time::Instant>>,
     #[cfg(test)]
     fail_next_directory_sync: std::sync::atomic::AtomicBool,
 }
@@ -143,6 +176,7 @@ impl DaemonJournal {
             temp_sequence: AtomicU64::new(1),
             write_lock: Mutex::new(()),
             usage: Mutex::new(None),
+            last_check_prune: Mutex::new(None),
             #[cfg(test)]
             fail_next_directory_sync: std::sync::atomic::AtomicBool::new(false),
         }
@@ -157,6 +191,7 @@ impl DaemonJournal {
             temp_sequence: AtomicU64::new(1),
             write_lock: Mutex::new(()),
             usage: Mutex::new(None),
+            last_check_prune: Mutex::new(None),
             #[cfg(test)]
             fail_next_directory_sync: std::sync::atomic::AtomicBool::new(false),
         }
@@ -351,6 +386,54 @@ impl DaemonJournal {
         Ok(operation)
     }
 
+    /// Delete check keys that can no longer prevent a second process tree:
+    /// acknowledged receipts past their deadline, and anything
+    /// [`CHECK_RETENTION`] past it. Returns how many were removed.
+    pub fn prune_checks(&self, now: chrono::DateTime<chrono::Utc>) -> Result<usize> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.ensure_confined()?;
+        self.current_usage()?;
+        if !self.directory.exists() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.directory)? {
+            let path = entry?.path();
+            if !is_entry_path(&path) || self.is_skipped(&path) {
+                continue;
+            }
+            let Ok(JournalEntry::Check { operation }) = read_entry(&path) else {
+                continue;
+            };
+            if !operation.expired(now) {
+                continue;
+            }
+            fs::remove_file(&path)?;
+            self.update_usage(&path, None, 0);
+            removed += 1;
+        }
+        if removed > 0 {
+            self.sync_directory()?;
+        }
+        Ok(removed)
+    }
+
+    /// [`Self::prune_checks`] at most once a minute: admission calls this
+    /// before it looks a key up, so retention needs no timer of its own.
+    pub fn prune_checks_when_due(&self) -> Result<usize> {
+        {
+            let mut last = self
+                .last_check_prune
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if last.is_some_and(|at| at.elapsed() < CHECK_PRUNE_INTERVAL) {
+                return Ok(0);
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        self.prune_checks(chrono::Utc::now())
+    }
+
     pub fn operation(&self, operation_id: &str) -> Result<Option<JournalOperation>> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let path = self.path_for_entry(&operation_entry_id(operation_id))?;
@@ -394,7 +477,9 @@ impl DaemonJournal {
                 continue;
             }
             let entry = read_entry(&path)?;
-            if !matches!(&entry, JournalEntry::Operation { operation } if operation.acknowledged) {
+            if !matches!(&entry, JournalEntry::Operation { operation } if operation.acknowledged)
+                && !matches!(&entry, JournalEntry::Check { operation } if operation.acknowledged)
+            {
                 entries.push(entry);
             }
         }
@@ -423,8 +508,28 @@ impl DaemonJournal {
         if matches!(&entry, JournalEntry::Check { operation } if operation.receipt.is_none()) {
             bail!("cannot acknowledge an unfinished check");
         }
-        // Check idempotency keys survive acknowledgment, just like attempts.
-        if matches!(&entry, JournalEntry::Check { .. }) {
+        // A check key outlives its acknowledgement only until the request's
+        // deadline: before it a duplicate must find the receipt, after it a
+        // duplicate can no longer start a command.
+        if let JournalEntry::Check { mut operation } = entry {
+            if !operation.acknowledged {
+                operation.acknowledged = true;
+                if !operation.expired(chrono::Utc::now()) {
+                    self.write_entry(&JournalEntry::Check { operation })?;
+                    return Ok(JournalAckResult {
+                        entry_id: params.entry_id.clone(),
+                        acknowledged: true,
+                    });
+                }
+            } else if !operation.expired(chrono::Utc::now()) {
+                return Ok(JournalAckResult {
+                    entry_id: params.entry_id.clone(),
+                    acknowledged: true,
+                });
+            }
+            fs::remove_file(&path)?;
+            self.update_usage(&path, None, 0);
+            self.sync_directory()?;
             return Ok(JournalAckResult {
                 entry_id: params.entry_id.clone(),
                 acknowledged: true,
@@ -710,10 +815,27 @@ impl DaemonJournal {
                             }
                             continue;
                         }
+                        if matches!(&record, JournalEntry::Check { operation } if operation.expired(chrono::Utc::now()))
+                        {
+                            if let Err(error) = fs::remove_file(&path) {
+                                tracing::warn!(path = %path.display(), %error, "could not remove expired check journal entry; skipping it");
+                                usage.skipped.insert(path);
+                            } else if let Err(error) = self.sync_directory() {
+                                tracing::warn!(path = %path.display(), %error, "could not sync expired check journal entry removal");
+                            }
+                            continue;
+                        }
                         // Scrub existing pre-fix receipts as part of the one-time
                         // journal scan, retaining their replay identity and result.
                         let retained = sanitized_entry(&record);
-                        let reservation = run_result_reservation(&retained)?;
+                        // A check intent found at startup was interrupted: no
+                        // receipt will ever be written for it, so it holds no
+                        // completion headroom.
+                        let reservation = if matches!(retained, JournalEntry::Check { .. }) {
+                            0
+                        } else {
+                            run_result_reservation(&retained)?
+                        };
                         if reservation > 0 {
                             usage.reservations.insert(path.clone(), reservation);
                         }
@@ -1007,13 +1129,22 @@ fn sanitized_entry(entry: &JournalEntry) -> JournalEntry {
 // cannot consume it while the command runs, including workspace-registry writes.
 fn run_result_reservation(entry: &JournalEntry) -> Result<u64> {
     if let JournalEntry::Check { operation } = entry {
-        // 64 command receipts + 32 cleanup receipts, 4096-byte tails per
-        // stream, worst-case JSON escaping and the 128 KiB request manifest.
-        return Ok(if operation.receipt.is_none() {
-            8 * 1024 * 1024
-        } else {
-            0
-        });
+        if operation.receipt.is_some() {
+            return Ok(0);
+        }
+        // Headroom for this request's own receipt: per declared command two
+        // 4096-byte tails at worst-case JSON escaping (six bytes per byte)
+        // plus its fixed fields and repeated command text.
+        let commands = ["/spec/commands", "/cleanup_commands"]
+            .iter()
+            .filter_map(|pointer| operation.request.pointer(pointer)?.as_array())
+            .map(Vec::len)
+            .sum::<usize>() as u64;
+        let request = serde_json::to_vec(&operation.request)?.len() as u64;
+        return Ok(commands
+            .saturating_mul(2 * 6 * check_executor::OUTPUT_TAIL_BYTES as u64 + 2048)
+            .saturating_add(request)
+            .saturating_add(8192));
     }
     let JournalEntry::Operation { operation } = entry else {
         return Ok(0);

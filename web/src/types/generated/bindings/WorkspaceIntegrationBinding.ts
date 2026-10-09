@@ -3,6 +3,6 @@ import type { WorkspaceIntegrationRequest } from "./WorkspaceIntegrationRequest"
 
 /**
  * Task-step authority remains distinct from the passive queue's lease. Both
- * use the same owner effects. Revision 4 always carries this tagged field.
+ * use the same owner effects. Since revision 4 every request carries this tagged field.
  */
 export type WorkspaceIntegrationBinding = { "kind": "task_step" } | { "kind": "task_step_effect", request: WorkspaceIntegrationRequest, } | { "kind": "attempt", request: WorkspaceIntegrationRequest, };

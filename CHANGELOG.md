@@ -8,6 +8,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Daemon protocol revision 5 (3.3 stage B).** The daemon command stream
+  adds `check.run`, `check.lookup` and `check.cancel`, and the minimum
+  revision is 5: a revision-4 or older daemon is refused at the handshake
+  with `daemon_upgrade_required` and cannot use any command RPC. Upgrade the
+  server first, then install `forge-ctl` from that release on every daemon
+  and restart each with the same `--workspace-root`. The on-disk daemon
+  journal needs no conversion: revision-4 entries, including in-flight
+  integration intents and attempt receipts, are read unchanged. No check
+  timeout changed: review-entry CI, manual review CI and the merge-path
+  check keep the limits they had (none for a whole run).
+
 - **Registered native Project calls refuse undeclared fields (3.8 slice E).**
   `project.current_state`, `project.observations`, `project.review_config`,
   `project.document`, `project.decision`, `project.milestone`,
@@ -670,6 +681,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **One execution primitive for CI steps (3.3 stage B).** The merge-path
+  check, review-entry CI and manual review CI run each step through the
+  shared `check-executor` on the server and on a daemon, on top of the
+  process-group supervisor that Git commands already used (now the
+  `process-supervisor` crate). Commands, order, working directory,
+  `bash -lc`, inherited environment, Project environment and secrets, run
+  budget and niceness, verdicts, comments and events are unchanged, and a
+  process a step leaves running still survives into the next step. A step's
+  retained output is the last 1 MiB per stream (manual review CI used to
+  log all of it); the verdict never depends on output size.
+- **Typed check receipts and a managed exact-commit checkout (3.3 stage
+  B).** The primitive returns a `CheckReceipt` (per-command exit, outcome,
+  duration, redacted tails, truncation and incomplete-drain flags, cleanup
+  outcome, owner and input identity) and can run a commit-scoped check in a
+  managed exact-commit checkout. Nothing uses either yet: no check is
+  cached, deduplicated or moved to the managed checkout in this release.
 
 - **Project operations and pending proposals use generated registry contracts
   (3.8 slice E).** Two Project reads, seven Project proposals and six pending
@@ -1564,6 +1592,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A CI step can no longer hang on its own output (3.3 stage B).** On the
+  server, a step that left a process holding its output pipe (a dev server
+  started with `&`) never returned. Output is now read for at most two
+  seconds after the step's shell exits, as a daemon already did, and the
+  step keeps its exit status. A step stopped by its deadline has its whole
+  process group stopped (SIGTERM, 500 ms, SIGKILL), not only the shell.
 
 - **A setup-only operation refused after setup completed names the real
   cause (3.8 slice E).** The denial is `charter_adoption_not_applicable`

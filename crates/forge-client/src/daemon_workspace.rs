@@ -1625,8 +1625,8 @@ impl DaemonWorkspaceBackend {
                     .is_some_and(|o| o.outcome == CheckExecutionOutcome::TimedOut),
                 stdout_truncated: output.as_ref().is_some_and(|o| o.stdout_truncated),
                 stderr_truncated: output.as_ref().is_some_and(|o| o.stderr_truncated),
-                stdout_drain_incomplete: false,
-                stderr_drain_incomplete: false,
+                stdout_drain_incomplete: output.as_ref().is_some_and(|o| o.stdout_drain_incomplete),
+                stderr_drain_incomplete: output.as_ref().is_some_and(|o| o.stderr_drain_incomplete),
             });
         }
         let output = bounded_command(command, params.timeout_secs, output_cap, true).await?;
