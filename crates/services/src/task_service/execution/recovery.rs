@@ -513,11 +513,21 @@ impl TaskService {
                 // is removed. Restoring the old park here turned the wait
                 // into an untyped `recovery_required: "dependency gate"`
                 // that offered the refused action again.
-                crate::deferred_dispatch::record_dispatch_disposition(
+                let dependency_ids = unsatisfied.clone();
+                crate::deferred_dispatch::record_dispatch_disposition_naming(
                     &self.db,
                     &current,
-                    &current.status,
-                    &error.to_string(),
+                    crate::deferred_dispatch::DEPENDENCY_WAIT_CAPABILITY,
+                    &format!(
+                        "waiting for unfinished dependenc{}: {}",
+                        if dependency_ids.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        },
+                        dependency_ids.join(", ")
+                    ),
+                    &dependency_ids,
                 )
                 .await?;
                 return Ok(true);
@@ -1421,7 +1431,17 @@ impl TaskService {
     ) -> Result<Task> {
         let reason = optional_recovery_reason(reason, "retry");
         let (gate_state, _budget, _count) = self.current_gate_retry_budget(&task).await?;
-        let resume_after_reset = if task.status == gate_state {
+        // A coordination root has no implementation run to go back to: its
+        // retry is review-only. The aggregate review runs again in place,
+        // under the fresh budget, instead of moving the root to a working
+        // state where no role may run for it.
+        let review_only = task.parent_task_id.is_none()
+            && task.status == gate_state
+            && gate_state == crate::workflow::default_states::REVIEW
+            && crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
+        let resume_after_reset = if review_only {
+            None
+        } else if task.status == gate_state {
             let failed_review = if gate_state == crate::workflow::default_states::REVIEW {
                 ReviewRepo::list_latest_reviews_for_tasks(&*self.db, &[task.id.as_str()])
                     .await?
@@ -1482,7 +1502,47 @@ impl TaskService {
                 .continue_task_process_with_plan(updated, Some(reason), None, plan, false)
                 .await;
         }
+        if review_only {
+            let id = uuid::Uuid::parse_str(&updated.id)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            let (task, _) = Box::pin(self.rerun_review(id)).await?;
+            return Ok(task);
+        }
         Ok(updated)
+    }
+
+    /// Clear a coordination root's exhausted review budget without running
+    /// anything: the first half of sending the root back for a corrective
+    /// subtask. The marker is the new counting boundary, so the aggregate
+    /// review that follows the corrective work starts a fresh budget.
+    pub(crate) async fn reset_root_review_budget_for_reopen(
+        &self,
+        task: &Task,
+        reason: &str,
+    ) -> Result<Task> {
+        let (gate_state, _budget, _count) = self.current_gate_retry_budget(task).await?;
+        let mut transition_log = recovery_marker(
+            &task.id,
+            &gate_state,
+            "retry",
+            &TaskService::task_action_actor(api_types::Actor::user(
+                api_types::UserActionSource::Action(api_types::TaskAction::retry()),
+            )),
+            reason,
+        );
+        transition_log.bridge = api_types::TransitionBridge::recovery("retry", true);
+        transition_log.hook_results_json = Some(
+            serde_json::to_string(&vec![api_types::HookResultEntry {
+                action: "retry".to_owned(),
+                phase: "action".to_owned(),
+                outcome: "reset_budget".to_owned(),
+                duration_ms: None,
+                error: None,
+            }])
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+        );
+        self.clear_retry_exhausted_blocking_metadata_with_marker(task, transition_log)
+            .await
     }
 
     pub(crate) async fn permit_one_task_retry(

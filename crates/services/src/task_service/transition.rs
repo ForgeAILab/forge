@@ -613,7 +613,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         if let Some(expected_version) = expected_version {
             if expected_version != task.version {
                 return Err(ServiceError::Db(db::DbError::TaskVersionConflict {
@@ -622,6 +621,13 @@ impl TaskService {
                 }));
             }
         }
+        // Cancel is the owner's exit and wins over a plan artifact that is
+        // still settling: the claim is abandoned (prior plan restored,
+        // staged files removed) and the cancel continues at the version that
+        // abandoning produced.
+        let task = self.abandon_plan_publication_for_cancel(task).await?;
+        let expected_version = expected_version.map(|_| task.version);
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -695,6 +701,70 @@ impl TaskService {
             );
         }
         Ok(task)
+    }
+
+    /// Give up a completed execution's unsettled plan publication so the
+    /// Task can be cancelled. A plan that cannot be restored does not keep
+    /// the Task alive: the claim is released anyway and the cancel proceeds.
+    pub(crate) async fn abandon_plan_publication_for_cancel(&self, task: Task) -> Result<Task> {
+        // A claim whose transition already committed (its state is no
+        // longer the Task's) authorizes nothing, but the transition guard
+        // refuses any claim it finds: clear it here instead of making the
+        // cancel wait for the scheduler to do so.
+        let task = super::execution::clear_stale_plan_publication_claim(
+            &self.db,
+            &self.workspace_backend_router,
+            &task,
+        )
+        .await?;
+        let Some(execution_id) = super::execution::active_plan_publication_claim_owner(&task)?
+        else {
+            return Ok(task);
+        };
+        if let Err(error) = self
+            .abandon_plan_publication_claim(&task, &execution_id)
+            .await
+        {
+            tracing::warn!(task_id = %task.id, %execution_id, %error, "plan publication could not be rolled back for a cancel; releasing its claim");
+            let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            if super::execution::active_plan_publication_claim_owner(&current)?.as_deref()
+                == Some(execution_id.as_str())
+            {
+                // The staged candidate must not outlive its claim: with no
+                // claim nothing would own (or ever remove) those files. A
+                // failure here is logged, not fatal: the Task is being
+                // cancelled and its workspace is cleaned up with it.
+                if let Err(error) = super::execution::cleanup_execution_plan_private_files(
+                    &self.db,
+                    &self.workspace_backend_router,
+                    &current,
+                    &execution_id,
+                )
+                .await
+                {
+                    tracing::warn!(task_id = %task.id, %execution_id, %error, "staged plan files could not be removed for a cancel");
+                }
+                super::execution::release_plan_publication_for_execution_id(
+                    &self.db,
+                    &current,
+                    &execution_id,
+                )
+                .await?;
+            }
+        }
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id))?;
+        // The settle may have committed its transition while the claim was
+        // being abandoned; what is left of the claim is then stale.
+        super::execution::clear_stale_plan_publication_claim(
+            &self.db,
+            &self.workspace_backend_router,
+            &current,
+        )
+        .await
     }
 
     async fn repair_cancelled_coordination_children(
