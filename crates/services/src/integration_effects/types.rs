@@ -1,6 +1,6 @@
 /// Placement authority is checked by the caller before constructing an effect.
 /// This is an input witness, not an owner-side fencing token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EffectWorkspace {
     pub workspace_id: String,
     pub placement_id: String,
@@ -9,7 +9,8 @@ pub struct EffectWorkspace {
     pub handle: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EffectOwner {
     Server,
     Daemon {

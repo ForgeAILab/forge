@@ -4442,16 +4442,19 @@ no Task column or budget is migrated, and no legacy producer is retired.
 A queue is unique by `(repo_id, target_branch)`. Branch validation strips one
 `refs/heads/` prefix and preserves exact spelling. Location is never a queue
 key. `resolve_integration_target_in_tx` is the single location-selection seam:
-it reads `repo.local_path` and the repo's explicitly default
-`repo_location` rows of kind `primary_checkout`. Exactly one must exist; if a
-local path is configured, it must match that server location. Multiple defaults
-(including a server checkout and daemon copies), missing defaults, contradictory
-local configuration and non-ready targets suspend the queue with a typed
-`target_ambiguous`, `target_unconfigured` or `target_unavailable` reason. Task
-placement and mere daemon presence never choose the target. This conservative
-selection can be replaced in one function when the authoritative setting is
-settled. The witness stores location/owner/runtime/generation, never a path or
-token.
+it reads the repo's explicitly default `repo_location` rows of kind
+`primary_checkout`. Exactly one ready location selects the checkout, regardless
+of server/daemon ownership or `repo.local_path`. The latter is a provisioning
+hint, not a second target setting. Task placement and mere daemon presence never
+choose a queue target. The witness stores location/owner/runtime/generation,
+never a path or token.
+
+Today's embedded Task merge uses the selected workspace location's checkout;
+a daemon merge uses the verified primary checkout supplied to that owner. Those
+paths do not veto a checkout because `local_path` disagrees. The table below
+covers a Task using the configured default location. A Task already placed at a
+non-default checkout still follows its existing backend path in this passive
+stage; routing such delivery to the authoritative target remains activation work.
 
 How the resolver decides (queue state, `target_location_id`, typed reason):
 
@@ -4460,14 +4463,20 @@ How the resolver decides (queue state, `target_location_id`, typed reason):
 | Server only: `repo.local_path` set, one default `primary_checkout` server location at that path, `ready` | `open`, that location |
 | Daemon only: no `local_path`, one default `primary_checkout` daemon location, `ready` | `open`, that location |
 | Both, the server checkout is the default (daemon copies are not default) | `open`, the server location; a non-default copy never selects |
-| Both, the default is a daemon location while `local_path` is set | `suspended`, none, `target_ambiguous` |
-| `local_path` set, default server location at a different path | `suspended`, none, `target_ambiguous` |
+| Both, the default is a daemon location while `local_path` is set | `open`, the daemon location |
+| `local_path` set, default server location at a different path | `open`, the default server location |
 | No default `primary_checkout` location (including a pre-location legacy repo with no `local_path`) | `suspended`, none, `target_unconfigured` |
 | Two or more default `primary_checkout` locations | `suspended`, none, `target_ambiguous` |
 | The one configured location is not `ready` | `suspended`, that location, `target_unavailable` |
 
-The resolution is taken once, when the queue row is created; stage B never
-refreshes it. A queue with no `target_location_id` is never claimable.
+Creation records a snapshot. Claim refreshes the default location and its
+owner/generation in the same queue-revision CAS transaction. A repaired
+suspended queue can reopen at claim. An unavailable/unconfigured/ambiguous
+resolution is committed as a suspension without advancing the fence, then the
+claim returns a version conflict. A live lease or stale revision cannot refresh
+a queue. An uncertain attempt retains its original intent even if the queue's
+configured target changes; takeover transfers reconciliation ownership and
+cannot repeat that effect.
 
 **Deletion.** In this passive stage the queue tables are evidence, not
 authority, and they restrict no deletion:
@@ -4574,6 +4583,9 @@ are retained opaque witnesses rather than cascading foreign keys.
 | `permit_json` | `TEXT CHECK(permit_json IS NULL OR json_valid(permit_json))` |
 | `operation_kind` | `TEXT CHECK(operation_kind IN ('merge','rebase','check','fast_forward','reconcile'))` |
 | `operation_id` | `TEXT` |
+| `owner_fence_json` (C2) | nullable owner/queue/attempt fence JSON, capped at 16 KiB |
+| `effect_intent_json` (C2) | nullable frozen request + digest JSON, capped at 64 KiB |
+| `effect_receipts_json` (C2) | non-null JSON array, default `[]`, capped at 1 MiB |
 | `current_operation_state` | `TEXT CHECK(current_operation_state IN ('pending','running','succeeded','failed','uncertain','acknowledged'))` |
 | `operation_receipts_json` | `TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(operation_receipts_json))` |
 | `checks_json` | `TEXT CHECK(checks_json IS NULL OR json_valid(checks_json))` |
@@ -4770,15 +4782,17 @@ no ordering/retry timing/budget and drives no Git or CI. The target-read
 buffer is one slot in the Task step's task-local scope: created empty by
 `in_task_step`, keyed by step id and hook index, dropped with the step.
 
-**Stage B rows are disposable.** Nothing reads these tables to make a
-decision, and the importer has no production caller. Before stage D's first
-import it must discard every stage B row (`DELETE FROM integration_attempt;
-DELETE FROM integration_queue;`) or version its admission key: import progress
+**Stage B shadow rows are disposable.** The importer has no production caller.
+Before stage D's first import, it must discard stage B's unfenced shadow rows or
+version its admission key. Once an owner gate has written an intent or receipt,
+that attempt is retained authority and must survive this discard; a blanket
+`DELETE FROM integration_attempt; DELETE FROM integration_queue;` is only valid
+when no C2 owner effects have been admitted. Import progress
 is the existence of an `import:<Task>:<status_epoch>` row, so a changed
 classification is not re-applied over existing rows; a current shadow attempt
 makes the importer retain its row non-current with
-`existing_attempt_identity`; and queue rows keep the target resolution and any
-quarantine pin they were created with.
+`existing_attempt_identity`; and mere import/read operations keep the queue target snapshot and any
+quarantine pin. Claim refreshes that snapshot as described above.
 
 Operator status adds only read-only counts by queue/current-attempt state and
 quarantined imports; there are no queue REST/MCP/web/CLI reads yet.
@@ -4791,14 +4805,14 @@ read-only facts used by today's Task-step consumer. It accepts an explicit
 `EffectWorkspace` witness (owner, workspace, placement, generation and handle),
 Git paths/branches and candidate/target objects, command purpose/environment,
 and caller-supplied command/transport deadlines. Its functions receive no
-repository, database, event publisher or Task service. Two inputs are wider
-than the effect needs and are narrow by contract only: `RpcExchange` holds the
-`DaemonConnectionRegistry` (which also carries the event bus and execution
-handlers) and may only look a connection up and ask whether it is current;
-`GitFacts` is implemented by `ResolvedWorkspace`, whose daemon path sends the
+repository, database, event publisher or Task service. `RpcExchange` receives
+only its selected `DaemonConnection`; connection lookup
+and protocol admission belong to the recorder. Replacement/unregistration marks
+the old connection stale and fails its pending replies. `GitFacts` is
+implemented by `ResolvedWorkspace`, whose daemon path sends the
 owner inspection through the workspace client. The witness is input
 provenance; the current consumers still perform placement and review authority
-checks. It is not a new owner-side or queue-generation fence.
+checks. The primitive witness checks do not replace the durable owner gate described below.
 
 The split is phased to preserve the existing transaction and read order:
 
@@ -4837,8 +4851,10 @@ The split is phased to preserve the existing transaction and read order:
   `RunCiSteps` recorder then serializes the facts and performs the same Review
   settlement, Task authority projection and event publication. Entry CI still
   passes `None` (wire `timeout_secs=0`), with unbounded collection and the same
-  4096-byte Review tails. No default timeout, CheckRunner cache or conformance
-  consolidation is introduced.
+  4096-byte Review tails. A finite `Duration` is rounded upward to the existing wire's whole-second
+  timeout (at least one second), so a sub-second or zero supplied duration
+  cannot become the unbounded `timeout_secs=0` sentinel. No default timeout,
+  CheckRunner cache or conformance consolidation is introduced.
 - `RpcExchange::prepare` installs only the in-memory pending reply; the
   consumer's `record_exchange_admission` persists remote-operation admission
   before `execute` sends a frame. `execute` performs the socket exchange with
@@ -4870,11 +4886,63 @@ extraction, including execution trigger effects and remote receipt ordering.
 All stage B shadow observation sites and content remain in their original
 Task-step/Review/result transactions. Carry predicates, manual mode, Task
 single-writer authority and cancellation protection are unchanged. There is
-still no integration worker or activation. Part 2 must add durable owner
-fencing, an attempt-keyed receipt sink and the cancel/reconnect/removal contract
-before a queue worker can consume these effects. The later head CI/rebase wall
+still no integration worker or activation. The server owner foundation below
+is available, but the existing Task-step recorders have not been converted to
+its attempt receipt sink. Daemon fence transport, receipt reconciliation and
+removal settlement must be completed before queue activation. The later head CI/rebase wall
 timeout remains an explicit setting decision (default 1800 seconds), not a
 default supplied by these primitives.
+
+
+### Server integration owner foundation (3.2 stage C, part 2, partial)
+
+A claim stamps `integration_attempt.owner_fence_json` with queue/attempt IDs,
+monotonic `slot_generation`, lease owner and the frozen target owner
+(location ID, server/daemon identity, runtime ID, location version). The owner
+gate checks this against the current queue, reserved head, lease deadline,
+stored attempt fence and current default location before any Git query.
+`ServerIntegrationOwner` resolves the workspace from its persisted ready
+placement, verifies workspace/placement/handle/generation and the expected HEAD
+and target objects, then uses the part-1 merge/rebase primitives. Refusals are
+typed: stale fence, foreign owner, witness mismatch, request conflict or required
+reconciliation. This gate changes neither Task nor Review authority.
+
+The additive `V202610082317__integration_fencing.sql` migration adds only three
+used columns: `owner_fence_json` (16 KiB), `effect_intent_json` (64 KiB), and
+`effect_receipts_json` (an array capped at 1 MiB). Receipt identity is
+`(attempt_id, operation_kind, fence)` with the full frozen request checked for
+identity reuse. A receipt is at most 128 KiB; admission reserves that capacity.
+Execution IDs are not receipt keys. Ordinary attempts' existing imported
+operation receipts remain separate evidence. These additions preserve Repo and
+Project CASCADE behavior.
+
+Order: receipt lookup → fence check → committed exact intent → fence recheck
+under the owner write guard → placement/object checks → Git → bounded typed
+receipt commit. An identical completed request returns the receipt before Git,
+including after constructing a new server owner. A committed intent without a
+receipt requires reconciliation and is never implicitly retried. The intent
+survives cancellation, guard drop, crash and lease takeover. A running/uncertain
+operation returns to `reconciling` on takeover; its original identity is retained
+in the intent independently of the new observing owner's fence. Failed/cancelled
+operations record their settlement; an uncertain infrastructure result retains
+the intent. Automatic reconciliation and Task-step consumption are not wired yet.
+
+The server gate currently holds `BEGIN IMMEDIATE` across the physical effect,
+preventing a claim from invalidating an admitted fence while Git runs. This is
+safe storage groundwork, not a scalable queue executor: owner serialization
+that permits narrowing that guard remains required before activation. The
+existing local review guard is retained because it also fences changes to
+review/Project authority; the owner fence does not replace that contract.
+
+Git process cancellation now kills the entire owned process group (including
+hooks), with `kill_on_drop` retaining child ownership. Cancellation/timeout on
+the server owner rebase records observed HEAD and stopped-rebase state without
+aborting it; the existing interrupted-rebase recovery remains applicable. The
+Git helper fix also applies to today's daemon rebase. The daemon still has its
+separate algorithm and its existing protocol revision **3**: there is no fence
+wire change or activation in this partial delivery. Remaining C2 work is legacy
+Task-step binding to the gate, shared daemon primitives and revision/handshake
+change, daemon attempt receipts, reconnect reconciliation and removal settlement.
 
 
 ### Task condition actions

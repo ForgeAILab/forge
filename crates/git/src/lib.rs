@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+mod process;
 mod remote;
 pub use remote::{normalize_remote_url, redact_remote_credentials};
 
@@ -39,15 +40,14 @@ pub struct BranchList {
 }
 
 async fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .kill_on_drop(true)
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(cwd)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+        .env_remove("GIT_INDEX_FILE");
+    let output = process::output(&mut command).await?;
 
     if !output.status.success() {
         return Err(GitError::CommandFailed {
@@ -413,16 +413,15 @@ pub async fn continue_rebase_keeping_conflicts(worktree_path: &Path) -> Result<V
                 });
             }
             run_git(worktree_path, &["add", "-A"]).await?;
-            let output = Command::new("git")
-                .kill_on_drop(true)
+            let mut command = Command::new("git");
+            command
                 .args(["-c", "core.editor=true", "rebase", "--continue"])
                 .current_dir(worktree_path)
                 .env_remove("GIT_DIR")
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE")
-                .env("GIT_EDITOR", "true")
-                .output()
-                .await?;
+                .env("GIT_EDITOR", "true");
+            let output = process::output(&mut command).await?;
             let continued = if output.status.success() {
                 Ok(())
             } else {

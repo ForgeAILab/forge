@@ -35,7 +35,9 @@ stored_enum!(IntegrationImportDisposition { Classified => "classified", NeedsFac
 
 #[cfg(test)]
 mod audit_tests;
+mod fencing;
 mod importer;
+pub use fencing::*;
 pub(crate) mod shadow;
 #[cfg(test)]
 mod tests;
@@ -139,6 +141,10 @@ pub struct IntegrationAttempt {
     pub operation_id: Option<String>,
     pub current_operation_state: Option<IntegrationOperationState>,
     pub operation_receipts_json: Value,
+    /// Owner evidence is read-only through ordinary attempt transitions.
+    pub owner_fence_json: Option<Value>,
+    pub effect_intent_json: Option<Value>,
+    pub effect_receipts_json: Value,
     pub checks_json: Option<Value>,
     pub checks_commit_sha: Option<String>,
     pub deadline: Option<String>,
@@ -241,6 +247,15 @@ fn map_attempt(row: sqlx::sqlite::SqliteRow) -> Result<IntegrationAttempt> {
             .map(|s| s.parse())
             .transpose()?,
         operation_receipts_json: parse_json(row.try_get("operation_receipts_json")?)?,
+        owner_fence_json: row
+            .try_get::<Option<String>, _>("owner_fence_json")?
+            .map(parse_json)
+            .transpose()?,
+        effect_intent_json: row
+            .try_get::<Option<String>, _>("effect_intent_json")?
+            .map(parse_json)
+            .transpose()?,
+        effect_receipts_json: parse_json(row.try_get("effect_receipts_json")?)?,
         checks_json: row
             .try_get::<Option<String>, _>("checks_json")?
             .map(parse_json)
@@ -337,6 +352,9 @@ impl IntegrationAttempt {
             operation_id: None,
             current_operation_state: None,
             operation_receipts_json: serde_json::json!([]),
+            owner_fence_json: None,
+            effect_intent_json: None,
+            effect_receipts_json: serde_json::json!([]),
             checks_json: None,
             checks_commit_sha: None,
             deadline: None,
@@ -361,6 +379,14 @@ impl IntegrationAttempt {
 }
 async fn insert_attempt(tx: &mut Transaction<'_, Sqlite>, a: &IntegrationAttempt) -> Result<()> {
     validate_attempt(a)?;
+    if a.owner_fence_json.is_some()
+        || a.effect_intent_json.is_some()
+        || a.effect_receipts_json != serde_json::json!([])
+    {
+        return Err(DbError::Check(
+            "admission cannot fabricate owner effect evidence".into(),
+        ));
+    }
     sqlx::query("INSERT INTO integration_attempt (id,queue_id,task_id,task_ref,project_ref,queue_seq,attempt_number,predecessor_attempt_id,current,admission_key,expected_status,expected_epoch,observed_task_version,workflow_ref_id,enqueued_at,execution_id,execution_ref,workspace_id,workspace_ref,placement_id,placement_ref,repo_location_id,repo_location_ref,owner_kind,daemon_id,runtime_id,placement_generation,original_candidate_sha,candidate_sha,target_tip_sha,contract_execution_id,review_id,reviewed_paths_json,changed_paths_json,conflict_paths_json,repair_paths_json,guard_paths_json,state,resume_state,failure_kind,failure_message,slot_generation,permit_json,operation_kind,operation_id,current_operation_state,operation_receipts_json,checks_json,checks_commit_sha,deadline,effect_seq,effect_ack_json,acknowledged_at,integrated_before_sha,integrated_sha,available_at,last_error_kind,last_error,started_at,updated_at,created_at,completed_at,import_source_json,observations_json,observations_dropped,revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&a.id)
         .bind(&a.queue_id)
@@ -767,19 +793,19 @@ pub struct IntegrationTarget {
     pub owner: Option<Value>,
     pub failure: Option<IntegrationFailureKind>,
 }
-/// Single target-selection seam. Read only the repo's configured local_path
-/// and explicitly-default primary_checkout locations. Neither the Task's
+/// Single target-selection seam. The repo's explicitly default primary_checkout
+/// is authoritative; local_path is a clone/provisioning hint. Neither the Task's
 /// placement nor a daemon's mere presence selects an integration target.
 async fn resolve_integration_target_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     repo_id: &str,
 ) -> Result<IntegrationTarget> {
-    let local_path: Option<String> = sqlx::query_scalar("SELECT local_path FROM repo WHERE id=?")
+    let _: String = sqlx::query_scalar("SELECT id FROM repo WHERE id=?")
         .bind(repo_id)
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(DbError::NotFound)?;
-    let locations = sqlx::query("SELECT id,owner_kind,daemon_id,runtime_id,path,status,version FROM repo_location WHERE repo_id=? AND is_default=1 AND kind='primary_checkout' ORDER BY id")
+    let locations = sqlx::query("SELECT id,owner_kind,daemon_id,runtime_id,status,version FROM repo_location WHERE repo_id=? AND is_default=1 AND kind='primary_checkout' ORDER BY id")
         .bind(repo_id).fetch_all(&mut **tx).await?;
     let failure = if locations.is_empty() {
         Some(IntegrationFailureKind::TargetUnconfigured)
@@ -797,17 +823,6 @@ async fn resolve_integration_target_in_tx(
     }
     let location = &locations[0];
     let owner_kind: String = location.try_get("owner_kind")?;
-    let path: String = location.try_get("path")?;
-    if local_path
-        .as_ref()
-        .is_some_and(|configured| owner_kind != "server" || configured != &path)
-    {
-        return Ok(IntegrationTarget {
-            location_id: None,
-            owner: None,
-            failure: Some(IntegrationFailureKind::TargetAmbiguous),
-        });
-    }
     let id: String = location.try_get("id")?;
     let status: String = location.try_get("status")?;
     Ok(IntegrationTarget {
@@ -1077,11 +1092,7 @@ impl IntegrationQueueRepo for SqliteDb {
         let mut tx = begin_immediate(self.pool()).await?;
         let mut q = queue_in_tx(&mut tx, queue_id).await?;
         if q.revision != expected_revision
-            || !matches!(
-                q.state,
-                IntegrationQueueState::Open | IntegrationQueueState::Quarantined
-            )
-            || q.target_location_id.is_none()
+            || q.state == IntegrationQueueState::Closed
             || (q.state == IntegrationQueueState::Quarantined && q.head_attempt_id.is_none())
             || q.lease_until
                 .as_deref()
@@ -1090,6 +1101,23 @@ impl IntegrationQueueRepo for SqliteDb {
                 .is_some_and(|until| until > now_time)
         {
             return Err(DbError::VersionConflict);
+        }
+        // Refresh in the same CAS transaction as the claim. A suspended queue
+        // can become claimable as soon as its configured target is repaired.
+        let target = resolve_integration_target_in_tx(&mut tx, &q.repo_id).await?;
+        q.target_location_id = target.location_id;
+        q.target_owner_json = target.owner;
+        q.last_error_kind = target.failure;
+        if target.failure.is_some() {
+            sqlx::query("UPDATE integration_queue SET target_location_id=?,target_owner_json=?,state='suspended',last_error_kind=?,last_error=NULL,revision=revision+1,updated_at=? WHERE id=? AND revision=?")
+                .bind(&q.target_location_id).bind(q.target_owner_json.as_ref().map(ToString::to_string))
+                .bind(target.failure.map(|f| f.to_string())).bind(now).bind(queue_id).bind(expected_revision)
+                .execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Err(DbError::VersionConflict);
+        }
+        if q.state == IntegrationQueueState::Suspended {
+            q.state = IntegrationQueueState::Open;
         }
         if let Some(head) = &q.head_attempt_id {
             let a = attempt_in_tx(&mut tx, head).await?;
@@ -1118,20 +1146,37 @@ impl IntegrationQueueRepo for SqliteDb {
         // Takeover transfers observation ownership. A ready permit belongs
         // to the old fence and needs a new Task-step authorization; an
         // in-flight effect must first reconcile its original identity.
-        if head.state == IntegrationAttemptState::ReadyFf {
+        if head.state == IntegrationAttemptState::FfInflight
+            || matches!(
+                head.current_operation_state,
+                Some(IntegrationOperationState::Running | IntegrationOperationState::Uncertain)
+            )
+        {
+            head.state = IntegrationAttemptState::Reconciling;
+        } else if head.state == IntegrationAttemptState::ReadyFf {
             head.state = IntegrationAttemptState::AwaitingTaskStep;
             head.permit_json = None;
             head.effect_seq += 1;
             head.effect_ack_json = None;
             head.acknowledged_at = None;
-        } else if head.state == IntegrationAttemptState::FfInflight {
-            head.state = IntegrationAttemptState::Reconciling;
         }
         head.slot_generation = q.fence_generation + 1;
+        let fence = IntegrationOwnerFence {
+            queue_id: q.id.clone(),
+            attempt_id: head.id.clone(),
+            generation: head.slot_generation,
+            lease_owner: owner.to_owned(),
+            target_owner: q.target_owner_json.clone().expect("resolved target owner"),
+        };
+        sqlx::query("UPDATE integration_attempt SET owner_fence_json=? WHERE id=?")
+            .bind(serde_json::to_string(&fence).map_err(|e| DbError::Check(e.to_string()))?)
+            .bind(&head.id)
+            .execute(&mut *tx)
+            .await?;
         head.updated_at = now.to_owned();
         update_attempt(&mut tx, &head).await?;
-        let n = sqlx::query("UPDATE integration_queue SET head_attempt_id=?,lease_owner=?,lease_until=?,fence_generation=fence_generation+1,revision=revision+1,updated_at=? WHERE id=? AND revision=?")
-            .bind(&q.head_attempt_id).bind(owner).bind(lease_until).bind(now).bind(queue_id).bind(expected_revision).execute(&mut *tx).await?.rows_affected();
+        let n = sqlx::query("UPDATE integration_queue SET head_attempt_id=?,lease_owner=?,lease_until=?,target_location_id=?,target_owner_json=?,state=?,last_error=CASE WHEN last_error_kind IN ('target_unconfigured','target_ambiguous','target_unavailable') THEN NULL ELSE last_error END,last_error_kind=CASE WHEN last_error_kind IN ('target_unconfigured','target_ambiguous','target_unavailable') THEN NULL ELSE last_error_kind END,fence_generation=fence_generation+1,revision=revision+1,updated_at=? WHERE id=? AND revision=?")
+            .bind(&q.head_attempt_id).bind(owner).bind(lease_until).bind(&q.target_location_id).bind(q.target_owner_json.as_ref().map(ToString::to_string)).bind(q.state.to_string()).bind(now).bind(queue_id).bind(expected_revision).execute(&mut *tx).await?.rows_affected();
         if n != 1 {
             return Err(DbError::VersionConflict);
         }
@@ -1170,6 +1215,22 @@ impl IntegrationQueueRepo for SqliteDb {
         if old.revision != a.revision {
             return Err(DbError::VersionConflict);
         }
+        // Only an owner receipt/reconciliation can settle an admitted effect.
+        // Editing a status column cannot release its uncertain logical head.
+        if old.effect_intent_json.is_some()
+            && (old.current_operation_state != a.current_operation_state
+                || matches!(
+                    a.state,
+                    IntegrationAttemptState::Completed
+                        | IntegrationAttemptState::Cancelled
+                        | IntegrationAttemptState::Superseded
+                        | IntegrationAttemptState::Ejected
+                        | IntegrationAttemptState::NeedsReview
+                        | IntegrationAttemptState::Parked
+                ))
+        {
+            return Err(DbError::InvalidTransition);
+        }
         if old.state.terminal() || (old.state != a.state && !old.state.exits().contains(&a.state)) {
             return Err(DbError::InvalidTransition);
         }
@@ -1189,6 +1250,9 @@ impl IntegrationQueueRepo for SqliteDb {
             || old.original_candidate_sha != a.original_candidate_sha
             || old.predecessor_attempt_id != a.predecessor_attempt_id
             || old.current != a.current
+            || old.owner_fence_json != a.owner_fence_json
+            || old.effect_intent_json != a.effect_intent_json
+            || old.effect_receipts_json != a.effect_receipts_json
         {
             return Err(DbError::Check(
                 "immutable integration admission changed".into(),
@@ -1249,6 +1313,7 @@ impl IntegrationQueueRepo for SqliteDb {
             || old.task_ref != successor.task_ref
             || old.queue_id != successor.queue_id
             || old.project_ref != successor.project_ref
+            || old.effect_intent_json.is_some()
             || matches!(
                 old.current_operation_state,
                 Some(IntegrationOperationState::Running | IntegrationOperationState::Uncertain)
