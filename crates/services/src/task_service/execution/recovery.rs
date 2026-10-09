@@ -513,11 +513,17 @@ impl TaskService {
                 // is removed. Restoring the old park here turned the wait
                 // into an untyped `recovery_required: "dependency gate"`
                 // that offered the refused action again.
-                crate::deferred_dispatch::record_dispatch_disposition(
+                let dependency_ids = unsatisfied.clone();
+                crate::deferred_dispatch::record_dispatch_disposition_naming(
                     &self.db,
                     &current,
-                    &current.status,
-                    &error.to_string(),
+                    crate::deferred_dispatch::DEPENDENCY_WAIT_CAPABILITY,
+                    &format!(
+                        "waiting for unfinished dependenc{}: {}",
+                        if dependency_ids.len() == 1 { "y" } else { "ies" },
+                        dependency_ids.join(", ")
+                    ),
+                    &dependency_ids,
                 )
                 .await?;
                 return Ok(true);

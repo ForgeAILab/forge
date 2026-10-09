@@ -564,6 +564,10 @@ impl TaskDispatcher {
         // A recorded refusal holds until the Task's version changes or a wake
         // clears it, exactly as before: no other fact re-opens it.
         f.disposition_current = deferred_dispatch::dispatch_disposition_is_current(t, capability);
+        f.dependency_wait = deferred_dispatch::dispatch_disposition_is_current(
+            t,
+            deferred_dispatch::DEPENDENCY_WAIT_CAPABILITY,
+        );
         if let Some(last) = r.transitions.last() {
             if last.from_state == "merging"
                 && last.to_state == t.status

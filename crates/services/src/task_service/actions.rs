@@ -686,6 +686,47 @@ impl TaskService {
         let task = &snapshot.task;
         let reason = reason.unwrap_or("held by owner");
         let now = now_rfc3339();
+        // Under a cancelled-dependency blocker the hold does not replace
+        // the blocker (and the condition it carries): the queued work is
+        // dropped as for any hold, and the hold waits behind the blocker.
+        if crate::task_actions::task_condition(task)
+            == Some(api_types::FailureKind::WorkflowGuardRejected)
+            && snapshot
+                .annotation()
+                .is_some_and(|annotation| annotation.blocking_reason == "dependency_cancelled")
+        {
+            let dropped = TaskRepo::mutate_metadata_and_bump_version(
+                &*self.db,
+                &task.id,
+                task.version,
+                [
+                    "queued_recovery",
+                    "deferred_dispatch",
+                    "dispatch_disposition",
+                    "environment_wait",
+                    "owner_wait",
+                ]
+                .into_iter()
+                .map(|key| db::TaskMetadataMutation::Remove {
+                    key: key.to_owned(),
+                })
+                .collect(),
+                &now,
+            )
+            .await?;
+            if let Some(held) = self
+                .hold_under_dependency_block(
+                    &dropped,
+                    db::ConditionStatement::hold_operator_text("user", reason, &now),
+                    json!({"kind":"manual_stop", "reason":reason, "created_at":now}).to_string(),
+                )
+                .await?
+            {
+                self.create_system_comment(&task.id, format!("Task paused by user: {reason}"))
+                    .await?;
+                return Ok(held);
+            }
+        }
         let held = TaskRepo::update_recovery_metadata_if_no_running_execution(
             &*self.db,
             &task.id,

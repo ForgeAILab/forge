@@ -536,6 +536,105 @@ async fn waiting_task_held_without_an_agent_can_be_released_to_the_queue() {
     assert!(verbs(&after).contains(&"hold[dispatch_wait]".to_owned()));
 }
 
+/// A hold placed on a Task that has a queued action and a cancelled
+/// dependency used to overwrite the `dependency_cancelled` blocker and the
+/// condition it carried. The hold now waits behind the blocker, and
+/// resolving the blocker leaves the Task held with its release on offer.
+#[tokio::test]
+async fn hold_over_a_cancelled_dependency_keeps_the_blocker_and_survives_its_removal() {
+    let fixture = fixture().await;
+    let owner = Actor::user(UserActionSource::Test);
+    let verbs = |offers: &api_types::TaskActionsResponse| {
+        offers
+            .available_actions
+            .iter()
+            .map(|offer| format!("{}[{}]", offer.action.verb(), offer.reason))
+            .collect::<Vec<_>>()
+    };
+    let queued = queued(&fixture).await;
+    let blocked = fixture
+        .service
+        .block_cancelled_dependencies(&queued, &["prerequisite".to_owned()])
+        .await
+        .unwrap();
+    let offers = fixture
+        .service
+        .task_action_offers(&fixture.task.id, &owner)
+        .await
+        .unwrap();
+    assert!(
+        verbs(&offers).contains(&"hold[dispatch_wait]".to_owned()),
+        "{:?}",
+        verbs(&offers)
+    );
+    fixture
+        .service
+        .perform_task_action_as(
+            &fixture.task.id,
+            TaskAction::Hold { reason: None },
+            blocked.version,
+            owner.clone(),
+        )
+        .await
+        .unwrap();
+
+    let held = reload(&fixture).await;
+    assert!(
+        held.error_annotation
+            .as_deref()
+            .is_some_and(|annotation| annotation.contains("dependency_cancelled")),
+        "the hold displaced the dependency blocker: {:?}",
+        held.error_annotation
+    );
+    let stash: serde_json::Value =
+        serde_json::from_str(held.blocked_json.as_deref().unwrap()).unwrap();
+    assert!(
+        stash["details"]["superseded"]["error_annotation"]
+            .as_str()
+            .is_some_and(|annotation| annotation.contains("manual_stop")),
+        "the blocker does not carry the hold: {stash}"
+    );
+    assert!(
+        crate::deferred_dispatch::queued_recovery(&held).is_none(),
+        "a hold drops the queued action"
+    );
+    let offers = fixture
+        .service
+        .task_action_offers(&fixture.task.id, &owner)
+        .await
+        .unwrap();
+    assert_eq!(verbs(&offers), ["cancel[cancellable]"]);
+
+    // The dependency is gone (no such edge is stored): the blocker resolves
+    // and the hold it carried is the Task's condition again.
+    fixture
+        .service
+        .remove_task_dependency(&fixture.task.id, "prerequisite")
+        .await
+        .unwrap();
+    let restored = reload(&fixture).await;
+    assert!(
+        restored
+            .error_annotation
+            .as_deref()
+            .is_some_and(|annotation| annotation.contains("manual_stop")),
+        "{:?}",
+        restored.error_annotation
+    );
+    let offers = fixture
+        .service
+        .task_action_offers(&fixture.task.id, &owner)
+        .await
+        .unwrap();
+    assert!(
+        verbs(&offers)
+            .iter()
+            .any(|verb| verb.starts_with("release[")),
+        "{:?}",
+        verbs(&offers)
+    );
+}
+
 async fn parked_restart_fixture(other_owner: bool) -> (Fixture, Task) {
     let fixture = fixture().await;
     let repo_id: String = sqlx::query_scalar("SELECT id FROM repo WHERE project_id=?")

@@ -1391,6 +1391,21 @@ impl World {
                 }
                 Ok(())
             }
+            // The Agent that would run the Task is paused or unreachable:
+            // the exit is on the Agent, which the model can resume.
+            (_, "agent") => {
+                let agent = task["condition"]["primary"]["agent_id"]
+                    .as_str()
+                    .unwrap_or_default();
+                if agent != self.coder_id && agent != self.reviewer_id {
+                    return wedge("the Agent it names is not one of this Project's");
+                }
+                if self.agent_paused || self.project_paused {
+                    Ok(())
+                } else {
+                    wedge("the Agent it waits for is not paused")
+                }
+            }
             (_, "capacity") => {
                 let mut busy = false;
                 for other in 0..self.tasks.len() {
@@ -1517,7 +1532,10 @@ impl World {
                 }
                 // These wait for other Tasks, not for the owner.
                 if !matches!(kind, "parked" | "failed")
-                    || matches!(reason, "dependencies" | "children" | "capacity" | "parent")
+                    || matches!(
+                        reason,
+                        "dependencies" | "children" | "capacity" | "parent" | "agent"
+                    )
                 {
                     continue;
                 }
@@ -2011,7 +2029,11 @@ async fn start_on_a_queued_task_does_not_park_it_as_failed() {
             }
             let started = world.tasks.len() - 1;
             let task = world.task(started).await?;
-            if task["status"] != "todo" || task["condition"]["kind"] == "parked" {
+            // Waiting for its paused Agent is a visible wait, not a park the
+            // refused claim left behind.
+            let agent_wait = task["condition"]["primary"]["kind"] == "agent";
+            if task["status"] != "todo" || (task["condition"]["kind"] == "parked" && !agent_wait)
+            {
                 return Err(format!(
                     "(b) `start` on a queued Task must leave it queued, not parked or moved: {} {}",
                     task["status"], task["condition"]

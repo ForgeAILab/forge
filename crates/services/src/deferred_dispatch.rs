@@ -338,6 +338,10 @@ pub(crate) async fn clear_paused_integration(
 // (`project_execution_baseline*`, `project_reconciliation_record`, ...);
 // whatever commits one of those changes must call `wake_task_dispatch`.
 const DISPOSITION_METADATA_KEY: &str = "dispatch_disposition";
+/// The capability of the disposition an accepted action leaves when an
+/// unfinished dependency refuses its admission. It holds until the Task
+/// changes or is woken (a dependency finished, a link was removed).
+pub(crate) const DEPENDENCY_WAIT_CAPABILITY: &str = "dependency_wait";
 
 /// The stored record of one dispatch attempt's deterministic refusal. See the
 /// notes above for the invalidation contract.
@@ -393,6 +397,18 @@ pub(crate) async fn record_dispatch_disposition(
     capability: &str,
     safe_message: &str,
 ) -> Result<bool> {
+    record_dispatch_disposition_naming(db, task, capability, safe_message, &[]).await
+}
+
+/// [`record_dispatch_disposition`], naming the dependencies the Task waits
+/// for (`dependency_ids`), which the typed condition presents.
+pub(crate) async fn record_dispatch_disposition_naming(
+    db: &db::SqliteDb,
+    task: &Task,
+    capability: &str,
+    safe_message: &str,
+    dependency_ids: &[String],
+) -> Result<bool> {
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
@@ -408,13 +424,16 @@ pub(crate) async fn record_dispatch_disposition(
     {
         return Ok(false);
     }
-    let value = json!({
+    let mut value = json!({
         "task_version": task.version,
         "capability": capability,
         "blocker_digest": blocker_digest,
         "recorded_at": now_rfc3339(),
         "safe_message": safe_message,
     });
+    if !dependency_ids.is_empty() {
+        value["dependency_ids"] = json!(dependency_ids);
+    }
     let mutation = match metadata.extra.get(DISPOSITION_METADATA_KEY) {
         Some(expected) => TaskMetadataMutation::SetIf {
             key: DISPOSITION_METADATA_KEY.to_owned(),

@@ -502,6 +502,15 @@ pub(crate) fn owner_park(raw: &Value) -> Option<(ParkReason, TaskBlockingAnnotat
             park_diagnostic("parent_wait", &message),
         ));
     }
+    if let Some(v) = r.get("AgentWait") {
+        let agent_id = v["agent_id"].as_str()?.to_owned();
+        let status = v["status"].as_str()?.to_owned();
+        let message = format!("This Task waits for its Agent {agent_id} ({status}).");
+        return Some((
+            ParkReason::Agent { agent_id, status },
+            park_diagnostic("agent_wait", &message),
+        ));
+    }
     let owner = r.get("UnknownCondition")?["owner"].as_str()?;
     if !matches!(owner, "plan publication cleanup" | "entry hooks") {
         return None;
@@ -535,13 +544,15 @@ pub(super) fn apply_owner_park(mut condition: TaskCondition, raw: Option<&Value>
     {
         return condition;
     }
-    if let ParkReason::Parent { cause, .. } = &reason {
-        // A wait, not a failure: the subtask shows what it waits for and
-        // nothing about it needs repair. Its exit is on the parent.
-        let owner = if cause == "held" {
-            api_types::ConditionOwner::User
-        } else {
-            api_types::ConditionOwner::ProjectAgent
+    if matches!(reason, ParkReason::Parent { .. } | ParkReason::Agent { .. }) {
+        // A wait, not a failure: the Task shows what it waits for and
+        // nothing about it needs repair. Its exit is on the parent or on
+        // the Agent the reason names.
+        let owner = match &reason {
+            ParkReason::Parent { cause, .. } if cause != "held" => {
+                api_types::ConditionOwner::ProjectAgent
+            }
+            _ => api_types::ConditionOwner::User,
         };
         return match condition {
             TaskCondition::Clear { mut evidence } => {

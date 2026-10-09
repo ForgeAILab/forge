@@ -1005,9 +1005,13 @@ informational, clients must not write it). Removing the cancelled link restores
 that condition, or clears the blocker when there was none, once no cancelled
 prerequisites remain; a dependent that left that state meanwhile (cancelled,
 finished, moved) gets a clear condition instead. A Task action accepted while a
-prerequisite is unfinished stays accepted: the Task shows a `dispatch_refusal`
-wait offering `hold` and `cancel`, and the action runs when the prerequisite
-reaches `done` or the link is removed.
+prerequisite is unfinished stays accepted: the Task shows a `dependencies`
+wait (`cancelled: false`, `dependency_ids` naming the unfinished
+prerequisites) offering `hold` and `cancel`, and the action runs when the
+prerequisite reaches `done` or the link is removed; it is not re-attempted in
+between. A `hold` placed on a Task that carries a cancelled-prerequisite
+blocker does not replace the blocker: the Task keeps naming the cancelled
+prerequisite, and removing the link leaves it held, offering `release`.
 `task_type`, when present, is the same closed enum as normal
 Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
 values are rejected before the command is admitted. Terminal Task delivery,
@@ -3064,7 +3068,15 @@ or a blocked entry; recovering the parent is the exit) or `not_coordinating`
 wait, not a failure: `details.failure_kind` stays empty, `start` is not offered
 on the subtask while it lasts, and it clears by itself when the parent lets its
 subtasks run again. A subtask that only waits for an earlier sibling shows no
-such reason.
+such reason. The reason `agent` (`agent_id`, `status`) is shown by a Task whose
+Agent cannot take work: `status` is the Agent's effective status (`paused`,
+`daemon_offline`, `deactivated`, ...). It is the same kind of wait: no failure
+kind, `start` and `retry` stay hidden as before, and it clears when the Agent
+can take work again (resume the Agent, reconnect its machine, or assign the
+role to another Agent). The reason `dependencies` carries `cancelled` and
+`dependency_ids` (at most 16): the cancelled prerequisites of a
+`dependency_cancelled` blocker, or the unfinished ones an accepted action
+waits behind.
 
 A stored condition this build cannot decode projects a `parked` condition whose
 primary reason is `unknown_condition` with `source.field = condition_json`. Its

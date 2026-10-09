@@ -105,6 +105,7 @@ impl ConditionStatement {
             | ParkReason::Dependencies { .. }
             | ParkReason::Children { .. }
             | ParkReason::Parent { .. }
+            | ParkReason::Agent { .. }
             | ParkReason::WorkflowInvalid { .. } => false,
         }
     }

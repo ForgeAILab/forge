@@ -270,8 +270,11 @@ pub enum ConditionReason {
     PlacementDenied {},
     DaemonUpgradeRequired {},
     RemoteCancelPending {},
+    /// `dependency_ids` names the Tasks waited for (at most 16).
     Dependencies {
         cancelled: bool,
+        #[serde(default)]
+        dependency_ids: Vec<String>,
     },
     Children {
         root_id: String,
@@ -282,6 +285,12 @@ pub enum ConditionReason {
     Parent {
         parent_id: String,
         cause: String,
+    },
+    /// The Agent that would run the Task cannot take work; `status` is its
+    /// effective status (`paused`, `daemon_offline`, ...).
+    Agent {
+        agent_id: String,
+        status: String,
     },
     PlanSettlementWait {
         execution_id: Option<String>,

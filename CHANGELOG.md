@@ -1737,6 +1737,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **Three waits that showed nothing, or lost what they waited for, are now
+  typed and visible.** (1) A Task whose Agent is paused or unreachable kept a
+  clear condition while `start` and `retry` were hidden; its condition is now
+  `parked` with the new typed reason `agent` (`agent_id`, `status`) and clears
+  when the Agent can take work. (2) A Task action accepted while a dependency
+  was unfinished waited as `dispatch_refusal` and was replayed and refused
+  again whenever the scheduler looked at the Task; it now waits as
+  `dependencies` (`cancelled: false`) and is replayed once, when the
+  dependency finishes or its link is removed. The `dependencies` reason gains
+  `dependency_ids`, naming the unfinished or cancelled dependencies. (3) A
+  `hold` placed on a Task with a queued action and a cancelled dependency
+  overwrote the `dependency_cancelled` blocker and the condition it carried;
+  the hold now waits behind the blocker and removing the dependency leaves
+  the Task held, offering `release`. Clients that switch on
+  `condition.primary.kind` will see `agent` and, for the unfinished-dependency
+  wait, `dependencies` where they saw `dispatch_refusal`.
+
 - **A subtask whose parent is held (or otherwise not running subtasks) shows
   why it waits.** Such a subtask sat in `todo` with a clear condition and
   offered `start`, which could not run it. Its condition is now `parked` with
@@ -1796,8 +1813,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   A Task action that was accepted before the dependency was cancelled ends
   in the same typed blocker. An accepted action that meets an unfinished
   dependency is no longer refused into the untyped park either: it stays
-  accepted, the Task shows the dependency wait an unstarted Task shows
-  (`dispatch_refusal`, offering `hold` and `cancel`), and the action runs
+  accepted, the Task shows a typed `dependencies` wait naming the unfinished
+  dependencies (offering `hold` and `cancel`), and the action runs
   when the dependency finishes or its link is removed. Found by the
   model-based workflow test.
 - **`start` on a queued Task no longer parks it as failed.** `start` was

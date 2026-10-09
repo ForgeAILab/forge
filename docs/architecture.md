@@ -5222,8 +5222,16 @@ hold, a failure park, the condition a queued action saved) and keeps it in
 `blocked.details.superseded`; a queued action refused by the dependency gate
 for a cancelled dependency settles into the same blocker, not an untyped
 `recovery_required` park, and one refused for an unfinished dependency stays
-queued behind a `dispatch_refusal` wait until the dependency finishes or its
-link is removed. The displaced condition records the state it was taken in and
+queued behind a typed `dependencies` wait (a `dispatch_disposition` with the
+capability `dependency_wait` naming the unfinished dependencies) until the
+dependency finishes or its link is removed: while that disposition is current
+the scheduler parks on it instead of replaying the action
+(`Facts::dependency_wait`), and the dependency's completion or the link's
+removal wakes the Task (`wake_task_dispatch`). A hold placed on a Task that
+carries the `dependency_cancelled` blocker goes under it
+(`hold_under_dependency_block`): the queued action is dropped as for any
+hold, the blocker stays, and the hold replaces what the blocker carried in
+`superseded`, so removing the dependency leaves the Task held. The displaced condition records the state it was taken in and
 is restored only while the Task is still in that state. A queued action always offers Hold alongside cancel,
 even when a newer condition appears. Restart follows the resolver's explicit set
 of resettable condition kinds. Cancel wins over a settling plan
@@ -5263,7 +5271,11 @@ is `parked` with the typed reason `parent { parent_id, cause }` (`held`,
 `blocked`, `not_coordinating`). It is a wait without a diagnostic or failure
 kind, `start` is not offered on the subtask meanwhile, and the park is cleared
 on the pass that finds the root coordinating again (a change of the root's
-condition or status marks its children for the scheduler). Releasing a held
+condition or status marks its children for the scheduler). A Task whose Agent cannot
+take work is shown the same way: `Reason::AgentWait` is a visible schedule
+park and the stored condition is `parked` on `agent { agent_id, status }`
+(the Agent's effective status), cleared on the pass that finds the Agent
+available. Releasing a held
 root that already has subtasks launches no role for it (`release` takes the
 `held_waiting` path): the hold is cleared and its subtasks run. The
 root `coder` never executes there. The review role is whatever the workflow's

@@ -63,6 +63,12 @@ pub enum Reason {
     },
     HumanWork,
     AgentUnavailable,
+    /// The Agent that would run the Task is paused or cannot be reached.
+    /// Visible: the stored condition names the Agent and its status.
+    AgentWait {
+        agent_id: String,
+        status: String,
+    },
     Capacity,
     ExecutionStopped,
     ReviewChecks,
@@ -116,6 +122,10 @@ pub struct Facts {
     pub queue_owned: bool,
     pub in_flight: bool,
     pub agent_unavailable: bool,
+    /// The unavailable Agent and its effective status.
+    pub agent_wait: Option<(String, String)>,
+    /// An accepted action waits behind an unfinished dependency.
+    pub dependency_wait: bool,
     pub agent_full: bool,
     pub owner_expired: bool,
     pub integrate: bool,
@@ -205,6 +215,7 @@ fn condition_park(condition: &TaskCondition) -> Next {
         ParkReason::Children { .. } => (Owner::ProjectAgent, Action::SettleChildren),
         ParkReason::Parent { cause, .. } if cause == "held" => (Owner::User, Action::ReleaseHold),
         ParkReason::Parent { .. } => (Owner::ProjectAgent, Action::SettleChildren),
+        ParkReason::Agent { .. } => (Owner::User, Action::RepairAndRetry),
         ParkReason::Environment { .. } | ParkReason::PlacementDenied { .. } => {
             (Owner::Machine, Action::RepairAndRetry)
         }
@@ -311,6 +322,12 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         };
     }
     if f.queued_recovery {
+        // Behind an unfinished dependency the accepted action is not
+        // replayed (and refused) again: the dependency's completion, or the
+        // removal of its link, wakes the Task.
+        if f.dependency_wait {
+            return condition_park(s.condition);
+        }
         return Next::Step(Step::QueuedRecovery);
     }
     if f.integrate && !f.blocking {
@@ -405,7 +422,13 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     }
     if f.agent_unavailable {
         return park(
-            Reason::AgentUnavailable,
+            match &f.agent_wait {
+                Some((agent_id, status)) => Reason::AgentWait {
+                    agent_id: agent_id.clone(),
+                    status: status.clone(),
+                },
+                None => Reason::AgentUnavailable,
+            },
             Owner::User,
             Action::RepairAndRetry,
         );
