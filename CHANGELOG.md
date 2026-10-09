@@ -876,6 +876,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   The `locked` field stays in the daemon `workspace.describe` result for
   protocol compatibility and is now always `false`, on the server and on a
   daemon.
+- **Passive storage for the merge queue worker (3.2 stage D, part 1a).** Migration `V202610091612__integration_activation.sql` adds two `integration_attempt` columns (`cancel_requested_at`, `phase_timings_json`) and three indexes, and keeps existing rows; new repository methods cover cancel requests, head timings, sweeps, witnessed queue re-open (by a settled receipt, or by the stored row of an attempt that never had an effect admitted) and receipt retention. The attempt graph gains `validating → awaiting_task_step` and `reconciling → queued` (only once the effect is settled). Nothing calls any of it yet and merging behaves as before.
 
 - **One execution primitive for CI steps (3.3 stage B).** The merge-path
   check, review-entry CI and manual review CI run each step through the
