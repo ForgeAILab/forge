@@ -712,7 +712,10 @@ mod transfer_tests {
             }
         );
         assert_eq!(
-            git(&pair.target, &["rev-parse", "refs/forge/integration/attempt-1-out"]),
+            git(
+                &pair.target,
+                &["rev-parse", "refs/forge/integration/attempt-1-out"]
+            ),
             pair.tip
         );
         assert_eq!(git(&pair.target, &["rev-parse", "HEAD"]), head);

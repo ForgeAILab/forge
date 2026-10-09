@@ -8,6 +8,28 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Daemon protocol revision 6 (3.2 stage D1c).** The minimum revision is 6:
+  a revision-5 or older daemon is refused at the handshake with
+  `daemon_upgrade_required` and cannot use any command RPC. Upgrade the
+  server first, then install `forge-ctl` from that release on every daemon
+  and restart each with the same `--workspace-root`. Nothing about how a Task
+  merges changes in this release: the revision adds what the coming merge
+  queue needs from a machine and nothing uses it yet. New daemon methods:
+  `integration.announce` (a queue claim tells the machine its fence; an older
+  claim is refused `stale_fence`), and `integration.export_objects` /
+  `integration.import_objects` / `integration.release_objects`, which move a
+  Task's commits between two checkouts of one repository as a verified Git
+  bundle (at most 256 MiB, else refused `object_transfer_refused` /
+  `too_large` before anything is stored on the target; the import writes
+  only `refs/forge/integration/<key>`, moves no branch or tag and checks
+  nothing out). A queue attempt lookup now also returns `owner_fence`, which
+  says whether the machine can vouch that an effect was not performed
+  (`not_performed`) or cannot (`unknown`, kept as an uncertain result; Forge
+  never guesses a merge result). `journal.ack` of a queue attempt entry no
+  longer keeps the entry forever: it is deleted once a newer claim of the
+  same queue is recorded. The on-disk daemon journal needs no conversion:
+  revision-5 entries, including in-flight integration intents, are read
+  unchanged.
 - **A subtask can no longer be created under a parent in review, integrating
   or finished.** Creating a Task with a `parent_task_id` (REST, MCP, native
   tools, `create_subtasks`) whose parent is terminal or in a review-phase

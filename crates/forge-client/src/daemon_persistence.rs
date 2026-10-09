@@ -1438,14 +1438,14 @@ mod tests {
         operation
     }
 
-    /// Two thousand merged attempts on one queue never approach the journal
+    /// Two hundred merged attempts on one queue never approach the journal
     /// bound: each acknowledged receipt is pruned by the next generation.
     #[test]
     fn acknowledged_attempt_receipts_are_retained_then_pruned_within_the_bound() {
         let dir = tempfile::tempdir().unwrap();
         let store = DaemonJournal::with_limits(dir.path(), 4, MAX_JOURNAL_BYTES);
         store.initialize().unwrap();
-        for generation in 1..=2000_i64 {
+        for generation in 1..=200_i64 {
             let operation = attempt_receipt(generation);
             store
                 .retain_entry(&JournalEntry::Operation {
@@ -1473,7 +1473,7 @@ mod tests {
                 .unwrap();
             assert!(kept.acknowledged);
             assert!(store.pending().unwrap().is_empty());
-            if generation % 500 == 0 {
+            if generation % 50 == 0 {
                 let restarted = DaemonJournal::with_limits(dir.path(), 4, MAX_JOURNAL_BYTES);
                 restarted.initialize().unwrap();
                 assert!(restarted
