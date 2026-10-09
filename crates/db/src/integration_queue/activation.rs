@@ -186,6 +186,12 @@ pub enum IntegrationQueueReopenWitness {
         generation: i64,
         operation: IntegrationOperationKind,
     },
+    /// The attempt that pinned the queue never had an effect admitted, so no
+    /// receipt can ever exist for it: an imported uncertain merge resolved by
+    /// lookup, or a head that stopped before its intent. Verified from the
+    /// stored row (no intent, no receipt, no pending / running / uncertain
+    /// operation). Leaves `quarantined`.
+    NoEffect { attempt_id: String },
     /// The repo's one ready default checkout, as resolved now. Leaves `suspended`.
     TargetReady {
         location_id: String,
@@ -373,10 +379,12 @@ pub trait IntegrationActivationRepo: Send + Sync {
         kind: IntegrationFailureKind,
         message: &str,
     ) -> Result<IntegrationQueue>;
-    /// Leave `quarantined` (with `SettledEffect`) or `suspended` (with
-    /// `TargetReady`). `InvalidTransition` for any other state / witness
-    /// pairing, `DbError::Check` when the witness does not match the stored
-    /// rows or an effect of the queue is still unsettled. A quarantined queue
+    /// Leave `quarantined` (with `SettledEffect`, or `NoEffect` for an attempt
+    /// that never had an effect admitted) or `suspended` (with `TargetReady`).
+    /// `InvalidTransition` for any other state / witness pairing,
+    /// `DbError::Check` when the witness does not match the stored rows, the
+    /// head is still `ff_inflight` / `reconciling`, or an effect of the queue
+    /// is still unsettled. A quarantined queue
     /// whose target is not ready becomes `suspended`, not `open`. Lease and
     /// head are left as they are.
     async fn reopen_integration_queue(
@@ -619,44 +627,61 @@ impl IntegrationActivationRepo for SqliteDb {
         match (q.state, witness) {
             (
                 IntegrationQueueState::Quarantined,
-                IntegrationQueueReopenWitness::SettledEffect {
-                    attempt_id,
-                    generation,
-                    operation,
-                },
+                IntegrationQueueReopenWitness::SettledEffect { attempt_id, .. }
+                | IntegrationQueueReopenWitness::NoEffect { attempt_id },
             ) => {
-                let raw: Option<String> = sqlx::query_scalar(
-                    "SELECT effect_receipts_json FROM integration_attempt WHERE id=? AND queue_id=?",
+                let row = sqlx::query(
+                    "SELECT effect_receipts_json,effect_intent_json,current_operation_state FROM integration_attempt WHERE id=? AND queue_id=?",
                 )
                 .bind(attempt_id)
                 .bind(queue_id)
                 .fetch_optional(&mut *tx)
-                .await?;
-                let receipts: Vec<IntegrationEffectReceipt> = raw
-                    .map(|raw| serde_json::from_str(&raw))
-                    .transpose()
-                    .map_err(|e| DbError::Check(format!("invalid effect receipts: {e}")))?
-                    .unwrap_or_default();
-                let settled = receipts.iter().any(|receipt| {
-                    receipt.request.fence.queue_id == queue_id
-                        && &receipt.request.fence.attempt_id == attempt_id
-                        && receipt.request.fence.generation == *generation
-                        && receipt.request.kind == *operation
-                        && matches!(
-                            receipt.operation_state,
-                            IntegrationOperationState::Succeeded
-                                | IntegrationOperationState::Failed
-                        )
-                });
-                if !settled {
+                .await?
+                .ok_or_else(|| {
+                    DbError::Check("integration reopen witness names no attempt of this queue".into())
+                })?;
+                let receipts: Vec<IntegrationEffectReceipt> =
+                    serde_json::from_str(&row.try_get::<String, _>("effect_receipts_json")?)
+                        .map_err(|e| DbError::Check(format!("invalid effect receipts: {e}")))?;
+                let verified = match witness {
+                    IntegrationQueueReopenWitness::SettledEffect {
+                        generation,
+                        operation,
+                        ..
+                    } => receipts.iter().any(|receipt| {
+                        receipt.request.fence.queue_id == queue_id
+                            && &receipt.request.fence.attempt_id == attempt_id
+                            && receipt.request.fence.generation == *generation
+                            && receipt.request.kind == *operation
+                            && matches!(
+                                receipt.operation_state,
+                                IntegrationOperationState::Succeeded
+                                    | IntegrationOperationState::Failed
+                            )
+                    }),
+                    // Nothing was ever admitted for this attempt. One with any
+                    // receipt must be witnessed by that receipt instead.
+                    _ => {
+                        receipts.is_empty()
+                            && row
+                                .try_get::<Option<String>, _>("effect_intent_json")?
+                                .is_none()
+                            && !matches!(
+                                row.try_get::<Option<String>, _>("current_operation_state")?
+                                    .as_deref(),
+                                Some("pending" | "running" | "uncertain")
+                            )
+                    }
+                };
+                if !verified {
                     return Err(DbError::Check(
-                        "integration reopen witness names no settled receipt of this queue".into(),
+                        "integration reopen witness does not match the stored attempt".into(),
                     ));
                 }
                 // A quarantined queue is never claimed for a new head, so a
                 // head still reserved here is the one whose result was
-                // unknown: only its own receipt speaks for it, and not while
-                // the worker has yet to apply that receipt to the attempt.
+                // unknown: only that attempt speaks for the queue, and not
+                // while the worker has yet to apply its result to it.
                 if let Some(head) = q.head_attempt_id.as_deref() {
                     if head != attempt_id {
                         return Err(DbError::Check(
@@ -672,7 +697,9 @@ impl IntegrationActivationRepo for SqliteDb {
                         ));
                     }
                 }
-                let unsettled: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM integration_attempt WHERE queue_id=? AND current=1 AND (effect_intent_json IS NOT NULL OR current_operation_state IN ('running','uncertain')))")
+                // Whatever the witness says, no member may still hold an
+                // unknown result: this is what keeps a forged witness harmless.
+                let unsettled: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM integration_attempt WHERE queue_id=? AND current=1 AND (effect_intent_json IS NOT NULL OR current_operation_state IN ('running','uncertain') OR state IN ('ff_inflight','reconciling')))")
                     .bind(queue_id)
                     .fetch_one(&mut *tx)
                     .await?;

@@ -1752,3 +1752,181 @@ async fn hinted_statements_prepare_and_their_indexes_are_pinned() {
         assert!(!unhinted.contains("INDEXED BY"));
     }
 }
+
+/// An imported uncertain merge pins its queue as a `reconciling` head with no
+/// intent and no receipt, and none can ever be recorded for it. Once the
+/// lookup has resolved the head, the queue must still be able to open.
+#[tokio::test]
+async fn a_queue_quarantined_by_a_head_with_no_effect_reopens_once_the_head_is_resolved() {
+    let db = fixture().await;
+    let q = main_queue(&db).await;
+    let head = admit(&db, &q, "a").await;
+    let waiting = admit(&db, &q, "b").await;
+    // As the importer writes it.
+    sqlx::query("UPDATE integration_attempt SET state='reconciling' WHERE id=?")
+        .bind(&head.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE integration_queue SET state='quarantined',head_attempt_id=?,revision=revision+1 WHERE id=?")
+        .bind(&head.id)
+        .bind(&q.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let no_effect = |attempt_id: &str| IntegrationQueueReopenWitness::NoEffect {
+        attempt_id: attempt_id.to_owned(),
+    };
+    let reopen = |witness: IntegrationQueueReopenWitness| {
+        let (db, id) = (&db, q.id.clone());
+        async move {
+            let revision = db.integration_queue(&id).await.unwrap().unwrap().revision;
+            db.reopen_integration_queue(&id, revision, &witness).await
+        }
+    };
+    // Still unresolved: the worker claims it and looks the result up first.
+    assert!(matches!(
+        reopen(no_effect(&head.id)).await,
+        Err(DbError::Check(_))
+    ));
+    claim(&db, &q.id, NOW, LATER).await.unwrap();
+    let mut resolved = reread(&db, &head.id).await;
+    assert_eq!(resolved.state, IntegrationAttemptState::Reconciling);
+    // Proven not landed.
+    resolved.state = IntegrationAttemptState::Queued;
+    db.transition_integration_attempt(resolved).await.unwrap();
+    // Another member cannot speak for the head, nor can an unknown attempt.
+    assert!(matches!(
+        reopen(no_effect(&waiting.id)).await,
+        Err(DbError::Check(_))
+    ));
+    assert!(matches!(
+        reopen(no_effect("missing")).await,
+        Err(DbError::Check(_))
+    ));
+    let open = reopen(no_effect(&head.id)).await.unwrap();
+    assert_eq!(open.state, IntegrationQueueState::Open);
+    // Lease and head are untouched, so the holder goes on with its head.
+    assert_eq!(
+        (open.head_attempt_id.as_deref(), open.lease_owner.as_deref()),
+        (Some(head.id.as_str()), Some("worker"))
+    );
+    db.start_integration_round(
+        &open.id,
+        open.revision,
+        "worker",
+        open.fence_generation,
+        NOW,
+        LATER,
+    )
+    .await
+    .unwrap();
+}
+
+/// `NoEffect` is only for an attempt that never had an effect admitted: one
+/// with an intent or any receipt must be witnessed by its settled receipt.
+#[tokio::test]
+async fn no_effect_cannot_stand_in_for_an_effect_that_was_admitted() {
+    let db = fixture().await;
+    let (q, request) = uncertain_head(&db).await;
+    let q = db
+        .quarantine_integration_queue(
+            &q.id,
+            db.integration_queue(&q.id).await.unwrap().unwrap().revision,
+            "worker",
+            request.fence.generation,
+            IntegrationFailureKind::Timeout,
+            "merge result unknown",
+        )
+        .await
+        .unwrap();
+    let witness = IntegrationQueueReopenWitness::NoEffect {
+        attempt_id: request.fence.attempt_id.clone(),
+    };
+    assert!(matches!(
+        db.reopen_integration_queue(&q.id, q.revision, &witness)
+            .await,
+        Err(DbError::Check(_))
+    ));
+    db.lock_integration_reconciliation(&request)
+        .await
+        .unwrap()
+        .unwrap()
+        .record(
+            serde_json::json!({"kind":"not_performed"}),
+            IntegrationOperationState::Failed,
+        )
+        .await
+        .unwrap();
+    let mut head = reread(&db, &request.fence.attempt_id).await;
+    head.state = IntegrationAttemptState::Cancelled;
+    db.transition_integration_attempt(head).await.unwrap();
+    let q = db.integration_queue(&q.id).await.unwrap().unwrap();
+    // Settled and released, but it has a receipt: that receipt is the witness.
+    assert!(matches!(
+        db.reopen_integration_queue(&q.id, q.revision, &witness)
+            .await,
+        Err(DbError::Check(_))
+    ));
+    assert_eq!(
+        serde_json::to_value(&witness).unwrap(),
+        serde_json::json!({"kind":"no_effect","attempt_id":request.fence.attempt_id})
+    );
+}
+
+/// Replay reads the attempt's receipts. After pruning there is nothing to
+/// replay, and the same attempt key must be refused, never performed again.
+#[tokio::test]
+async fn a_pruned_attempt_key_is_refused_and_never_performed_again() {
+    let db = fixture().await;
+    let q = main_queue(&db).await;
+    let a = admit(&db, &q, "a").await;
+    claim(&db, &q.id, NOW, FAR).await.unwrap();
+    let request = effect(db.integration_owner_fence(&a.id).await.unwrap().unwrap());
+    let IntegrationEffectAdmission::Started(mut guard) =
+        db.begin_integration_effect(request.clone()).await.unwrap()
+    else {
+        panic!("effect not admitted");
+    };
+    assert!(guard.start().await.unwrap().is_none());
+    guard
+        .record(
+            serde_json::json!({"kind":"merged"}),
+            IntegrationOperationState::Succeeded,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.begin_integration_effect(request.clone()).await.unwrap(),
+        IntegrationEffectAdmission::Replay(_)
+    ));
+    let mut done = reread(&db, &a.id).await;
+    for state in [
+        IntegrationAttemptState::Validating,
+        IntegrationAttemptState::Applied,
+        IntegrationAttemptState::Completed,
+    ] {
+        done.state = state;
+        done = db.transition_integration_attempt(done).await.unwrap();
+    }
+    sqlx::query(
+        "UPDATE integration_attempt SET completed_at='2026-01-01T00:00:00+00:00' WHERE id=?",
+    )
+    .bind(&a.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        db.prune_integration_evidence("2026-09-01T00:00:00Z", 10)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        db.begin_integration_effect(request).await.unwrap(),
+        IntegrationEffectAdmission::Refused(IntegrationEffectRefusal::StaleFence)
+    ));
+    let pruned = reread(&db, &a.id).await;
+    assert!(pruned.effect_intent_json.is_none());
+    assert_eq!(pruned.effect_receipts_json, serde_json::json!([]));
+}
