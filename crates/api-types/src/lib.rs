@@ -707,6 +707,21 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     DaemonCheckRunParams::export().expect("export DaemonCheckRunParams");
     DaemonCheckOperationParams::export().expect("export DaemonCheckOperationParams");
     DaemonCheckResult::export().expect("export DaemonCheckResult");
+    IntegrationIntentRecord::export().expect("export IntegrationIntentRecord");
+    IntegrationFenceAnnouncement::export().expect("export IntegrationFenceAnnouncement");
+    IntegrationAnnounceParams::export().expect("export IntegrationAnnounceParams");
+    IntegrationAnnounceResult::export().expect("export IntegrationAnnounceResult");
+    ObjectTransferRefusal::export().expect("export ObjectTransferRefusal");
+    ExportObjectsParams::export().expect("export ExportObjectsParams");
+    ObjectExportReceipt::export().expect("export ObjectExportReceipt");
+    ExportObjectsResult::export().expect("export ExportObjectsResult");
+    ObjectChunk::export().expect("export ObjectChunk");
+    ImportObjectsParams::export().expect("export ImportObjectsParams");
+    ObjectImportReceipt::export().expect("export ObjectImportReceipt");
+    ImportObjectsResult::export().expect("export ImportObjectsResult");
+    ReleaseObjectsParams::export().expect("export ReleaseObjectsParams");
+    ReleaseObjectsResult::export().expect("export ReleaseObjectsResult");
+    ObjectTransferDirection::export().expect("export ObjectTransferDirection");
 }
 
 pub mod execution_outbox;

@@ -263,8 +263,8 @@ impl DaemonWorkspaceBackend {
             WorkspaceIntegrationBinding::Attempt { .. }
         ) {
             updated
-                .integration_fences
-                .insert(request.fence.queue_id.clone(), request.fence.clone());
+                .advance_integration_fence(&request.fence, unix_now())
+                .map_err(refusal)?;
         }
         self.journal
             .save_workspace_state(&updated)
@@ -469,5 +469,208 @@ impl DaemonWorkspaceBackend {
             .finish_operation(&operation)
             .map_err(storage_error)?;
         Ok(())
+    }
+}
+
+/// One fence per queue that targets (or sources objects from) this owner.
+/// Past this the least recently recorded fences are dropped.
+pub(super) const MAX_INTEGRATION_FENCES: usize = 1024;
+/// An acknowledged attempt receipt whose queue never claims again is kept
+/// this long for a duplicate of its key, then replaced by a tombstone.
+pub(super) const ACKNOWLEDGED_ATTEMPT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+impl WorkspaceRegistry {
+    /// Record `fence` as the queue's high-water mark and return what was held
+    /// before. An older generation, or another claim of the same generation,
+    /// is refused and changes nothing.
+    pub(super) fn advance_integration_fence(
+        &mut self,
+        fence: &IntegrationOwnerFence,
+        now: u64,
+    ) -> Result<Option<IntegrationOwnerFence>, IntegrationOwnerRefusal> {
+        let previous = self.integration_fences.get(&fence.queue_id).cloned();
+        if fence.generation < 1
+            || fence.queue_id.is_empty()
+            || previous.as_ref().is_some_and(|current| {
+                fence.generation < current.generation
+                    || (fence.generation == current.generation && fence != current)
+            })
+        {
+            return Err(IntegrationOwnerRefusal::StaleFence);
+        }
+        self.integration_fences
+            .insert(fence.queue_id.clone(), fence.clone());
+        self.integration_fence_seen
+            .insert(fence.queue_id.clone(), now);
+        Ok(previous)
+    }
+}
+
+impl DaemonWorkspaceBackend {
+    /// `integration.announce`: the first message of a claim generation.
+    pub(super) fn announce_integration(
+        &self,
+        params: IntegrationAnnounceParams,
+    ) -> CommandResult<IntegrationAnnounceResult> {
+        self.check_owner(&params.daemon_id, &params.runtime_id)?;
+        validate_id(&params.fence.queue_id)?;
+        let previous = self.record_integration_fence(&params.fence)?;
+        // The announced queue is live whatever the list says.
+        let live = params.live_queue_ids.map(|mut live| {
+            live.push(params.fence.queue_id.clone());
+            live
+        });
+        let (pruned_fences, pruned_entries) =
+            self.prune_integration_state(live.as_deref(), None)?;
+        Ok(IntegrationAnnounceResult {
+            queue_id: params.fence.queue_id,
+            previous,
+            generation: params.fence.generation,
+            pruned_fences,
+            pruned_entries,
+        })
+    }
+
+    /// Durably advance the queue's high-water mark; returns the prior fence.
+    pub(super) fn record_integration_fence(
+        &self,
+        fence: &IntegrationOwnerFence,
+    ) -> CommandResult<Option<IntegrationOwnerFence>> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut updated = state.clone();
+        let previous = updated
+            .advance_integration_fence(fence, unix_now())
+            .map_err(refusal)?;
+        if previous.as_ref() != Some(fence) {
+            self.journal
+                .save_workspace_state(&updated)
+                .map_err(storage_error)?;
+            *state = updated;
+        }
+        Ok(previous)
+    }
+
+    /// Bounded retention for the owner's queue bookkeeping. Returns how many
+    /// fences and journal receipts were dropped.
+    ///
+    /// * A fence is never dropped while its queue has work this owner still
+    ///   answers for: a journal entry the server has not acknowledged (an
+    ///   intent in flight or a result not yet stored by the server).
+    ///   Dropping such a fence would let a delayed
+    ///   frame of an older claim in, and would turn a lookup of the current
+    ///   claim into "unknown".
+    /// * Otherwise a fence goes when its queue is not in `live_queues`, or as
+    ///   the least recently recorded past [`MAX_INTEGRATION_FENCES`]. The
+    ///   protected fences are bounded by the journal's own entry bound.
+    /// * An acknowledged attempt receipt goes once its queue's fence has moved
+    ///   past its generation (a late duplicate is then refused `stale_fence`),
+    ///   once the queue's fence is gone, or
+    ///   [`ACKNOWLEDGED_ATTEMPT_RETENTION`] after the acknowledgement (in
+    ///   both cases a late duplicate then meets a cancellation tombstone).
+    /// * A checkout's pending marker goes when its operation was just
+    ///   acknowledged, was pruned, or has settled.
+    pub(super) fn prune_integration_state(
+        &self,
+        live_queues: Option<&[String]>,
+        acknowledged_operation: Option<&str>,
+    ) -> CommandResult<(u32, u32)> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut updated = state.clone();
+        let before = updated.integration_fences.len();
+        if live_queues.is_some() || before > MAX_INTEGRATION_FENCES {
+            // Queues with an attempt entry the server has not acknowledged.
+            let mut busy = std::collections::HashSet::new();
+            for entry in self.journal.pending().map_err(storage_error)? {
+                let JournalEntry::Operation { operation } = entry else {
+                    continue;
+                };
+                if let WorkspaceIntegrationBinding::Attempt { request } =
+                    &operation.fence.integration
+                {
+                    if !operation.acknowledged
+                        && acknowledged_operation != Some(operation.fence.operation_id.as_str())
+                    {
+                        busy.insert(request.fence.queue_id.clone());
+                    }
+                }
+            }
+            if let Some(live) = live_queues {
+                updated
+                    .integration_fences
+                    .retain(|queue, _| busy.contains(queue) || live.iter().any(|id| id == queue));
+            }
+            if updated.integration_fences.len() > MAX_INTEGRATION_FENCES {
+                let mut by_age: Vec<(u64, String)> = updated
+                    .integration_fences
+                    .keys()
+                    .filter(|queue| !busy.contains(*queue))
+                    .map(|queue| {
+                        (
+                            updated
+                                .integration_fence_seen
+                                .get(queue)
+                                .copied()
+                                .unwrap_or_default(),
+                            queue.clone(),
+                        )
+                    })
+                    .collect();
+                by_age.sort();
+                let excess = updated.integration_fences.len() - MAX_INTEGRATION_FENCES;
+                for (_, queue) in by_age.into_iter().take(excess) {
+                    updated.integration_fences.remove(&queue);
+                }
+            }
+        }
+        let fences = &updated.integration_fences;
+        updated
+            .integration_fence_seen
+            .retain(|queue, _| fences.contains_key(queue));
+        let pruned_fences = before - updated.integration_fences.len();
+        let mut unfenced = Vec::new();
+        let removed = self
+            .journal
+            .prune_acknowledged_attempts(|operation, acknowledged_for| {
+                let WorkspaceIntegrationBinding::Attempt { request } = &operation.fence.integration
+                else {
+                    return false;
+                };
+                match fences.get(&request.fence.queue_id) {
+                    Some(current) if request.fence.generation < current.generation => true,
+                    Some(_) if acknowledged_for < ACKNOWLEDGED_ATTEMPT_RETENTION => false,
+                    _ => {
+                        unfenced.push(operation.fence.operation_id.clone());
+                        true
+                    }
+                }
+            })
+            .map_err(storage_error)?;
+        let now = unix_now();
+        for operation_id in &unfenced {
+            updated.record_cancel_tombstone(operation_id, now);
+        }
+        let mut settled = Vec::new();
+        for (checkout, operation_id) in &updated.integration_pending {
+            if acknowledged_operation == Some(operation_id.as_str())
+                || removed.contains(operation_id)
+                || self
+                    .journal
+                    .operation(operation_id)
+                    .map_err(storage_error)?
+                    .is_some_and(|operation| operation.outcome.is_some())
+            {
+                settled.push(checkout.clone());
+            }
+        }
+        for checkout in &settled {
+            updated.integration_pending.remove(checkout);
+        }
+        if pruned_fences > 0 || !unfenced.is_empty() || !settled.is_empty() {
+            self.journal
+                .save_workspace_state(&updated)
+                .map_err(storage_error)?;
+            *state = updated;
+        }
+        Ok((pruned_fences as u32, removed.len() as u32))
     }
 }

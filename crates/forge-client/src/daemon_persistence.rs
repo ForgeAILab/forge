@@ -418,6 +418,52 @@ impl DaemonJournal {
         Ok(removed)
     }
 
+    /// Delete acknowledged queue-attempt receipts the owner says can no
+    /// longer be asked for. Returns the removed operation ids.
+    ///
+    /// `prunable` also receives how long ago the entry was last written. An
+    /// acknowledgement rewrites the entry, so for these that is the time
+    /// since the server acknowledged it.
+    pub fn prune_acknowledged_attempts(
+        &self,
+        mut prunable: impl FnMut(&JournalOperation, std::time::Duration) -> bool,
+    ) -> Result<Vec<String>> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.ensure_confined()?;
+        self.current_usage()?;
+        if !self.directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut removed = Vec::new();
+        for entry in fs::read_dir(&self.directory)? {
+            let path = entry?.path();
+            if !is_entry_path(&path) || self.is_skipped(&path) {
+                continue;
+            }
+            let Ok(JournalEntry::Operation { operation }) = read_entry(&path) else {
+                continue;
+            };
+            if !operation.acknowledged || !is_queue_attempt(&operation) {
+                continue;
+            }
+            let age = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .unwrap_or_default();
+            if !prunable(&operation, age) {
+                continue;
+            }
+            fs::remove_file(&path)?;
+            self.update_usage(&path, None, 0);
+            removed.push(operation.fence.operation_id);
+        }
+        if !removed.is_empty() {
+            self.sync_directory()?;
+        }
+        Ok(removed)
+    }
+
     /// [`Self::prune_checks`] at most once a minute: admission calls this
     /// before it looks a key up, so retention needs no timer of its own.
     pub fn prune_checks_when_due(&self) -> Result<usize> {
@@ -535,15 +581,22 @@ impl DaemonJournal {
                 acknowledged: true,
             });
         }
-        // Attempt receipts survive acknowledgements: a repeated effect key
-        // still returns its stored result. Their existing journal count/byte
-        // bounds are enforced before any effect, never by discarding evidence.
-        if matches!(&entry, JournalEntry::Operation { operation } if matches!(operation.fence.integration, api_types::WorkspaceIntegrationBinding::Attempt { .. }))
-        {
-            return Ok(JournalAckResult {
-                entry_id: params.entry_id.clone(),
-                acknowledged: true,
-            });
+        // An acknowledged attempt receipt stays readable: a repeated effect
+        // key of the same claim generation still returns its stored result.
+        // The owner prunes it once a newer fence makes that key unreachable
+        // ([`Self::prune_acknowledged_attempts`]).
+        if let JournalEntry::Operation { operation } = &entry {
+            if is_queue_attempt(operation) {
+                if !operation.acknowledged {
+                    let mut operation = operation.clone();
+                    operation.acknowledged = true;
+                    self.write_entry(&JournalEntry::Operation { operation })?;
+                }
+                return Ok(JournalAckResult {
+                    entry_id: params.entry_id.clone(),
+                    acknowledged: true,
+                });
+            }
         }
         self.current_usage()?;
         fs::remove_file(&path)?;
@@ -805,7 +858,7 @@ impl DaemonJournal {
                                 continue;
                             }
                         };
-                        if matches!(&record, JournalEntry::Operation { operation } if operation.acknowledged)
+                        if matches!(&record, JournalEntry::Operation { operation } if operation.acknowledged && !is_queue_attempt(operation))
                         {
                             if let Err(error) = fs::remove_file(&path) {
                                 tracing::warn!(path = %path.display(), %error, "could not remove acknowledged journal entry; skipping it");
@@ -896,6 +949,14 @@ impl DaemonJournal {
             .as_ref()
             .is_some_and(|usage| usage.skipped.contains(path))
     }
+}
+
+/// A queue claim's effect, as opposed to a Task step's.
+fn is_queue_attempt(operation: &JournalOperation) -> bool {
+    matches!(
+        operation.fence.integration,
+        api_types::WorkspaceIntegrationBinding::Attempt { .. }
+    )
 }
 
 fn is_entry_path(path: &Path) -> bool {
@@ -1367,6 +1428,157 @@ mod tests {
             .to_string()
             .contains("record bound"));
         assert_eq!(store.pending().unwrap().len(), 1);
+    }
+
+    fn attempt_receipt(generation: i64) -> JournalOperation {
+        attempt_receipt_on("queue-1", generation)
+    }
+
+    fn attempt_receipt_on(queue: &str, generation: i64) -> JournalOperation {
+        let request = api_types::WorkspaceIntegrationRequest {
+            fence: api_types::IntegrationOwnerFence {
+                queue_id: queue.into(),
+                attempt_id: format!("attempt-{queue}"),
+                generation,
+                lease_owner: "queue-worker".into(),
+                target_owner: serde_json::json!({"owner_kind":"daemon"}),
+            },
+            kind: api_types::WorkspaceIntegrationKind::FastForward,
+            witness: serde_json::json!({}),
+        };
+        let mut operation = run_intent(&request.operation_id());
+        operation.method = api_types::METHOD_WORKSPACE_MERGE.into();
+        operation.request = serde_json::json!({});
+        operation.fence.integration = api_types::WorkspaceIntegrationBinding::Attempt { request };
+        operation.outcome = Some(Ok(serde_json::json!({"outcome":{"kind":"done"}})));
+        operation
+    }
+
+    /// Two hundred merged attempts on one queue never approach the journal
+    /// bound: each acknowledged receipt is pruned by the next generation.
+    #[test]
+    fn acknowledged_attempt_receipts_are_retained_then_pruned_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DaemonJournal::with_limits(dir.path(), 4, MAX_JOURNAL_BYTES);
+        store.initialize().unwrap();
+        for generation in 1..=200_i64 {
+            let operation = attempt_receipt(generation);
+            store
+                .retain_entry(&JournalEntry::Operation {
+                    operation: operation.clone(),
+                })
+                .unwrap();
+            // Unacknowledged receipts are never prunable.
+            assert!(
+                store
+                    .prune_acknowledged_attempts(
+                        |candidate, _| candidate.entry_id == operation.entry_id
+                    )
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .acknowledge(&JournalAckParams {
+                        entry_id: operation.entry_id.clone(),
+                    })
+                    .unwrap()
+                    .acknowledged
+            );
+            // Acknowledged: kept for a duplicate of the same key, no longer
+            // replayed, and it survives a restart.
+            let kept = store
+                .operation(&operation.fence.operation_id)
+                .unwrap()
+                .unwrap();
+            assert!(kept.acknowledged);
+            assert!(store.pending().unwrap().is_empty());
+            if generation % 50 == 0 {
+                let restarted = DaemonJournal::with_limits(dir.path(), 4, MAX_JOURNAL_BYTES);
+                restarted.initialize().unwrap();
+                assert!(restarted
+                    .operation(&operation.fence.operation_id)
+                    .unwrap()
+                    .is_some());
+            }
+            let removed = store
+                .prune_acknowledged_attempts(|operation, _| {
+                    matches!(&operation.fence.integration, api_types::WorkspaceIntegrationBinding::Attempt { request } if request.fence.generation < generation)
+                })
+                .unwrap();
+            assert_eq!(removed.len(), usize::from(generation > 1));
+        }
+        let entries = fs::read_dir(store.directory())
+            .unwrap()
+            .filter(|entry| is_entry_path(&entry.as_ref().unwrap().path()))
+            .count();
+        assert_eq!(entries, 1);
+    }
+
+    /// A long-lived daemon serving many queues that each merged once and
+    /// went idle: the age rule removes their acknowledged receipts, so the
+    /// journal does not grow without bound. Until then each receipt still
+    /// counts against the journal's record bound.
+    #[test]
+    fn idle_queue_receipts_expire_by_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DaemonJournal::with_limits(dir.path(), 301, MAX_JOURNAL_BYTES);
+        store.initialize().unwrap();
+        let queues = 300;
+        let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+        for index in 0..queues {
+            let operation = attempt_receipt_on(&format!("queue-{index}"), 1);
+            store
+                .retain_entry(&JournalEntry::Operation {
+                    operation: operation.clone(),
+                })
+                .unwrap();
+            store
+                .acknowledge(&JournalAckParams {
+                    entry_id: operation.entry_id.clone(),
+                })
+                .unwrap();
+            if index % 3 != 0 {
+                // Acknowledged more than a week ago.
+                fs::File::options()
+                    .write(true)
+                    .open(store.path_for_entry(&operation.entry_id).unwrap())
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() - week - week)
+                    .unwrap();
+            }
+        }
+        assert!(store.pending().unwrap().is_empty());
+        store
+            .retain_entry(&JournalEntry::Operation {
+                operation: attempt_receipt_on("queue-new", 1),
+            })
+            .unwrap();
+        // Acknowledged receipts count against the record bound until pruned.
+        assert!(store
+            .retain_entry(&JournalEntry::Operation {
+                operation: attempt_receipt_on("queue-over", 1),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("record bound"));
+        let removed = store
+            .prune_acknowledged_attempts(|_, acknowledged_for| acknowledged_for > week)
+            .unwrap();
+        assert_eq!(removed.len(), 200);
+        store
+            .retain_entry(&JournalEntry::Operation {
+                operation: attempt_receipt_on("queue-over", 1),
+            })
+            .unwrap();
+        let restarted = DaemonJournal::with_limits(dir.path(), 301, MAX_JOURNAL_BYTES);
+        restarted.initialize().unwrap();
+        let entries = fs::read_dir(restarted.directory())
+            .unwrap()
+            .filter(|entry| is_entry_path(&entry.as_ref().unwrap().path()))
+            .count();
+        assert_eq!(entries, 102, "100 recent receipts and two pending intents");
+        assert_eq!(restarted.pending().unwrap().len(), 2);
     }
 
     #[test]
