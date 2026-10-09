@@ -5392,7 +5392,7 @@ The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`
 
 Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Legacy annotation, blocked, failed and entry-barrier columns remain private dual-write storage until stage five.
 
-Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
+Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. `release` is the owner's decision on the run the hold stopped: when no Agent can take the Task at that moment (the Agent or the Project is paused) the release clears the hold and marks that stopped run resumable (`resume_policy = auto`), so the dispatcher starts the role again as soon as the Agent is available instead of treating the stopped run as one that still needs a decision. Only that run is marked: the Task's latest non-interactive run, and only when the user stopped it (`cancelled` with `stop_reason = user_cancelled`). A run that failed or was stopped for any other reason (executor failure, timeout, stall, lost machine) keeps `resume_policy = manual` and its own recovery, and the mark is undone when the release loses its version race. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
 Task action conditions precede generic review decisions. In `review`, ordinary
 approval requires an awaiting-human Review and no condition. Re-running review requires
@@ -5404,11 +5404,45 @@ hold, a failure park, the condition a queued action saved) and keeps it in
 `blocked.details.superseded`; a queued action refused by the dependency gate
 for a cancelled dependency settles into the same blocker, not an untyped
 `recovery_required` park, and one refused for an unfinished dependency stays
-queued behind a `dispatch_refusal` wait until the dependency finishes or its
-link is removed. The displaced condition records the state it was taken in and
+queued behind a typed `dependencies` wait (a `dispatch_disposition` with the
+capability `dependency_wait` naming the unfinished dependencies) until the
+dependency finishes or its link is removed: while that disposition is current
+the scheduler parks on it instead of replaying the action
+(`Facts::dependency_wait`), and the dependency's completion or the link's
+removal wakes the Task (`wake_task_dispatch`). A hold placed on a Task that
+carries the `dependency_cancelled` blocker goes under it
+(`hold_under_dependency_block`): the queued action is dropped as for any
+hold, the blocker stays, and the hold replaces what the blocker carried in
+`superseded`, so removing the dependency leaves the Task held. The displaced condition records the state it was taken in and
 is restored only while the Task is still in that state. A queued action always offers Hold alongside cancel,
 even when a newer condition appears. Restart follows the resolver's explicit set
-of resettable condition kinds. Pause refusals preserve the typed wait cause and
+of resettable condition kinds. Cancel wins over a settling plan
+artifact: when the Task (or a subtask the root's cancel cascades to) holds a
+`plan_publication_claim`, the cancel abandons it first (prior plan restored,
+staged private files removed, claim released; when the restore fails it is
+logged, the staged files are still removed and the claim is released) and
+continues at the Task version that produced. A claim left by a transition that
+already committed (its state is no longer the Task's) is cleared on the same
+path. Both the cancel and the settle run through the Task's single writer, so
+exactly one of them wins,
+so an offered `cancel` is never refused with "settling a completed execution's
+plan artifact". A coordination root's `retry` on an exhausted
+review budget is review-only: it resets the budget and re-runs the aggregate
+review where the root is, instead of resuming the root in a working state
+where the aggregate-review guard refuses every role; a gate decision that
+leaves a root in a working state queues no role for it (the scheduler advances
+the root when its subtasks are complete). The same park offers `send_back`
+(`root_review_reopen`): the budget is reset, the root takes its reject
+transition to the working state and is held there, because an unheld root
+whose subtasks are all finished is advanced straight back into the review
+that failed. In the working state `ensure_parent_accepts_subtasks` admits a
+corrective subtask, which waits on `parent` / `held` until the root's
+`release`. The owner's manual pass of a failed review is review authority
+for integration, for a root and for any other Task:
+`ReviewConformanceRepo::lock_review_integration` returns no contract (as for
+a Task with no reviewer) when the latest passed review carries the
+`manual_override` a user wrote, instead of demanding a passed reviewer
+conformance the override by definition does not have. Pause refusals preserve the typed wait cause and
 turn retry scope across REST, MCP, and native tools.
 
 ### Root Tasks and ordered subtasks
@@ -5423,7 +5457,30 @@ Agent as a proxy for all child work. A `coder` assignment on the root is the
 default worker for children that have no own `coder`; converting a Task into a
 coordination root keeps that assignment and removes other non-review roles.
 The root's aggregate review role also remains assignable and is the only role
-that may execute on the root, only while the root is in its review state. The
+that may execute on the root, only while the root is in its review state. A
+subtask whose root does not let it run
+(`task_hierarchy::coordination_root_allows_child_dispatch` is false: the root
+is held, parked on a failure or a blocked entry, or in a state that runs no
+subtasks) says so: the dispatcher resolves `Reason::ParentWait` for it
+(`task_dispatcher/next_step.rs`), which is one of the visible schedule parks
+(`db::task_condition::readers::owner_park`), so the subtask's stored condition
+is `parked` with the typed reason `parent { parent_id, cause }` (`held`,
+`blocked`, `not_coordinating`). It is a wait without a diagnostic or failure
+kind, `start` is not offered on the subtask meanwhile, and the park is cleared
+on the pass that finds the root coordinating again (a change of the root's
+condition or status marks its children for the scheduler). A Task whose Agent cannot
+take work is shown the same way: `Reason::AgentWait` is a visible schedule
+park and the stored condition is `parked` on `agent { agent_id, status }`
+(the Agent's effective status), cleared on the pass that finds the Agent
+available. A Task past its initial state whose Agent is at its run limit
+resolves `Reason::AgentCapacity`, also a visible schedule park: its stored
+condition is `parked` on `capacity { scope: agent }` and it is woken by the
+Agent's wait record when a run ends. A Task still waiting for its first run
+keeps the unstored `Reason::Capacity`. None of these visible waits sets an
+interruption, failure or refusal flag, so `max_active_tasks` slot accounting
+(`TaskRepo::count_project_slots`) counts the Task exactly as before. Releasing a held
+root that already has subtasks launches no role for it (`release` takes the
+`held_waiting` path): the hold is cleared and its subtasks run. The
 root `coder` never executes there. The review role is whatever the workflow's
 review gate declares, not the built-in `reviewer` name.
 `services::task_hierarchy::RootRolePolicy` owns these assignment and execution

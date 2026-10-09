@@ -55,13 +55,36 @@ pub enum Reason {
     ReviewGrace,
     ProjectPaused,
     Children,
+    /// A subtask whose parent does not let it run. Visible: the stored
+    /// condition names the parent and the cause.
+    ParentWait {
+        parent_id: String,
+        cause: String,
+    },
     HumanWork,
     AgentUnavailable,
+    /// The Agent that would run the Task is paused or cannot be reached.
+    /// Visible: the stored condition names the Agent and its status.
+    AgentWait {
+        agent_id: String,
+        status: String,
+    },
     Capacity,
+    /// A started Task whose Agent is at its run limit. Visible: the stored
+    /// condition is the `capacity` reason with the `agent` scope. A Task
+    /// still waiting for its first slot keeps the unstored `Capacity`.
+    AgentCapacity {
+        agent_id: String,
+    },
     ExecutionStopped,
     ReviewChecks,
-    WorkflowInvalid { state: String, cause: String },
-    UnknownCondition { owner: String },
+    WorkflowInvalid {
+        state: String,
+        cause: String,
+    },
+    UnknownCondition {
+        owner: String,
+    },
     Settled,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +133,11 @@ pub struct Facts {
     pub queue_owned: bool,
     pub in_flight: bool,
     pub agent_unavailable: bool,
+    /// The Agent that cannot take the Task now (unavailable, or at its run
+    /// limit) and its effective status.
+    pub agent_wait: Option<(String, String)>,
+    /// An accepted action waits behind an unfinished dependency.
+    pub dependency_wait: bool,
     pub agent_full: bool,
     pub owner_expired: bool,
     pub integrate: bool,
@@ -129,6 +157,8 @@ pub struct Facts {
     pub root_advance: bool,
     pub root_role_allowed: bool,
     pub child_ready: bool,
+    /// The parent that does not let this subtask run, and why.
+    pub parent_wait: Option<(String, String)>,
     pub disposition_current: bool,
     pub stopped_execution: bool,
     pub reviewer_ready: bool,
@@ -195,6 +225,9 @@ fn condition_park(condition: &TaskCondition) -> Next {
         ParkReason::RemoteCancelPending { .. } => (Owner::Machine, Action::AcknowledgeCancellation),
         ParkReason::Dependencies { .. } => (Owner::ProjectAgent, Action::CompleteDependencies),
         ParkReason::Children { .. } => (Owner::ProjectAgent, Action::SettleChildren),
+        ParkReason::Parent { cause, .. } if cause == "held" => (Owner::User, Action::ReleaseHold),
+        ParkReason::Parent { .. } => (Owner::ProjectAgent, Action::SettleChildren),
+        ParkReason::Agent { .. } => (Owner::User, Action::RepairAndRetry),
         ParkReason::Environment { .. } | ParkReason::PlacementDenied { .. } => {
             (Owner::Machine, Action::RepairAndRetry)
         }
@@ -301,6 +334,12 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
         };
     }
     if f.queued_recovery {
+        // Behind an unfinished dependency the accepted action is not
+        // replayed (and refused) again: the dependency's completion, or the
+        // removal of its link, wakes the Task.
+        if f.dependency_wait {
+            return condition_park(s.condition);
+        }
         return Next::Step(Step::QueuedRecovery);
     }
     if f.integrate && !f.blocking {
@@ -365,6 +404,27 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     // An unfinished or cancelled dependency is not a park of its own: the
     // admission attempt meets the dependency gate, which writes the visible
     // refusal (and blocks on a cancelled dependency) exactly as before.
+    if let Some((parent_id, cause)) = &f.parent_wait {
+        return if cause == "held" {
+            park(
+                Reason::ParentWait {
+                    parent_id: parent_id.clone(),
+                    cause: cause.clone(),
+                },
+                Owner::User,
+                Action::ReleaseHold,
+            )
+        } else {
+            park(
+                Reason::ParentWait {
+                    parent_id: parent_id.clone(),
+                    cause: cause.clone(),
+                },
+                Owner::ProjectAgent,
+                Action::SettleChildren,
+            )
+        };
+    }
     if !f.child_ready || (f.root && !f.root_role_allowed) {
         return park(
             Reason::Children,
@@ -374,12 +434,29 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     }
     if f.agent_unavailable {
         return park(
-            Reason::AgentUnavailable,
+            match &f.agent_wait {
+                Some((agent_id, status)) => Reason::AgentWait {
+                    agent_id: agent_id.clone(),
+                    status: status.clone(),
+                },
+                None => Reason::AgentUnavailable,
+            },
             Owner::User,
             Action::RepairAndRetry,
         );
     }
     if f.agent_full {
+        // A Task that already started and has no run must show why: its
+        // Agent is busy with other Tasks. It is dispatched when a run ends.
+        if let (Some((agent_id, _)), false) = (&f.agent_wait, kind == Some(StateKind::Initial)) {
+            return park(
+                Reason::AgentCapacity {
+                    agent_id: agent_id.clone(),
+                },
+                Owner::Scheduler,
+                Action::FreeCapacity,
+            );
+        }
         return park(Reason::Capacity, Owner::Scheduler, Action::FreeCapacity);
     }
     match kind {

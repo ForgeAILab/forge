@@ -1859,6 +1859,88 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **Three waits that showed nothing, or lost what they waited for, are now
+  typed and visible.** (1) A Task whose Agent is paused or unreachable kept a
+  clear condition while `start` and `retry` were hidden; its condition is now
+  `parked` with the new typed reason `agent` (`agent_id`, `status`) and clears
+  when the Agent can take work. (2) A Task action accepted while a dependency
+  was unfinished waited as `dispatch_refusal` and was replayed and refused
+  again whenever the scheduler looked at the Task; it now waits as
+  `dependencies` (`cancelled: false`) and is replayed once, when the
+  dependency finishes or its link is removed. The `dependencies` reason gains
+  `dependency_ids`, naming the unfinished or cancelled dependencies. (3) A
+  `hold` placed on a Task with a queued action and a cancelled dependency
+  overwrote the `dependency_cancelled` blocker and the condition it carried;
+  the hold now waits behind the blocker and removing the dependency leaves
+  the Task held, offering `release`. Clients that switch on
+  `condition.primary.kind` will see `agent` and, for the unfinished-dependency
+  wait, `dependencies` where they saw `dispatch_refusal`.
+
+- **A subtask whose parent is held (or otherwise not running subtasks) shows
+  why it waits.** Such a subtask sat in `todo` with a clear condition and
+  offered `start`, which could not run it. Its condition is now `parked` with
+  the new typed reason `parent` (`parent_id`, `cause`: `held`, `blocked` or
+  `not_coordinating`), `start` is no longer offered on it, and it is
+  dispatched as soon as the parent lets its subtasks run. `condition.primary`
+  can therefore carry a `kind` older clients have not seen (`parent`).
+  Releasing a held parent that already has subtasks used to be accepted and
+  then put the hold back with "coordination root ... is not in its aggregate
+  review state"; it now clears the hold and the subtasks run. Found by the
+  model-based workflow test.
+
+- **Retrying a parent Task whose aggregate review failed no longer loops
+  between `retry` and `restart`.** A parent Task (one with subtasks) parked in
+  `review` on "review retry budget exhausted" offered `retry`, which moved it
+  to `in_progress` and parked it there on "coordination root ... is not in its
+  aggregate review state"; `restart` put it back, and the two alternated for
+  ever. `retry` on a parent now resets the budget and re-runs the aggregate
+  review in place. Two more exits now work on that park. `send_back` is
+  offered (reason `root_review_reopen`): the parent returns to its working
+  state with a fresh review budget and a hold, accepts a corrective subtask
+  there (it answered `SUBTASK_PARENT_CLOSED` in `review`), and `release` runs
+  the subtask and then the aggregate review. And the owner's `approve`
+  (override) now merges; see the next entry. Found by the model-based
+  workflow test.
+
+- **An owner's manual pass of a failed review is accepted by integration.**
+  Passing a failed review by hand (`approve` with `override_checks: true`, or
+  deferring a `review_needs_owner` finding) moved the Task to `merging`, where
+  integration sent it back with "conformance review required: fresh
+  conformance review required before integration" whenever a reviewer Agent
+  was assigned, so the override could never land. The owner's pass is now
+  the review authority for that merge, for a parent Task and for any other
+  Task. This changes what merges: a Task whose review failed and whose owner
+  overrode it is now integrated without a passed reviewer conformance.
+
+- **A started Task waiting for a busy Agent shows why.** A Task past its
+  initial state with no run (for example one sent back by review while its
+  coder runs other Tasks) sat in `in_progress` with a clear condition. Its
+  condition is now `parked` with the existing reason `capacity`,
+  `scope: "agent"`, and it runs when one of the Agent's runs ends. Clients
+  that switch on `condition.primary.kind` will see `capacity` on such Tasks
+  where they saw a clear condition. Found by the model-based workflow test.
+
+- **An offered `cancel` is no longer refused while a plan artifact
+  settles.** Cancelling a Task (or a coordination root whose subtask was in
+  that state) whose finished run had not yet published its plan answered
+  `400 validation_error` ("the Task is settling a completed execution's plan
+  artifact; retry after publication") although `cancel` was on offer, and in
+  some states the publication never settled, so the Task could not be
+  cancelled at all. Cancel now abandons the pending publication (the previous
+  plan is restored and the staged files are removed) and goes through; a
+  claim left behind by a publication that already finished no longer refuses
+  it either. Found by the model-based workflow test.
+
+- **A Task released while its Agent is paused runs again when the Agent
+  resumes.** Holding a running Task stops its run. Releasing the hold while
+  the Agent (or the Project) was paused cleared the hold but left the stopped
+  run waiting for a decision, so once the Agent resumed the Task stayed in
+  `in_progress` with a clear condition, no run and no park. The release now
+  counts as that decision, for the run the hold stopped and no other (a run
+  that failed, timed out or lost its machine still waits for its own
+  recovery), and the Task is dispatched as soon as its Agent can take it.
+  Found by the model-based workflow test.
+
 - **Output a finished command wrote just before its drain limit is no longer
   dropped.** After a command exits, Forge reads its output for a bounded time
   (2 seconds by default, when something the command started keeps the pipe open). That limit is
@@ -1885,8 +1967,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   A Task action that was accepted before the dependency was cancelled ends
   in the same typed blocker. An accepted action that meets an unfinished
   dependency is no longer refused into the untyped park either: it stays
-  accepted, the Task shows the dependency wait an unstarted Task shows
-  (`dispatch_refusal`, offering `hold` and `cancel`), and the action runs
+  accepted, the Task shows a typed `dependencies` wait naming the unfinished
+  dependencies (offering `hold` and `cancel`), and the action runs
   when the dependency finishes or its link is removed. Found by the
   model-based workflow test.
 - **`start` on a queued Task no longer parks it as failed.** `start` was

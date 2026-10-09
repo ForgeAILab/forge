@@ -2,6 +2,7 @@ import type { InterruptionMetadata, Task } from '@/types/generated'
 import {
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
+  getTaskWaitNotice,
   getTaskWorkflowWarning,
 } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
@@ -78,6 +79,18 @@ export function TaskBlockingBanner({ task }: { task: Task }) {
               {staleAnnotation.blocked_execution_id}
             </p>
           ) : null}
+        </div>
+      </section>
+    )
+  }
+
+  const waitNotice = getTaskWaitNotice(task)
+  if (waitNotice) {
+    return (
+      <section className="rounded-lg border border-border bg-muted/40 p-4 text-foreground">
+        <div className="space-y-1.5">
+          <p className="text-sm font-semibold">{waitNotice.title}</p>
+          <p className="text-sm">{waitNotice.message}</p>
         </div>
       </section>
     )
