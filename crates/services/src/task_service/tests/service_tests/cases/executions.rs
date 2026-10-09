@@ -8168,8 +8168,12 @@ async fn superseded_project_revision_cannot_apply_completed_coder_guard_effects(
     assert_eq!(executions.items.len(), 1, "no follow-up may be launched");
 }
 
+/// A Project edit, pause or resume moves the Project version. A run that
+/// then fails must still be retried: dropping the failure left the Task
+/// active with no run, no retry and no park (model-based workflow test,
+/// `a_run_that_fails_after_a_project_pause_is_retried`).
 #[tokio::test]
-async fn superseded_project_revision_cannot_schedule_failed_execution_retry_or_block() {
+async fn failed_execution_from_a_superseded_project_revision_is_still_retried() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -8207,15 +8211,25 @@ async fn superseded_project_revision_cannot_schedule_failed_execution_retry_or_b
     service
         .annotate_executor_failure_block(&execution)
         .await
-        .expect("superseded failure is inert");
+        .expect("the failure is handled under the current revision");
 
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
         .expect("task exists");
     let metadata = current.metadata().expect("metadata parses");
-    assert!(metadata.extra.get("execution_retry_count").is_none());
-    assert!(metadata.extra.get("deferred_dispatch").is_none());
+    assert!(
+        metadata.extra.get("deferred_dispatch").is_some(),
+        "the retry is scheduled"
+    );
+    assert_eq!(
+        metadata
+            .extra
+            .get("last_execution_failure_execution_id")
+            .and_then(Value::as_str),
+        Some(execution.id.as_str()),
+        "the failure is recorded once"
+    );
     assert!(current.blocked_json.is_none());
     assert!(current.error_annotation.is_none());
 }
