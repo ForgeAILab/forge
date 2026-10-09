@@ -4886,7 +4886,7 @@ quarantined imports; there are no queue REST/MCP/web/CLI reads yet.
 
 ### Integration effect primitives and Task-step recorders (3.2 stage C, part 1)
 
-`services::integration_effects` contains the Git/command/socket effects and
+`services::integration_effects` contains the Git/command/socket effect adapters and
 read-only facts used by today's Task-step consumer. It accepts an explicit
 `EffectWorkspace` witness (owner, workspace, placement, generation and handle),
 Git paths/branches and candidate/target objects, command purpose/environment,
@@ -4974,94 +4974,153 @@ extraction, including execution trigger effects and remote receipt ordering.
 All stage B shadow observation sites and content remain in their original
 Task-step/Review/result transactions. Carry predicates, manual mode, Task
 single-writer authority and cancellation protection are unchanged. There is
-still no integration worker or activation. The server owner foundation below
-is available, but the existing Task-step recorders have not been converted to
-its attempt receipt sink. Daemon fence transport, receipt reconciliation and
-removal settlement must be completed before queue activation. The later head CI/rebase wall
+still no integration worker or activation. The owner gates and attempt sink below
+now bind the existing Task-step merge/rebase recorders, without claiming a queue
+or changing Task projections. The later head CI/rebase wall
 timeout remains an explicit setting decision (default 1800 seconds), not a
 default supplied by these primitives.
 
 
-### Server integration owner foundation (3.2 stage C, part 2, partial)
+### Integration owners, fenced wire and reconciliation (3.2 stage C, part 2b)
 
-A claim stamps `integration_attempt.owner_fence_json` with queue/attempt IDs,
-monotonic `slot_generation`, lease owner and the frozen target owner
-(location ID, server/daemon identity, runtime ID, location version). The owner
-gate checks this against the current queue, reserved head, lease deadline,
-stored attempt fence and current default location before any Git query.
-`ServerIntegrationOwner` resolves the workspace from its persisted ready
-placement, verifies workspace/placement/handle/generation and the expected HEAD
-and target objects, then uses the part-1 merge/rebase primitives. Refusals are
-typed: stale fence, foreign owner, witness mismatch, request conflict or required
-reconciliation. Fence, owner, request and placement refusals happen before any
-Git command; a HEAD or target mismatch is found by reading those refs and is
-refused before any Git write. This gate changes neither Task nor Review
-authority, and nothing on today's Task-step path calls it.
+A queue claim stamps `integration_attempt.owner_fence_json` with queue/attempt
+IDs, monotonic generation, lease owner and the frozen target owner (location,
+server/daemon identity, runtime and location version). `ServerIntegrationOwner`
+and the daemon gate refuse foreign owners, stale fences and changed physical
+placement before Git. Queue effects also verify expected HEAD and target refs
+before Git writes. The persistence-free primitives never validate witnesses;
+the owner gates own those checks.
 
-The additive `V202610082317__integration_fencing.sql` migration adds only three
-used columns: `owner_fence_json` (16 KiB), `effect_intent_json` (64 KiB), and
-`effect_receipts_json` (an array capped at 1 MiB). Receipt identity is
-`(attempt_id, operation_kind, fence)` with the full frozen request checked for
-identity reuse. A receipt is at most 128 KiB; admission reserves that capacity.
-Execution IDs are not receipt keys. Ordinary attempts' existing imported
-operation receipts remain separate evidence. These additions preserve Repo and
-Project CASCADE behavior. Its version sorts before
-`V202610082320__check_run_identity.sql`, which merged first; the two touch
-different tables and the runner applies any missing version, so a database
-that already has the later one still receives this one.
+Both owners use `git::integration` for rebase/conflict handoff and the reviewed
+fast-forward. Server and daemon adapters retain their established outcome
+classification and error rendering. The shared effects receive paths, objects,
+mode and explicit limits; the daemon has no database dependency.
 
-Order: receipt lookup → fence check → committed exact intent → fence recheck
-under the owner write guard → placement/object checks → Git → bounded typed
-receipt commit. An identical completed request returns the receipt before Git,
-including after constructing a new server owner. A committed intent without a
-receipt requires reconciliation and is never implicitly retried. The intent
-survives cancellation, guard drop, crash and lease takeover. A running/uncertain
-operation returns to `reconciling` on takeover; its original identity is retained
-in the intent independently of the new observing owner's fence. Failed/cancelled
-operations record their settlement; an uncertain infrastructure result retains
-the intent. Automatic reconciliation and Task-step consumption are not wired yet.
+Order: owner checkout lock → receipt lookup → short fenced intent transaction →
+last fence check/start checkpoint → Git outside SQLite → short receipt transaction.
+`IntegrationEffectGuard` holds an in-process owner lock, not a write transaction.
+The durable intent distinguishes `started:false` from a potentially performed
+effect. A refusal after intent commit settles `not_performed`; an abandoned
+unstarted intent is reconciled the same way. A queue claim's started intent never
+authorizes another effect without owner receipt lookup, and a checkout with
+another unresolved started queue intent refuses a new effect. A Task-step intent
+never refuses anything (see "Task-step intents always settle" below). Only
+intents that share an owner lock are compared: a rebase or check locks its
+workspace alone, so one Task's rebase neither waits on nor is refused by another
+Task's in-flight merge into the same checkout. Receipt identity remains
+`(attempt_id, operation_kind, fence)` with the entire request checked against reuse.
+An uncertain receipt is replaced on reconciliation, not appended as a second
+receipt for the same key. An original owner can retain its receipt after lease
+takeover; the frozen intent remains its identity.
 
-The server gate currently holds `BEGIN IMMEDIATE` across the physical effect,
-preventing a claim from invalidating an admitted fence while Git runs. This is
-safe storage groundwork, not a scalable queue executor: owner serialization
-that permits narrowing that guard remains required before activation. The
-existing local review guard is retained because it also fences changes to
-review/Project authority; the owner fence does not replace that contract.
+The existing `V202610082317__integration_fencing.sql` columns retain their bounds:
+16 KiB fence, 64 KiB intent, 128 KiB per receipt, 1 MiB receipt array. This stage
+uses no additional SQL columns or stored enum values and needs no migration.
+The daemon persists high-water fences and unresolved checkout operation identities
+beside its workspace registry in `.forge/journal`; attempt effects use stable
+attempt/kind/generation operation IDs in that journal. The existing journal
+count/byte limits apply before an effect. Queue attempt receipts survive ACK and
+replay without Git, including after restarting the owner. Cancelling an attempt
+stops its Git process group before retaining a receipt with observed HEAD and
+rebase progress. Task-step merge cancellation keeps today's protected-completion
+behavior. Ordinary Task-step journal ACKs retain their existing lifecycle.
 
-Known limits of this passive stage, to settle before activation:
+Daemon protocol revision **4** requires the tagged `integration` binding on
+mutation and reconciliation messages. `attempt` carries the queue fence and
+frozen witness; `task_step_effect` carries the existing Task step's attempt
+binding; `task_step` identifies other existing workspace operations. There is
+one revision-4 format, and revisions below 4 are refused with
+`daemon_upgrade_required` and an “upgrade the daemon” message. Upgrade the server
+then each daemon, preserving `--workspace-root`. Startup forward-migrates retained
+revision-3 journal intents/results in place; old wire decoding is never enabled.
 
-- A fence refusal between the committed intent and the guard (a takeover in
-  that window) leaves an intent with no Git run. It reads as "reconciliation
-  required" and is never retried implicitly; reconciliation must settle it.
-- A claim refused for an unresolved target records the reason and keeps a
-  quarantined queue quarantined (an open or suspended one becomes suspended).
-- The queue resolver follows the repo's default location, while today's merge
-  integrates into the checkout of the Task's own placement and nothing
-  propagates that to the default checkout or a remote. Stage D must either
-  place integrating Tasks on the default location's owner or move the
-  candidate there.
+Today's merge/rebase recorders bind to the current shadow attempt and Task-step
+fence without claiming a queue. Their owner witness follows the Task's current
+placement. Existing dirty/review/ancestry/target classification, local review
+authority guard, execution writes, comments, events and hook result ordering
+remain authoritative. The new receipt facts confer no Task or Review authority.
+The local review guard still spans the bounded reviewed merge because it fences
+Review and Project edits; a queue owner guard does not replace that contract.
 
-Every command the `git` crate runs through its common runner (rebase,
-continue, merge, checkout, commit, fetch) starts in its own process group with
-stdin closed. A command that finishes is untouched: same environment, working
-directory, captured output and exit status. Dropping its future (cancel or
-timeout) stops the whole group, hooks included, and returns only afterwards:
-SIGTERM first, so Git removes its own `index.lock` and ref locks, a wait of at
-most 500 ms for Git to exit, then SIGKILL for whatever ignored it. The group
-is the child's own, never the server's or daemon's. A stopped rebase is left
-as Git leaves it (`rebase-merge` present, no lock), which is the state the
-existing interrupted-rebase recovery aborts. Cancellation/timeout on the
-server owner rebase records the observed HEAD and whether a rebase is in
-progress without aborting it. The same runner serves today's daemon rebase.
-The read-only probes that spawn Git directly (`rev-parse`, `diff
---name-only`) and the reviewed fast-forward (`review::contract::git_read`)
-are outside this runner and keep `kill_on_drop` only; the owner gate's merge
-takes no cancel token. The daemon still has its
-separate algorithm and its existing protocol revision **3**: there is no fence
-wire change or activation in this partial delivery. Remaining C2 work is legacy
-Task-step binding to the gate, shared daemon primitives and revision/handshake
-change, daemon attempt receipts, reconnect reconciliation and removal settlement.
+On server recovery, local intents are reconciled before Task recovery. Before a
+new local effect, the same owner lock waits for any live effect to retain its
+receipt. A restarted server can prove an exact reviewed queue merge from the frozen
+candidate/target refs. A queue claim's unknown effect retains an uncertain receipt
+and its intent. On reconnect, the workspace client reconciles daemon attempt intents
+before ordinary execution receipts and any new effect. The owner returns its
+retained receipt. An absent owner intent is fenced against delayed delivery and
+settles `not_performed`; an interrupted merge needs exact object proof. Receipt
+validation and attempt persistence precede ACK. No Git effect is repeated to
+reconstruct a result.
 
+**Task-step intents always settle.** Today's merge and rebase are bound to the
+Task step's lease (`lease_owner = task-step:<step id>`, `generation` = the step's
+claim count), not to a queue claim, and the Task step already owns recovery of
+its effect: the durable `merge_intent` / `merge_outcome` / `rebase_target` /
+`rebase_outcome` hook effects, the idempotent already-merged check, and
+interrupted-rebase recovery. The attempt receipt is therefore a record of the
+effect and never its result or a precondition of the next one:
+
+- A recorder error, a missing/oversized/contradictory owner receipt and a failed
+  receipt write are logged; the merge or rebase result the Task step computed is
+  returned unchanged. An error result is recorded `failed`, never `uncertain`.
+- A started Task-step intent whose guard is gone (server crash, dropped future,
+  daemon that never answered) is settled `failed` with an `infrastructure`
+  result by whichever comes first: startup reconciliation, the reconnect pass,
+  or the next admission that takes the same owner lock, which holds the lock the
+  dead guard held and so knows the effect is not running here. It never returns
+  `ReconciliationRequired`.
+- Reconciliation before a Task-step effect, at startup and on daemon reconnect
+  is best effort: a failure is logged and neither crash recovery, the reconnect
+  pass for run/merge intents, nor the effect is stopped.
+- When the shadow attempt no longer matches the Task's placement or target
+  branch, the step lease is still verified and the effect proceeds unrecorded.
+- On the daemon, a Task-step effect is not held to the location version (the
+  server changes it without telling the owner; only a queue claim freezes it),
+  and a Task-step journal intent left without an outcome by a daemon restart is
+  settled as interrupted, with a receipt, by the next Task-step request on that
+  checkout instead of refusing it.
+
+| Durable state (Task-step binding) | What moves it | When | Ends as |
+|---|---|---|---|
+| intent written, not started | startup / reconnect reconciliation, or the next admission on the checkout | next server start, daemon reconnect, or next merge/rebase there | receipt `failed` / `not_performed`; Task step retried by its lease |
+| intent started, guard alive | the effect itself; today's deadlines and protected completion | bounded by the step | receipt `succeeded` or `failed` |
+| intent started, guard gone | same three passes as above | next server start, reconnect, or next admission (step lease expiry reclaims the step) | receipt `failed` / `infrastructure`; step recovery re-reads Git |
+| owner receipt missing or invalid | settled at the reply, else by the lookup, else by the next admission | immediately, or as above | receipt `failed` / `infrastructure`; owner result still returned |
+| daemon journal intent without outcome | server lookup, else the next Task-step request on that checkout | reconnect, or next request | journal outcome `interrupted` plus receipt |
+| daemon never reconnects | today's owner-disconnected timeout fails the placement; machine removal settles the attempt | existing timeout / operator removal | receipt `failed` / `infrastructure`, Task handled by placement recovery |
+| machine or location removed mid-effect | the remover's transaction | at removal | receipt `failed`, attempt `parked` (or still `quarantined`), queue `suspended` |
+| queue `suspended` / attempt `quarantined` | nothing automatic: no worker runs before activation, and today's Task-step path does not read queue state | n/a | passive rows; stage D owns their exits |
+
+Queue-claim (`attempt`) intents keep the strict rule (uncertain until the owner's
+receipt). No production caller creates one before activation.
+
+Machine removal and permitted location deletion settle in-flight attempts with
+an infrastructure receipt/failure in the remover's transaction, suspend their
+queues, clear leases and preserve quarantine. A late owner cannot overwrite
+that settlement. Existing placement-in-use deletion refusals and Repo/Project
+CASCADE behavior remain unchanged.
+
+Every Git command in `git`, including read probes and reviewed fast-forward,
+uses the group runner: closed stdin, a separate process group, SIGTERM, up to
+500 ms grace, then SIGKILL. Review's bounded Git evidence reads use that runner
+as well. Owner merge and rebase accept cancellation; an explicit daemon
+`deadline_nanos` witness binds the owner wall limit, separately from RPC timeout.
+Their deadlines include Git witness probes. Cancellation retains the state interrupted-rebase recovery
+expects, including a stopped rebase without `index.lock`.
+
+Known limits before activation:
+
+- Queue activation, the integration worker and Task state/public shape changes
+  remain stage D work.
+- Placement off the default location still follows today's Task placement;
+  stage D will place integrating Tasks according to the target.
+- Unknown effects are kept uncertain when neither a retained receipt nor exact
+  Git completion proof exists. Lease expiry alone never grants a repeat.
+- Queue attempt receipts are bounded and retained after ACK; retention/cleanup
+  policy must preserve replay fencing when the future worker starts using them.
+- The existing local Review/Project authority guard remains separate from queue
+  owner serialization.
 
 ### Task condition actions
 

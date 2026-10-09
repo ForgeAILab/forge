@@ -28,6 +28,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - **A Project Agent cannot queue `project.create` (3.8 slice E).** The
   agent-action policy refuses it from a Project scope or Project Chat, where
   it was never offered; it used to be queued for approval.
+- **Daemon protocol revision 4 (3.2 stage C, part 2b).** Workspace mutation
+  and reconciliation messages now carry a required tagged `integration`
+  binding (`task_step`, `task_step_effect` or `attempt`), and merge / rebase
+  replies carry an attempt receipt. There is one wire format: a daemon below
+  revision 4 is refused at the handshake with `daemon_upgrade_required`, is
+  shown as `upgrade_required`, and runs nothing until upgraded. Upgrade the
+  server first, then install that release's `forge-ctl` on every daemon and
+  restart each with the same `--workspace-root`. A revision-4 daemon pointed at
+  an older server has every mutation refused as invalid input (no effect runs),
+  so do not upgrade daemons first. The daemon rewrites its retained revision-3
+  journal entries in place at startup, in-flight ones included.
 
 - **Reviewers get no workflow permission (3.8 slice D).** `propose_review` is
   removed from the read-only Task ceiling and from the Task scope of the
@@ -733,6 +744,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   per attempt, effect kind and fence: a repeated request returns the stored
   receipt and runs nothing. Migration `V202610082317__integration_fencing.sql`
   adds three columns to `integration_attempt` and keeps existing rows.
+- **Server and daemon integration owners share one Git implementation and one
+  receipt shape; today's merge and rebase record through them (3.2 stage C,
+  part 2b).** Rebase with conflict handoff and the reviewed fast-forward live
+  in `git::integration` and are used by both owners; the daemon's own copy is
+  gone. An owner effect no longer holds SQLite's writer: a short transaction
+  writes the intent, Git runs under an in-process owner lock, a short
+  transaction writes the receipt. The daemon's single operation lock is
+  replaced by per-checkout locks, so work in different workspaces no longer
+  queues behind one merge. Today's Task-step merge and rebase bind to the
+  Task's shadow attempt and write an attempt receipt, on the server and on a
+  daemon. That receipt is a record only: Task state, comments, events, review
+  authority and recovery are decided exactly as before, and a Task-step intent
+  left without a receipt (crash, lost reply, daemon restart, failed receipt
+  write) is settled as failed by the next start, reconnect or merge on that
+  checkout and never refuses a merge. The queue worker is still off.
 - **The integration queue's target is the repo's default location only.**
   `repo.local_path` no longer makes a queue ambiguous: one ready default
   `primary_checkout` location opens the queue, whether the server or a daemon
@@ -1540,6 +1566,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   whose ledger row was marked `executed` without a receipt is refused instead
   of returning success.
 
+- **An interrupted Git probe no longer outlives its caller.** The read-only
+  probes around a merge or rebase (rebase-in-progress, conflict state, the
+  reviewed `merge --ff-only`) now run in the same process group runner as the
+  mutating commands, so a cancel or deadline stops them (SIGTERM, 500 ms,
+  SIGKILL) instead of leaving a Git child holding the checkout.
+- **Removing a machine or a repo location with an integration attempt in
+  flight settles that attempt** with an infrastructure failure in the same
+  transaction, clears the queue lease and keeps a quarantine in place, instead
+  of leaving an intent nobody can answer.
 - **A cancelled or timed-out Git command stops its hooks too, and leaves no
   stale `index.lock`.** Forge and the daemon run each Git command in its own
   process group with stdin closed. On cancel or timeout the group gets

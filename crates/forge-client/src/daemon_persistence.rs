@@ -56,6 +56,12 @@ pub struct JournalOperation {
     // None is a durable intent. An interrupted shell command is never rerun.
     pub outcome: Option<std::result::Result<Value, DaemonErrorPayload>>,
     pub acknowledged: bool,
+    /// Old unfinished journal entries are conservatively considered started.
+    #[serde(default = "effect_may_have_started")]
+    pub effect_started: bool,
+}
+fn effect_may_have_started() -> bool {
+    true
 }
 
 impl JournalEntry {
@@ -151,6 +157,7 @@ impl DaemonJournal {
     /// Convert the old queue on startup; delete each source only after the new
     /// entry and its directory have been synced. A partial conversion retries.
     pub fn initialize(&self) -> Result<()> {
+        self.upgrade_integration_journal()?;
         {
             let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
             self.current_usage()?;
@@ -181,6 +188,46 @@ impl DaemonJournal {
         if fs::read_dir(&old)?.next().is_none() {
             fs::remove_dir(&old)?;
         }
+        Ok(())
+    }
+
+    /// Forward migration of on-disk revision-3 intents. Wire decoding stays
+    /// strict; only startup rewrites retained files before deserializing them.
+    fn upgrade_integration_journal(&self) -> Result<()> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.ensure_confined()?;
+        if !self.directory.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&self.directory)? {
+            let path = entry?.path();
+            if !is_entry_path(&path) || !path.is_file() {
+                continue;
+            }
+            let Ok(mut value) = read_json::<Value>(&path) else {
+                continue;
+            };
+            if value["kind"] != "operation"
+                || value.pointer("/operation/fence/integration").is_some()
+                || !value
+                    .pointer("/operation/fence")
+                    .is_some_and(Value::is_object)
+                || !value
+                    .pointer("/operation/request")
+                    .is_some_and(Value::is_object)
+            {
+                continue;
+            }
+            value["operation"]["fence"]["integration"] = serde_json::json!({"kind":"task_step"});
+            if value["operation"]["request"].get("operation_id").is_some() {
+                value["operation"]["request"]["integration"] =
+                    serde_json::json!({"kind":"task_step"});
+            }
+            value["operation"]["effect_started"] = Value::Bool(true);
+            let migrated: JournalEntry = serde_json::from_value(value)?;
+            self.atomic_write(&path, &serde_json::to_vec(&migrated)?)?;
+        }
+        *self.usage.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
     }
 
@@ -240,6 +287,20 @@ impl DaemonJournal {
             unreachable!()
         };
         Ok(operation)
+    }
+
+    pub fn start_operation(&self, operation_id: &str) -> Result<()> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let path = self.path_for_entry(&operation_entry_id(operation_id))?;
+        let JournalEntry::Operation { mut operation } = read_entry(&path)? else {
+            bail!("operation intent is missing");
+        };
+        if operation.outcome.is_some() {
+            bail!("operation already settled");
+        }
+        operation.effect_started = true;
+        self.write_entry(&JournalEntry::Operation { operation })
+            .map(|_| ())
     }
 
     pub fn operation(&self, operation_id: &str) -> Result<Option<JournalOperation>> {
@@ -310,6 +371,16 @@ impl DaemonJournal {
         }
         if matches!(&entry, JournalEntry::Operation { operation } if operation.outcome.is_none()) {
             bail!("cannot acknowledge an unfinished operation");
+        }
+        // Attempt receipts survive acknowledgements: a repeated effect key
+        // still returns its stored result. Their existing journal count/byte
+        // bounds are enforced before any effect, never by discarding evidence.
+        if matches!(&entry, JournalEntry::Operation { operation } if matches!(operation.fence.integration, api_types::WorkspaceIntegrationBinding::Attempt { .. }))
+        {
+            return Ok(JournalAckResult {
+                entry_id: params.entry_id.clone(),
+                acknowledged: true,
+            });
         }
         self.current_usage()?;
         fs::remove_file(&path)?;
@@ -1049,6 +1120,7 @@ mod tests {
         let operation = JournalOperation {
             entry_id: operation_entry_id("run-once"),
             fence: WorkspaceMutationFence {
+                integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                 daemon_id: "daemon-1".into(),
                 runtime_id: "runtime-1".into(),
                 placement_id: "placement-1".into(),
@@ -1061,6 +1133,7 @@ mod tests {
             request: serde_json::json!({"command":"printf once"}),
             outcome: Some(Ok(serde_json::json!({"stdout":"once"}))),
             acknowledged: false,
+            effect_started: true,
         };
         store
             .retain_entry(&JournalEntry::Operation {
@@ -1084,6 +1157,7 @@ mod tests {
         let mut operation = JournalOperation {
             entry_id: operation_entry_id("ci-result"),
             fence: WorkspaceMutationFence {
+                integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                 daemon_id: "daemon-1".into(),
                 runtime_id: "runtime-1".into(),
                 placement_id: "placement-1".into(),
@@ -1096,6 +1170,7 @@ mod tests {
             request: serde_json::json!({"purpose":"ci_step", "max_output_bytes":u64::MAX}),
             outcome: None,
             acknowledged: false,
+            effect_started: true,
         };
         store
             .retain_entry(&JournalEntry::Operation {
@@ -1170,6 +1245,54 @@ mod tests {
     }
 
     #[test]
+    fn revision_three_journal_is_migrated_without_accepting_old_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DaemonJournal::new(dir.path());
+        let operation = run_intent("old-integration-intent");
+        let entry_id = operation.entry_id.clone();
+        store
+            .retain_entry(&JournalEntry::Operation { operation })
+            .unwrap();
+        let path = store.path_for_entry(&entry_id).unwrap();
+        let mut old: Value = read_json(&path).unwrap();
+        old["operation"]["fence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("integration");
+        old["operation"]["request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("integration");
+        old["operation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("effect_started");
+        assert!(serde_json::from_value::<WorkspaceMutationFence>(
+            old["operation"]["fence"].clone()
+        )
+        .is_err());
+        old["operation"]["request"]["operation_id"] = serde_json::json!("old-integration-intent");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let restart = DaemonJournal::new(dir.path());
+        restart.initialize().unwrap();
+        let migrated = restart
+            .operation("old-integration-intent")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            migrated.fence.integration,
+            api_types::WorkspaceIntegrationBinding::TaskStep
+        ));
+        assert!(migrated.effect_started);
+        assert!(migrated.outcome.is_none());
+        let disk: Value = read_json(&path).unwrap();
+        assert_eq!(
+            disk["operation"]["request"]["integration"]["kind"],
+            "task_step"
+        );
+    }
+
+    #[test]
     fn operation_journal_never_persists_environment_secret_values() {
         let dir = tempfile::tempdir().unwrap();
         let journal = DaemonJournal::new(dir.path());
@@ -1177,6 +1300,7 @@ mod tests {
         let mut operation = JournalOperation {
             entry_id: operation_entry_id("secret-run"),
             fence: WorkspaceMutationFence {
+                integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                 daemon_id: "daemon-1".into(),
                 runtime_id: "runtime-1".into(),
                 placement_id: "placement-1".into(),
@@ -1189,6 +1313,7 @@ mod tests {
             request: serde_json::json!({"env":[["TOKEN",secret]], "command":format!("printf {secret}")}),
             outcome: None,
             acknowledged: false,
+            effect_started: true,
         };
         journal
             .retain_entry(&JournalEntry::Operation {
@@ -1269,6 +1394,7 @@ mod tests {
         JournalOperation {
             entry_id: operation_entry_id(id),
             fence: WorkspaceMutationFence {
+                integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                 daemon_id: "daemon-1".into(),
                 runtime_id: "runtime-1".into(),
                 placement_id: "placement-1".into(),
@@ -1281,6 +1407,7 @@ mod tests {
             request: serde_json::json!({"command":"echo 1", "env":[["CI","1"]], "max_output_bytes":u64::MAX}),
             outcome: None,
             acknowledged: false,
+            effect_started: true,
         }
     }
 

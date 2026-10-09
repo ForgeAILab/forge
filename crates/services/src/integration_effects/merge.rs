@@ -2,7 +2,6 @@
 use super::{EffectWorkspace, MergeOutcome};
 use crate::{Result, ServiceError};
 use std::path::{Path, PathBuf};
-use tokio::process::Command;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReviewedMergeObject {
@@ -150,30 +149,39 @@ pub async fn apply_merge(
     input: &MergeEffectInput<'_>,
     already_merged: bool,
 ) -> Result<MergeApplyOutcome> {
-    if !already_merged {
-        git::checkout_branch(input.repo_path, input.target_branch).await?;
-    }
-    if already_merged {
-        Ok(MergeApplyOutcome::Applied)
-    } else if let Some(candidate) = &input.reviewed {
-        let result = ::review::contract::git_read(
+    let candidate = input
+        .reviewed
+        .as_ref()
+        .map(|object| object.commit_sha.as_str())
+        .unwrap_or(input.task_branch);
+    Ok(
+        match git::integration::apply_merge(
             input.repo_path,
-            &["merge", "--ff-only", &candidate.commit_sha],
+            input.target_branch,
+            candidate,
+            input.reviewed.is_some(),
+            already_merged,
+            None,
+            git::integration::FastForwardLimits {
+                deadline: std::time::Duration::from_secs(30),
+                output_bytes: ::review::contract::MAX_EVIDENCE_BYTES,
+            },
         )
-        .await;
-        if result.is_ok() && git::get_current_sha(input.repo_path).await? != candidate.commit_sha {
-            return Ok(MergeApplyOutcome::ExactObjectMismatch);
-        }
-        match result {
-            Ok(_) => Ok(MergeApplyOutcome::Applied),
-            Err(reason) => Ok(MergeApplyOutcome::ReviewRequired { reason }),
-        }
-    } else {
-        match git::merge_branch_into(input.repo_path, input.task_branch).await {
-            Ok(()) => Ok(MergeApplyOutcome::Applied),
-            Err(error) => Ok(MergeApplyOutcome::ManualFailed(error)),
-        }
-    }
+        .await?
+        {
+            git::integration::MergeApplyOutcome::Applied => MergeApplyOutcome::Applied,
+            git::integration::MergeApplyOutcome::ManualFailed(error) => {
+                MergeApplyOutcome::ManualFailed(error)
+            }
+            git::integration::MergeApplyOutcome::ReviewRequired { reason } => {
+                MergeApplyOutcome::ReviewRequired { reason }
+            }
+            git::integration::MergeApplyOutcome::ExactObjectMismatch
+            | git::integration::MergeApplyOutcome::TargetMoved => {
+                MergeApplyOutcome::ExactObjectMismatch
+            }
+        },
+    )
 }
 
 /// Finish fact collection after today's authority guard has been released.
@@ -277,36 +285,10 @@ fn short_sha(sha: &str) -> &str {
 }
 
 async fn read_conflict_paths(worktree_path: &Path) -> Vec<PathBuf> {
-    let output = Command::new("git")
-        .args(["diff", "--name-only", "--diff-filter=U"])
-        .current_dir(worktree_path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await;
-
-    match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(PathBuf::from)
-            .collect(),
-        Ok(output) => {
-            tracing::warn!(target: "services::merge_service",
-                worktree_path = %worktree_path.display(),
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "failed to read merge conflict paths"
-            );
-            Vec::new()
-        }
+    match git::conflict_paths(worktree_path).await {
+        Ok(paths) => paths.into_iter().map(PathBuf::from).collect(),
         Err(error) => {
-            tracing::warn!(target: "services::merge_service",
-                worktree_path = %worktree_path.display(),
-                %error,
-                "failed to run git diff for merge conflict paths"
-            );
+            tracing::warn!(target: "services::merge_service", worktree_path = %worktree_path.display(), %error, "failed to read merge conflict paths");
             Vec::new()
         }
     }

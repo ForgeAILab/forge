@@ -5,9 +5,8 @@ use std::{
 
 use api_types::ProjectEnvironment;
 use async_trait::async_trait;
-use tokio::process::Command;
 
-use crate::{command::bounded_output, ReviewError};
+use crate::ReviewError;
 
 #[derive(Clone, Copy)]
 pub struct CommandLimits {
@@ -114,14 +113,16 @@ impl<T: AsRef<Path> + Send + Sync + ?Sized> ReviewWorkspace for T {
     }
 
     async fn git_read(&self, args: &[&str], optional: bool) -> Result<Option<String>, String> {
-        let mut command = Command::new("git");
-        command
-            .args(args)
-            .current_dir(self.as_ref())
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE");
-        let output = bounded_output(&mut command, 30, crate::contract::MAX_EVIDENCE_BYTES).await?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            git::command_output_bounded(self.as_ref(), args, crate::contract::MAX_EVIDENCE_BYTES),
+        )
+        .await
+        .map_err(|_| "review command timed out".to_owned())?
+        .map_err(|error| match error {
+            git::GitError::Io(error) => error.to_string(),
+            error => error.to_string(),
+        })?;
         if !output.status.success() {
             return if optional {
                 Ok(None)

@@ -121,6 +121,7 @@ impl Fixture {
 
 fn fence(id: &str, generation: u64, sha: &str) -> WorkspaceMutationFence {
     WorkspaceMutationFence {
+        integration: api_types::WorkspaceIntegrationBinding::TaskStep,
         daemon_id: "daemon-1".into(),
         runtime_id: "runtime-1".into(),
         placement_id: "placement-1".into(),
@@ -798,7 +799,11 @@ async fn cleanup_checks_execution_activity_after_waiting_for_the_operation_lock(
     })
     .unwrap();
     let tracker = crate::daemon_runtime::ActiveExecutionTracker::default();
-    let lock = fixture.backend.operation_lock.lock().await;
+    let checkout_lock = fixture.backend.owner_lock(&format!(
+        "workspace:{}",
+        fixture.prepared.workspace.workspace_handle
+    ));
+    let lock = checkout_lock.lock().await;
     let request = fixture
         .backend
         .handle(METHOD_WORKSPACE_CLEANUP, params, || tracker.running_ids());
@@ -1197,7 +1202,11 @@ async fn machine_probe_scratch_policy_timeout_output_and_no_journal() {
         .allowed_purposes
         .push(WorkspaceRunPurpose::EnvironmentProbe);
     let before = fixture.journal.pending().unwrap().len();
-    let held_lock = fixture.backend.operation_lock.lock().await;
+    let checkout_lock = fixture.backend.owner_lock(&format!(
+        "workspace:{}",
+        fixture.prepared.workspace.workspace_handle
+    ));
+    let held_lock = checkout_lock.lock().await;
     let result: MachineProbeResult = serde_json::from_value(
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1264,7 +1273,11 @@ async fn provision_idempotency_conflict_partial_clone_and_restart() {
         repo_id: repo_id.clone(),
         remote_url: fixture.repo.to_string_lossy().into_owned(),
     };
-    let held_workspace_lock = fixture.backend.operation_lock.lock().await;
+    let checkout_lock = fixture.backend.owner_lock(&format!(
+        "workspace:{}",
+        fixture.prepared.workspace.workspace_handle
+    ));
+    let held_workspace_lock = checkout_lock.lock().await;
     let reply: RepoLocationProvisionResult = serde_json::from_value(
         tokio::time::timeout(
             Duration::from_secs(10),

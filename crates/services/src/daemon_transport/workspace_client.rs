@@ -98,7 +98,7 @@ impl DaemonWorkspaceClient {
         self
     }
 
-    pub(crate) fn with_receipts(mut self, db: Arc<SqliteDb>) -> Self {
+    pub fn with_receipts(mut self, db: Arc<SqliteDb>) -> Self {
         self.db = Some(db);
         self
     }
@@ -387,6 +387,26 @@ impl DaemonWorkspaceClient {
                 .remember_mutation(daemon_id, method, params, None)
                 .await?;
         }
+        let admission = self
+            .bind_task_step_integration(daemon_id, method, &mut params)
+            .await?;
+        let receipt_guard = match admission {
+            Some(db::IntegrationEffectAdmission::Replay(receipt)) => {
+                let value = receipt.result.get("owner_result").cloned().ok_or_else(|| {
+                    ServiceError::invalid_operation("prior owner effect did not complete")
+                })?;
+                return crate::integration_effects::rpc::decode_reply(method, &params, &value);
+            }
+            Some(db::IntegrationEffectAdmission::Started(guard)) => Some(guard),
+            Some(db::IntegrationEffectAdmission::Refused(reason)) => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "integration owner refused {reason:?}"
+                ))
+                .into())
+            }
+            None => None,
+        };
+        let mut receipt_guard = receipt_guard;
         let mut retried = false;
         let value = loop {
             match self
@@ -410,6 +430,14 @@ impl DaemonWorkspaceClient {
                     break self.reconcile(daemon_id, method, &params).await?;
                 }
                 Err(WorkspaceClientError::Daemon(error)) => {
+                    if let Some(guard) = receipt_guard.take() {
+                        let receipt = error
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("integration_receipt"))
+                            .cloned();
+                        settle_task_step_receipt(guard, receipt, &error.message).await;
+                    }
                     if method != METHOD_WORKSPACE_MERGE {
                         self.retain_error(daemon_id, method, &params, &error)
                             .await?;
@@ -420,6 +448,14 @@ impl DaemonWorkspaceClient {
             }
         };
         let result = crate::integration_effects::rpc::decode_reply(method, &params, &value)?;
+        if let Some(guard) = receipt_guard {
+            settle_task_step_receipt(
+                guard,
+                value.get("integration_receipt").cloned(),
+                "owner reply carried no attempt receipt",
+            )
+            .await;
+        }
         if !matches!(method, METHOD_WORKSPACE_MERGE | METHOD_WORKSPACE_CANCEL) {
             self.retain_result(daemon_id, method, &params, &value)
                 .await?;
@@ -435,6 +471,7 @@ impl DaemonWorkspaceClient {
             ServiceError::invalid_operation("interrupted workspace operation has no id")
         })?;
         let request = WorkspaceReconcileParams {
+            integration: api_types::WorkspaceIntegrationBinding::TaskStep,
             workspace: serde_json::from_value(params.clone()).map_err(|error| {
                 ServiceError::invalid_operation(format!("invalid workspace reference: {error}"))
             })?,
@@ -461,9 +498,18 @@ impl DaemonWorkspaceClient {
         match result.outcome {
             WorkspaceReconcileOutcome::Result { result } => Ok(result),
             WorkspaceReconcileOutcome::Error { mut error } => {
+                let receipt = error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("integration_receipt"))
+                    .cloned();
                 error.details = Some(
-                    serde_json::json!({"entry_id": result.entry_id, "operation_id": operation_id}),
+                    serde_json::json!({"entry_id":result.entry_id,"operation_id":operation_id}),
                 );
+                if let Some(receipt) = receipt {
+                    error.details.as_mut().expect("settled details")["integration_receipt"] =
+                        receipt;
+                }
                 if method != METHOD_WORKSPACE_MERGE {
                     self.retain_error(daemon_id, method, params, &error).await?;
                 }
@@ -876,6 +922,16 @@ impl DaemonWorkspaceClient {
     /// Inspect retained run/merge intents on reconnect without rerunning either
     /// command. The owner must durably settle an intent before returning it.
     pub async fn reconcile_pending_operations(&self, daemon_id: &str) -> Result<()> {
+        // Attempt receipts are bookkeeping. A lookup that fails must not stop
+        // the run/merge intent reconciliation below (today's recovery); the
+        // next admission on that checkout settles what is left.
+        if let Err(error) = self.reconcile_integration_attempts(daemon_id).await {
+            let error = match error {
+                WorkspaceClientError::Transport(error) => error.to_string(),
+                WorkspaceClientError::Daemon(error) => error.message,
+            };
+            tracing::warn!(target: "services::daemon_transport", %daemon_id, %error, "integration attempt reconciliation failed on reconnect");
+        }
         let Some(db) = &self.db else { return Ok(()) };
         let intents = sqlx::query_scalar::<_, String>(
             "SELECT intent.outcome_json FROM command_receipt intent
@@ -1169,6 +1225,430 @@ fn mutation_identity(method: &str, params: &Value) -> Value {
     identity
 }
 
+/// Retain the owner's receipt for a Task-step effect that has already been
+/// answered. The receipt records the effect and is never its result: a
+/// missing, oversized or contradictory receipt settles the attempt terminally
+/// with a bounded note, and the caller still returns what the owner said.
+async fn settle_task_step_receipt(
+    guard: db::IntegrationEffectGuard,
+    receipt: Option<Value>,
+    context: &str,
+) {
+    let request = guard.request().clone();
+    let reason = match receipt.map(serde_json::from_value::<db::IntegrationEffectReceipt>) {
+        Some(Ok(receipt)) => match crate::integration_owner::validate_attempt_receipt(&receipt) {
+            Ok(()) if receipt.request != request => {
+                "owner receipt belongs to another request".to_owned()
+            }
+            Ok(()) => match guard.record_owner_receipt(receipt).await {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(target: "services::daemon_transport", attempt_id = %request.fence.attempt_id, %error, "owner attempt receipt was not retained");
+                    return;
+                }
+            },
+            Err(error) => error.to_string(),
+        },
+        Some(Err(error)) => format!("owner attempt receipt is invalid: {error}"),
+        None => context.to_owned(),
+    };
+    let message = crate::integration_effects::check::tail_bytes(&reason, 4096);
+    if let Err(error) = guard
+        .record(
+            serde_json::json!({"kind":"infrastructure","message":message,"head_sha":null,"rebase_in_progress":true}),
+            db::IntegrationOperationState::Failed,
+        )
+        .await
+    {
+        tracing::warn!(target: "services::daemon_transport", attempt_id = %request.fence.attempt_id, %error, "attempt receipt was not recorded");
+    }
+}
+
+impl DaemonWorkspaceClient {
+    async fn bind_task_step_integration(
+        &self,
+        daemon_id: &str,
+        method: &str,
+        params: &mut Value,
+    ) -> Result<Option<db::IntegrationEffectAdmission>> {
+        let Some(db) = &self.db else {
+            return Ok(None);
+        };
+        let rebase = method == METHOD_WORKSPACE_RESET
+            && params.pointer("/operation/kind").and_then(Value::as_str) == Some("rebase_target");
+        if method != METHOD_WORKSPACE_MERGE && !rebase {
+            return Ok(None);
+        }
+        if params.pointer("/integration/kind").and_then(Value::as_str) != Some("task_step")
+            || db::task_writer::current_task_step().is_none()
+        {
+            return Ok(None);
+        }
+        let placement = WorkspacePlacementRepo::get_by_id(
+            &**db,
+            params["placement_id"].as_str().unwrap_or_default(),
+        )
+        .await
+        .map_err(ServiceError::from)?
+        .ok_or_else(|| ServiceError::invalid_operation("integration placement missing"))?;
+        if let Err(error) = self
+            .reconcile_integration_attempts_on(daemon_id, Some(&placement.repo_location_id))
+            .await
+        {
+            let error = match error {
+                WorkspaceClientError::Transport(error) => error.to_string(),
+                WorkspaceClientError::Daemon(error) => error.message,
+            };
+            tracing::warn!(target: "services::daemon_transport", %daemon_id, %error, "integration reconciliation before a Task-step effect failed");
+        }
+        let workspace = crate::workspace_backend::effect_workspace(&placement);
+        let (kind, branch, target) = if rebase {
+            let branch = params["operation"]["target_branch"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let probe = WorkspaceInspectParams::Git {
+                workspace: serde_json::from_value(params.clone())
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+                query: WorkspaceGitQuery::TargetHead {
+                    branch: branch.clone(),
+                },
+                optional: false,
+                limit: 4096,
+            };
+            let probe = self
+                .request_once(
+                    daemon_id,
+                    METHOD_WORKSPACE_READ,
+                    serde_json::to_value(probe).expect("probe serializes"),
+                    Some(self.timeout),
+                )
+                .await?;
+            let target = match serde_json::from_value::<WorkspaceInspectResult>(probe)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+            {
+                WorkspaceInspectResult::Git {
+                    output: Some(output),
+                } => output.trim().to_owned(),
+                _ => {
+                    return Err(ServiceError::invalid_operation("rebase target has no HEAD").into())
+                }
+            };
+            (db::IntegrationOperationKind::Rebase, branch, target)
+        } else {
+            (
+                db::IntegrationOperationKind::Merge,
+                params["target_branch"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                params["expected_target_sha"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        };
+        let witness = serde_json::json!({"workspace":workspace,"target_branch":branch,"expected_head_sha":params["expected"]["sha"],"expected_target_sha":target,"handed_off_paths":params["handed_off_paths"],"handoff_conflicts":params["operation"]["handoff_conflicts"],"operation_id":params["operation_id"],"reviewed":params["reviewed_commit_sha"].as_str().map(|head| serde_json::json!({"commit_sha":head,"base_sha":target}))});
+        let Some(request) = db
+            .task_step_integration_request(&placement.workspace_id, kind, witness)
+            .await
+            .map_err(ServiceError::from)?
+        else {
+            return Ok(None);
+        };
+        let wire: WorkspaceIntegrationRequest =
+            serde_json::from_value(serde_json::to_value(&request).expect("request serializes"))
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        params["integration"] =
+            serde_json::to_value(WorkspaceIntegrationBinding::TaskStepEffect { request: wire })
+                .expect("binding serializes");
+        let mut admission = db
+            .begin_integration_effect(request)
+            .await
+            .map_err(ServiceError::from)?;
+        if let db::IntegrationEffectAdmission::Started(guard) = &mut admission {
+            if let Some(reason) = guard.start().await.map_err(ServiceError::from)? {
+                return Err(ServiceError::invalid_operation(format!(
+                    "integration owner refused {reason:?}"
+                ))
+                .into());
+            }
+        }
+        Ok(Some(admission))
+    }
+
+    /// Owner lookup is mandatory on reconnect and before a new integration
+    /// request. No lookup runs Git effects; its receipt commits before ACK.
+    pub async fn reconcile_integration_attempts(&self, daemon_id: &str) -> Result<()> {
+        self.reconcile_integration_attempts_on(daemon_id, None)
+            .await
+    }
+
+    async fn reconcile_integration_attempts_on(
+        &self,
+        daemon_id: &str,
+        location: Option<&str>,
+    ) -> Result<()> {
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+        for request in db
+            .outstanding_integration_effects("daemon", Some(daemon_id))
+            .await
+            .map_err(ServiceError::from)?
+        {
+            if location.is_some_and(|location| {
+                request.fence.target_owner["location_id"].as_str() != Some(location)
+            }) {
+                continue;
+            }
+            let Some(guard) = db
+                .lock_integration_reconciliation(&request)
+                .await
+                .map_err(ServiceError::from)?
+            else {
+                continue;
+            };
+            if !guard.started {
+                guard
+                    .record(
+                        serde_json::json!({"kind":"not_performed"}),
+                        db::IntegrationOperationState::Failed,
+                    )
+                    .await
+                    .map_err(ServiceError::from)?;
+                continue;
+            }
+            let wire: WorkspaceIntegrationRequest =
+                serde_json::from_value(serde_json::to_value(&request).expect("request serializes"))
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            let workspace = &request.witness["workspace"];
+            let operation_id = request.witness["operation_id"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| wire.operation_id());
+            let integration = if request.fence.lease_owner.starts_with("task-step:") {
+                WorkspaceIntegrationBinding::TaskStepEffect { request: wire }
+            } else {
+                WorkspaceIntegrationBinding::Attempt { request: wire }
+            };
+            let params = WorkspaceReconcileParams {
+                integration,
+                workspace: WorkspaceHandleReference {
+                    daemon_id: daemon_id.into(),
+                    runtime_id: request.fence.target_owner["runtime_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .into(),
+                    placement_id: workspace["placement_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .into(),
+                    workspace_handle: workspace["handle"].as_str().unwrap_or_default().into(),
+                    generation: workspace["generation"].as_u64().unwrap_or_default(),
+                },
+                operation: WorkspaceReconcileOperation::Reconcile,
+                operation_id,
+            };
+            let value = self
+                .request_once(
+                    daemon_id,
+                    METHOD_WORKSPACE_DESCRIBE,
+                    serde_json::to_value(&params).expect("lookup serializes"),
+                    Some(self.timeout),
+                )
+                .await;
+            let value = match value {
+                Ok(value) => value,
+                // The owner refused the lookup itself (workspace cleaned, a
+                // newer generation): for a Task step that is its answer.
+                Err(WorkspaceClientError::Daemon(error)) if db::is_task_step(&request) => {
+                    tracing::warn!(target: "services::daemon_transport", %daemon_id, attempt_id = %request.fence.attempt_id, reason = %error.message, "owner refused an attempt lookup");
+                    let message =
+                        crate::integration_effects::check::tail_bytes(&error.message, 4096);
+                    guard
+                        .record(
+                            serde_json::json!({"kind":"infrastructure","message":message,"head_sha":null,"rebase_in_progress":true}),
+                            db::IntegrationOperationState::Failed,
+                        )
+                        .await
+                        .map_err(ServiceError::from)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            // The owner answered. Whatever it said about this one attempt is
+            // settled here; only a transport failure above stops the pass.
+            let task_step = db::is_task_step(&request);
+            let lookup = serde_json::from_value::<WorkspaceReconcileResult>(value)
+                .map_err(|error| error.to_string())
+                .and_then(|lookup| {
+                    if lookup.operation_id != params.operation_id {
+                        return Err("owner lookup returned another attempt".to_owned());
+                    }
+                    let receipt = match &lookup.outcome {
+                        WorkspaceReconcileOutcome::Result { result } => {
+                            result.get("integration_receipt")
+                        }
+                        WorkspaceReconcileOutcome::Error { error } => error
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("integration_receipt")),
+                    }
+                    .cloned()
+                    .ok_or("owner lookup did not return an attempt receipt")?;
+                    let receipt: db::IntegrationEffectReceipt =
+                        serde_json::from_value(receipt).map_err(|error| error.to_string())?;
+                    crate::integration_owner::validate_attempt_receipt(&receipt)
+                        .map_err(|error| error.to_string())?;
+                    if receipt.request != request {
+                        return Err("owner receipt belongs to another request".to_owned());
+                    }
+                    Ok((lookup.entry_id, receipt))
+                });
+            let (entry_id, receipt) = match lookup {
+                Ok(found) => found,
+                Err(reason) => {
+                    tracing::warn!(target: "services::daemon_transport", %daemon_id, attempt_id = %request.fence.attempt_id, %reason, "owner attempt lookup was unusable");
+                    // A queue lease's unknown effect stays for its owner. A
+                    // Task-step intent settles: step recovery decides repeats.
+                    if task_step {
+                        let message = crate::integration_effects::check::tail_bytes(&reason, 4096);
+                        guard
+                            .record(
+                                serde_json::json!({"kind":"infrastructure","message":message,"head_sha":null,"rebase_in_progress":true}),
+                                db::IntegrationOperationState::Failed,
+                            )
+                            .await
+                            .map_err(ServiceError::from)?;
+                    }
+                    continue;
+                }
+            };
+            // The owner could not prove a Task-step effect either way. Keeping
+            // it uncertain would refuse every later effect on this checkout.
+            if task_step && receipt.operation_state == db::IntegrationOperationState::Uncertain {
+                guard
+                    .record(
+                        receipt.result.clone(),
+                        db::IntegrationOperationState::Failed,
+                    )
+                    .await
+                    .map_err(ServiceError::from)?;
+            } else {
+                guard
+                    .record_owner_receipt(receipt)
+                    .await
+                    .map_err(ServiceError::from)?;
+            }
+            self.acknowledge(daemon_id, entry_id).await?;
+        }
+        Ok(())
+    }
+}
+
+impl DaemonWorkspaceClient {
+    /// Queue-only transport: writes the attempt sink, never execution/Task
+    /// receipts. No worker calls this until queue activation is approved.
+    pub async fn integration_effect(
+        &self,
+        daemon_id: &str,
+        request: db::IntegrationEffectRequest,
+        method: &str,
+        mut params: Value,
+        timeout: Duration,
+    ) -> Result<db::IntegrationEffectReceipt> {
+        let db = self.db.as_ref().ok_or_else(|| {
+            ServiceError::invalid_operation("integration transport has no attempt sink")
+        })?;
+        self.reconcile_integration_attempts_on(
+            daemon_id,
+            request.fence.target_owner["location_id"].as_str(),
+        )
+        .await?;
+        let wire: WorkspaceIntegrationRequest =
+            serde_json::from_value(serde_json::to_value(&request).expect("request serializes"))
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        params["integration"] = serde_json::to_value(WorkspaceIntegrationBinding::Attempt {
+            request: wire.clone(),
+        })
+        .expect("binding serializes");
+        params["operation_id"] = serde_json::json!(wire.operation_id());
+        let mut guard = match db
+            .begin_integration_effect(request.clone())
+            .await
+            .map_err(ServiceError::from)?
+        {
+            db::IntegrationEffectAdmission::Replay(receipt) => return Ok(receipt),
+            db::IntegrationEffectAdmission::Refused(reason) => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "integration owner refused {reason:?}"
+                ))
+                .into())
+            }
+            db::IntegrationEffectAdmission::Started(guard) => guard,
+        };
+        if let Some(reason) = guard.start().await.map_err(ServiceError::from)? {
+            return Err(ServiceError::invalid_operation(format!(
+                "integration owner refused {reason:?}"
+            ))
+            .into());
+        }
+        let value = match self
+            .request_once(daemon_id, method, params, Some(timeout))
+            .await
+        {
+            Ok(value) => value,
+            Err(WorkspaceClientError::Daemon(error)) => {
+                if let Some(receipt) = error
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("integration_receipt"))
+                {
+                    let receipt: db::IntegrationEffectReceipt =
+                        serde_json::from_value(receipt.clone())
+                            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                    crate::integration_owner::validate_attempt_receipt(&receipt)?;
+                    guard
+                        .record_owner_receipt(receipt.clone())
+                        .await
+                        .map_err(ServiceError::from)?;
+                    return Ok(receipt);
+                }
+                if error.code == "integration_owner_refused" {
+                    return guard.record(serde_json::json!({"kind":"refused","reason":error.details.as_ref().map(|details| &details["refusal"])}), db::IntegrationOperationState::Failed).await.map_err(ServiceError::from).map_err(WorkspaceClientError::from);
+                }
+                return Err(WorkspaceClientError::Daemon(error));
+            }
+            Err(error) => return Err(error),
+        };
+        if value["operation_id"].as_str() != Some(&wire.operation_id()) {
+            return Err(
+                ServiceError::invalid_operation("owner returned another attempt identity").into(),
+            );
+        }
+        let receipt: db::IntegrationEffectReceipt =
+            serde_json::from_value(value["integration_receipt"].clone())
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        crate::integration_owner::validate_attempt_receipt(&receipt)?;
+        guard
+            .record_owner_receipt(receipt.clone())
+            .await
+            .map_err(ServiceError::from)?;
+        self.acknowledge(
+            daemon_id,
+            value["entry_id"]
+                .as_str()
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation("owner receipt has no journal entry")
+                })?
+                .into(),
+        )
+        .await?;
+        Ok(receipt)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::daemon_transport::{lock, DaemonConnection};
@@ -1418,6 +1898,7 @@ pub(crate) mod tests {
     fn prepare_params() -> WorkspacePrepareParams {
         WorkspacePrepareParams {
             fence: WorkspaceMutationFence {
+                integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                 daemon_id: DAEMON_ID.to_owned(),
                 runtime_id: "runtime-test".to_owned(),
                 placement_id: "placement-test".to_owned(),
@@ -1440,6 +1921,7 @@ pub(crate) mod tests {
     ) -> WorkspaceRunParams {
         WorkspaceRunParams {
             fence: WorkspaceMutationFence {
+                integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                 daemon_id: placement.daemon_id.clone().unwrap(),
                 runtime_id: placement.runtime_id.clone().unwrap(),
                 placement_id: placement.id.clone(),

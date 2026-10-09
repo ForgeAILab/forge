@@ -536,9 +536,39 @@ pub(crate) async fn target_moved_result(
         let outcome = match recovery {
             crate::integration_effects::rebase::RebaseRecoveryOutcome::Recorded(outcome) => outcome,
             crate::integration_effects::rebase::RebaseRecoveryOutcome::Perform { in_progress } => {
-                let outcome = resolved
-                    .rebase_target(target_branch, handoff_conflicts)
-                    .await?;
+                let outcome = if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
+                    let workspace = crate::workspace_backend::effect_workspace(&resolved.placement);
+                    let head = resolved.git_query(api_types::WorkspaceGitQuery::Head, false).await?.unwrap_or_default().trim().to_owned();
+                    let owner = crate::integration_owner::ServerIntegrationOwner::new(ctx.db.clone());
+                    match owner.admit_task_step(&workspace, db::IntegrationOperationKind::Rebase,
+                        serde_json::json!({"workspace":workspace,"target_branch":target_branch,"expected_head_sha":head,"expected_target_sha":target,"handoff_conflicts":handoff_conflicts})).await? {
+                        Some(db::IntegrationEffectAdmission::Replay(receipt)) => {
+                            match serde_json::from_value::<crate::integration_owner::OwnerRebaseReceipt>(receipt.result).map_err(|error| crate::ServiceError::invalid_operation(error.to_string()))? {
+                                crate::integration_owner::OwnerRebaseReceipt::Completed { outcome } => outcome,
+                                _ => return Err(crate::ServiceError::invalid_operation("prior rebase did not complete")),
+                            }
+                        }
+                        Some(db::IntegrationEffectAdmission::Refused(reason)) => return Err(crate::ServiceError::invalid_operation(format!("integration owner refused {reason:?}"))),
+                        admission => {
+                            let result = resolved.rebase_target(target_branch, handoff_conflicts).await;
+                            if let Some(db::IntegrationEffectAdmission::Started(guard)) = admission {
+                                let (receipt, state) = match &result {
+                                    Ok(outcome) => (crate::integration_owner::OwnerRebaseReceipt::Completed { outcome: outcome.clone() }, db::IntegrationOperationState::Succeeded),
+                                    Err(error) => (crate::integration_owner::OwnerRebaseReceipt::Infrastructure { message: crate::integration_effects::check::tail_bytes(&error.to_string(), 4096), head_sha: None, rebase_in_progress: true }, db::IntegrationOperationState::Failed),
+                                };
+                                // A record of the effect, never its result. A
+                                // failed rebase settles terminally: interrupted
+                                // rebase recovery decides the repeat.
+                                if let Err(error) = guard.record(serde_json::json!(receipt), state).await {
+                                    tracing::warn!(target: "services::workflow::merge", task_id = %ctx.task_id, %error, "rebase attempt receipt was not recorded");
+                                }
+                            }
+                            result?
+                        }
+                    }
+                } else {
+                    resolved.rebase_target(target_branch, handoff_conflicts).await?
+                };
                 crate::integration_effects::rebase::finish_rebase_recovery(
                     &resolved,
                     &target,

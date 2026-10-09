@@ -122,6 +122,7 @@ impl DaemonWorkspaceBackend {
     ) -> Result<WorkspaceMutationFence> {
         let (daemon_id, runtime_id) = self.owner(placement)?;
         Ok(WorkspaceMutationFence {
+            integration: api_types::WorkspaceIntegrationBinding::TaskStep,
             daemon_id: daemon_id.to_owned(),
             runtime_id: runtime_id.to_owned(),
             placement_id: placement.id.clone(),

@@ -756,7 +756,7 @@ async fn daemon_plan_dispatch_missing_capability_is_structured_placement_refusal
         .unwrap()
         .unwrap();
     assert_eq!(refused.version, unchanged.version);
-    fixture.owner.outbound.send(DaemonFrame::Notification { method:METHOD_DAEMON_HANDSHAKE.into(),params:json!({"protocol_revision":3,"capabilities":[DAEMON_CAPABILITY_USAGE_REPORTS,DAEMON_CAPABILITY_JOURNAL_ACK,DAEMON_CAPABILITY_WORKSPACE,DAEMON_CAPABILITY_PLAN_TRANSPORT],"executor_capabilities":{"shell":{"cancel_ack":true,"terminal_observed":true,"resume":true}},"workspace_run_policy":{"allowed_purposes":["hook","ci_step","environment_setup"]}})}).unwrap();
+    fixture.owner.outbound.send(DaemonFrame::Notification { method:METHOD_DAEMON_HANDSHAKE.into(),params:json!({"protocol_revision":DAEMON_PROTOCOL_REVISION,"capabilities":[DAEMON_CAPABILITY_USAGE_REPORTS,DAEMON_CAPABILITY_JOURNAL_ACK,DAEMON_CAPABILITY_WORKSPACE,DAEMON_CAPABILITY_PLAN_TRANSPORT],"executor_capabilities":{"shell":{"cancel_ack":true,"terminal_observed":true,"resume":true}},"workspace_run_policy":{"allowed_purposes":["hook","ci_step","environment_setup"]}})}).unwrap();
     for _ in 0..2000 {
         if fixture
             .harness

@@ -42,56 +42,30 @@ pub async fn rebase(input: &RebaseEffectInput<'_>) -> Result<WorkspaceOwnerOpera
 }
 
 async fn rebase_inner(input: &RebaseEffectInput<'_>) -> Result<WorkspaceOwnerOperationOutcome> {
-    let in_progress = git::detect_rebase_in_progress(input.worktree_path).await?;
-    if in_progress && !input.handoff_conflicts {
-        // Resume an interrupted rebase the way a fresh conflicting one
-        // ends without handoff: abort, restoring the branch.
-        git::abort_rebase(input.worktree_path).await?;
-        return Ok(WorkspaceOwnerOperationOutcome::Conflict {
-            details: "aborted interrupted rebase".into(),
-            conflict_paths: Vec::new(),
-        });
-    }
-    if in_progress {
-        return match git::continue_rebase_keeping_conflicts(input.worktree_path).await {
-            Ok(conflict_paths) => Ok(WorkspaceOwnerOperationOutcome::Conflict {
-                details: "resumed interrupted rebase".into(),
+    Ok(
+        match git::integration::rebase(
+            input.worktree_path,
+            input.target_branch,
+            input.handoff_conflicts,
+        )
+        .await?
+        {
+            git::integration::RebaseOutcome::Rebased => WorkspaceOwnerOperationOutcome::Rebased,
+            git::integration::RebaseOutcome::Conflict {
+                details,
                 conflict_paths,
-            }),
-            Err(git::GitError::UnsupportedRebaseConflict { details }) => {
-                Ok(WorkspaceOwnerOperationOutcome::UnsupportedConflict { details })
+            } => WorkspaceOwnerOperationOutcome::Conflict {
+                details,
+                conflict_paths,
+            },
+            git::integration::RebaseOutcome::UnsupportedConflict { details } => {
+                WorkspaceOwnerOperationOutcome::UnsupportedConflict { details }
             }
-            Err(error) => Err(error.into()),
-        };
-    }
-    if !git::is_worktree_clean(input.worktree_path).await? {
-        return Ok(WorkspaceOwnerOperationOutcome::Dirty {
-            files: git::status_porcelain(input.worktree_path).await?,
-        });
-    }
-    match git::rebase(input.worktree_path, input.target_branch).await {
-        Ok(()) => Ok(WorkspaceOwnerOperationOutcome::Rebased),
-        Err(git::GitError::MergeConflict { stderr, .. }) => {
-            if !input.handoff_conflicts {
-                git::abort_rebase(input.worktree_path).await?;
-                return Ok(WorkspaceOwnerOperationOutcome::Conflict {
-                    details: stderr,
-                    conflict_paths: Vec::new(),
-                });
+            git::integration::RebaseOutcome::Dirty { files } => {
+                WorkspaceOwnerOperationOutcome::Dirty { files }
             }
-            match git::continue_rebase_keeping_conflicts(input.worktree_path).await {
-                Ok(conflict_paths) => Ok(WorkspaceOwnerOperationOutcome::Conflict {
-                    details: stderr,
-                    conflict_paths,
-                }),
-                Err(git::GitError::UnsupportedRebaseConflict { details }) => {
-                    Ok(WorkspaceOwnerOperationOutcome::UnsupportedConflict { details })
-                }
-                Err(error) => Err(error.into()),
-            }
-        }
-        Err(error) => Err(error.into()),
-    }
+        },
+    )
 }
 
 /// A read-only port: no effect, receipt, Task or event capability.

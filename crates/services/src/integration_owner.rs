@@ -35,6 +35,7 @@ impl From<db::IntegrationEffectRefusal> for OwnerEffectRefusal {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OwnerRebaseReceipt {
+    NotPerformed {},
     Completed {
         outcome: WorkspaceOwnerOperationOutcome,
     },
@@ -74,6 +75,225 @@ impl ServerIntegrationOwner {
     pub fn new(db: Arc<SqliteDb>) -> Self {
         Self { db }
     }
+    /// Reconcile under the same physical-owner lock before admitting another
+    /// effect. A restarted owner can prove an exact reviewed merge; an unknown
+    /// run never becomes permission to repeat it.
+    pub async fn reconcile_outstanding(&self) -> Result<()> {
+        self.reconcile_checkout(None).await
+    }
+
+    async fn reconcile_checkout(&self, current: Option<&IntegrationEffectRequest>) -> Result<()> {
+        for request in self
+            .db
+            .outstanding_integration_effects("server", None)
+            .await?
+        {
+            // Only intents sharing an owner lock with the coming effect are
+            // its business. A rebase or check locks its workspace alone, so it
+            // must not queue behind another workspace's in-flight merge.
+            let workspace_only = |request: &IntegrationEffectRequest| {
+                matches!(
+                    request.kind,
+                    IntegrationOperationKind::Rebase | IntegrationOperationKind::Check
+                )
+            };
+            if current.is_some_and(|current| {
+                current.fence.target_owner["location_id"]
+                    != request.fence.target_owner["location_id"]
+                    || ((workspace_only(&request) || workspace_only(current))
+                        && request.witness["workspace"]["handle"]
+                            != current.witness["workspace"]["handle"])
+            }) {
+                continue;
+            }
+            let Some(guard) = self.db.lock_integration_reconciliation(&request).await? else {
+                continue;
+            };
+            if !guard.started {
+                guard
+                    .record(
+                        json!({"kind":"not_performed"}),
+                        IntegrationOperationState::Failed,
+                    )
+                    .await?;
+                continue;
+            }
+            let result = self.server_reconciliation_result(&request).await;
+            let (result, state) = match result {
+                Ok(Some(result)) => (result, IntegrationOperationState::Succeeded),
+                // This owner holds the checkout lock, so a Task-step guard is
+                // gone. Its unproven effect settles terminally: today's step
+                // recovery re-reads Git and decides whether to repeat it. An
+                // uncertain receipt would refuse every later merge here.
+                Ok(None) | Err(_) if db::is_task_step(&request) => {
+                    (db::superseded_result(), IntegrationOperationState::Failed)
+                }
+                Ok(None) | Err(_) => (
+                    json!({"kind":"infrastructure","message":"owner effect has no exact completion proof","head_sha":null,"rebase_in_progress":true}),
+                    IntegrationOperationState::Uncertain,
+                ),
+            };
+            guard.record(result, state).await?;
+        }
+        Ok(())
+    }
+
+    async fn server_reconciliation_result(
+        &self,
+        request: &IntegrationEffectRequest,
+    ) -> Result<Option<serde_json::Value>> {
+        let legacy = request.fence.lease_owner.starts_with("task-step:");
+        if legacy && request.kind == IntegrationOperationKind::Rebase {
+            let path = request.witness["workspace"]["handle"]
+                .as_str()
+                .unwrap_or_default();
+            let target = request.witness["expected_target_sha"]
+                .as_str()
+                .unwrap_or_default();
+            if path.is_empty() || target.is_empty() {
+                return Ok(None);
+            }
+            let proof = tokio::time::timeout(Duration::from_secs(2), async {
+                let path = Path::new(path);
+                if git::detect_rebase_in_progress(path).await?
+                    || !git::command_output(path, &["merge-base", "--is-ancestor", target, "HEAD"])
+                        .await?
+                        .status
+                        .success()
+                {
+                    return Ok::<_, ServiceError>(None);
+                }
+                let paths = if request.witness["handoff_conflicts"] == true {
+                    git::paths_adding_conflict_markers(path, target, "HEAD").await?
+                } else {
+                    Vec::new()
+                };
+                let outcome = if paths.is_empty() {
+                    WorkspaceOwnerOperationOutcome::Rebased
+                } else {
+                    WorkspaceOwnerOperationOutcome::Conflict {
+                        details: "resumed committed conflict handoff".into(),
+                        conflict_paths: paths,
+                    }
+                };
+                Ok(Some(json!(OwnerRebaseReceipt::Completed { outcome })))
+            })
+            .await;
+            return match proof {
+                Ok(result) => result,
+                Err(_) => Ok(None),
+            };
+        }
+        let path: Option<String> =
+            sqlx::query_scalar("SELECT path FROM repo_location WHERE id=? AND owner_kind='server'")
+                .bind(request.fence.target_owner["location_id"].as_str())
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db::DbError::from)?;
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let path = Path::new(&path);
+        if !matches!(
+            request.kind,
+            IntegrationOperationKind::FastForward | IntegrationOperationKind::Merge
+        ) || request.witness["reviewed"].is_null()
+        {
+            return Ok(None);
+        }
+        let candidate = request.witness["expected_head_sha"]
+            .as_str()
+            .unwrap_or_default();
+        let branch = request.witness["target_branch"]
+            .as_str()
+            .unwrap_or_default();
+        let before = request.witness["expected_target_sha"]
+            .as_str()
+            .unwrap_or_default();
+        if candidate.is_empty() || before.is_empty() || branch.is_empty() {
+            return Ok(None);
+        }
+        let proof = tokio::time::timeout(Duration::from_secs(2), async {
+            if legacy {
+                let target = integration_effects::merge::target_tip(path, branch).await?;
+                return Ok::<_, ServiceError>(
+                    git::command_output(path, &["merge-base", "--is-ancestor", candidate, &target])
+                        .await?
+                        .status
+                        .success(),
+                );
+            }
+            Ok::<_, ServiceError>(
+                git::get_current_sha(path).await? == candidate
+                    && integration_effects::merge::target_tip(path, branch).await? == candidate
+                    && git::command_output(
+                        path,
+                        &["merge-base", "--is-ancestor", before, candidate],
+                    )
+                    .await?
+                    .status
+                    .success(),
+            )
+        })
+        .await;
+        if !matches!(proof, Ok(Ok(true))) {
+            return Ok(None);
+        }
+        Ok(Some(json!(OwnerMergeReceipt::Completed {
+            outcome: crate::MergeOutcome::Done {
+                before_sha: before.to_owned(),
+                after_sha: candidate.to_owned(),
+                branch: branch.to_owned()
+            }
+        })))
+    }
+
+    /// Today's recorder keeps its phased read/authority ordering. Bind its
+    /// existing facts to the current Task-step fence, not a queue claim.
+    pub(crate) async fn admit_task_step(
+        &self,
+        workspace: &EffectWorkspace,
+        kind: IntegrationOperationKind,
+        witness: serde_json::Value,
+    ) -> Result<Option<IntegrationEffectAdmission>> {
+        let Some(request) = self
+            .db
+            .task_step_integration_request(&workspace.workspace_id, kind, witness)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Reconciliation is bookkeeping for a recorder: admission below settles
+        // any Task-step intent it could not, so a failure here never blocks.
+        if let Err(error) = self.reconcile_checkout(Some(&request)).await {
+            tracing::warn!(target: "services::integration_owner", %error, "integration reconciliation before a Task-step effect failed");
+        }
+        Ok(Some(
+            match self.db.begin_integration_effect(request).await? {
+                IntegrationEffectAdmission::Started(mut guard) => {
+                    if let Some(refusal) = guard.start().await? {
+                        return Ok(Some(IntegrationEffectAdmission::Refused(refusal)));
+                    }
+                    if guard.server_workspace_paths().await?.is_none() {
+                        // The shadow attempt no longer describes this Task's
+                        // placement or target (it is passive until activation).
+                        // The step lease was verified above, so the Task-step
+                        // effect proceeds unrecorded instead of being refused.
+                        guard
+                            .record(
+                                json!({"kind":"refused","reason":"witness_mismatch"}),
+                                IntegrationOperationState::Failed,
+                            )
+                            .await?;
+                        return Ok(None);
+                    }
+                    IntegrationEffectAdmission::Started(guard)
+                }
+                admission => admission,
+            },
+        ))
+    }
+
     pub async fn rebase(&self, input: ServerRebaseRequest<'_>) -> Result<OwnerRebaseReceipt> {
         // Owner mismatch is refused before any Git (including fact queries).
         if input.workspace.owner != EffectOwner::Server
@@ -88,6 +308,7 @@ impl ServerIntegrationOwner {
             kind: IntegrationOperationKind::Rebase,
             witness: json!({"workspace":input.workspace,"target_branch":input.target_branch,"expected_head_sha":input.expected_head_sha,"expected_target_sha":input.expected_target_sha,"handoff_conflicts":input.handoff_conflicts,"deadline_nanos":input.deadline.as_nanos().to_string()}),
         };
+        self.reconcile_checkout(Some(&request)).await?;
         let mut guard = match self.db.begin_integration_effect(request).await? {
             IntegrationEffectAdmission::Replay(r) => {
                 return serde_json::from_value(r.result).map_err(|e| {
@@ -99,6 +320,11 @@ impl ServerIntegrationOwner {
             }
             IntegrationEffectAdmission::Started(g) => g,
         };
+        if let Some(refusal) = guard.start().await? {
+            return Ok(OwnerRebaseReceipt::Refused {
+                reason: refusal.into(),
+            });
+        }
         let Some((path, target_path)) = guard.server_workspace_paths().await? else {
             let outcome = OwnerRebaseReceipt::Refused {
                 reason: OwnerEffectRefusal::WitnessMismatch,
@@ -106,38 +332,43 @@ impl ServerIntegrationOwner {
             guard.record(json!(outcome), rebase_state(&outcome)).await?;
             return Ok(outcome);
         };
-        let objects = verify_objects(
-            &path,
-            &target_path,
-            input.target_branch,
-            input.expected_head_sha,
-            input.expected_target_sha,
-        )
-        .await;
-        let outcome = match objects {
-            Err(error) => interrupted(&path, false, Some(error.to_string())).await,
-            Ok(false) => OwnerRebaseReceipt::Refused {
-                reason: OwnerEffectRefusal::WitnessMismatch,
-            },
-            Ok(true) => {
-                let effect = integration_effects::rebase::RebaseEffectInput {
-                    workspace: input.workspace,
-                    worktree_path: &path,
-                    target_branch: input.target_branch,
-                    handoff_conflicts: input.handoff_conflicts,
-                    expected_head_sha: Some(input.expected_head_sha),
-                    expected_target_sha: Some(input.expected_target_sha),
-                    deadline: None,
-                };
-                tokio::select! {
-                    biased;
-                    _=input.cancel.cancelled()=>interrupted(&path,false,None).await,
-                    result=tokio::time::timeout(input.deadline,integration_effects::rebase::rebase(&effect))=>match result {
-                        Ok(Ok(outcome))=>OwnerRebaseReceipt::Completed {outcome},
-                        Ok(Err(e))=>interrupted(&path,false,Some(e.to_string())).await,
-                        Err(_)=>interrupted(&path,true,None).await,
+        let operation = async {
+            match verify_objects(
+                &path,
+                &target_path,
+                input.target_branch,
+                input.expected_head_sha,
+                input.expected_target_sha,
+            )
+            .await
+            {
+                Err(error) => interrupted(&path, false, Some(error.to_string())).await,
+                Ok(false) => OwnerRebaseReceipt::Refused {
+                    reason: OwnerEffectRefusal::WitnessMismatch,
+                },
+                Ok(true) => {
+                    let effect = integration_effects::rebase::RebaseEffectInput {
+                        workspace: input.workspace,
+                        worktree_path: &path,
+                        target_branch: input.expected_target_sha,
+                        handoff_conflicts: input.handoff_conflicts,
+                        expected_head_sha: Some(input.expected_head_sha),
+                        expected_target_sha: Some(input.expected_target_sha),
+                        deadline: None,
+                    };
+                    match integration_effects::rebase::rebase(&effect).await {
+                        Ok(outcome) => OwnerRebaseReceipt::Completed { outcome },
+                        Err(error) => interrupted(&path, false, Some(error.to_string())).await,
                     }
                 }
+            }
+        };
+        let outcome = tokio::select! {
+            biased;
+            _ = input.cancel.cancelled() => interrupted(&path, false, None).await,
+            result = tokio::time::timeout(input.deadline, operation) => match result {
+                Ok(outcome) => outcome,
+                Err(_) => interrupted(&path, true, None).await,
             }
         };
         guard.record(json!(outcome), rebase_state(&outcome)).await?;
@@ -159,8 +390,14 @@ async fn verify_objects(
         && integration_effects::merge::target_tip(path, target).await? == target_sha)
 }
 async fn interrupted(path: &Path, timed_out: bool, message: Option<String>) -> OwnerRebaseReceipt {
-    let head_sha = git::get_current_sha(path).await.ok();
-    let rebase_in_progress = git::detect_rebase_in_progress(path).await.unwrap_or(true);
+    let (head_sha, rebase_in_progress) = tokio::time::timeout(Duration::from_secs(2), async {
+        (
+            git::get_current_sha(path).await.ok(),
+            git::detect_rebase_in_progress(path).await.unwrap_or(true),
+        )
+    })
+    .await
+    .unwrap_or((None, true));
     match message {
         Some(message) => OwnerRebaseReceipt::Infrastructure {
             message: integration_effects::check::tail_bytes(&message, 4096),
@@ -181,9 +418,24 @@ async fn interrupted(path: &Path, timed_out: bool, message: Option<String>) -> O
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OwnerMergeReceipt {
-    Completed { outcome: crate::MergeOutcome },
-    Refused { reason: OwnerEffectRefusal },
-    Infrastructure { message: String },
+    NotPerformed {},
+    Cancelled {
+        head_sha: Option<String>,
+        rebase_in_progress: bool,
+    },
+    TimedOut {
+        head_sha: Option<String>,
+        rebase_in_progress: bool,
+    },
+    Completed {
+        outcome: crate::MergeOutcome,
+    },
+    Refused {
+        reason: OwnerEffectRefusal,
+    },
+    Infrastructure {
+        message: String,
+    },
 }
 pub struct ServerMergeRequest<'a> {
     pub fence: &'a IntegrationOwnerFence,
@@ -193,6 +445,8 @@ pub struct ServerMergeRequest<'a> {
     pub expected_head_sha: &'a str,
     pub expected_target_sha: &'a str,
     pub reviewed: Option<integration_effects::merge::ReviewedMergeObject>,
+    pub cancel: &'a CancellationToken,
+    pub deadline: Option<Duration>,
 }
 impl ServerIntegrationOwner {
     /// The caller supplies its frozen review permit. The owner gate protects
@@ -213,8 +467,9 @@ impl ServerIntegrationOwner {
         let request = IntegrationEffectRequest {
             fence: input.fence.clone(),
             kind,
-            witness: json!({"workspace":input.workspace,"target_branch":input.target_branch,"task_branch":input.task_branch,"expected_head_sha":input.expected_head_sha,"expected_target_sha":input.expected_target_sha,"reviewed":input.reviewed}),
+            witness: json!({"workspace":input.workspace,"target_branch":input.target_branch,"task_branch":input.task_branch,"expected_head_sha":input.expected_head_sha,"expected_target_sha":input.expected_target_sha,"reviewed":input.reviewed,"deadline_nanos":input.deadline.map(|duration| duration.as_nanos().to_string())}),
         };
+        self.reconcile_checkout(Some(&request)).await?;
         let mut guard = match self.db.begin_integration_effect(request).await? {
             IntegrationEffectAdmission::Replay(r) => {
                 return serde_json::from_value(r.result).map_err(|e| {
@@ -226,6 +481,11 @@ impl ServerIntegrationOwner {
             }
             IntegrationEffectAdmission::Started(g) => g,
         };
+        if let Some(refusal) = guard.start().await? {
+            return Ok(OwnerMergeReceipt::Refused {
+                reason: refusal.into(),
+            });
+        }
         let outcome = match guard.server_workspace_paths().await? {
             None => OwnerMergeReceipt::Refused {
                 reason: OwnerEffectRefusal::WitnessMismatch,
@@ -243,26 +503,58 @@ impl ServerIntegrationOwner {
                     observed_target_sha: input.expected_target_sha,
                     reviewed: input.reviewed,
                 };
-                match server_merge(&effect).await {
-                    Ok(Some(outcome)) => OwnerMergeReceipt::Completed { outcome },
-                    Ok(None) => OwnerMergeReceipt::Refused {
-                        reason: OwnerEffectRefusal::WitnessMismatch,
-                    },
-                    Err(e) => OwnerMergeReceipt::Infrastructure {
-                        message: integration_effects::check::tail_bytes(&e.to_string(), 4096),
-                    },
+                let deadline = async {
+                    match input.deadline {
+                        Some(duration) => tokio::time::sleep(duration).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = input.cancel.cancelled() => merge_interrupted(&target, false).await,
+                    _ = deadline => merge_interrupted(&target, true).await,
+                    result = server_merge(&effect) => match result {
+                        Ok(Some(outcome)) => OwnerMergeReceipt::Completed { outcome },
+                        Ok(None) => OwnerMergeReceipt::Refused { reason: OwnerEffectRefusal::WitnessMismatch },
+                        Err(e) => OwnerMergeReceipt::Infrastructure { message: integration_effects::check::tail_bytes(&e.to_string(), 4096) },
+                    }
                 }
             }
         };
         let state = match &outcome {
             OwnerMergeReceipt::Completed { .. } => IntegrationOperationState::Succeeded,
-            OwnerMergeReceipt::Refused { .. } => IntegrationOperationState::Failed,
+            OwnerMergeReceipt::Refused { .. }
+            | OwnerMergeReceipt::NotPerformed { .. }
+            | OwnerMergeReceipt::Cancelled { .. }
+            | OwnerMergeReceipt::TimedOut { .. } => IntegrationOperationState::Failed,
             OwnerMergeReceipt::Infrastructure { .. } => IntegrationOperationState::Uncertain,
         };
         guard.record(json!(outcome), state).await?;
         Ok(outcome)
     }
 }
+async fn merge_interrupted(path: &Path, timed_out: bool) -> OwnerMergeReceipt {
+    let (head_sha, rebase_in_progress) = tokio::time::timeout(Duration::from_secs(2), async {
+        (
+            git::get_current_sha(path).await.ok(),
+            git::detect_rebase_in_progress(path).await.unwrap_or(true),
+        )
+    })
+    .await
+    .unwrap_or((None, true));
+    if timed_out {
+        OwnerMergeReceipt::TimedOut {
+            head_sha,
+            rebase_in_progress,
+        }
+    } else {
+        OwnerMergeReceipt::Cancelled {
+            head_sha,
+            rebase_in_progress,
+        }
+    }
+}
+
 async fn server_merge(
     input: &integration_effects::merge::MergeEffectInput<'_>,
 ) -> Result<Option<crate::MergeOutcome>> {
@@ -293,6 +585,62 @@ fn rebase_state(outcome: &OwnerRebaseReceipt) -> IntegrationOperationState {
     }
 }
 
+/// Validate owner facts before persistence or journal acknowledgement.
+pub(crate) fn validate_attempt_receipt(receipt: &db::IntegrationEffectReceipt) -> Result<()> {
+    let invalid = || {
+        ServiceError::invalid_operation(
+            "owner attempt receipt contradicts its frozen request or state",
+        )
+    };
+    let completed = receipt.result["kind"] == "completed";
+    if (receipt.operation_state == IntegrationOperationState::Succeeded) != completed {
+        return Err(invalid());
+    }
+    match receipt.request.kind {
+        IntegrationOperationKind::Merge | IntegrationOperationKind::FastForward => {
+            let outcome: OwnerMergeReceipt =
+                serde_json::from_value(receipt.result.clone()).map_err(|_| invalid())?;
+            if let OwnerMergeReceipt::Completed {
+                outcome:
+                    crate::MergeOutcome::Done {
+                        after_sha, branch, ..
+                    },
+            } = outcome
+            {
+                let witness = &receipt.request.witness;
+                if witness["target_branch"].as_str() != Some(&branch) {
+                    return Err(invalid());
+                }
+                let reviewed = witness["reviewed"]["commit_sha"].as_str();
+                let expected = if receipt.request.kind == IntegrationOperationKind::FastForward {
+                    witness["expected_head_sha"].as_str()
+                } else {
+                    reviewed
+                };
+                if expected.is_some_and(|head| head != after_sha) {
+                    return Err(invalid());
+                }
+            }
+        }
+        IntegrationOperationKind::Rebase => {
+            let outcome: OwnerRebaseReceipt =
+                serde_json::from_value(receipt.result.clone()).map_err(|_| invalid())?;
+            if matches!(
+                outcome,
+                OwnerRebaseReceipt::Completed {
+                    outcome: WorkspaceOwnerOperationOutcome::Applied
+                        | WorkspaceOwnerOperationOutcome::ReviewCheckout { .. }
+                }
+            ) {
+                return Err(invalid());
+            }
+        }
+        IntegrationOperationKind::Check => {}
+        IntegrationOperationKind::Reconcile => return Err(invalid()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +655,7 @@ mod tests {
         tree: std::path::PathBuf,
         head: String,
         target: String,
+        cancel: CancellationToken,
     }
     async fn git_at(path: &Path, args: &[&str]) -> String {
         let out = tokio::process::Command::new("git")
@@ -326,6 +675,9 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
     async fn fixture() -> Fixture {
+        fixture_with_storage(false).await
+    }
+    async fn fixture_with_storage(durable: bool) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -342,7 +694,15 @@ mod tests {
         std::fs::write(tree.join("candidate"), "candidate\n").unwrap();
         git::commit_all(&tree, "candidate").await.unwrap();
         let head = git::get_current_sha(&tree).await.unwrap();
-        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        let url = if durable {
+            format!(
+                "sqlite://{}?mode=rwc",
+                temp.path().join("owner.sqlite").display()
+            )
+        } else {
+            "sqlite::memory:".to_owned()
+        };
+        let pool = db::create_sqlite_pool(&url).await.unwrap();
         db::run_migrations(&pool).await.unwrap();
         let db = Arc::new(SqliteDb::new(pool));
         let now = db::now_rfc3339();
@@ -397,10 +757,13 @@ mod tests {
             tree,
             head,
             target,
+            cancel: CancellationToken::new(),
         }
     }
     fn merge_request(f: &Fixture) -> ServerMergeRequest<'_> {
         ServerMergeRequest {
+            cancel: &f.cancel,
+            deadline: None,
             fence: &f.fence,
             workspace: &f.workspace,
             target_branch: "main",
@@ -413,6 +776,32 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn owner_receipt_validation_refuses_wrong_object_and_false_success() {
+        let request = IntegrationEffectRequest {
+            fence: IntegrationOwnerFence {
+                queue_id: "q".into(),
+                attempt_id: "a".into(),
+                generation: 1,
+                lease_owner: "worker".into(),
+                target_owner: json!({}),
+            },
+            kind: IntegrationOperationKind::FastForward,
+            witness: json!({"target_branch":"main","expected_head_sha":"approved"}),
+        };
+        let mut receipt = db::IntegrationEffectReceipt {
+            request,
+            result: json!({"kind":"completed","outcome":crate::MergeOutcome::Done { before_sha: "before".into(), after_sha: "foreign".into(), branch: "main".into() }}),
+            operation_state: IntegrationOperationState::Succeeded,
+            recorded_at: db::now_rfc3339(),
+        };
+        assert!(validate_attempt_receipt(&receipt).is_err());
+        receipt.result["outcome"]["Done"]["after_sha"] = json!("approved");
+        validate_attempt_receipt(&receipt).unwrap();
+        receipt.operation_state = IntegrationOperationState::Failed;
+        assert!(validate_attempt_receipt(&receipt).is_err());
+    }
+
     #[tokio::test]
     async fn lost_merge_reply_replays_one_receipt_without_git_changes() {
         let f = fixture().await;
@@ -447,6 +836,54 @@ mod tests {
             Some(IntegrationOperationState::Succeeded)
         );
     }
+    #[tokio::test]
+    async fn restart_reconciles_outstanding_intent_before_a_new_effect() {
+        let mut f = fixture_with_storage(true).await;
+        let request = IntegrationEffectRequest {
+            fence: f.fence.clone(),
+            kind: IntegrationOperationKind::FastForward,
+            witness: json!({"workspace":f.workspace,"target_branch":"main","task_branch":"candidate","expected_head_sha":f.head,"expected_target_sha":f.target,"reviewed":{"commit_sha":f.head,"base_sha":f.target},"deadline_nanos":null}),
+        };
+        let IntegrationEffectAdmission::Started(mut guard) =
+            f.db.begin_integration_effect(request.clone())
+                .await
+                .unwrap()
+        else {
+            panic!("not admitted");
+        };
+        assert!(guard.start().await.unwrap().is_none());
+        git::checkout_branch(&f.repo, "main").await.unwrap();
+        git_at(&f.repo, &["merge", "--ff-only", &f.head]).await;
+        // Crash after Git but before receipt commit; reopen durable storage.
+        drop(guard);
+        f.db.pool().close().await;
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            f._temp.path().join("owner.sqlite").display()
+        );
+        f.db = Arc::new(SqliteDb::new(db::create_sqlite_pool(&url).await.unwrap()));
+        f.owner = ServerIntegrationOwner::new(f.db.clone());
+        let reflog = git_at(&f.repo, &["reflog", "--all"]).await;
+        let result = f.owner.merge(merge_request(&f)).await.unwrap();
+        assert!(matches!(
+            result,
+            OwnerMergeReceipt::Completed {
+                outcome: crate::MergeOutcome::Done { .. }
+            }
+        ));
+        assert_eq!(git_at(&f.repo, &["reflog", "--all"]).await, reflog);
+        let attempt =
+            f.db.integration_attempt(&f.fence.attempt_id)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(attempt.effect_intent_json.is_none());
+        assert_eq!(
+            attempt.current_operation_state,
+            Some(IntegrationOperationState::Succeeded)
+        );
+    }
+
     #[tokio::test]
     async fn stale_and_foreign_server_owner_are_refused_before_git_and_witness_is_checked() {
         for case in ["stale", "foreign", "placement", "head", "target"] {
@@ -535,6 +972,16 @@ mod tests {
             })
             .await
             .unwrap();
+            tokio::time::timeout(Duration::from_millis(250), async {
+                let mut tx = db::begin_immediate(f.db.pool()).await.unwrap();
+                sqlx::query("UPDATE repo SET name='writer during Git' WHERE id='r'")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+            })
+            .await
+            .expect("Git effect held the SQLite writer");
             cancel.cancel();
         };
         let (outcome, _) = tokio::join!(operation, cancel_midway);

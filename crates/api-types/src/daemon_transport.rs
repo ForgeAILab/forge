@@ -48,11 +48,11 @@ pub const PURPOSE_DENIED: &str = "purpose_denied";
 pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
-/// Revision 3 provides workspace operations; plan transport is capability-gated.
-pub const DAEMON_PROTOCOL_REVISION: u32 = 3;
-/// Every command RPC requires revision 3.
-pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 3;
-pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 3 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
+/// Revision 4 carries explicit integration authority and attempt identities.
+pub const DAEMON_PROTOCOL_REVISION: u32 = 4;
+/// Every command RPC requires revision 4.
+pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 4;
+pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 4 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
 pub const DAEMON_CAPABILITY_USAGE_REPORTS: &str = "execution.terminal.usage_reports";
 pub const DAEMON_CAPABILITY_JOURNAL_ACK: &str = "journal.ack";
 pub const DAEMON_CAPABILITY_PLAN_TRANSPORT: &str = "execution.plan_transport";
@@ -187,9 +187,91 @@ pub enum WorkspaceOperationExpected {
     Version { version: i64 },
 }
 
+/// Frozen queue owner identity; deliberately contains no owner-local path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationOwnerFence {
+    pub queue_id: String,
+    pub attempt_id: String,
+    pub generation: i64,
+    pub lease_owner: String,
+    #[ts(type = "unknown")]
+    pub target_owner: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceIntegrationKind {
+    Merge,
+    FastForward,
+    Rebase,
+    Check,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkspaceIntegrationRequest {
+    pub fence: IntegrationOwnerFence,
+    pub kind: WorkspaceIntegrationKind,
+    /// Placement, expected objects and exact effect input, frozen by recorder.
+    #[ts(type = "unknown")]
+    pub witness: serde_json::Value,
+}
+
+impl WorkspaceIntegrationRequest {
+    /// Stable attempt/effect/fence identity in the existing bounded journal.
+    pub fn operation_id(&self) -> String {
+        let kind = match self.kind {
+            WorkspaceIntegrationKind::Merge => "merge",
+            WorkspaceIntegrationKind::FastForward => "fast_forward",
+            WorkspaceIntegrationKind::Rebase => "rebase",
+            WorkspaceIntegrationKind::Check => "check",
+        };
+        let step = self
+            .fence
+            .lease_owner
+            .strip_prefix("task-step:")
+            .map(|id| format!(":{id}"))
+            .unwrap_or_default();
+        format!(
+            "integration:{}:{}:{kind}{step}",
+            self.fence.attempt_id, self.fence.generation
+        )
+    }
+}
+
+/// Task-step authority remains distinct from the passive queue's lease. Both
+/// use the same owner effects. Revision 4 always carries this tagged field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum WorkspaceIntegrationBinding {
+    TaskStep,
+    TaskStepEffect {
+        request: WorkspaceIntegrationRequest,
+    },
+    Attempt {
+        request: WorkspaceIntegrationRequest,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum IntegrationOwnerRefusal {
+    StaleFence,
+    ForeignOwner,
+    WitnessMismatch,
+    ReconciliationRequired,
+    RequestConflict,
+}
+
 /// Prepare uses the placement id before its owner has issued a handle.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct WorkspaceMutationFence {
+    pub integration: WorkspaceIntegrationBinding,
     pub daemon_id: String,
     pub runtime_id: String,
     pub placement_id: String,
@@ -611,7 +693,9 @@ pub struct WorkspaceReviewedMergeParams {
 /// can succeed only when the verified target is exactly the frozen candidate;
 /// an interrupted run has no recoverable exit code and finishes as an error.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct WorkspaceReconcileParams {
+    pub integration: WorkspaceIntegrationBinding,
     #[serde(flatten)]
     pub workspace: WorkspaceHandleReference,
     pub operation: WorkspaceReconcileOperation,
@@ -1064,13 +1148,16 @@ pub struct DaemonErrorPayload {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn machine_capabilities_are_optional_at_revision_three() {
+    fn machine_capabilities_are_optional_at_current_revision() {
         let old: Vec<String> = super::DAEMON_REQUIRED_CAPABILITIES
             .iter()
             .map(|fact| (*fact).into())
             .collect();
-        assert!(super::daemon_protocol_is_compatible(3, &old));
-        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 3);
+        assert!(super::daemon_protocol_is_compatible(
+            super::DAEMON_PROTOCOL_REVISION,
+            &old
+        ));
+        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 4);
         let probe: super::MachineProbeParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_location_id":null,"commands":[{"name":"cargo","command":"cargo --version","timeout_seconds":10}],"env":{}})).unwrap();
         assert_eq!(probe.commands[0].name, "cargo");
         let provision: super::RepoLocationProvisionParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_id":"repo","remote_url":"file:///repository","default_branch":"main","timeout_seconds":1800})).unwrap();
@@ -1102,6 +1189,7 @@ mod tests {
 
     fn mutation_params(fields: Value) -> Value {
         let mut value = json!({
+            "integration": {"kind":"task_step"},
             "daemon_id": "daemon-1",
             "runtime_id": "runtime-1",
             "placement_id": "placement-1",
@@ -1337,14 +1425,14 @@ mod tests {
             DAEMON_PROTOCOL_REVISION,
             &revision_2_capabilities
         ));
-        assert_eq!(DAEMON_PROTOCOL_REVISION, 3);
-        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 3);
+        assert_eq!(DAEMON_PROTOCOL_REVISION, 4);
+        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 4);
     }
 
     #[test]
     fn workspace_handshake_round_trips_adapter_facts_and_run_policy() {
         let handshake = assert_round_trip::<DaemonHandshakeNotification>(json!({
-            "protocol_revision": 3,
+            "protocol_revision": DAEMON_PROTOCOL_REVISION,
             "capabilities": [
                 DAEMON_CAPABILITY_USAGE_REPORTS,
                 DAEMON_CAPABILITY_JOURNAL_ACK,
@@ -1657,12 +1745,14 @@ mod tests {
         assert_round_trip::<WorkspaceInspectParams>(request);
         let mut request = workspace.clone();
         request["operation_id"] = json!("operation");
+        request["integration"] = json!({"kind":"task_step"});
         request["expected"] = json!({"kind":"base_sha", "sha":"candidate"});
         request["operation"] = json!({"kind":"review_checkout", "commit_sha":"candidate",
             "environment":{"env":{}, "assets":[], "checks":[],
                 "recheck_interval_seconds":600}, "prepare":true});
         assert_round_trip::<WorkspaceOwnerOperationParams>(request);
         let mut request = workspace;
+        request["integration"] = json!({"kind":"task_step"});
         request["operation"] = json!("reconcile");
         request["operation_id"] = json!("operation");
         assert_round_trip::<WorkspaceReconcileParams>(request);

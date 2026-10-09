@@ -577,69 +577,116 @@ impl MergeService {
         )
         .await?;
 
-        self.db.protect_step_integration().await?;
-        let review_guard = match self.db.lock_review_integration(&task_id).await {
-            Ok(guard) => guard,
-            Err(db::DbError::Check(reason)) => {
-                return Ok(MergeOutcome::ReviewRequired { reason });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let target_sha =
+        let observed_target =
             crate::integration_effects::merge::target_tip(repo_path, &target_branch).await?;
-        if let Some(hook) = crate::workflow::engine::durable::current_hook(&task_id) {
-            db::note_integration_target(
-                &hook.step.id,
-                hook.index,
-                Some(&worktree_sha),
-                &target_sha,
-            );
-        }
-        let task_branch = workspace::task_branch_name(&task_id);
-        let effect = crate::integration_effects::merge::MergeEffectInput {
-            workspace: input.workspace,
-            worktree_path,
-            repo_path,
-            target_branch: &target_branch,
-            task_branch: &task_branch,
-            diagnostic_entity_id: &task_id,
-            before_sha: &before_sha,
-            expected_head_sha: &worktree_sha,
-            observed_target_sha: &target_sha,
-            reviewed: review_guard.candidate.as_ref().map(|candidate| {
-                crate::integration_effects::merge::ReviewedMergeObject {
-                    commit_sha: candidate.commit_sha.clone(),
-                    base_sha: candidate.base_sha.clone(),
-                }
-            }),
+        // Critical before the intent exists: a preempt between the started
+        // intent and its receipt would orphan it for the next admission.
+        self.db.protect_step_integration().await?;
+        let owner = crate::integration_owner::ServerIntegrationOwner::new(self.db.clone());
+        let receipt_guard = match owner.admit_task_step(input.workspace, db::IntegrationOperationKind::Merge,
+            serde_json::json!({"workspace":input.workspace,"target_branch":target_branch,"expected_head_sha":worktree_sha,"expected_target_sha":observed_target})).await? {
+            None => None,
+            Some(db::IntegrationEffectAdmission::Started(guard)) => Some(guard),
+            Some(db::IntegrationEffectAdmission::Replay(receipt)) => {
+                let receipt: crate::integration_owner::OwnerMergeReceipt = serde_json::from_value(receipt.result).map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                return match receipt {
+                    crate::integration_owner::OwnerMergeReceipt::Completed { outcome } => Ok(outcome),
+                    _ => Err(ServiceError::invalid_operation("prior merge effect did not complete")),
+                };
+            }
+            Some(db::IntegrationEffectAdmission::Refused(reason)) => return Err(ServiceError::invalid_operation(format!("integration owner refused {reason:?}"))),
         };
-        let already_merged =
-            match crate::integration_effects::merge::validate_merge_candidate(&effect).await? {
-                crate::integration_effects::merge::MergeCandidateOutcome::Ready {
-                    already_merged,
-                } => already_merged,
-                crate::integration_effects::merge::MergeCandidateOutcome::Refused(outcome) => {
-                    return Ok(outcome)
+        let result = async {
+            self.db.protect_step_integration().await?;
+            let review_guard = match self.db.lock_review_integration(&task_id).await {
+                Ok(guard) => guard,
+                Err(db::DbError::Check(reason)) => {
+                    return Ok(MergeOutcome::ReviewRequired { reason });
                 }
+                Err(error) => return Err(error.into()),
             };
-        let applied =
-            crate::integration_effects::merge::apply_merge(&effect, already_merged).await?;
-        // Preserve the original guard lifetime on the exact-object refusal.
-        if matches!(
-            applied,
-            crate::integration_effects::merge::MergeApplyOutcome::ExactObjectMismatch
-        ) {
-            return crate::integration_effects::merge::merge_result(
-                &effect,
-                already_merged,
+            let target_sha =
+                crate::integration_effects::merge::target_tip(repo_path, &target_branch).await?;
+            if let Some(hook) = crate::workflow::engine::durable::current_hook(&task_id) {
+                db::note_integration_target(
+                    &hook.step.id,
+                    hook.index,
+                    Some(&worktree_sha),
+                    &target_sha,
+                );
+            }
+            let task_branch = workspace::task_branch_name(&task_id);
+            let effect = crate::integration_effects::merge::MergeEffectInput {
+                workspace: input.workspace,
+                worktree_path,
+                repo_path,
+                target_branch: &target_branch,
+                task_branch: &task_branch,
+                diagnostic_entity_id: &task_id,
+                before_sha: &before_sha,
+                expected_head_sha: &worktree_sha,
+                observed_target_sha: &target_sha,
+                reviewed: review_guard.candidate.as_ref().map(|candidate| {
+                    crate::integration_effects::merge::ReviewedMergeObject {
+                        commit_sha: candidate.commit_sha.clone(),
+                        base_sha: candidate.base_sha.clone(),
+                    }
+                }),
+            };
+            let already_merged =
+                match crate::integration_effects::merge::validate_merge_candidate(&effect).await? {
+                    crate::integration_effects::merge::MergeCandidateOutcome::Ready {
+                        already_merged,
+                    } => already_merged,
+                    crate::integration_effects::merge::MergeCandidateOutcome::Refused(outcome) => {
+                        return Ok(outcome)
+                    }
+                };
+            let applied =
+                crate::integration_effects::merge::apply_merge(&effect, already_merged).await?;
+            // Preserve the original guard lifetime on the exact-object refusal.
+            if matches!(
                 applied,
-            )
-            .await;
+                crate::integration_effects::merge::MergeApplyOutcome::ExactObjectMismatch
+            ) {
+                return crate::integration_effects::merge::merge_result(
+                    &effect,
+                    already_merged,
+                    applied,
+                )
+                .await;
+            }
+            review_guard.release().await?;
+            crate::integration_effects::merge::merge_result(&effect, already_merged, applied).await
         }
-        review_guard.release().await?;
-        let outcome =
-            crate::integration_effects::merge::merge_result(&effect, already_merged, applied)
-                .await?;
+        .await;
+        if let Some(guard) = receipt_guard {
+            let (receipt, state) = match &result {
+                Ok(outcome) => (
+                    crate::integration_owner::OwnerMergeReceipt::Completed {
+                        outcome: outcome.clone(),
+                    },
+                    db::IntegrationOperationState::Succeeded,
+                ),
+                Err(error) => (
+                    crate::integration_owner::OwnerMergeReceipt::Infrastructure {
+                        message: crate::integration_effects::check::tail_bytes(
+                            &error.to_string(),
+                            4096,
+                        ),
+                    },
+                    // Terminal: the step's own recovery re-reads Git and
+                    // decides whether to repeat. An uncertain receipt would
+                    // keep the intent and refuse every later merge here.
+                    db::IntegrationOperationState::Failed,
+                ),
+            };
+            // The receipt is a record of the effect, never its result.
+            if let Err(error) = guard.record(serde_json::json!(receipt), state).await {
+                tracing::warn!(target: "services::merge_service", task_id = %task_id, %error, "merge attempt receipt was not recorded");
+            }
+        }
+        let outcome = result?;
         if let MergeOutcome::Done { after_sha, .. } = &outcome {
             self.record_merge_execution_evidence(
                 &execution.id,
@@ -987,6 +1034,151 @@ mod tests {
         .await
         .expect("execution creates");
         execution_id
+    }
+
+    /// Today's server-local Task-step merge, bound to its shadow attempt: it
+    /// writes one receipt, and an earlier Task-step effect that started and
+    /// never wrote a receipt (crash or dropped future) is settled by the next
+    /// claim's merge instead of refusing it with `ReconciliationRequired`.
+    #[tokio::test]
+    async fn task_step_merge_records_a_receipt_and_is_never_refused_by_an_orphaned_intent() {
+        use db::{IntegrationQueueRepo, TaskStepRepo};
+        let db = sqlite_db().await;
+        let event_bus = Arc::new(EventBus::new(16));
+        let temp = TempDir::new().expect("temp creates");
+        let repo_path = setup_repo(&temp).await;
+        let task_id = new_uuid_v4();
+        let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
+        git::create_worktree(
+            &repo_path,
+            &workspace::task_branch_name(&task_id),
+            &worktree_path,
+        )
+        .await
+        .expect("worktree creates");
+        std::fs::write(worktree_path.join("feature.txt"), "one\n").expect("feature writes");
+        git::commit_all(&worktree_path, "feature")
+            .await
+            .expect("feature commits");
+        seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
+        let task = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        let repo_id: String = sqlx::query_scalar("SELECT repo_id FROM workspace WHERE task_id=?")
+            .bind(&task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("repo id reads");
+        let queue = db
+            .create_or_get_integration_queue(&repo_id, "main")
+            .await
+            .expect("queue creates");
+        let attempt = db
+            .admit_integration_attempt(db::IntegrationAttempt::new(
+                Some(queue.id.clone()),
+                task_id.clone(),
+                task.project_id.clone(),
+                format!("shadow:{task_id}:0"),
+                task.status.clone(),
+                0,
+                task.version,
+            ))
+            .await
+            .expect("shadow attempt admits");
+        db.enqueue_step(&db::EnqueueTaskStep {
+            id: "merge-step".into(),
+            task_id: task_id.clone(),
+            kind: "hooks".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: "merge-step".into(),
+            chain_id: "merge-chain".into(),
+            chain_position: 1,
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch: Some(0),
+            lane: "long".into(),
+            available_at: now_rfc3339(),
+        })
+        .await
+        .expect("step enqueues");
+        let service =
+            MergeService::new_for_test(Arc::clone(&db), event_bus, temp.path().to_path_buf());
+        let claim = || async {
+            sqlx::query("UPDATE task_step SET lease_until='2000-01-01T00:00:00Z' WHERE id='merge-step' AND status='claimed'")
+                .execute(db.pool())
+                .await
+                .expect("lease expires");
+            db.claim_step("worker", Some(&task_id), "2099-01-01T00:00:00Z")
+                .await
+                .expect("claim runs")
+                .expect("step claims")
+        };
+        let receipts = || async {
+            let raw: String = sqlx::query_scalar(
+                "SELECT effect_receipts_json FROM integration_attempt WHERE id=?",
+            )
+            .bind(&attempt.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("receipts read");
+            serde_json::from_str::<Vec<serde_json::Value>>(&raw).expect("receipts parse")
+        };
+
+        let first = db::task_writer::in_task_step(claim().await, service.merge(task_id.clone()))
+            .await
+            .expect("first merge returns");
+        assert!(matches!(first, MergeOutcome::Done { .. }), "{first:?}");
+        let recorded = receipts().await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the live merge was not bound: {recorded:?}"
+        );
+        assert_eq!(recorded[0]["operation_state"], "succeeded");
+
+        // A later effect of this Task started under the old claim and died
+        // before its receipt. Nothing can prove it either way.
+        let mut orphan = recorded[0]["request"].clone();
+        orphan["kind"] = serde_json::json!("rebase");
+        orphan["witness"]["expected_target_sha"] = serde_json::json!("unprovable");
+        sqlx::query("UPDATE integration_attempt SET effect_intent_json=?,current_operation_state='running' WHERE id=?")
+            .bind(serde_json::json!({"request":orphan,"digest":"","started":true}).to_string())
+            .bind(&attempt.id)
+            .execute(db.pool())
+            .await
+            .expect("orphan plants");
+
+        std::fs::write(worktree_path.join("feature.txt"), "two\n").expect("feature rewrites");
+        let head = git::commit_all(&worktree_path, "feature again")
+            .await
+            .expect("feature commits again");
+        let second = db::task_writer::in_task_step(claim().await, service.merge(task_id.clone()))
+            .await
+            .expect("an orphaned Task-step intent refused the next claim's merge");
+        assert!(matches!(second, MergeOutcome::Done { .. }), "{second:?}");
+        assert_eq!(
+            git::get_current_sha(&repo_path).await.expect("head reads"),
+            head
+        );
+        let recorded = receipts().await;
+        assert_eq!(recorded.len(), 3, "{recorded:?}");
+        assert!(recorded
+            .iter()
+            .any(|receipt| receipt["request"]["kind"] == "rebase"
+                && receipt["operation_state"] == "failed"
+                && receipt["result"]["kind"] == "infrastructure"));
+        let intent: Option<String> =
+            sqlx::query_scalar("SELECT effect_intent_json FROM integration_attempt WHERE id=?")
+                .bind(&attempt.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("intent reads");
+        assert!(
+            intent.is_none(),
+            "an intent outlived its effect: {intent:?}"
+        );
     }
 
     #[tokio::test]

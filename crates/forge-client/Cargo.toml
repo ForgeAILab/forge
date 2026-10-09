@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 api-types = { path = "../api-types" }
 cli-adapters = { path = "../cli-adapters" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.29", default-features = false, features = ["windows"] }
 config = { path = "../config" }
