@@ -1,4 +1,5 @@
 //! Durable mechanical-evidence requests. This port has no Task/Review writers.
+pub mod consumer;
 pub mod owners;
 mod receipt;
 pub mod worker;
@@ -37,6 +38,15 @@ impl CheckRunner {
         if request.identity.inputs.spec.commands.len() > 64 {
             return Err(ServiceError::invalid_operation(
                 "check owner accepts at most 64 commands",
+            ));
+        }
+        // Results are delivered as Task steps and the worker cancels a
+        // consumer whose Task epoch moved, so a consumer without a Task
+        // could never be woken: refuse it instead of scheduling a run that
+        // is cancelled on first sight.
+        if request.task_id.is_none() {
+            return Err(ServiceError::invalid_operation(
+                "check consumers are Task steps: a request needs its Task",
             ));
         }
         if request.request_key.len() > 512 {

@@ -16,17 +16,90 @@ pub struct CheckResultDelivery {
     pub origin: CheckConsumerOrigin,
 }
 
+/// A consumer as its delivery step must see it before applying.
+#[derive(Debug, Clone)]
+pub struct CheckConsumerDelivery {
+    pub consumer: CheckConsumer,
+    pub delivery_step_id: Option<String>,
+    pub cancelled_at: Option<String>,
+    pub applied_at: Option<String>,
+    /// The consumer's Task's current status entry; None when it is gone.
+    pub live_task_epoch: Option<i64>,
+}
+
 #[async_trait]
 pub trait CheckDeliveryRepo: Send + Sync {
+    async fn live_task_epoch(&self, task_id: &str) -> Result<Option<i64>>;
+    async fn check_consumer_delivery(
+        &self,
+        consumer_id: &str,
+    ) -> Result<Option<CheckConsumerDelivery>>;
+    /// Only the recorded delivery step may mark its consumer applied, once.
+    async fn mark_check_result_applied(
+        &self,
+        consumer_id: &str,
+        step_id: &str,
+        now: &str,
+    ) -> Result<bool>;
     /// The durable marker and enqueue share a transaction. A crash on either
     /// side of this call cannot lose a consumer or enqueue it twice.
     async fn enqueue_check_result_steps(&self, limit: i64) -> Result<u64>;
 }
 #[async_trait]
 impl CheckDeliveryRepo for SqliteDb {
+    async fn live_task_epoch(&self, task_id: &str) -> Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=? AND deleted_at IS NULL")
+                .bind(task_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+    async fn check_consumer_delivery(
+        &self,
+        consumer_id: &str,
+    ) -> Result<Option<CheckConsumerDelivery>> {
+        let Some(row) = sqlx::query("SELECT c.*,(SELECT t.status_epoch FROM task t WHERE t.id=c.task_id AND t.deleted_at IS NULL) AS live_task_epoch FROM check_consumer c WHERE c.id=?")
+            .bind(consumer_id)
+            .fetch_optional(self.pool())
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(CheckConsumerDelivery {
+            delivery_step_id: row.try_get("delivery_step_id")?,
+            cancelled_at: row.try_get("cancelled_at")?,
+            applied_at: row.try_get("applied_at")?,
+            live_task_epoch: row.try_get("live_task_epoch")?,
+            consumer: map_consumer(row)?,
+        }))
+    }
+    async fn mark_check_result_applied(
+        &self,
+        consumer_id: &str,
+        step_id: &str,
+        now: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query("UPDATE check_consumer SET applied_at=? WHERE id=? AND delivery_step_id=? AND applied_at IS NULL")
+            .bind(now)
+            .bind(consumer_id)
+            .bind(step_id)
+            .execute(self.pool())
+            .await?
+            .rows_affected()
+            == 1)
+    }
     async fn enqueue_check_result_steps(&self, limit: i64) -> Result<u64> {
         if !(1..=1000).contains(&limit) {
             return Err(DbError::Check("invalid check delivery batch limit".into()));
+        }
+        // An idle sweep must not take the write lock: probe the partial
+        // index first and open the transaction only when there is work.
+        let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM check_consumer c WHERE c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL)")
+            .fetch_one(self.pool())
+            .await?;
+        if !pending {
+            return Ok(0);
         }
         let mut tx = begin_immediate(self.pool()).await?;
         let rows = sqlx::query("SELECT c.*, r.spec_digest, r.commit_sha, t.status AS task_status, t.version AS task_version FROM check_consumer c JOIN check_run r ON r.id=c.run_id JOIN task t ON t.id=c.task_id JOIN check_result result ON result.id=c.result_id WHERE c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL AND (result.outcome<>'infrastructure_failed' OR c.infrastructure_retries>=2) AND r.state IN ('succeeded','failed','cancelled') ORDER BY c.created_at,c.id LIMIT ?")

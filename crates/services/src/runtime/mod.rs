@@ -261,6 +261,8 @@ pub struct ForgeRuntime {
     pub domain_event_broadcast: Arc<DomainEventBroadcastConsumer>,
     storage_maintenance: Arc<StorageMaintenanceWorker>,
     pub check_runner: Arc<crate::check_runner::CheckRunner>,
+    /// Where a consumer family registers and a Task step asks for a check.
+    pub check_consumers: Arc<crate::check_runner::consumer::TaskCheckConsumers>,
     check_worker: Arc<crate::check_runner::worker::CheckRunWorker>,
     pub lifecycle_emitter: Arc<crate::lifecycle::LifecycleEventEmitter>,
     pub workspace_exec_locks: Arc<WorkspaceExecutionLockManager>,
@@ -799,6 +801,11 @@ impl ForgeRuntimeBuilder {
         operator_status_service.set_event_relay(Arc::clone(&domain_event_broadcast));
         let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
         let check_runner = Arc::new(crate::check_runner::CheckRunner::new(self.db.clone()));
+        let check_consumers = Arc::new(crate::check_runner::consumer::TaskCheckConsumers::new(
+            self.db.clone(),
+            check_runner.clone(),
+        ));
+        let _ = task_service.check_consumers.set(check_consumers.clone());
         let check_owners = Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
             self.db.clone(),
             daemon_connections.clone(),
@@ -857,6 +864,7 @@ impl ForgeRuntimeBuilder {
             domain_event_broadcast,
             storage_maintenance,
             check_runner,
+            check_consumers,
             check_worker,
             lifecycle_emitter,
             workspace_exec_locks,

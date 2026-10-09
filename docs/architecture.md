@@ -7348,7 +7348,7 @@ receipt acknowledgment. No extra setup or managed checkout is enabled. Required
 conformance/setup, lifecycle/before-work, readiness/preflight/environment helper
 and agent-selected families retain their existing orchestration and check policy.
 
-### Durable check orchestration foundation (3.3 stage C, partial)
+### Durable check runner and its Task-step consumer contract (3.3 stage C)
 
 `check_runner::CheckRunner::request` returns a consumer and `Hit(result)`,
 `Joined(run)` or `Scheduled(run)`. Selection and consumer insertion are one
@@ -7382,9 +7382,20 @@ passes) exact HEAD/tracked-change witnesses. A malformed terminal receipt is
 infrastructure evidence, never a pass. Server receipts remain available in
 memory if their durable write has a transient failure. The worker records the
 immutable result before delivering it. Daemon `journal.ack` uses
-`forge:operation:<operation_id>` only after result durability; failed ACKs are
-retried independently on later sweeps. A disconnected ACK cannot serially hold
-up every other machine.
+`forge:operation:<operation_id>` only after result durability. A fresh result
+is acknowledged on the next sweep; a refused or unanswered acknowledgement is
+retried no sooner than every 60 seconds, each attempt bounded to 5 seconds, and
+ends when the machine is removed, passes the disconnected-owner bound, or the
+result is 25 hours old (the daemon keeps a check entry for 24).
+
+An idle worker costs five indexed reads per second and no write: the sweep
+reads `check_run_state_lease` and the partial indexes
+`check_consumer_undelivered` and `check_run_unacknowledged`, which hold only
+rows that still need work, and it opens a write transaction only when one of
+them is non-empty. A run or consumer the sweep cannot process is logged and
+skipped; it never stops the sweep for the others. The worker touches only rows
+of `check_run`, `check_result` and `check_consumer` created through
+`CheckRunner::request`, and enqueues Task steps.
 
 Transport timeout/disconnect means `uncertain`. Recovery looks up the original
 operation; it never repeats `check.run` under that key. An owner reporting
@@ -7393,20 +7404,32 @@ delayed dispatch frame. A retained receipt settles the original run. Unknown or
 interrupted after that stop fence, an owner past the existing configured
 workspace-disconnect bound, or removal of its machine settles infrastructure
 failure. Reconciliation releases its worker job between lookups while keeping
-machine occupancy and the single-flight key. Scans use least-recently-attempted
-order. Infrastructure retry allowance is stored per consumer: two automatic
+machine occupancy and the single-flight key: the run keeps a 15-second lease,
+so it is looked up again every 15 seconds, not every sweep. An owner that is
+reachable but still answers "running" (or refuses to answer) 600 seconds past
+the run's settlement deadline is given up on: the run settles as an
+infrastructure failure that is **not** retried automatically, because nothing
+proved the process stopped. Every consumer is answered "no verdict", and a
+second run of that identity is an explicit decision. Scans use
+least-recently-attempted order. Infrastructure retry allowance is stored per consumer: two automatic
 retries, then one terminal infrastructure notification. Recovery rechecks the
 cache before retrying and reuses a pass certified by another consumer meanwhile.
 This prevents a silent second execution of a certified key.
 
 | Run state | Automatic exit | Bound/policy |
 | --- | --- | --- |
-| `queued` | Admit to `running`; stale consumers cancel; unavailable owner/expired capacity wait settles infrastructure | Capacity wait: 1,800 seconds, plus bounded sweep/batch delay. Expiry settlement runs even when all 32 effect jobs are occupied. Queue time is excluded from wall time. |
-| `running` | Receipt to `cleaning`; lost reply or lease to `uncertain`; no consumers requests cancellation | Recorded wall limit (1–86,400 seconds), owner cleanup up to 30 seconds, then 65 seconds of settlement/RPC grace. Lease recovery within 60 seconds plus sweep delay. |
-| `cancelling` | Owner completion to cleanup, or expired lease to reconciliation | Owner cancellation/cleanup bounds; worker cancel exchange at most 61 seconds, with lease renewal. |
-| `cleaning` | Immutable result to a terminal state; expired lease resumes from retained receipt | Owner cleanup at most 30 seconds; receipt/result writes are fenced and replayed after lease recovery. |
-| `uncertain` | Receipt settles; confirmed stopped/removed/expired disconnected owner settles infrastructure | Lookup exchange at most 30 seconds; cancellation exchange at most 61 seconds. Original owner deadline and configured owner-disconnected bound govern resolution; the next sweep retries lookup, never dispatch. |
-| `succeeded`, `failed`, `cancelled` | Deliver durable consumer notifications; ACK retained daemon entries | Transactional delivery checkpoint plus periodic sweep. Infrastructure gets at most two automatic retries per consumer. |
+| `queued` | Admit to `running`; all consumers stale: `cancelled`; owner removed or slot wait expired: infrastructure failure | Slot wait 1,800 seconds per attempt (with two automatic retries a consumer waits at most about 90 minutes before its Task is answered "no verdict"). Expiry settlement runs even when all 32 effect jobs are occupied. Queue time is excluded from wall time. |
+| `running` | Receipt to `cleaning`; lost reply or lost lease to `uncertain`; no consumers left: `cancelling`. A run taken over before its intent was stored launched nothing and settles as an infrastructure failure | Recorded wall limit (1–86,400 seconds) plus 65 seconds of settlement grace. Lease 60 seconds, renewed every 15; takeover within 60 seconds plus sweep delay. |
+| `cancelling` | Cancel reply with a receipt to `cleaning`; any other reply, or a lost lease, to `uncertain` | One cancel exchange, at most 61 seconds. |
+| `cleaning` | Immutable result to a terminal state; a lost lease to `uncertain`, which resumes from the retained receipt | One fenced transaction; takeover within 60 seconds plus sweep delay. |
+| `uncertain` | Receipt settles the original run; owner reports unknown or interrupted after a cancel tombstone: infrastructure failure (retried); machine removed or owner past the disconnected-owner bound: infrastructure failure (retried); owner still "running" or refusing: infrastructure failure, **not** retried | Lookup at most 30 seconds, cancel at most 61, repeated every 15 seconds. Hard bound: the smaller of the configured disconnected-owner bound and the run's wall limit + 65 + 600 seconds. Never a second `check.run` for the operation. |
+| `succeeded`, `failed`, `cancelled` | One `apply_check_result` Task step per consumer; owner acknowledgement | Delivery marker and enqueue share a transaction, on the sweep after settlement. An infrastructure failure is retried at most twice per consumer, then delivered as "no verdict". |
+
+| Consumer delivery state | Automatic exit | Bound |
+| --- | --- | --- |
+| Waiting for its run | The run's exits above; the consumer's Task leaving its status entry cancels the consumer | As the run. |
+| Result recorded, not delivered | Infrastructure failure with retries left: moved to the retry run; otherwise the delivery step is enqueued | Next sweep (one second). |
+| Delivered, not applied | The Task-step worker runs the step: applied, or stale (Task left the status entry, or another attempt is in charge) and the Task is untouched | The Task-step worker's own retry and dead-letter bounds. |
 
 Capacity admission uses the same SQLite writer transaction and shared occupancy
 query as executions, reservations and Chat turns. Checks use the physical
@@ -7426,18 +7449,45 @@ consumer/result/run identities, exact commit and spec digest. The consumer's
 retention, so restart and pruning cannot enqueue a second notification. Already
 stale epochs are enqueued as superseded and leave the Task untouched.
 
-**Consumer application is not implemented in this slice.** No existing execution
-family requests this runner yet. The `apply_check_result` family handler, original
-candidate/authority references, typed check-wait/slot-wait/retry-exhausted
-conditions and Task scheduling/offer changes must land before a family uses the
-port. In particular a terminal infrastructure notification does not yet park a
-Task with the requested typed reason. Merge-path and review-entry CI, manual
-`ReviewRunner`, conformance, before-work and other checks retain their current
-orchestration, limits and verdicts. The 3.2 integration queue stays inactive.
-Canonical PATH/HOME declaration and managed-checkout/canonical-policy activation
-are also pending. Current owner dispatch uses the frozen legacy workspace policy
-and supplies no new server input attestation; configured checks remain
-uncacheable. No historical review or legacy CI row is promoted to cache.
+#### Task-step consumer contract
+
+`check_runner::consumer::TaskCheckConsumers` is the only way a Task step uses
+the runner. A consumer family (one per `CheckConsumerOrigin`) registers a
+`CheckConsumerFamily`. A step asks with `request(TaskCheckRequest)`, naming
+its Task, the status entry it runs under and its *authority*: the step or
+attempt that asks, as the family names it. The request is idempotent on
+(origin, Task, status entry, authority) and is refused when the Task has left
+that status entry or no family is registered. Its reply (`Hit`, `Joined`,
+`Scheduled`) is information only. Hit, joined or scheduled, the verdict always
+arrives as exactly one `apply_check_result` Task step, so there is one
+application path.
+
+`apply(step_id, delivery)` runs inside that step. It refuses (the step fails
+visibly) an envelope that is not carried by the consumer's recorded delivery
+step, or whose consumer, run, result, commit or spec digest differ from what
+is stored. It returns `stale` and leaves the Task untouched when the consumer
+was cancelled, the Task left the status entry, or the family's
+`current_authority` is no longer the one that asked. Otherwise it hands the
+family a `CheckVerdict`: `Result` (pass, fail, timed out or cancelled, for
+exactly the requested commit and spec) or `InfrastructureExhausted` (no
+verdict after the automatic retries: the family parks its Task with a
+retryable reason and records no failure of the candidate). The consumer is
+then marked applied; a redelivered step returns `already_applied`. A crash
+between the family's write and that mark redelivers once more, so a family's
+`apply` is idempotent on `consumer_id`.
+
+**No family is registered yet, and no execution family requests the runner.**
+Merge-path and review-entry CI, manual `ReviewRunner`, conformance,
+before-work and other checks retain their current orchestration, limits and
+verdicts. The 3.2 integration queue stays inactive. Still pending: the typed
+Task conditions for a check wait, a check-slot wait and exhausted check
+retries (with their `is_blocked`, offer and dispatcher rules), the
+review-entry and merge-path cutovers, canonical PATH/HOME declaration and
+managed-checkout/canonical-policy activation. Current owner dispatch uses the
+frozen legacy workspace policy and supplies no new server input attestation;
+configured checks remain uncacheable. A reusable result has no expiry: reuse
+ends only when the commit, spec digest or audited execution revision differs.
+No historical review or legacy CI row is promoted to cache.
 
 The owner supervision guarantees tested here cover normal cancellation, dropped
 futures, retained receipts and restart reconciliation. Abrupt process death

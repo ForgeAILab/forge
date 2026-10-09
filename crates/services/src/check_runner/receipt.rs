@@ -25,6 +25,15 @@ pub(super) fn validate_receipt(
     if finished < started || receipt.commands.len() > run.identity.inputs.spec.commands.len() {
         return Err(refuse());
     }
+    // A witness the owner did take must name the requested commit, whatever
+    // the outcome: a result is only ever reported for that exact commit.
+    if receipt
+        .prepared_head
+        .as_deref()
+        .is_some_and(|head| head != run.identity.commit_sha)
+    {
+        return Err(refuse());
+    }
     let legacy = matches!(
         run.identity.inputs.spec.execution_policy.as_str(),
         "legacy-server/1" | "legacy-daemon/1"

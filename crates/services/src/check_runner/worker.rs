@@ -17,7 +17,14 @@ pub const CHECK_LEASE_SECONDS: i64 = 60;
 pub const CHECK_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 pub const CHECK_SLOT_WAIT_SECONDS: i64 = 1800;
 const OWNER_RPC_BOUND: Duration = Duration::from_secs(30);
+/// The sweep awaits its acknowledgement batch, so one silent owner can hold
+/// admission back by at most this long per `CHECK_ACK_RETRY_SECONDS`.
+const OWNER_ACK_BOUND: Duration = Duration::from_secs(5);
 const SETTLEMENT_GRACE_SECONDS: i64 = 65;
+/// How long past its settlement deadline an owner may keep answering
+/// "still running" (or refusing to answer) to lookup and cancel before the
+/// run is settled without it.
+pub const CHECK_UNCONFIRMED_STOP_SECONDS: u64 = 600;
 
 /// This effect port supplies owner-local evidence, never Task authority.
 #[async_trait]
@@ -84,27 +91,48 @@ impl CheckRunWorker {
                 .admit_check_run(&run, &self.instance, &now, &lease_until())
                 .await
             {
-                Ok(CheckAdmission::Admitted(run)) => self.drive(*run).await?,
+                // One unreadable or contended run must not stop the sweep for
+                // every other run: its lease expires and it is taken up again.
+                Ok(CheckAdmission::Admitted(run)) => {
+                    let id = run.id.clone();
+                    if let Err(error) = self.drive(*run).await {
+                        tracing::warn!(run_id = %id, %error, "expired check settlement failed; lease recovery will retry");
+                    }
+                }
                 Ok(CheckAdmission::Waiting) | Err(db::DbError::VersionConflict) => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    tracing::warn!(run_id = %run.id, %error, "expired check admission failed");
+                }
             }
         }
         // Resume the result->retry boundary before exposing terminal evidence.
         for id in self.store.retryable_check_runs(100).await? {
-            self.store
+            if let Err(error) = self
+                .store
                 .retry_infrastructure_check(&id, &db::now_rfc3339())
-                .await?;
+                .await
+            {
+                tracing::warn!(run_id = %id, %error, "check infrastructure retry failed");
+            }
         }
         self.store.enqueue_check_result_steps(100).await?;
         // A disconnected machine's ACK must not serially delay every other
         // machine. Every retained result remains eligible on later sweeps.
         let mut acknowledgments = JoinSet::new();
-        for record in self.store.unacknowledged_checks(100).await? {
+        for record in self
+            .store
+            .unacknowledged_checks(&db::now_rfc3339(), 100)
+            .await?
+        {
             let (store, owners) = (self.store.clone(), self.owners.clone());
             acknowledgments.spawn(async move {
-                if tokio::time::timeout(OWNER_RPC_BOUND, owners.acknowledge(&record))
+                // A removed machine, or one past the disconnected-owner
+                // bound, holds no journal left to prune: the acknowledgement
+                // is settled instead of being retried forever.
+                if tokio::time::timeout(OWNER_ACK_BOUND, owners.acknowledge(&record))
                     .await
                     .is_ok_and(|r| r.is_ok())
+                    || owners.owner_gone(&record).await.unwrap_or(false)
                 {
                     store
                         .acknowledge_check(
@@ -150,7 +178,9 @@ impl CheckRunWorker {
                     jobs.spawn(async move { this.drive(*run).await });
                 }
                 Ok(CheckAdmission::Waiting) | Err(db::DbError::VersionConflict) => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    tracing::warn!(run_id = %run.id, %error, "check admission failed");
+                }
             }
         }
         Ok(())
@@ -232,7 +262,15 @@ impl CheckRunWorker {
                     _=tokio::time::sleep_until(deadline)=>break Err(ServiceError::invalid_operation("check dispatch reply uncertain")),
                     _=renew.tick()=> {
                         run=self.store.renew_check_run(&fence(&run),&db::now_rfc3339(),&lease_until()).await?;
-                        if self.store.active_check_consumers(&run.id,&db::now_rfc3339()).await?.is_empty() { cancel.cancel(); break self.bounded_cancel(&mut run,&record).await; }
+                        if self.store.active_check_consumers(&run.id,&db::now_rfc3339()).await?.is_empty() {
+                            // Nobody waits for this result any more. The run
+                            // is `cancelling` for the length of the bounded
+                            // cancel exchange: its reply settles it, anything
+                            // else leaves it uncertain for reconciliation.
+                            cancel.cancel();
+                            run=self.store.transition_check_run(&fence(&run),CheckRunState::Cancelling,&db::now_rfc3339()).await?;
+                            break self.bounded_cancel(&mut run,&record).await;
+                        }
                     }
                 }
             }
@@ -304,10 +342,25 @@ impl CheckRunWorker {
             _ => {}
         }
         // A reachable owner must not report Running forever past the
-        // effect's own bound. Keep its identity fenced until it confirms
-        // stop or reaches the configured disconnected-owner timeout.
-        // Retain machine occupancy and the single-flight identity, but
-        // release this worker job while awaiting the next reconciliation.
+        // effect's own bound. Its identity stays fenced until it confirms
+        // stop, reaches the configured disconnected-owner timeout, or has
+        // ignored cancel for CHECK_UNCONFIRMED_STOP_SECONDS. That last exit
+        // cannot prove the process stopped, so it never retries on its own:
+        // every consumer is answered "no verdict" and its Task parks; a
+        // second run of this identity is then an explicit decision.
+        if unconfirmed_stop_expired(&record)? {
+            tracing::warn!(run_id = %run.id, operation_id = %run.operation_id, "check owner never confirmed stop; settling without automatic retry");
+            self.store.exhaust_check_retries(&run.id).await?;
+            return self
+                .settle_without_receipt(
+                    run,
+                    CheckResultOutcome::InfrastructureFailed,
+                    CheckCleanup::Failed,
+                )
+                .await;
+        }
+        // Until then retain machine occupancy and the single-flight identity,
+        // but release this worker job while awaiting the next reconciliation.
         self.store
             .defer_check_reconciliation(&fence(&run), &db::now_rfc3339())
             .await?;
@@ -438,6 +491,21 @@ pub(super) fn fence(run: &StoredCheckRun) -> CheckRunFence {
 }
 fn lease_until() -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(CHECK_LEASE_SECONDS)).to_rfc3339()
+}
+/// Wall-clock, so it also holds for a run taken over after a restart.
+fn unconfirmed_stop_expired(record: &CheckWorkerRecord) -> Result<bool> {
+    let deadline = chrono::DateTime::parse_from_rfc3339(
+        record
+            .deadline_at
+            .as_deref()
+            .ok_or_else(|| ServiceError::invalid_operation("check dispatch has no deadline"))?,
+    )
+    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+    Ok(chrono::Utc::now()
+        >= deadline.with_timezone(&chrono::Utc)
+            + chrono::Duration::seconds(
+                SETTLEMENT_GRACE_SECONDS + CHECK_UNCONFIRMED_STOP_SECONDS as i64,
+            ))
 }
 fn settlement_deadline(record: &CheckWorkerRecord) -> Result<tokio::time::Instant> {
     let deadline = chrono::DateTime::parse_from_rfc3339(

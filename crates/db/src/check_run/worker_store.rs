@@ -3,6 +3,13 @@ use super::*;
 use api_types::{CheckOwnerIdentity, CheckReceipt, WorkspaceHandleReference};
 
 pub const CHECK_AUTOMATIC_RETRIES: i64 = 2;
+/// A refused or unanswered owner acknowledgement is retried no sooner.
+pub const CHECK_ACK_RETRY_SECONDS: i64 = 60;
+/// One hour past the owner's own 24-hour retention of a check entry.
+pub const CHECK_ACK_GIVE_UP_SECONDS: i64 = 25 * 3600;
+/// An uncertain run the owner still reports as running is looked up again
+/// no sooner; the lease is kept so no other worker re-claims it meanwhile.
+pub const CHECK_RECONCILE_BACKOFF_SECONDS: i64 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "owner", rename_all = "snake_case")]
@@ -90,7 +97,9 @@ pub trait CheckWorkerRepo: CheckRunRepo + CheckDeliveryRepo {
         operation_id: &str,
         receipt: &CheckReceipt,
     ) -> Result<()>;
-    async fn unacknowledged_checks(&self, limit: i64) -> Result<Vec<CheckWorkerRecord>>;
+    /// Dispatched terminal runs whose owner entry is not yet acknowledged and
+    /// whose last attempt is older than [`CHECK_ACK_RETRY_SECONDS`].
+    async fn unacknowledged_checks(&self, now: &str, limit: i64) -> Result<Vec<CheckWorkerRecord>>;
     async fn acknowledge_check(&self, id: &str, operation_id: &str, now: &str) -> Result<()>;
     async fn defer_check_ack(&self, id: &str, operation_id: &str, now: &str) -> Result<()>;
     /// Only infrastructure outcomes get automatic retries, after reconciliation
@@ -102,6 +111,10 @@ pub trait CheckWorkerRepo: CheckRunRepo + CheckDeliveryRepo {
         now: &str,
     ) -> Result<Option<StoredCheckRun>>;
     async fn retryable_check_runs(&self, limit: i64) -> Result<Vec<String>>;
+    /// The run's consumers get its next infrastructure failure as their
+    /// answer: no automatic retry may follow an operation whose owner never
+    /// confirmed it stopped.
+    async fn exhaust_check_retries(&self, id: &str) -> Result<()>;
 }
 #[async_trait]
 impl CheckWorkerRepo for SqliteDb {
@@ -110,8 +123,15 @@ impl CheckWorkerRepo for SqliteDb {
             .bind(now).bind(limit.clamp(1,1000)).fetch_all(self.pool()).await?.into_iter().map(map_run).collect()
     }
     async fn defer_check_reconciliation(&self, fence: &CheckRunFence, now: &str) -> Result<()> {
-        let changed=sqlx::query("UPDATE check_run SET lease_owner=NULL,lease_until=NULL,version=version+1,updated_at=? WHERE id=? AND version=? AND lease_generation=? AND lease_owner=? AND state='uncertain' AND julianday(lease_until)>julianday(?)")
-            .bind(now).bind(&fence.run_id).bind(fence.version).bind(fence.lease_generation).bind(&fence.lease_owner).bind(now).execute(self.pool()).await?;
+        // The lease CHECK ties owner and expiry together, so the backoff is a
+        // short lease: nobody claims the run until it expires, then any
+        // worker (this one included) takes it over and looks it up again.
+        let until = (chrono::DateTime::parse_from_rfc3339(now)
+            .map_err(|e| DbError::Check(e.to_string()))?
+            + chrono::Duration::seconds(CHECK_RECONCILE_BACKOFF_SECONDS))
+        .to_rfc3339();
+        let changed=sqlx::query("UPDATE check_run SET lease_until=?,version=version+1,updated_at=? WHERE id=? AND version=? AND lease_generation=? AND lease_owner=? AND state='uncertain' AND julianday(lease_until)>julianday(?)")
+            .bind(until).bind(now).bind(&fence.run_id).bind(fence.version).bind(fence.lease_generation).bind(&fence.lease_owner).bind(now).execute(self.pool()).await?;
         if changed.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
@@ -270,16 +290,21 @@ impl CheckWorkerRepo for SqliteDb {
         tx.commit().await?;
         Ok(())
     }
-    async fn unacknowledged_checks(&self, limit: i64) -> Result<Vec<CheckWorkerRecord>> {
-        sqlx::query("SELECT * FROM check_run WHERE state IN ('succeeded','failed','cancelled') AND dispatch_json IS NOT NULL AND acknowledged_at IS NULL ORDER BY updated_at,created_at,id LIMIT ?").bind(limit.clamp(1,1000)).fetch_all(self.pool()).await?.into_iter().map(map_worker).collect()
+    async fn unacknowledged_checks(&self, now: &str, limit: i64) -> Result<Vec<CheckWorkerRecord>> {
+        // `acknowledge_attempted_at` is NULL until the first attempt, so a
+        // fresh result is acknowledged at once and a refused one backs off.
+        sqlx::query("SELECT * FROM check_run WHERE dispatch_json IS NOT NULL AND acknowledged_at IS NULL AND finished_at IS NOT NULL AND (acknowledge_attempted_at IS NULL OR julianday(acknowledge_attempted_at)<=julianday(?)-?/86400.0) ORDER BY updated_at LIMIT ?")
+            .bind(now).bind(CHECK_ACK_RETRY_SECONDS).bind(limit.clamp(1,1000)).fetch_all(self.pool()).await?.into_iter().map(map_worker).collect()
     }
     async fn acknowledge_check(&self, id: &str, operation_id: &str, now: &str) -> Result<()> {
         sqlx::query("UPDATE check_run SET acknowledged_at=? WHERE id=? AND operation_id=? AND state IN ('succeeded','failed','cancelled') AND acknowledged_at IS NULL").bind(now).bind(id).bind(operation_id).execute(self.pool()).await?;
         Ok(())
     }
     async fn defer_check_ack(&self, id: &str, operation_id: &str, now: &str) -> Result<()> {
-        sqlx::query("UPDATE check_run SET updated_at=?,version=version+1 WHERE id=? AND operation_id=? AND state IN ('succeeded','failed','cancelled') AND acknowledged_at IS NULL")
-            .bind(now).bind(id).bind(operation_id).execute(self.pool()).await?;
+        // The owner keeps a check entry for 24 hours at most. Past that there
+        // is nothing left to acknowledge, so the retry ends.
+        sqlx::query("UPDATE check_run SET acknowledge_attempted_at=?,updated_at=?,acknowledged_at=CASE WHEN julianday(finished_at)<=julianday(?)-?/86400.0 THEN ? END WHERE id=? AND operation_id=? AND state IN ('succeeded','failed','cancelled') AND acknowledged_at IS NULL")
+            .bind(now).bind(now).bind(now).bind(CHECK_ACK_GIVE_UP_SECONDS).bind(now).bind(id).bind(operation_id).execute(self.pool()).await?;
         Ok(())
     }
     async fn retry_infrastructure_check(
@@ -352,8 +377,15 @@ impl CheckWorkerRepo for SqliteDb {
         tx.commit().await?;
         Ok(Some(next))
     }
+    async fn exhaust_check_retries(&self, id: &str) -> Result<()> {
+        sqlx::query("UPDATE check_consumer SET infrastructure_retries=? WHERE run_id=? AND cancelled_at IS NULL AND delivery_step_id IS NULL")
+            .bind(CHECK_AUTOMATIC_RETRIES).bind(id).execute(self.pool()).await?;
+        Ok(())
+    }
     async fn retryable_check_runs(&self, limit: i64) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar("SELECT r.id FROM check_run r WHERE r.state='failed' AND EXISTS(SELECT 1 FROM check_consumer c JOIN check_result result ON result.id=c.result_id WHERE c.run_id=r.id AND c.cancelled_at IS NULL AND c.delivery_step_id IS NULL AND c.infrastructure_retries<2 AND result.outcome='infrastructure_failed' AND result.cleanup<>'uncertain') ORDER BY r.created_at,r.id LIMIT ?")
+        // Driven from the undelivered-consumer partial index, never from the
+        // history of failed runs.
+        Ok(sqlx::query_scalar("SELECT DISTINCT c.run_id FROM check_consumer c JOIN check_result result ON result.id=c.result_id JOIN check_run r ON r.id=c.run_id WHERE c.result_id IS NOT NULL AND c.delivery_step_id IS NULL AND c.cancelled_at IS NULL AND c.infrastructure_retries<2 AND result.outcome='infrastructure_failed' AND result.cleanup<>'uncertain' AND r.state='failed' LIMIT ?")
             .bind(limit.clamp(1,1000)).fetch_all(self.pool()).await?)
     }
 }

@@ -758,6 +758,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Durable check runner, not yet used by any check (3.3 stage C).** The
+  server now starts a `check-runs` worker and has a durable path for running a
+  check: one run per identical request (same Project, repository, commit and
+  check definition), a result that later identical requests can reuse when the
+  check declares its inputs controlled, recovery after a server or daemon
+  restart without running the check twice, and a slot on the machine that
+  runs the check. No existing check uses it yet: review CI, merge CI and every
+  other check run exactly as before, and with no check requested the worker
+  makes five indexed reads a second and writes nothing. `GET /api/v1/operations`
+  gains `check_runs.admitted_runs`, `check_runs.waiting_for_capacity`,
+  `check_runs.borrowed_runs` and, per machine, `check_runs` and
+  `borrowed_check_runs`; a machine's `active_runs` includes checks that hold a
+  slot of their own. The fields are additive and zero until a check uses the
+  runner.
+
 - **Workspace cleanup finishes instead of failing the same way forever (3.4
   stage A).** Before removing a Task root, on the server and on a daemon,
   Forge gives the owner full access to every directory in it (`u+rwx`; files
@@ -1724,6 +1739,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **Output a finished command wrote just before its drain limit is no longer
+  dropped.** After a command exits, Forge reads its output for a bounded time
+  (2 seconds by default, when something the command started keeps the pipe open). That limit is
+  wall-clock time, so on a busy host the limit could pass before Forge had
+  read bytes the command had already written, and the end of the output was
+  lost. Forge now reads whatever the pipe already holds once the limit passes
+  (up to 4 MiB per stream), without waiting for more.
 
 - **A lifecycle script hook no longer runs in your own checkout when the
   Task worktree is gone (3.4 stage A).** If a server-owned workspace was on
