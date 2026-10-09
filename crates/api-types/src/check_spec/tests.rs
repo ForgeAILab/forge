@@ -59,14 +59,30 @@ fn every_semantic_field_changes_the_digest_and_audit_metadata_does_not() {
     // One typed field per entry: a field `encoding()` dropped would not move
     // the digest and fails here by name.
     let changes: &[(&str, Change)] = &[
-        ("purpose", |i| i.spec.purpose = CheckPurpose::EntryCi),
-        ("whole_run_timeout_seconds", |i| {
-            i.spec.whole_run_timeout_seconds += 1
+        ("scope commit", |i| i.spec.scope = CheckScope::Commit),
+        ("scope workspace id", |i| {
+            i.spec.scope = CheckScope::Workspace {
+                workspace_id: "workspace-2".into(),
+                generation: 3,
+            }
         }),
+        ("scope workspace generation", |i| {
+            i.spec.scope = CheckScope::Workspace {
+                workspace_id: "workspace-1".into(),
+                generation: 4,
+            }
+        }),
+        ("scope task", |i| {
+            i.spec.scope = CheckScope::Task {
+                task_id: "workspace-1".into(),
+            }
+        }),
+        ("declares_cleanup", |i| i.spec.declares_cleanup = true),
         ("execution_policy", |i| i.spec.execution_policy.push('!')),
         ("command order", |i| i.spec.commands.reverse()),
         ("command removed", |i| {
             i.spec.commands.pop();
+            i.spec.configured_commands -= 1;
         }),
         ("command id", |i| i.spec.commands[0].id.push('!')),
         ("shell_text", |i| i.spec.commands[0].shell_text.push(' ')),
@@ -132,6 +148,34 @@ fn every_semantic_field_changes_the_digest_and_audit_metadata_does_not() {
         }),
         ("execution revision", |i| i.execution_revision.number += 1),
     ];
+    // Exhaustive by construction: a field added to the spec does not compile
+    // here until it is listed above (semantic) or below (not semantic).
+    let CheckSpec {
+        schema_revision: _,
+        scope: _,
+        commands: _,
+        declares_cleanup: _,
+        execution_policy: _,
+        configured_commands: _,
+        blank_commands: _,
+    } = &input.spec;
+    let CheckCommandSpec {
+        id: _,
+        shell_text: _,
+        shell: _,
+        working_directory: _,
+        environment_keys: _,
+        timeout_seconds: _,
+        failure_policy: _,
+        cacheability: _,
+        requirement_ids: _,
+    } = &input.spec.commands[0];
+    let CheckDigestInput {
+        spec: _,
+        environment: _,
+        environment_identity: _,
+        execution_revision: _,
+    } = &input;
     let mut seen = std::collections::BTreeSet::from([digest.clone()]);
     for (name, change) in changes {
         let mut changed = input.clone();
@@ -149,7 +193,38 @@ fn every_semantic_field_changes_the_digest_and_audit_metadata_does_not() {
         crate::canonical_json(&spec).unwrap()
     };
     assert_ne!(encode(CHECK_SPEC_REVISION), encode(CHECK_SPEC_REVISION + 1));
-    assert!(input.encoding().unwrap().contains("\"schema_revision\":1"));
+    assert!(input.encoding().unwrap().contains("\"schema_revision\":2"));
+
+    // Not semantic: where a blank step sat changes no command that runs.
+    let unchanged: &[(&str, Change)] = &[
+        ("one more blank step", |i| {
+            i.spec.configured_commands += 1;
+            i.spec.blank_commands.push(3);
+        }),
+        ("no blank step", |i| {
+            i.spec.configured_commands = 2;
+            i.spec.blank_commands.clear();
+        }),
+        ("blank step elsewhere", |i| i.spec.blank_commands = vec![0]),
+    ];
+    for (name, change) in unchanged {
+        let mut changed = input.clone();
+        change(&mut changed);
+        assert_eq!(changed.digest().unwrap(), digest, "{name} moved the digest");
+    }
+    // Purpose and the whole-run wall timeout are not identity inputs at all:
+    // the digest input has nowhere to put them, and nothing encodes them.
+    let encoding = input.encoding().unwrap();
+    for absent in ["purpose", "whole_run", "wall_timeout", "blank_commands"] {
+        assert!(!encoding.contains(absent), "{absent} reached the digest");
+    }
+    assert!(serde_json::to_string(&input)
+        .unwrap()
+        .contains("blank_commands"));
+    // The record of blank steps must still account for every configured step.
+    let mut changed = input.clone();
+    changed.spec.configured_commands += 1;
+    assert!(changed.digest().is_err());
 
     let mut changed = input.clone();
     changed.environment.remove("LANG");

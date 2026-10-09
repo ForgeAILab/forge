@@ -268,8 +268,10 @@ fn canonical_ci_spec_matches_the_existing_check_run_input_and_sequence() {
             event: api_types::LifecycleEvent::BeforeWork,
             role: "coder",
             owner_is_daemon: false,
-            has_workspace: true,
-            whole_run_timeout_seconds: 1800,
+            workspace: Some(review::check_spec::CheckWorkspaceIdentity {
+                workspace_id: "workspace",
+                generation: 1,
+            }),
             queue_head_bundle: None,
         },
     )

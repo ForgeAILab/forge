@@ -1,6 +1,6 @@
 //! Passive check repositories. No Task/Review writes, scheduling or execution.
 use crate::{begin_immediate, new_uuid_v4, now_rfc3339, DbError, Result, SqliteDb};
-use api_types::{CheckCommandOutcome, CheckDigestInput};
+use api_types::{CheckCommandOutcome, CheckDigestInput, CheckPurpose, CheckScope};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row};
@@ -33,10 +33,11 @@ stored_enum!(CheckResultOutcome { Pass => "pass", Fail => "fail", TimedOut => "t
 stored_enum!(CheckCleanup { Success => "success", Failed => "failed", Uncertain => "uncertain", NotPerformed => "not_performed" });
 stored_enum!(CheckConsumerOrigin { Entry => "entry", ManualReview => "manual_review", Conformance => "conformance", BeforeWork => "before_work", Lifecycle => "lifecycle", Environment => "environment", Integration => "integration" });
 
-/// State-machine DATA; lease renew/takeover are fenced self transitions.
-/// Every edge is performed by exactly one repository method: the first claim
-/// (queued to running), `finish_check_run` (cleaning to succeeded or failed,
-/// and any settlement that carries evidence) or `transition_check_run`.
+/// State-machine DATA; lease renewal is a fenced self transition.
+/// Edges are performed by: the claim (queued to running; and, when it takes
+/// over an expired lease, running, cancelling or cleaning to uncertain),
+/// `finish_check_run` (cleaning to succeeded or failed, and any settlement
+/// that carries evidence) or `transition_check_run`.
 /// A queued run has never been dispatched, so it cannot become uncertain.
 pub const CHECK_RUN_TRANSITIONS: &[(CheckRunState, CheckRunState)] = &[
     (CheckRunState::Queued, CheckRunState::Running),
@@ -103,8 +104,15 @@ pub struct CheckRunRequest {
     pub task_id: Option<String>,
     pub status_epoch: i64,
     pub origin: CheckConsumerOrigin,
+    /// Why this consumer asks. Recorded on the consumer row only: it never
+    /// decides which run the consumer gets.
+    pub purpose: CheckPurpose,
     pub workspace_id: Option<String>,
     pub machine_id: Option<String>,
+    /// The whole-run wall limit in force now. It is recorded on a run this
+    /// request schedules and is the limit that run executes under; it is not
+    /// part of the identity and is ignored when the request joins or reuses.
+    pub wall_timeout_seconds: u64,
 }
 #[derive(Debug, Clone)]
 pub struct StoredCheckRun {
@@ -117,6 +125,8 @@ pub struct StoredCheckRun {
     pub operation_id: String,
     pub workspace_id: Option<String>,
     pub machine_id: Option<String>,
+    /// The wall limit this run executes under, fixed when it was scheduled.
+    pub applied_timeout_seconds: Option<i64>,
     pub lease_owner: Option<String>,
     pub lease_generation: i64,
     pub lease_until: Option<String>,
@@ -133,6 +143,7 @@ pub struct CheckConsumer {
     pub task_id: Option<String>,
     pub status_epoch: i64,
     pub origin: CheckConsumerOrigin,
+    pub purpose: Option<CheckPurpose>,
     pub request_key: String,
     pub identity_key: String,
     pub run_id: Option<String>,
@@ -266,6 +277,7 @@ fn map_run(row: SqliteRow) -> Result<StoredCheckRun> {
         operation_id: row.try_get("operation_id")?,
         workspace_id: row.try_get("workspace_id")?,
         machine_id: row.try_get("machine_id")?,
+        applied_timeout_seconds: row.try_get("applied_timeout_seconds")?,
         lease_owner: row.try_get("lease_owner")?,
         lease_generation: row.try_get("lease_generation")?,
         lease_until: row.try_get("lease_until")?,
@@ -283,6 +295,16 @@ fn map_consumer(row: SqliteRow) -> Result<CheckConsumer> {
         task_id: row.try_get("task_id")?,
         status_epoch: row.try_get("status_epoch")?,
         origin: row.try_get::<String, _>("origin")?.parse()?,
+        purpose: row
+            .try_get::<Option<String>, _>("purpose")?
+            .map(|text| {
+                CheckPurpose::ALL
+                    .iter()
+                    .copied()
+                    .find(|purpose| purpose.as_str() == text)
+                    .ok_or_else(|| DbError::Check(format!("unknown CheckPurpose: {text}")))
+            })
+            .transpose()?,
         request_key: row.try_get("request_key")?,
         identity_key: row.try_get("identity_key")?,
         run_id: row.try_get("run_id")?,
@@ -305,7 +327,8 @@ fn map_result(row: SqliteRow) -> Result<StoredCheckResult> {
     })
 }
 const LIVE: &str = "SELECT * FROM check_run WHERE identity_key=? AND state IN ('queued','running','cancelling','cleaning','uncertain')";
-const REUSABLE: &str = "SELECT result.* FROM check_result result JOIN check_run run ON run.id=result.run_id WHERE result.identity_key=? AND result.outcome='pass' AND result.cleanup='success' AND result.certified=1 AND result.cacheable=1 AND run.cacheable=1 AND run.state='succeeded'";
+/// `certified` already holds the pass-and-cleanup rule (see `finish_check_run`).
+const REUSABLE: &str = "SELECT result.* FROM check_result result JOIN check_run run ON run.id=result.run_id WHERE result.identity_key=? AND result.outcome='pass' AND result.certified=1 AND result.cacheable=1 AND run.cacheable=1 AND run.state='succeeded'";
 /// Keep at most `budget` trailing bytes on a character boundary.
 fn keep_tail(text: &mut String, budget: usize) -> bool {
     if text.len() <= budget {
@@ -338,6 +361,28 @@ impl CheckRunRepo for SqliteDb {
         let input = json(&request.identity.inputs, CHECK_INPUT_BYTES)?;
         if request.request_key.is_empty() || request.status_epoch < 0 {
             return Err(DbError::Check("invalid check consumer identity".into()));
+        }
+        let wall_timeout = i64::try_from(request.wall_timeout_seconds)
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .ok_or_else(|| DbError::Check("check wall timeout must be positive".into()))?;
+        // A worktree- or Task-scoped identity is only this requester's to ask for.
+        match &request.identity.inputs.spec.scope {
+            CheckScope::Commit => {}
+            CheckScope::Workspace { workspace_id, .. } => {
+                if request.workspace_id.as_ref() != Some(workspace_id) {
+                    return Err(DbError::Check(
+                        "check scope names a different workspace than the request".into(),
+                    ));
+                }
+            }
+            CheckScope::Task { task_id } => {
+                if request.task_id.as_ref() != Some(task_id) {
+                    return Err(DbError::Check(
+                        "check scope names a different Task than the request".into(),
+                    ));
+                }
+            }
         }
         let mut tx = begin_immediate(self.pool()).await?;
         // Reject contradictory scope even though individual FK references exist.
@@ -379,6 +424,7 @@ impl CheckRunRepo for SqliteDb {
                 || consumer.task_id != request.task_id
                 || consumer.status_epoch != request.status_epoch
                 || consumer.origin != request.origin
+                || consumer.purpose != Some(request.purpose)
             {
                 return Err(DbError::IdempotencyConflict);
             }
@@ -413,16 +459,16 @@ impl CheckRunRepo for SqliteDb {
             (map_run(row)?.id, None, CheckRequestDisposition::Joined)
         } else {
             let id = new_uuid_v4();
-            sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,workspace_id,machine_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,'queued',?,?,?,?,?)")
+            sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,workspace_id,machine_id,applied_timeout_seconds,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?)")
                 .bind(&id).bind(&request.identity.project_id).bind(&request.identity.repo_id).bind(&request.identity.commit_sha)
                 .bind(request.identity.inputs.digest().map_err(DbError::Check)?).bind(&key).bind(input).bind(request.identity.inputs.reusable_inputs())
-                .bind(new_uuid_v4()).bind(&request.workspace_id).bind(&request.machine_id).bind(&now).bind(&now).execute(&mut *tx).await?;
+                .bind(new_uuid_v4()).bind(&request.workspace_id).bind(&request.machine_id).bind(wall_timeout).bind(&now).bind(&now).execute(&mut *tx).await?;
             (id, None, CheckRequestDisposition::Scheduled)
         };
         let id = new_uuid_v4();
-        sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,request_key,identity_key,run_id,result_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,purpose,request_key,identity_key,run_id,result_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&id).bind(&request.identity.project_id).bind(&request.identity.repo_id).bind(&request.task_id).bind(request.status_epoch)
-            .bind(request.origin.to_string()).bind(&request.request_key).bind(key).bind(run_id).bind(result_id).bind(now).execute(&mut *tx).await?;
+            .bind(request.origin.to_string()).bind(request.purpose.as_str()).bind(&request.request_key).bind(key).bind(run_id).bind(result_id).bind(now).execute(&mut *tx).await?;
         let consumer = map_consumer(
             sqlx::query("SELECT * FROM check_consumer WHERE id=?")
                 .bind(id)
@@ -466,7 +512,11 @@ impl CheckRunRepo for SqliteDb {
         if owner.is_empty() {
             return Err(DbError::Check("check lease owner is empty".into()));
         }
-        let row = sqlx::query("UPDATE check_run SET state=CASE WHEN state='queued' THEN 'running' ELSE state END,lease_owner=?,lease_until=?,lease_generation=lease_generation+1,version=version+1,updated_at=? WHERE id=? AND version=? AND state IN ('queued','running','cancelling','cleaning','uncertain') AND (lease_until IS NULL OR julianday(lease_until)<=julianday(?)) RETURNING *")
+        // Nobody started a queued run, so it is simply claimed. Taking over an
+        // expired lease on a dispatched run is different: the previous owner
+        // may still be executing, so the run becomes uncertain and can only
+        // be reconciled or superseded, never continued or relaunched.
+        let row = sqlx::query("UPDATE check_run SET state=CASE WHEN state='queued' THEN 'running' ELSE 'uncertain' END,lease_owner=?,lease_until=?,lease_generation=lease_generation+1,version=version+1,updated_at=? WHERE id=? AND version=? AND state IN ('queued','running','cancelling','cleaning','uncertain') AND (lease_until IS NULL OR julianday(lease_until)<=julianday(?)) RETURNING *")
             .bind(owner).bind(until).bind(now).bind(id).bind(version).bind(now).fetch_optional(self.pool()).await?.ok_or(DbError::VersionConflict)?;
         map_run(row)
     }
@@ -581,8 +631,14 @@ impl CheckRunRepo for SqliteDb {
                 "passing result requires every declared command to pass".into(),
             ));
         }
+        // A bundle with no cleanup step has nothing to clean: `not_performed`
+        // is then the complete, expected receipt. When the spec declares a
+        // cleanup step, only a performed and successful cleanup certifies.
+        // A timed-out, failed or cancelled run is never certified.
         let certified = evidence.outcome == CheckResultOutcome::Pass
-            && evidence.cleanup == CheckCleanup::Success;
+            && (evidence.cleanup == CheckCleanup::Success
+                || (evidence.cleanup == CheckCleanup::NotPerformed
+                    && !run.identity.inputs.spec.declares_cleanup));
         let state = if evidence.cleanup == CheckCleanup::Uncertain {
             CheckRunState::Uncertain
         } else if certified {
@@ -674,7 +730,7 @@ impl CheckRunRepo for SqliteDb {
                 .by_state
                 .insert(row.try_get("state")?, row.try_get("n")?);
         }
-        counts.reusable_results = sqlx::query_scalar("SELECT COUNT(*) FROM check_result result JOIN check_run run ON run.id=result.run_id WHERE result.outcome='pass' AND result.cleanup='success' AND result.certified=1 AND result.cacheable=1 AND run.cacheable=1 AND run.state='succeeded'").fetch_one(self.pool()).await?;
+        counts.reusable_results = sqlx::query_scalar("SELECT COUNT(*) FROM check_result result JOIN check_run run ON run.id=result.run_id WHERE result.outcome='pass' AND result.certified=1 AND result.cacheable=1 AND run.cacheable=1 AND run.state='succeeded'").fetch_one(self.pool()).await?;
         Ok(counts)
     }
 }

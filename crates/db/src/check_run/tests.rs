@@ -32,8 +32,8 @@ fn identity() -> CheckRunIdentity {
         commit_sha: "a".repeat(40),
         inputs: CheckDigestInput {
             spec: CheckSpec {
-                schema_revision: 1,
-                purpose: CheckPurpose::EntryCi,
+                schema_revision: CHECK_SPEC_REVISION,
+                scope: CheckScope::Commit,
                 commands: vec![CheckCommandSpec {
                     id: "ci:0".into(),
                     shell_text: "cargo test".into(),
@@ -45,7 +45,9 @@ fn identity() -> CheckRunIdentity {
                     cacheability: CheckCacheability::DeclaredControlledInputs,
                     requirement_ids: Default::default(),
                 }],
-                whole_run_timeout_seconds: 1800,
+                declares_cleanup: false,
+                configured_commands: 1,
+                blank_commands: vec![],
                 execution_policy: "controlled/1".into(),
             },
             environment: Default::default(),
@@ -66,8 +68,10 @@ fn request(key: &str) -> CheckRunRequest {
         task_id: Some("t".into()),
         status_epoch: 0,
         origin: CheckConsumerOrigin::Entry,
+        purpose: CheckPurpose::EntryCi,
         workspace_id: Some("w".into()),
         machine_id: Some("m".into()),
+        wall_timeout_seconds: 1800,
     }
 }
 fn fence(run: &StoredCheckRun) -> CheckRunFence {
@@ -345,6 +349,7 @@ async fn a_long_bundle_shrinks_its_tails_to_fit_the_row_instead_of_refusing_to_s
             ..template.clone()
         })
         .collect();
+    req.identity.inputs.spec.configured_commands = 64;
     let run = cleaning(&db, req).await;
     let mut output = evidence(CheckResultOutcome::Pass, CheckCleanup::Success);
     let step = output.commands[0].clone();
@@ -517,6 +522,7 @@ async fn lease_takeover_renews_generation_and_fences_stale_finish() {
         .unwrap();
     assert_eq!(takeover.lease_generation, first.lease_generation + 1);
     assert_eq!(takeover.operation_id, first.operation_id);
+    assert_eq!(takeover.state, CheckRunState::Uncertain);
     assert!(matches!(
         db.renew_check_run(&fence(&first), NOW, UNTIL).await,
         Err(DbError::VersionConflict)
@@ -672,8 +678,13 @@ async fn failed_timeout_cancelled_and_cleanup_failure_results_never_reuse() {
         (CheckResultOutcome::Pass, CheckCleanup::Uncertain),
     ] {
         let db = fixture().await;
-        let result = complete(&db, request("one"), outcome, cleanup).await;
+        // The bundle declares a cleanup step, so an unperformed one is incomplete.
+        let mut req = request("one");
+        req.identity.inputs.spec.declares_cleanup = true;
+        let declared = req.identity.clone();
+        let result = complete(&db, req, outcome, cleanup).await;
         assert!(!result.certified);
+        assert!(db.reusable_check_result(&declared).await.unwrap().is_none());
         assert!(db
             .reusable_check_result(&identity())
             .await
@@ -952,6 +963,10 @@ async fn upgrade_preserves_old_rows_and_never_seeds_cache() {
             .file_name()
             .to_string_lossy()
             .ends_with("__check_runs.sql")
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with("__check_run_identity.sql")
         {
             continue;
         }
@@ -1045,4 +1060,554 @@ fn mutable_refs_and_abbreviated_objects_are_not_check_identities() {
         input.commit_sha = valid;
         assert!(input.key().is_ok());
     }
+}
+
+/// A second Task `t2` with its own worktree `w2`, at the same commit.
+async fn seed_second_task(db: &SqliteDb) {
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('t2','p','task two','todo',?,?)").bind(NOW).bind(NOW).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES('w2','t2','r',?,'task/branch-two','ready',?,?)")
+        .bind(std::env::temp_dir().join("check-contract-workspace-two").to_str().unwrap()).bind(NOW).bind(NOW).execute(db.pool()).await.unwrap();
+}
+/// The same blocking before-work script, asked for by `task` in `workspace`.
+fn before_work(key: &str, task: &str, workspace: &str) -> CheckRunRequest {
+    let mut req = request(key);
+    req.task_id = Some(task.into());
+    req.workspace_id = Some(workspace.into());
+    req.origin = CheckConsumerOrigin::BeforeWork;
+    req.purpose = CheckPurpose::BeforeWork;
+    let spec = &mut req.identity.inputs.spec;
+    spec.scope = CheckScope::Workspace {
+        workspace_id: workspace.into(),
+        generation: 1,
+    };
+    spec.commands[0].id = "hook:0".into();
+    spec.commands[0].shell_text = "./prepare-worktree".into();
+    spec.commands[0].cacheability = CheckCacheability::Uncacheable;
+    req
+}
+async fn rows(db: &SqliteDb, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn two_tasks_at_one_commit_each_prepare_their_worktree_and_share_one_commit_check() {
+    let db = fixture().await;
+    seed_second_task(&db).await;
+    let first = db
+        .request_check_run(before_work("prepare-1", "t", "w"))
+        .await
+        .unwrap();
+    let second = db
+        .request_check_run(before_work("prepare-2", "t2", "w2"))
+        .await
+        .unwrap();
+    for response in [&first, &second] {
+        assert!(matches!(
+            response.disposition,
+            CheckRequestDisposition::Scheduled
+        ));
+    }
+    assert_ne!(first.consumer.run_id, second.consumer.run_id);
+    assert_ne!(first.consumer.identity_key, second.consumer.identity_key);
+    assert_eq!(rows(&db, "check_run").await, 2);
+    // The same worktree asking twice still joins its own run.
+    let again = db
+        .request_check_run(before_work("prepare-1-again", "t", "w"))
+        .await
+        .unwrap();
+    assert_eq!(again.consumer.run_id, first.consumer.run_id);
+    // A re-placed worktree (next generation) is a new target.
+    let mut regenerated = before_work("prepare-1-regenerated", "t", "w");
+    regenerated.identity.inputs.spec.scope = CheckScope::Workspace {
+        workspace_id: "w".into(),
+        generation: 2,
+    };
+    assert!(matches!(
+        db.request_check_run(regenerated).await.unwrap().disposition,
+        CheckRequestDisposition::Scheduled
+    ));
+    // A requester cannot ask for another worktree's or Task's scoped run.
+    let mut foreign = before_work("foreign", "t", "w");
+    foreign.workspace_id = Some("w2".into());
+    assert!(matches!(
+        db.request_check_run(foreign).await,
+        Err(DbError::Check(_))
+    ));
+    let mut foreign = before_work("foreign-task", "t2", "w2");
+    foreign.identity.inputs.spec.scope = CheckScope::Task {
+        task_id: "t".into(),
+    };
+    assert!(matches!(
+        db.request_check_run(foreign).await,
+        Err(DbError::Check(_))
+    ));
+
+    // CI that only reads the commit carries no Task or workspace: both Tasks
+    // share one run, whichever worktree it is placed in.
+    let ci_first = db.request_check_run(request("ci-1")).await.unwrap();
+    let mut other = request("ci-2");
+    other.task_id = Some("t2".into());
+    other.workspace_id = Some("w2".into());
+    let ci_second = db.request_check_run(other).await.unwrap();
+    assert!(matches!(
+        ci_second.disposition,
+        CheckRequestDisposition::Joined
+    ));
+    assert_eq!(ci_first.consumer.run_id, ci_second.consumer.run_id);
+    assert_eq!(rows(&db, "check_run").await, 4);
+}
+#[tokio::test]
+async fn purpose_is_recorded_on_the_consumer_and_never_splits_a_run() {
+    let db = fixture().await;
+    let entry = db.request_check_run(request("entry")).await.unwrap();
+    let mut review = request("review");
+    review.origin = CheckConsumerOrigin::ManualReview;
+    review.purpose = CheckPurpose::ReviewCi;
+    let review = db.request_check_run(review).await.unwrap();
+    assert!(matches!(
+        review.disposition,
+        CheckRequestDisposition::Joined
+    ));
+    assert_eq!(entry.consumer.run_id, review.consumer.run_id);
+    assert_eq!(entry.consumer.identity_key, review.consumer.identity_key);
+    assert_eq!(entry.consumer.purpose, Some(CheckPurpose::EntryCi));
+    assert_eq!(review.consumer.purpose, Some(CheckPurpose::ReviewCi));
+    assert_eq!(
+        (
+            rows(&db, "check_run").await,
+            rows(&db, "check_consumer").await
+        ),
+        (1, 2)
+    );
+    // Every purpose is storable, and all of them share the one run.
+    for purpose in CheckPurpose::ALL {
+        let mut req = request(purpose.as_str());
+        req.purpose = *purpose;
+        let consumer = db.request_check_run(req).await.unwrap().consumer;
+        assert_eq!(consumer.purpose, Some(*purpose));
+        assert_eq!(consumer.run_id, entry.consumer.run_id);
+    }
+    assert_eq!(rows(&db, "check_run").await, 1);
+    // The request key still pins what its consumer asked for.
+    let mut changed = request("entry");
+    changed.purpose = CheckPurpose::QueueHeadCi;
+    assert!(matches!(
+        db.request_check_run(changed).await,
+        Err(DbError::IdempotencyConflict)
+    ));
+}
+/// A certified reusable pass for `identity()`, then a request that differs
+/// only by `change`: it must neither reuse that result nor join a live run.
+async fn assert_never_shared(change: fn(&mut CheckRunIdentity)) {
+    let db = fixture().await;
+    let result = complete(
+        &db,
+        request("one"),
+        CheckResultOutcome::Pass,
+        CheckCleanup::Success,
+    )
+    .await;
+    assert!(result.certified && result.cacheable);
+    let mut changed = request("two");
+    change(&mut changed.identity);
+    let other = changed.identity.clone();
+    assert!(db.reusable_check_result(&other).await.unwrap().is_none());
+    let scheduled = db.request_check_run(changed).await.unwrap();
+    assert!(matches!(
+        scheduled.disposition,
+        CheckRequestDisposition::Scheduled
+    ));
+    assert_eq!(scheduled.consumer.result_id, None);
+    assert_ne!(
+        scheduled.consumer.run_id.as_deref(),
+        Some(result.run_id.as_str())
+    );
+    // While that second run is live, the original identity does not join it.
+    let original = db.request_check_run(request("three")).await.unwrap();
+    assert!(matches!(
+        original.disposition,
+        CheckRequestDisposition::Reused
+    ));
+    assert_eq!(
+        db.find_live_check_run(&other).await.unwrap().unwrap().id,
+        scheduled.consumer.run_id.unwrap()
+    );
+    assert!(db.find_live_check_run(&identity()).await.unwrap().is_none());
+}
+#[tokio::test]
+async fn a_result_never_crosses_environment_attestations() {
+    // Another machine or environment attests different inputs.
+    assert_never_shared(|identity| {
+        identity.inputs.environment_identity = CheckEnvironmentIdentity::Attested {
+            input_digest: "b".repeat(64),
+        }
+    })
+    .await;
+}
+#[tokio::test]
+async fn a_result_never_survives_a_forced_rerun_revision() {
+    assert_never_shared(|identity| {
+        identity.inputs.execution_revision = CheckExecutionRevision {
+            number: 1,
+            audit_ref: Some("owner-forced-rerun".into()),
+        }
+    })
+    .await;
+}
+const AFTER: &str = "2026-10-08T00:01:01Z";
+const AFTER_UNTIL: &str = "2026-10-08T00:02:00Z";
+#[tokio::test]
+async fn taking_over_an_expired_lease_makes_a_dispatched_run_uncertain() {
+    for state in [
+        CheckRunState::Running,
+        CheckRunState::Cancelling,
+        CheckRunState::Cleaning,
+    ] {
+        let db = fixture().await;
+        let lost = run_in(&db, state).await;
+        // An unexpired lease is not taken over at all.
+        assert!(matches!(
+            db.claim_check_run(&lost.id, lost.version, "second", NOW, UNTIL)
+                .await,
+            Err(DbError::VersionConflict)
+        ));
+        let taken = db
+            .claim_check_run(&lost.id, lost.version, "second", AFTER, AFTER_UNTIL)
+            .await
+            .unwrap();
+        assert_eq!(taken.state, CheckRunState::Uncertain, "{state}");
+        assert_eq!(taken.lease_owner.as_deref(), Some("second"));
+        assert_eq!(taken.operation_id, lost.operation_id);
+        assert_eq!(taken.finished_at, None);
+        // The lost owner is fenced out; the new one cannot continue the run.
+        assert!(matches!(
+            db.transition_check_run(&fence(&lost), CheckRunState::Cleaning, AFTER)
+                .await,
+            Err(DbError::VersionConflict)
+        ));
+        assert!(matches!(
+            db.transition_check_run(&fence(&taken), CheckRunState::Running, AFTER)
+                .await,
+            Err(DbError::InvalidTransition)
+        ));
+        assert!(matches!(
+            db.finish_check_run(
+                &fence(&taken),
+                evidence(CheckResultOutcome::Pass, CheckCleanup::Success),
+                AFTER
+            )
+            .await,
+            Err(DbError::InvalidTransition)
+        ));
+        // It still occupies the identity: nobody launches a duplicate.
+        assert!(matches!(
+            db.request_check_run(request("late"))
+                .await
+                .unwrap()
+                .disposition,
+            CheckRequestDisposition::Joined
+        ));
+        // The only exits are stage A's: reconcile with evidence, or cancel.
+        let reconciling = db
+            .transition_check_run(&fence(&taken), CheckRunState::Cleaning, AFTER)
+            .await
+            .unwrap();
+        let settled = db
+            .finish_check_run(
+                &fence(&reconciling),
+                evidence(CheckResultOutcome::Pass, CheckCleanup::Success),
+                AFTER,
+            )
+            .await
+            .unwrap();
+        assert!(settled.certified);
+    }
+    // Nobody started a queued run: claiming it simply starts it.
+    let db = fixture().await;
+    let queued = run_in(&db, CheckRunState::Queued).await;
+    let started = db
+        .claim_check_run(&queued.id, queued.version, "second", AFTER, AFTER_UNTIL)
+        .await
+        .unwrap();
+    assert_eq!(started.state, CheckRunState::Running);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_takeover_of_an_expired_running_lease_has_one_winner_and_is_uncertain() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = create_sqlite_pool(&format!(
+        "sqlite://{}",
+        dir.path().join("takeover.db").display()
+    ))
+    .await
+    .unwrap();
+    run_migrations(&pool).await.unwrap();
+    let db = Arc::new(SqliteDb::new(pool));
+    seed(&db).await;
+    let running = run_in(&db, CheckRunState::Running).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(8));
+    let mut claims = Vec::new();
+    for n in 0..8 {
+        let (db, barrier, id) = (db.clone(), barrier.clone(), running.id.clone());
+        claims.push(tokio::spawn(async move {
+            barrier.wait().await;
+            db.claim_check_run(
+                &id,
+                running.version,
+                &format!("taker-{n}"),
+                AFTER,
+                AFTER_UNTIL,
+            )
+            .await
+        }));
+    }
+    let mut winners = Vec::new();
+    for claim in claims {
+        match claim.await.unwrap() {
+            Ok(run) => winners.push(run),
+            Err(DbError::VersionConflict) => {}
+            other => panic!("unexpected takeover {other:?}"),
+        }
+    }
+    assert_eq!(winners.len(), 1);
+    let stored = db.check_run(&running.id).await.unwrap().unwrap();
+    assert_eq!(winners[0].state, CheckRunState::Uncertain);
+    assert_eq!(stored.state, CheckRunState::Uncertain);
+    assert_eq!(stored.lease_owner, winners[0].lease_owner);
+    assert_eq!(stored.lease_generation, running.lease_generation + 1);
+    assert_eq!(stored.version, running.version + 1);
+    db.pool().close().await;
+}
+#[tokio::test]
+async fn a_pass_without_a_cleanup_step_settles_passed_and_a_declared_cleanup_must_run() {
+    for (declares_cleanup, cleanup, passed) in [
+        (false, CheckCleanup::NotPerformed, true),
+        (false, CheckCleanup::Success, true),
+        (true, CheckCleanup::NotPerformed, false),
+        (true, CheckCleanup::Success, true),
+        (false, CheckCleanup::Failed, false),
+    ] {
+        let db = fixture().await;
+        let mut req = request("one");
+        req.identity.inputs.spec.declares_cleanup = declares_cleanup;
+        let asked = req.identity.clone();
+        let result = complete(&db, req, CheckResultOutcome::Pass, cleanup).await;
+        let case = format!("declares_cleanup={declares_cleanup} cleanup={cleanup}");
+        assert_eq!(result.certified, passed, "{case}");
+        assert_eq!(result.cleanup, cleanup, "{case}");
+        assert_eq!(
+            db.check_run(&result.run_id).await.unwrap().unwrap().state,
+            if passed {
+                CheckRunState::Succeeded
+            } else {
+                CheckRunState::Failed
+            },
+            "{case}"
+        );
+        assert_eq!(
+            db.reusable_check_result(&asked).await.unwrap().is_some(),
+            passed,
+            "{case}"
+        );
+        assert_eq!(
+            db.check_run_counts().await.unwrap().reusable_results,
+            i64::from(passed),
+            "{case}"
+        );
+    }
+    // Only a pass is ever certified without a cleanup.
+    let db = fixture().await;
+    let failed = complete(
+        &db,
+        request("one"),
+        CheckResultOutcome::Fail,
+        CheckCleanup::NotPerformed,
+    )
+    .await;
+    assert!(!failed.certified);
+}
+#[tokio::test]
+async fn the_wall_timeout_is_recorded_on_the_run_and_is_not_part_of_its_identity() {
+    let db = fixture().await;
+    let applied = |id: String| {
+        let db = &db;
+        async move {
+            db.check_run(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .applied_timeout_seconds
+        }
+    };
+    let first = db.request_check_run(request("one")).await.unwrap();
+    let run_id = first.consumer.run_id.clone().unwrap();
+    assert_eq!(applied(run_id.clone()).await, Some(1800));
+    // The setting changed while the run is live: same run, same recorded limit.
+    let mut joined = request("two");
+    joined.wall_timeout_seconds = 60;
+    let joined = db.request_check_run(joined).await.unwrap();
+    assert_eq!(joined.consumer.identity_key, first.consumer.identity_key);
+    assert_eq!(joined.consumer.run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(applied(run_id.clone()).await, Some(1800));
+    let run = db
+        .claim_check_run(&run_id, 1, "worker", NOW, UNTIL)
+        .await
+        .unwrap();
+    let run = db
+        .transition_check_run(&fence(&run), CheckRunState::Cleaning, NOW)
+        .await
+        .unwrap();
+    let passed = db
+        .finish_check_run(
+            &fence(&run),
+            evidence(CheckResultOutcome::Pass, CheckCleanup::Success),
+            NOW,
+        )
+        .await
+        .unwrap();
+    // Raising or lowering the setting never invalidates the reusable result.
+    for (key, seconds) in [("raised", 7200), ("lowered", 30)] {
+        let mut later = request(key);
+        later.wall_timeout_seconds = seconds;
+        let later = db.request_check_run(later).await.unwrap();
+        assert!(matches!(later.disposition, CheckRequestDisposition::Reused));
+        assert_eq!(
+            later.consumer.result_id.as_deref(),
+            Some(passed.id.as_str())
+        );
+    }
+    assert_eq!(rows(&db, "check_run").await, 1);
+
+    // A run that ended by timeout is never a reusable result, so the same
+    // identity runs again under the limit in force then.
+    let mut short = request("short");
+    short.identity.commit_sha = "b".repeat(40);
+    short.wall_timeout_seconds = 60;
+    let identity = short.identity.clone();
+    let timed_out = complete(
+        &db,
+        short,
+        CheckResultOutcome::TimedOut,
+        CheckCleanup::Success,
+    )
+    .await;
+    assert!(!timed_out.certified);
+    assert!(db.reusable_check_result(&identity).await.unwrap().is_none());
+    let mut raised = request("after-raise");
+    raised.identity = identity;
+    raised.wall_timeout_seconds = 3600;
+    let raised = db.request_check_run(raised).await.unwrap();
+    assert!(matches!(
+        raised.disposition,
+        CheckRequestDisposition::Scheduled
+    ));
+    assert_eq!(raised.consumer.identity_key, timed_out.identity_key);
+    assert_eq!(applied(raised.consumer.run_id.unwrap()).await, Some(3600));
+    assert_eq!(applied(timed_out.run_id).await, Some(60));
+
+    let mut unbounded = request("zero");
+    unbounded.wall_timeout_seconds = 0;
+    assert!(matches!(
+        db.request_check_run(unbounded).await,
+        Err(DbError::Check(_))
+    ));
+}
+#[tokio::test]
+async fn identity_migration_carries_stage_a_rows_and_their_result_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let migrations = dir.path().join("migrations");
+    std::fs::create_dir(&migrations).unwrap();
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let entry = entry.unwrap();
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with("__check_run_identity.sql")
+        {
+            std::fs::copy(entry.path(), migrations.join(entry.file_name())).unwrap();
+        }
+    }
+    let pool = create_sqlite_pool(&format!(
+        "sqlite://{}",
+        dir.path().join("identity.db").display()
+    ))
+    .await
+    .unwrap();
+    crate::run_migrations_from(&pool, &migrations)
+        .await
+        .unwrap();
+    let db = SqliteDb::new(pool);
+    seed(&db).await;
+    // Rows as stage A's tables would have held them.
+    sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,created_at,updated_at) VALUES('run','p','r',?,'digest','key','{}',1,'succeeded','operation',?,?)")
+        .bind("a".repeat(40)).bind(NOW).bind(NOW).execute(db.pool()).await.unwrap();
+    for (id, outcome, certified) in [("pass", "pass", 1), ("fail", "fail", 0)] {
+        sqlx::query("INSERT INTO check_result(id,run_id,identity_key,outcome,cleanup,certified,cacheable,steps_json,output_truncated,created_at) VALUES(?,'run','key',?,'success',?,1,'[]',0,?)")
+            .bind(id).bind(outcome).bind(certified).bind(NOW).execute(db.pool()).await.unwrap();
+    }
+    for (id, result) in [("linked", Some("pass")), ("unlinked", None)] {
+        sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,request_key,identity_key,run_id,result_id,created_at) VALUES(?,'p','r','t',0,'entry',?,'key','run',?,?)")
+            .bind(id).bind(id).bind(result).bind(NOW).execute(db.pool()).await.unwrap();
+    }
+    let before = legacy_snapshot(&db).await;
+    crate::run_migrations_from(db.pool(), &source)
+        .await
+        .unwrap();
+    assert_eq!(before, legacy_snapshot(&db).await);
+    assert_eq!(counts(&db).await, (1, 2, 2));
+    let links: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT id,result_id,purpose FROM check_consumer ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        links,
+        [
+            ("linked".into(), Some("pass".into()), None),
+            ("unlinked".into(), None, None)
+        ]
+    );
+    let results: Vec<(String, String, bool)> =
+        sqlx::query_as("SELECT id,outcome,certified FROM check_result ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        results,
+        [
+            ("fail".into(), "fail".into(), false),
+            ("pass".into(), "pass".into(), true)
+        ]
+    );
+    let run = sqlx::query("SELECT applied_timeout_seconds FROM check_run WHERE id='run'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(run.get::<Option<i64>, _>(0), None);
+    // The rebuilt table keeps its guards and its link to the run.
+    let insert = "INSERT INTO check_result(id,run_id,identity_key,outcome,cleanup,certified,cacheable,steps_json,output_truncated,created_at) VALUES(?,'run','key',?,?,1,0,'[]',0,?)";
+    for (id, outcome, cleanup, accepted) in [
+        ("no-cleanup", "pass", "not_performed", true),
+        ("failed-cleanup", "pass", "failed", false),
+        ("uncertain-cleanup", "pass", "uncertain", false),
+        ("timed-out", "timed_out", "success", false),
+    ] {
+        let inserted = sqlx::query(insert)
+            .bind(id)
+            .bind(outcome)
+            .bind(cleanup)
+            .bind(NOW)
+            .execute(db.pool())
+            .await;
+        assert_eq!(inserted.is_ok(), accepted, "{id}");
+    }
+    sqlx::query("DELETE FROM check_run WHERE id='run'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows(&db, "check_result").await, 0);
+    assert_eq!(rows(&db, "check_consumer").await, 2);
+    db.pool().close().await;
 }

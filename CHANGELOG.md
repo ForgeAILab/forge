@@ -612,6 +612,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the tables `check_run`, `check_result` and `check_consumer` (new migration,
   existing rows untouched, no cache seeded from old reviews); and fenced
   repositories for them. Every check configured today builds as uncacheable.
+  The run identity (digest `forge.check-execution/2`) holds what executes
+  and where it may be shared, and nothing else: a check that only reads a
+  commit is shared by every Task at that commit, while before-work, lifecycle,
+  environment-preflight and setup-bearing conformance bundles carry the
+  workspace and its generation so each worktree is prepared. The asker's
+  purpose and the whole-run timeout are not identity inputs (purpose is
+  recorded per consumer, the applied timeout per run), so entry and review CI
+  on one commit share a run and changing the timeout setting invalidates
+  nothing. A new owner taking over an expired lease on a dispatched run marks
+  it `uncertain` instead of continuing it; a pass settles as passed when the
+  bundle declares no cleanup step; blank CI steps are dropped from the spec
+  (and recorded) instead of being refused.
 - **New server setting `server.check_run_timeout_seconds`** (default 1800,
   positive integer; `--check-run-timeout-seconds`, then
   `FORGE_SERVER_CHECK_RUN_TIMEOUT_SECONDS`, then `forge.yaml`). It defines the
