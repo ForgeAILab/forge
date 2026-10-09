@@ -1077,6 +1077,55 @@ async fn command_drain_preserves_output_without_claiming_size_truncation() {
     assert!(output.stdout_drain_incomplete && output.stderr_drain_incomplete);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn cleanup_reclaims_a_read_only_tree_and_leaves_link_targets_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let set_mode = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let fixture = Fixture::new().await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("kept"), "outside").unwrap();
+    set_mode(&outside.path().join("kept"), 0o400);
+    // A module cache the toolchain wrote read-only, in the worktree and
+    // beside it in the handle's directory.
+    let task_root = fixture.path().parent().unwrap().to_path_buf();
+    for cache in [fixture.path().join("pkg/mod"), task_root.join("cache/mod")] {
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("module.go"), "package module\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("kept"), cache.join("escape")).unwrap();
+        set_mode(&cache.join("module.go"), 0o400);
+        set_mode(&cache, 0o500);
+        set_mode(cache.parent().unwrap(), 0o500);
+    }
+    let handle = fixture.prepared.workspace.workspace_handle.clone();
+    let cleanup = WorkspaceCleanupParams {
+        fence: fence("read-only-cleanup", 1, &fixture.prepared.workspace.base_sha),
+        workspace_handle: handle.clone(),
+    };
+
+    fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_CLEANUP,
+            serde_json::to_value(cleanup).unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap();
+
+    assert!(!task_root.exists());
+    assert!(fixture.backend.state.lock().unwrap().handles[&handle].cleaned);
+    let kept = outside.path().join("kept");
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "outside");
+    assert_eq!(
+        std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+}
+
 #[tokio::test]
 async fn cleanup_prunes_handle_and_execution_ids_on_ack() {
     let fixture = Fixture::new().await;

@@ -2618,6 +2618,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_cleanup_never_deletes_a_branch_forge_did_not_name_for_the_task() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        // Merged branches of the user's, one of them under `task/`, and the
+        // target itself: a row that names one of them deletes nothing.
+        for recorded in ["task/users-own", "feature/mine", "main"] {
+            let (workspace_id, worktree_path) =
+                seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+            let (source, task_branch) = fixture_source(&db, temp.path(), &workspace_id).await;
+            fixture_git(
+                &source,
+                &["merge", "--no-ff", "-m", "deliver", &task_branch],
+            )
+            .await;
+            if recorded != "main" {
+                fixture_git(&source, &["branch", recorded, "main"]).await;
+            }
+            sqlx::query("UPDATE workspace SET branch = ? WHERE id = ?")
+                .bind(recorded)
+                .bind(&workspace_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+
+            clean_due(&scheduler, &workspace_id).await;
+
+            assert!(!worktree_path.exists());
+            assert_eq!(
+                WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                WorkspaceStatus::Cleaned
+            );
+            assert!(git::branch_exists(&source, recorded).await.unwrap());
+            // The Task's own branch is not what the row names, so it stays too.
+            assert!(git::branch_exists(&source, &task_branch).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
     async fn leftovers_of_an_already_cleaned_workspace_keep_its_branch() {
         let db = sqlite_db().await;
         let temp = TempDir::new().unwrap();

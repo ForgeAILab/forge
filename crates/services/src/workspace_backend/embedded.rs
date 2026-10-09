@@ -574,7 +574,20 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
             .cleanup_worktree(&workspace.task_id, &source, path)
             .await
         {
-            Ok(()) => Ok(CleanupAck { removed: existed }),
+            Ok(()) => {
+                if !existed && workspace.status != WorkspaceStatus::Cleaned {
+                    // Success with nothing at the recorded path: either the
+                    // directory was already removed, or the row names the
+                    // wrong place and the real one is still on disk.
+                    tracing::warn!(
+                        workspace_id = %workspace.id,
+                        task_id = %workspace.task_id,
+                        path = %path.display(),
+                        "workspace cleanup found no directory at the recorded path"
+                    );
+                }
+                Ok(CleanupAck { removed: existed })
+            }
             Err(WorkspaceError::NotFound) => Ok(CleanupAck { removed: false }),
             Err(error) => Err(error.into()),
         }

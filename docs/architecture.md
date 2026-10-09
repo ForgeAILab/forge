@@ -5281,14 +5281,31 @@ for 24 hours to preserve uncommitted work. Cleanup is deferred while any
 execution or WorkspaceLease is active, and a root shared by subtasks is kept
 until every child is terminal.
 
+The only directory workspace cleanup may delete is
+`<workspace root>/<task id>`. The id must be one plain path component that
+does not start with a dot (not empty, `.`, `..`, absolute or nested, and
+not `.repos` / `.forge`); the worktree must be its direct child; neither
+the Task root nor the worktree path may be a symbolic link; the repository
+must not live inside the Task root. Anything else is refused with
+`path escapes worktree root` before a file is touched. Only linked
+worktrees count as registrations: the main working tree of a repository is
+never matched. The workspace root itself may sit behind a link; Git's
+resolved paths are matched against the resolved root.
+
 Reclaiming one Task root is one sequence in the `workspace` crate
 (`WorkspaceManager::cleanup_worktree`), used by the server backend and by the
 daemon `cleanup` handler:
 
-1. Make the Task root owner-writable (`u+rwx` on directories, `u+rw` on files),
-   recursively. Symbolic links are never followed or changed, so nothing
-   outside the root is touched. Toolchains leave read-only trees behind (a Go
-   module cache, for one); without this step every retry failed the same way.
+1. Give the owner full access (`u+rwx`) to every directory under the Task
+   root. Files are not changed (a file's mode does not stop its removal on
+   Unix). Symbolic links are never followed or changed, and a mode is changed
+   through a handle that is first checked to be the directory just inspected,
+   so nothing outside the root is touched. Toolchains leave read-only trees
+   behind (a Go module cache, for one); without this step every retry failed
+   the same way. A directory its owner cannot read is not repaired and fails
+   the cleanup. The walk and `git worktree remove` go by path, so they rely on
+   nothing writing into the tree: cleanup runs only when no execution or lease
+   is active.
 2. `git worktree remove --force` for the Task's exact worktree.
 3. Remove what is left of the Task root: build output, execution outboxes,
    `plan.md`, and any `<name>.broken-<ms>` copy an earlier worktree recovery
@@ -5309,7 +5326,9 @@ workspace, Forge deletes the Task branch when the change is delivered. Delivery
 is decided by Git at that moment, never by a stored flag: the branch tip must
 be an ancestor of the Task's target branch (`merge_config.target_branch`, else
 the repository default branch; `refs/heads/<target>` or
-`refs/remotes/origin/<target>`). A branch that Git does not report as contained
+`refs/remotes/origin/<target>`; the local target is what Forge merges into, so
+a change merged locally and not yet pushed is delivered). A branch that Git
+does not report as contained
 is kept: an undelivered or cancelled Task with commits of its own, a squash or
 rebase delivery, a target that was moved back. A branch is also kept when it
 is checked out in another worktree, when its name is not the `task/<id8>` name
@@ -5325,7 +5344,9 @@ workspace is on record and its worktree is missing or is a directory without
 Git metadata, the hook is not run and the emitter reports
 `workspace reset required`; it never runs in the user's own checkout instead.
 The primary-checkout context is used only where no worktree is expected: before
-the workspace is prepared, and after Forge has reclaimed it (`cleaned`).
+the workspace is prepared, and when the directory is gone while or after Forge
+reclaims it (workspace `cleaning` or `cleaned`). Hooks run from the event bus
+after the transition, so a hook failure never blocks a state change.
 A bounded sweep runs on startup and every ten minutes to backfill terminal Tasks,
 including missing worktrees and managed homes left by older installs. The
 deadline worker snapshots a bounded set of due rows before processing them, so

@@ -342,25 +342,24 @@ impl WorkspaceManager {
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<()> {
-        let task_root = self.root.join(task_id);
-        if worktree_path.parent() != Some(task_root.as_path()) {
-            return Err(WorkspaceError::PathEscape);
-        }
+        let (task_root, absolute_root, absolute_path) =
+            self.confined_task_root(task_id, worktree_path).await?;
         // A repository that no longer exists holds no registration to remove.
         let repo_present = fs::try_exists(repo_path).await?;
-        let absolute_path = fs::canonicalize(worktree_path)
-            .await
-            .unwrap_or(std::path::absolute(worktree_path)?);
-        // Resolved while the directory still exists, so leftovers can be
-        // matched against Git's canonical paths after it is gone.
-        let absolute_root = fs::canonicalize(&task_root)
-            .await
-            .unwrap_or(std::path::absolute(&task_root)?);
+        if repo_present {
+            // A repository inside the Task root would be deleted with it.
+            let repo = fs::canonicalize(repo_path).await?;
+            if repo.starts_with(&absolute_root) || repo_path.starts_with(&task_root) {
+                return Err(WorkspaceError::PathEscape);
+            }
+        }
+        let is_this_worktree =
+            |path: &PathBuf| path == &absolute_path || path.as_path() == worktree_path;
         let registered = repo_present
-            && registered_worktrees(repo_path)
+            && linked_worktrees(repo_path)
                 .await?
                 .iter()
-                .any(|path| path == &absolute_path);
+                .any(is_this_worktree);
         if repo_present
             && !registered
             && fs::try_exists(worktree_path.join(".git")).await?
@@ -392,7 +391,7 @@ impl WorkspaceManager {
         remove_dir_all_writable(&task_root).await?;
         if repo_present {
             // Exact prune: only registrations that lived under this Task root.
-            for path in registered_worktrees(repo_path).await? {
+            for path in linked_worktrees(repo_path).await? {
                 if (path.starts_with(&absolute_root) || path.starts_with(&task_root))
                     && !fs::try_exists(&path).await?
                 {
@@ -414,6 +413,70 @@ impl WorkspaceManager {
             }
         }
         Ok(())
+    }
+
+    /// The only directory `cleanup_worktree` may delete: `<root>/<task_id>`,
+    /// a real directory (or nothing) that is a direct child of this manager's
+    /// root, with the worktree as its direct child.
+    ///
+    /// Refused with [`WorkspaceError::PathEscape`]: an id that is not one
+    /// plain path component (empty, `.`, `..`, absolute, nested) or is a
+    /// dot-directory of the root (`.repos`, `.forge`); a worktree path that is
+    /// not `<root>/<task_id>/<name>`; and a Task root or worktree path that is
+    /// a symbolic link, whose target is not Forge's to delete.
+    ///
+    /// Returns the Task root as given, and the Task root and worktree path
+    /// with the manager root resolved, which is how Git lists a worktree
+    /// (also after its directory is gone).
+    async fn confined_task_root(
+        &self,
+        task_id: &str,
+        worktree_path: &Path,
+    ) -> Result<(PathBuf, PathBuf, PathBuf)> {
+        use std::path::Component;
+
+        let mut components = Path::new(task_id).components();
+        let plain = matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        );
+        if !plain || task_id.starts_with('.') {
+            return Err(WorkspaceError::PathEscape);
+        }
+        let task_root = self.root.join(task_id);
+        let name = match worktree_path.components().next_back() {
+            Some(Component::Normal(name)) => name,
+            _ => return Err(WorkspaceError::PathEscape),
+        };
+        if worktree_path.parent() != Some(task_root.as_path()) {
+            return Err(WorkspaceError::PathEscape);
+        }
+        for path in [task_root.as_path(), worktree_path] {
+            match fs::symlink_metadata(path).await {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(WorkspaceError::PathEscape)
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // The root may sit behind a link (`/tmp`, a relocated data
+        // directory); the Task root and the worktree, checked above, do not.
+        let root = match fs::canonicalize(&self.root).await {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::path::absolute(&self.root)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let absolute_root = root.join(task_id);
+        let absolute_path = absolute_root.join(name);
+        Ok((task_root, absolute_root, absolute_path))
     }
 
     pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
@@ -559,7 +622,9 @@ async fn resolve_commit(repo_path: &Path, reference: &str) -> Result<Option<Stri
     Ok((output.status.success() && !sha.is_empty()).then_some(sha))
 }
 
-async fn registered_worktrees(repo_path: &Path) -> Result<Vec<PathBuf>> {
+/// Linked worktrees of `repo_path`. The first entry Git lists is the main
+/// working tree (or the bare repository), which is never a Task worktree.
+async fn linked_worktrees(repo_path: &Path) -> Result<Vec<PathBuf>> {
     let output = git_command()
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo_path)
@@ -577,6 +642,7 @@ async fn registered_worktrees(repo_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
+        .skip(1)
         .map(PathBuf::from)
         .collect())
 }
@@ -1020,6 +1086,244 @@ mod tests {
         let registrations = registrations(&cache).await;
         assert!(!registrations.contains(stale.to_str().unwrap()));
         assert!(!registrations.contains("task-1"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_refuses_an_id_that_is_not_one_task_root() {
+        let (_repo_dir, repo_path) = setup_repo().await;
+        let workspace_dir = TempDir::new().unwrap();
+        let root = workspace_dir.path().join("forge");
+        let manager = WorkspaceManager::new(root.clone());
+        let kept = manager
+            .create_worktree(repo_path.to_str().unwrap(), "task-1", "HEAD")
+            .await
+            .unwrap();
+        let cache = root.join(".repos").join("repo-1");
+        fs::create_dir_all(&cache).await.unwrap();
+        let outside = workspace_dir.path().join("outside");
+        fs::create_dir_all(outside.join("repo")).await.unwrap();
+        fs::write(outside.join("repo/kept"), "kept").await.unwrap();
+
+        let outside_id = outside.to_str().unwrap();
+        for (task_id, worktree_path) in [
+            // The workspace root itself.
+            ("", root.join("repo")),
+            (".", root.join("repo")),
+            (".", root.join(".").join("repo")),
+            // Above the root, and an absolute id that replaces it.
+            ("..", root.join("..").join("repo")),
+            ("..", workspace_dir.path().join("repo")),
+            (outside_id, outside.join("repo")),
+            ("/", PathBuf::from("/repo")),
+            // Forge's own directories under the root, and a nested id.
+            (".repos", cache.clone()),
+            (".forge", root.join(".forge").join("logs")),
+            ("task-1/repo", kept.join("src")),
+            // A worktree path that is the Task root, or climbs out of it.
+            ("task-1", root.join("task-1")),
+            ("task-1", root.join("task-1").join("..")),
+            ("task-1", root.join("task-1").join("repo").join("..")),
+            ("task-1", root.join("task-2").join("repo")),
+            ("task-1", PathBuf::new()),
+            ("task-1", PathBuf::from("repo")),
+        ] {
+            let result = manager
+                .cleanup_worktree(task_id, &repo_path, &worktree_path)
+                .await;
+            assert!(
+                matches!(result, Err(WorkspaceError::PathEscape)),
+                "{task_id:?} {worktree_path:?}: {result:?}"
+            );
+        }
+
+        assert!(fs::try_exists(kept.join("README.md")).await.unwrap());
+        assert!(fs::try_exists(&cache).await.unwrap());
+        assert!(fs::try_exists(outside.join("repo/kept")).await.unwrap());
+        assert!(registrations(&repo_path).await.contains("task-1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_refuses_a_task_root_or_worktree_that_is_a_link() {
+        let (_repo_dir, repo_path) = setup_repo().await;
+        let workspace_dir = TempDir::new().unwrap();
+        let root = workspace_dir.path().join("forge");
+        fs::create_dir_all(&root).await.unwrap();
+        let manager = WorkspaceManager::new(root.clone());
+        // The user's own directory, holding a worktree of the same repository
+        // that the user registered, with uncommitted work in it.
+        let users = workspace_dir.path().join("users");
+        fs::create_dir_all(&users).await.unwrap();
+        let user_worktree = users.join("repo");
+        git_ok(
+            &repo_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/mine",
+                user_worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        )
+        .await;
+        fs::write(user_worktree.join("uncommitted"), "mine")
+            .await
+            .unwrap();
+        set_mode(&user_worktree.join("uncommitted"), 0o400);
+
+        // The Task root is a link to the user's directory.
+        std::os::unix::fs::symlink(&users, root.join("task-1")).unwrap();
+        let result = manager
+            .cleanup_worktree("task-1", &repo_path, &root.join("task-1").join("repo"))
+            .await;
+        assert!(matches!(result, Err(WorkspaceError::PathEscape)));
+
+        // The Task root is real; the worktree path is a link to the user's.
+        fs::create_dir_all(root.join("task-2")).await.unwrap();
+        std::os::unix::fs::symlink(&user_worktree, root.join("task-2").join("repo")).unwrap();
+        let result = manager
+            .cleanup_worktree("task-2", &repo_path, &root.join("task-2").join("repo"))
+            .await;
+        assert!(matches!(result, Err(WorkspaceError::PathEscape)));
+
+        use std::os::unix::fs::PermissionsExt;
+        let uncommitted = user_worktree.join("uncommitted");
+        assert_eq!(fs::read_to_string(&uncommitted).await.unwrap(), "mine");
+        assert_eq!(
+            std::fs::metadata(&uncommitted)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+        assert!(registrations(&repo_path)
+            .await
+            .contains(user_worktree.canonicalize().unwrap().to_str().unwrap()));
+        assert!(git::branch_exists(&repo_path, "feature/mine")
+            .await
+            .unwrap());
+        assert!(fs::symlink_metadata(root.join("task-1")).await.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_leaves_the_target_of_a_link_inside_the_tree_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_repo_dir, repo_path) = setup_repo().await;
+        let workspace_dir = TempDir::new().unwrap();
+        let outside = workspace_dir.path().join("outside");
+        fs::create_dir_all(outside.join("dir")).await.unwrap();
+        fs::write(outside.join("file"), "kept").await.unwrap();
+        fs::write(outside.join("dir/inner"), "kept").await.unwrap();
+        set_mode(&outside.join("file"), 0o400);
+        set_mode(&outside.join("dir/inner"), 0o400);
+        set_mode(&outside.join("dir"), 0o500);
+        let manager = WorkspaceManager::new(workspace_dir.path().join("forge"));
+        let worktree_path = manager
+            .create_worktree(repo_path.to_str().unwrap(), "task-1", "HEAD")
+            .await
+            .unwrap();
+        let locked = worktree_path.join("locked");
+        fs::create_dir_all(&locked).await.unwrap();
+        std::os::unix::fs::symlink(outside.join("file"), locked.join("file-link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("dir"), locked.join("dir-link")).unwrap();
+        set_mode(&locked, 0o500);
+
+        manager
+            .cleanup_worktree("task-1", &repo_path, &worktree_path)
+            .await
+            .unwrap();
+
+        assert!(!fs::try_exists(workspace_dir.path().join("forge/task-1"))
+            .await
+            .unwrap());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&outside.join("file")), 0o400);
+        assert_eq!(mode(&outside.join("dir")), 0o500);
+        assert_eq!(mode(&outside.join("dir/inner")), 0o400);
+        assert_eq!(
+            fs::read_to_string(outside.join("file")).await.unwrap(),
+            "kept"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("dir/inner")).await.unwrap(),
+            "kept"
+        );
+        set_mode(&outside.join("dir"), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_unregisters_a_missing_worktree_behind_a_linked_workspace_root() {
+        let (_repo_dir, repo_path) = setup_repo().await;
+        let workspace_dir = TempDir::new().unwrap();
+        let real_root = workspace_dir.path().join("real");
+        fs::create_dir_all(&real_root).await.unwrap();
+        let linked_root = workspace_dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+        let manager = WorkspaceManager::new(linked_root.clone());
+        let worktree_path = manager
+            .create_worktree(repo_path.to_str().unwrap(), "task-1", "HEAD")
+            .await
+            .unwrap();
+        // Git records the resolved path, which the missing directory can no
+        // longer be resolved to.
+        fs::remove_dir_all(real_root.join("task-1")).await.unwrap();
+        assert!(registrations(&repo_path).await.contains("task-1"));
+
+        manager
+            .cleanup_worktree("task-1", &repo_path, &worktree_path)
+            .await
+            .unwrap();
+
+        assert!(!registrations(&repo_path).await.contains("task-1"));
+        // And with the directory present, through the link.
+        let worktree_path = manager
+            .recover_worktree(
+                repo_path.to_str().unwrap(),
+                "task-1",
+                &task_branch_name("task-1"),
+            )
+            .await
+            .unwrap();
+        manager
+            .cleanup_worktree("task-1", &repo_path, &worktree_path)
+            .await
+            .unwrap();
+        assert!(!fs::try_exists(real_root.join("task-1")).await.unwrap());
+        assert!(!registrations(&repo_path).await.contains("task-1"));
+        assert!(fs::try_exists(&real_root).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_a_full_clone_and_a_repository_inside_the_task_root() {
+        let (_repo_dir, repo_path) = setup_repo().await;
+        let workspace_dir = TempDir::new().unwrap();
+        let root = workspace_dir.path().to_path_buf();
+        let manager = WorkspaceManager::new(root.clone());
+
+        // A repository of its own (`.git` is a directory) at the recorded path.
+        let clone = root.join("task-1").join("repo");
+        fs::create_dir_all(&clone).await.unwrap();
+        git::init(&clone).await.unwrap();
+        fs::write(clone.join("work.txt"), "work").await.unwrap();
+        let result = manager.cleanup_worktree("task-1", &repo_path, &clone).await;
+        assert!(matches!(result, Err(WorkspaceError::Git(_))));
+        assert!(fs::try_exists(clone.join("work.txt")).await.unwrap());
+
+        // The workspace's repository is the recorded path itself (a row that
+        // names the user's primary checkout), or lives under the Task root.
+        for worktree_path in [clone.clone(), root.join("task-1").join("other")] {
+            let result = manager
+                .cleanup_worktree("task-1", &clone, &worktree_path)
+                .await;
+            assert!(matches!(result, Err(WorkspaceError::PathEscape)));
+        }
+        assert!(fs::try_exists(clone.join("work.txt")).await.unwrap());
+        assert!(fs::try_exists(clone.join(".git")).await.unwrap());
     }
 
     async fn commit_on_task_branch(manager: &WorkspaceManager, repo_path: &Path, task_id: &str) {

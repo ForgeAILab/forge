@@ -351,13 +351,15 @@ impl LifecycleEventEmitter {
         let resolved = resolved.filter(|workspace| {
             !before_execution || workspace.placement.owner_kind != db::PlacementOwnerKind::Server
         });
-        // A server workspace Forge has already reclaimed is, like one not yet
-        // prepared, no workspace: its hooks keep the primary-checkout context.
-        let reclaimed = workspace
-            .as_ref()
-            .is_some_and(|workspace| workspace.status == db::WorkspaceStatus::Cleaned);
-        let resolved = resolved.filter(|workspace| {
-            !reclaimed || workspace.placement.owner_kind != db::PlacementOwnerKind::Server
+        // A server workspace Forge is reclaiming or has reclaimed has no
+        // worktree to expect: once the directory is gone its hooks keep the
+        // primary-checkout context they always had (`on_task_done` commonly
+        // fires while or after a `done` Task is cleaned up).
+        let reclaimed = workspace.as_ref().is_some_and(|workspace| {
+            matches!(
+                workspace.status,
+                db::WorkspaceStatus::Cleaning | db::WorkspaceStatus::Cleaned
+            )
         });
         let (repo_path, worktree_path) = match resolved.as_ref() {
             Some(resolved) => {
@@ -372,7 +374,18 @@ impl LifecycleEventEmitter {
                         resolved.placement.workspace_id
                     ));
                 }
-                if !exists {
+                if !exists && reclaimed {
+                    (
+                        self.resolve_repo_path(
+                            &project,
+                            execution.as_ref(),
+                            workspace.as_ref(),
+                            None,
+                        )
+                        .await,
+                        None,
+                    )
+                } else if !exists {
                     // The Task has a worktree on record and it is not usable.
                     // Its hook must not run anywhere else, least of all in the
                     // user's own checkout.
@@ -385,17 +398,13 @@ impl LifecycleEventEmitter {
                         ),
                     }
                     .to_string());
+                } else {
+                    (repo_path, Some(handle))
                 }
-                (repo_path, Some(handle))
             }
             None => (
-                self.resolve_repo_path(
-                    &project,
-                    execution.as_ref(),
-                    workspace.as_ref().filter(|_| reclaimed),
-                    None,
-                )
-                .await,
+                self.resolve_repo_path(&project, execution.as_ref(), None, None)
+                    .await,
                 None,
             ),
         };
@@ -834,10 +843,42 @@ mod tests {
 
     #[tokio::test]
     async fn script_hook_of_a_reclaimed_workspace_keeps_its_primary_checkout_context() {
+        // `cleaning`: an `on_task_done` hook that fires while the `done`
+        // Task's worktree is being removed ran in the primary checkout before
+        // and still does; it must not start failing.
+        for status in [db::WorkspaceStatus::Cleaning, db::WorkspaceStatus::Cleaned] {
+            let db = migrated_db().await;
+            let temp = tempfile::TempDir::new().unwrap();
+            let (user_repo, task_id, _) = seed_hook_fixture(&db, temp.path(), status).await;
+            let emitter =
+                LifecycleEventEmitter::new(Arc::clone(&db), Arc::new(PluginRegistry::new()));
+
+            emitter
+                .emit_lifecycle_event(
+                    &task_id,
+                    None,
+                    api_types::LifecycleEvent::OnTaskDone,
+                    Some("review".to_owned()),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert!(user_repo.join("hook-ran").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn script_hook_runs_in_a_worktree_that_is_still_there_while_it_is_reclaimed() {
         let db = migrated_db().await;
         let temp = tempfile::TempDir::new().unwrap();
         let (user_repo, task_id, _) =
-            seed_hook_fixture(&db, temp.path(), db::WorkspaceStatus::Cleaned).await;
+            seed_hook_fixture(&db, temp.path(), db::WorkspaceStatus::Cleaning).await;
+        let worktree = temp.path().join("worktrees").join(&task_id).join("repo");
+        git::create_worktree(&user_repo, "hook-worktree", &worktree)
+            .await
+            .unwrap();
         let emitter = LifecycleEventEmitter::new(Arc::clone(&db), Arc::new(PluginRegistry::new()));
 
         emitter
@@ -852,6 +893,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(user_repo.join("hook-ran").exists());
+        assert!(worktree.join("hook-ran").exists());
+        assert!(!user_repo.join("hook-ran").exists());
     }
 }
