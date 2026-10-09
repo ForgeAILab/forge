@@ -3587,8 +3587,10 @@ to `Execute` when it is not), the native executor at the start of a turn (`Execu
 Task service's workspace root and repository-cache locks), reassignment reset
 (`Reset`), review entry CI (`Check`), review rerun (`Review`), blocking
 `before_work` hooks (`Hook`), merge delivery and target-moved rebase
-(`Integrate`), and three read-only users (`Inspect`): the lifecycle emitter,
-the terminal before a shell opens, and evidence capture from a worktree file.
+(`Integrate`), and two read-only users (`Inspect`): the lifecycle emitter and evidence
+capture from a worktree file. The terminal does not go through the manager: it
+opens in the recorded directory after its own path guardrail, so a broken
+workspace can still be looked into.
 A claim on a daemon placement still asks its owner's `describe`. One Task run
 with one coding execution and one review makes about seven to ten manager
 calls, each one Git process on a healthy worktree: claim (1, replacing the

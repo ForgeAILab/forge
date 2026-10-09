@@ -1165,6 +1165,10 @@ const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     // created, captured to remove it. Nothing runs there.
     // Plus one Task-root anchor (plan stage discard).
     ("services/src/task_service.rs", 2),
+    // A terminal is how a person looks into a workspace, a broken one
+    // included: it opens in the recorded directory after the terminal
+    // service's own path guardrail, as it always has.
+    ("services/src/terminal_service.rs", 1),
     // Task-root anchors only: plan and outbox files beside the worktree.
     ("services/src/plan_artifact.rs", 5),
     ("services/src/recovery.rs", 1),
@@ -1195,7 +1199,7 @@ fn raw_workspace_path_getter_uses_are_exactly_the_recorded_ones() {
         .collect::<Vec<_>>();
     recorded.sort();
     assert_eq!(found, recorded);
-    assert_eq!(found.iter().map(|(_, uses)| uses).sum::<usize>(), 37);
+    assert_eq!(found.iter().map(|(_, uses)| uses).sum::<usize>(), 38);
 }
 
 fn raw_path_uses(source: &str) -> usize {

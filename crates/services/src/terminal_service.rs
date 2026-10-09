@@ -308,7 +308,7 @@ impl TerminalService {
         let cols = cols.unwrap_or(DEFAULT_COLS);
         validate_terminal_size(rows, cols)?;
 
-        let (task, workspace) = self.require_terminal_workspace(task_id).await?;
+        let (_task, workspace) = self.require_terminal_workspace(task_id).await?;
 
         let task_sessions =
             TerminalSessionRepo::list_running_terminal_sessions_for_task(&*self.db, task_id)
@@ -340,18 +340,8 @@ impl TerminalService {
             .await?;
         let workspace_path = resolved.handle()?.to_owned();
         if resolved.placement.owner_kind == PlacementOwnerKind::Server {
-            // A shell opens only in a worktree the workspace manager has
-            // just inspected; nothing is repaired for a terminal.
-            let path = crate::workspace_manager::inspect_path(
-                &self.db,
-                &self.workspace_root,
-                &self.workspace_backend_router,
-                &task,
-                workspace.clone(),
-            )
-            .await?
-            .ok_or(ServiceError::TerminalPathGuardrail)?;
-            self.validate_workspace_path(&path).await?;
+            self.validate_workspace_path(&resolved.embedded_path()?)
+                .await?;
         }
         let daemon_id = terminal_daemon_id(&resolved)?;
         if let Some(daemon_id) = daemon_id.as_deref() {

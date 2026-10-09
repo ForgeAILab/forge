@@ -884,10 +884,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   executor could be started on whatever HEAD the worktree was left on. The
   healthy claim costs one Git process instead of three. The native executor's
   own check now uses the server's workspace root and repository-cache locks.
-  The terminal and the evidence-capture tool inspect the worktree first: a
-  directory that is present but is not the Task's worktree is refused (the
-  terminal with its existing path-guardrail error, evidence capture with
-  `Task workspace is unavailable: its worktree is not usable`). Plan,
+  The evidence-capture tool inspects the worktree first: a directory that is
+  present but is not the Task's worktree is refused with
+  `Task workspace is unavailable: its worktree is not usable`. The terminal is
+  unchanged: it opens in the recorded directory after its own path guardrail,
+  so a person can still look into a broken workspace. Plan,
   staged-plan and execution-outbox files, which sit beside the worktree, are
   read as before whether or not the worktree is there, except that a recorded
   worktree path that is relative, contains `..`, has no Task root above it, or
