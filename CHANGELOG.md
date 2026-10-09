@@ -1672,6 +1672,27 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **`start` on a queued Task no longer parks it as failed.** `start` was
+  offered for the Agent of the planning gate's role (any available Agent when
+  no planner is assigned) while the claim it makes enters `in_progress` for
+  the coder. With a different coder assigned the claim was refused, the Task
+  was parked `recovery_required` ("role 'coder' is assigned to a different
+  agent") and `retry` restored the same park. The offer, the queued action
+  and its replay now resolve the role the way a claim does, so `start` runs
+  the Task's coder: on a Task queued for capacity it is accepted and waits
+  for the slot, and it is not offered while that Agent is paused or offline
+  (resuming the Agent starts the Task).
+- **A run that fails after a Project edit, pause or resume is retried.** A
+  failure of a run dispatched under an older Project version was dropped:
+  no retry was scheduled, no blocker was written and the dispatcher's healer
+  skipped it, leaving the Task active with a `clear` condition and no run
+  until someone took `retry`. A failed run now spends the execution retry
+  budget and backs off (or blocks the Task when the budget is exhausted)
+  under the current Project, whichever version dispatched it; usage-limit
+  and provider-capacity failures, and failures reported by a daemon, follow
+  the same rule. Completions stay fenced to the Project version that
+  dispatched them.
+
 - Adding a Task dependency that already exists is a no-op. It used to fail
   the unique constraint and answer `500 internal_error`. Found by the new
   model-based workflow test.
