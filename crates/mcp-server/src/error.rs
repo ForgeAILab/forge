@@ -604,6 +604,9 @@ impl From<DbError> for McpToolError {
                 .with_data(json!({"code":"turn_not_retryable"})),
             DbError::ChatTurnLive => Self::new(-32009, "another Agent Chat turn is live")
                 .with_data(json!({"code":"another_turn_live"})),
+            DbError::PermissionDocument(error) => {
+                Self::new(-32602, error.to_string()).with_data(json!({"code":error.code()}))
+            }
             DbError::VersionConflict => Self::new(-32009, "version conflict"),
             DbError::TaskVersionConflict {
                 expected: _,

@@ -1,3 +1,4 @@
+use operation_registry::authority::permission_set;
 use std::{
     collections::BTreeSet,
     net::{IpAddr, SocketAddr},
@@ -371,6 +372,11 @@ impl EmbeddedAgentService {
                 "CLI Chat session authority does not match the admitted turn",
             ));
         }
+        let provider = forge_agent_host::authority_bound_provider(
+            self.db.clone(),
+            &binding,
+            self.tool_provider.clone(),
+        );
         forge_agent_host::ScopeToolComposition::for_scope_with_permissions_and_project_context(
             binding.identity_id,
             binding.scope,
@@ -381,7 +387,7 @@ impl EmbeddedAgentService {
                 is_project_agent_chat: binding.agent_chat_project_id.is_some(),
                 charter_setup_required: binding.project_charter_setup_required,
             },
-            Some(self.tool_provider.clone()),
+            Some(provider),
             // Inspection must report the catalog a turn would actually get,
             // so it carries the same transport the backend composes with.
             forge_agent_host::ScopeToolRuntime {
@@ -1824,61 +1830,40 @@ impl EmbeddedAgentService {
         let canonical = self
             .authorize_scope(actor_user_id, &identity, scope_request)
             .await?;
-        let account_json: String = sqlx::query_scalar(
-            "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
-        )
-        .bind(identity_id)
-        .fetch_one(self.db.pool())
-        .await?;
-        let mut layers = vec![
-            permission_set(&account_json),
-            permission_set(&profile.tool_policy_json),
-        ];
-        let project_id = self.scope_project_id(scope_request).await?;
-        let project_charter_setup_required = if let Some(project_id) = project_id.as_deref() {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT charter_setup_required FROM project WHERE id = ? LIMIT 1",
+        let allowed = if canonical.scope_type == CanonicalScopeType::Task {
+            // Task caller authority remains execution-bound until slice F.
+            let account_json: String = sqlx::query_scalar(
+                "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
             )
-            .bind(project_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .is_some_and(|value| value != 0)
+            .bind(identity_id)
+            .fetch_one(self.db.pool())
+            .await?;
+            intersect_non_empty_layers(&[
+                permission_set(&account_json),
+                permission_set(&profile.tool_policy_json),
+                scope_permission_set(&canonical, false, false),
+            ])
         } else {
-            false
-        };
-        if let Some(project_id) = project_id.as_deref() {
-            // Project/Agent Chat authorization above already requires the
-            // singular Project Agent binding. A Task assignment follows the
-            // existing Task role path and does not inherit Project binding
-            // authority.
-            match scope_request {
-                RequestedCanonicalScope::AgentChat { .. }
-                | RequestedCanonicalScope::Project { .. } => {
-                    let binding =
-                        ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
-                            .await?
-                            .filter(|binding| {
-                                binding.state == "active"
-                                    && binding.identity_id.as_deref() == Some(identity_id)
-                            })
-                            .ok_or_else(|| {
-                                ServiceError::not_found("project_agent_binding", identity_id)
-                            })?;
-                    layers.push(permission_set(&binding.permission_ceiling_json));
-                }
-                RequestedCanonicalScope::Task { .. } => {}
-                RequestedCanonicalScope::Account => unreachable!("Account has no Project id"),
+            let authority = self
+                .db
+                .resolve_effective_authority(
+                    identity_id,
+                    Some(&profile.id),
+                    canonical_scope_name(canonical.scope_type),
+                    &canonical.scope_id,
+                    match canonical.workspace_access {
+                        WorkspaceAccess::AccountScratch => "account_scratch",
+                        WorkspaceAccess::ProjectVerify => "project_verify",
+                        _ => "deny",
+                    },
+                )
+                .await?;
+            if authority.active {
+                authority.ceiling
+            } else {
+                BTreeSet::new()
             }
-        }
-        let project_agent_chat = matches!(scope_request, RequestedCanonicalScope::AgentChat { .. })
-            && canonical.scope_type == CanonicalScopeType::AgentChat
-            && project_id.is_some();
-        layers.push(scope_permission_set(
-            &canonical,
-            project_agent_chat,
-            project_charter_setup_required,
-        ));
-        let allowed = intersect_non_empty_layers(&layers);
+        };
         let known = known_permissions();
         let denied = known.difference(&allowed).cloned().collect();
         let requires_approval = allowed
@@ -2909,86 +2894,23 @@ fn validate_frozen_binding_state(
     Ok(())
 }
 
-fn permission_set(value: &str) -> BTreeSet<String> {
-    let Ok(value) = serde_json::from_str::<Value>(value) else {
-        return BTreeSet::new();
-    };
-    match value {
-        Value::Array(values) => values
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        Value::Object(map) => map
-            .get("permissions")
-            .or_else(|| map.get("allowed"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        _ => BTreeSet::new(),
-    }
-}
-
 fn scope_permission_set(
     scope: &CanonicalScope,
     project_agent_chat: bool,
     project_charter_setup_required: bool,
 ) -> BTreeSet<String> {
-    let mut values: Vec<&str> = match scope.scope_type {
-        CanonicalScopeType::Account => vec![
-            "read_account",
-            "propose_discovery",
-            "propose_project",
-            "propose_handoff",
-        ],
-        CanonicalScopeType::Project => {
-            let mut project = vec![
-                "read_project",
-                "read_memory",
-                "propose_project",
-                "propose_message",
-            ];
-            if !project_charter_setup_required {
-                project.extend([
-                    "propose_task",
-                    "propose_commitment",
-                    "propose_memory",
-                    "propose_review",
-                    "propose_decision",
-                    "propose_session",
-                ]);
-            }
-            project
-        }
-        CanonicalScopeType::AgentChat => {
-            let mut chat = vec!["read_agent_chat", "read_memory", "propose_message"];
-            if project_agent_chat && !project_charter_setup_required {
-                chat.extend(["propose_commitment", "propose_memory", "propose_session"]);
-            }
-            chat
-        }
-        CanonicalScopeType::Task => match scope.workspace_access {
-            WorkspaceAccess::TaskRead => {
-                vec!["read_task", "read_memory", "task_read", "propose_review"]
-            }
-            WorkspaceAccess::TaskWrite => {
-                vec!["read_task", "read_memory", "task_read", "task_write"]
-            }
-            WorkspaceAccess::Deny
-            | WorkspaceAccess::ProjectVerify
-            | WorkspaceAccess::AccountScratch => Vec::new(),
+    operation_registry::authority::scope_permissions(
+        canonical_scope_name(scope.scope_type),
+        match scope.workspace_access {
+            WorkspaceAccess::Deny => "deny",
+            WorkspaceAccess::TaskRead => "task_read",
+            WorkspaceAccess::TaskWrite => "task_write",
+            WorkspaceAccess::ProjectVerify => "project_verify",
+            WorkspaceAccess::AccountScratch => "account_scratch",
         },
-    };
-    if scope.scope_type == CanonicalScopeType::AgentChat && project_agent_chat {
-        values.push("propose_project");
-        if !project_charter_setup_required {
-            values.push("propose_task");
-        }
-    } else if scope.scope_type == CanonicalScopeType::AgentChat {
-        values.extend(["propose_discovery", "propose_project", "propose_handoff"]);
-    }
-    values.into_iter().map(str::to_owned).collect()
+        project_agent_chat,
+        project_charter_setup_required,
+    )
 }
 
 fn known_permissions() -> BTreeSet<String> {

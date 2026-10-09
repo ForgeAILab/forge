@@ -941,7 +941,14 @@ impl MainGenesisCommandService {
     /// and Charter drafting.
     pub async fn select_project_agent(
         &self,
+        input: MainGenesisProjectAgentSelectCommandInput,
+    ) -> Result<MainGenesisProjectAgentSelectResult> {
+        self.select_project_agent_for_admission(input, None).await
+    }
+    pub(crate) async fn select_project_agent_for_admission(
+        &self,
         mut input: MainGenesisProjectAgentSelectCommandInput,
+        admitted: Option<&operation_registry::authority::EffectiveAuthority>,
     ) -> Result<MainGenesisProjectAgentSelectResult> {
         let (principal, account_id, canonical_scope, actor_type, actor_id) =
             self.resolve_principal(&input.principal).await?;
@@ -1015,6 +1022,29 @@ impl MainGenesisCommandService {
             });
         }
 
+        let admission =
+            if let MainGenesisDraftPrincipal::MainAgent { identity_id, scope } = &input.principal {
+                Some(match admitted {
+                    Some(admitted) => admitted.clone(),
+                    None => {
+                        self.db
+                            .resolve_effective_authority(
+                                identity_id,
+                                None,
+                                if scope.scope_type == CanonicalScopeType::AgentChat {
+                                    "agent_chat"
+                                } else {
+                                    "account"
+                                },
+                                &scope.scope_id,
+                                "deny",
+                            )
+                            .await?
+                    }
+                })
+            } else {
+                None
+            };
         let session_id = match input.request.genesis_session_id.as_deref() {
             Some(id) => id.to_owned(),
             None => sqlx::query_scalar::<_, String>(
@@ -1080,6 +1110,38 @@ impl MainGenesisCommandService {
         {
             transaction.rollback().await?;
             return self.replay_project_agent_selection(receipt).await;
+        }
+        // Replay is receipt-first; a fresh selection rechecks the same
+        // evaluator using facts loaded inside the mutation transaction.
+        if let MainGenesisDraftPrincipal::MainAgent { identity_id, scope } = &input.principal {
+            let authority = self
+                .db
+                .resolve_effective_authority_in_tx(
+                    &mut transaction,
+                    identity_id,
+                    admission
+                        .as_ref()
+                        .map(|authority| authority.admitted_profile_id.as_str()),
+                    if scope.scope_type == CanonicalScopeType::AgentChat {
+                        "agent_chat"
+                    } else {
+                        "account"
+                    },
+                    &scope.scope_id,
+                    "deny",
+                )
+                .await?;
+            let spec = operation_registry::main_proposals::CATALOG
+                .lookup(MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION)
+                .expect("registered selection");
+            admission
+                .as_ref()
+                .expect("Main admission")
+                .narrowed(&authority)
+                .and_then(|authority| authority.evaluate(spec))
+                .map_err(|_| ServiceError::AuthorizationDenied {
+                    message: "authority_revoked".into(),
+                })?;
         }
         let changed = sqlx::query(
             "UPDATE product_genesis_session

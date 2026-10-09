@@ -12,6 +12,7 @@ path = "src/lib.rs"
 test-template = ["dep:rusqlite", "dep:tempfile"]
 
 [dependencies]
+operation-registry = { path = "../operation-registry" }
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }

@@ -1,3 +1,4 @@
+use operation_registry::authority::permission_set;
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
@@ -333,7 +334,7 @@ impl SqliteProtectedRuntimeStore {
         workspace_path: Option<&str>,
     ) -> Result<crate::RuntimeScopeBinding, crate::AgentHostError> {
         let row = sqlx::query(
-            "SELECT session.identity_id,
+            "SELECT session.identity_id, session.profile_id,
                     identity.account_permission_ceiling,
                     identity.paused,
                     identity.archived_at,
@@ -552,26 +553,55 @@ impl SqliteProtectedRuntimeStore {
                 "native session Project authority is no longer active".to_owned(),
             ));
         }
-        let mut allowed_permissions = permission_set(&account_permission_ceiling);
-        intersect_permissions(
-            &mut allowed_permissions,
-            &permission_set(&profile_tool_policy),
-        );
-        intersect_permissions(
-            &mut allowed_permissions,
-            &scope_permission_set(
-                scope.scope_type,
-                scope.workspace_access,
-                agent_chat_project_id.is_some(),
-                project_charter_setup_required,
-            ),
-        );
-        if let Some(binding_permissions) = binding_permission_ceiling {
+        let authority = if scope.scope_type != crate::CanonicalScopeType::Task {
+            let profile_id: String = row
+                .try_get("profile_id")
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            let authority = self
+                .db
+                .resolve_effective_authority(
+                    &identity_id,
+                    Some(&profile_id),
+                    scope_type_name(scope.scope_type),
+                    &scope.scope_id,
+                    workspace_access_name(scope.workspace_access),
+                )
+                .await
+                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            if !authority.active {
+                return Err(crate::AgentHostError::Authority(
+                    "session binding is no longer active".to_owned(),
+                ));
+            }
+            Some(authority)
+        } else {
+            None
+        };
+        let allowed_permissions = if let Some(authority) = &authority {
+            authority.ceiling.clone()
+        } else {
+            let mut allowed_permissions = permission_set(&account_permission_ceiling);
             intersect_permissions(
                 &mut allowed_permissions,
-                &permission_set(&binding_permissions),
+                &permission_set(&profile_tool_policy),
             );
-        }
+            intersect_permissions(
+                &mut allowed_permissions,
+                &scope_permission_set(
+                    scope.scope_type,
+                    scope.workspace_access,
+                    agent_chat_project_id.is_some(),
+                    project_charter_setup_required,
+                ),
+            );
+            if let Some(binding_permissions) = binding_permission_ceiling {
+                intersect_permissions(
+                    &mut allowed_permissions,
+                    &permission_set(&binding_permissions),
+                );
+            }
+            allowed_permissions
+        };
         Ok(crate::RuntimeScopeBinding {
             identity_id,
             scope,
@@ -580,6 +610,7 @@ impl SqliteProtectedRuntimeStore {
             agent_chat_project_id,
             project_charter_setup_required,
             allowed_permissions,
+            authority,
         })
     }
 
@@ -652,7 +683,7 @@ impl SqliteProtectedRuntimeStore {
         successor: bool,
     ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
         let row = sqlx::query(
-            "SELECT session.identity_id, scope.scope_type, scope.scope_id
+            "SELECT session.identity_id, session.profile_id, scope.scope_type, scope.scope_id
              FROM agent_session AS session
              JOIN agent_context_scope AS scope
                ON scope.id = session.context_scope_id
@@ -1585,27 +1616,6 @@ impl ProviderCredentialSource for SqliteProviderCredentialSource {
     }
 }
 
-fn permission_set(value: &str) -> BTreeSet<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(value) else {
-        return BTreeSet::new();
-    };
-    match value {
-        serde_json::Value::Array(values) => values
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        serde_json::Value::Object(map) => map
-            .get("permissions")
-            .or_else(|| map.get("allowed"))
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        _ => BTreeSet::new(),
-    }
-}
-
 fn intersect_permissions(target: &mut BTreeSet<String>, layer: &BTreeSet<String>) {
     *target = target.intersection(layer).cloned().collect();
 }
@@ -1616,70 +1626,29 @@ fn scope_permission_set(
     project_agent_chat: bool,
     project_charter_setup_required: bool,
 ) -> BTreeSet<String> {
-    let mut values: Vec<&str> = match scope_type {
-        // An inquiry sub-agent runs under the Account scope with a scratch
-        // directory. It gets the bounded account reads and public research
-        // only: withholding the propose permissions here is what keeps a
-        // sub-agent structurally unable to create a Project, publish a
-        // handoff, or otherwise act on the account that dispatched it.
-        crate::CanonicalScopeType::Account
-            if workspace_access == crate::WorkspaceAccess::AccountScratch =>
-        {
-            vec!["read_account", "propose_discovery"]
-        }
-        crate::CanonicalScopeType::Account => vec![
-            "read_account",
-            "propose_discovery",
-            "propose_project",
-            "propose_handoff",
-        ],
-        crate::CanonicalScopeType::Project => {
-            let mut project = vec![
-                "read_project",
-                "read_memory",
-                "propose_project",
-                "propose_message",
-            ];
-            if !project_charter_setup_required {
-                project.extend([
-                    "propose_task",
-                    "propose_commitment",
-                    "propose_memory",
-                    "propose_review",
-                    "propose_decision",
-                    "propose_session",
-                ]);
-            }
-            project
-        }
-        crate::CanonicalScopeType::AgentChat => {
-            let mut chat = vec!["read_agent_chat", "read_memory", "propose_message"];
-            if project_agent_chat && !project_charter_setup_required {
-                chat.extend(["propose_commitment", "propose_memory", "propose_session"]);
-            }
-            chat
-        }
-        crate::CanonicalScopeType::Task => match workspace_access {
-            crate::WorkspaceAccess::TaskRead => {
-                vec!["read_task", "read_memory", "task_read", "propose_review"]
-            }
-            crate::WorkspaceAccess::TaskWrite => {
-                vec!["read_task", "read_memory", "task_read", "task_write"]
-            }
-            crate::WorkspaceAccess::Deny
-            | crate::WorkspaceAccess::ProjectVerify
-            | crate::WorkspaceAccess::AccountScratch => vec![],
-        },
-    };
-    if matches!(scope_type, crate::CanonicalScopeType::AgentChat) && project_agent_chat {
-        values.push("propose_project");
-        if !project_charter_setup_required {
-            values.push("propose_task");
-        }
-    } else if matches!(scope_type, crate::CanonicalScopeType::AgentChat) {
-        values.extend(["propose_discovery", "propose_project", "propose_handoff"]);
+    operation_registry::authority::scope_permissions(
+        scope_type_name(scope_type),
+        workspace_access_name(workspace_access),
+        project_agent_chat,
+        project_charter_setup_required,
+    )
+}
+fn scope_type_name(scope: crate::CanonicalScopeType) -> &'static str {
+    match scope {
+        crate::CanonicalScopeType::Account => "account",
+        crate::CanonicalScopeType::Project => "project",
+        crate::CanonicalScopeType::AgentChat => "agent_chat",
+        crate::CanonicalScopeType::Task => "task",
     }
-    values.into_iter().map(str::to_owned).collect()
+}
+fn workspace_access_name(access: crate::WorkspaceAccess) -> &'static str {
+    match access {
+        crate::WorkspaceAccess::Deny => "deny",
+        crate::WorkspaceAccess::TaskRead => "task_read",
+        crate::WorkspaceAccess::TaskWrite => "task_write",
+        crate::WorkspaceAccess::ProjectVerify => "project_verify",
+        crate::WorkspaceAccess::AccountScratch => "account_scratch",
+    }
 }
 
 impl fmt::Debug for SqliteProtectedRuntimeStore {

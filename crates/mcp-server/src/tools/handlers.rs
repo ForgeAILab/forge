@@ -869,6 +869,17 @@ pub(super) async fn forge_list_projects(
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let params: ListProjectsParams = parse_params(params)?;
+    if let Some(project_id) = context.project_id.as_deref() {
+        let page = state
+            .db
+            .list_visible_bound_project(
+                project_id,
+                authenticated_user(context)?,
+                page_request(params.cursor, params.limit, None)?,
+            )
+            .await?;
+        return Ok(project_page_value(page));
+    }
     let page = ProjectRepo::list_visible(
         &*state.db,
         authenticated_user(context)?,

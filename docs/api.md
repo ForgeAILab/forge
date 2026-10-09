@@ -4530,6 +4530,24 @@ For service-level invalid command arguments, REST returns HTTP 400 with code
 `validation_error`, matching the native orchestration outcome code. Transport
 and endpoint-specific validation may use their documented endpoint code.
 
+### Permission document and admitted-turn errors
+
+Identity/Profile and Project-binding writes reject conflicting `permissions`
+and `allowed` sets with HTTP 400 `conflicting_permission_document`. Unsupported
+or malformed permission documents return HTTP 400
+`invalid_permission_document`. Equal sets, including different ordering or
+duplicate names, are accepted. Stored conflicts fail closed on reads.
+MCP projects these write errors as `-32602` with `data.code` set to the same
+name.
+
+A registered native/CLI operation whose admitted permission or binding is
+revoked returns `policy_denied` with `denied_by: "authority_revoked"`, and a
+non-retryable session-scoped instruction. Changing to a broader Profile during
+a turn does not extend the admitted grant; a new admission is required.
+Current-state/version corrections keep the existing typed outcome contract.
+Task reviewers receive no workflow action from `propose_review`, and Task
+read summaries mark `available_actions_informational: true`.
+
 ### Native and MCP orchestration outcomes
 
 Native and MCP orchestration commands use one shared model-facing
@@ -4806,6 +4824,20 @@ authority identity, return raw credentials, protected session state, or
 checkpoint bodies. Binding, message-send, and handoff mutations derive actor
 and scope from the authenticated MCP context; identity, Project, chat, and
 Task IDs are only references that Forge authorizes.
+
+Project-constrained grants use an explicitly scope-classified catalog. These
+account-wide tools are absent from `tools/list` and refused on `tools/call`:
+`forge_register_agent`, `forge_list_agents`, `forge_create_project`,
+`forge_list_agent_profiles`, `forge_list_agent_sessions`,
+`forge_get_agent_session`, `forge_get_main_agent`, `forge_set_main_agent`.
+Calling a known omitted tool returns in-band authorization error `-32001`
+with `data.code = "mcp_scope_denied"`; unknown names remain JSON-RPC
+method-not-found. This authority check precedes argument diagnostics.
+`forge_list_projects` returns only the bound Project, with count 1 and no
+continuation cursor; account grants retain the account-visible listing.
+Project/Chat/handoff/Task references remain restricted to that same bound
+Project. The credential acts as the authenticated delegated user, not the
+bound Project Agent.
 
 `forge_get_project` and `forge_list_projects` expose the current Project
 `version`. Both `forge_update_project` and

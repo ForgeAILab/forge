@@ -748,7 +748,9 @@ impl NativeAgentRuntimeBackend {
                 is_project_agent_chat: binding.agent_chat_project_id.is_some(),
                 charter_setup_required: binding.project_charter_setup_required,
             },
-            self.forge_tool_provider.clone(),
+            self.forge_tool_provider.clone().map(|provider| {
+                crate::authority_bound_provider(self.protected_store.database(), &binding, provider)
+            }),
             ScopeToolRuntime {
                 command_allowlist: request.command_allowlist.clone(),
                 environment: request.environment.clone(),

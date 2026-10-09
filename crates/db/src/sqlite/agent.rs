@@ -221,7 +221,10 @@ impl AgentRepo for SqliteDb {
         .bind(if identity.paused { 1 } else { 0 })
         .bind(identity.owner_id.as_deref())
         .bind(&identity.visibility)
-        .bind(&identity.account_permission_ceiling)
+        .bind({
+            operation_registry::authority::parse_permissions(&identity.account_permission_ceiling)?;
+            &identity.account_permission_ceiling
+        })
         .bind(&identity.created_at)
         .bind(&identity.updated_at)
         .execute(&mut *transaction)
@@ -675,6 +678,7 @@ async fn insert_profile(
     transaction: &mut Transaction<'_, Sqlite>,
     input: &CreateAgentProfile,
 ) -> Result<()> {
+    operation_registry::authority::parse_permissions(&input.tool_policy_json)?;
     let revision = sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(MAX(version), 0) + 1
          FROM agent_profile

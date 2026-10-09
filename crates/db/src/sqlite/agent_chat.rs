@@ -21,6 +21,27 @@ pub(super) const AGENT_CHAT_TURN_WITH_RETRY_STATE: &str = "SELECT t.*, CASE
     )
 ) ELSE 0 END AS retry_superseded FROM agent_chat_turn_job t WHERE t.id = ?";
 
+impl SqliteDb {
+    /// A delegated Project grant filters to one visible Project before its
+    /// cursor/count projection; it never reads or paginates the account list.
+    pub async fn list_visible_bound_project(
+        &self,
+        id: &str,
+        user_id: &str,
+        page: PageRequest,
+    ) -> Result<Page<Project>> {
+        let offset = decode_offset(&page.cursor)?;
+        let visible = ProjectRepo::get_visible_by_id(self, id, user_id).await?;
+        let total = i64::from(visible.is_some());
+        let items = if offset == 0 {
+            visible.into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        page_from_items(items, &page, offset, Some(total))
+    }
+}
+
 #[async_trait]
 impl AccountMainAgentBindingRepo for SqliteDb {
     async fn get_active_main_binding(
@@ -212,7 +233,10 @@ impl ProjectAgentBindingRepo for SqliteDb {
         .bind(input.profile_id.as_deref())
         .bind(&input.state)
         .bind(&input.autonomy_policy_json)
-        .bind(&input.permission_ceiling_json)
+        .bind({
+            operation_registry::authority::parse_permissions(&input.permission_ceiling_json)?;
+            &input.permission_ceiling_json
+        })
         .bind(&input.subscriptions_json)
         .bind(input.wake_budget)
         .bind(input.operating_skill_revision_id.as_deref())
@@ -273,7 +297,12 @@ impl ProjectAgentBindingRepo for SqliteDb {
         .bind(input.replacement.profile_id.as_deref())
         .bind(&input.replacement.state)
         .bind(&input.replacement.autonomy_policy_json)
-        .bind(&input.replacement.permission_ceiling_json)
+        .bind({
+            operation_registry::authority::parse_permissions(
+                &input.replacement.permission_ceiling_json,
+            )?;
+            &input.replacement.permission_ceiling_json
+        })
         .bind(&input.replacement.subscriptions_json)
         .bind(input.replacement.wake_budget)
         .bind(input.replacement.operating_skill_revision_id.as_deref())
@@ -366,7 +395,12 @@ impl ProjectBindingCommandRepo for SqliteDb {
         .bind(input.replacement.profile_id.as_deref())
         .bind(&input.replacement.state)
         .bind(&input.replacement.autonomy_policy_json)
-        .bind(&input.replacement.permission_ceiling_json)
+        .bind({
+            operation_registry::authority::parse_permissions(
+                &input.replacement.permission_ceiling_json,
+            )?;
+            &input.replacement.permission_ceiling_json
+        })
         .bind(&input.replacement.subscriptions_json)
         .bind(input.replacement.wake_budget)
         .bind(input.replacement.operating_skill_revision_id.as_deref())

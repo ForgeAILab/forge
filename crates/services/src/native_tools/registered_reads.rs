@@ -15,6 +15,7 @@ pub(super) struct Context<'a> {
     pub provider: &'a CoordinationToolProvider,
     pub actor_identity_id: &'a str,
     pub scope: &'a CanonicalScope,
+    pub admitted_authority: Option<&'a operation_registry::authority::EffectiveAuthority>,
     pub proposal_arguments: Option<&'a Value>,
 }
 #[async_trait]

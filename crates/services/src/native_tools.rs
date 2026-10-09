@@ -6,11 +6,14 @@
 //! call their shared command services, while approval-required mutations
 //! retain an `AgentAction` envelope.
 
+use operation_registry::authority::permission_set;
 mod registered_proposals;
 mod registered_reads;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::{self, File},
     io::Read,
     net::{IpAddr, Ipv6Addr},
@@ -517,6 +520,7 @@ impl CoordinationToolProvider {
                     json!(offers.available_actions),
                 );
                 result.insert("version".to_owned(), json!(offers.version));
+                result.insert("available_actions_informational".to_owned(), json!(true));
             }
         }
         result.insert(
@@ -2660,7 +2664,7 @@ impl CoordinationToolProvider {
     ) -> Result<Value, AgentHostError> {
         if registered_proposals::CATALOG.lookup(operation).is_some() {
             return self
-                .registered_proposal(actor_identity_id, scope, operation, arguments, false)
+                .registered_proposal(actor_identity_id, scope, operation, arguments, false, None)
                 .await;
         }
         let payload = arguments
@@ -4107,6 +4111,7 @@ impl CoordinationToolProvider {
         }
         AgentHostError::StructuredOutcome(Box::new(outcome))
     }
+    #[allow(clippy::too_many_arguments)]
     async fn proposal_boundary(
         &self,
         actor_identity_id: &str,
@@ -4115,6 +4120,7 @@ impl CoordinationToolProvider {
         operation: &str,
         arguments: Value,
         prepared: bool,
+        admitted_authority: Option<&operation_registry::authority::EffectiveAuthority>,
     ) -> Result<Value, AgentHostError> {
         let correlation = correlation_id(&arguments, operation, scope);
         let payload = arguments.get("payload");
@@ -4126,9 +4132,18 @@ impl CoordinationToolProvider {
                 )
             })
             .unwrap_or(false);
-        let result = if prepared && registered_proposals::CATALOG.lookup(operation).is_some() {
-            self.registered_proposal(actor_identity_id, scope, operation, arguments.clone(), true)
-                .await
+        let result = if (prepared || admitted_authority.is_some())
+            && registered_proposals::CATALOG.lookup(operation).is_some()
+        {
+            self.registered_proposal(
+                actor_identity_id,
+                scope,
+                operation,
+                arguments.clone(),
+                prepared,
+                admitted_authority,
+            )
+            .await
         } else {
             self.propose(
                 actor_identity_id,
@@ -4187,6 +4202,15 @@ impl CoordinationToolProvider {
 
 #[async_trait]
 impl ForgeToolProvider for CoordinationToolProvider {
+    async fn read_denial(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        self.registered_authority(actor, scope, operation).await
+    }
+
     async fn record_terminal_denial(
         &self,
         actor_identity_id: &str,
@@ -4367,6 +4391,8 @@ impl ForgeToolProvider for CoordinationToolProvider {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
+        self.registered_authority(actor_identity_id, scope, operation)
+            .await?;
         let boundary_arguments = arguments.clone();
         match operation_descriptor(scope.scope_type, operation, None).classification {
             OperationClassification::Query => {}
@@ -4393,6 +4419,7 @@ impl ForgeToolProvider for CoordinationToolProvider {
                 actor_identity_id,
                 scope,
                 proposal_arguments: None,
+                admitted_authority: None,
             };
             match spec.dispatch(&context, arguments).await {
                 Ok(result) => Ok(result),
@@ -4514,6 +4541,7 @@ impl ForgeToolProvider for CoordinationToolProvider {
             operation,
             arguments,
             false,
+            None,
         )
         .await
     }
@@ -4532,6 +4560,28 @@ impl ForgeToolProvider for CoordinationToolProvider {
             operation,
             arguments,
             true,
+            None,
+        )
+        .await
+    }
+    async fn propose_admitted(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        runtime_session_id: &str,
+        operation: &str,
+        arguments: Value,
+        authority: &operation_registry::authority::EffectiveAuthority,
+        prepared: bool,
+    ) -> Result<Value, AgentHostError> {
+        self.proposal_boundary(
+            actor_identity_id,
+            scope,
+            runtime_session_id,
+            operation,
+            arguments,
+            prepared,
+            Some(authority),
         )
         .await
     }
@@ -5422,27 +5472,6 @@ fn workspace_access_name(access: WorkspaceAccess) -> &'static str {
         WorkspaceAccess::TaskWrite => "task_write",
         WorkspaceAccess::ProjectVerify => "project_verify",
         WorkspaceAccess::AccountScratch => "account_scratch",
-    }
-}
-
-fn permission_set(value: &str) -> BTreeSet<String> {
-    let Ok(value) = serde_json::from_str::<Value>(value) else {
-        return BTreeSet::new();
-    };
-    match value {
-        Value::Array(values) => values
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        Value::Object(map) => map
-            .get("permissions")
-            .or_else(|| map.get("allowed"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        _ => BTreeSet::new(),
     }
 }
 

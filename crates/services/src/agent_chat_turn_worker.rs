@@ -133,24 +133,7 @@ const PROJECT_SETUP_PERMISSION_CEILING: &str =
 /// True when a stored permission ceiling admits no operation — either blank or
 /// a JSON value carrying no permission entries, such as `{}` or `[]`.
 fn ceiling_grants_nothing(ceiling: &str) -> bool {
-    let trimmed = ceiling.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        // A non-JSON ceiling is the comma-separated form, which grants
-        // whatever names it lists.
-        return false;
-    };
-    let entries = match &value {
-        serde_json::Value::Array(values) => Some(values),
-        serde_json::Value::Object(map) => map
-            .get("permissions")
-            .or_else(|| map.get("allowed"))
-            .and_then(serde_json::Value::as_array),
-        _ => None,
-    };
-    entries.is_none_or(|values| !values.iter().any(serde_json::Value::is_string))
+    operation_registry::authority::permission_set(ceiling).is_empty()
 }
 #[cfg(test)]
 const REQUIRED_HANDOFF_REDACTION_CATEGORIES: [&str; 6] = [
@@ -6097,31 +6080,32 @@ fn compact_permission_list(mut entries: Vec<String>) -> String {
 }
 
 fn readable_permission_ceiling(value: &str) -> String {
-    fn readable(value: &Value) -> String {
-        match value {
-            Value::String(text) => text.clone(),
-            Value::Array(values) => compact_permission_list(values.iter().map(readable).collect()),
-            Value::Object(values) => {
-                let mut entries = values
-                    .iter()
-                    .map(|(key, value)| format!("{key}: {}", readable(value)))
-                    .collect::<Vec<_>>();
-                entries.sort();
-                entries.join("; ")
-            }
-            _ => value.to_string(),
-        }
+    let permissions = if !value.trim_start().starts_with(['{', '[']) && value.contains(',') {
+        let names = value.split(',').map(str::trim).collect::<Vec<_>>();
+        operation_registry::authority::permission_set(
+            &serde_json::to_string(&names).expect("display names"),
+        )
+    } else {
+        operation_registry::authority::permission_set(value)
+    };
+    let rendered = compact_permission_list(permissions.into_iter().collect());
+    // Keep the stored representation label in the state card, never its
+    // contents: conflicts and malformed entries have no authority to render.
+    if rendered.is_empty() {
+        return rendered;
     }
-    serde_json::from_str::<Value>(value)
-        .map(|v| readable(&v))
-        .unwrap_or_else(|_| {
-            compact_permission_list(
-                value
-                    .split(',')
-                    .map(|entry| entry.trim().to_owned())
-                    .collect(),
-            )
+    let label = serde_json::from_str::<Value>(value).ok().and_then(|v| {
+        v.as_object().and_then(|m| {
+            if m.contains_key("allowed") {
+                Some("allowed")
+            } else if m.contains_key("permissions") {
+                Some("permissions")
+            } else {
+                None
+            }
         })
+    });
+    label.map_or_else(|| rendered.clone(), |label| format!("{label}: {rendered}"))
 }
 
 fn hash_parts<'a, I>(prefix: &[u8], values: I) -> String

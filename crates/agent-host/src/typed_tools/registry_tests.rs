@@ -4,41 +4,128 @@ use operation_registry::READ_CATALOG;
 
 #[test]
 fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
-    for spec in READ_CATALOG.iter() {
-        for scope_type in [
-            CanonicalScopeType::Account,
-            CanonicalScopeType::AgentChat,
-            CanonicalScopeType::Project,
-            CanonicalScopeType::Task,
+    use operation_registry::authority::{AuthorityFacts, EffectiveAuthority, Principal};
+    // A = Main account, M = Main Chat, P = Project, C = Project Chat.
+    let rows = [
+        ("account.summary", "A", false),
+        ("agent_chat.summary", "MC", false),
+        ("charter.approval_target", "AM", false),
+        ("charter.diff", "AM", false),
+        ("charter.read", "AM", false),
+        ("charter.readiness", "AM", false),
+        ("discovery.read", "AM", false),
+        ("genesis.project_agents.read", "AM", false),
+        ("inquiry.run", "M", false),
+        ("portfolio.read", "AM", false),
+        ("project.charter", "PC", true),
+        ("skill.section", "PC", true),
+        ("genesis.project_agent.select", "AM", false),
+        ("project.create", "AM", false),
+    ];
+    let specs = READ_CATALOG
+        .iter()
+        .chain(operation_registry::main_proposals::CATALOG.iter())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        specs.iter().map(|s| s.id).collect::<BTreeSet<_>>(),
+        rows.iter().map(|r| r.0).collect::<BTreeSet<_>>(),
+        "every moved operation needs an authority row"
+    );
+    let granted_permissions = specs
+        .iter()
+        .flat_map(|spec| {
+            spec.authority
+                .permissions
+                .iter()
+                .map(|(_, permission)| (*permission).to_owned())
+        })
+        .collect::<BTreeSet<_>>();
+    for spec in specs {
+        let (_, admitted_scopes, ready_only) = rows.iter().find(|r| r.0 == spec.id).unwrap();
+        for (key, scope_type, project_chat) in [
+            ('A', CanonicalScopeType::Account, false),
+            ('M', CanonicalScopeType::AgentChat, false),
+            ('P', CanonicalScopeType::Project, false),
+            ('C', CanonicalScopeType::AgentChat, true),
+            ('T', CanonicalScopeType::Task, false),
         ] {
-            let existing = crate::operation_permission(scope_type, spec.id);
-            assert_eq!(
-                spec.authority.permission(scope_type_name(scope_type)),
-                existing,
-                "{} {scope_type:?}",
-                spec.id
-            );
-            if existing.is_some() {
-                assert_eq!(
-                    spec.effect == operation_registry::EffectClass::Query,
-                    crate::operation_descriptor(scope_type, spec.id, None).classification
-                        == crate::OperationClassification::Query,
-                    "{} {scope_type:?}",
-                    spec.id
-                );
-            }
-            for granted in [
-                BTreeSet::new(),
-                existing
-                    .map(|p| BTreeSet::from([p.to_owned()]))
-                    .unwrap_or_default(),
-            ] {
-                assert_eq!(
-                    spec.authority.allows(scope_type_name(scope_type), &granted),
-                    !filter_operations(scope_type, &[spec.id.to_owned()], &granted).is_empty(),
-                    "{} {scope_type:?}",
-                    spec.id
-                );
+            for granted in [false, true] {
+                for setup in [false, true] {
+                    let permissions = if granted {
+                        granted_permissions.clone()
+                    } else {
+                        BTreeSet::new()
+                    };
+                    let context = ProjectChatToolContext {
+                        is_project_agent_chat: project_chat,
+                        charter_setup_required: setup,
+                    };
+                    for kind in 0..6 {
+                        if (kind == 0 && matches!(key, 'P' | 'C'))
+                            || (kind == 1 && matches!(key, 'A' | 'M'))
+                        {
+                            continue;
+                        }
+                        let principal = match kind {
+                            0 => Principal::MainAgent {
+                                identity_id: "main".into(),
+                            },
+                            1 => Principal::ProjectAgent {
+                                identity_id: "project".into(),
+                                project_id: "p".into(),
+                            },
+                            2 => Principal::InteractiveUser {
+                                user_id: "user".into(),
+                            },
+                            3 => Principal::DelegatedUser {
+                                user_id: "user".into(),
+                            },
+                            4 => Principal::TaskAgent {
+                                identity_id: "task".into(),
+                                execution_id: "exec".into(),
+                            },
+                            _ => Principal::SystemComponent {
+                                name: "system".into(),
+                            },
+                        };
+                        let authority = EffectiveAuthority::resolve(AuthorityFacts {
+                            principal,
+                            scope_type: scope_type_name(scope_type).into(),
+                            scope_id: "scope".into(),
+                            profile_id: "profile".into(),
+                            layers: vec![permissions.clone()],
+                            binding_id: Some("projection".into()),
+                            setup_required: setup,
+                            active: true,
+                        });
+                        let native_principal = if matches!(key, 'P' | 'C') {
+                            kind == 1
+                        } else {
+                            kind == 0
+                        };
+                        let expected = native_principal
+                            && admitted_scopes.contains(key)
+                            && granted
+                            && (!ready_only || !setup);
+                        assert_eq!(
+                            authority.evaluate(spec).is_ok(),
+                            expected,
+                            "{} {key} principal={kind} profile={granted} setup={setup}",
+                            spec.id
+                        );
+                        if native_principal {
+                            let advertised = !filter_operations(
+                                scope_type,
+                                &[spec.id.into()],
+                                &permissions,
+                                context,
+                                None,
+                            )
+                            .is_empty();
+                            assert_eq!(advertised, expected, "advertisement {} {key}", spec.id);
+                        }
+                    }
+                }
             }
         }
     }

@@ -125,6 +125,18 @@ pub struct CommandObservation {
 
 #[async_trait]
 pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
+    fn admitted_authority(&self) -> Option<&operation_registry::authority::EffectiveAuthority> {
+        None
+    }
+    async fn read_denial(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        let _ = (actor_identity_id, scope, operation);
+        Ok(())
+    }
     /// Persist a safe terminal-denial reminder using host-issued session and
     /// scope values. Inspection-only providers need no durable storage.
     async fn record_terminal_denial(
@@ -211,6 +223,39 @@ pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
             arguments,
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn propose_admitted(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        runtime_session_id: &str,
+        operation: &str,
+        arguments: Value,
+        authority: &operation_registry::authority::EffectiveAuthority,
+        prepared: bool,
+    ) -> Result<Value, AgentHostError> {
+        let _ = authority;
+        if prepared {
+            self.propose_prepared(
+                actor_identity_id,
+                scope,
+                runtime_session_id,
+                operation,
+                arguments,
+            )
+            .await
+        } else {
+            self.propose(
+                actor_identity_id,
+                scope,
+                runtime_session_id,
+                operation,
+                arguments,
+            )
+            .await
+        }
     }
 
     /// Records one command a Project Agent verification session ran and
@@ -431,6 +476,10 @@ impl ScopeToolComposition {
         runtime: ScopeToolRuntime,
     ) -> Result<Self, AgentHostError> {
         scope.validate()?;
+        let admitted_authority = provider
+            .as_ref()
+            .and_then(|provider| provider.admitted_authority())
+            .cloned();
         let denial_provider = provider.clone();
         // `None` is the built-in set. An owner widens or replaces it in the
         // Forge config and per Project; the resolved list arrives with the
@@ -549,12 +598,19 @@ impl ScopeToolComposition {
                 }
                 if let Some(provider) = provider {
                     let (read_operations, propose_operations) = task_operations(role);
-                    let read_operations =
-                        filter_operations(scope.scope_type, &read_operations, allowed_permissions);
+                    let read_operations = filter_operations(
+                        scope.scope_type,
+                        &read_operations,
+                        allowed_permissions,
+                        project_chat,
+                        admitted_authority.as_ref(),
+                    );
                     let propose_operations = filter_operations(
                         scope.scope_type,
                         &propose_operations,
                         allowed_permissions,
+                        project_chat,
+                        admitted_authority.as_ref(),
                     );
                     if !read_operations.is_empty() {
                         tools.push(Arc::new(ForgeScopeReadTool::new(
@@ -630,12 +686,19 @@ impl ScopeToolComposition {
                         project_chat.is_project_agent_chat,
                         project_chat.charter_setup_required,
                     );
-                    let read_operations =
-                        filter_operations(scope.scope_type, &read_operations, allowed_permissions);
+                    let read_operations = filter_operations(
+                        scope.scope_type,
+                        &read_operations,
+                        allowed_permissions,
+                        project_chat,
+                        admitted_authority.as_ref(),
+                    );
                     let propose_operations = filter_operations(
                         scope.scope_type,
                         &propose_operations,
                         allowed_permissions,
+                        project_chat,
+                        admitted_authority.as_ref(),
                     );
                     if !read_operations.is_empty() {
                         tools.push(Arc::new(ForgeScopeReadTool::new(
@@ -714,6 +777,8 @@ impl ScopeToolComposition {
                             scope.scope_type,
                             &orchestration_reads,
                             allowed_permissions,
+                            project_chat,
+                            admitted_authority.as_ref(),
                         );
                         // The depth cap. An inquiry sub-agent runs under the
                         // Account scope, so withholding the dispatch
@@ -733,6 +798,8 @@ impl ScopeToolComposition {
                             scope.scope_type,
                             &orchestration_proposals,
                             allowed_permissions,
+                            project_chat,
+                            admitted_authority.as_ref(),
                         );
                         // An inquiry reads and reports; it never proposes.
                         // Withholding the whole proposal surface is what
@@ -1550,10 +1617,47 @@ fn filter_operations(
     scope_type: CanonicalScopeType,
     operations: &[String],
     allowed_permissions: &BTreeSet<String>,
+    project_chat: ProjectChatToolContext,
+    admitted: Option<&operation_registry::authority::EffectiveAuthority>,
 ) -> Vec<String> {
     operations
         .iter()
         .filter(|operation| {
+            if let Some(spec) = operation_registry::READ_CATALOG
+                .lookup(operation)
+                .or_else(|| operation_registry::main_proposals::CATALOG.lookup(operation))
+            {
+                if let Some(admitted) = admitted {
+                    return admitted.evaluate(spec).is_ok();
+                }
+                use operation_registry::authority::{
+                    AuthorityFacts, EffectiveAuthority, Principal,
+                };
+                let principal = if scope_type == CanonicalScopeType::Project
+                    || project_chat.is_project_agent_chat
+                {
+                    Principal::ProjectAgent {
+                        identity_id: String::new(),
+                        project_id: String::new(),
+                    }
+                } else {
+                    Principal::MainAgent {
+                        identity_id: String::new(),
+                    }
+                };
+                return EffectiveAuthority::resolve(AuthorityFacts {
+                    principal,
+                    scope_type: scope_type_name(scope_type).to_owned(),
+                    scope_id: String::new(),
+                    profile_id: String::new(),
+                    layers: vec![allowed_permissions.clone()],
+                    binding_id: Some("projection".into()),
+                    setup_required: project_chat.charter_setup_required,
+                    active: true,
+                })
+                .evaluate(spec)
+                .is_ok();
+            }
             let descriptor =
                 crate::operation_catalog::descriptor(scope_type, operation.as_str(), None);
             descriptor.is_exposed()
@@ -1845,6 +1949,28 @@ impl Tool for ForgeScopeReadTool {
         let object = arguments
             .as_object()
             .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
+        let operation = required_string(&arguments, "operation")?;
+        if !self.operations.contains(operation) {
+            return Err(RuntimeError::tool(
+                "Forge read operation is outside this scope",
+            ));
+        }
+        if operation_registry::READ_CATALOG.lookup(operation).is_some() {
+            if let Err(error) = self
+                .provider
+                .read_denial(&self.actor_identity_id, &self.scope, operation)
+                .await
+            {
+                return prepare_authority_denial(
+                    error,
+                    operation,
+                    self.tool_name,
+                    &self.scope,
+                    ctx,
+                    FORGE_SCOPE_READ_PERMISSION,
+                );
+            }
+        }
         if let Some(field) = object
             .keys()
             .find(|field| !matches!(field.as_str(), "operation" | "arguments"))
@@ -1852,12 +1978,6 @@ impl Tool for ForgeScopeReadTool {
             return Err(RuntimeError::tool(format!(
                 "Forge read argument `{field}` is not admitted"
             )));
-        }
-        let operation = required_string(&arguments, "operation")?;
-        if !self.operations.contains(operation) {
-            return Err(RuntimeError::tool(
-                "Forge read operation is outside this scope",
-            ));
         }
         if self.reject_authority_overrides {
             reject_authority_overrides(&arguments)?;
@@ -1891,6 +2011,9 @@ impl Tool for ForgeScopeReadTool {
         prepared: PreparedToolCall,
         _ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
+        if let Some(denial) = prepared.arguments().get("__forge_authority_denial") {
+            return Ok(tool_error_outcome(denial.clone()));
+        }
         let arguments = prepared.into_arguments();
         let operation = required_string(&arguments, "operation")?;
         let input = arguments
@@ -2170,10 +2293,20 @@ impl Tool for ForgeScopeProposeTool {
         }
         let registered = operation_registry::main_proposals::CATALOG.lookup(operation);
         if registered.is_some() {
-            self.provider
+            if let Err(error) = self
+                .provider
                 .proposal_denial(&self.actor_identity_id, &self.scope, operation)
                 .await
-                .map_err(|error| RuntimeError::tool(error.to_string()))?;
+            {
+                return prepare_authority_denial(
+                    error,
+                    operation,
+                    self.tool_name,
+                    &self.scope,
+                    ctx,
+                    FORGE_SCOPE_PROPOSE_PERMISSION,
+                );
+            }
         }
         if registered.is_some() {
             // Preparation refuses everything the registered dispatch guard
@@ -2234,6 +2367,9 @@ impl Tool for ForgeScopeProposeTool {
         prepared: PreparedToolCall,
         ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
+        if let Some(denial) = prepared.arguments().get("__forge_authority_denial") {
+            return Ok(tool_error_outcome(denial.clone()));
+        }
         let runtime_session_id = ctx.session.to_string();
         provider_result_to_tool_outcome(
             self.provider
@@ -3357,6 +3493,31 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
 
 fn bound_chat_tool_error(message: String, limit: usize) -> String {
     message.chars().take(limit).collect()
+}
+
+fn prepare_authority_denial(
+    error: AgentHostError,
+    operation: &str,
+    tool_name: &str,
+    scope: &CanonicalScope,
+    ctx: &PreparationContext,
+    permission: &'static str,
+) -> Result<PreparedToolCall, RuntimeError> {
+    let AgentHostError::StructuredOutcome(outcome) = error else {
+        return Err(RuntimeError::tool(error.to_string()));
+    };
+    Ok(PreparedToolCall::new(
+        ctx.call_id.clone(),
+        tool_name,
+        json!({"operation":operation,"__forge_authority_denial":outcome}),
+        PermissionSet::single(Permission::other(permission)),
+        SecurityResource::other(
+            "forge.scope",
+            format!("{}:{}", scope_type_name(scope.scope_type), scope.scope_id),
+        ),
+        ToolEffects::new(Vec::new()),
+        ToolCallDisplay::new("Forge authority revoked"),
+    ))
 }
 
 #[cfg(test)]

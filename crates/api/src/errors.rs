@@ -460,6 +460,8 @@ impl From<ServiceError> for ApiError {
 impl From<DbError> for ApiError {
     fn from(error: DbError) -> Self {
         match error {
+            DbError::PermissionDocument(error) => Self::bad_request_with_code(
+                error.code(), error.to_string()),
             DbError::TaskBusy {pending_steps,retry_after_ms} => ServiceError::TaskBusy {pending_steps,retry_after_ms}.into(),
             DbError::TaskConditionQuarantined { task_id } => ServiceError::TaskConditionQuarantined { task_id }.into(),
             DbError::NotFound => Self {

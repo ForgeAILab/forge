@@ -50,6 +50,13 @@ pub(crate) async fn dispatch_with_context(
             if !known_tool(&params.name, context.project_id.is_some()) {
                 return Err(McpToolError::protocol(-32601, "method not found"));
             }
+            authorize_catalog_tool(context, &params.name).map_err(|error| {
+                error.with_call_context(
+                    &params.name,
+                    context.project_id.as_deref(),
+                    context.user_id.as_deref(),
+                )
+            })?;
             let arguments = match params.arguments {
                 Value::Null => json!({}),
                 arguments => arguments,
@@ -511,7 +518,16 @@ fn handle_initialize() -> Result<Value, McpToolError> {
 }
 
 fn handle_tools_list(context: &McpContext) -> Result<Value, McpToolError> {
-    Ok(json!({ "tools": descriptor_catalog(context.project_id.is_some()).clone() }))
+    let tools = descriptor_catalog(context.project_id.is_some())
+        .as_array()
+        .expect("tool catalog")
+        .iter()
+        .filter(|tool| {
+            authorize_catalog_tool(context, tool["name"].as_str().expect("tool name")).is_ok()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(json!({ "tools": tools }))
 }
 
 fn tool_call_result(result: Value) -> Value {
@@ -522,5 +538,19 @@ fn tool_call_result(result: Value) -> Value {
                 "text": serde_json::to_string(&result).unwrap_or_else(|_| result.to_string()),
             }
         ],
+    })
+}
+
+fn authorize_catalog_tool(context: &McpContext, name: &str) -> Result<(), McpToolError> {
+    use operation_registry::authority::{mcp_authority, mcp_scope_rule};
+    let authority = mcp_authority(
+        context.user_id.as_deref().unwrap_or_default(),
+        context.project_id.as_deref(),
+    );
+    let rule =
+        mcp_scope_rule(name).ok_or_else(|| McpToolError::protocol(-32601, "method not found"))?;
+    authority.evaluate(rule).map_err(|_| {
+        McpToolError::new(-32001, "tool is outside the delegated MCP grant")
+            .with_data(json!({"code":"mcp_scope_denied"}))
     })
 }

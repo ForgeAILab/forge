@@ -55,8 +55,8 @@ forge-solo → services → db / events / agent-host / executors / workspace →
 ### Native operation registry
 
 `operation-registry` is a leaf crate: Serde, schemars and async-trait, all of
-which the workspace already resolved. Both `agent-host` and `services` depend
-on it; it imports neither, so typed service handler registration does not
+which the workspace already resolved. `agent-host`, `services`, `db` and
+`mcp-server` depend on it; it imports neither, so typed service handler registration does not
 create a dependency cycle. Specifications live in domain modules of that crate
 (`scope_reads`, `project_reads`, `main_reads`, `main_proposals`), below `agent-host`, because `agent-host`
 builds the advertised schema and cannot depend on `services`. Each module owns
@@ -70,7 +70,8 @@ availability, native aggregate and field projection, short summary, bounded
 guidance, and typed handler binding. A handler takes exactly the spec's input
 type, so a mismatch does not compile.
 
-**What is advertised, what is enforced.** These are deliberately different:
+**Contracts and authority.** The schema projection and full input contract
+have different jobs; operation authority uses the same evaluator:
 
 - *Advertised.* The aggregate tool schema sent to a provider keeps the flat
   shape `{operation: enum, arguments: object}` and uses only the JSON-Schema
@@ -387,6 +388,52 @@ commits once. A failed commit exposes none of those writes. The in-process
 event bus is published only after commit; it is a live projection, not the
 replay or authority boundary. Consequently, response loss replays the same
 domain identifiers, receipt, event, and outcome without creating a duplicate.
+
+### Effective authority for registered operations (3.8 D)
+
+`operation-registry::authority` owns permission normalization, the
+`EffectiveAuthority::resolve` resolver, and one `evaluate` function. Native
+registry specs and explicit MCP scope classifications both implement its
+requirement interface. Principals distinguish interactive users, delegated
+users, Main Agents, Project Agents, execution-bound Task Agents and system
+components. MCP credentials remain delegated-user authority; a Project
+constraint never infers an Agent identity.
+
+The stored permission shapes are arrays of strings, `permissions` objects,
+`allowed` objects, the empty default object, and JSON `null` (five stored
+shapes). Empty objects and `null` normalize to no permissions. Both keys together must
+normalize to the same set (order and duplicates do not matter). Conflicts
+are refused at identity/profile/binding write boundaries with a typed error;
+conflicting or malformed persisted entries grant nothing on reads. Shipped
+seed/default and migration data use these supported forms and retain their
+authority. The comma-separated legacy setup ceiling is display text only;
+it is normalized through a string-array projection for rendering.
+
+The database loads authenticated identity, admitted Profile, current selected
+Profile, active Main/Project binding and Project setup facts. At native or CLI
+turn admission the protected session fixes the Profile ID and effective
+ceiling. Advertisement uses the registry evaluator against that ceiling and
+principal/scope/setup facts. Before registered dispatch, the provider loads
+fresh facts, intersects them with the admitted and remaining turn ceilings,
+and runs the same evaluator. Narrowing is monotonic within the running provider;
+restoring a permission later in that turn cannot revive its revoked grant. A widened Profile or binding never widens that turn; a missing or
+replaced binding, inactive identity, or permission revoked since admission
+returns typed `authority_revoked`. Current state can instead produce a typed
+Charter denial or the command's existing version correction. Terminal-denial
+caching suppresses repeated effect dispatch and records one reminder per
+operation and turn. Preparation carries a server-generated typed denial to
+invocation before exposing input contract details.
+
+Registered Main reads, Project Charter/doctrine reads, identity summaries,
+`genesis.project_agent.select` and `project.create` use this path. UI effective
+permissions and CLI composition use the same resolver. Existing exact-object,
+receipt-first replay, governing-policy and optimistic-version checks remain
+in command transactions; fresh Genesis Agent selection also evaluates
+transaction-loaded authority. The evaluator does not replace semantic input
+validation, approval ownership or the workflow engine. Task caller authority
+and Task offers remain on their execution path until slice F. Task read-only
+summaries label workflow offers informational, and their ceilings carry no
+review/workflow proposal permission.
 
 ### Identity, profiles, and explicit authority
 

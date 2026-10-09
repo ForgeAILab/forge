@@ -2150,22 +2150,7 @@ fn policy_allows_project_chat(tool_policy_json: &str) -> bool {
 }
 
 fn policy_has_permission(tool_policy_json: &str, expected: &str) -> bool {
-    serde_json::from_str::<Value>(tool_policy_json)
-        .ok()
-        .and_then(|value| match value {
-            Value::Array(values) => Some(values),
-            Value::Object(map) => map
-                .get("permissions")
-                .or_else(|| map.get("allowed"))
-                .and_then(Value::as_array)
-                .cloned(),
-            _ => None,
-        })
-        .is_some_and(|permissions| {
-            permissions
-                .iter()
-                .any(|permission| permission.as_str() == Some(expected))
-        })
+    operation_registry::authority::permission_set(tool_policy_json).contains(expected)
 }
 
 fn availability_reason(availability: SoloAgentAvailability) -> &'static str {
