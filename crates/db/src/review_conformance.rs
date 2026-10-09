@@ -336,6 +336,14 @@ pub(crate) async fn verify_review_source(
     Ok(())
 }
 
+/// Whether the latest passed review is the owner's manual pass of a failed
+/// review. Only `create_manual_pass_with_task_authority` writes a passed
+/// review carrying `manual_override` with a user actor.
+fn owner_passed_review_manually(raw: Option<&str>) -> bool {
+    raw.and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .is_some_and(|details| details["manual_override"]["actor_type"] == "user")
+}
+
 /// Every check that makes a passed review still current authority for its
 /// Task, shared by integration and by authority carry: the Review recorded a
 /// passed conformance under the current policy, the governing context still
@@ -438,8 +446,18 @@ impl ReviewConformanceRepo for SqliteDb {
             }
             let raw: Option<String> = sqlx::query_scalar("SELECT CASE WHEN status = 'passed' THEN step_results_json ELSE '{}' END FROM review WHERE task_id = ? ORDER BY attempt_number DESC, id DESC LIMIT 1")
                 .bind(task_id).fetch_optional(&mut *tx).await?;
-            let contract = verified_passed_contract(&mut tx, task_id, raw.as_deref()).await?;
-            Some(contract)
+            if owner_passed_review_manually(raw.as_deref()) {
+                // The owner passed the failed review by hand
+                // (`create_manual_pass_with_task_authority`). That decision
+                // is the review authority: there is no reviewer conformance
+                // to verify and no reviewed object to pin, exactly as for a
+                // Task with no reviewer. The pass still has to be current
+                // (`review_passed_at`, checked above, is cleared whenever
+                // the Task leaves the accepted state).
+                None
+            } else {
+                Some(verified_passed_contract(&mut tx, task_id, raw.as_deref()).await?)
+            }
         } else {
             None
         };

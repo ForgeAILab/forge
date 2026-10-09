@@ -553,11 +553,16 @@ impl TaskDispatcher {
                 facts: &p.facts,
             });
             // Ownerless diagnoses now live in the condition; never write a legacy annotation.
-            let visible = matches!(&next, Next::Park(park) if matches!(&park.reason, Reason::WorkflowInvalid{..}) || matches!(&park.reason, Reason::UnknownCondition{owner} if owner == next_step::PUBLICATION_OWNER || owner == next_step::ENTRY_HOOKS_OWNER));
+            let visible = matches!(&next, Next::Park(park) if matches!(&park.reason, Reason::WorkflowInvalid{..} | Reason::ParentWait{..} | Reason::AgentWait{..} | Reason::AgentCapacity{..}) || matches!(&park.reason, Reason::UnknownCondition{owner} if owner == next_step::PUBLICATION_OWNER || owner == next_step::ENTRY_HOOKS_OWNER));
             let current_visible = p.read.condition.reasons().any(|r| {
                 matches!(
                     r,
                     db::ParkReason::WorkflowInvalid { .. }
+                        | db::ParkReason::Parent { .. }
+                        | db::ParkReason::Agent { .. }
+                        | db::ParkReason::Capacity {
+                            scope: db::ConditionCapacityScope::Agent
+                        }
                         | db::ParkReason::UnknownCondition {
                             source: db::ConditionSource {
                                 field: db::LegacyConditionField::SchedulePark,
@@ -582,7 +587,10 @@ impl TaskDispatcher {
                 Next::Park(park) => {
                     parked = Some(park.clone());
                     // Availability also turns on facts no commit announces.
-                    outcome.recheck |= park.reason == Reason::AgentUnavailable;
+                    outcome.recheck |= matches!(
+                        park.reason,
+                        Reason::AgentUnavailable | Reason::AgentWait { .. }
+                    );
                     if initial
                         && p.facts.initial_target.is_none()
                         && park.reason == Reason::HumanWork
@@ -787,7 +795,11 @@ impl TaskDispatcher {
         ) || matches!(
             next,
             Next::Park(Park {
-                reason: Reason::RetryDeadline | Reason::AgentUnavailable | Reason::Capacity,
+                reason: Reason::RetryDeadline
+                    | Reason::AgentUnavailable
+                    | Reason::AgentWait { .. }
+                    | Reason::AgentCapacity { .. }
+                    | Reason::Capacity,
                 ..
             })
         );
@@ -1228,6 +1240,10 @@ impl TaskDispatcher {
                 Some(EffectiveStatus::Active | EffectiveStatus::Busy)
             );
             p.facts.agent_full = status == Some(&EffectiveStatus::Busy);
+            if p.facts.agent_unavailable || p.facts.agent_full {
+                p.facts.agent_wait =
+                    status.map(|status| (agent.clone(), status.as_str().to_owned()));
+            }
         }
         failed
     }

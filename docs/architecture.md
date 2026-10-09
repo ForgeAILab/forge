@@ -3636,7 +3636,7 @@ CLI adapter, streams
 execution logs back as `execution.log` notifications, and reports final status
 through `execution.terminal`.
 
-Protocol revision 5 independently negotiates `machine_probe.v1` for
+The command protocol independently negotiates `machine_probe.v1` for
 `machine.probe` and `repo_provision.v1` for `repo_location.provision`.
 A probe accepts named commands, 1–300 second timeouts, Project env, and an
 optional verified location ID. It returns exit status, timeout and a redacted
@@ -3658,21 +3658,21 @@ local policy purposes, `environment_probe` and `repo_provision`, and refusal is
 Upgrade the server first: a daemon that opts into these new purposes needs a
 server from this release; an older server rejects the handshake because its
 run-purpose enum does not recognize them. These capabilities did not change
-the protocol revision; the current revision is 5.
+the protocol revision; the current revision is 6.
 
-Protocol revision 5 negotiates `workspace.v1` for `repo_location.verify`,
+Protocol revision 6 negotiates `workspace.v1` for `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
 `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
 Plan-writing roles on a daemon-owned workspace require `execution.plan_transport`.
-A revision-5 daemon without it can still run reviewers, interactive executions,
+A daemon without it can still run reviewers, interactive executions,
 server-owned shared-mount executions, filesystem requests and PTYs. Deterministic
 placement refusals record a structured Task annotation naming the machine and
 missing capability. Dispatch waits until eligibility facts change, then clears
 the refusal and retries.
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 5 or newer), restarting each with its existing
+release (protocol revision 6 or newer), restarting each with its existing
 `--workspace-root`.
-A connection below revision 5 receives `daemon_upgrade_required` and cannot use any
+A connection below revision 6 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -3683,7 +3683,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 5, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 6, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
@@ -5150,14 +5150,98 @@ An uncertain receipt is replaced on reconciliation, not appended as a second
 receipt for the same key. An original owner can retain its receipt after lease
 takeover; the frozen intent remains its identity.
 
+**Integration owner wire (3.2 stage D1c, daemon protocol revision 6).** This
+sub-stage is passive: the queue worker is still off and today's merge path does
+not call any of it. It adds what the worker needs from an owner.
+
+- *Fence announcement.* `integration.announce { daemon_id, runtime_id, fence,
+  live_queue_ids? }` is the first message of a claim generation. The daemon
+  records the fence as the queue's high-water mark, returns the fence it held
+  before, and refuses an older generation (or another claim of the same
+  generation) with `stale_fence`. A queue attempt lookup (`workspace.describe`
+  with `operation: reconcile`) now returns `owner_fence { queue_id, generation,
+  attempt_id, intent }`: the generation the daemon held *before* the lookup and
+  what its journal said. `intent` is `retained` (the journal held the intent;
+  the receipt is evidence), `not_performed` (the daemon already knew this claim
+  generation and holds no intent: the effect never ran, and its key is now
+  fenced off) or `unknown` (the daemon had never been told of this claim
+  generation, so its empty journal proves nothing: lost or replaced owner
+  state). For `unknown` the daemon retains an `uncertain` receipt, so asking
+  again never turns it into `not_performed`, and the server records the effect
+  as uncertain. Forge never guesses a merge result. The rule that keeps a
+  healthy merge from ever reading as `unknown`: the queue transport
+  (`DaemonWorkspaceClient::integration_effect`) sends the announcement itself,
+  before the intent is marked started. So when a started effect is looked up,
+  the daemon was told of its generation: a frame that never arrived reads
+  `not_performed`, and `unknown` can only mean the daemon's registry was lost
+  or replaced. A refused or undelivered announcement leaves no intent. Today's
+  merges are Task-step effects, not queue attempts: their lookups carry no
+  `owner_fence` and behave as before.
+- *Journal retention.* `journal.ack` for a queue attempt entry marks it
+  acknowledged (no longer replayed to the server) and clears the checkout's
+  pending marker. The entry is deleted when the queue's fence passes its
+  generation, when the queue's fence is dropped, or 7 days after the
+  acknowledgement for a queue that never claims again (in the last two cases
+  its key gets a 7-day cancellation tombstone, so a late duplicate is refused
+  and not run). Until it is deleted an acknowledged receipt still counts
+  against the journal's 1024-record bound, so a daemon that holds
+  acknowledged receipts of about a thousand idle queues refuses new effects
+  until the 7 days pass (known limit; stage D1d must lift it). Fences are
+  dropped when the server's `live_queue_ids` no longer lists
+  their queue (the announced queue always stays), and as the least recently
+  recorded past 1024 fences. A fence is never dropped, by either rule, while
+  its queue has a journal entry the server has not acknowledged: dropping it
+  would let an older claim in and turn a lookup into `unknown`. Such fences
+  are bounded by the journal's own entry bound. Pending markers of settled
+  operations are dropped on every acknowledgement and announcement. A
+  revision-5 journal needs no conversion; an in-flight attempt intent and its
+  fence are read unchanged.
+- *Object transfer.* A Task placed on a non-default checkout will be merged
+  into the repository's default checkout (stage D2). Its commits travel as a
+  thin Git bundle: `export_objects` on the source owner, `import_objects` on
+  the target owner, one algorithm (`git::integration`) for the server owner
+  (local) and the daemon (`integration.export_objects`,
+  `integration.import_objects`, `integration.release_objects`, 1 MiB chunks,
+  staging under `.forge/transfer`, removed on release, after 24 hours and at
+  daemon start). The cap is 256 MiB; a larger transfer is refused `too_large`
+  before any byte is stored on the target, and a chunk that runs past the
+  declared size is refused before it is written. Chunks arrive in order; a
+  transfer is never resumed part way: after a lost connection or a daemon
+  restart the sender starts the key again from its first chunk and the owner
+  drops what it had staged. The import checks size and SHA-256, runs `git
+  bundle verify`, unpacks into a quarantine directory inside the Git
+  directory, re-checks the pack with `git index-pack --strict`, requires the
+  expected tip and full connectivity, and only then moves the pack into the
+  object store and creates `refs/forge/integration/<key>` (create-only: of two
+  concurrent imports of a key one binds the ref and the other replays). Ref
+  names inside the bundle are never used, no other ref moves, nothing is
+  checked out, and the index and work tree are not read. `have` and `want`
+  must be full object ids. The ref writes run with hooks disabled
+  (`core.hooksPath=/dev/null`), so no repository hook runs; none of the Git
+  commands used starts a program named in repository configuration. The key
+  is `<attempt>-<generation>-in|out`; an import whose ref already names the
+  expected tip returns its receipt (`replayed`) without reading or
+  transferring anything. A refused, failed or cancelled transfer leaves both
+  repositories unchanged and no temporary file. A killed process can leave
+  an export pin ref (`refs/forge/export/<key>`) or a quarantine directory
+  (`forge-incoming-*` in the Git directory): the daemon removes both from
+  every verified checkout when it starts
+  (`git::integration::sweep_transfer_leftovers`); the server owner does not
+  call that sweep yet (stage D1d). Transfers carry the queue fence (stale
+  claims are refused) but are not journaled effects and write no attempt
+  receipt: the Git ref is the receipt. Imported refs are not deleted by this
+  stage; stage D2 deletes them when the attempt ends.
+
 The existing `V202610082317__integration_fencing.sql` columns retain their bounds:
 16 KiB fence, 64 KiB intent, 128 KiB per receipt, 1 MiB receipt array. This stage
 uses no additional SQL columns or stored enum values and needs no migration.
 The daemon persists high-water fences and unresolved checkout operation identities
 beside its workspace registry in `.forge/journal`; attempt effects use stable
 attempt/kind/generation operation IDs in that journal. The existing journal
-count/byte limits apply before an effect. Queue attempt receipts survive ACK and
-replay without Git, including after restarting the owner. Cancelling an attempt
+count/byte limits apply before an effect. An acknowledged queue attempt receipt
+stays in the journal and replays without Git, including after restarting the
+owner, until a newer claim generation of its queue is recorded (protocol
+revision 6, below); then it is pruned. Cancelling an attempt
 stops its Git process group before retaining a receipt with observed HEAD and
 rebase progress. Task-step merge cancellation keeps today's protected-completion
 behavior. Ordinary Task-step journal ACKs retain their existing lifecycle.
@@ -5254,8 +5338,10 @@ Known limits before activation:
   stage D will place integrating Tasks according to the target.
 - Unknown effects are kept uncertain when neither a retained receipt nor exact
   Git completion proof exists. Lease expiry alone never grants a repeat.
-- Queue attempt receipts are bounded and retained after ACK; retention/cleanup
-  policy must preserve replay fencing when the future worker starts using them.
+- Queue attempt receipts are bounded and retained after ACK until the queue's
+  fence moves past their generation (3.2 stage D1c, protocol revision 6): a late
+  duplicate of a pruned key is refused `stale_fence`, so pruning keeps replay
+  fencing.
 - The existing local Review/Project authority guard remains separate from queue
   owner serialization.
 
@@ -5446,7 +5532,7 @@ The closed verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`
 
 Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Legacy annotation, blocked, failed and entry-barrier columns remain private dual-write storage until stage five.
 
-Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
+Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. `release` is the owner's decision on the run the hold stopped: when no Agent can take the Task at that moment (the Agent or the Project is paused) the release clears the hold and marks that stopped run resumable (`resume_policy = auto`), so the dispatcher starts the role again as soon as the Agent is available instead of treating the stopped run as one that still needs a decision. Only that run is marked: the Task's latest non-interactive run, and only when the user stopped it (`cancelled` with `stop_reason = user_cancelled`). A run that failed or was stopped for any other reason (executor failure, timeout, stall, lost machine) keeps `resume_policy = manual` and its own recovery, and the mark is undone when the release loses its version race. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
 Task action conditions precede generic review decisions. In `review`, ordinary
 approval requires an awaiting-human Review and no condition. Re-running review requires
@@ -5458,11 +5544,45 @@ hold, a failure park, the condition a queued action saved) and keeps it in
 `blocked.details.superseded`; a queued action refused by the dependency gate
 for a cancelled dependency settles into the same blocker, not an untyped
 `recovery_required` park, and one refused for an unfinished dependency stays
-queued behind a `dispatch_refusal` wait until the dependency finishes or its
-link is removed. The displaced condition records the state it was taken in and
+queued behind a typed `dependencies` wait (a `dispatch_disposition` with the
+capability `dependency_wait` naming the unfinished dependencies) until the
+dependency finishes or its link is removed: while that disposition is current
+the scheduler parks on it instead of replaying the action
+(`Facts::dependency_wait`), and the dependency's completion or the link's
+removal wakes the Task (`wake_task_dispatch`). A hold placed on a Task that
+carries the `dependency_cancelled` blocker goes under it
+(`hold_under_dependency_block`): the queued action is dropped as for any
+hold, the blocker stays, and the hold replaces what the blocker carried in
+`superseded`, so removing the dependency leaves the Task held. The displaced condition records the state it was taken in and
 is restored only while the Task is still in that state. A queued action always offers Hold alongside cancel,
 even when a newer condition appears. Restart follows the resolver's explicit set
-of resettable condition kinds. Pause refusals preserve the typed wait cause and
+of resettable condition kinds. Cancel wins over a settling plan
+artifact: when the Task (or a subtask the root's cancel cascades to) holds a
+`plan_publication_claim`, the cancel abandons it first (prior plan restored,
+staged private files removed, claim released; when the restore fails it is
+logged, the staged files are still removed and the claim is released) and
+continues at the Task version that produced. A claim left by a transition that
+already committed (its state is no longer the Task's) is cleared on the same
+path. Both the cancel and the settle run through the Task's single writer, so
+exactly one of them wins,
+so an offered `cancel` is never refused with "settling a completed execution's
+plan artifact". A coordination root's `retry` on an exhausted
+review budget is review-only: it resets the budget and re-runs the aggregate
+review where the root is, instead of resuming the root in a working state
+where the aggregate-review guard refuses every role; a gate decision that
+leaves a root in a working state queues no role for it (the scheduler advances
+the root when its subtasks are complete). The same park offers `send_back`
+(`root_review_reopen`): the budget is reset, the root takes its reject
+transition to the working state and is held there, because an unheld root
+whose subtasks are all finished is advanced straight back into the review
+that failed. In the working state `ensure_parent_accepts_subtasks` admits a
+corrective subtask, which waits on `parent` / `held` until the root's
+`release`. The owner's manual pass of a failed review is review authority
+for integration, for a root and for any other Task:
+`ReviewConformanceRepo::lock_review_integration` returns no contract (as for
+a Task with no reviewer) when the latest passed review carries the
+`manual_override` a user wrote, instead of demanding a passed reviewer
+conformance the override by definition does not have. Pause refusals preserve the typed wait cause and
 turn retry scope across REST, MCP, and native tools.
 
 ### Root Tasks and ordered subtasks
@@ -5477,7 +5597,30 @@ Agent as a proxy for all child work. A `coder` assignment on the root is the
 default worker for children that have no own `coder`; converting a Task into a
 coordination root keeps that assignment and removes other non-review roles.
 The root's aggregate review role also remains assignable and is the only role
-that may execute on the root, only while the root is in its review state. The
+that may execute on the root, only while the root is in its review state. A
+subtask whose root does not let it run
+(`task_hierarchy::coordination_root_allows_child_dispatch` is false: the root
+is held, parked on a failure or a blocked entry, or in a state that runs no
+subtasks) says so: the dispatcher resolves `Reason::ParentWait` for it
+(`task_dispatcher/next_step.rs`), which is one of the visible schedule parks
+(`db::task_condition::readers::owner_park`), so the subtask's stored condition
+is `parked` with the typed reason `parent { parent_id, cause }` (`held`,
+`blocked`, `not_coordinating`). It is a wait without a diagnostic or failure
+kind, `start` is not offered on the subtask meanwhile, and the park is cleared
+on the pass that finds the root coordinating again (a change of the root's
+condition or status marks its children for the scheduler). A Task whose Agent cannot
+take work is shown the same way: `Reason::AgentWait` is a visible schedule
+park and the stored condition is `parked` on `agent { agent_id, status }`
+(the Agent's effective status), cleared on the pass that finds the Agent
+available. A Task past its initial state whose Agent is at its run limit
+resolves `Reason::AgentCapacity`, also a visible schedule park: its stored
+condition is `parked` on `capacity { scope: agent }` and it is woken by the
+Agent's wait record when a run ends. A Task still waiting for its first run
+keeps the unstored `Reason::Capacity`. None of these visible waits sets an
+interruption, failure or refusal flag, so `max_active_tasks` slot accounting
+(`TaskRepo::count_project_slots`) counts the Task exactly as before. Releasing a held
+root that already has subtasks launches no role for it (`release` takes the
+`held_waiting` path): the hold is cleared and its subtasks run. The
 root `coder` never executes there. The review role is whatever the workflow's
 review gate declares, not the built-in `reviewer` name.
 `services::task_hierarchy::RootRolePolicy` owns these assignment and execution

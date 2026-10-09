@@ -60,7 +60,7 @@ export function getApiConflictDetails(error: unknown): ApiConflictDetails | unde
 const placementFilterMessages: Record<string, string> = {
   owner_unreachable: 'Owner is offline or unreachable',
   daemon_upgrade_required:
-    'Upgrade the daemon to the server release (protocol revision 5 or newer)',
+    'Upgrade the daemon to the server release (protocol revision 6 or newer)',
   workspace_protocol_missing: 'Daemon lacks workspace protocol support',
   location_not_ready: 'Repository location is not ready',
   executor_unavailable: 'Executor is not installed, authenticated, or enabled',

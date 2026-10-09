@@ -1360,6 +1360,52 @@ impl World {
                     wedge("every child is settled and nothing is offered")
                 }
             }
+            // A subtask its parent does not let run: the exit is on the
+            // parent, which must exist, be open and (when it is held) offer
+            // its release.
+            (_, "parent") => {
+                let parent = task["condition"]["primary"]["parent_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let cause = task["condition"]["primary"]["cause"]
+                    .as_str()
+                    .unwrap_or_default();
+                let Some(parent_index) = self.tasks.iter().position(|id| *id == parent) else {
+                    return wedge("the parent it names is not a Task of this Project");
+                };
+                if !unsettled(vec![parent]).await? {
+                    return wedge("the parent it waits for is settled");
+                }
+                if cause == "held" {
+                    let (_, offers) = self.offers(parent_index).await?;
+                    if !offers
+                        .iter()
+                        .any(|offer| offer["action"]["verb"] == "release")
+                    {
+                        return wedge("its held parent offers no release");
+                    }
+                }
+                if verbs.contains(&"start") {
+                    return wedge("`start` is offered although the parent does not let it run");
+                }
+                Ok(())
+            }
+            // The Agent that would run the Task is paused or unreachable:
+            // the exit is on the Agent, which the model can resume.
+            (_, "agent") => {
+                let agent = task["condition"]["primary"]["agent_id"]
+                    .as_str()
+                    .unwrap_or_default();
+                if agent != self.coder_id && agent != self.reviewer_id {
+                    return wedge("the Agent it names is not one of this Project's");
+                }
+                if self.agent_paused || self.project_paused {
+                    Ok(())
+                } else {
+                    wedge("the Agent it waits for is not paused")
+                }
+            }
             (_, "capacity") => {
                 let mut busy = false;
                 for other in 0..self.tasks.len() {
@@ -1431,6 +1477,7 @@ impl World {
         self.trace.push(format!("pauses lifted: {last}"));
         let mut unchanged = 0;
         let mut attempts: HashMap<usize, usize> = HashMap::new();
+        let mut reopened: std::collections::HashSet<usize> = Default::default();
         for round in 0..SETTLE_ROUNDS {
             let mut open = 0;
             let mut moves = 0;
@@ -1486,7 +1533,10 @@ impl World {
                 }
                 // These wait for other Tasks, not for the owner.
                 if !matches!(kind, "parked" | "failed")
-                    || matches!(reason, "dependencies" | "children" | "capacity")
+                    || matches!(
+                        reason,
+                        "dependencies" | "children" | "capacity" | "parent" | "agent"
+                    )
                 {
                     continue;
                 }
@@ -1494,17 +1544,37 @@ impl World {
                 // was accepted and changed nothing, the next round takes the
                 // next one: a park is a wedge only when none of them helps.
                 let (version, offers) = self.offers(index).await?;
-                let forward: Vec<&Value> = ["release", "retry", "send_back", "restart", "approve"]
+                // Reopening a parent for corrective work is taken once per
+                // parent: it changes state every time (the parent leaves
+                // review, held, and comes back), so the rotation below would
+                // never get past it to the owner's override.
+                let forward: Vec<Value> = ["release", "retry", "send_back", "restart", "approve"]
                     .iter()
                     .filter_map(|verb| offers.iter().find(|offer| offer["action"]["verb"] == *verb))
+                    .filter(|offer| {
+                        offer["reason"] != "root_review_reopen" || !reopened.contains(&index)
+                    })
+                    .cloned()
                     .collect();
                 if !forward.is_empty() {
                     let turn = attempts.entry(index).or_insert(0);
-                    let offer = forward[*turn % forward.len()];
+                    let offer = &forward[*turn % forward.len()];
                     *turn += 1;
                     let verb = self.apply_offer(index, version, offer).await?;
                     taken.push(format!("{verb}({index})"));
                     moves += 1;
+                    if offer["reason"] == "root_review_reopen" {
+                        // What the reopening is for: the parent must now
+                        // accept a corrective subtask.
+                        reopened.insert(index);
+                        let created = self.create(Some(index)).await?;
+                        if created.starts_with("refused") {
+                            return Err(format!(
+                                "(b) task {index} was sent back for corrective work and refuses a subtask: {created}"
+                            ));
+                        }
+                        taken.push(format!("corrective child of {index}"));
+                    }
                 }
             }
             if open == 0 {
@@ -1980,7 +2050,10 @@ async fn start_on_a_queued_task_does_not_park_it_as_failed() {
             }
             let started = world.tasks.len() - 1;
             let task = world.task(started).await?;
-            if task["status"] != "todo" || task["condition"]["kind"] == "parked" {
+            // Waiting for its paused Agent is a visible wait, not a park the
+            // refused claim left behind.
+            let agent_wait = task["condition"]["primary"]["kind"] == "agent";
+            if task["status"] != "todo" || (task["condition"]["kind"] == "parked" && !agent_wait) {
                 return Err(format!(
                     "(b) `start` on a queued Task must leave it queued, not parked or moved: {} {}",
                     task["status"], task["condition"]
@@ -2125,15 +2198,18 @@ async fn a_run_that_fails_after_a_project_pause_is_retried() {
     run_cases(cases).await;
 }
 
-/// OPEN, UNTRIAGED: found by a random run once the generator stopped stepping
-/// around failures after a Project pause (`FORGE_MODEL_SEED=45233331
-/// FORGE_MODEL_LONG=1`); minimized below. The coder Agent is paused, the
-/// running Task is held, the server crashes before the hold's steps run, and
-/// the Task is released. Once the Agent resumes the Task stays in
-/// `in_progress` with a `clear` condition and no run; `retry` is offered.
-/// The same crash under a paused Agent without the hold recovers.
+/// Found by a random run of this model (`FORGE_MODEL_SEED=45233331
+/// FORGE_MODEL_LONG=1`) and fixed with it; minimized below. The coder Agent
+/// is paused, the running Task is held and then released. The hold stopped
+/// the run with a `manual` resume policy, and a release taken while no Agent
+/// could run the Task (`release_to_dispatch_queue`,
+/// `services/src/task_service/actions.rs`) cleared the hold but left that
+/// policy, so the dispatcher's stopped-run park
+/// (`task_dispatcher/snapshot.rs`, `stopped_execution`) kept the Task in
+/// `in_progress` with a `clear` condition and no run once the Agent resumed.
+/// The release is the owner's decision on that run: it now marks it
+/// resumable and the Task runs again when its Agent can take it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open stall: hold, crash and release under a paused Agent leave the Task idle once the Agent resumes"]
 async fn a_task_released_after_a_crash_under_a_paused_agent_runs_again() {
     use Action::{Create, PauseAgent, Take};
     run_cases(vec![(
@@ -2143,6 +2219,39 @@ async fn a_task_released_after_a_crash_under_a_paused_agent_runs_again() {
             step(PauseAgent),
             crash_after(Take(0, "hold")),
             step(Take(0, "release")),
+        ],
+    )])
+    .await;
+}
+
+/// Reached by `FORGE_MODEL_LONG=1 FORGE_MODEL_SEED=951857209` and fixed;
+/// minimized below. Task 3's review is rejected (scripted) while other Tasks
+/// hold the coder's runs; it goes back to `in_progress` and stayed there with
+/// a `clear` condition, no run, no deferral and no park. It was waiting for a
+/// free run of its busy Agent: the dispatcher's capacity park
+/// (`Reason::Capacity`, `task_dispatcher/next_step.rs`, `agent_full`) was a
+/// scheduling decision nothing stored. For a Task that already started it is
+/// now the visible schedule park `AgentCapacity`: the Task is `parked` on the
+/// typed reason `capacity` with scope `agent`, and runs when a run ends. The
+/// capacity park is code the parent, Agent and dependency waits did not
+/// touch, so the stall predates them (read, not re-run on the older build).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_sent_back_by_review_under_a_busy_agent_shows_why_it_waits() {
+    use Action::{Create, Finish, Offer, Verdict};
+    run_cases(vec![(
+        "review rejection while the coder is busy".to_owned(),
+        vec![
+            step(Create),
+            step(Offer(0, 0)),
+            step(Create),
+            step(Create),
+            step(Finish(2, Outcome::Fail)),
+            step(Finish(2, Outcome::Success)),
+            step(Create),
+            step(Create),
+            step(Create),
+            step(Verdict(3, false)),
+            step(Finish(1, Outcome::Conflict)),
         ],
     )])
     .await;
@@ -2167,22 +2276,28 @@ async fn a_subtask_of_a_settled_parent_is_scheduled_or_refused() {
     .await;
 }
 
-/// OPEN WEDGE found by a random run with `CreateChild` generated; minimized
+/// Found by a random run with `CreateChild` generated and fixed; minimized
 /// below. A coordination root whose aggregate review check fails ends in
-/// `review` parked on `review retry budget exhausted`. The offered `retry`
-/// is accepted, moves the root to `in_progress` and parks it on "invalid
-/// operation: coordination root <id> is not in its aggregate review state";
-/// the offered `restart` puts it back in `review` on the exhausted budget.
-/// The two alternate for ever and no offer leads anywhere else.
+/// `review` parked on `review retry budget exhausted`. It used to have no
+/// exit but `cancel`:
 ///
-/// Root cause (read, not fixed): `retry` on an exhausted review budget is
-/// the implementation retry, which moves the Task to its working state; a
-/// coordination root has no implementation run, and the aggregate review
-/// guard (`services/src/task_service/execution/guards.rs:54`) then refuses
-/// it outside `review`. A root needs a review-only retry that resets the
-/// review budget in place (or `send_back` to add a corrective subtask).
+/// - `retry` moved the root to `in_progress`, parked it on "coordination root
+///   <id> is not in its aggregate review state"
+///   (`services/src/task_service/execution/guards.rs`), and `restart` put it
+///   back, for ever. `retry` on a root is now review-only: it resets the
+///   budget and re-runs the aggregate review in place
+///   (`reset_task_retry_budget`, `services/src/task_service/execution/recovery.rs`).
+/// - The owner's `approve` (override) moved the root to `merging`, where
+///   integration sent it back: "fresh conformance review required before
+///   integration". A manual pass was not review authority while a reviewer
+///   Agent was assigned, for a root or for any other Task. It now is
+///   (`lock_review_integration`, `db/src/review_conformance.rs`).
+/// - A corrective subtask could not be added (`SUBTASK_PARENT_CLOSED` in
+///   `review`) and `send_back` was not offered on an exhausted budget. It is
+///   now (`root_review_reopen`, `services/src/task_actions.rs`): the root
+///   goes back to its working state with a fresh budget, held, and accepts
+///   the subtask; its release runs the subtask and the review after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open wedge: a coordination root that fails aggregate review loops between retry and restart"]
 async fn a_coordination_root_that_fails_aggregate_review_can_recover() {
     use Action::{Create, CreateChild, Finish};
     run_cases(vec![(
@@ -2198,25 +2313,17 @@ async fn a_coordination_root_that_fails_aggregate_review_can_recover() {
     .await;
 }
 
-/// OPEN finding from a random run with `CreateChild` generated; minimized
-/// below. `cancel` is offered for a coordination root and refused with
-/// `400 validation_error`: "the Task is settling a completed execution's plan
-/// artifact; retry after publication". An offered action must be accepted
-/// (invariant (b)).
-///
-/// Root cause (read, not fixed): the refusal is
+/// Found by a random run with `CreateChild` generated and fixed with it;
+/// minimized below. `cancel` was offered for a coordination root and refused
+/// with `400 validation_error`: "the Task is settling a completed execution's
+/// plan artifact; retry after publication". The refusal was
 /// `ensure_plan_publication_transition_authority`
-/// (`services/src/task_service/execution.rs:277`), reached when the root's
-/// cancel cascades to its subtask
-/// (`services/src/workflow/actions/common.rs:136`; the engine entry
-/// `services/src/workflow/engine/mod.rs:807` applies the same guard), while
-/// the `cancel` offer (`services/src/task_actions.rs`) never consults a
-/// plan-publication claim. The subtask's claim outlives quiescence here, so
-/// waiting does not clear it. Cancellation has to abandon the claim
-/// (`abandon_brokered_plan_authority`) instead of being refused by it; that
-/// touches plan publication and is not a local change.
+/// (`services/src/task_service/execution.rs`) in `cancel_task_with_options`
+/// and in the subtask cancel cascade
+/// (`services/src/workflow/actions/common.rs`), and the claim outlived
+/// quiescence, so waiting did not clear it. Cancel now abandons the claim
+/// (the prior plan is restored, staged files are removed) and proceeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open: an offered cancel on a coordination root is refused while a plan artifact settles"]
 async fn an_offered_cancel_is_accepted_while_a_plan_artifact_settles() {
     use Action::{Create, CreateChild, Finish, Offer, Verdict};
     run_cases(vec![(
@@ -2236,21 +2343,18 @@ async fn an_offered_cancel_is_accepted_while_a_plan_artifact_settles() {
     .await;
 }
 
-/// OPEN STALL found by a random run with `CreateChild` generated. A subtask
-/// created under a held parent is accepted and never dispatched while the
-/// hold lasts (`task_hierarchy::coordination_root_allows_child_dispatch`),
-/// which is right, but it says nothing: it sits in `todo` with a `clear`
-/// condition and offers `start` and `cancel`. Its exit is releasing the
-/// parent; the subtask should show that it waits for its parent.
-///
-/// Root cause (read, not fixed): the dispatcher's `Children` park for a
-/// subtask whose root does not allow dispatch
-/// (`services/src/task_dispatcher/next_step.rs`, `!f.child_ready`) is a
-/// scheduling decision only; nothing stores it, and the stored condition
-/// (`db/src/task_condition.rs`) has no reason for "waits for its parent".
-/// It needs a new typed condition, a public payload addition.
+/// Found by a random run with `CreateChild` generated and fixed with it. A
+/// subtask created under a held parent is accepted and never dispatched while
+/// the hold lasts (`task_hierarchy::coordination_root_allows_child_dispatch`),
+/// which is right, but it said nothing: it sat in `todo` with a `clear`
+/// condition and offered `start` and `cancel`. The dispatcher's park for it
+/// (`services/src/task_dispatcher/next_step.rs`) was a scheduling decision
+/// nothing stored. It is now the visible schedule park `ParentWait`: the
+/// subtask is `parked` on the typed reason `parent`, naming the parent and
+/// the cause, and offers no `start`. The same run found that releasing the
+/// held parent queued a role the root may not run and put the hold back;
+/// the release now clears the hold and the subtask runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open stall: a subtask of a held parent waits with a clear condition"]
 async fn a_subtask_of_a_held_parent_shows_why_it_waits() {
     use Action::{Create, CreateChild, Take};
     run_cases(vec![(
