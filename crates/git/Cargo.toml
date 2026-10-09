@@ -10,12 +10,12 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "process"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process"] }
 url = "2"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }
 
 [lints]
 workspace = true

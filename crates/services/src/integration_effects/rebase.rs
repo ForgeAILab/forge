@@ -33,30 +33,6 @@ pub struct RebaseEffectInput<'a> {
 }
 
 pub async fn rebase(input: &RebaseEffectInput<'_>) -> Result<WorkspaceOwnerOperationOutcome> {
-    // The owner gate supplies a placement witness. Verify its local handle
-    // and the frozen objects before starting or continuing a rebase.
-    if input.workspace.owner == super::EffectOwner::Server
-        && !input.workspace.handle.is_empty()
-        && Path::new(&input.workspace.handle) != input.worktree_path
-    {
-        return Err(crate::ServiceError::conflict(
-            "rebase workspace witness mismatch",
-        ));
-    }
-    if let Some(expected) = input.expected_head_sha {
-        if git::get_current_sha(input.worktree_path).await? != expected {
-            return Err(crate::ServiceError::conflict(
-                "rebase HEAD witness mismatch",
-            ));
-        }
-    }
-    if let Some(expected) = input.expected_target_sha {
-        if super::merge::target_tip(input.worktree_path, input.target_branch).await? != expected {
-            return Err(crate::ServiceError::conflict(
-                "rebase target witness mismatch",
-            ));
-        }
-    }
     match input.deadline {
         None => rebase_inner(input).await,
         Some(deadline) => tokio::time::timeout(deadline, rebase_inner(input))

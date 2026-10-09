@@ -637,6 +637,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   writes no rows and publishes no events, and the existing Task-step code
   records their results in the same order and transactions as before. No
   behaviour, timeout, REST, MCP or daemon protocol change.
+- **Server integration owner foundation: fences and attempt-keyed receipts
+  (3.2 stage C, part 2a).** Internal and passive: nothing calls it yet, and
+  today's merge path, REST, MCP and the daemon protocol (revision 3) are
+  unchanged. A queue claim stamps the head attempt with a durable owner fence
+  (queue, attempt, generation, lease owner, target owner). A new server gate
+  refuses a stale or foreign fence before any Git command and a HEAD, target
+  or placement mismatch before any Git write, and stores one bounded receipt
+  per attempt, effect kind and fence: a repeated request returns the stored
+  receipt and runs nothing. Migration `V202610082317__integration_fencing.sql`
+  adds three columns to `integration_attempt` and keeps existing rows.
+- **The integration queue's target is the repo's default location only.**
+  `repo.local_path` no longer makes a queue ambiguous: one ready default
+  `primary_checkout` location opens the queue, whether the server or a daemon
+  owns it. A claim re-reads that setting, so a queue reopens once its target
+  is repaired and is suspended (a quarantined queue stays quarantined) when
+  the target is missing, ambiguous or not ready. Passive, as above.
+- **A daemon RPC exchange holds one connection instead of the whole
+  connection registry.** Internal; a replaced or unregistered connection
+  still fails its pending replies.
 - **`genesis.project_agent.select` and `project.create` moved onto the
   operation registry (3.8 slice C).** Each has one typed contract that
   produces its advertised payload line, its argument check and its dispatch;
@@ -1427,6 +1446,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A cancelled or timed-out Git command stops its hooks too, and leaves no
+  stale `index.lock`.** Forge and the daemon run each Git command in its own
+  process group with stdin closed. On cancel or timeout the group gets
+  SIGTERM, so Git removes its lock files, then SIGKILL after at most 500 ms.
+  Before, only Git itself was killed: a hook kept running, and the kill could
+  leave `index.lock` behind and block the next Git command in that checkout.
+  Commands that finish behave as before.
+- **A check deadline shorter than one second no longer means "no limit".**
+  The deadline is rounded up to whole seconds (at least one). No current
+  caller passes a sub-second deadline.
 - A full machine no longer lets a second waiting Task leave its initial state in the same dispatcher pass. For a moment after a Task's transition step settled, its queued role entry was not counted as an admission in flight, so the next waiter was moved to its work state and parked there on machine capacity. No second run started, the run cap held.
 - **A corrupt Task condition repairs itself again.** A stored condition that
   is empty or corrupt (`{}`, `[]`, a bare number, invalid JSON, a known kind

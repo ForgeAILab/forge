@@ -4812,7 +4812,9 @@ the old connection stale and fails its pending replies. `GitFacts` is
 implemented by `ResolvedWorkspace`, whose daemon path sends the
 owner inspection through the workspace client. The witness is input
 provenance; the current consumers still perform placement and review authority
-checks. The primitive witness checks do not replace the durable owner gate described below.
+checks. The primitives do not verify the witness themselves, so today's
+Task-step path behaves as before; the durable owner gate described below
+verifies placement, HEAD and target before it calls them.
 
 The split is phased to preserve the existing transaction and read order:
 
@@ -4905,7 +4907,10 @@ stored attempt fence and current default location before any Git query.
 placement, verifies workspace/placement/handle/generation and the expected HEAD
 and target objects, then uses the part-1 merge/rebase primitives. Refusals are
 typed: stale fence, foreign owner, witness mismatch, request conflict or required
-reconciliation. This gate changes neither Task nor Review authority.
+reconciliation. Fence, owner, request and placement refusals happen before any
+Git command; a HEAD or target mismatch is found by reading those refs and is
+refused before any Git write. This gate changes neither Task nor Review
+authority, and nothing on today's Task-step path calls it.
 
 The additive `V202610082317__integration_fencing.sql` migration adds only three
 used columns: `owner_fence_json` (16 KiB), `effect_intent_json` (64 KiB), and
@@ -4914,7 +4919,10 @@ used columns: `owner_fence_json` (16 KiB), `effect_intent_json` (64 KiB), and
 identity reuse. A receipt is at most 128 KiB; admission reserves that capacity.
 Execution IDs are not receipt keys. Ordinary attempts' existing imported
 operation receipts remain separate evidence. These additions preserve Repo and
-Project CASCADE behavior.
+Project CASCADE behavior. Its version sorts before
+`V202610082320__check_run_identity.sql`, which merged first; the two touch
+different tables and the runner applies any missing version, so a database
+that already has the later one still receives this one.
 
 Order: receipt lookup → fence check → committed exact intent → fence recheck
 under the owner write guard → placement/object checks → Git → bounded typed
@@ -4934,11 +4942,35 @@ that permits narrowing that guard remains required before activation. The
 existing local review guard is retained because it also fences changes to
 review/Project authority; the owner fence does not replace that contract.
 
-Git process cancellation now kills the entire owned process group (including
-hooks), with `kill_on_drop` retaining child ownership. Cancellation/timeout on
-the server owner rebase records observed HEAD and stopped-rebase state without
-aborting it; the existing interrupted-rebase recovery remains applicable. The
-Git helper fix also applies to today's daemon rebase. The daemon still has its
+Known limits of this passive stage, to settle before activation:
+
+- A fence refusal between the committed intent and the guard (a takeover in
+  that window) leaves an intent with no Git run. It reads as "reconciliation
+  required" and is never retried implicitly; reconciliation must settle it.
+- A claim refused for an unresolved target records the reason and keeps a
+  quarantined queue quarantined (an open or suspended one becomes suspended).
+- The queue resolver follows the repo's default location, while today's merge
+  integrates into the checkout of the Task's own placement and nothing
+  propagates that to the default checkout or a remote. Stage D must either
+  place integrating Tasks on the default location's owner or move the
+  candidate there.
+
+Every command the `git` crate runs through its common runner (rebase,
+continue, merge, checkout, commit, fetch) starts in its own process group with
+stdin closed. A command that finishes is untouched: same environment, working
+directory, captured output and exit status. Dropping its future (cancel or
+timeout) stops the whole group, hooks included, and returns only afterwards:
+SIGTERM first, so Git removes its own `index.lock` and ref locks, a wait of at
+most 500 ms for Git to exit, then SIGKILL for whatever ignored it. The group
+is the child's own, never the server's or daemon's. A stopped rebase is left
+as Git leaves it (`rebase-merge` present, no lock), which is the state the
+existing interrupted-rebase recovery aborts. Cancellation/timeout on the
+server owner rebase records the observed HEAD and whether a rebase is in
+progress without aborting it. The same runner serves today's daemon rebase.
+The read-only probes that spawn Git directly (`rev-parse`, `diff
+--name-only`) and the reviewed fast-forward (`review::contract::git_read`)
+are outside this runner and keep `kill_on_drop` only; the owner gate's merge
+takes no cancel token. The daemon still has its
 separate algorithm and its existing protocol revision **3**: there is no fence
 wire change or activation in this partial delivery. Remaining C2 work is legacy
 Task-step binding to the gate, shared daemon primitives and revision/handshake

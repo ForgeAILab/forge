@@ -15,7 +15,6 @@ pub struct IntegrationOwnerFence {
 pub enum IntegrationEffectRefusal {
     StaleFence,
     ForeignOwner,
-    WitnessMismatch,
     ReconciliationRequired,
     RequestConflict,
 }
@@ -402,6 +401,65 @@ mod tests {
             db.transition_integration_attempt(attempt).await,
             Err(DbError::InvalidTransition)
         ));
+    }
+    #[tokio::test]
+    async fn deleting_the_repo_removes_an_attempt_that_holds_a_fence_and_a_receipt() {
+        let (db, f) = claimed().await;
+        let IntegrationEffectAdmission::Started(g) = db
+            .begin_integration_effect(request(f.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!("not admitted")
+        };
+        g.record(
+            serde_json::json!({"kind":"rebased"}),
+            IntegrationOperationState::Succeeded,
+        )
+        .await
+        .unwrap();
+        crate::RepoRepo::delete(&db, "r").await.unwrap();
+        for table in ["integration_queue", "integration_attempt"] {
+            let rows: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+    }
+    #[tokio::test]
+    async fn a_refused_claim_keeps_a_quarantined_queue_quarantined() {
+        let (db, f) = claimed().await;
+        sqlx::query(
+            "UPDATE integration_queue SET state='quarantined',lease_until='2026-10-08T00:00:30Z' WHERE id=?",
+        )
+        .bind(&f.queue_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE repo_location SET status='unavailable' WHERE id='l'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let q = db.integration_queue(&f.queue_id).await.unwrap().unwrap();
+        assert!(matches!(
+            db.claim_integration_queue(
+                &q.id,
+                q.revision,
+                "next",
+                "2026-10-09T00:00:00Z",
+                "2026-10-09T00:01:00Z",
+            )
+            .await,
+            Err(DbError::VersionConflict)
+        ));
+        let refused = db.integration_queue(&f.queue_id).await.unwrap().unwrap();
+        assert_eq!(refused.state, IntegrationQueueState::Quarantined);
+        assert_eq!(
+            refused.last_error_kind,
+            Some(IntegrationFailureKind::TargetUnavailable)
+        );
+        assert_eq!(refused.fence_generation, q.fence_generation);
     }
     #[tokio::test]
     async fn fencing_json_bounds_and_effect_enum_sql_parity() {

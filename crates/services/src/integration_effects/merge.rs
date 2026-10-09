@@ -150,18 +150,6 @@ pub async fn apply_merge(
     input: &MergeEffectInput<'_>,
     already_merged: bool,
 ) -> Result<MergeApplyOutcome> {
-    if input.workspace.owner == super::EffectOwner::Server
-        && !input.workspace.handle.is_empty()
-        && Path::new(&input.workspace.handle) != input.worktree_path
-    {
-        return Err(ServiceError::conflict("merge workspace witness mismatch"));
-    }
-    if git::get_current_sha(input.worktree_path).await? != input.expected_head_sha {
-        return Err(ServiceError::conflict("merge HEAD witness mismatch"));
-    }
-    if target_tip(input.repo_path, input.target_branch).await? != input.observed_target_sha {
-        return Ok(MergeApplyOutcome::ExactObjectMismatch);
-    }
     if !already_merged {
         git::checkout_branch(input.repo_path, input.target_branch).await?;
     }

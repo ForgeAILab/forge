@@ -1109,7 +1109,7 @@ impl IntegrationQueueRepo for SqliteDb {
         q.target_owner_json = target.owner;
         q.last_error_kind = target.failure;
         if target.failure.is_some() {
-            sqlx::query("UPDATE integration_queue SET target_location_id=?,target_owner_json=?,state='suspended',last_error_kind=?,last_error=NULL,revision=revision+1,updated_at=? WHERE id=? AND revision=?")
+            sqlx::query("UPDATE integration_queue SET target_location_id=?,target_owner_json=?,state=CASE WHEN state IN ('open','suspended') THEN 'suspended' ELSE state END,last_error_kind=?,last_error=NULL,revision=revision+1,updated_at=? WHERE id=? AND revision=?")
                 .bind(&q.target_location_id).bind(q.target_owner_json.as_ref().map(ToString::to_string))
                 .bind(target.failure.map(|f| f.to_string())).bind(now).bind(queue_id).bind(expected_revision)
                 .execute(&mut *tx).await?;

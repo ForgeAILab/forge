@@ -27,7 +27,6 @@ impl From<db::IntegrationEffectRefusal> for OwnerEffectRefusal {
         match v {
             R::StaleFence => Self::StaleFence,
             R::ForeignOwner => Self::ForeignOwner,
-            R::WitnessMismatch => Self::WitnessMismatch,
             R::ReconciliationRequired => Self::ReconciliationRequired,
             R::RequestConflict => Self::RequestConflict,
         }
