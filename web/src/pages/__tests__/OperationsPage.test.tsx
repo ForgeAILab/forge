@@ -84,6 +84,9 @@ const degradedStatus: OperatorStatusResponse = {
   check_runs: {
     by_state: { queued: 0, running: 0, cancelling: 0, cleaning: 0, uncertain: 0, succeeded: 0, failed: 0, cancelled: 0 },
     reusable_results: 0,
+    admitted_runs: 0,
+    waiting_for_capacity: 0,
+    borrowed_runs: 0,
   },
   integration_queues: {
     queues_by_state: {},
@@ -212,6 +215,8 @@ const degradedStatus: OperatorStatusResponse = {
       daemon_id: 'server_host',
       hostname: 'Server host',
       active_runs: 2,
+      check_runs: 0,
+      borrowed_check_runs: 0,
       max_concurrent_runs: 4,
       logical_cores: 8,
       build_jobs_per_run: 2,
@@ -222,6 +227,8 @@ const degradedStatus: OperatorStatusResponse = {
       daemon_id: 'daemon-1',
       hostname: 'worker-01',
       active_runs: 2,
+      check_runs: 0,
+      borrowed_check_runs: 0,
       max_concurrent_runs: 4,
       logical_cores: null,
       build_jobs_per_run: null,

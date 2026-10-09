@@ -14,6 +14,7 @@ pub mod agent_turn_admission;
 pub mod attention_service;
 pub mod auth_service;
 pub(crate) mod chat_usage;
+pub mod check_runner;
 pub mod command_boundary;
 pub mod context_manifest;
 pub mod coordination_consumer;

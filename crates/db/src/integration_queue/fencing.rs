@@ -353,6 +353,26 @@ impl IntegrationReconciliationGuard {
 }
 
 impl SqliteDb {
+    /// Same physical checkout lock as merge/rebase, without admitting an
+    /// integration effect or manufacturing integration authority.
+    pub async fn lock_server_check_checkout(&self, path: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let request = IntegrationEffectRequest {
+            fence: IntegrationOwnerFence {
+                queue_id: String::new(),
+                attempt_id: String::new(),
+                generation: 0,
+                lease_owner: String::new(),
+                target_owner: serde_json::json!({"owner_kind":"server","daemon_id":null,"runtime_id":null}),
+            },
+            kind: IntegrationOperationKind::Check,
+            witness: serde_json::json!({"workspace":{"handle":path}}),
+        };
+        lock_owner(&request)
+            .await
+            .pop()
+            .expect("one workspace owner lock")
+    }
+
     /// Bind the existing Task step to its shadow attempt without claiming or
     /// activating the queue. Placement follows today's Task, including when
     /// its location differs from the configured future queue target.

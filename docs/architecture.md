@@ -7276,3 +7276,99 @@ retain command order, cwd, inherited env, verdicts, comments/events and per-comm
 receipt acknowledgment. No extra setup or managed checkout is enabled. Required
 conformance/setup, lifecycle/before-work, readiness/preflight/environment helper
 and agent-selected families retain their existing orchestration and check policy.
+
+### Durable check orchestration foundation (3.3 stage C, partial)
+
+`check_runner::CheckRunner::request` returns a consumer and `Hit(result)`,
+`Joined(run)` or `Scheduled(run)`. Selection and consumer insertion are one
+`BEGIN IMMEDIATE` transaction using the stage-A partial unique identity index.
+A repeated consumer key joins its original run, including a terminal failure;
+it never silently launches another attempt. A certified cacheable pass returns
+`Hit`. Uncacheable or failed idempotent evidence stays `Joined`, with the
+consumer's own `result_id`. New consumers never hit an uncacheable, unattested,
+failed, timed-out, uncertain or cleanup-failed result. Purpose belongs to the
+consumer, whole-run timeout belongs to the run, and neither divides the key.
+Forced execution still needs a new audited execution revision. The runner
+accepts at most 64 commands, consumer keys up to 512 bytes and wall bounds from 1 through 86,400
+seconds, matching the daemon's maximum retained operation deadline.
+
+The shared server/Solo runtime starts the supervised `check-runs` worker. It
+holds only check-repository and owner-effect ports; it writes no Task, Review,
+budget, comment, condition or domain event. Framework supervision owns worker
+health separately. At startup and on its one-second sweep it claims queued or
+expired runs with a 60-second lease and renews every 15 seconds while awaiting
+an owner. The stored operation UUID exists before admission. It persists a
+placement/generation/runtime intent and absolute deadline before `check.run`.
+Project environment values are resolved transiently, not copied to the intent.
+Server execution shares the integration owner's physical checkout lock and
+rechecks its dispatch lease, placement and exact candidate before starting.
+Daemon-local paths stay opaque to the server.
+
+Owner receipts are retained before result projection. Certification compares
+operation, pinned owner/runtime and execution-input identity, command order and
+completion, exit outcomes, timestamps, cleanup and (for reusable or canonical
+passes) exact HEAD/tracked-change witnesses. A malformed terminal receipt is
+infrastructure evidence, never a pass. Server receipts remain available in
+memory if their durable write has a transient failure. The worker records the
+immutable result before delivering it. Daemon `journal.ack` uses
+`forge:operation:<operation_id>` only after result durability; failed ACKs are
+retried independently on later sweeps. A disconnected ACK cannot serially hold
+up every other machine.
+
+Transport timeout/disconnect means `uncertain`. Recovery looks up the original
+operation; it never repeats `check.run` under that key. An owner reporting
+unknown/interrupted must first retain a cancellation tombstone, which fences a
+delayed dispatch frame. A retained receipt settles the original run. Unknown or
+interrupted after that stop fence, an owner past the existing configured
+workspace-disconnect bound, or removal of its machine settles infrastructure
+failure. Reconciliation releases its worker job between lookups while keeping
+machine occupancy and the single-flight key. Scans use least-recently-attempted
+order. Infrastructure retry allowance is stored per consumer: two automatic
+retries, then one terminal infrastructure notification. Recovery rechecks the
+cache before retrying and reuses a pass certified by another consumer meanwhile.
+This prevents a silent second execution of a certified key.
+
+| Run state | Automatic exit | Bound/policy |
+| --- | --- | --- |
+| `queued` | Admit to `running`; stale consumers cancel; unavailable owner/expired capacity wait settles infrastructure | Capacity wait: 1,800 seconds, plus bounded sweep/batch delay. Expiry settlement runs even when all 32 effect jobs are occupied. Queue time is excluded from wall time. |
+| `running` | Receipt to `cleaning`; lost reply or lease to `uncertain`; no consumers requests cancellation | Recorded wall limit (1–86,400 seconds), owner cleanup up to 30 seconds, then 65 seconds of settlement/RPC grace. Lease recovery within 60 seconds plus sweep delay. |
+| `cancelling` | Owner completion to cleanup, or expired lease to reconciliation | Owner cancellation/cleanup bounds; worker cancel exchange at most 61 seconds, with lease renewal. |
+| `cleaning` | Immutable result to a terminal state; expired lease resumes from retained receipt | Owner cleanup at most 30 seconds; receipt/result writes are fenced and replayed after lease recovery. |
+| `uncertain` | Receipt settles; confirmed stopped/removed/expired disconnected owner settles infrastructure | Lookup exchange at most 30 seconds; cancellation exchange at most 61 seconds. Original owner deadline and configured owner-disconnected bound govern resolution; the next sweep retries lookup, never dispatch. |
+| `succeeded`, `failed`, `cancelled` | Deliver durable consumer notifications; ACK retained daemon entries | Transactional delivery checkpoint plus periodic sweep. Infrastructure gets at most two automatic retries per consumer. |
+
+Capacity admission uses the same SQLite writer transaction and shared occupancy
+query as executions, reservations and Chat turns. Checks use the physical
+checkout owner (`machine_id`), including server-owned shared mounts, and consume
+no Agent concurrency. Hits and joins acquire no slot. A check borrows a live
+reservation or execution slot for the same consumer Task on that same counted
+machine; Chat cannot lend. Borrowing is calculated on every occupancy read, so
+when the held slot ends or expires the running check accounts for its own slot.
+Running, cancelling, cleaning and uncertain admitted checks retain occupancy;
+queued checks do not. Slot release is observed by the periodic scan without a
+notification race. Operations includes admitted, borrowed and capacity-wait
+counts; per-machine `active_runs` includes exclusive check slots.
+
+Result delivery enqueues an entry-fenced `apply_check_result` Task command with
+consumer/result/run identities, exact commit and spec digest. The consumer's
+`delivery_step_id` and enqueue share a transaction. Its marker survives Task-step
+retention, so restart and pruning cannot enqueue a second notification. Already
+stale epochs are enqueued as superseded and leave the Task untouched.
+
+**Consumer application is not implemented in this slice.** No existing execution
+family requests this runner yet. The `apply_check_result` family handler, original
+candidate/authority references, typed check-wait/slot-wait/retry-exhausted
+conditions and Task scheduling/offer changes must land before a family uses the
+port. In particular a terminal infrastructure notification does not yet park a
+Task with the requested typed reason. Merge-path and review-entry CI, manual
+`ReviewRunner`, conformance, before-work and other checks retain their current
+orchestration, limits and verdicts. The 3.2 integration queue stays inactive.
+Canonical PATH/HOME declaration and managed-checkout/canonical-policy activation
+are also pending. Current owner dispatch uses the frozen legacy workspace policy
+and supplies no new server input attestation; configured checks remain
+uncacheable. No historical review or legacy CI row is promoted to cache.
+
+The owner supervision guarantees tested here cover normal cancellation, dropped
+futures, retained receipts and restart reconciliation. Abrupt process death
+between OS spawn and durable process-tree evidence, and escaped descendants,
+are not proven by the runner; the stage-B process-supervisor limits still apply.

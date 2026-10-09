@@ -132,6 +132,7 @@ pub enum RuntimeWorker {
     DomainEventBroadcast,
     StorageMaintenance,
     TaskSteps,
+    CheckRuns,
 }
 
 impl RuntimeWorker {
@@ -150,7 +151,7 @@ impl RuntimeWorker {
     }
 }
 
-pub(crate) const COMMON_WORKERS: [RuntimeWorker; 17] = [
+pub(crate) const COMMON_WORKERS: [RuntimeWorker; 18] = [
     RuntimeWorker::CrashRecovery,
     RuntimeWorker::NotificationProjection,
     RuntimeWorker::OperatorStatusProjection,
@@ -168,6 +169,7 @@ pub(crate) const COMMON_WORKERS: [RuntimeWorker; 17] = [
     RuntimeWorker::StorageMaintenance,
     RuntimeWorker::TaskSteps,
     RuntimeWorker::ConflictHotspots,
+    RuntimeWorker::CheckRuns,
 ];
 
 /// Abortable ownership for a compatibility worker that starts before a
@@ -258,6 +260,8 @@ pub struct ForgeRuntime {
         Arc<crate::worker_runtime::conflict_hotspot::ConflictHotspotConsumer>,
     pub domain_event_broadcast: Arc<DomainEventBroadcastConsumer>,
     storage_maintenance: Arc<StorageMaintenanceWorker>,
+    pub check_runner: Arc<crate::check_runner::CheckRunner>,
+    check_worker: Arc<crate::check_runner::worker::CheckRunWorker>,
     pub lifecycle_emitter: Arc<crate::lifecycle::LifecycleEventEmitter>,
     pub workspace_exec_locks: Arc<WorkspaceExecutionLockManager>,
     pub repo_cache_locks: Arc<RepoCacheLockManager>,
@@ -794,6 +798,16 @@ impl ForgeRuntimeBuilder {
         ));
         operator_status_service.set_event_relay(Arc::clone(&domain_event_broadcast));
         let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
+        let check_runner = Arc::new(crate::check_runner::CheckRunner::new(self.db.clone()));
+        let check_owners = Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
+            self.db.clone(),
+            daemon_connections.clone(),
+            Duration::from_secs(effective_config.workspace.max_disconnect_seconds),
+        ));
+        let check_worker = Arc::new(crate::check_runner::worker::CheckRunWorker::new(
+            self.db.clone(),
+            check_owners,
+        ));
         let plugin_registry = lifecycle_plugin_registry();
         let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new_with_router(
             Arc::clone(&self.db),
@@ -842,6 +856,8 @@ impl ForgeRuntimeBuilder {
             conflict_hotspot_consumer,
             domain_event_broadcast,
             storage_maintenance,
+            check_runner,
+            check_worker,
             lifecycle_emitter,
             workspace_exec_locks,
             repo_cache_locks,
@@ -1007,6 +1023,10 @@ impl RuntimeSupervisor {
                 .task_service
                 .task_step_worker()
                 .start(shutdown.clone()),
+        ));
+        self.handles.push((
+            RuntimeWorker::CheckRuns,
+            Arc::clone(&self.runtime.check_worker).start(&periodic_workers, shutdown.clone()),
         ));
         self.handles.push((
             RuntimeWorker::TaskDispatcher,
@@ -1199,7 +1219,7 @@ mod tests {
 
     #[test]
     fn worker_set_is_explicit_and_stable() {
-        assert_eq!(COMMON_WORKERS.len(), 17);
+        assert_eq!(COMMON_WORKERS.len(), 18);
         assert_eq!(COMMON_WORKERS[0], RuntimeWorker::CrashRecovery);
         assert_eq!(COMMON_WORKERS[1], RuntimeWorker::NotificationProjection);
         assert_eq!(COMMON_WORKERS[2], RuntimeWorker::OperatorStatusProjection);
@@ -1208,6 +1228,7 @@ mod tests {
         assert_eq!(COMMON_WORKERS[14], RuntimeWorker::StorageMaintenance);
         assert_eq!(COMMON_WORKERS[15], RuntimeWorker::TaskSteps);
         assert_eq!(COMMON_WORKERS[16], RuntimeWorker::ConflictHotspots);
+        assert_eq!(COMMON_WORKERS[17], RuntimeWorker::CheckRuns);
     }
 
     #[tokio::test]
@@ -1256,8 +1277,8 @@ mod tests {
         assert!(!supervisor.started());
         supervisor.start().await.expect("runtime starts");
         assert!(supervisor.started());
-        assert_eq!(supervisor.workers().len(), 17);
-        assert_eq!(supervisor.worker_handle_count(), 16);
+        assert_eq!(supervisor.workers().len(), 18);
+        assert_eq!(supervisor.worker_handle_count(), 17);
         assert!(supervisor
             .workers()
             .contains(&RuntimeWorker::HeartbeatMonitor));
@@ -1308,6 +1329,7 @@ mod tests {
             "workspace-cleanup",
             "storage-maintenance",
             "environment-settings-observer",
+            "check-runs",
         ];
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1358,7 +1380,7 @@ mod tests {
         let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
 
         supervisor.start().await.expect("runtime starts");
-        assert_eq!(supervisor.worker_handle_count(), 16);
+        assert_eq!(supervisor.worker_handle_count(), 17);
         supervisor.shutdown().await.expect("runtime shuts down");
     }
 }
