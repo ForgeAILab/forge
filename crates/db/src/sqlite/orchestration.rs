@@ -435,22 +435,7 @@ pub(crate) async fn reauthorize_direct_project_command_in_tx(
 }
 
 fn permission_ceiling_contains(value: &str, permission: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()
-        .and_then(|value| match value {
-            serde_json::Value::Array(values) => Some(values),
-            serde_json::Value::Object(map) => map
-                .get("permissions")
-                .or_else(|| map.get("allowed"))
-                .and_then(serde_json::Value::as_array)
-                .cloned(),
-            _ => None,
-        })
-        .is_some_and(|values| {
-            values
-                .iter()
-                .any(|value| value.as_str() == Some(permission))
-        })
+    operation_registry::authority::permission_set(value).contains(permission)
 }
 
 fn is_direct_project_command_operation(operation: &str) -> bool {
@@ -1298,23 +1283,7 @@ async fn recheck_task_proposal_authorization_in_tx(
     {
         return Err(DbError::IdempotencyConflict);
     }
-    let permits_task_proposal = !permission_ceiling.is_empty() && {
-        let json = permission_ceiling.as_str();
-        serde_json::from_str::<serde_json::Value>(json)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("allowed")
-                    .or_else(|| value.get("permissions"))
-                    .cloned()
-            })
-            .and_then(|value| value.as_array().cloned())
-            .is_some_and(|permissions| {
-                permissions
-                    .iter()
-                    .any(|permission| permission.as_str() == Some("propose_task"))
-            })
-    };
+    let permits_task_proposal = permission_ceiling_contains(&permission_ceiling, "propose_task");
     if !permits_task_proposal {
         return Err(DbError::InvalidTransition);
     }
@@ -3713,7 +3682,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .bind(identity_id)
             .bind(profile_id)
             .bind(&binding_policy)
-            .bind(&binding_ceiling)
+            .bind({
+                operation_registry::authority::parse_permissions(&binding_ceiling)?;
+                &binding_ceiling
+            })
             .bind(&binding_subscriptions)
             .bind(binding_wake_budget)
             .bind(binding_version)

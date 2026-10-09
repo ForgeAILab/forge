@@ -1,3 +1,4 @@
+use operation_registry::authority::permission_set;
 use std::{collections::BTreeSet, sync::Arc};
 
 use db::{
@@ -1521,27 +1522,6 @@ fn is_non_executable_authority_operation(operation: &str) -> bool {
     )
 }
 
-fn permission_set(value: &str) -> BTreeSet<String> {
-    let Ok(value) = serde_json::from_str::<Value>(value) else {
-        return BTreeSet::new();
-    };
-    match value {
-        Value::Array(values) => values
-            .into_iter()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        Value::Object(map) => map
-            .get("permissions")
-            .or_else(|| map.get("allowed"))
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.as_str().map(str::to_owned))
-            .collect(),
-        _ => BTreeSet::new(),
-    }
-}
-
 async fn scope_permissions(
     db: &SqliteDb,
     scope_type: &str,
@@ -1567,13 +1547,7 @@ async fn scope_permissions(
             "propose_session",
         ][..],
         "agent_chat" => &["read_agent_chat", "read_memory"][..],
-        "task" => &[
-            "read_task",
-            "read_memory",
-            "task_read",
-            "task_write",
-            "propose_review",
-        ][..],
+        "task" => &["read_task", "read_memory", "task_read", "task_write"][..],
         "agent" => &["read_account", "propose_message"][..],
         _ => &[][..],
     }

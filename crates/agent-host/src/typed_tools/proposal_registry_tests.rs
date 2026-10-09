@@ -187,8 +187,19 @@ fn proposal_authority_and_availability_match_base_catalog() {
                     .unwrap_or_default(),
             ] {
                 assert_eq!(
-                    spec.authority.allows(scope_type_name(scope), &granted),
-                    !filter_operations(scope, &[spec.id.into()], &granted).is_empty()
+                    permission.is_some_and(|permission| granted.contains(permission))
+                        && matches!(
+                            scope,
+                            CanonicalScopeType::Account | CanonicalScopeType::AgentChat
+                        ),
+                    !filter_operations(
+                        scope,
+                        &[spec.id.into()],
+                        &granted,
+                        ProjectChatToolContext::default(),
+                        None
+                    )
+                    .is_empty()
                 );
             }
             if permission.is_some() {

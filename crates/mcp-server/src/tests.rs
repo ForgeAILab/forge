@@ -2890,3 +2890,80 @@ fn mcp_send_back_spends_the_review_budget() {
         );
     });
 }
+
+#[test]
+fn project_constrained_catalog_matches_call_authority_and_projects_only_the_bound_project() {
+    run_async(async {
+        use operation_registry::authority::{McpScopeRule, MCP_OPERATIONS};
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let (other_id, _) = seed_project_repo(&state).await;
+        assert_ne!(project_id, other_id);
+        let context = McpContext {
+            user_id: Some("mcp-test-user".into()),
+            project_id: Some(project_id.clone()),
+        };
+        let account = dispatch(&state, "tools/list", json!({})).await.unwrap();
+        let names = account["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names,
+            MCP_OPERATIONS.iter().map(|(n, _)| *n).collect(),
+            "every MCP tool needs an explicit scope classification"
+        );
+        let scoped = dispatch_with_context(&state, &context, "tools/list", json!({}))
+            .await
+            .unwrap();
+        let scoped_names = scoped["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (name, rule) in MCP_OPERATIONS {
+            assert_eq!(
+                scoped_names.contains(name),
+                *rule == McpScopeRule::BoundProject,
+                "{name}"
+            );
+            if *rule == McpScopeRule::AccountInspection {
+                // Authority denial precedes malformed tool arguments.
+                let error = dispatch_with_context(
+                    &state,
+                    &context,
+                    "tools/call",
+                    json!({"name":name,"arguments":7}),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.code, -32001, "{name}");
+            }
+        }
+        let result = dispatch_with_context(
+            &state,
+            &context,
+            "tools/call",
+            json!({"name":"forge_list_projects","arguments":{}}),
+        )
+        .await
+        .unwrap();
+        let body: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"][0]["id"], project_id);
+        assert_eq!(body["total_count"], 1);
+        let error = dispatch_with_context(
+            &state,
+            &context,
+            "tools/call",
+            json!({"name":"forge_list_projects","arguments":{"cursor":"not-a-cursor"}}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, -32602);
+    });
+}

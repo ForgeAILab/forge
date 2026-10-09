@@ -46,6 +46,7 @@ impl Section {
     }
 }
 const AUTHORITY: AuthorityRule = AuthorityRule {
+    principal: authority::PrincipalRule::ProjectAgent,
     permissions: &[
         ("project", "read_project"),
         ("agent_chat", "read_agent_chat"),

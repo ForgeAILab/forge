@@ -273,9 +273,10 @@ pub enum RetryScope {
 #[serde(try_from = "String", into = "String")]
 #[ts(
     export,
-    type = "`permission_missing(${string})` | `project_paused(${string})` | \"target_agent_paused\" | \"identity_paused\" | \"charter_not_adopted\" | \"operation_not_in_scope\" | \"profile_not_selected\" | \"task_terminal\" | \"reviewer_read_only\" | \"independent_approval_required\" | \"user_request_required\" | \"leased_turn_required\" | \"charter_adoption_not_applicable\" | \"read_boundary_required\" | \"direct_command_not_admitted\" | \"review_assignment_required\" | \"placement_unavailable\" | \"daemon_upgrade_required\" | \"workspace_reset_required\" | \"unspecified\""
+    type = "\"authority_revoked\" | `permission_missing(${string})` | `project_paused(${string})` | \"target_agent_paused\" | \"identity_paused\" | \"charter_not_adopted\" | \"operation_not_in_scope\" | \"profile_not_selected\" | \"task_terminal\" | \"reviewer_read_only\" | \"independent_approval_required\" | \"user_request_required\" | \"leased_turn_required\" | \"charter_adoption_not_applicable\" | \"read_boundary_required\" | \"direct_command_not_admitted\" | \"review_assignment_required\" | \"placement_unavailable\" | \"daemon_upgrade_required\" | \"workspace_reset_required\" | \"unspecified\""
 )]
 pub enum DeniedBy {
+    AuthorityRevoked,
     PermissionMissing(String),
     IdentityPaused,
     TargetAgentPaused,
@@ -304,7 +305,8 @@ impl DeniedBy {
     #[must_use]
     pub const fn scope(&self) -> RetryScope {
         match self {
-            Self::PermissionMissing(_)
+            Self::AuthorityRevoked
+            | Self::PermissionMissing(_)
             | Self::IdentityPaused
             | Self::CharterNotAdopted
             | Self::ProjectPaused(_)
@@ -318,7 +320,8 @@ impl DeniedBy {
     pub const fn clears(&self) -> bool {
         matches!(
             self,
-            Self::PermissionMissing(_)
+            Self::AuthorityRevoked
+                | Self::PermissionMissing(_)
                 | Self::IdentityPaused
                 | Self::CharterNotAdopted
                 | Self::ProjectPaused(_)
@@ -330,7 +333,8 @@ impl DeniedBy {
     pub const fn withdraws_operation(&self) -> bool {
         matches!(
             self,
-            Self::PermissionMissing(_)
+            Self::AuthorityRevoked
+                | Self::PermissionMissing(_)
                 | Self::IdentityPaused
                 | Self::CharterNotAdopted
                 | Self::ProjectPaused(_)
@@ -346,6 +350,7 @@ impl std::fmt::Display for DeniedBy {
                 return write!(f, "permission_missing({permission})")
             }
             Self::ProjectPaused(detail) => return write!(f, "project_paused({detail})"),
+            Self::AuthorityRevoked => "authority_revoked",
             Self::IdentityPaused => "identity_paused",
             Self::TargetAgentPaused => "target_agent_paused",
             Self::CharterNotAdopted => "charter_not_adopted",
@@ -393,6 +398,7 @@ impl std::str::FromStr for DeniedBy {
             return Ok(Self::ProjectPaused(detail.to_owned()));
         }
         Ok(match value {
+            "authority_revoked" => Self::AuthorityRevoked,
             "identity_paused" => Self::IdentityPaused,
             "target_agent_paused" => Self::TargetAgentPaused,
             "charter_not_adopted" => Self::CharterNotAdopted,
@@ -727,6 +733,10 @@ impl ToolResultSummary {
     }
 }
 
+/// Permission JSON cannot select precedence between conflicting keys.
+pub const CONFLICTING_PERMISSION_DOCUMENT: &str = "conflicting_permission_document";
+pub const INVALID_PERMISSION_DOCUMENT: &str = "invalid_permission_document";
+
 #[cfg(test)]
 mod tool_result_summary_tests {
     use super::*;
@@ -734,6 +744,7 @@ mod tool_result_summary_tests {
     #[test]
     fn denial_lifetimes_and_messages_follow_typed_causes() {
         for cause in [
+            DeniedBy::AuthorityRevoked,
             DeniedBy::PermissionMissing("propose_task".to_owned()),
             DeniedBy::IdentityPaused,
             DeniedBy::ProjectPaused("environment_not_ready".to_owned()),

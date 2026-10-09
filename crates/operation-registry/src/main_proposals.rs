@@ -50,6 +50,7 @@ pub fn catalog<E: Send + 'static>() -> Catalog<E> {
             OperationSpec::typed(
                 "genesis.project_agent.select",
                 AuthorityRule {
+                    principal: authority::PrincipalRule::MainOrInquiry,
                     permissions: &[
                         ("account", "propose_discovery"),
                         ("agent_chat", "propose_discovery"),
@@ -70,6 +71,7 @@ pub fn catalog<E: Send + 'static>() -> Catalog<E> {
             OperationSpec::typed(
                 "project.create",
                 AuthorityRule {
+                    principal: authority::PrincipalRule::MainOrInquiry,
                     permissions: &[
                         ("account", "propose_project"),
                         ("agent_chat", "propose_project"),

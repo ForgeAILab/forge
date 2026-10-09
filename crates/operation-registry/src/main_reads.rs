@@ -70,6 +70,7 @@ pub trait MainReadContext<E>: Send + Sync {
     async fn inquiry_run(&self, input: InquiryQuery) -> Result<Value, E>;
 }
 const AUTHORITY: AuthorityRule = AuthorityRule {
+    principal: authority::PrincipalRule::MainOrInquiry,
     permissions: &[
         ("account", "read_account"),
         ("agent_chat", "read_agent_chat"),
@@ -119,6 +120,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             "Read the bounded account-owned portfolio.", "", &[StructuralConstraint::ClosedObject],
             |context, input| Box::pin(context.portfolio_read(input))),
         OperationSpec::typed("inquiry.run", AuthorityRule {
+    principal: authority::PrincipalRule::MainChat,
             permissions: &[("account", "propose_discovery"), ("agent_chat", "propose_discovery")],
             binding: "bound Main Chat with inquiry runner; unavailable to account inquiry sessions",
         }, EffectClass::Query, AvailabilityRule::MainChatOnly, MAIN,

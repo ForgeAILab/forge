@@ -1,6 +1,7 @@
 //! Transport-neutral operation contracts. Domain modules bind typed inputs to
 //! handlers; consumers use the same catalog for schemas, decoding and dispatch.
 
+pub mod authority;
 mod input_check;
 pub mod main_proposals;
 pub mod main_reads;
@@ -58,10 +59,11 @@ pub enum AvailabilityRule {
     SetupOnly,
     MainChatOnly,
 }
-/// The existing permission checks enforce these facts until EffectiveAuthority.
+/// Declarative requirements consumed by the shared EffectiveAuthority evaluator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorityRule {
     pub permissions: &'static [(&'static str, &'static str)],
+    pub principal: authority::PrincipalRule,
     pub binding: &'static str,
 }
 impl AuthorityRule {
@@ -70,10 +72,6 @@ impl AuthorityRule {
             .iter()
             .find(|(s, _)| *s == scope)
             .map(|(_, p)| *p)
-    }
-    pub fn allows(self, scope: &str, permissions: &BTreeSet<String>) -> bool {
-        self.permission(scope)
-            .is_some_and(|p| permissions.contains(p))
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,6 +9,51 @@ use std::sync::LazyLock;
 pub(super) static CATALOG: LazyLock<main_proposals::Catalog<AgentHostError>> =
     LazyLock::new(main_proposals::catalog);
 impl CoordinationToolProvider {
+    pub(super) async fn registered_authority(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        let Some(spec) = registered_reads::CATALOG
+            .lookup(operation)
+            .or_else(|| CATALOG.lookup(operation))
+        else {
+            return Ok(());
+        };
+        let authority = self
+            .db
+            .resolve_effective_authority(
+                actor,
+                None,
+                scope_type_name(scope.scope_type),
+                &scope.scope_id,
+                match scope.workspace_access {
+                    WorkspaceAccess::AccountScratch => "account_scratch",
+                    WorkspaceAccess::ProjectVerify => "project_verify",
+                    _ => "deny",
+                },
+            )
+            .await
+            .map_err(|error| service_error(error.into()))?;
+        authority.evaluate(spec).map_err(|denial| {
+            use operation_registry::authority::AuthorityDenial;
+            let cause = match denial {
+                AuthorityDenial::Revoked => DeniedBy::AuthorityRevoked,
+                AuthorityDenial::PermissionMissing(permission) => {
+                    DeniedBy::PermissionMissing(permission)
+                }
+                AuthorityDenial::PrincipalMismatch => DeniedBy::OperationNotInScope,
+                AuthorityDenial::StateChanged => DeniedBy::CharterNotAdopted,
+            };
+            AgentHostError::StructuredOutcome(Box::new(OrchestrationOutcome::terminal_denial(
+                operation,
+                outcome_scope(scope),
+                "authority",
+                cause,
+            )))
+        })
+    }
     pub(super) async fn main_proposal_admission(
         &self,
         actor: &str,
@@ -22,31 +67,8 @@ impl CoordinationToolProvider {
             .main_account_id(actor, scope)
             .await
             .map_err(native_scope_error)?;
-        let permission = spec
-            .authority
-            .permission(scope_type_name(scope.scope_type))
-            .ok_or_else(|| {
-                AgentHostError::Authority(
-                    "proposal operation is not admitted for this scope".into(),
-                )
-            })?;
-        let (policy, reason) = self
-            .actions
-            .evaluate_direct_command_policy(
-                actor,
-                scope_type_name(scope.scope_type),
-                &scope.scope_id,
-                permission,
-                operation,
-                None,
-            )
-            .await
-            .map_err(service_error)?;
-        if policy == AgentActionPolicyResult::Denied {
-            return Err(AgentHostError::Authority(
-                reason.unwrap_or_else(|| "Main proposal policy denied".into()),
-            ));
-        }
+        let _ = spec;
+        self.registered_authority(actor, scope, operation).await?;
         Ok(())
     }
     pub(super) async fn registered_proposal(
@@ -56,6 +78,7 @@ impl CoordinationToolProvider {
         operation: &str,
         mut arguments: Value,
         prepared: bool,
+        admitted_authority: Option<&operation_registry::authority::EffectiveAuthority>,
     ) -> Result<Value, AgentHostError> {
         // Current authority precedes every payload diagnostic. Stored preparations
         // keep their exact arguments; only fresh calls consult the current spec.
@@ -86,6 +109,7 @@ impl CoordinationToolProvider {
             actor_identity_id: actor,
             scope,
             proposal_arguments: Some(&arguments),
+            admitted_authority,
         };
         spec.dispatch_prepared(&context, payload)
             .await
@@ -110,39 +134,42 @@ impl MainProposalContext<AgentHostError> for super::registered_reads::Context<'_
             .permission(scope_type_name(self.scope.scope_type))
             .unwrap();
         let result = MainGenesisCommandService::new(self.provider.db.clone())
-            .select_project_agent(crate::MainGenesisProjectAgentSelectCommandInput {
-                principal: MainGenesisDraftPrincipal::MainAgent {
-                    identity_id: self.actor_identity_id.to_owned(),
-                    scope: self.scope.clone(),
+            .select_project_agent_for_admission(
+                crate::MainGenesisProjectAgentSelectCommandInput {
+                    principal: MainGenesisDraftPrincipal::MainAgent {
+                        identity_id: self.actor_identity_id.to_owned(),
+                        scope: self.scope.clone(),
+                    },
+                    request: crate::MainGenesisProjectAgentSelectRequest {
+                        genesis_session_id: input.genesis_session_id,
+                        expected_session_version: input.expected_session_version,
+                        project_agent_identity_id: input.project_agent_identity_id,
+                    },
+                    idempotency_key: required_argument(
+                        self.proposal_arguments.expect("proposal envelope"),
+                        "dedupe_key",
+                    )?,
+                    correlation_id: required_argument(
+                        self.proposal_arguments.expect("proposal envelope"),
+                        "correlation_id",
+                    )?,
+                    causation_id: self
+                        .proposal_arguments
+                        .expect("proposal envelope")
+                        .get("causation_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    causation_depth: self
+                        .proposal_arguments
+                        .expect("proposal envelope")
+                        .get("causation_depth")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    policy_result: AgentActionPolicyResult::Allowed.to_string(),
+                    requested_permission: permission.to_owned(),
                 },
-                request: crate::MainGenesisProjectAgentSelectRequest {
-                    genesis_session_id: input.genesis_session_id,
-                    expected_session_version: input.expected_session_version,
-                    project_agent_identity_id: input.project_agent_identity_id,
-                },
-                idempotency_key: required_argument(
-                    self.proposal_arguments.expect("proposal envelope"),
-                    "dedupe_key",
-                )?,
-                correlation_id: required_argument(
-                    self.proposal_arguments.expect("proposal envelope"),
-                    "correlation_id",
-                )?,
-                causation_id: self
-                    .proposal_arguments
-                    .expect("proposal envelope")
-                    .get("causation_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                causation_depth: self
-                    .proposal_arguments
-                    .expect("proposal envelope")
-                    .get("causation_depth")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
-                policy_result: AgentActionPolicyResult::Allowed.to_string(),
-                requested_permission: permission.to_owned(),
-            })
+                self.admitted_authority,
+            )
             .await
             .map_err(service_error)?;
         Ok(

@@ -4,6 +4,7 @@ mod agent_chat_topic_repository;
 pub mod budget;
 mod chat_session_denials;
 mod connection;
+mod effective_authority;
 mod environment_readiness;
 mod error;
 mod ids;

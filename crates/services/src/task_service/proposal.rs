@@ -763,20 +763,7 @@ impl TaskService {
         .fetch_optional(self.db.pool())
         .await?;
         if !permissions.as_deref().is_some_and(|permissions| {
-            serde_json::from_str::<Value>(permissions)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("allowed")
-                        .or_else(|| value.get("permissions"))
-                        .cloned()
-                })
-                .and_then(|value| value.as_array().cloned())
-                .is_some_and(|allowed| {
-                    allowed
-                        .iter()
-                        .any(|permission| permission.as_str() == Some("propose_task"))
-                })
+            operation_registry::authority::permission_set(permissions).contains("propose_task")
         }) {
             return Err(ServiceError::invalid_operation(
                 "task proposal actor is not an active Project binding",

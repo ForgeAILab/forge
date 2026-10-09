@@ -8,6 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+operation-registry = { path = "../operation-registry" }
 api-types = { path = "../api-types" }
 executors = { path = "../executors" }
 db = { path = "../db" }

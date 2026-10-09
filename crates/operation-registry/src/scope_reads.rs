@@ -20,6 +20,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
         OperationSpec::typed(
             "account.summary",
             AuthorityRule {
+                principal: authority::PrincipalRule::BoundIdentity,
                 permissions: &[("account", "read_account")],
                 binding: "current identity",
             },
@@ -37,6 +38,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
         OperationSpec::typed(
             "agent_chat.summary",
             AuthorityRule {
+                principal: authority::PrincipalRule::BoundIdentity,
                 permissions: &[("agent_chat", "read_agent_chat")],
                 binding: "bound chat",
             },

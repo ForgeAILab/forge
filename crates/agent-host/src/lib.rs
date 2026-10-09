@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod command_allowlist;
+mod effective_authority;
+pub use effective_authority::authority_bound_provider;
 mod fetch;
 mod interaction;
 mod lcm;
@@ -185,6 +187,7 @@ pub struct RuntimeScopeBinding {
     /// tool registration must use this set as a second boundary; it is never
     /// supplied by the turn request or model input.
     pub allowed_permissions: BTreeSet<String>,
+    pub authority: Option<operation_registry::authority::EffectiveAuthority>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
