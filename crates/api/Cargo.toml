@@ -46,6 +46,7 @@ services = { path = "../services", features = ["test-support"] }
 async-trait = "0.1"
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+check-executor = { path = "../check-executor" }
 cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 db = { path = "../db", features = ["test-template"] }
 events = { path = "../events" }

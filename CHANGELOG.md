@@ -770,6 +770,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Task conditions can say a Task is waiting on its checks (3.3 stage D
+  part 1).** The public Task condition gains the reason
+  `{ "kind": "check", "wait": { "phase", "consumer_id", "origin" } }` with
+  three phases: `result` (the checks are running), `slot` (the machine that
+  holds the checkout is at its run limit) and `infrastructure_exhausted` (the
+  checks produced no result after the automatic retries). The first two are
+  owned work, not a block or a failure: `details.owner = check_runner`,
+  `details.recovery = wait_for_check`, and only `cancel` is offered. The
+  third is not a verdict on the change: `details.owner = user`,
+  `details.recovery = retry_check`, and the Task offers `retry` (reason
+  `check_infrastructure_exhausted`: the same check is requested again with a
+  fresh infrastructure budget, no agent is relaunched and no retry budget is
+  spent) and `cancel`. `ConditionOwner` gains `check_runner`;
+  `ConditionRecovery` gains `wait_for_check` and `retry_check`. Clients that
+  match these enums exhaustively must add the new values. The web Task page
+  shows the wait ("Waiting for checks", "Waiting for a check slot", "Checks
+  could not run"), and the board's blocked filter includes a Task whose checks
+  could not run. Nothing requests the durable check runner in production yet
+  (review-entry and merge-path CI still run inline), so these values first
+  appear when review-entry CI moves onto it. The stored condition encoding
+  moves to mapping revision 6; every Task condition is recomputed once in the
+  background after upgrade, and an older build that reads a database written
+  by this one quarantines the Tasks it cannot read instead of guessing.
+
 - **Durable check runner, not yet used by any check (3.3 stage C).** The
   server now starts a `check-runs` worker and has a durable path for running a
   check: one run per identical request (same Project, repository, commit and

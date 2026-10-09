@@ -514,6 +514,14 @@ pub struct LaunchExecutionResult {
 }
 
 impl TaskService {
+    /// The durable check runner's Task-step consumer contract, once the
+    /// runtime has composed it. Consumer families register through it.
+    pub fn check_consumers(
+        &self,
+    ) -> Option<Arc<crate::check_runner::consumer::TaskCheckConsumers>> {
+        self.check_consumers.get().cloned()
+    }
+
     /// Production services receive the runtime's shared owner router.
     pub fn new_with_router(
         db: Arc<SqliteDb>,

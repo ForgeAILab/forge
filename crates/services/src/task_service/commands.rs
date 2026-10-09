@@ -738,6 +738,20 @@ impl TaskService {
                     })?;
                     encode(consumers.apply(&step.id, &delivery).await?)
                 }
+                "apply_check_progress" => {
+                    let note: db::CheckProgressDelivery =
+                        serde_json::from_value(command.arguments.clone())
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    if db::task_writer::current_task_step().is_none() {
+                        return Err(ServiceError::invalid_operation(
+                            "check progress is applied only by its own step",
+                        ));
+                    }
+                    let consumers = self.check_consumers.get().ok_or_else(|| {
+                        ServiceError::invalid_operation("check consumers are not composed")
+                    })?;
+                    encode(consumers.progress(&note).await?)
+                }
                 _ => Err(ServiceError::invalid_operation("unknown Task command")),
             }
         })

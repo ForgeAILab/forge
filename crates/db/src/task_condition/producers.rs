@@ -189,6 +189,23 @@ pub(crate) async fn derive(
                 facts.integration = None;
                 facts.integration_handoff_ready = false;
             }
+            ConditionStatement::Check { wait, epoch } => {
+                // Only the status entry that asked may state its wait.
+                if *epoch != snapshot.epoch {
+                    return Err(DbError::VersionConflict);
+                }
+                facts.check = Some((wait.clone(), *epoch));
+            }
+            ConditionStatement::CheckCleared { consumer_id } => {
+                // A stale consumer never clears its successor's wait.
+                if facts
+                    .check
+                    .as_ref()
+                    .is_some_and(|(wait, _)| wait.consumer_id == *consumer_id)
+                {
+                    facts.check = None;
+                }
+            }
             _ => {}
         }
     }
@@ -197,7 +214,10 @@ pub(crate) async fn derive(
     let condition = if (facts.initial && !from_statement)
         || matches!(
             statement,
-            Some(ConditionStatement::IntegrationCleared { .. })
+            Some(
+                ConditionStatement::IntegrationCleared { .. }
+                    | ConditionStatement::CheckCleared { .. }
+            )
         ) {
         // Clearing integration restores the other owners' current mapping,
         // including a Deferred timer whose continuation integration stood over.
@@ -206,6 +226,7 @@ pub(crate) async fn derive(
         facts.apply(mapped)
     };
     integration::validate(&condition)?;
+    check::validate(&condition)?;
     let encoded = encode(&condition);
     Ok(Some(Produced {
         version: snapshot.version,
@@ -246,14 +267,9 @@ pub(crate) async fn state(
     task_id: &str,
     statement: &ConditionStatement,
 ) -> Result<()> {
-    if matches!(
-        statement,
-        ConditionStatement::Integration { .. }
-            | ConditionStatement::IntegrationHandedOff { .. }
-            | ConditionStatement::IntegrationCleared { .. }
-    ) {
+    if statement.owner_stated() {
         return Err(DbError::Check(
-            "integration statements require state_integration_condition_in_tx".into(),
+            "integration and check statements require state_integration_condition_in_tx".into(),
         ));
     }
     let Some(produced) = derive(c, task_id, ConditionChange::Legacy, None, Some(statement)).await?

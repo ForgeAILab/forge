@@ -36,9 +36,29 @@ pub enum ConditionStatement {
     /// The owner releases the Task: its diagnostic, interruption and failure
     /// are cleared. Whatever else holds the Task still does.
     Release,
+    // --- durable check runner (plan 3.3 stage D) ---
+    /// The Task's current status entry (`epoch`) waits on this check.
+    /// Replaces only the check runner's reason, preserving every other owner.
+    Check { wait: CheckWait, epoch: i64 },
+    /// The named consumer's wait is over (its result was applied, or it is
+    /// no longer the one in charge). Another consumer's wait is left alone.
+    CheckCleared { consumer_id: String },
 }
 
 impl ConditionStatement {
+    /// A statement that edits its owner's typed witness on the stored
+    /// condition and writes no legacy field: stated only under the Task's
+    /// claimed step, through `state_integration_condition_in_tx`.
+    pub fn owner_stated(&self) -> bool {
+        matches!(
+            self,
+            Self::Integration { .. }
+                | Self::IntegrationHandedOff { .. }
+                | Self::IntegrationCleared { .. }
+                | Self::Check { .. }
+                | Self::CheckCleared { .. }
+        )
+    }
     /// The hold as the operator reads it, and as the legacy annotation has
     /// always stored it: one rendering of the typed fields, used for both.
     pub fn hold_operator_text(actor: &str, reason: &str, at: &str) -> String {
@@ -80,7 +100,7 @@ impl ConditionStatement {
     fn carries(&self, reason: &ParkReason) -> bool {
         use LegacyConditionField as Field;
         match reason {
-            ParkReason::Integration { .. } => true,
+            ParkReason::Integration { .. } | ParkReason::Check { .. } => true,
             ParkReason::EntryBlocked { .. }
             | ParkReason::PlacementDenied { .. }
             | ParkReason::DaemonUpgradeRequired { .. }
@@ -135,12 +155,7 @@ impl ConditionStatement {
     /// The condition after this statement, before the durable facts (entry,
     /// hooks, execution, children, cancellations) are laid over it.
     pub(super) fn apply(&self, stored: &TaskCondition) -> TaskCondition {
-        if matches!(
-            self,
-            Self::Integration { .. }
-                | Self::IntegrationHandedOff { .. }
-                | Self::IntegrationCleared { .. }
-        ) {
+        if self.owner_stated() {
             let mut stated = stored.typed();
             stated.evidence_mut().stated = true;
             return stated;
@@ -201,7 +216,9 @@ impl ConditionStatement {
         match self {
             Self::Integration { .. }
             | Self::IntegrationHandedOff { .. }
-            | Self::IntegrationCleared { .. } => unreachable!(),
+            | Self::IntegrationCleared { .. }
+            | Self::Check { .. }
+            | Self::CheckCleared { .. } => unreachable!(),
             Self::Hold { actor, reason, at } => {
                 // The retry timer goes, so a plan settlement it was standing
                 // in for is a wait of its own.

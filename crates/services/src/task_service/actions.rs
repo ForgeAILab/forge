@@ -305,6 +305,23 @@ impl TaskService {
                             self.retry_recorded_placement(&snapshot, reason.as_deref())
                                 .await?
                         }
+                        TaskAction::Retry { .. }
+                            if offer.reason == "check_infrastructure_exhausted" =>
+                        {
+                            // The same consumer asks again with a fresh
+                            // infrastructure budget; no agent is relaunched.
+                            let consumers = self.check_consumers.get().ok_or_else(|| {
+                                ServiceError::invalid_operation("check consumers are not composed")
+                            })?;
+                            if !consumers.retry_exhausted(&task).await? {
+                                return Err(ServiceError::invalid_operation(
+                                    "the Task no longer waits on an exhausted check",
+                                ));
+                            }
+                            TaskRepo::get_by_id(&*self.db, &task.id, false)
+                                .await?
+                                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?
+                        }
                         TaskAction::Retry { .. } if offer.reason == "owner_reconcile" => {
                             self.reconcile_task_action_owner(task, action.clone())
                                 .await?
