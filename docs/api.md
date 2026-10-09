@@ -2748,7 +2748,10 @@ post-commit hooks (including CI, merge and dispatch) and follow-up cascades are 
 
 `parent_task_id` is the hierarchy pointer. A Task that names a parent is a
 direct child of a root coordination Task, inherits the root's shared workspace,
-and receives a `subtask_order` position. A root with one or more children is a
+and receives a `subtask_order` position. The parent must still be able to
+coordinate it: creating a subtask under a parent that is terminal, in review or
+integrating answers `409 SUBTASK_PARENT_CLOSED` with
+`details.parent_task_id` and `details.state`. A root with one or more children is a
 non-executing coordination container: the root's implementation prompt is not
 dispatched. Its `coder` assignment is retained as the default worker, while
 other non-review role assignments are removed. A child with its own `coder`

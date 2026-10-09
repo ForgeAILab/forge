@@ -155,8 +155,9 @@ fn generate(seed: u64, steps: usize) -> Vec<Step> {
                 tasks += 1;
                 Action::Create
             }
-            // `CreateChild` is not generated: coordination roots need a
-            // model of their own (see the ignored subtask test below).
+            // `CreateChild` is not generated yet: a long run with it enabled
+            // reaches the open subtask findings pinned by the ignored tests
+            // at the end of this file within a few dozen seeds.
             18..=22 => Action::Depend(task, rng.below(tasks) as usize),
             23..=26 => Action::Claim(task),
             0..=57 => Action::Finish(
@@ -206,6 +207,9 @@ struct Script {
 struct Shared {
     verdicts: Mutex<HashMap<String, bool>>,
     index: Mutex<HashMap<String, usize>>,
+    /// Subtask index -> its coordination root: a subtask's work is also the
+    /// root's deliverable, which the root's aggregate review checks.
+    parents: Mutex<HashMap<usize, usize>>,
     writes: AtomicU64,
 }
 
@@ -259,7 +263,12 @@ impl ScriptedAdapter {
             Outcome::CiFail => {
                 std::fs::write(worktree.join(format!("junk-{index}.txt")), format!("{n}\n"))?
             }
-            _ => std::fs::write(worktree.join(deliverable(index)), format!("{n}\n"))?,
+            _ => {
+                std::fs::write(worktree.join(deliverable(index)), format!("{n}\n"))?;
+                if let Some(root) = self.0.shared.parents.lock().unwrap().get(&index) {
+                    std::fs::write(worktree.join(deliverable(*root)), format!("{n}\n"))?;
+                }
+            }
         }
         if outcome == Outcome::Conflict || handed_off {
             std::fs::write(&shared, format!("task {index} write {n}\n"))?;
@@ -771,6 +780,9 @@ impl World {
             .await
             .map_err(|error| error.to_string())?;
         self.shared.index.lock().unwrap().insert(id.clone(), index);
+        if let Some(parent) = parent {
+            self.shared.parents.lock().unwrap().insert(index, parent);
+        }
         self.tasks.push(id);
         Ok("created".to_owned())
     }
@@ -2004,17 +2016,12 @@ async fn a_run_that_fails_after_a_project_pause_is_retried() {
     .await;
 }
 
-/// UNTRIAGED observation from this model, and the reason `CreateChild` is not
-/// generated yet. A subtask is accepted under a parent that is already done,
-/// cancelled or in review; it then sits in `todo` with a `clear` condition,
-/// is never scheduled and offers only `start` and `cancel`. Either the
-/// create should be refused or the child needs an owner. Two more runs with
-/// subtasks stopped on things this model cannot judge yet: an offered
-/// `cancel` refused with "the Task is settling a completed execution's plan
-/// artifact; retry after publication", and a root left in `review` with a
-/// `clear` condition after its only child was cancelled.
+/// Found by this model, fixed. A subtask used to be accepted under a parent
+/// that was already done, cancelled, in review or integrating; it then sat in
+/// `todo` with a `clear` condition, was never scheduled and offered only
+/// `start` and `cancel`. Creating it is now refused with
+/// `SUBTASK_PARENT_CLOSED`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "untriaged: a subtask created under a settled parent is never scheduled"]
 async fn a_subtask_of_a_settled_parent_is_scheduled_or_refused() {
     use Action::{Create, CreateChild, Finish};
     run_cases(vec![(
@@ -2024,6 +2031,73 @@ async fn a_subtask_of_a_settled_parent_is_scheduled_or_refused() {
             step(Finish(0, Outcome::Success)),
             step(CreateChild(0)),
         ],
+    )])
+    .await;
+}
+
+/// OPEN WEDGE found by a random run with `CreateChild` generated; minimized
+/// below. A coordination root whose aggregate review check fails ends in
+/// `review` parked on `review retry budget exhausted`. The offered `retry`
+/// is accepted, moves the root to `in_progress` and parks it on "invalid
+/// operation: coordination root <id> is not in its aggregate review state";
+/// the offered `restart` puts it back in `review` on the exhausted budget.
+/// The two alternate for ever and no offer leads anywhere else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "open wedge: a coordination root that fails aggregate review loops between retry and restart"]
+async fn a_coordination_root_that_fails_aggregate_review_can_recover() {
+    use Action::{Create, CreateChild, Finish};
+    run_cases(vec![(
+        "root fails aggregate review".to_owned(),
+        vec![
+            step(Create),
+            step(Create),
+            crash_after(Finish(1, Outcome::Fail)),
+            step(CreateChild(1)),
+            step(Finish(2, Outcome::CiFail)),
+        ],
+    )])
+    .await;
+}
+
+/// OPEN finding from a random run with `CreateChild` generated; minimized
+/// below. `cancel` is offered for a coordination root and refused with
+/// `400 validation_error`: "the Task is settling a completed execution's plan
+/// artifact; retry after publication". An offered action must be accepted
+/// (invariant (b)).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "open: an offered cancel on a coordination root is refused while a plan artifact settles"]
+async fn an_offered_cancel_is_accepted_while_a_plan_artifact_settles() {
+    use Action::{Create, CreateChild, Finish, Offer, Verdict};
+    run_cases(vec![(
+        "cancel offered and refused on a root".to_owned(),
+        vec![
+            step(Create),
+            step(Finish(0, Outcome::Success)),
+            step(Create),
+            step(Create),
+            crash_after(Verdict(3, false)),
+            step(CreateChild(2)),
+            step(Finish(4, Outcome::Success)),
+            step(Finish(4, Outcome::Success)),
+            step(Offer(2, 0)),
+        ],
+    )])
+    .await;
+}
+
+/// OPEN STALL found by a random run with `CreateChild` generated. A subtask
+/// created under a held parent is accepted and never dispatched while the
+/// hold lasts (`task_hierarchy::coordination_root_allows_child_dispatch`),
+/// which is right, but it says nothing: it sits in `todo` with a `clear`
+/// condition and offers `start` and `cancel`. Its exit is releasing the
+/// parent; the subtask should show that it waits for its parent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "open stall: a subtask of a held parent waits with a clear condition"]
+async fn a_subtask_of_a_held_parent_shows_why_it_waits() {
+    use Action::{Create, CreateChild, Take};
+    run_cases(vec![(
+        "subtask under a held parent".to_owned(),
+        vec![step(Create), step(Take(0, "hold")), step(CreateChild(0))],
     )])
     .await;
 }

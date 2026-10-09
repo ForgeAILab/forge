@@ -485,6 +485,18 @@ impl From<ServiceError> for McpToolError {
                     "code": "NESTED_SUBTASK_UNSUPPORTED"
                 }))
             }
+            ServiceError::SubtaskParentClosed {
+                parent_task_id,
+                state,
+            } => Self::new(
+                -32602,
+                format!("task {parent_task_id} is in `{state}` and no longer accepts subtasks"),
+            )
+            .with_data(json!({
+                "code": "SUBTASK_PARENT_CLOSED",
+                "parent_task_id": parent_task_id,
+                "state": state,
+            })),
             ServiceError::ParentWorkspaceRequired { parent_task_id } => Self::new(
                 -32602,
                 format!("parent workspace required for task {parent_task_id}"),

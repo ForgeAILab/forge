@@ -1672,6 +1672,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A subtask can no longer be created under a parent that would never run
+  it.** Creating a Task with a `parent_task_id` (REST, MCP, native tools,
+  `create_subtasks`) whose parent is terminal, in review or integrating was
+  accepted; the subtask then stayed in `todo` with a clear condition and was
+  never scheduled. It is now refused with `409 SUBTASK_PARENT_CLOSED`
+  (`-32602` with `data.code = "SUBTASK_PARENT_CLOSED"` over MCP), naming the
+  parent and its state. Add subtasks before the parent enters review, or
+  create a new root Task. Found by the model-based workflow test.
 - **A cancelled dependency no longer discards what its dependant was waiting
   on.** The `dependency_cancelled` blocker used to overwrite a hold, and to
   be skipped when the dependant was already parked for another reason: a

@@ -143,6 +143,14 @@ impl TaskService {
             if parent.parent_task_id.is_some() {
                 return Err(ServiceError::nested_subtask_unsupported());
             }
+            crate::task_hierarchy::ensure_parent_accepts_subtasks(
+                &parent,
+                &WorkflowEngine::resolve_workflow_for_task(
+                    &parent,
+                    &project.workflow_definition,
+                    &Actor::system(api_types::SystemComponent::Workflow),
+                ),
+            )?;
             Some(TaskRepo::next_subtask_order(&*self.db, parent_id).await?)
         } else {
             None

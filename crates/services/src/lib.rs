@@ -465,6 +465,14 @@ pub enum ServiceError {
     #[error("parent workspace required for task {parent_task_id}")]
     ParentWorkspaceRequired { parent_task_id: String },
 
+    /// The parent is in review, integrating or terminal: it would never
+    /// schedule a new subtask.
+    #[error("task {parent_task_id} is in `{state}` and no longer accepts subtasks; add subtasks before the parent enters review, or create a new root Task")]
+    SubtaskParentClosed {
+        parent_task_id: String,
+        state: String,
+    },
+
     #[error("workspace reset required for task {task_id}: {reason}")]
     WorkspaceResetRequired { task_id: String, reason: String },
 

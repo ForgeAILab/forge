@@ -5244,6 +5244,13 @@ review gate declares, not the built-in `reviewer` name.
 `services::task_hierarchy::RootRolePolicy` owns these assignment and execution
 decisions.
 
+A subtask can be created only while its parent can still coordinate it: in a
+backlog, initial or working state. A parent that is terminal, in its review
+gate or integrating never dispatches a child, so creating one there is refused
+with `SUBTASK_PARENT_CLOSED` (`ServiceError::SubtaskParentClosed`,
+`task_hierarchy::ensure_parent_accepts_subtasks`) instead of leaving an
+unscheduled Task behind.
+
 Each subtask is an independent Task with its own status, execution record,
 session, logs, retry state, comments, and completion event. Its effective coder
 is its own `coder` row when present, otherwise the root's `coder`, otherwise

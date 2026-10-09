@@ -339,6 +339,27 @@ pub(crate) async fn coordination_root_context(
     Ok((parent, workflow))
 }
 
+/// Refuse a new subtask under a parent that would never schedule it: a
+/// terminal parent stays terminal, and a parent in review or integration is
+/// judged on the work it already has.
+pub(crate) fn ensure_parent_accepts_subtasks(
+    parent: &Task,
+    workflow: &WorkflowDefinition,
+) -> Result<()> {
+    let closed = workflow.state_kind(&parent.status) == Some(StateKind::Terminal)
+        || matches!(
+            workflow.canonical_phase_for_state(&parent.status),
+            CanonicalPhase::Review | CanonicalPhase::Done
+        );
+    if closed {
+        return Err(ServiceError::SubtaskParentClosed {
+            parent_task_id: parent.id.clone(),
+            state: parent.status.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Return whether a root state permits its next child to dispatch.
 pub(crate) fn coordination_root_allows_child_dispatch(
     parent: &Task,
