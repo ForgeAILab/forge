@@ -72,8 +72,13 @@ pub enum Reason {
     Capacity,
     ExecutionStopped,
     ReviewChecks,
-    WorkflowInvalid { state: String, cause: String },
-    UnknownCondition { owner: String },
+    WorkflowInvalid {
+        state: String,
+        cause: String,
+    },
+    UnknownCondition {
+        owner: String,
+    },
     Settled,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

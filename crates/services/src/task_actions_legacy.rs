@@ -576,8 +576,16 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         append_owner_advance(snapshot, &mut offers);
         return offers;
     }
+    // Mirrors `task_actions`: a held coordination root's release launches
+    // no role outside its aggregate review.
+    let root_role_refused = snapshot.coordination_root
+        && role.is_some_and(|role| {
+            !crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
+                .allows_execution(&task.status, role)
+        });
     if held {
-        if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() {
+        if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() && !root_role_refused
+        {
             offer(
                 TaskAction::Release { reason: None },
                 &[],

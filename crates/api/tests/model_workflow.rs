@@ -2032,8 +2032,7 @@ async fn start_on_a_queued_task_does_not_park_it_as_failed() {
             // Waiting for its paused Agent is a visible wait, not a park the
             // refused claim left behind.
             let agent_wait = task["condition"]["primary"]["kind"] == "agent";
-            if task["status"] != "todo" || (task["condition"]["kind"] == "parked" && !agent_wait)
-            {
+            if task["status"] != "todo" || (task["condition"]["kind"] == "parked" && !agent_wait) {
                 return Err(format!(
                     "(b) `start` on a queued Task must leave it queued, not parked or moved: {} {}",
                     task["status"], task["condition"]
@@ -2199,6 +2198,39 @@ async fn a_task_released_after_a_crash_under_a_paused_agent_runs_again() {
             step(PauseAgent),
             crash_after(Take(0, "hold")),
             step(Take(0, "release")),
+        ],
+    )])
+    .await;
+}
+
+/// OPEN, UNTRIAGED: reached by `FORGE_MODEL_LONG=1 FORGE_MODEL_SEED=951857209`
+/// on the build that typed the parent, Agent and dependency waits; minimized
+/// below. Not established whether it predates that build. Task 3's review is
+/// rejected (scripted) while other Tasks hold the coder's runs; it goes back
+/// to `in_progress` and stays there with a `clear` condition, no run, no
+/// deferral and no park, offering `cancel`, `retry` and `approve`. A started
+/// Task waiting for a busy Agent is the suspected cause: the dispatcher's
+/// capacity park (`Reason::Capacity`, `task_dispatcher/next_step.rs`,
+/// `agent_full`) is a scheduling decision nothing stores, like the parent
+/// and Agent waits were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "open stall, untriaged: a Task sent back by review while its Agent is busy is idle with a clear condition"]
+async fn a_task_sent_back_by_review_under_a_busy_agent_shows_why_it_waits() {
+    use Action::{Create, Finish, Offer, Verdict};
+    run_cases(vec![(
+        "review rejection while the coder is busy".to_owned(),
+        vec![
+            step(Create),
+            step(Offer(0, 0)),
+            step(Create),
+            step(Create),
+            step(Finish(2, Outcome::Fail)),
+            step(Finish(2, Outcome::Success)),
+            step(Create),
+            step(Create),
+            step(Create),
+            step(Verdict(3, false)),
+            step(Finish(1, Outcome::Conflict)),
         ],
     )])
     .await;

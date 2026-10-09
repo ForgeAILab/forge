@@ -520,7 +520,11 @@ impl TaskService {
                     crate::deferred_dispatch::DEPENDENCY_WAIT_CAPABILITY,
                     &format!(
                         "waiting for unfinished dependenc{}: {}",
-                        if dependency_ids.len() == 1 { "y" } else { "ies" },
+                        if dependency_ids.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        },
                         dependency_ids.join(", ")
                     ),
                     &dependency_ids,
