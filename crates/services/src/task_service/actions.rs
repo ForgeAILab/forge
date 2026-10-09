@@ -562,7 +562,10 @@ impl TaskService {
                             } else {
                                 let snapshot =
                                     self.task_action_snapshot(&staged.id, &actor).await?;
-                                if !snapshot.has_agent
+                                // A coordination root's retry re-ran its
+                                // aggregate review; no role is launched for it.
+                                if snapshot.coordination_root
+                                    || !snapshot.has_agent
                                     || snapshot
                                         .workflow
                                         .states
@@ -956,6 +959,17 @@ impl TaskService {
             })
         });
         if !agent_owned || !snapshot.has_agent {
+            return Ok(snapshot.task);
+        }
+        // A coordination root runs only its aggregate review role. A
+        // decision that leaves it in a working state queues no role for it:
+        // the scheduler advances the root when its subtasks are complete.
+        if snapshot.coordination_root
+            && role.is_some_and(|role| {
+                !crate::task_hierarchy::RootRolePolicy::for_workflow(&snapshot.workflow)
+                    .allows_execution(&snapshot.task.status, role)
+            })
+        {
             return Ok(snapshot.task);
         }
         let mut selection = snapshot.clone();

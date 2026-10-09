@@ -1421,7 +1421,17 @@ impl TaskService {
     ) -> Result<Task> {
         let reason = optional_recovery_reason(reason, "retry");
         let (gate_state, _budget, _count) = self.current_gate_retry_budget(&task).await?;
-        let resume_after_reset = if task.status == gate_state {
+        // A coordination root has no implementation run to go back to: its
+        // retry is review-only. The aggregate review runs again in place,
+        // under the fresh budget, instead of moving the root to a working
+        // state where no role may run for it.
+        let review_only = task.parent_task_id.is_none()
+            && task.status == gate_state
+            && gate_state == crate::workflow::default_states::REVIEW
+            && crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
+        let resume_after_reset = if review_only {
+            None
+        } else if task.status == gate_state {
             let failed_review = if gate_state == crate::workflow::default_states::REVIEW {
                 ReviewRepo::list_latest_reviews_for_tasks(&*self.db, &[task.id.as_str()])
                     .await?
@@ -1481,6 +1491,12 @@ impl TaskService {
             return self
                 .continue_task_process_with_plan(updated, Some(reason), None, plan, false)
                 .await;
+        }
+        if review_only {
+            let id = uuid::Uuid::parse_str(&updated.id)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            let (task, _) = Box::pin(self.rerun_review(id)).await?;
+            return Ok(task);
         }
         Ok(updated)
     }

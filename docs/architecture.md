@@ -5232,7 +5232,12 @@ artifact: when the Task (or a subtask the root's cancel cascades to) holds a
 staged private files removed, claim released; a failed restore is logged and
 the claim is released anyway) and continues at the Task version that produced,
 so an offered `cancel` is never refused with "settling a completed execution's
-plan artifact". Pause refusals preserve the typed wait cause and
+plan artifact". A coordination root's `retry` on an exhausted
+review budget is review-only: it resets the budget and re-runs the aggregate
+review where the root is, instead of resuming the root in a working state
+where the aggregate-review guard refuses every role; a gate decision that
+leaves a root in a working state queues no role for it (the scheduler advances
+the root when its subtasks are complete). Pause refusals preserve the typed wait cause and
 turn retry scope across REST, MCP, and native tools.
 
 ### Root Tasks and ordered subtasks

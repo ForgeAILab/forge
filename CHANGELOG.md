@@ -1737,6 +1737,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **Retrying a parent Task whose aggregate review failed no longer loops
+  between `retry` and `restart`.** A parent Task (one with subtasks) parked in
+  `review` on "review retry budget exhausted" offered `retry`, which moved it
+  to `in_progress` and parked it there on "coordination root ... is not in its
+  aggregate review state"; `restart` put it back, and the two alternated for
+  ever. `retry` on a parent now resets the budget and re-runs the aggregate
+  review in place. Still open: when that review can never pass, the owner's
+  override is sent back by integration ("fresh conformance review required"),
+  so the parent's only exit is `cancel`. Found by the model-based workflow
+  test.
+
 - **An offered `cancel` is no longer refused while a plan artifact
   settles.** Cancelling a Task (or a coordination root whose subtask was in
   that state) whose finished run had not yet published its plan answered

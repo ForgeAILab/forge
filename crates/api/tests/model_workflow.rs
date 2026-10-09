@@ -2170,22 +2170,34 @@ async fn a_subtask_of_a_settled_parent_is_scheduled_or_refused() {
     .await;
 }
 
-/// OPEN WEDGE found by a random run with `CreateChild` generated; minimized
-/// below. A coordination root whose aggregate review check fails ends in
-/// `review` parked on `review retry budget exhausted`. The offered `retry`
-/// is accepted, moves the root to `in_progress` and parks it on "invalid
-/// operation: coordination root <id> is not in its aggregate review state";
-/// the offered `restart` puts it back in `review` on the exhausted budget.
-/// The two alternate for ever and no offer leads anywhere else.
+/// PARTLY FIXED, STILL OPEN. Found by a random run with `CreateChild`
+/// generated; minimized below. A coordination root whose aggregate review
+/// check fails ends in `review` parked on `review retry budget exhausted`.
 ///
-/// Root cause (read, not fixed): `retry` on an exhausted review budget is
-/// the implementation retry, which moves the Task to its working state; a
-/// coordination root has no implementation run, and the aggregate review
-/// guard (`services/src/task_service/execution/guards.rs:54`) then refuses
-/// it outside `review`. A root needs a review-only retry that resets the
-/// review budget in place (or `send_back` to add a corrective subtask).
+/// Fixed: the offered `retry` used to move the root to `in_progress` and park
+/// it on "coordination root <id> is not in its aggregate review state"
+/// (`services/src/task_service/execution/guards.rs`), and `restart` put it
+/// back, for ever. `retry` on a root is now review-only: it resets the budget
+/// and re-runs the aggregate review in place
+/// (`reset_task_retry_budget`, `services/src/task_service/execution/recovery.rs`),
+/// and no role is queued for a root in a working state
+/// (`queue_deferred_action_role`, `services/src/task_service/actions.rs`).
+///
+/// Open: when the aggregate check can never pass (here the finished subtask
+/// did not write the root's deliverable) the root has no exit but `cancel`.
+/// The offered owner `approve` (override) is accepted, moves the root to
+/// `merging`, and integration sends it back: "conformance review required:
+/// fresh conformance review required before integration"
+/// (`db/src/review_conformance.rs`, `verified_passed_contract`, reached from
+/// `services/src/workflow/actions/merge.rs`). An owner override of a failed
+/// review is not review authority for integration while a reviewer Agent is
+/// assigned, and a corrective subtask cannot be added to a root in `review`
+/// (`SUBTASK_PARENT_CLOSED`) while `send_back` is not offered on an exhausted
+/// budget. Deciding which of those is the owner's exit (override counts as
+/// authority, or `send_back` reopens the root for a corrective subtask) is a
+/// product decision in integration-owned code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open wedge: a coordination root that fails aggregate review loops between retry and restart"]
+#[ignore = "open: a root whose aggregate check cannot pass has no exit; the owner's override is bounced by the integration conformance gate"]
 async fn a_coordination_root_that_fails_aggregate_review_can_recover() {
     use Action::{Create, CreateChild, Finish};
     run_cases(vec![(
