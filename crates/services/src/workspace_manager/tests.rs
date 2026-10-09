@@ -448,37 +448,221 @@ async fn worktree_behind_the_task_branch_returns_to_it_only_for_a_clean_launch()
     assert_eq!(fixture.head_ref(), fixture.task_ref());
 }
 
-/// Commits made on a detached HEAD or another branch are not on the Task
-/// branch. Checking the Task branch out would leave them unreachable and the
-/// Task would finish without them, so no purpose does it.
+/// Every purpose a Task step uses: launch, review, check, hook, delivery.
+const STEPS: [Purpose; 5] = [
+    Purpose::Execute,
+    Purpose::Review,
+    Purpose::Check,
+    Purpose::Hook,
+    Purpose::Integrate,
+];
+
+async fn task_row(fixture: &Fixture) -> Task {
+    db::TaskRepo::get_by_id(&fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .expect("task row exists")
+}
+
+async fn forge_comments(fixture: &Fixture) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT content FROM task_comment WHERE task_id = ? AND author_type = 'system' \
+         ORDER BY created_at",
+    )
+    .bind(&fixture.task.id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap()
+}
+
+fn rescued_refs(fixture: &Fixture) -> Vec<String> {
+    git(
+        &fixture.path,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            RESCUED_REF_NAMESPACE,
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Commits made on a detached HEAD or another branch, on top of the Task
+/// branch: the branch is advanced to them and checked out. Nothing is lost,
+/// nothing is reset, uncommitted work stays, and the Task row (review and
+/// retry budgets included) is untouched.
 #[tokio::test]
-async fn commits_off_the_task_branch_are_never_left_behind_by_a_checkout() {
+async fn commits_ahead_of_the_task_branch_fast_forward_it_for_every_step() {
     for detach in [false, true] {
+        for purpose in STEPS {
+            let fixture = Fixture::new().await;
+            let before = task_row(&fixture).await;
+            let switch: &[&str] = if detach {
+                &["checkout", "-q", "--detach"]
+            } else {
+                &["checkout", "-q", "-b", "elsewhere"]
+            };
+            git(&fixture.path, switch);
+            std::fs::write(fixture.path.join("work.txt"), "the Task's work").unwrap();
+            git(&fixture.path, &["add", "work.txt"]);
+            git(
+                &fixture.path,
+                &["commit", "-q", "-m", "work off the branch"],
+            );
+            std::fs::write(fixture.path.join("uncommitted.txt"), "in progress").unwrap();
+            let commit = git(&fixture.path, &["rev-parse", "HEAD"]);
+
+            let valid = fixture.check(purpose).await.expect("fast-forwarded");
+            assert_eq!(
+                valid.repair(),
+                Repair::FastForwardedTaskBranch,
+                "{purpose:?}"
+            );
+            assert!(valid.on_task_branch());
+            assert_eq!(valid.rescued_ref(), None);
+            assert_eq!(fixture.head_ref(), fixture.task_ref());
+            assert_eq!(
+                git(&fixture.path, &["rev-parse", &fixture.task_ref()]),
+                commit,
+                "{purpose:?}: the Task branch holds the commit"
+            );
+            assert!(fixture.path.join("work.txt").exists());
+            assert_eq!(
+                std::fs::read_to_string(fixture.path.join("uncommitted.txt")).unwrap(),
+                "in progress"
+            );
+            assert!(rescued_refs(&fixture).is_empty());
+            assert!(forge_comments(&fixture).await.is_empty());
+            assert_eq!(task_row(&fixture).await, before, "{purpose:?}: no budget");
+
+            // The step's next check is the healthy path again.
+            let again = fixture.check(purpose).await.expect("healthy");
+            assert_eq!(again.repair(), Repair::None);
+        }
+    }
+}
+
+/// HEAD and the Task branch each have commits the other lacks: HEAD's are
+/// kept under a Forge ref, the Task is told, and the worktree returns to the
+/// Task branch so the step continues.
+#[tokio::test]
+async fn diverged_head_is_rescued_under_a_forge_ref_for_every_step() {
+    for purpose in STEPS {
         let fixture = Fixture::new().await;
-        let switch: &[&str] = if detach {
-            &["checkout", "-q", "--detach"]
-        } else {
-            &["checkout", "-q", "-b", "elsewhere"]
-        };
-        git(&fixture.path, switch);
-        std::fs::write(fixture.path.join("work.txt"), "the Task's work").unwrap();
-        git(&fixture.path, &["add", "work.txt"]);
+        let before = task_row(&fixture).await;
+        let base = git(&fixture.path, &["rev-parse", "HEAD"]);
         git(
             &fixture.path,
-            &["commit", "-q", "-m", "work off the branch"],
+            &["commit", "-q", "--allow-empty", "-m", "task work"],
         );
-        let off = fixture.head_ref();
-        let commit = git(&fixture.path, &["rev-parse", "HEAD"]);
+        let branch_tip = git(&fixture.path, &["rev-parse", "HEAD"]);
+        git(&fixture.path, &["checkout", "-q", "--detach", &base]);
+        std::fs::write(fixture.path.join("stray.txt"), "stray work").unwrap();
+        git(&fixture.path, &["add", "stray.txt"]);
+        git(&fixture.path, &["commit", "-q", "-m", "stray"]);
+        let stray = git(&fixture.path, &["rev-parse", "HEAD"]);
 
-        for purpose in [Purpose::Execute].into_iter().chain(CANDIDATE) {
-            assert_reset_required(
-                fixture.check(purpose).await,
-                "1 commit(s) that are not on the Task branch",
+        let valid = fixture.check(purpose).await.expect("rescued");
+        assert_eq!(
+            valid.repair(),
+            Repair::RescuedOffBranchCommits,
+            "{purpose:?}"
+        );
+        let kept = valid.rescued_ref().expect("the ref is reported").to_owned();
+        assert!(
+            kept.starts_with(&format!("refs/forge/rescued/{}/", fixture.task.id)),
+            "{kept}"
+        );
+        assert_eq!(git(&fixture.path, &["rev-parse", &kept]), stray);
+        assert_eq!(fixture.head_ref(), fixture.task_ref());
+        assert_eq!(git(&fixture.path, &["rev-parse", "HEAD"]), branch_tip);
+        assert!(!fixture.path.join("stray.txt").exists());
+        let comments = forge_comments(&fixture).await;
+        assert_eq!(comments.len(), 1, "{comments:?}");
+        assert!(comments[0].contains(&kept) && comments[0].contains(&stray));
+        assert_eq!(task_row(&fixture).await, before, "{purpose:?}: no budget");
+
+        let again = fixture.check(purpose).await.expect("healthy");
+        assert_eq!(again.repair(), Repair::None);
+        assert_eq!(rescued_refs(&fixture).len(), 1);
+        assert_eq!(forge_comments(&fixture).await.len(), 1);
+    }
+}
+
+/// The checkout after a rescue is never forced. Uncommitted changes it would
+/// overwrite stay where they are, the reason names the ref, and checking
+/// again writes no second ref and no second comment: there is no reset loop.
+#[tokio::test]
+async fn diverged_head_with_conflicting_local_changes_parks_once_with_the_ref_named() {
+    let fixture = Fixture::new().await;
+    let base = git(&fixture.path, &["rev-parse", "HEAD"]);
+    std::fs::write(fixture.path.join("shared.txt"), "task version").unwrap();
+    git(&fixture.path, &["add", "shared.txt"]);
+    git(&fixture.path, &["commit", "-q", "-m", "task work"]);
+    git(&fixture.path, &["checkout", "-q", "--detach", &base]);
+    std::fs::write(fixture.path.join("shared.txt"), "stray version").unwrap();
+    git(&fixture.path, &["add", "shared.txt"]);
+    git(&fixture.path, &["commit", "-q", "-m", "stray"]);
+    let stray = git(&fixture.path, &["rev-parse", "HEAD"]);
+    std::fs::write(fixture.path.join("shared.txt"), "uncommitted version").unwrap();
+
+    for purpose in STEPS.into_iter().chain(STEPS) {
+        assert_reset_required(
+            fixture.check(purpose).await,
+            "commit(s) are kept under refs/forge/rescued/",
+        );
+        assert_eq!(git(&fixture.path, &["rev-parse", "HEAD"]), stray);
+        assert_eq!(
+            std::fs::read_to_string(fixture.path.join("shared.txt")).unwrap(),
+            "uncommitted version"
+        );
+    }
+    assert_eq!(rescued_refs(&fixture).len(), 1);
+    assert_eq!(forge_comments(&fixture).await.len(), 1);
+    assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
+}
+
+/// A step that finds its directory gone, or not a worktree, gets it back
+/// from the Task branch in the same call and spends no budget. One call
+/// makes one attempt: when the Task branch is gone too the answer is the
+/// typed reset, again and again, with nothing recreated in between.
+#[tokio::test]
+async fn unusable_directory_is_recreated_once_per_step_without_budget() {
+    for purpose in STEPS {
+        for not_a_worktree in [false, true] {
+            let fixture = Fixture::new().await;
+            let before = task_row(&fixture).await;
+            std::fs::remove_dir_all(&fixture.path).unwrap();
+            if not_a_worktree {
+                std::fs::create_dir_all(&fixture.path).unwrap();
+                std::fs::write(fixture.path.join("left-over.txt"), "x").unwrap();
+            }
+            let valid = fixture.check(purpose).await.expect("recreated");
+            assert_recovered(&fixture, &valid);
+            assert_eq!(task_row(&fixture).await, before, "{purpose:?}: no budget");
+            assert_eq!(
+                fixture.check(purpose).await.expect("healthy").repair(),
+                Repair::None
             );
-            assert_eq!(fixture.head_ref(), off, "{purpose:?} never moves HEAD");
-            assert_eq!(git(&fixture.path, &["rev-parse", "HEAD"]), commit);
         }
-        assert!(fixture.path.join("work.txt").exists());
+
+        let fixture = Fixture::new().await;
+        std::fs::remove_dir_all(&fixture.path).unwrap();
+        git(fixture.repo_dir.path(), &["worktree", "prune"]);
+        git(
+            fixture.repo_dir.path(),
+            &["branch", "-D", &fixture.workspace.branch],
+        );
+        for _ in 0..2 {
+            let error = ServiceError::from(fixture.check(purpose).await.err().expect("parked"));
+            assert!(
+                matches!(error, ServiceError::WorkspaceResetRequired { .. }),
+                "{purpose:?}: {error}"
+            );
+            assert!(!fixture.path.exists(), "{purpose:?}: nothing is recreated");
+        }
         assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
     }
 }

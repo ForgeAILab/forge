@@ -7,7 +7,8 @@
 //! caller runs a command in a directory this module has not just checked.
 //!
 //! The manager never writes Task rows: callers map the outcome through their
-//! existing producers. `From<WorkspaceUnavailable> for ServiceError` keeps the
+//! existing producers. The one thing it records itself is a Forge comment
+//! naming the ref that keeps commits it moved HEAD away from. `From<WorkspaceUnavailable> for ServiceError` keeps the
 //! error variants the dispatcher, HTTP and MCP layers already match on.
 
 use std::{
@@ -70,6 +71,12 @@ pub(crate) enum Repair {
     Recovered,
     /// A clean worktree was put back on the Task branch.
     CheckedOutTaskBranch,
+    /// HEAD was strictly ahead of the Task branch: the branch was advanced
+    /// to HEAD and checked out. No commit and no file changed.
+    FastForwardedTaskBranch,
+    /// HEAD had diverged from the Task branch: its commits are kept under
+    /// [`ValidWorkspace::rescued_ref`] and the Task branch was checked out.
+    RescuedOffBranchCommits,
 }
 
 /// A workspace checked against disk and Git by [`WorkspaceManager::ensure_valid`].
@@ -80,9 +87,16 @@ pub(crate) struct ValidWorkspace {
     path: Option<PathBuf>,
     repair: Repair,
     on_task_branch: bool,
+    rescued_ref: Option<String>,
 }
 
 impl ValidWorkspace {
+    /// The Forge-owned ref that keeps the commits HEAD was on, for
+    /// [`Repair::RescuedOffBranchCommits`].
+    pub(crate) fn rescued_ref(&self) -> Option<&str> {
+        self.rescued_ref.as_deref()
+    }
+
     pub(crate) fn workspace(&self) -> &Workspace {
         &self.workspace
     }
@@ -343,7 +357,7 @@ impl<'a> WorkspaceManager<'a> {
                 Ok(valid(workspace, resolved, path, Repair::None, false))
             }
             Observed::OffBranch { head } => {
-                self.return_to_task_branch(workspace, resolved, path, purpose, &head)
+                self.return_to_task_branch(task, workspace, resolved, path, purpose, &head)
                     .await
             }
             observed @ (Observed::Missing | Observed::Invalid | Observed::Foreign { .. }) => {
@@ -378,17 +392,23 @@ impl<'a> WorkspaceManager<'a> {
         }
     }
 
-    /// Put HEAD back on the Task branch only when nothing can be lost.
+    /// Put HEAD back on the Task branch without losing a commit.
     ///
-    /// - HEAD holds commits the Task branch lacks: never checked out for any
-    ///   purpose. Leaving them would make them unreachable from the branch
-    ///   Forge reviews and delivers, and the Task would finish without them.
     /// - HEAD is the Task branch's own commit: the checkout changes no file,
-    ///   so every repairing purpose may do it, with or without local changes.
+    ///   so every repairing purpose does it, with or without local changes.
+    /// - HEAD is strictly ahead of the Task branch (the agent committed on a
+    ///   detached HEAD, or after an interrupted rebase finished): the Task
+    ///   branch is advanced to HEAD and checked out. No file changes.
+    /// - HEAD has diverged from the Task branch: its commits are kept under
+    ///   `refs/forge/rescued/<task>/<ts>`, a Forge comment on the Task says
+    ///   so, and the Task branch is checked out. Git refuses the checkout
+    ///   when it would overwrite uncommitted changes; the workspace then
+    ///   needs the explicit reset and the reason names the ref.
     /// - HEAD is behind the Task branch: the checkout moves the tree, so only
     ///   [`Purpose::Execute`] does it, and only on a clean worktree.
     async fn return_to_task_branch(
         &self,
+        task: &Task,
         workspace: Workspace,
         resolved: ResolvedWorkspace,
         path: PathBuf,
@@ -403,19 +423,42 @@ impl<'a> WorkspaceManager<'a> {
             ),
         };
         let task_ref = format!("refs/heads/{}", workspace.branch);
-        let Some((ahead, behind)) = divergence(&path, &task_ref).await else {
+        let compared = match resolve_commits(&path, &task_ref).await {
+            Some((head_sha, branch_sha)) => divergence(&path, &head_sha, &branch_sha)
+                .await
+                .map(|counts| (head_sha, branch_sha, counts)),
+            None => None,
+        };
+        let Some((head_sha, branch_sha, (ahead, behind))) = compared else {
             return Err(reset_required(
                 "HEAD could not be compared with the Task branch",
             ));
         };
-        if ahead > 0 {
-            return Err(reset_required(&format!(
-                "HEAD has {ahead} commit(s) that are not on the Task branch, so the branch was \
-                 not checked out; move them onto the Task branch (or reset the workspace to \
-                 discard them)"
-            )));
-        }
-        if behind > 0 {
+        let mut repair = Repair::CheckedOutTaskBranch;
+        let mut rescued_ref = None;
+        if ahead > 0 && behind == 0 {
+            // Compare-and-swap on the commit just compared: a Task branch
+            // that moved in between is not overwritten.
+            if !git_succeeds(&path, &["update-ref", &task_ref, &head_sha, &branch_sha]).await {
+                return Err(reset_required(&format!(
+                    "HEAD has {ahead} commit(s) that are not on the Task branch and the branch \
+                     could not be advanced to them"
+                )));
+            }
+            repair = Repair::FastForwardedTaskBranch;
+        } else if ahead > 0 {
+            let Some(kept) = self
+                .rescue_off_branch_commits(task, &workspace, &path, head, &head_sha, ahead, behind)
+                .await
+            else {
+                return Err(reset_required(&format!(
+                    "HEAD has {ahead} commit(s) that are not on the Task branch and they could \
+                     not be kept under a Forge ref, so the branch was not checked out"
+                )));
+            };
+            repair = Repair::RescuedOffBranchCommits;
+            rescued_ref = Some(kept);
+        } else if behind > 0 {
             if purpose != Purpose::Execute {
                 return Err(reset_required(
                     "the candidate is not moved for this operation",
@@ -430,6 +473,7 @@ impl<'a> WorkspaceManager<'a> {
                 ));
             }
         }
+        // Never forced: Git carries local changes over or refuses.
         let checkout = git_at(&path)
             .args(["checkout", "--quiet", &workspace.branch, "--"])
             .output()
@@ -448,7 +492,13 @@ impl<'a> WorkspaceManager<'a> {
                     %error,
                     "could not put the worktree back on its Task branch"
                 );
-                return Err(reset_required("checking the Task branch out failed"));
+                return Err(match &rescued_ref {
+                    Some(kept) => reset_required(&format!(
+                        "its {ahead} commit(s) are kept under {kept}, and checking the Task \
+                         branch out failed (uncommitted changes would be overwritten)"
+                    )),
+                    None => reset_required("checking the Task branch out failed"),
+                });
             }
         }
         tracing::info!(
@@ -457,16 +507,76 @@ impl<'a> WorkspaceManager<'a> {
             branch = %workspace.branch,
             previous_head = head,
             purpose = ?purpose,
+            repair = ?repair,
+            rescued_ref = rescued_ref.as_deref().unwrap_or(""),
             "worktree put back on its Task branch"
         );
         let workspace = clear_workspace_cleanup_after(self.db, workspace).await?;
-        Ok(valid(
-            workspace,
-            resolved,
-            path,
-            Repair::CheckedOutTaskBranch,
-            true,
-        ))
+        let mut valid = valid(workspace, resolved, path, repair, true);
+        valid.rescued_ref = rescued_ref;
+        Ok(valid)
+    }
+
+    /// Keep the commits of a diverged HEAD reachable and say so on the Task.
+    /// One ref and one comment per rescued commit, however often the
+    /// workspace is checked while it stays in that state. `None` when the
+    /// ref could not be written; nothing is checked out then.
+    #[allow(clippy::too_many_arguments)]
+    async fn rescue_off_branch_commits(
+        &self,
+        task: &Task,
+        workspace: &Workspace,
+        path: &Path,
+        head: &str,
+        head_sha: &str,
+        ahead: u64,
+        behind: u64,
+    ) -> Option<String> {
+        let namespace = format!("{RESCUED_REF_NAMESPACE}/{}", workspace.task_id);
+        let kept = match existing_ref_at(path, &namespace, head_sha).await {
+            Some(kept) => kept,
+            None => {
+                let kept = format!(
+                    "{namespace}/{}",
+                    chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
+                );
+                if !git_succeeds(path, &["update-ref", &kept, head_sha]).await {
+                    return None;
+                }
+                kept
+            }
+        };
+        let now = db::now_rfc3339();
+        let created = db::TaskCommentRepo::create_comment(
+            self.db,
+            db::CreateTaskComment {
+                id: db::new_uuid_v4(),
+                task_id: task.id.clone(),
+                author_type: db::CommentAuthorType::System,
+                author_id: None,
+                author_name: "Forge".to_owned(),
+                content: format!(
+                    "The Task worktree was on {head} with {ahead} commit(s) that are not on Task \
+                     branch '{branch}', which has {behind} commit(s) they do not build on. Forge \
+                     kept those commits under `{kept}` ({head_sha}) and put the worktree back on \
+                     the Task branch. They are not part of what is reviewed and delivered; bring \
+                     them in with `git cherry-pick` or `git merge {kept}` if they belong to this \
+                     Task.",
+                    branch = workspace.branch
+                ),
+                execution_id: None,
+                role: None,
+                worklog_kind: None,
+                idempotency_key: Some(format!("workspace-rescued:{}:{head_sha}", task.id)),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await;
+        if let Err(error) = created {
+            tracing::warn!(task_id = %task.id, %error, "failed to record rescued worktree commits");
+        }
+        Some(kept)
     }
 
     /// Daemon placements keep the describe / prepare contract: Forge never
@@ -506,6 +616,7 @@ impl<'a> WorkspaceManager<'a> {
                 path: None,
                 repair: Repair::None,
                 on_task_branch: true,
+                rescued_ref: None,
             });
         }
         if !purpose.repairs() {
@@ -549,6 +660,7 @@ impl<'a> WorkspaceManager<'a> {
             path: None,
             repair: Repair::Recovered,
             on_task_branch: true,
+            rescued_ref: None,
         })
     }
 
@@ -732,6 +844,7 @@ fn valid(
         path: Some(path),
         repair,
         on_task_branch,
+        rescued_ref: None,
     }
 }
 
@@ -795,15 +908,56 @@ async fn worktree_identity(path: &Path) -> Result<Option<WorktreeIdentity>, Work
     }))
 }
 
-/// Commits HEAD has that `full_ref` lacks, and commits `full_ref` has that
-/// HEAD lacks. `None` when Git cannot compare them.
-async fn divergence(path: &Path, full_ref: &str) -> Option<(u64, u64)> {
+/// Refs that keep commits Forge moved a worktree's HEAD away from.
+pub(crate) const RESCUED_REF_NAMESPACE: &str = "refs/forge/rescued";
+
+async fn git_succeeds(path: &Path, args: &[&str]) -> bool {
+    match git_at(path).args(args).output().await {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            tracing::warn!(
+                path = %path.display(),
+                ?args,
+                error = %String::from_utf8_lossy(&output.stderr).trim(),
+                "git command failed while repairing a workspace"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), ?args, %error, "git could not be started");
+            false
+        }
+    }
+}
+
+/// The commits HEAD and `full_ref` name. `None` when Git cannot resolve them.
+async fn resolve_commits(path: &Path, full_ref: &str) -> Option<(String, String)> {
+    let output = git_at(path)
+        .args([
+            "rev-parse",
+            "HEAD^{commit}",
+            &format!("{full_ref}^{{commit}}"),
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    Some((lines.next()?.to_owned(), lines.next()?.to_owned()))
+}
+
+/// Commits `left` has that `right` lacks, and commits `right` has that
+/// `left` lacks. `None` when Git cannot compare them.
+async fn divergence(path: &Path, left: &str, right: &str) -> Option<(u64, u64)> {
     let output = git_at(path)
         .args([
             "rev-list",
             "--left-right",
             "--count",
-            &format!("HEAD...{full_ref}"),
+            &format!("{left}...{right}"),
         ])
         .output()
         .await
@@ -814,6 +968,24 @@ async fn divergence(path: &Path, full_ref: &str) -> Option<(u64, u64)> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut counts = stdout.split_whitespace();
     Some((counts.next()?.parse().ok()?, counts.next()?.parse().ok()?))
+}
+
+/// A ref under `namespace` that already points at `sha`.
+async fn existing_ref_at(path: &Path, namespace: &str, sha: &str) -> Option<String> {
+    let output = git_at(path)
+        .args([
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "--points-at",
+            sha,
+            namespace,
+        ])
+        .output()
+        .await
+        .ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.success() && !name.is_empty()).then_some(name)
 }
 
 async fn ref_exists(path: &Path, full_ref: &str) -> bool {
