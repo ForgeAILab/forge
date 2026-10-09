@@ -613,7 +613,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         if let Some(expected_version) = expected_version {
             if expected_version != task.version {
                 return Err(ServiceError::Db(db::DbError::TaskVersionConflict {
@@ -622,6 +621,13 @@ impl TaskService {
                 }));
             }
         }
+        // Cancel is the owner's exit and wins over a plan artifact that is
+        // still settling: the claim is abandoned (prior plan restored,
+        // staged files removed) and the cancel continues at the version that
+        // abandoning produced.
+        let task = self.abandon_plan_publication_for_cancel(task).await?;
+        let expected_version = expected_version.map(|_| task.version);
+        super::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -695,6 +701,38 @@ impl TaskService {
             );
         }
         Ok(task)
+    }
+
+    /// Give up a completed execution's unsettled plan publication so the
+    /// Task can be cancelled. A plan that cannot be restored does not keep
+    /// the Task alive: the claim is released anyway and the cancel proceeds.
+    pub(crate) async fn abandon_plan_publication_for_cancel(&self, task: Task) -> Result<Task> {
+        let Some(execution_id) = super::execution::active_plan_publication_claim_owner(&task)?
+        else {
+            return Ok(task);
+        };
+        if let Err(error) = self
+            .abandon_plan_publication_claim(&task, &execution_id)
+            .await
+        {
+            tracing::warn!(task_id = %task.id, %execution_id, %error, "plan publication could not be rolled back for a cancel; releasing its claim");
+            let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            if super::execution::active_plan_publication_claim_owner(&current)?.as_deref()
+                == Some(execution_id.as_str())
+            {
+                super::execution::release_plan_publication_for_execution_id(
+                    &self.db,
+                    &current,
+                    &execution_id,
+                )
+                .await?;
+            }
+        }
+        TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id))
     }
 
     async fn repair_cancelled_coordination_children(

@@ -133,6 +133,12 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
     if workflow.state_kind(&subtask.status) == Some(api_types::StateKind::Terminal) {
         return Ok(());
     }
+    // The root's cancel wins over a subtask's settling plan artifact.
+    let subtask = ctx
+        .task_service
+        .abandon_plan_publication_for_cancel(subtask)
+        .await
+        .map_err(|error| error.to_string())?;
     crate::task_service::execution::ensure_plan_publication_transition_authority(&subtask, None)
         .map_err(|error| error.to_string())?;
     let target_state = workflow

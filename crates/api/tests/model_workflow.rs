@@ -2201,25 +2201,17 @@ async fn a_coordination_root_that_fails_aggregate_review_can_recover() {
     .await;
 }
 
-/// OPEN finding from a random run with `CreateChild` generated; minimized
-/// below. `cancel` is offered for a coordination root and refused with
-/// `400 validation_error`: "the Task is settling a completed execution's plan
-/// artifact; retry after publication". An offered action must be accepted
-/// (invariant (b)).
-///
-/// Root cause (read, not fixed): the refusal is
+/// Found by a random run with `CreateChild` generated and fixed with it;
+/// minimized below. `cancel` was offered for a coordination root and refused
+/// with `400 validation_error`: "the Task is settling a completed execution's
+/// plan artifact; retry after publication". The refusal was
 /// `ensure_plan_publication_transition_authority`
-/// (`services/src/task_service/execution.rs:277`), reached when the root's
-/// cancel cascades to its subtask
-/// (`services/src/workflow/actions/common.rs:136`; the engine entry
-/// `services/src/workflow/engine/mod.rs:807` applies the same guard), while
-/// the `cancel` offer (`services/src/task_actions.rs`) never consults a
-/// plan-publication claim. The subtask's claim outlives quiescence here, so
-/// waiting does not clear it. Cancellation has to abandon the claim
-/// (`abandon_brokered_plan_authority`) instead of being refused by it; that
-/// touches plan publication and is not a local change.
+/// (`services/src/task_service/execution.rs`) in `cancel_task_with_options`
+/// and in the subtask cancel cascade
+/// (`services/src/workflow/actions/common.rs`), and the claim outlived
+/// quiescence, so waiting did not clear it. Cancel now abandons the claim
+/// (the prior plan is restored, staged files are removed) and proceeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open: an offered cancel on a coordination root is refused while a plan artifact settles"]
 async fn an_offered_cancel_is_accepted_while_a_plan_artifact_settles() {
     use Action::{Create, CreateChild, Finish, Offer, Verdict};
     run_cases(vec![(

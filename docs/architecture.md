@@ -5226,7 +5226,13 @@ queued behind a `dispatch_refusal` wait until the dependency finishes or its
 link is removed. The displaced condition records the state it was taken in and
 is restored only while the Task is still in that state. A queued action always offers Hold alongside cancel,
 even when a newer condition appears. Restart follows the resolver's explicit set
-of resettable condition kinds. Pause refusals preserve the typed wait cause and
+of resettable condition kinds. Cancel wins over a settling plan
+artifact: when the Task (or a subtask the root's cancel cascades to) holds a
+`plan_publication_claim`, the cancel abandons it first (prior plan restored,
+staged private files removed, claim released; a failed restore is logged and
+the claim is released anyway) and continues at the Task version that produced,
+so an offered `cancel` is never refused with "settling a completed execution's
+plan artifact". Pause refusals preserve the typed wait cause and
 turn retry scope across REST, MCP, and native tools.
 
 ### Root Tasks and ordered subtasks

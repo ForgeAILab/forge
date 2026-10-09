@@ -1737,6 +1737,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **An offered `cancel` is no longer refused while a plan artifact
+  settles.** Cancelling a Task (or a coordination root whose subtask was in
+  that state) whose finished run had not yet published its plan answered
+  `400 validation_error` ("the Task is settling a completed execution's plan
+  artifact; retry after publication") although `cancel` was on offer, and in
+  some states the publication never settled, so the Task could not be
+  cancelled at all. Cancel now abandons the pending publication (the previous
+  plan is restored and the staged files are removed) and goes through. Found
+  by the model-based workflow test.
+
 - **A Task released while its Agent is paused runs again when the Agent
   resumes.** Holding a running Task stops its run. Releasing the hold while
   the Agent (or the Project) was paused cleared the hold but left the stopped
