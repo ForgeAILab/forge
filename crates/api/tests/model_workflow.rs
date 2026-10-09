@@ -398,8 +398,8 @@ struct World {
     agent_paused: bool,
     /// Random runs step around the open findings pinned by the ignored
     /// tests at the end of this file, so they keep finding other things:
-    /// they do not cancel a Task another unsettled Task depends on, and do
-    /// not fail a run that was in flight across a Project pause or resume.
+    /// they do not fail a run that was in flight across a Project pause or
+    /// resume.
     avoid_open_findings: bool,
     /// Executions that were running when the Project was last paused or
     /// resumed (see `a_run_that_fails_after_a_project_pause_is_retried`).
@@ -827,18 +827,6 @@ impl World {
         Ok(moved)
     }
 
-    async fn has_open_dependants(&self, index: usize) -> Result<bool, String> {
-        let open: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM task_dependency d JOIN task t ON t.id = d.task_id
-             WHERE d.depends_on_id = ? AND t.status NOT IN ('done', 'cancelled')",
-        )
-        .bind(&self.tasks[index])
-        .fetch_one(&self.live().pool)
-        .await
-        .map_err(|error| error.to_string())?;
-        Ok(open > 0)
-    }
-
     /// The first Task at or after `from` (wrapping) for which `wanted` holds.
     fn first_from(&self, from: usize, wanted: impl Fn(usize) -> bool) -> Option<usize> {
         let count = self.tasks.len();
@@ -949,11 +937,7 @@ impl World {
                 let Some(task) = pick(*task) else {
                     return Ok("skipped".to_owned());
                 };
-                let (version, mut offers) = self.offers(task).await?;
-                if self.avoid_open_findings {
-                    let depended_on = self.has_open_dependants(task).await?;
-                    offers.retain(|offer| !(depended_on && offer["action"]["verb"] == "cancel"));
-                }
+                let (version, offers) = self.offers(task).await?;
                 if offers.is_empty() {
                     return Ok("no offers".to_owned());
                 }
@@ -968,12 +952,6 @@ impl World {
                 let Some(task) = pick(*task) else {
                     return Ok("skipped".to_owned());
                 };
-                if self.avoid_open_findings
-                    && verb == "cancel"
-                    && self.has_open_dependants(task).await?
-                {
-                    return Ok("skipped".to_owned());
-                }
                 let (version, offers) = self.offers(task).await?;
                 match offers.iter().find(|offer| offer["action"]["verb"] == verb) {
                     Some(offer) => self.apply_offer(task, version, offer).await,
@@ -1936,17 +1914,14 @@ async fn start_on_a_queued_task_does_not_park_it_as_failed() {
     }
 }
 
-/// OPEN STALL found by this model. A held Task loses its hold when one of
-/// its dependencies is cancelled: `block_cancelled_dependencies`
-/// (`services/src/task_service/dependencies.rs`) replaces the hold with the
-/// `dependency_cancelled` blocker while the run the hold stopped stays
-/// stopped. Removing the cancelled dependency (that blocker's designed exit)
-/// then leaves the Task in `in_progress` with a `clear` condition, no live
-/// run, no queued step and no park: nothing resumes it and `release` is no
-/// longer offered. `retry` is offered and does recover it, so it is a silent
-/// stall rather than a dead end.
+/// Found by this model, fixed. A held Task used to lose its hold when one of
+/// its dependencies was cancelled: the `dependency_cancelled` blocker
+/// (`services/src/task_service/dependencies.rs`) overwrote it, and removing
+/// the cancelled dependency then left the Task in `in_progress` with a
+/// `clear` condition, no run and no park. The blocker now carries the
+/// condition it displaces and removing the dependency restores it: the Task
+/// is held again and offers `release`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open stall: a held Task whose dependency is cancelled is left idle with a clear condition"]
 async fn a_held_task_survives_a_cancelled_dependency() {
     use Action::{Cancel, Create, Depend, Take};
     run_cases(vec![(
@@ -1962,20 +1937,16 @@ async fn a_held_task_survives_a_cancelled_dependency() {
     .await;
 }
 
-/// OPEN WEDGE found by a random run of this model; minimized below.
-/// A dependency is cancelled while its dependant is already parked for
-/// another reason (here: an owner approval with no implementation
-/// candidate). The typed `dependency_cancelled` blocker, whose exit is
-/// removing the dependency, is not what the Task ends up with: every owner
-/// action afterwards (`send_back`, `retry`, `restart`) is accepted, refused
-/// by the dependency gate as `ServiceError::DependencyGate`
-/// (`services/src/lib.rs`), and restored by
-/// `settle_queued_task_action_refusal`
-/// (`services/src/task_service/execution/recovery.rs`) as an untyped
-/// `recovery_required: "dependency gate"` park that names no dependency and
-/// offers the same actions again.
+/// Found by a random run of this model, fixed; minimized below. A dependency
+/// is cancelled while its dependant is already parked for another reason
+/// (here: an owner approval with no implementation candidate). The typed
+/// `dependency_cancelled` blocker used to be skipped, so `send_back`, `retry`
+/// and `restart` stayed on offer, each accepted and then refused by the
+/// dependency gate into an untyped `recovery_required: "dependency gate"`
+/// park. The Task now shows the typed blocker naming the dependency, offers
+/// cancellation only, and gets its original park back when the dependency is
+/// removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open wedge: a cancelled dependency under an already parked Task becomes an untyped park whose offers loop"]
 async fn a_parked_task_names_its_cancelled_dependency() {
     use Action::{Cancel, Create, Depend, Take};
     run_cases(vec![(

@@ -1672,6 +1672,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A cancelled dependency no longer discards what its dependant was waiting
+  on.** The `dependency_cancelled` blocker used to overwrite a hold, and to
+  be skipped when the dependant was already parked for another reason: a
+  held Task ended up idle with a clear condition once the dependency was
+  removed, and a parked Task kept offering `retry`, `send_back` and
+  `restart`, each accepted and then refused as an untyped
+  `recovery_required: "dependency gate"` park that named no dependency. The
+  blocker now always replaces the current condition, names every cancelled
+  dependency, offers cancellation only, and keeps the displaced condition
+  (in `blocked.details.superseded`). Removing the last cancelled dependency
+  puts that condition back: a held Task is held again and offers `release`,
+  a parked Task offers its recovery again, and a Task that was waiting on
+  nothing is dispatched. A Task action that was accepted before the
+  dependency was cancelled ends in the same typed blocker. Found by the
+  model-based workflow test.
 - Adding a Task dependency that already exists is a no-op. It used to fail
   the unique constraint and answer `500 internal_error`. Found by the new
   model-based workflow test.

@@ -513,6 +513,24 @@ impl TaskService {
             });
         if let (Some(original), Some(raw)) = (original, raw) {
             if original.get("id") == raw.get("id") {
+                // A cancelled dependency is its own typed park, with its own
+                // exit: it carries the condition this action had cleared, in
+                // place of an untyped refusal that offers the action again.
+                let dependency_gate = match error {
+                    ServiceError::DependencyGate => true,
+                    ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",
+                    _ => false,
+                };
+                if dependency_gate && db::task_writer::owns_task(&current.id) {
+                    let unsatisfied =
+                        TaskDependencyRepo::unsatisfied_dependencies(&*self.db, &current.id)
+                            .await?;
+                    let cancelled = self
+                        .cancelled_dependency_ids(&current, &unsatisfied)
+                        .await?;
+                    self.block_cancelled_dependencies(&current, &cancelled)
+                        .await?;
+                }
                 self.restore_failed_task_action(&current, &raw, error)
                     .await?;
             }

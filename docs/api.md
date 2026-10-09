@@ -996,8 +996,12 @@ Project's own records even when `capability_class` is read-only. Optional
 `depends_on_task_ids` must name accepted, non-cancelled Tasks in the same
 Project and every prerequisite must reach `done` before dispatch.
 If a prerequisite is later cancelled, Forge writes a typed durable blocker on
-each unfinished dependent instead of repeatedly rejecting dispatch. Removing
-the cancelled link clears that blocker once no cancelled prerequisites remain.
+each unfinished dependent instead of repeatedly rejecting dispatch. The blocker
+replaces the dependent's current condition (a hold or another park included),
+offers cancellation only, and keeps the displaced condition in
+`blocked.details.superseded`. Removing the cancelled link restores that
+condition, or clears the blocker when there was none, once no cancelled
+prerequisites remain.
 `task_type`, when present, is the same closed enum as normal
 Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
 values are rejected before the command is admitted. Terminal Task delivery,
@@ -1043,7 +1047,7 @@ prerequisite edge between two Tasks in the bound Project. Its closed payload is
 Forge derives the Project from the authenticated binding and rejects a Task
 from another Project in either position. Adding refuses a cancelled
 prerequisite and a self-edge; removing the last cancelled prerequisite clears
-the dependency block it caused.
+the dependency block it caused and restores the condition that block displaced.
 
 Without this, `depends_on_task_ids` was settable only at `task.propose` and an
 Agent re-planning a graph had to cancel and recreate every downstream Task —

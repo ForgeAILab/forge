@@ -5217,7 +5217,11 @@ approval requires an awaiting-human Review and no condition. Re-running review r
 a completed implementation candidate; entry-check retries and budget resets remain
 independent controls. Dependency cancellation uses the writer's
 `workflow_guard_rejected` annotation with `blocking_reason:"dependency_cancelled"`
-and offers cancellation only. A queued action always offers Hold alongside cancel,
+and offers cancellation only. It replaces whatever condition the Task had (a
+hold, a failure park, the condition a queued action saved) and keeps it in
+`blocked.details.superseded`; a queued action refused by the dependency gate
+for a cancelled dependency settles into the same blocker, not an untyped
+`recovery_required` park. A queued action always offers Hold alongside cancel,
 even when a newer condition appears. Restart follows the resolver's explicit set
 of resettable condition kinds. Pause refusals preserve the typed wait cause and
 turn retry scope across REST, MCP, and native tools.
@@ -5800,9 +5804,13 @@ creating an execution.
 
 Dependency cancellation is a durable state, not a transient guard result. When
 a prerequisite reaches the workflow's cancellation state, Forge projects a
-typed blocker onto every unfinished dependent. New links to cancelled Tasks are
-rejected, and removing the last cancelled prerequisite clears the matching
-blocker so scheduling can resume.
+typed blocker onto every unfinished dependent, whatever that dependent was
+waiting on: the blocker names every cancelled prerequisite and carries the
+condition it displaced. New links to cancelled Tasks are rejected. Removing a
+cancelled prerequisite while another remains renames the blocker; removing the
+last one restores the displaced condition (a held Task is held again, a parked
+Task is parked for its original reason with its original offers) or, when there
+was none, clears the blocker so scheduling resumes.
 
 Cancellation is implicit from any non-terminal state to
 `workflow.cancellation_state` (or terminal `"cancelled"` if unset), even
