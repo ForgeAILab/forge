@@ -5183,8 +5183,11 @@ not call any of it. It adds what the worker needs from an owner.
   generation, when the queue's fence is dropped, or 7 days after the
   acknowledgement for a queue that never claims again (in the last two cases
   its key gets a 7-day cancellation tombstone, so a late duplicate is refused
-  and not run). Acknowledged receipts do not count against the pending-entry
-  bound. Fences are dropped when the server's `live_queue_ids` no longer lists
+  and not run). Until it is deleted an acknowledged receipt still counts
+  against the journal's 1024-record bound, so a daemon that holds
+  acknowledged receipts of about a thousand idle queues refuses new effects
+  until the 7 days pass (known limit; stage D1d must lift it). Fences are
+  dropped when the server's `live_queue_ids` no longer lists
   their queue (the announced queue always stays), and as the least recently
   recorded past 1024 fences. A fence is never dropped, by either rule, while
   its queue has a journal entry the server has not acknowledged: dropping it

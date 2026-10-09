@@ -1438,7 +1438,7 @@ mod tests {
         let request = api_types::WorkspaceIntegrationRequest {
             fence: api_types::IntegrationOwnerFence {
                 queue_id: queue.into(),
-                attempt_id: "attempt-1".into(),
+                attempt_id: format!("attempt-{queue}"),
                 generation,
                 lease_owner: "queue-worker".into(),
                 target_owner: serde_json::json!({"owner_kind":"daemon"}),
@@ -1516,12 +1516,13 @@ mod tests {
     }
 
     /// A long-lived daemon serving many queues that each merged once and
-    /// went idle: the acknowledged receipts never block new work, and the
-    /// age rule removes them, so the journal does not grow without bound.
+    /// went idle: the age rule removes their acknowledged receipts, so the
+    /// journal does not grow without bound. Until then each receipt still
+    /// counts against the journal's record bound.
     #[test]
-    fn idle_queue_receipts_never_block_new_work_and_expire_by_age() {
+    fn idle_queue_receipts_expire_by_age() {
         let dir = tempfile::tempdir().unwrap();
-        let store = DaemonJournal::with_limits(dir.path(), 4, MAX_JOURNAL_BYTES);
+        let store = DaemonJournal::with_limits(dir.path(), 301, MAX_JOURNAL_BYTES);
         store.initialize().unwrap();
         let queues = 300;
         let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
@@ -1547,25 +1548,37 @@ mod tests {
                     .unwrap();
             }
         }
-        // 300 acknowledged receipts and a pending bound of 4: still room.
         assert!(store.pending().unwrap().is_empty());
         store
             .retain_entry(&JournalEntry::Operation {
                 operation: attempt_receipt_on("queue-new", 1),
             })
             .unwrap();
+        // Acknowledged receipts count against the record bound until pruned.
+        assert!(store
+            .retain_entry(&JournalEntry::Operation {
+                operation: attempt_receipt_on("queue-over", 1),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("record bound"));
         let removed = store
             .prune_acknowledged_attempts(|_, acknowledged_for| acknowledged_for > week)
             .unwrap();
         assert_eq!(removed.len(), 200);
-        let restarted = DaemonJournal::with_limits(dir.path(), 4, MAX_JOURNAL_BYTES);
+        store
+            .retain_entry(&JournalEntry::Operation {
+                operation: attempt_receipt_on("queue-over", 1),
+            })
+            .unwrap();
+        let restarted = DaemonJournal::with_limits(dir.path(), 301, MAX_JOURNAL_BYTES);
         restarted.initialize().unwrap();
         let entries = fs::read_dir(restarted.directory())
             .unwrap()
             .filter(|entry| is_entry_path(&entry.as_ref().unwrap().path()))
             .count();
-        assert_eq!(entries, 101, "100 recent receipts and the pending intent");
-        assert_eq!(restarted.pending().unwrap().len(), 1);
+        assert_eq!(entries, 102, "100 recent receipts and two pending intents");
+        assert_eq!(restarted.pending().unwrap().len(), 2);
     }
 
     #[test]
