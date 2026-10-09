@@ -4827,7 +4827,7 @@ Critical and uncertain states cannot be cancelled merely by a timeout.
 |---|---|
 | `queued` | `path_wait`, `validating`, `parked`, `cancelled`, `superseded` |
 | `path_wait` | `queued`, `validating`, `parked`, `cancelled`, `superseded` |
-| `validating` | `applied`, `needs_review`, `parked`, `rebasing`, `cancelled`, `superseded` |
+| `validating` | `applied`, `needs_review`, `parked`, `rebasing`, `awaiting_task_step`, `cancelled`, `superseded` |
 | `rebasing` | `checking`, `ejected`, `parked`, `reconciling`, `cancelled` |
 | `checking` | `awaiting_task_step`, `ejected`, `parked`, `cancelled` |
 | `awaiting_task_step` | `ready_ff`, `needs_review`, `ejected`, `parked`, `cancelled` |
@@ -5201,6 +5201,62 @@ Known limits before activation:
   policy must preserve replay fencing when the future worker starts using them.
 - The existing local Review/Project authority guard remains separate from queue
   owner serialization.
+
+### Integration activation storage (3.2 stage D, part 1a; not called until D2)
+
+Migration `V202610091022__integration_activation.sql` and
+`db::integration_queue::activation` add the storage the queue worker will use.
+Nothing in production calls it until D2: `merging` still runs today's merge
+hooks, and existing rows read both new columns as `NULL`.
+
+New `integration_attempt` columns:
+
+| Column | Type / constraint | Meaning |
+|---|---|---|
+| `cancel_requested_at` | `TEXT` | Set once by `request_integration_cancel`. An ordinary attempt transition can neither set nor clear it. |
+| `phase_timings_json` | `TEXT`, JSON object, at most 16384 bytes | The head's timings (`IntegrationPhaseTimings`), written only by `record_integration_head_timings`. |
+
+`IntegrationPhaseTimings` is cumulative over an attempt's rounds: `rounds`,
+`queued_ms`, `validate_ms`, `transfer_ms`, `rebase_ms`, `check` (either
+`ran {slot_wait_ms, run_ms}` or `skipped {reason}` with reason
+`target_unchanged` or `no_checks_configured`), `step_wait_ms`, `ff_ms`,
+`head_total_ms` and `lost_races` (at most 32 entries of `{kind, round, at}`,
+kind `queue_member` or `external`). Only an `external` lost race spends the
+"target moved" allowance; `external_target_moves()` counts them.
+
+New indexes, all partial: `integration_attempt_timed (state, id)` for current
+attempts with an `available_at`; `integration_attempt_cancel_requested (id)`
+for current attempts with a cancel request; `integration_attempt_prunable
+(completed_at, id)` for finished attempts that still hold receipts or
+observations. No trigger is added.
+
+Operations (trait `IntegrationActivationRepo`; all not called until D2). Every
+write compares the row's `revision` and bumps it, so a caller holding an older
+copy gets `VersionConflict` and must re-read:
+
+| Operation | Rule |
+|---|---|
+| `request_integration_cancel` | Legal exactly where the attempt graph can reach `cancelled`: `queued`, `path_wait`, `validating`, `rebasing`, `checking`, `awaiting_task_step`, `ready_ff`, `ejected`, `needs_review`, `parked`. Refused (`InvalidTransition`) in `ff_inflight`, `reconciling`, `applied`, `quarantined` and terminal states. It only sets the flag; the worker performs the transition. Repeating it keeps the first time. A queued member carrying the flag is never selected as head by a claim, so a cancel and a claim racing for the same member have exactly one winner. |
+| `record_integration_head_timings` | Head of its queue only. Replaces the whole document. |
+| `start_integration_round` | The live lease holder, at its current fence generation, takes a new generation and lease for the same head, with the claim's takeover rules. One generation admits one receipt per effect kind, so another rebase or fast-forward of the same head needs a new round. |
+| `claimable_integration_queues` | Unleased queues a worker must act on: open or suspended with a due queued member (not asked to cancel) or a reserved head, and every quarantined queue. Keyset by queue id, `LIMIT` at most 500. |
+| `expired_integration_heads` | Queues whose lease ended at or before the given time. Keyset by queue id. |
+| `due_parked_integration_attempts` | Current `parked` attempts whose `available_at` is due. A parked attempt without `available_at` waits for its owner. Keyset by attempt id. |
+| `cancel_requested_integration_attempts` | Current attempts carrying a cancel request. Keyset by attempt id. |
+| `quarantine_integration_queue` | Lease holder only; needs a head that is `ff_inflight`, `reconciling`, `quarantined` or has an unsettled effect. |
+| `reopen_integration_queue` | The only exit from `quarantined`. Needs a witness that is re-verified against stored rows: `settled_effect` names a succeeded or failed (never uncertain) receipt of this queue, and no current member may still have an intent or a running / uncertain operation. An owner's reconnect lookup and a machine or location removal settlement both produce such a receipt; a timeout does not. With a target that is not ready the queue becomes `suspended` instead of `open`. A `suspended` queue re-opens with `target_ready` naming the repo's one ready default checkout and its version (a claim also still re-opens it). |
+| `prune_integration_evidence` | Empties `effect_receipts_json`, `operation_receipts_json` and `observations_json` of at most `limit` attempts that finished before the cutoff. Never touches a current attempt, an attempt with an intent, a pending / running / uncertain operation or an uncertain receipt, an attempt whose Task has a live successor, or any attempt of a quarantined queue. Rows, SHAs and outcomes stay. A settled intent needs no pruning: its receipt already cleared it. |
+| `integration_queue_ages` | Count and oldest age for queued members, heads, expired heads, parked members, pending cancel requests and unsettled effects. |
+| `integration_timing_samples` | Timings of recently completed attempts, newest first, for percentiles. |
+
+Time comparisons in the sweeps and in pruning use the instant, not the text, so
+a timestamp written with an offset is handled.
+
+Queue states are data too (`INTEGRATION_QUEUE_TRANSITIONS`): `open` →
+`suspended`, `quarantined`, `closed`; `suspended` → `open`, `closed`;
+`quarantined` → `open`, `suspended`, `closed`; `closed` is terminal. The
+attempt graph gains one edge, `validating` → `awaiting_task_step`: with an
+unchanged target there is nothing to rebase or re-check.
 
 ### Task condition actions
 

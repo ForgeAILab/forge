@@ -673,6 +673,7 @@ async fn additive_migration_preserves_every_status_and_legacy_marker_then_replay
         if ![
             "V202610080123__integration_queue.sql",
             "V202610082317__integration_fencing.sql",
+            "V202610091022__integration_activation.sql",
         ]
         .contains(&file.file_name().to_str().unwrap())
         {
@@ -712,7 +713,7 @@ async fn additive_migration_preserves_every_status_and_legacy_marker_then_replay
             .fetch_one(&pool)
             .await
             .unwrap(),
-        migration_count + 2
+        migration_count + 3
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM integration_queue")
