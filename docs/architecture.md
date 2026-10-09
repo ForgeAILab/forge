@@ -6601,8 +6601,13 @@ read-only filtering. The existing persistence-free 3.2 `CheckRunInput` and
 `CheckCommandOutcome` moves verbatim to `api-types` so the effect and stored
 step evidence share one type; no second CI outcome representation is introduced.
 
-`CheckSpec` contains `schema_revision`, `purpose`, ordered `commands`,
-`whole_run_timeout_seconds` and `execution_policy`. Each `CheckCommandSpec`
+`CheckSpec` contains `schema_revision`, `scope`, ordered `commands`,
+`declares_cleanup`, `execution_policy`, and the evidence-only pair
+`configured_commands` / `blank_commands`. It has no purpose and no whole-run
+timeout: `CheckPurpose` only selects which bundle the builder assembles and is
+recorded on the consumer row, and the wall limit is recorded on the run row.
+`declares_cleanup` says whether the bundle has a cleanup step the runner must
+perform; no family configured today declares one. Each `CheckCommandSpec`
 contains `id`, exact `shell_text`, explicit `shell` (`bash -lc` today),
 `working_directory`, sorted `environment_keys`, `timeout_seconds` (`None` for
 unbounded legacy CI), `failure_policy`, `cacheability` and sorted
@@ -6618,7 +6623,7 @@ using `declared_controlled_inputs`.
 | Execution family | Characterized bundle, cwd, environment and timeout |
 |---|---|
 | Review-entry CI | Effective workflow/Project/Task CI in order; Task root; Project keys; no per-command limit; stop at first failure. |
-| Manual `ReviewRunner` CI | Same effective CI resolution and command semantics; separate `review_ci` purpose. |
+| Manual `ReviewRunner` CI | Same effective CI resolution and command semantics, hence the same spec and digest as review-entry CI; only the consumer's purpose (`review_ci`) differs. |
 | Conformance | Effective setup followed by CI-derived and requirement-linked checks, using the admitted governing context; Task root; Project keys; configured 1–14,400-second per-command limit, default 1800. Setup failure stops the bundle; required-check failure does not stop later checks. |
 | Blocking before-work | Selected event's blocking scripts only, original hook indices; Task root or existing lifecycle fallback; Project keys plus the eleven `FORGE_*` context keys; configured limit or legacy 30-second zero fallback; stop at failure. |
 | Other lifecycle / hook test | Selected script hooks; the asynchronous before-work path excludes blocking scripts; existing workspace/fallback cwd and context keys; same timeout fallback; continue between scripts. Plugins have no shell-check contract. Owner hook tests select an original hook index and bypass the asynchronous blocking-hook filter. |
@@ -6628,34 +6633,86 @@ using `declared_controlled_inputs`.
 | Agent-selected commands | No configured authoritative bundle exists. The builder returns an empty `agent_selected` spec; it does not manufacture reusable CI from arbitrary agent tool calls. |
 | Future queue-head CI | `queue_head_ci` can describe CI-only or conformance bundles. The caller must explicitly supply `QueueHeadCheckBundle`; there is no default and no execution. This leaves the later gating decision open. |
 
+**Run scope.** `CheckSpec.scope` says who may share one run of the bundle, and
+it is part of the digest. `check_family_scope` classifies every family:
+
+| Family | Scope | Why |
+|---|---|---|
+| Review-entry CI, manual review CI, queue-head CI (CI only), agent-selected | `commit` | The commands only read the commit. Every Task at that commit shares the run; no Task or workspace is in the identity. |
+| Conformance and queue-head conformance **without** setup steps | `commit` | Same: checks only. |
+| Conformance and queue-head conformance **with** setup steps | worktree | Setup steps prepare the worktree the checks then run in. |
+| Blocking before-work, other lifecycle scripts / hook test | worktree | The script acts on the Task's worktree (or is owed to the Task's event). |
+| Environment preflight | worktree | It judges the state of the Task's worktree, not the commit. |
+| Project/machine readiness, exported environment helpers | probe | Workspace-scoped when the probe runs in a workspace; otherwise `commit` (no Task exists; the machine is covered by the attestation). |
+
+A worktree-scoped spec carries `workspace { workspace_id, generation }`: the
+workspace ID and its `workspace_placement.generation`, the durable identity
+already used to fence workspace operations. Two Tasks at the same commit with
+the same before-work script therefore get two runs, and a re-placed worktree
+(next generation) is a new target. A worktree-scoped family that has no
+worktree (lifecycle fallback cwd) carries `task { task_id }` instead, so it
+still runs once for its own Task; with neither a workspace nor a Task the
+builder refuses. The repository refuses a request whose `workspace_id` or
+`task_id` differs from the one its scope names; it does not yet compare the
+generation with the placement row (stage C rechecks authority on every hit).
+
+**Blank steps.** Production runs a blank or whitespace-only CI step and it
+passes. The builder never refuses one: it drops the step, because the outcome
+is identical and nothing runs. `configured_commands` keeps the configured step
+count and `blank_commands` the zero-based configured positions that were
+dropped, so evidence can still say "step 3 of 5 was blank". CI command IDs
+number the steps that run (`ci:0`, `ci:1`, ...), and the blank-step record is
+excluded from the digest, so a list with blanks has the identity of the same
+list without them and an all-blank list is exactly the empty-steps auto-pass.
+Blank hook and environment-check commands are dropped the same way.
+
 Characterization tests pin each configured family's command order, IDs, cwd,
 explicit environment keys and per-command limits. Existing CI primitive tests
 also compare the built spec with the actual commands yielded by `CheckRun`.
-The whole-run field does not change those per-command limits in this stage.
+The whole-run wall limit is not in the spec and does not change those
+per-command limits in this stage.
 
 **Execution digest.** `CheckDigestInput::encoding` validates the input, then
-produces compact UTF-8 JSON in a `forge.check-execution/1` schema envelope.
+produces compact UTF-8 JSON in a `forge.check-execution/2` schema envelope
+(spec revision 2; stage A's `/1` was never deployed, so no stored digest needs
+converting).
 Object keys are recursively sorted lexically, arrays preserve order, and no
 Unicode normalization or command whitespace normalization is applied. SHA-256
 of those bytes, lowercase hex, is the digest. The fixture under
 `crates/api-types/src/check_spec/fixtures/` pins the input, exact encoding and
 hash; a key-permutation test pins invariance, and a test that changes one typed
-field at a time (every spec and command field, each environment value kind, the
-attestation and the revision number) pins invalidation.
+field at a time (every spec and command field, each scope kind and workspace
+ID/generation, each environment value kind, the attestation and the revision
+number) pins invalidation. That test destructures the spec, command and digest
+input exhaustively, so a new field does not compile until it is listed as
+semantic or as not semantic.
 
 Included:
 
-- the complete spec: command order, IDs, shell text and shell semantics, cwd
-  rule, environment key names, timeout and stop/continue policy, cacheability,
-  requirement links, purpose, schema revision and execution-policy revision;
+- the spec's semantic fields: command order, IDs, shell text and shell
+  semantics, cwd rule, environment key names, per-command timeout and
+  stop/continue policy, cacheability, requirement links, whether a cleanup step
+  is declared, schema revision and execution-policy revision;
+- the run scope: `commit`, or the workspace ID and generation, or the Task ID
+  (see the classification above);
 - each declared key's classified identity: a controlled non-secret value, an
   opaque owner-maintained secret revision, an explicit removal, or a `volatile`
   marker (never the per-run value);
-- the audited execution revision **number** (nonzero requires an audit ref);
-- attested execution-input digest, or the distinct `not_attested` value.
+- the audited execution revision **number** (nonzero requires an audit ref), so
+  a forced rerun never reuses or joins the previous execution;
+- attested execution-input digest, or the distinct `not_attested` value, so a
+  result never crosses machines or environments.
 
 Excluded:
 
+- **purpose** (entry CI, review CI, queue-head CI, ...): same commands, same
+  commit, same environment attestation and same execution revision are one
+  run, whoever asks. Purpose is a column of `check_consumer`;
+- **the whole-run wall timeout**: it is a server setting, recorded on the run
+  row as `applied_timeout_seconds`. Changing the setting neither splits an
+  identity nor invalidates a reusable result, and a run that ended by timeout
+  is never reusable, so no stale timeout verdict outlives a raised setting;
+- the blank-step record (`configured_commands`, `blank_commands`);
 - secret bytes and public hashes of secret bytes; secret changes use opaque
   private revisions rather than exposing a low-entropy secret hash;
 - volatile values such as run/operation IDs, timestamps, lease values, output,
@@ -6682,7 +6739,10 @@ or mutable dependencies require `uncacheable`; attestation cannot turn such a
 spec into a reusable check.
 
 **Tables.** `V202610080851__check_runs.sql` is additive, has no triggers or
-legacy DML, and preserves existing data. Only fields read/written by the passive
+legacy DML, and preserves existing data. `V202610082320__check_run_identity.sql`
+adds `check_run.applied_timeout_seconds` and `check_consumer.purpose`, and
+rebuilds `check_result` to change its certification CHECK (SQLite cannot alter
+one), carrying every row and every consumer-to-result link. Only fields read/written by the passive
 repositories, or required by constraints/indexes, are included. All JSON limits
 are UTF-8 bytes, enforced in code and with SQLite BLOB-length CHECKs.
 
@@ -6700,6 +6760,7 @@ are UTF-8 bytes, enforced in code and with SQLite BLOB-length CHECKs.
 | `operation_id` | NOT NULL UNIQUE application UUID, allocated before claim and preserved on takeover. |
 | `workspace_id` | Optional workspace FK, ON DELETE SET NULL. |
 | `machine_id` | Optional physical-owner daemon FK, ON DELETE SET NULL. No capacity admission occurs. |
+| `applied_timeout_seconds` | Optional positive integer: the whole-run wall limit this run executes under, taken from the request that scheduled it. Later requests that join or reuse never change it. The runner must apply this value, not the setting current at execution. |
 | `lease_owner`, `lease_until` | Optional text, both null or both populated; expiry comparisons use SQLite julianday. |
 | `lease_generation` | INTEGER NOT NULL DEFAULT 0, nonnegative; advances on every claim/takeover. |
 | `version` | INTEGER NOT NULL DEFAULT 1, positive; every mutation uses and increments CAS version. |
@@ -6717,15 +6778,15 @@ cancelling, cleaning and uncertain; `check_run_state_lease(state, lease_until)`;
 | `run_id`, `identity_key` | NOT NULL; composite FK to check_run `(id, identity_key)`, ON DELETE CASCADE. |
 | `outcome` | NOT NULL enum: pass, fail, timed_out, cancelled, infrastructure_failed. |
 | `cleanup` | NOT NULL enum: success, failed, uncertain, not_performed. |
-| `certified` | NOT NULL boolean; may be true only for pass plus successful cleanup; repository requires all ordered commands to have passed. |
+| `certified` | NOT NULL boolean. The repository sets it for a pass whose cleanup succeeded, or whose cleanup is `not_performed` when the spec declares no cleanup step; it requires all ordered commands to have passed. The SQL CHECK refuses it for any non-pass outcome and for failed or uncertain cleanup. |
 | `cacheable` | NOT NULL boolean copied from validated run eligibility. |
 | `steps_json` | NOT NULL ordered existing CheckCommandOutcome array, valid JSON, maximum 262,144 bytes. |
 | `output_truncated` | NOT NULL boolean; supplied capture truncation OR storage tail truncation. |
 | `created_at` | NOT NULL timestamp. |
 
 Result indexes: `check_result_run(run_id, created_at)` and partial UNIQUE
-`check_result_reusable_identity(identity_key)` for pass + successful cleanup +
-certified + cacheable. Results are insert-only through the repository. Uncertain
+`check_result_reusable_identity(identity_key)` for pass + certified +
+cacheable. Results are insert-only through the repository. Uncertain
 cleanup can retain an immutable receipt followed by a separate reconciled
 receipt; the first is never overwritten or reused. Each stderr/combined output
 is redacted using transient values, then retained as at most a 4096-byte UTF-8
@@ -6742,7 +6803,8 @@ command text that alone exceeds the cap is refused.
 | `task_id` | Optional Task FK, ON DELETE SET NULL. |
 | `status_epoch` | INTEGER NOT NULL, nonnegative consumer fence. |
 | `origin` | NOT NULL enum: entry, manual_review, conformance, before_work, lifecycle, environment, integration. |
-| `request_key` | NOT NULL UNIQUE idempotency key; contradictory identity/Task/epoch/origin is refused. |
+| `purpose` | Optional `CheckPurpose` enum (entry_ci, review_ci, conformance, before_work, lifecycle, environment_preflight, readiness_probe, environment_helper, agent_selected, queue_head_ci); the repository always writes it. It records why this consumer asked and never selects the run. |
+| `request_key` | NOT NULL UNIQUE idempotency key; contradictory identity/Task/epoch/origin/purpose is refused. |
 | `identity_key` | NOT NULL requested scoped identity witness. |
 | `run_id` | Optional run FK, ON DELETE SET NULL. |
 | `result_id` | Optional result FK, ON DELETE SET NULL; settlement attaches the latest receipt to joined consumers. |
@@ -6778,14 +6840,21 @@ a totality test ensuring every nonterminal has an exit and terminals have none:
 | uncertain | cleaning, cancelled (owner reconciliation required before either) |
 | succeeded / failed / cancelled | None |
 
-Every listed exit is performed by one repository method, and a test drives each
+Every listed exit is performed by a repository method, and a test drives each
 one and refuses every unlisted one. A queued run was never dispatched, so it has
 no exit to uncertain; it has no lease either, so it is cancelled with a
 version-only fence (`lease_owner: None`) that can do nothing else.
-Claim changes queued to running; expired running/cancelling/cleaning leases keep
-the same state and operation ID while advancing generation. An expired uncertain
-run can acquire a **reconciliation** lease, remaining uncertain; claim never
-changes uncertainty back to running. Renew, settlement and every transition of a claimed run require
+Claim changes queued to running: nobody started a queued run, so it is simply
+claimed. Taking over an **expired lease on a dispatched run** (running,
+cancelling or cleaning) moves it to `uncertain` in the same statement, keeping
+the operation ID and advancing the generation: the lost owner may still be
+executing, so the new owner never continues the run as running. Concurrent
+takeovers race on the version; exactly one wins. From `uncertain` the only
+exits are the ones in the table: reconcile to a settled result with evidence
+(`cleaning`, then settlement) or cancel; a rerun needs a new execution
+revision, which is a different identity. An expired uncertain run can acquire a
+**reconciliation** lease, remaining uncertain; claim never changes uncertainty
+back to running. Renew, settlement and every transition of a claimed run require
 current version, generation, owner and an unexpired lease. Final settlement inserts
 immutable evidence and changes the run atomically. Version/generation/lease
 mismatch returns `DbError::VersionConflict`. A storage caller must supply owner
@@ -6804,10 +6873,12 @@ pool and four runtime threads with simultaneous requests and claims.
 **Reuse rule.** Exact Project/repo/commit/semantic digest identity; every command
 explicitly declares controlled inputs; all declared identity values are present;
 no volatile input; owner-computed environment attestation; complete ordered
-passing commands; certified pass; successful cleanup; and the source run is
-`succeeded`. Different execution revisions or environment identities miss.
-Failed, timed-out, cancelled, uncertain, unattested, uncacheable and failed or
-unperformed cleanup evidence never yields a hit. The partial result index admits
+passing commands; certified pass (cleanup succeeded, or the spec declares no
+cleanup step and none was performed); and the source run is `succeeded`.
+Purpose and the wall timeout play no part. Different execution revisions or environment identities miss.
+Failed, timed-out, cancelled, uncertain, unattested, uncacheable and failed
+cleanup evidence never yields a hit, nor does a declared cleanup step that was
+not performed. The partial result index admits
 at most one certified reusable pass per exact identity. A forced rerun must
 advance the audited execution revision rather than duplicating that identity.
 Consumer authority and current attestation must be revalidated by the future

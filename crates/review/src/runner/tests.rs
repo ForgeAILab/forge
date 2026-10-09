@@ -690,8 +690,10 @@ async fn canonical_spec_for_test(
             event: api_types::LifecycleEvent::BeforeWork,
             role: "reviewer",
             owner_is_daemon: false,
-            has_workspace: true,
-            whole_run_timeout_seconds: 1800,
+            workspace: Some(crate::check_spec::CheckWorkspaceIdentity {
+                workspace_id: "workspace",
+                generation: 1,
+            }),
             queue_head_bundle: None,
         },
     )
