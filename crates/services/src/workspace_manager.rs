@@ -711,7 +711,21 @@ impl<'a> WorkspaceManager<'a> {
         // tests): Git works in it, and the delivery owners refuse it.
         if identity.git_dir != identity.common_dir {
             let recorded = self.recorded_common_dirs(workspace, repo, resolved).await;
-            if !recorded.is_empty() && !recorded.contains(&identity.common_dir) {
+            let task_ref = format!("refs/heads/{}", workspace.branch);
+            let foreign = !recorded.is_empty() && !recorded.contains(&identity.common_dir);
+            // Replacing it needs the Task branch in a recorded repository.
+            // When none has it (a worktree made before its Repo moved to
+            // another location), this worktree is the only home of the
+            // Task's work and stays the one it runs in, as it always was.
+            if foreign && !any_repository_has_ref(&recorded, &task_ref).await {
+                tracing::warn!(
+                    task_id = %workspace.task_id,
+                    workspace_id = %workspace.id,
+                    worktree_repository = %identity.common_dir.display(),
+                    "worktree belongs to a repository other than the recorded one, which does \
+                     not have the Task branch; the worktree is used as it is"
+                );
+            } else if foreign {
                 return Ok(Observed::Foreign {
                     reason: format!(
                         "{} is a worktree of {}, not of the recorded repository",
@@ -829,6 +843,55 @@ impl<'a> WorkspaceManager<'a> {
         }
         dirs
     }
+}
+
+/// The Task worktree on the Forge host for a read-only use, checked by
+/// [`Purpose::Inspect`]: `None` when it is not usable right now (gone, not a
+/// worktree of the recorded repository, or owned by a daemon). Nothing on
+/// disk or in a row changes.
+pub(crate) async fn inspect_path(
+    db: &SqliteDb,
+    workspace_root: &Path,
+    router: &WorkspaceBackendRouter,
+    task: &Task,
+    workspace: Workspace,
+) -> Result<Option<PathBuf>, ServiceError> {
+    match WorkspaceManager::new(db, workspace_root, None, router)
+        .ensure_valid(task, workspace, Purpose::Inspect)
+        .await
+    {
+        Ok(valid) => Ok(valid.path().map(Path::to_path_buf)),
+        Err(WorkspaceUnavailable::Absent { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Where the Task-root files of a server workspace are found: the plan, the
+/// staged plans and the execution outboxes sit beside the worktree, are
+/// located from its recorded path and outlive it (a worktree that was
+/// recreated or is gone still has its plan). This is not a directory to run
+/// anything in; the readers confine every file to the Task root themselves.
+/// A daemon placement has no such path on this host.
+pub(crate) fn task_root_anchor(
+    resolved: &ResolvedWorkspace,
+) -> Result<PathBuf, crate::workspace_backend::WorkspaceBackendError> {
+    resolved.embedded_path()
+}
+
+/// [`task_root_anchor`] for a caller that holds only the placement row.
+pub(crate) fn task_root_anchor_of(
+    placement: &db::WorkspacePlacement,
+) -> Result<PathBuf, ServiceError> {
+    if placement.owner_kind != PlacementOwnerKind::Server {
+        return Err(ServiceError::invalid_operation(
+            "workspace is not owned by the Forge host",
+        ));
+    }
+    placement
+        .workspace_handle
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| ServiceError::invalid_operation("workspace has no server handle"))
 }
 
 fn valid(
@@ -994,6 +1057,26 @@ async fn ref_exists(path: &Path, full_ref: &str) -> bool {
         .status()
         .await
         .is_ok_and(|status| status.success())
+}
+
+async fn any_repository_has_ref(common_dirs: &[PathBuf], full_ref: &str) -> bool {
+    for common_dir in common_dirs {
+        let found = tokio::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(common_dir)
+            .args(["show-ref", "--verify", "--quiet", full_ref])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .kill_on_drop(true)
+            .status()
+            .await
+            .is_ok_and(|status| status.success());
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 async fn git_common_dir(path: &Path) -> Option<PathBuf> {

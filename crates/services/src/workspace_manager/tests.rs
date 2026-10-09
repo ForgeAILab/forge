@@ -324,9 +324,10 @@ async fn worktree_of_another_repository_is_moved_aside_and_recreated() {
 }
 
 /// A worktree Git can still use is never left without its row. When it
-/// belongs to another repository and the recorded one no longer has the Task
-/// branch, the create-or-reuse path asks for the reset and keeps the row and
-/// the directory, with whatever work is in it.
+/// belongs to another repository and the recorded one does not have the Task
+/// branch (a worktree made before its Repo moved to another location), it is
+/// the only home of the Task's work: it is used as it is, as on base, with
+/// the row, the directory and whatever work is in it kept.
 #[tokio::test]
 async fn usable_worktree_of_another_repository_is_never_forgotten() {
     let fixture = Fixture::new().await;
@@ -342,7 +343,9 @@ async fn usable_worktree_of_another_repository_is_never_forgotten() {
         .ensure_valid_or_forget(&fixture.task, workspace, Purpose::Execute)
         .await;
 
-    assert_reset_required(result, "are both gone");
+    let valid = result.expect("the only worktree holding the Task branch is used");
+    assert_eq!(valid.repair(), Repair::None);
+    assert!(valid.on_task_branch());
     assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
     assert_eq!(fixture.siblings(), ["repo"]);
     assert_eq!(
@@ -979,24 +982,45 @@ const RAW_PATH_GETTERS: [&str; 3] = [
 /// lower the entry when convenient.
 const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     // Manager and backend internals.
-    ("services/src/workspace_manager.rs", 2),
+    ("services/src/workspace_manager.rs", 3),
     ("services/src/task_service/workspace.rs", 2),
     ("services/src/workspace_backend/embedded.rs", 5),
     ("services/src/workspace_backend/review.rs", 10),
     ("review/src/workspace.rs", 2),
     // Pending conversion: owned by another job while this one landed.
-    ("services/src/merge_service.rs", 2),          // 3.2 D
-    ("services/src/task_actions.rs", 1),           // 3.2 D
-    ("services/src/task_service/execution.rs", 1), // 3.4 C
-    ("services/src/task_service/execution/runner.rs", 7), // 3.4 C
-    // Pending conversion: 3.4 B part 2.
-    ("services/src/lifecycle/plugin.rs", 1),
-    ("services/src/native_tools.rs", 1),
-    ("services/src/plan_artifact.rs", 5),
-    ("services/src/recovery.rs", 1),
-    ("services/src/task_service.rs", 2),
-    ("services/src/terminal_service.rs", 1),
+    ("services/src/merge_service.rs", 2), // 3.2 D
+    ("services/src/task_actions.rs", 1),  // 3.2 D
+    // Admission-failure cleanup: the path of a workspace this claim just
+    // created, captured to remove it. Nothing runs there.
+    ("services/src/task_service.rs", 1),
 ];
+
+/// The exact production uses left, so a conversion that is undone, or a
+/// listed file that silently gains a use it had before, shows up here.
+#[test]
+fn raw_workspace_path_getter_uses_are_exactly_the_recorded_ones() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates directory");
+    let mut found = Vec::new();
+    for source in [
+        "services/src",
+        "api/src",
+        "mcp-server/src",
+        "review/src",
+        "executors/src",
+    ] {
+        scan_raw_path_uses(crates, &crates.join(source), &mut found);
+    }
+    found.sort();
+    let mut recorded = RAW_PATH_CALLERS
+        .iter()
+        .map(|(file, uses)| ((*file).to_owned(), *uses))
+        .collect::<Vec<_>>();
+    recorded.sort();
+    assert_eq!(found, recorded);
+    assert_eq!(found.iter().map(|(_, uses)| uses).sum::<usize>(), 26);
+}
 
 fn raw_path_uses(source: &str) -> usize {
     let lines = source.lines().collect::<Vec<_>>();

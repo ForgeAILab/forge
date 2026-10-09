@@ -252,11 +252,11 @@ pub(crate) async fn read_plan_for_resolved_workspace(
     match artifact {
         Ok(Some(artifact)) => {
             let source_path = match resolved.placement.owner_kind {
-                db::PlacementOwnerKind::Server => {
-                    default_plan_artifact_path(&resolved.embedded_path()?)
-                        .to_string_lossy()
-                        .to_string()
-                }
+                db::PlacementOwnerKind::Server => default_plan_artifact_path(
+                    &crate::workspace_manager::task_root_anchor(resolved)?,
+                )
+                .to_string_lossy()
+                .to_string(),
                 db::PlacementOwnerKind::Daemon => "../plan.md".to_owned(),
             };
             Ok(Some((
@@ -288,7 +288,7 @@ pub(crate) async fn read_plan_text_for_resolved_workspace(
     resolved: &ResolvedWorkspace,
 ) -> Result<Option<String>, PlanArtifactError> {
     if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
-        return read_canonical_plan_text(&resolved.embedded_path()?);
+        return read_canonical_plan_text(&crate::workspace_manager::task_root_anchor(resolved)?);
     }
     match resolved
         .backend
@@ -364,7 +364,10 @@ impl<'a> ExecutionPlan<'a> {
         execution: &db::Execution,
     ) -> Result<bool, PlanArtifactError> {
         if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
-            return publish_staged_execution_plan(&self.resolved.embedded_path()?, &execution.id);
+            return publish_staged_execution_plan(
+                &crate::workspace_manager::task_root_anchor(self.resolved)?,
+                &execution.id,
+            );
         }
         let (content, issue) = transport::stored(self.db, &execution.id).await?;
         let Some(content) =
@@ -385,7 +388,10 @@ impl<'a> ExecutionPlan<'a> {
     }
     pub(crate) async fn restore(&self, execution_id: &str) -> Result<(), PlanArtifactError> {
         if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
-            return restore_plan_before_abandon(&self.resolved.embedded_path()?, execution_id);
+            return restore_plan_before_abandon(
+                &crate::workspace_manager::task_root_anchor(self.resolved)?,
+                execution_id,
+            );
         }
         self.operation(
             execution_id,
@@ -399,7 +405,7 @@ impl<'a> ExecutionPlan<'a> {
     }
     pub(crate) async fn discard(&self, execution_id: &str) -> Result<(), PlanArtifactError> {
         if self.resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
-            let path = self.resolved.embedded_path()?;
+            let path = crate::workspace_manager::task_root_anchor(self.resolved)?;
             discard_staged_execution_plan(&path, execution_id)?;
             if let Some(outbox) = executors::execution_outbox_path(&path, execution_id) {
                 match fs::remove_dir_all(outbox) {

@@ -45,7 +45,14 @@ async fn discard_execution_plan_artifacts(db: &SqliteDb, execution: &Execution) 
             return;
         }
     };
-    let Ok(path) = EmbeddedWorkspaceBackend::recorded_server_path(db, &workspace).await else {
+    // The outbox and plan stage sit in the Task root, beside the worktree,
+    // and must go even when the worktree itself is no longer there.
+    let Ok(placement) =
+        EmbeddedWorkspaceBackend::ensure_recorded_server_placement(db, &workspace).await
+    else {
+        return;
+    };
+    let Ok(path) = crate::workspace_manager::task_root_anchor_of(&placement) else {
         return;
     };
     let worktree = path.as_path();

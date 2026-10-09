@@ -930,7 +930,69 @@ impl TaskService {
         &self,
         mut admission: WorkspaceAdmission,
     ) -> Result<WorkspaceAdmission> {
+        if admission.placement.state == PlacementState::Ready
+            && admission.placement.owner_kind == PlacementOwnerKind::Server
+        {
+            // The launch guard every executor family shares: the workspace
+            // manager checks the recorded worktree against disk and Git and
+            // repairs what it can, so a CLI executor is never started in a
+            // directory that is gone or off the Task branch.
+            let workspace = if admission.workspace.status == WorkspaceStatus::Ready {
+                let manager = crate::workspace_manager::WorkspaceManager::new(
+                    &self.db,
+                    &self.workspace_root,
+                    self.repo_cache_locks.clone(),
+                    &self.workspace_backend_router,
+                );
+                let workspace = admission.workspace.clone();
+                // Only the Task that owns the row may forget it when its
+                // branch is gone too; a subtask never drops the shared root.
+                let valid = if workspace.task_id == admission.claiming_task.id {
+                    manager
+                        .ensure_valid_or_forget(
+                            &admission.claiming_task,
+                            workspace,
+                            Purpose::Execute,
+                        )
+                        .await
+                } else {
+                    manager
+                        .ensure_valid(&admission.claiming_task, workspace, Purpose::Execute)
+                        .await
+                }?;
+                if valid.repair() != crate::workspace_manager::Repair::None {
+                    info!(
+                        task_id = %admission.claiming_task.id,
+                        workspace_id = %valid.workspace().id,
+                        placement_id = %admission.placement.id,
+                        repair = ?valid.repair(),
+                        "workspace repaired at claim"
+                    );
+                }
+                valid.into_workspace()
+            } else {
+                // A row that is not `ready` (a cleaned workspace awaiting its
+                // next run) is rebuilt by the create-or-reuse path.
+                prepare_workspace(
+                    &self.db,
+                    &self.workspace_root,
+                    &admission.claiming_task,
+                    &admission.claiming_task.id,
+                    self.repo_cache_locks.clone(),
+                    &self.workspace_backend_router,
+                )
+                .await?
+            };
+            admission.workspace = clear_workspace_cleanup_after(&self.db, workspace).await?;
+            admission.placement =
+                WorkspacePlacementRepo::get_by_id(&*self.db, &admission.placement.id)
+                    .await?
+                    .ok_or(DbError::NotFound)?;
+            return Ok(admission);
+        }
         if admission.placement.state == PlacementState::Ready {
+            // A daemon answers for its own placement; Forge never interprets
+            // its handle.
             let needs_recreation = match async {
                 let backend = self
                     .workspace_backend_router
@@ -940,12 +1002,6 @@ impl TaskService {
             .await
             {
                 Ok(state) => !state.exists,
-                Err(error)
-                    if admission.placement.owner_kind == PlacementOwnerKind::Server
-                        && worktree_describe_needs_recreation(&error) =>
-                {
-                    true
-                }
                 Err(error) => {
                     let cause = match &error {
                         crate::workspace_backend::WorkspaceBackendError::StaleGeneration {
@@ -1343,13 +1399,6 @@ async fn ensure_valid_for(
         );
     }
     Ok(valid.into_workspace())
-}
-
-fn worktree_describe_needs_recreation(
-    error: &crate::workspace_backend::WorkspaceBackendError,
-) -> bool {
-    matches!(error, crate::workspace_backend::WorkspaceBackendError::Other(error)
-        if matches!(&**error, ServiceError::Git(_)))
 }
 
 /// Prepare a workspace and report whether this call won creation ownership.

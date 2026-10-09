@@ -591,6 +591,10 @@ impl TaskService {
         self
     }
 
+    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
+    }
+
     pub fn workspace_backend_router(&self) -> Arc<WorkspaceBackendRouter> {
         Arc::clone(&self.workspace_backend_router)
     }
@@ -1943,11 +1947,11 @@ impl TaskService {
 
         if execution.status != ExecutionStatus::Completed {
             if let Some(workspace) = workspace.as_ref() {
-                if let Ok(path) =
-                    crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                        &self.db, workspace,
-                    )
+                // The plan stage sits in the Task root, beside the worktree.
+                if let Ok(path) = crate::workspace_backend::EmbeddedWorkspaceBackend::ensure_recorded_server_placement(&self.db, workspace)
                     .await
+                    .map_err(ServiceError::from)
+                    .and_then(|placement| crate::workspace_manager::task_root_anchor_of(&placement))
                 {
                     execution::discard_execution_plan_stage(&path.to_string_lossy(), &execution.id);
                 }

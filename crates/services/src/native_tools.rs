@@ -834,9 +834,7 @@ impl CoordinationToolProvider {
         let (bytes, default_name, content_type) = match (path, content) {
             (Some(path), None) => {
                 let workspace = self.task_workspace(&task_id).await?;
-                let root = workspace
-                    .embedded_path()
-                    .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+                let root = self.inspected_task_worktree(&task_id, &workspace).await?;
                 let resolved =
                     resolve_workspace_artifact(&root, path).map_err(invalid_arguments)?;
                 let relative = resolved
@@ -1683,6 +1681,39 @@ impl CoordinationToolProvider {
                 }
             }
         }
+    }
+
+    /// The Task worktree an artifact is read from, as the workspace manager
+    /// finds it right now. Nothing is repaired for a read.
+    async fn inspected_task_worktree(
+        &self,
+        task_id: &str,
+        resolved: &crate::workspace_backend::ResolvedWorkspace,
+    ) -> Result<PathBuf, AgentHostError> {
+        let runtime = |error: String| AgentHostError::Runtime(error);
+        let service = self
+            .task_service_handle()
+            .ok_or_else(|| runtime("workspace router is not configured".to_owned()))?;
+        let task = db::TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await
+            .map_err(|error| runtime(error.to_string()))?
+            .ok_or_else(|| runtime(format!("task {task_id} not found")))?;
+        let workspace = db::WorkspaceRepo::get_by_id(&*self.db, &resolved.placement.workspace_id)
+            .await
+            .map_err(|error| runtime(error.to_string()))?
+            .ok_or_else(|| runtime("Task workspace is unavailable: no workspace".to_owned()))?;
+        crate::workspace_manager::inspect_path(
+            &self.db,
+            service.workspace_root(),
+            &service.workspace_backend_router(),
+            &task,
+            workspace,
+        )
+        .await
+        .map_err(|error| runtime(error.to_string()))?
+        .ok_or_else(|| {
+            runtime("Task workspace is unavailable: its worktree is not usable".to_owned())
+        })
     }
 
     async fn task_workspace(
