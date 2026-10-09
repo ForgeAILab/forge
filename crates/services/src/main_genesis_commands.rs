@@ -1013,6 +1013,8 @@ impl MainGenesisCommandService {
             return self.replay_project_agent_selection(receipt).await;
         }
 
+        self.authorize_current_principal(&input.principal, &account_id)
+            .await?;
         if input.policy_result != "allowed" || input.requested_permission != "propose_discovery" {
             return Err(ServiceError::AuthorizationDenied {
                 message: "Project Agent selection requires admitted Main discovery authority"

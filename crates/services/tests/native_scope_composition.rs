@@ -2608,7 +2608,7 @@ async fn main_selection_registry_replays_base_command_receipt_and_preserves_effe
 }
 
 #[tokio::test]
-async fn main_proposals_admit_owned_unbound_and_deny_forged_callers_before_contract_detail() {
+async fn main_proposal_dispatch_denies_unbound_and_forged_callers_before_contract_detail() {
     use forge_agent_host::ForgeToolProvider;
     let f = fixture(false).await;
     for operation in operation_registry::main_proposals::IDS {
@@ -2639,7 +2639,7 @@ async fn main_proposals_admit_owned_unbound_and_deny_forged_callers_before_contr
                     .to_string();
                 assert_eq!(
                     prepared_error.contains("expected "),
-                    field == "unexpected",
+                    actor == AGENT_ID && field == "unexpected",
                     "{operation} {actor} {field}: {prepared_error}"
                 );
                 let error = ForgeToolProvider::propose(
@@ -2653,7 +2653,7 @@ async fn main_proposals_admit_owned_unbound_and_deny_forged_callers_before_contr
                 .await
                 .unwrap_err();
                 let text = format!("{error:?}");
-                if field != "unexpected" {
+                if actor != AGENT_ID || field != "unexpected" {
                     assert!(
                         !text.contains("expected "),
                         "{operation} {actor} {field}: {text}"

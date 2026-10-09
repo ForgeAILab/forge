@@ -2265,11 +2265,9 @@ impl CoordinationToolProvider {
         scope: &CanonicalScope,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
-        self.registered_authority(actor_identity_id, scope, "portfolio.read")
-            .await?;
         let account_id = self
             .authorization
-            .main_account_target(scope)
+            .main_account_id(actor_identity_id, scope)
             .await
             .map_err(native_scope_error)?;
         let project_id = arguments
@@ -3551,10 +3549,8 @@ impl CoordinationToolProvider {
         // identifiers are intentionally not accepted here.
         match search_scope {
             PublicSearchScope::Main => {
-                self.registered_authority(actor_identity_id, scope, "portfolio.read")
-                    .await?;
                 self.authorization
-                    .main_account_target(scope)
+                    .main_account_id(actor_identity_id, scope)
                     .await
                     .map_err(native_scope_error)?;
             }
@@ -4318,7 +4314,12 @@ impl ForgeToolProvider for CoordinationToolProvider {
         scope: &CanonicalScope,
         operation: &str,
     ) -> Result<(), AgentHostError> {
-        self.registered_authority(actor, scope, operation).await
+        // Only a typed denial stops preparation. A resolution failure is
+        // reported by the read itself, which names the operation and scope.
+        match self.registered_authority(actor, scope, operation).await {
+            Err(error @ AgentHostError::StructuredOutcome(_)) => Err(error),
+            _ => Ok(()),
+        }
     }
 
     async fn record_terminal_denial(

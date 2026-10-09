@@ -5477,18 +5477,29 @@ scope names. Omitted optional fields stay omitted, preserving receipt inputs;
 prepared calls retain their stored arguments. Proposal payloads are limited to
 65,536 serialized UTF-8 bytes. Generic proposal envelopes declare object payloads
 and non-null idempotency/correlation strings, matching preparation acceptance.
+A `null` or omitted payload on a registered proposal is read as `{}`, so the
+call is judged by the operation's own contract. A refused field is answered
+with one correction that names the operation, the field and the expected
+contract line. Document `approve` no longer takes `kind`, `title` or
+`envelope_digest`: the approval never read them.
 
 The six legacy message, commitment, memory, review and session operations return
 pending proposals only. Their generated descriptions explicitly say no domain
 effect occurred. Their intent values remain opaque; fresh payloads admit only
 the operation's declared fields. No executor was added. A replay cannot report a
-receipt-less legacy row marked succeeded as a materialized effect.
+receipt-less legacy row marked `executed` as a materialized effect.
 
 Ready Project Agents see the existing Charter amendment draft capability.
-Charter approval and final release remain user-only. Owned unbound identities
-retain Project-create and Project-Agent-selection proposal authority. Other
-registered operations retain their binding requirements; identity-scoped legacy
-proposals cannot bypass the bound Project contract. Setup-only denials after
+Charter approval and final release remain user-only. In the agent-action
+policy, owned unbound identities retain Project-create and
+Project-Agent-selection proposal authority; a native Main proposal still needs
+the caller's active Main binding. A Project Agent can no longer queue
+`project.create` from its Project scope or Project Chat (it was never offered
+there). Other registered operations retain their binding requirements;
+identity-scoped legacy proposals cannot bypass the bound Project contract. In a
+Project Chat, `project.current_state` and `project.observations` are enforced
+with the permission that advertises them (`read_agent_chat`), like
+`project.charter`. Setup-only denials after
 setup completes name `charter_adoption_not_applicable`.
 
 These changes affect native tool contracts and agent-action admission; REST

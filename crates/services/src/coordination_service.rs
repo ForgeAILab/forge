@@ -1332,13 +1332,18 @@ async fn evaluate_action_policy(
             other => other,
         };
         if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(canonical_operation) {
-            if spec.authority.permission(scope_type) != Some(requested_permission)
-                || authority.evaluate(spec).is_err()
-            {
-                return Ok((
-                    AgentActionPolicyResult::Denied,
-                    Some("operation is denied by the canonical native operation catalog".into()),
-                ));
+            // A caller naming another permission is judged by the checks
+            // below, exactly as before the registry: they name the real cause
+            // (read boundary, independent approval) instead of "unavailable".
+            // A Charter-state refusal likewise keeps its own cause.
+            if spec.authority.permission(scope_type) != Some(requested_permission) {
+            } else if let Err(denial) = authority.evaluate(spec) {
+                let reason = match denial {
+                    AuthorityDenial::StateChanged => "Project orchestration remains blocked until a user-approved Charter adoption is committed",
+                    AuthorityDenial::SetupCompleted => "Project Charter adoption is not valid for the current Project state",
+                    _ => "operation is denied by the canonical native operation catalog",
+                };
+                return Ok((AgentActionPolicyResult::Denied, Some(reason.into())));
             }
         }
     }
@@ -2375,6 +2380,8 @@ mod tests {
             .await
             .unwrap();
         let mut table = serde_json::Map::new();
+        let mut narrowed = Vec::new();
+        let mut admitted = 0;
         for (state, setup, paused, restricted) in [
             ("setup", 1, 0, false),
             ("ready", 0, 0, false),
@@ -2468,6 +2475,10 @@ mod tests {
                             AgentActionPolicyResult::Allowed => 2,
                         };
                         assert!(rank <= base_rank, "widened {state}/{actor}/{scope}/{id}/{operation}/{action}: base={base_rank} new={rank}");
+                        if rank < base_rank {
+                            narrowed.push(format!("{state}/{actor}/{scope}/{id}/{operation}/{action}: base={base_rank} new={rank}"));
+                        }
+                        admitted += usize::from(rank > 0);
                         if matches!(operation, "project.create" | "genesis.project_agent.select")
                             && scope == "account"
                             && id == "user-1"
@@ -2488,5 +2499,26 @@ mod tests {
             }
         }
         assert_eq!(table.len(), 4 * 2 * 6 * operations.len());
+        // Never wider is not enough: a table that denies everything would
+        // pass. No cell may silently lose what base admitted either.
+        assert!(admitted > 0, "the fixture must admit some cells");
+        // The one intended loss: a Project Agent can no longer queue
+        // `project.create` from its Project scope or Project Chat. It was
+        // never advertised there; the operation belongs to the Main Agent.
+        let expected = ["setup", "ready"]
+            .into_iter()
+            .flat_map(|state| {
+                [
+                    "project/project-1".to_owned(),
+                    format!("agent_chat/{project_chat}"),
+                ]
+                .map(|scope| {
+                    format!(
+                        "{state}/agent-a/{scope}/project.create/create_from_approval: base=1 new=0"
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(narrowed, expected, "cells narrower than base");
     }
 }

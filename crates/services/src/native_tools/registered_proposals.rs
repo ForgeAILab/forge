@@ -42,7 +42,12 @@ impl CoordinationToolProvider {
                 },
             )
             .await
-            .map_err(|error| service_error(error.into()))
+            .map_err(|error| match error {
+                db::DbError::NotFound => service_error(error.into()),
+                // A persistence failure is not a denial: the boundary reports
+                // it as an internal failure that names the operation.
+                _ => AgentHostError::ProtectedPersistence,
+            })
     }
     pub(super) fn evaluate_registered_authority(
         &self,
@@ -79,7 +84,25 @@ impl CoordinationToolProvider {
             return Ok(());
         };
         let _ = spec;
+        self.main_proposal_binding(actor, scope, operation).await?;
         self.registered_authority(actor, scope, operation).await?;
+        Ok(())
+    }
+    /// A native Main proposal still needs the caller's active Main binding.
+    /// The shared evaluator admits an owned unbound identity for the
+    /// AgentAction policy; the native boundary never did.
+    async fn main_proposal_binding(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        if operation_registry::main_proposals::IDS.contains(&operation) {
+            self.authorization
+                .main_account_id(actor, scope)
+                .await
+                .map_err(native_scope_error)?;
+        }
         Ok(())
     }
     pub(super) async fn registered_proposal(
@@ -94,6 +117,7 @@ impl CoordinationToolProvider {
         // Current authority precedes every payload diagnostic. Stored preparations
         // keep their exact arguments; only fresh calls consult the current spec.
         if let Some(admitted) = admitted_authority {
+            self.main_proposal_binding(actor, scope, operation).await?;
             self.evaluate_registered_authority(
                 admitted,
                 scope,

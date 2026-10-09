@@ -257,7 +257,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             &[StructuralConstraint::ClosedObject, StructuralConstraint::MaxSerializedBytes(65536), StructuralConstraint::AtLeastOne(&["milestone_version","expected_milestone_version"])],
             |context, input| Box::pin(context.validation(input))),
         OperationSpec::typed("project.release.request", AUTHORITY, EffectClass::ApprovalRequired, AvailabilityRule::ReadyOnly, SURFACES,
-            "Queue an exact release candidate proposal; final release is user-only.", "", closed,
+            "Queue an exact release candidate proposal; final release is user-only.", "Project Agent release candidate only. Invoke this only for an exact current ReadinessSnapshot whose result is ready. A blocked, failed, or stale snapshot must be reported with every canonical blocker and must never be described as a release proposal or as Known Issues: None. This submits a user-release request; it never approves, executes, or creates a final release manifest.", closed,
             |context, input| Box::pin(context.release_request(input))),
         OperationSpec::typed("project.escalate", AUTHORITY, EffectClass::DirectCommand, AvailabilityRule::ReadyOnly, SURFACES,
             "Ask the owner for the need blocking named Tasks.", "Ask the Project owner for the exact need blocking named Tasks; creates one Notification and Attention item.", closed,

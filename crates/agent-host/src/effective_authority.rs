@@ -68,7 +68,7 @@ impl AuthorityBoundProvider {
             _ => {
                 return Err(AgentHostError::Authority(
                     "native caller is not an admitted Agent".into(),
-                ))
+                ));
             }
         };
         if actor != identity {
@@ -198,7 +198,9 @@ impl ForgeToolProvider for AuthorityBoundProvider {
             .lookup(operation)
             .is_some()
         {
-            self.check(actor, scope, operation, true).await
+            self.check(actor, scope, operation, true).await?;
+            // The provider keeps its own admission (the Main binding gate).
+            self.inner.proposal_denial(actor, scope, operation).await
         } else {
             self.inner.proposal_denial(actor, scope, operation).await
         }
@@ -477,23 +479,26 @@ mod tests {
             .resolve_effective_authority("agent", None, "account", "owner", "deny")
             .await
             .unwrap();
-        assert!(next
-            .evaluate(
+        assert!(
+            next.evaluate(
                 operation_registry::PROPOSAL_CATALOG
                     .lookup("project.create")
                     .unwrap()
             )
-            .is_ok());
-        assert!(provider
-            .propose(
-                "agent",
-                &scope,
-                "runtime",
-                "project.create",
-                serde_json::json!({})
-            )
-            .await
-            .is_err());
+            .is_ok()
+        );
+        assert!(
+            provider
+                .propose(
+                    "agent",
+                    &scope,
+                    "runtime",
+                    "project.create",
+                    serde_json::json!({})
+                )
+                .await
+                .is_err()
+        );
         assert_eq!(inner.0.load(Ordering::SeqCst), 1);
         select_policy(&db, r#"{"permissions":[]}"#).await;
         provider
@@ -501,10 +506,12 @@ mod tests {
             .await
             .unwrap();
         // Reads retain the admission; a fresh proposal discovers revocation.
-        assert!(provider
-            .proposal_denial("agent", &scope, "project.create")
-            .await
-            .is_err());
+        assert!(
+            provider
+                .proposal_denial("agent", &scope, "project.create")
+                .await
+                .is_err()
+        );
         let AgentHostError::StructuredOutcome(outcome) = provider
             .read("agent", &scope, "account.summary", serde_json::json!({}))
             .await
@@ -545,10 +552,12 @@ mod tests {
             .read("agent", &scope, "account.summary", serde_json::json!({}))
             .await
             .unwrap();
-        assert!(replacement_turn
-            .proposal_denial("agent", &scope, "project.create")
-            .await
-            .is_err());
+        assert!(
+            replacement_turn
+                .proposal_denial("agent", &scope, "project.create")
+                .await
+                .is_err()
+        );
         let AgentHostError::StructuredOutcome(outcome) = replacement_turn
             .read("agent", &scope, "account.summary", serde_json::json!({}))
             .await
@@ -679,9 +688,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inner.0.load(Ordering::SeqCst), 1);
-        assert!(provider
-            .read("forged", &scope, "account.summary", serde_json::json!({}))
-            .await
-            .is_err());
+        assert!(
+            provider
+                .read("forged", &scope, "account.summary", serde_json::json!({}))
+                .await
+                .is_err()
+        );
     }
 }

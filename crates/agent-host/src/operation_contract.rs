@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use agent_runtime::core::prelude::RuntimeError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::operation_catalog::{
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_START_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
@@ -1151,11 +1151,11 @@ pub(crate) fn validate_orchestration_proposal_arguments(
 mod tests {
     use super::*;
     use crate::operation_catalog::{
-        OperationInputContract, OperationOutputContract, MIGRATED_OPERATION_CONTRACTS,
+        MIGRATED_OPERATION_CONTRACTS, OperationInputContract, OperationOutputContract,
         SHARED_ORCHESTRATION_OUTCOME,
     };
     use crate::{
-        MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+        MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
     };
 
     #[test]
@@ -1164,12 +1164,14 @@ mod tests {
         let description = schema["description"].as_str().unwrap();
         assert!(description.split_whitespace().count() <= 25);
         let c = crate::operation_contract(crate::PROJECT_ESCALATE_OPERATION).unwrap();
-        assert!(!c
-            .supported_scopes
-            .contains(&crate::CanonicalScopeType::Account));
-        assert!(!c
-            .supported_scopes
-            .contains(&crate::CanonicalScopeType::Task));
+        assert!(
+            !c.supported_scopes
+                .contains(&crate::CanonicalScopeType::Account)
+        );
+        assert!(
+            !c.supported_scopes
+                .contains(&crate::CanonicalScopeType::Task)
+        );
         assert_eq!(
             crate::classify_operation(
                 crate::PROJECT_ESCALATE_OPERATION,
@@ -1216,10 +1218,11 @@ mod tests {
                     json!({"approval_id":null}),
                     json!({"approval_id":""}),
                 ] {
-                    assert!(spec
-                        .validate_arguments(&refused)
-                        .unwrap_err()
-                        .contains("approval_id"));
+                    assert!(
+                        spec.validate_arguments(&refused)
+                            .unwrap_err()
+                            .contains("approval_id")
+                    );
                 }
             } else {
                 assert_eq!(
@@ -1272,9 +1275,11 @@ mod tests {
             evidence["properties"]["evidence_kind"]["enum"],
             json!(["screenshot", "walkthrough_video", "log", "report", "other"])
         );
-        assert!(evidence["properties"]["evidence_kind"]["type"]
-            .as_array()
-            .is_some_and(|kinds| kinds.contains(&json!("null"))));
+        assert!(
+            evidence["properties"]["evidence_kind"]["type"]
+                .as_array()
+                .is_some_and(|kinds| kinds.contains(&json!("null")))
+        );
     }
 
     #[test]
@@ -1364,10 +1369,12 @@ mod tests {
                 "adoption payload content must expose required field {required}"
             );
         }
-        assert!(payload["description"]
-            .as_str()
-            .expect("adoption payload description")
-            .contains("Payload shape by operation"));
+        assert!(
+            payload["description"]
+                .as_str()
+                .expect("adoption payload description")
+                .contains("Payload shape by operation")
+        );
     }
 
     #[test]
@@ -1409,20 +1416,22 @@ mod tests {
             assert_eq!(guidance.matches(rule).count(), 1);
             assert!(!guidance.contains(crate::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
         }
-        assert!(!coordination_payload_guidance(&BTreeSet::from([
-            TASK_WORKLOG_OPERATION.to_owned()
-        ]))
-        .contains(rule));
+        assert!(
+            !coordination_payload_guidance(&BTreeSet::from([TASK_WORKLOG_OPERATION.to_owned()]))
+                .contains(rule)
+        );
     }
 
     #[test]
     fn task_proposal_requires_an_explicit_review_scope_decision() {
         let schema = orchestration_payload_schema(TASK_PROPOSE_OPERATION);
-        assert!(schema["required"]
-            .as_array()
-            .expect("required fields")
-            .iter()
-            .any(|field| field == "review_requirement_ids"));
+        assert!(
+            schema["required"]
+                .as_array()
+                .expect("required fields")
+                .iter()
+                .any(|field| field == "review_requirement_ids")
+        );
         assert_eq!(
             schema["properties"]["review_requirement_ids"]["type"],
             "array"
@@ -1448,14 +1457,18 @@ mod tests {
         assert!(guidance.contains("prerequisite DAG edges only"));
         assert!(guidance.contains("not a parent/child hierarchy or workspace sharing"));
         let properties = coordination_payload_properties(&operations).expect("flat properties");
-        assert!(properties["depends_on_task_ids"]["description"]
-            .as_str()
-            .expect("flat prerequisite guidance")
-            .contains("prerequisite DAG edges only"));
-        assert!(properties["description"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("owned repository-relative paths"));
+        assert!(
+            properties["depends_on_task_ids"]["description"]
+                .as_str()
+                .expect("flat prerequisite guidance")
+                .contains("prerequisite DAG edges only")
+        );
+        assert!(
+            properties["description"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("owned repository-relative paths")
+        );
         // A field the server requires but the flat surface never declares is
         // a field a declared-properties-only provider cannot send at all:
         // the Task can then never be created, however the model writes it.
@@ -1489,11 +1502,13 @@ mod tests {
         assert_eq!(schema["properties"]["setup_steps"]["maxItems"], 16);
         assert_eq!(schema["properties"]["setup_steps"]["uniqueItems"], true);
         for required in ["action", "expected_project_version", "ci_steps"] {
-            assert!(schema["required"]
-                .as_array()
-                .expect("required fields")
-                .iter()
-                .any(|field| field == required));
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .expect("required fields")
+                    .iter()
+                    .any(|field| field == required)
+            );
         }
     }
 
@@ -1677,14 +1692,18 @@ mod tests {
                 "adaptive guidance must distinguish {phrase}: {adaptive_description}"
             );
         }
-        assert!(variants[0]["description"]
-            .as_str()
-            .expect("split variant guidance")
-            .contains("ordered direct children"));
-        assert!(variants[1]["description"]
-            .as_str()
-            .expect("sequence variant guidance")
-            .contains("does not create a dependency graph"));
+        assert!(
+            variants[0]["description"]
+                .as_str()
+                .expect("split variant guidance")
+                .contains("ordered direct children")
+        );
+        assert!(
+            variants[1]["description"]
+                .as_str()
+                .expect("sequence variant guidance")
+                .contains("does not create a dependency graph")
+        );
         let properties = schema["properties"].as_object().expect("properties");
         for forbidden in [
             "project_id",
@@ -1721,14 +1740,18 @@ mod tests {
         assert!(properties.get("action").is_some());
         assert!(properties.get("source_task_id").is_some());
         assert!(properties.get("ordered_task_ids").is_some());
-        assert!(properties["items"]["description"]
-            .as_str()
-            .expect("split property guidance")
-            .contains("non-executing coordination root"));
-        assert!(properties["ordered_task_ids"]["description"]
-            .as_str()
-            .expect("sequence property guidance")
-            .contains("does not create a dependency graph"));
+        assert!(
+            properties["items"]["description"]
+                .as_str()
+                .expect("split property guidance")
+                .contains("non-executing coordination root")
+        );
+        assert!(
+            properties["ordered_task_ids"]["description"]
+                .as_str()
+                .expect("sequence property guidance")
+                .contains("does not create a dependency graph")
+        );
     }
 
     #[test]

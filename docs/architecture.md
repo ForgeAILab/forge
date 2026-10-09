@@ -196,8 +196,11 @@ Charter amendment draft capability; no approval authority is added.
 `review.request` and `session.action` are closed pending-intent specs. Their
 results remain pending proposals, never success for a message, memory, commitment,
 review or session effect. No materializer was added. The same operation schema
-produces field aliases and the contract line; mixed Project coordination payloads
-avoid duplicating their flat property declarations inside `payload`.
+produces field aliases and the contract line. On a tool that mixes them with
+hand operations, registered fields are not repeated inside `payload`; the hand
+operations' payload fields stay declared there, because some providers drop
+undeclared nested fields. A `null` payload on a registered proposal is read as
+`{}`.
 
 `project.charter.adoption`, `project.evidence` and `project.readiness` retain their
 hand paths because their base receipt capture could not be proven exact in this
@@ -456,12 +459,12 @@ Chat carries `propose_task`, `propose_commitment`, `propose_memory` and
 `propose_session` once the Charter is adopted, but not the Project scope's
 `propose_review` or `propose_decision`. An owned identity without the Main
 binding keeps its account ceiling for the unregistered account operations;
-Main reads require the binding through their principal rule. Owned unbound identities retain `project.create` and `genesis.project_agent.select` proposal authority; Charter adoption, amendment approval and final release remain user-only.
+Main reads require the binding through their principal rule. Owned unbound identities retain `project.create` and `genesis.project_agent.select` proposal authority in the agent-action policy; the native boundary still requires the active Main binding for both (`OrchestrationAuthorizationService::main_account_id`); Charter adoption, amendment approval and final release remain user-only.
 A stored document that fails to parse is logged with the identity and layer.
 
 Registered Main reads, Project Charter/doctrine reads, identity summaries,
 `genesis.project_agent.select` and `project.create` use this path. The
-approval-envelope `AgentAction` policy (`evaluate_action_policy`) uses the same resolver/evaluator for account, Project, Chat and identity callers. Task assignment/terminal/reviewer checks remain on their existing path for slice F. The former `action_scope_access` and `main_account_id` checks are removed; a test-only frozen base policy compares each principal/scope/action cell and refuses any widening. UI effective
+approval-envelope `AgentAction` policy (`evaluate_action_policy`) uses the same resolver/evaluator for account, Project, Chat and identity callers. Task assignment/terminal/reviewer checks remain on their existing path for slice F. The former `action_scope_access` check is removed. `main_account_id` remains as the native Main binding gate for Main proposals, `project.summary` in a Main Chat and Main public search, which the evaluator does not cover. A test-only frozen base policy compares each principal/scope/action cell, refuses any widening, and lists the one intended narrowing (a Project Agent queueing `project.create` from its Project scope or Chat). UI effective
 permissions and CLI composition use the same resolver. Existing exact-object,
 receipt-first replay, governing-policy and optimistic-version checks remain
 in command transactions; fresh Genesis Agent selection also evaluates

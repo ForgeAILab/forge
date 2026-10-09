@@ -134,7 +134,7 @@ async fn seed_project(db: &SqliteDb, project_id: &str, repo_id: &str) {
          SET permission_ceiling_json = ?
          WHERE project_id = ? AND state = 'active'",
     )
-    .bind(r#"{"allowed":["read_account","read_agent_chat","read_project","propose_project","propose_task","propose_commitment"]}"#)
+    .bind(r#"{"allowed":["read_project","propose_project","propose_task","propose_commitment"]}"#)
     .bind(project_id)
     .execute(db.pool())
     .await
@@ -1422,7 +1422,6 @@ async fn invoke_native(
 }
 
 async fn project_chat_session(fixture: &Fixture) -> (CanonicalScope, String) {
-    sqlx::query("UPDATE project_agent_binding SET permission_ceiling_json = ? WHERE project_id=? AND state='active'").bind(serde_json::json!({"permissions":["read_project","read_agent_chat","propose_project","propose_task"]}).to_string()).bind(PROJECT_ID).execute(fixture.db.pool()).await.unwrap();
     let chat_id: String = sqlx::query_scalar("SELECT id FROM agent_chat WHERE project_id = ?")
         .bind(PROJECT_ID)
         .fetch_one(fixture.db.pool())
@@ -1543,7 +1542,22 @@ async fn terminal_denial_per_document_refusal_does_not_block_a_different_documen
 
 #[tokio::test]
 async fn terminal_denial_current_state_load_error_is_internal_and_not_recorded() {
-    let fixture = fixture().await;
+    // `native_tool` composes the Project Chat with `read_agent_chat`; the
+    // registered read enforces what that surface advertises, so the identity
+    // and binding must really hold it.
+    let fixture = fixture_with_permissions(
+        r#"{"permissions":["read_project","read_agent_chat","propose_project","propose_task","propose_commitment"]}"#,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE project_agent_binding SET permission_ceiling_json = ?
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(r#"{"allowed":["read_project","read_agent_chat","propose_project","propose_task","propose_commitment"]}"#)
+    .bind(PROJECT_ID)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
     let (scope, _) = project_chat_session(&fixture).await;
     let tool = native_tool(
         &fixture,
@@ -1564,7 +1578,7 @@ async fn terminal_denial_current_state_load_error_is_internal_and_not_recorded()
     )
     .await;
     assert!(failed.is_error);
-    assert_eq!(failed.value["code"], "internal_failure");
+    assert_eq!(failed.value["code"], "internal_failure", "{failed:?}");
     assert!(failed.value.get("denied_by").is_none());
     assert_eq!(
         count(

@@ -8,6 +8,27 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Registered native Project calls refuse undeclared fields (3.8 slice E).**
+  `project.current_state`, `project.observations`, `project.review_config`,
+  `project.document`, `project.decision`, `project.milestone`,
+  `project.validation`, `project.release.request`, `project.escalate` and the
+  six pending proposals (`message.send`, `commitment.update`,
+  `memory.publish`, `memory.supersede`, `review.request`, `session.action`)
+  are checked against one contract per operation. An unknown payload or
+  envelope field is answered with one correction naming the operation, the
+  field and the expected contract. Document and milestone actions accept only
+  their own fields: Document `approve` no longer takes `kind`, `title` or
+  `envelope_digest`, which it required or allowed and never read. The
+  proposal envelope declares `dedupe_key` and `correlation_id` as non-null
+  strings. A `null` or omitted payload is still accepted and read as `{}`.
+- **Project Chat reads are enforced as advertised (3.8 slice E).**
+  `project.current_state` and `project.observations` called from a Project
+  Chat need `read_agent_chat`, the permission that already decided whether
+  the chat was offered them. A direct call without it used to succeed.
+- **A Project Agent cannot queue `project.create` (3.8 slice E).** The
+  agent-action policy refuses it from a Project scope or Project Chat, where
+  it was never offered; it used to be queued for approval.
+
 - **Reviewers get no workflow permission (3.8 slice D).** `propose_review` is
   removed from the read-only Task ceiling and from the Task scope of the
   agent-action policy, so a Task-scoped `review.request` or `review.propose`
@@ -633,6 +654,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Project operations and pending proposals use generated registry contracts
+  (3.8 slice E).** Two Project reads, seven Project proposals and six pending
+  proposals moved from hand-written branches and flat schemas to the
+  operation registry; aggregate tool names are unchanged. Registered reads
+  evaluate the authority pinned at turn admission instead of resolving it
+  again, so a revocation during a turn stops reads at the next proposal or
+  the next turn. The agent-action policy uses the shared evaluator for
+  account, Project, Chat and identity scopes. Ready Project Agents are
+  offered Charter amendment drafting, which was already enforced; Charter
+  approval and final release stay user-only. `project.charter.adoption`,
+  `project.evidence` and `project.readiness` keep their hand paths. Tool
+  definitions: Project 24,104 to 24,092 bytes, Project verification 25,353
+  to 25,341, Project setup 15,572 to 15,766 (the pending `message.send`
+  contract line and its `body` / `content` aliases).
 
 - **Authority is resolved once per turn and pinned (3.8 slice D).** A native
   or CLI turn fixes its Agent Profile and permission ceiling at admission.
@@ -1495,6 +1531,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A setup-only operation refused after setup completed names the real
+  cause (3.8 slice E).** The denial is `charter_adoption_not_applicable`
+  instead of `charter_not_adopted`.
+- **A pending proposal never reports a completed effect (3.8 slice E).**
+  Replaying a legacy message, commitment, memory, review or session proposal
+  whose ledger row was marked `executed` without a receipt is refused instead
+  of returning success.
 
 - **A cancelled or timed-out Git command stops its hooks too, and leaves no
   stale `index.lock`.** Forge and the daemon run each Git command in its own

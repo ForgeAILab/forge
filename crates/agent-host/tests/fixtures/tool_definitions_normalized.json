@@ -553,6 +553,7 @@
               "null"
             ]
           },
+          "body": {},
           "capability_class": {
             "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\").",
             "type": [
@@ -695,6 +696,237 @@
           },
           "payload": {
             "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- task.propose — create a Task in the bound Project. Fields: title (required); description (outcome, acceptance criteria, and owned repository-relative paths); priority (integer, higher runs sooner); task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); plan_item_id (optional traceability to a stable item in the active execution baseline, for example \"pi-2\"; when supplied, it must exist and may have only one non-cancelled Task); milestone_id (optional traceability, defaulting to the active baseline's primary milestone when one exists); capability_class (when supplied it must be one of the server-approved profiles: \"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", \"planning_read\" — and, when the baseline declares allowed classes, also one of those); risk_class (only when the baseline declares allowed classes). depends_on_task_ids (optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. Forge binds implementation authority to the Project's current approved Charter. Baseline references are optional traceability; never echo baseline ids or digests.\n- task.adaptive — apply one bounded adaptive command to a Task in the bound Project. Fields: action (required: \"split\", \"sequence\", or \"replace\"); source_task_id, expected_task_version, expected_board_revision, and rationale (all required; read both from work.read — the Task's version and the top-level board_revision; a version_conflict returns the current values in retry.arguments); split requires non-empty items of {title, description?, assignee_id?}; split creates ordered direct children under a non-executing coordination root; children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order. sequence manages that child order only and does not create a dependency graph. replace requires title and optional description. Project, scope, actor, permission, governance, and fixed-boundary values are server-derived and unknown fields are rejected.\n- task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n\n- task.dependency — add or remove one prerequisite edge between two Tasks in the bound Project. Fields: action (required: \"add\" or \"remove\"), task_id (the Task that waits), depends_on_task_id (the Task it waits for), and a non-empty rationale (all required). This is a DAG edge only: no parent/child hierarchy and no shared workspace. Adding refuses a cancelled prerequisite and a self-edge; removing the last cancelled prerequisite clears the dependency block it caused. Prefer this over cancelling and recreating Tasks, which changes their ids and orphans dependents.\n- commitment.update: {commitment_id?, content?, description?, due_at?, expected_version?, status?}; PENDING commitment proposal; no commitment is changed. Payload <=65536 serialized UTF-8 bytes.\n- memory.publish: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is published. Payload <=65536 serialized UTF-8 bytes.\n- memory.supersede: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is superseded. Payload <=65536 serialized UTF-8 bytes.\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.\n- session.action: {action?, content?, session_id?}; PENDING session proposal; no session is cancelled or steered. Payload <=65536 serialized UTF-8 bytes.",
+            "properties": {
+              "action": {
+                "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string.",
+                "properties": {
+                  "fresh_session": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "guidance": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "override": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "refresh_workspace": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "reset_budget": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "verb": {
+                    "enum": [
+                      "start",
+                      "hold",
+                      "release",
+                      "retry",
+                      "send_back",
+                      "approve",
+                      "restart",
+                      "cancel"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "type": [
+                  "string",
+                  "object",
+                  "null"
+                ]
+              },
+              "capability_class": {
+                "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\").",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "depends_on_task_id": {
+                "description": "task.dependency: the single prerequisite Task the edge points at. Use task.dependency to change an existing graph; recreating Tasks changes their ids and orphans everything downstream.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "depends_on_task_ids": {
+                "description": "task.propose: optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. Every prerequisite must reach done before dispatch. Use this for implementation-before-verification ordering instead of narration.",
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "description": {
+                "description": "task.propose: outcome, acceptance criteria, and owned repository-relative paths.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "expected_board_revision": {
+                "description": "task.adaptive: Project board revision precondition (work.read returns it as board_revision).",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "expected_task_version": {
+                "description": "task.adaptive: Task version precondition. task.action uses version.",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "items": {
+                "description": "task.adaptive split: non-empty ordered direct-child list; creates children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "assignee_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "description": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "title": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "title"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "milestone_id": {
+                "description": "task.propose: optional; defaults to the active baseline's primary milestone.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ordered_task_ids": {
+                "description": "task.adaptive sequence: non-empty ordered direct-child Task ids; manages child order only and does not create a dependency graph.",
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "plan_item_id": {
+                "description": "task.propose: optional traceability to a stable plan-item id in the Project's active execution baseline (for example \"pi-2\"). When supplied, the id must exist in that baseline. Each plan item admits exactly one non-cancelled Task — never re-propose a plan item that already has one.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "priority": {
+                "description": "task.propose: integer; higher runs sooner.",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "rationale": {
+                "description": "task.adaptive/task.dependency: required. Why the command is being issued — for task.dependency, why the graph is changing shape.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "review_requirement_ids": {
+                "description": "task.propose: required. Exact non-universal requirement IDs from the approved Charter that this Task owns, copied verbatim from selectable_review_requirements in the project.charter read, or [] when it owns none. Do not construct these strings: an ID that does not match the catalog exactly is rejected and no Task is created.",
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "risk_class": {
+                "description": "task.propose: optional; only when the baseline declares allowed risk classes.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_task_id": {
+                "description": "task.adaptive: source Task id in the bound Project.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "task_id": {
+                "description": "task.action/task.dependency: required Task id in this Project.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "task_type": {
+                "description": "task.propose: \"task\" (implementation default), \"planning_task\", or \"discovery\".",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "description": "task.propose: required Task title.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "version": {
+                "description": "task.action: required current Task version from the offered actions.",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
             "type": "object"
           },
           "plan_item_id": {
@@ -766,6 +998,7 @@
               "null"
             ]
           },
+          "value": {},
           "version": {
             "description": "task.action: required current Task version from the offered actions.",
             "type": [
@@ -773,9 +1006,7 @@
               "null"
             ]
           },
-          "visibility": {},
-          "body": {},
-          "value": {}
+          "visibility": {}
         },
         "required": [
           "operation",
@@ -1109,6 +1340,7 @@
               "null"
             ]
           },
+          "body": {},
           "capability_class": {
             "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\").",
             "type": [
@@ -1251,6 +1483,237 @@
           },
           "payload": {
             "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- task.propose — create a Task in the bound Project. Fields: title (required); description (outcome, acceptance criteria, and owned repository-relative paths); priority (integer, higher runs sooner); task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); plan_item_id (optional traceability to a stable item in the active execution baseline, for example \"pi-2\"; when supplied, it must exist and may have only one non-cancelled Task); milestone_id (optional traceability, defaulting to the active baseline's primary milestone when one exists); capability_class (when supplied it must be one of the server-approved profiles: \"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", \"planning_read\" — and, when the baseline declares allowed classes, also one of those); risk_class (only when the baseline declares allowed classes). depends_on_task_ids (optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. Forge binds implementation authority to the Project's current approved Charter. Baseline references are optional traceability; never echo baseline ids or digests.\n- task.adaptive — apply one bounded adaptive command to a Task in the bound Project. Fields: action (required: \"split\", \"sequence\", or \"replace\"); source_task_id, expected_task_version, expected_board_revision, and rationale (all required; read both from work.read — the Task's version and the top-level board_revision; a version_conflict returns the current values in retry.arguments); split requires non-empty items of {title, description?, assignee_id?}; split creates ordered direct children under a non-executing coordination root; children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order. sequence manages that child order only and does not create a dependency graph. replace requires title and optional description. Project, scope, actor, permission, governance, and fixed-boundary values are server-derived and unknown fields are rejected.\n- task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n\n- task.dependency — add or remove one prerequisite edge between two Tasks in the bound Project. Fields: action (required: \"add\" or \"remove\"), task_id (the Task that waits), depends_on_task_id (the Task it waits for), and a non-empty rationale (all required). This is a DAG edge only: no parent/child hierarchy and no shared workspace. Adding refuses a cancelled prerequisite and a self-edge; removing the last cancelled prerequisite clears the dependency block it caused. Prefer this over cancelling and recreating Tasks, which changes their ids and orphans dependents.\n- commitment.update: {commitment_id?, content?, description?, due_at?, expected_version?, status?}; PENDING commitment proposal; no commitment is changed. Payload <=65536 serialized UTF-8 bytes.\n- memory.publish: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is published. Payload <=65536 serialized UTF-8 bytes.\n- memory.supersede: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is superseded. Payload <=65536 serialized UTF-8 bytes.\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.\n- session.action: {action?, content?, session_id?}; PENDING session proposal; no session is cancelled or steered. Payload <=65536 serialized UTF-8 bytes.",
+            "properties": {
+              "action": {
+                "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string.",
+                "properties": {
+                  "fresh_session": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "guidance": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "override": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "refresh_workspace": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "reset_budget": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "verb": {
+                    "enum": [
+                      "start",
+                      "hold",
+                      "release",
+                      "retry",
+                      "send_back",
+                      "approve",
+                      "restart",
+                      "cancel"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "type": [
+                  "string",
+                  "object",
+                  "null"
+                ]
+              },
+              "capability_class": {
+                "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\").",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "depends_on_task_id": {
+                "description": "task.dependency: the single prerequisite Task the edge points at. Use task.dependency to change an existing graph; recreating Tasks changes their ids and orphans everything downstream.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "depends_on_task_ids": {
+                "description": "task.propose: optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. Every prerequisite must reach done before dispatch. Use this for implementation-before-verification ordering instead of narration.",
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "description": {
+                "description": "task.propose: outcome, acceptance criteria, and owned repository-relative paths.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "expected_board_revision": {
+                "description": "task.adaptive: Project board revision precondition (work.read returns it as board_revision).",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "expected_task_version": {
+                "description": "task.adaptive: Task version precondition. task.action uses version.",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "items": {
+                "description": "task.adaptive split: non-empty ordered direct-child list; creates children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "assignee_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "description": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "title": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "title"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "milestone_id": {
+                "description": "task.propose: optional; defaults to the active baseline's primary milestone.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ordered_task_ids": {
+                "description": "task.adaptive sequence: non-empty ordered direct-child Task ids; manages child order only and does not create a dependency graph.",
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "plan_item_id": {
+                "description": "task.propose: optional traceability to a stable plan-item id in the Project's active execution baseline (for example \"pi-2\"). When supplied, the id must exist in that baseline. Each plan item admits exactly one non-cancelled Task — never re-propose a plan item that already has one.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "priority": {
+                "description": "task.propose: integer; higher runs sooner.",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "rationale": {
+                "description": "task.adaptive/task.dependency: required. Why the command is being issued — for task.dependency, why the graph is changing shape.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "review_requirement_ids": {
+                "description": "task.propose: required. Exact non-universal requirement IDs from the approved Charter that this Task owns, copied verbatim from selectable_review_requirements in the project.charter read, or [] when it owns none. Do not construct these strings: an ID that does not match the catalog exactly is rejected and no Task is created.",
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "risk_class": {
+                "description": "task.propose: optional; only when the baseline declares allowed risk classes.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_task_id": {
+                "description": "task.adaptive: source Task id in the bound Project.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "task_id": {
+                "description": "task.action/task.dependency: required Task id in this Project.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "task_type": {
+                "description": "task.propose: \"task\" (implementation default), \"planning_task\", or \"discovery\".",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "description": "task.propose: required Task title.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "version": {
+                "description": "task.action: required current Task version from the offered actions.",
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
             "type": "object"
           },
           "plan_item_id": {
@@ -1322,6 +1785,7 @@
               "null"
             ]
           },
+          "value": {},
           "version": {
             "description": "task.action: required current Task version from the offered actions.",
             "type": [
@@ -1329,9 +1793,7 @@
               "null"
             ]
           },
-          "visibility": {},
-          "body": {},
-          "value": {}
+          "visibility": {}
         },
         "required": [
           "operation",
@@ -1521,6 +1983,7 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "body": {},
           "causation_depth": {
             "maximum": 8,
             "minimum": 0,
@@ -1555,8 +2018,7 @@
           "payload": {
             "description": "Payload shape by operation (exact contract enforced server-side):\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.",
             "type": "object"
-          },
-          "body": {}
+          }
         },
         "required": [
           "operation",

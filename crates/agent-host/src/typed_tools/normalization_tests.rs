@@ -1,4 +1,4 @@
-use super::tests::{all_permissions, scope, ConfiguredSearchProvider};
+use super::tests::{ConfiguredSearchProvider, all_permissions, scope};
 use super::*;
 
 /// Print actual compact provider definitions, not a reconstructed schema.
@@ -152,8 +152,12 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     ("inquiry", 4_089),
     // 24,048 and 25,297 at 172338b3, plus 56 each: the `skill.section`
     // argument line states the required enum instead of `optional {section}`.
-    ("project", 19_502),
-    ("project_verify_solo", 20_751),
+    // Less 12 each: generated contract lines for the registered Project
+    // operations (-1,007) outweigh the pending legacy proposals' contract
+    // lines and flat aliases (+995). Hand Task operations keep their payload
+    // fields declared; that duplication is theirs to remove.
+    ("project", 24_092),
+    ("project_verify_solo", 25_341),
     // Setup gains 194 bytes: the required truthful PENDING message contract
     // and its body/content aliases add 200; the amendment wording adds 2; the new
     // current-state line saves 8. The unchanged hand Charter dominates
@@ -743,10 +747,18 @@ async fn normalization_errors_never_fall_back_on_native_or_cli() {
     ] {
         let native = native_call(&composition, "forge_scope_propose", arguments.clone()).await;
         assert!(native.is_error);
-        assert!(composition
-            .invoke_denied_chat_tool("session", "turn", "call", "forge_scope_propose", arguments)
-            .await
-            .is_err());
+        assert!(
+            composition
+                .invoke_denied_chat_tool(
+                    "session",
+                    "turn",
+                    "call",
+                    "forge_scope_propose",
+                    arguments
+                )
+                .await
+                .is_err()
+        );
     }
     assert!(provider.0.lock().unwrap().is_empty());
 }
@@ -771,10 +783,18 @@ async fn missing_required_fields_and_unknown_properties_fail_both_paths() {
                 .await
                 .is_error
         );
-        assert!(composition
-            .invoke_denied_chat_tool("session", "turn", "call", "forge_scope_propose", arguments)
-            .await
-            .is_err());
+        assert!(
+            composition
+                .invoke_denied_chat_tool(
+                    "session",
+                    "turn",
+                    "call",
+                    "forge_scope_propose",
+                    arguments
+                )
+                .await
+                .is_err()
+        );
     }
     assert!(provider.0.lock().unwrap().is_empty());
 }
@@ -987,10 +1007,12 @@ async fn hook_failure_does_not_retry_schema_valid_raw_arguments() {
     })];
     let result = native_call(&composition, "forge_scope_propose", proposal()).await;
     assert!(result.is_error);
-    assert!(result.content[0]
-        .as_text()
-        .unwrap()
-        .contains("normalization failed"));
+    assert!(
+        result.content[0]
+            .as_text()
+            .unwrap()
+            .contains("normalization failed")
+    );
     let error = composition
         .invoke_denied_chat_tool("session", "turn", "call", "forge_scope_propose", proposal())
         .await
