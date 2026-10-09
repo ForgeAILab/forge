@@ -142,7 +142,7 @@ impl WorkspaceCheckOwners {
         let receipt=async {
             // This shares the integration owner's physical checkout lock.
             let _checkout=tokio::select! {
-                guard=self.db.lock_server_check_checkout(path)=>guard,
+                guard=self.db.lock_server_check_checkout(workspace_id,path)=>guard?,
                 _=token.cancelled()=>return Ok(check_executor::unstarted_receipt(&id,intent.owner.clone(),CheckExecutionOutcome::Cancelled,None)),
                 _=tokio::time::sleep_until(deadline.into())=>return Ok(check_executor::unstarted_receipt(&id,intent.owner.clone(),CheckExecutionOutcome::TimedOut,None)),
             };

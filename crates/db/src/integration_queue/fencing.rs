@@ -354,23 +354,35 @@ impl IntegrationReconciliationGuard {
 
 impl SqliteDb {
     /// Same physical checkout lock as merge/rebase, without admitting an
-    /// integration effect or manufacturing integration authority.
-    pub async fn lock_server_check_checkout(&self, path: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    /// integration effect or manufacturing integration authority. The key is
+    /// built from the workspace's own repository location, as the integration
+    /// fence builds it: a server-owned shared mount carries a daemon and
+    /// runtime id, and a key without them would be a different lock.
+    pub async fn lock_server_check_checkout(
+        &self,
+        workspace_id: &str,
+        path: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let (daemon_id, runtime_id): (Option<String>, Option<String>) = sqlx::query_as("SELECT l.daemon_id,l.runtime_id FROM workspace_placement p JOIN repo_location l ON l.id=p.repo_location_id WHERE p.workspace_id=?")
+            .bind(workspace_id)
+            .fetch_optional(self.pool())
+            .await?
+            .unwrap_or_default();
         let request = IntegrationEffectRequest {
             fence: IntegrationOwnerFence {
                 queue_id: String::new(),
                 attempt_id: String::new(),
                 generation: 0,
                 lease_owner: String::new(),
-                target_owner: serde_json::json!({"owner_kind":"server","daemon_id":null,"runtime_id":null}),
+                target_owner: serde_json::json!({"owner_kind":"server","daemon_id":daemon_id,"runtime_id":runtime_id}),
             },
             kind: IntegrationOperationKind::Check,
             witness: serde_json::json!({"workspace":{"handle":path}}),
         };
-        lock_owner(&request)
+        Ok(lock_owner(&request)
             .await
             .pop()
-            .expect("one workspace owner lock")
+            .expect("one workspace owner lock"))
     }
 
     /// Bind the existing Task step to its shadow attempt without claiming or
