@@ -1162,9 +1162,6 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
-            return Ok(());
-        }
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
@@ -1175,6 +1172,10 @@ impl TaskService {
         }
 
         if task_blocked_by_execution(&task, &execution.id) {
+            return Ok(());
+        }
+        // The current-run fence (see `annotate_executor_failure_block_with_retry`).
+        if !super::execution_belongs_to_current_state_entry(&self.db, &task, execution).await? {
             return Ok(());
         }
         let usage_limited = attempts.as_array().is_some_and(|attempts| {
@@ -1307,6 +1308,21 @@ impl TaskService {
         Ok(())
     }
 
+    /// A failed run is retried or blocks its Task under the Project as it is
+    /// now, whichever Project revision dispatched the run. The revision
+    /// fence belongs to completions, which advance the workflow; a failure
+    /// advances nothing, its retry is a new run admitted under current
+    /// authority, and dropping it here left the Task active with no run, no
+    /// retry and no park after any Project edit, pause or resume.
+    ///
+    /// What fences a failure instead is that the run is still the Task's
+    /// current one: the Task is in the state, and the entry of that state,
+    /// that the run was dispatched for; the state still belongs to the run's
+    /// role; and, inside the write itself, the run is the newest of its role
+    /// and its Agent still holds the role
+    /// (`latest_execution_authority_matches_in_tx`). A late failure of a run
+    /// the Task has moved on from, or that a newer run replaced, changes
+    /// nothing and spends no budget.
     async fn annotate_executor_failure_block_with_retry(
         &self,
         execution: &Execution,
@@ -1318,9 +1334,6 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
-            return Ok(());
-        }
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             &task,
             &project.workflow_definition,
@@ -1342,6 +1355,9 @@ impl TaskService {
             || (current_role == Some(crate::workflow::default_roles::CODER)
                 && execution.role == "executor");
         if !execution_still_owns_current_role {
+            return Ok(());
+        }
+        if !super::execution_belongs_to_current_state_entry(&self.db, &task, execution).await? {
             return Ok(());
         }
         if task_blocked_by_execution(&task, &execution.id) {
@@ -1375,9 +1391,6 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(());
         };
-        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
-            return Ok(());
-        }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::ExecutorFailed,
             blocking_reason: "executor_failed".to_owned(),
@@ -1474,11 +1487,6 @@ impl TaskService {
             // Interactive runs are user-prompted and do not have a durable dispatcher target yet.
             return Ok(ExecutionRetryDisposition::NotScheduled(
                 "automatic retry is unavailable for interactive executions",
-            ));
-        }
-        if super::super::execution_dispatch_project_version(execution) != Some(project_version) {
-            return Ok(ExecutionRetryDisposition::NotScheduled(
-                "automatic retry was skipped because the project version changed",
             ));
         }
 

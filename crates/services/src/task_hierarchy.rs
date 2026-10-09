@@ -339,6 +339,29 @@ pub(crate) async fn coordination_root_context(
     Ok((parent, workflow))
 }
 
+/// Refuse a new subtask under a parent whose state never dispatches a child
+/// (the state rule of [`coordination_root_allows_child_dispatch`]): a
+/// terminal parent stays terminal, and a parent in a review-phase gate
+/// (review, merging) is judged on the work it already has. A working state
+/// in the review phase (`merge_failed`) does dispatch children, so a
+/// corrective subtask is accepted there.
+pub(crate) fn ensure_parent_accepts_subtasks(
+    parent: &Task,
+    workflow: &WorkflowDefinition,
+) -> Result<()> {
+    let kind = workflow.state_kind(&parent.status);
+    let closed = kind == Some(StateKind::Terminal)
+        || (kind == Some(StateKind::Gate)
+            && workflow.canonical_phase_for_state(&parent.status) == CanonicalPhase::Review);
+    if closed {
+        return Err(ServiceError::SubtaskParentClosed {
+            parent_task_id: parent.id.clone(),
+            state: parent.status.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Return whether a root state permits its next child to dispatch.
 pub(crate) fn coordination_root_allows_child_dispatch(
     parent: &Task,
@@ -453,6 +476,39 @@ mod tests {
             version: 0,
             created_at: "2026-09-28T00:00:00Z".to_owned(),
             updated_at: "2026-09-28T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// A subtask is refused exactly where the parent's state never
+    /// dispatches a child, so a corrective subtask under `merge_failed`
+    /// (a working state in the review phase) is accepted.
+    #[test]
+    fn parent_refuses_subtasks_only_in_states_that_never_dispatch_a_child() {
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        for (status, accepts) in [
+            ("backlog", true),
+            ("todo", true),
+            ("planning", true),
+            ("in_progress", true),
+            ("merge_failed", true),
+            ("review", false),
+            ("merging", false),
+            ("done", false),
+            ("cancelled", false),
+        ] {
+            let parent = task("root", status, None);
+            let refusal = ensure_parent_accepts_subtasks(&parent, &workflow);
+            assert_eq!(refusal.is_ok(), accepts, "{status}");
+            if !accepts {
+                assert!(
+                    !coordination_root_allows_child_dispatch(&parent, &workflow),
+                    "{status}: refused although its children would be dispatched"
+                );
+                assert!(matches!(
+                    refusal,
+                    Err(ServiceError::SubtaskParentClosed { state, .. }) if state == status
+                ));
+            }
         }
     }
 

@@ -30,6 +30,9 @@ impl TaskService {
         if parent.parent_task_id.is_some() {
             return Err(ServiceError::nested_subtask_unsupported());
         }
+        let (_, parent_workflow) =
+            crate::task_hierarchy::coordination_root_context(&self.db, &parent.id).await?;
+        crate::task_hierarchy::ensure_parent_accepts_subtasks(&parent, &parent_workflow)?;
         if !ExecutionRepo::list_running_by_task(&*self.db, &parent.id)
             .await?
             .is_empty()

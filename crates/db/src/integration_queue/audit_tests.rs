@@ -263,7 +263,7 @@ fn every_check_enum_in_the_migration_matches_its_rust_enum() {
     // the timings document), so the same scan must find nothing new in it.
     let sql = concat!(
         include_str!("../../migrations/V202610080123__integration_queue.sql"),
-        include_str!("../../migrations/V202610091022__integration_activation.sql")
+        include_str!("../../migrations/V202610091612__integration_activation.sql")
     );
     fn all<T: ToString>(values: &[T]) -> Vec<String> {
         values.iter().map(ToString::to_string).collect()

@@ -7,7 +7,7 @@ use super::*;
 use crate::{create_sqlite_pool, run_migrations};
 use std::sync::Arc;
 
-const NEW_MIGRATION: &str = "V202610091022__integration_activation.sql";
+const NEW_MIGRATION: &str = "V202610091612__integration_activation.sql";
 const NOW: &str = "2026-10-08T00:00:00Z";
 const LATER: &str = "2026-10-08T00:01:00Z";
 const FAR: &str = "2099-01-01T00:00:00Z";

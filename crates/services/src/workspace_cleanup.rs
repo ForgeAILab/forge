@@ -29,6 +29,36 @@ const TICK_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_CLEANUP_BACKOFF: Duration = Duration::from_secs(60 * 60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const SWEEP_LIMIT: i64 = 64;
+/// Failed attempts (about half an hour of backoff) after which a cleanup that
+/// keeps failing becomes one operator attention item.
+const CLEANUP_ATTENTION_ATTEMPTS: i64 = 5;
+
+pub(crate) fn cleanup_attention_key(workspace_id: &str) -> String {
+    format!("workspace-cleanup:{workspace_id}")
+}
+
+/// The branch a Task delivers into: its merge configuration's
+/// `target_branch`, else the repository default. Mirrors the merge path.
+fn delivery_target_branch(merge_config: Option<&str>, repo_default_branch: &str) -> Option<String> {
+    if let Some(merge_config) = merge_config {
+        // An unreadable configuration proves nothing: keep the branch.
+        let value = serde_json::from_str::<serde_json::Value>(merge_config).ok()?;
+        if let Some(target_branch) = value
+            .get("target_branch")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|target_branch| !target_branch.is_empty())
+        {
+            return Some(target_branch.to_owned());
+        }
+    }
+    let repo_default_branch = repo_default_branch.trim();
+    Some(if repo_default_branch.is_empty() {
+        "main".to_owned()
+    } else {
+        repo_default_branch.to_owned()
+    })
+}
 
 fn cleanup_backoff(previous_attempts: i64) -> Duration {
     let exponent = u32::try_from(previous_attempts.max(0))
@@ -256,10 +286,118 @@ impl WorkspaceCleanupScheduler {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        if !owner_unreachable && previous_attempts + 1 >= CLEANUP_ATTENTION_ATTEMPTS {
+            // The retry is already recorded; a failed notice must not undo it.
+            if let Err(error) = self.raise_cleanup_attention(task_id).await {
+                tracing::warn!(%task_id, %error, "failed to raise workspace cleanup attention");
+            }
+        }
+        Ok(())
+    }
+
+    /// One open item per workspace, however many retries follow. It is
+    /// reopened only after a success resolved it.
+    async fn raise_cleanup_attention(&self, task_id: &str) -> Result<()> {
+        use sqlx::Row as _;
+
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        let Some(row) = sqlx::query(
+            "SELECT w.id, w.worktree_path, w.cleanup_attempts, w.last_cleanup_error,
+                    t.project_id, t.title
+             FROM workspace w JOIN task t ON t.id = w.task_id
+             WHERE w.task_id = ? AND w.status != 'cleaned'",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        else {
+            transaction.commit().await?;
+            return Ok(());
+        };
+        let workspace_id: String = row.try_get("id")?;
+        let dedupe_key = cleanup_attention_key(&workspace_id);
+        let open = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (SELECT 1 FROM attention_projection
+                            WHERE dedupe_key = ? AND status <> 'resolved')",
+        )
+        .bind(&dedupe_key)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if open != 0 {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        let project_id: String = row.try_get("project_id")?;
+        let title: String = row.try_get("title")?;
+        let path: String = row.try_get("worktree_path")?;
+        let attempts: i64 = row.try_get("cleanup_attempts")?;
+        let last_error: Option<String> = row.try_get("last_cleanup_error")?;
+        let now = now_rfc3339();
+        let event = db::DomainEventRepo::append_event_in_tx(
+            &*self.db,
+            &mut transaction,
+            &db::CreateDomainEvent {
+                id: db::new_uuid_v4(),
+                event_type: "workspace.cleanup_failed".to_owned(),
+                entity_type: "workspace".to_owned(),
+                entity_id: workspace_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: Some("workspace-cleanup".to_owned()),
+                scope_type: "project".to_owned(),
+                scope_id: project_id.clone(),
+                correlation_id: task_id.to_owned(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!("{dedupe_key}:{now}")),
+                payload_json: serde_json::json!({
+                    "task_id": task_id, "workspace_id": workspace_id, "attempts": attempts,
+                })
+                .to_string(),
+                created_at: now.clone(),
+            },
+        )
+        .await?;
+        self.db
+            .insert_attention_in_tx(
+                &mut transaction,
+                db::CreateAttentionProjection {
+                    id: db::new_uuid_v4(),
+                    attention_type: "progress_warning".to_owned(),
+                    scope_type: "project".to_owned(),
+                    scope_id: project_id,
+                    identity_id: None,
+                    source_event_id: event.id,
+                    priority: 60,
+                    status: "open".to_owned(),
+                    summary: format!(
+                        "Workspace cleanup keeps failing ({attempts} attempts): {title}"
+                    ),
+                    details_json: serde_json::json!({
+                        "task": {"id": task_id, "title": title},
+                        "workspace_id": workspace_id,
+                        "path": path,
+                        "attempts": attempts,
+                        "last_cleanup_error": last_error,
+                    })
+                    .to_string(),
+                    dedupe_key,
+                    occurred_at: now.clone(),
+                    updated_at: now,
+                    acknowledged_at: None,
+                    snoozed_until: None,
+                    resolved_at: None,
+                    updated_by_user_id: None,
+                    recommended_action: "inspect".to_owned(),
+                    source_sequence: Some(event.sequence),
+                },
+            )
+            .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
     async fn clear_cleanup_after(&self, task_id: &str) -> Result<()> {
+        let now = now_rfc3339();
         sqlx::query(
             "UPDATE workspace
              SET cleanup_after = NULL, cleanup_attempts = 0,
@@ -268,7 +406,21 @@ impl WorkspaceCleanupScheduler {
                AND (cleanup_after IS NOT NULL OR cleanup_attempts != 0
                     OR last_cleanup_error IS NOT NULL)",
         )
-        .bind(now_rfc3339())
+        .bind(&now)
+        .bind(task_id)
+        .execute(self.db.pool())
+        .await?;
+        // Nothing is left to reclaim for this Task, so nothing is left to report.
+        sqlx::query(
+            "UPDATE attention_projection
+             SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                 updated_at = ?, version = version + 1
+             WHERE status <> 'resolved'
+               AND dedupe_key IN (SELECT 'workspace-cleanup:' || id FROM workspace
+                                  WHERE task_id = ?)",
+        )
+        .bind(&now)
+        .bind(&now)
         .bind(task_id)
         .execute(self.db.pool())
         .await?;
@@ -504,7 +656,14 @@ impl WorkspaceCleanupScheduler {
                 }
             };
             if present {
-                self.cleanup_workspace(workspace).await
+                // A reset keeps the branch: only a terminal Task's delivered
+                // branch is reclaimed.
+                let delivered_into = if terminal_only {
+                    self.delivery_target(&task, &workspace).await?
+                } else {
+                    None
+                };
+                self.cleanup_workspace(workspace, delivered_into).await
             } else {
                 Self::acknowledge_cleanup_receipts(&resolved).await?;
                 Ok(())
@@ -529,7 +688,47 @@ impl WorkspaceCleanupScheduler {
         cleanup_result
     }
 
-    async fn cleanup_workspace(&self, workspace: db::Workspace) -> Result<()> {
+    /// The target branch to prove delivery against, or `None` when this
+    /// workspace's branch must be kept whatever Git says: the name is not the
+    /// one Forge gave this Task, the repository is unknown, or another live
+    /// workspace of the repository uses the same branch name (Task branches
+    /// carry only the first eight characters of the Task id).
+    async fn delivery_target(
+        &self,
+        task: &db::Task,
+        workspace: &db::Workspace,
+    ) -> Result<Option<String>> {
+        if workspace.task_id != task.id
+            || workspace.branch != workspace::task_branch_name(&workspace.task_id)
+        {
+            return Ok(None);
+        }
+        let Some(repo) = db::RepoRepo::get_by_id(&*self.db, &workspace.repo_id).await? else {
+            return Ok(None);
+        };
+        let shared = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (SELECT 1 FROM workspace
+                            WHERE repo_id = ? AND branch = ? AND id != ? AND status != 'cleaned')",
+        )
+        .bind(&workspace.repo_id)
+        .bind(&workspace.branch)
+        .bind(&workspace.id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if shared != 0 {
+            return Ok(None);
+        }
+        Ok(delivery_target_branch(
+            task.merge_config.as_deref(),
+            &repo.default_branch,
+        ))
+    }
+
+    async fn cleanup_workspace(
+        &self,
+        workspace: db::Workspace,
+        delivered_into: Option<String>,
+    ) -> Result<()> {
         let terminal_cleanup = self
             .terminal_cleanup
             .read()
@@ -559,8 +758,17 @@ impl WorkspaceCleanupScheduler {
         };
         let ack = resolved.backend.cleanup(&resolved.placement).await?;
         if workspace.status == WorkspaceStatus::Cleaned {
+            // Leftovers of a workspace that was reclaimed earlier. Its branch
+            // was settled then (or predates branch reclamation) and stays.
             Self::acknowledge_cleanup_receipts(&resolved).await?;
             return Ok(());
+        }
+        // Before the row is marked cleaned, so a failure here is retried.
+        if let Some(target_branch) = delivered_into.as_deref() {
+            resolved
+                .backend
+                .reclaim_delivered_branch(&resolved.placement, target_branch)
+                .await?;
         }
         let workspace = self.acknowledge_cleanup(&resolved.placement, &ack).await?;
         Self::acknowledge_cleanup_receipts(&resolved).await?;
@@ -661,6 +869,17 @@ impl WorkspaceCleanupScheduler {
             )
             .bind(&now)
             .bind(&current.workspace_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE attention_projection
+                 SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                     updated_at = ?, version = version + 1
+                 WHERE dedupe_key = ? AND status <> 'resolved'",
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(cleanup_attention_key(&current.workspace_id))
             .execute(&mut *transaction)
             .await?;
             transaction.commit().await?;
@@ -814,6 +1033,13 @@ mod tests {
             )
             .await
             .expect("worktree creates");
+        // Undelivered work: a branch with no commit of its own is already
+        // contained in `main` and would be reclaimed with the worktree.
+        std::fs::write(worktree_path.join("task-change.txt"), "task change")
+            .expect("task change writes");
+        git::commit_all(&worktree_path, "task change")
+            .await
+            .expect("task change commits");
 
         ProjectRepo::create(
             db,
@@ -2073,8 +2299,35 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        std::fs::remove_dir_all(temp.path().join(".repos").join(&workspace.repo_id))
-            .expect("source disappears");
+        // A vanished repository no longer fails cleanup (the Task root is
+        // simply removed). A checkout of some other repository at the
+        // recorded path still does: it is not Forge's to delete.
+        let source = temp.path().join(".repos").join(&workspace.repo_id);
+        fixture_git(
+            &source,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                worktree_path.to_str().unwrap(),
+            ],
+        )
+        .await;
+        let other = temp.path().join("other-repository");
+        std::fs::create_dir_all(&other).unwrap();
+        git::init(&other).await.unwrap();
+        git::commit_all(&other, "initial commit").await.unwrap();
+        fixture_git(
+            &other,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                worktree_path.to_str().unwrap(),
+                "HEAD",
+            ],
+        )
+        .await;
         let scheduler = WorkspaceCleanupScheduler::new(
             Arc::clone(&db),
             Arc::new(EventBus::new(16)),
@@ -2092,6 +2345,35 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339(workspace.cleanup_after.as_deref().unwrap())
                 .unwrap()
                 > chrono::Utc::now()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_reclaims_the_task_root_when_its_repository_is_gone() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().expect("temp dir creates");
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(temp.path().join(".repos").join(&workspace.repo_id))
+            .expect("source disappears");
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        scheduler.cleanup_now(workspace_id.clone()).await.unwrap();
+        assert!(!worktree_path.parent().unwrap().exists());
+        assert_eq!(
+            WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            WorkspaceStatus::Cleaned
         );
     }
 
@@ -2199,5 +2481,504 @@ mod tests {
         scheduler.sweep().await.unwrap();
         responder.await.unwrap();
         assert!(!home.exists());
+    }
+
+    async fn fixture_git(cwd: &Path, args: &[&str]) -> String {
+        let output = git::command_output(cwd, args).await.expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    async fn fixture_source(db: &SqliteDb, root: &Path, workspace_id: &str) -> (PathBuf, String) {
+        let workspace = WorkspaceRepo::get_by_id(db, workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            root.join(".repos").join(&workspace.repo_id),
+            workspace.branch,
+        )
+    }
+
+    async fn clean_due(scheduler: &WorkspaceCleanupScheduler, workspace_id: &str) {
+        scheduler
+            .schedule(workspace_id, Duration::ZERO)
+            .await
+            .unwrap();
+        scheduler.tick().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_deletes_the_branch_only_when_git_proves_delivery() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        // Delivered: the tip is contained in the target branch.
+        let (delivered_id, delivered_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let (source, branch) = fixture_source(&db, temp.path(), &delivered_id).await;
+        fixture_git(&source, &["merge", "--no-ff", "-m", "deliver", &branch]).await;
+        clean_due(&scheduler, &delivered_id).await;
+        assert!(!delivered_path.exists());
+        assert!(!git::branch_exists(&source, &branch).await.unwrap());
+        assert!(git::branch_exists(&source, "main").await.unwrap());
+        // Idempotent re-run over an already reclaimed workspace.
+        scheduler.cleanup_now(delivered_id.clone()).await.unwrap();
+        scheduler.sweep().await.unwrap();
+        assert_eq!(
+            WorkspaceRepo::get_by_id(&*db, &delivered_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            WorkspaceStatus::Cleaned
+        );
+
+        // Delivered once, but the target moved and no longer contains the tip.
+        let (moved_id, moved_path) = seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let (source, branch) = fixture_source(&db, temp.path(), &moved_id).await;
+        let before = fixture_git(&source, &["rev-parse", "HEAD"]).await;
+        fixture_git(&source, &["merge", "--no-ff", "-m", "deliver", &branch]).await;
+        fixture_git(&source, &["reset", "--hard", &before]).await;
+        clean_due(&scheduler, &moved_id).await;
+        assert!(!moved_path.exists());
+        assert!(git::branch_exists(&source, &branch).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn reset_and_shared_branch_names_keep_a_delivered_branch() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        // A reset of a live Task rebuilds from the branch, so it stays.
+        let (reset_id, reset_path) = seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &reset_id).await;
+        set_fixture_status(&db, &task, "todo").await;
+        let (source, branch) = fixture_source(&db, temp.path(), &reset_id).await;
+        fixture_git(&source, &["merge", "--no-ff", "-m", "deliver", &branch]).await;
+        scheduler
+            .reset_workspace_now(reset_id.clone())
+            .await
+            .unwrap();
+        assert!(!reset_path.exists());
+        assert!(git::branch_exists(&source, &branch).await.unwrap());
+
+        // Two Task ids can share the eight-character branch name. While the
+        // other workspace is live, the name is not this Task's to delete.
+        let (shared_id, shared_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &shared_id).await;
+        let (source, branch) = fixture_source(&db, temp.path(), &shared_id).await;
+        fixture_git(&source, &["merge", "--no-ff", "-m", "deliver", &branch]).await;
+        let other =
+            seed_log_only_task(&db, temp.path(), &task, new_uuid_v4(), None, "in_progress").await;
+        let shared = WorkspaceRepo::get_by_id(&*db, &shared_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let now = now_rfc3339();
+        WorkspaceRepo::create(
+            &*db,
+            CreateWorkspace {
+                id: new_uuid_v4(),
+                task_id: other.id.clone(),
+                repo_id: shared.repo_id.clone(),
+                worktree_path: temp
+                    .path()
+                    .join(&other.id)
+                    .join("repo")
+                    .to_string_lossy()
+                    .into_owned(),
+                branch: branch.clone(),
+                status: WorkspaceStatus::Ready,
+                before_sha: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        clean_due(&scheduler, &shared_id).await;
+        assert!(!shared_path.exists());
+        assert!(git::branch_exists(&source, &branch).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_never_deletes_a_branch_forge_did_not_name_for_the_task() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        // Merged branches of the user's, one of them under `task/`, and the
+        // target itself: a row that names one of them deletes nothing.
+        for recorded in ["task/users-own", "feature/mine", "main"] {
+            let (workspace_id, worktree_path) =
+                seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+            let (source, task_branch) = fixture_source(&db, temp.path(), &workspace_id).await;
+            fixture_git(
+                &source,
+                &["merge", "--no-ff", "-m", "deliver", &task_branch],
+            )
+            .await;
+            if recorded != "main" {
+                fixture_git(&source, &["branch", recorded, "main"]).await;
+            }
+            sqlx::query("UPDATE workspace SET branch = ? WHERE id = ?")
+                .bind(recorded)
+                .bind(&workspace_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+
+            clean_due(&scheduler, &workspace_id).await;
+
+            assert!(!worktree_path.exists());
+            assert_eq!(
+                WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                WorkspaceStatus::Cleaned
+            );
+            assert!(git::branch_exists(&source, recorded).await.unwrap());
+            // The Task's own branch is not what the row names, so it stays too.
+            assert!(git::branch_exists(&source, &task_branch).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn leftovers_of_an_already_cleaned_workspace_keep_its_branch() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Cleaned).await;
+        let (source, branch) = fixture_source(&db, temp.path(), &workspace_id).await;
+        fixture_git(&source, &["merge", "--no-ff", "-m", "deliver", &branch]).await;
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        scheduler.sweep().await.unwrap();
+
+        assert!(!worktree_path.exists());
+        assert!(git::branch_exists(&source, &branch).await.unwrap());
+    }
+
+    async fn cleanup_attention(db: &SqliteDb, workspace_id: &str) -> Vec<(String, i64)> {
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, version FROM attention_projection WHERE dedupe_key = ?",
+        )
+        .bind(cleanup_attention_key(workspace_id))
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+    }
+
+    /// A workspace whose source is the user's own checkout at
+    /// `<root>/vol/user-repo`, recorded on the Repo, with Forge holding no
+    /// clone. `vol` stands for the volume the checkout lives on.
+    async fn user_repo_fixture(db: &Arc<SqliteDb>, root: &Path) -> (String, PathBuf, PathBuf) {
+        let (workspace_id, worktree_path) = seed_workspace(db, root, WorkspaceStatus::Ready).await;
+        let (cache, _branch) = fixture_source(db, root, &workspace_id).await;
+        let workspace = WorkspaceRepo::get_by_id(&**db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let user_repo = root.join("vol").join("user-repo");
+        std::fs::create_dir_all(user_repo.parent().unwrap()).unwrap();
+        std::fs::rename(&cache, &user_repo).unwrap();
+        fixture_git(
+            &user_repo,
+            &["worktree", "repair", &worktree_path.to_string_lossy()],
+        )
+        .await;
+        sqlx::query("UPDATE repo SET local_path = ? WHERE id = ?")
+            .bind(user_repo.to_string_lossy().as_ref())
+            .bind(&workspace.repo_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        (workspace_id, worktree_path, user_repo)
+    }
+
+    async fn worktree_registered(repo: &Path, worktree: &Path) -> bool {
+        fixture_git(repo, &["worktree", "list", "--porcelain"])
+            .await
+            .contains(worktree.to_string_lossy().as_ref())
+    }
+
+    /// A user's repository that is away right now (an unmounted volume) is
+    /// not a repository that is gone: cleanup keeps the worktree, retries, and
+    /// removes the registration from the user's repository once it is back.
+    #[tokio::test]
+    async fn recorded_repository_missing_right_now_is_retried_not_treated_as_gone() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path, user_repo) = user_repo_fixture(&db, temp.path()).await;
+        assert!(worktree_registered(&user_repo, &worktree_path).await);
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        // The volume is unmounted: the repository's parent is gone with it.
+        let volume = temp.path().join("vol");
+        let away = temp.path().join("vol.unmounted");
+        std::fs::rename(&volume, &away).unwrap();
+        for attempt in 1..=CLEANUP_ATTENTION_ATTEMPTS {
+            // An unmounted mount point may also be left behind as an empty
+            // directory: that is still "away".
+            if attempt == 2 {
+                std::fs::create_dir(&volume).unwrap();
+            }
+            clean_due(&scheduler, &workspace_id).await;
+            let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(row.status, WorkspaceStatus::Cleaned, "attempt {attempt}");
+            assert_eq!(row.cleanup_attempts, attempt);
+            assert!(row
+                .last_cleanup_error
+                .as_deref()
+                .unwrap()
+                .contains("is not reachable right now"));
+            assert!(worktree_path.exists(), "the worktree is kept for the retry");
+            assert_eq!(
+                cleanup_attention(&db, &workspace_id).await.len(),
+                usize::from(attempt == CLEANUP_ATTENTION_ATTEMPTS),
+                "attention is raised at the threshold, attempt {attempt}"
+            );
+        }
+
+        std::fs::remove_dir(&volume).unwrap();
+        std::fs::rename(&away, &volume).unwrap();
+        clean_due(&scheduler, &workspace_id).await;
+        let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, WorkspaceStatus::Cleaned);
+        assert!(!worktree_path.parent().unwrap().exists());
+        assert!(
+            !worktree_registered(&user_repo, &worktree_path).await,
+            "the registration is removed from the user's repository"
+        );
+        assert_eq!(cleanup_attention(&db, &workspace_id).await[0].0, "resolved");
+    }
+
+    /// A checkout deleted for good, in a directory that is still there, took
+    /// its worktree registrations with it: cleanup removes the Task root at
+    /// once instead of retrying for a repository that will never come back.
+    #[tokio::test]
+    async fn recorded_repository_deleted_for_good_is_cleaned_without_retries() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path, user_repo) = user_repo_fixture(&db, temp.path()).await;
+        std::fs::write(temp.path().join("vol").join("other-project"), "still here").unwrap();
+        std::fs::remove_dir_all(&user_repo).unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        clean_due(&scheduler, &workspace_id).await;
+
+        let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, WorkspaceStatus::Cleaned);
+        assert_eq!(row.cleanup_attempts, 0);
+        assert!(!worktree_path.parent().unwrap().exists());
+        assert!(cleanup_attention(&db, &workspace_id).await.is_empty());
+    }
+
+    /// Waiting for a repository that is away is bounded: a set time after the
+    /// attention item was raised, the Task root is removed without it and the
+    /// item records why.
+    #[tokio::test]
+    async fn recorded_repository_that_stays_away_stops_being_waited_for() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path, _user_repo) = user_repo_fixture(&db, temp.path()).await;
+        std::fs::rename(temp.path().join("vol"), temp.path().join("vol.unmounted")).unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        for _ in 0..CLEANUP_ATTENTION_ATTEMPTS + 2 {
+            clean_due(&scheduler, &workspace_id).await;
+        }
+        assert!(worktree_path.exists(), "still waiting inside the bound");
+        assert_eq!(cleanup_attention(&db, &workspace_id).await[0].0, "open");
+
+        let raised = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        sqlx::query("UPDATE attention_projection SET occurred_at = ? WHERE dedupe_key = ?")
+            .bind(raised)
+            .bind(cleanup_attention_key(&workspace_id))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        clean_due(&scheduler, &workspace_id).await;
+
+        let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, WorkspaceStatus::Cleaned);
+        assert!(!worktree_path.parent().unwrap().exists());
+        let (status, settled) = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, json_extract(details_json, '$.settled')
+             FROM attention_projection WHERE dedupe_key = ?",
+        )
+        .bind(cleanup_attention_key(&workspace_id))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "resolved");
+        assert!(
+            settled
+                .as_deref()
+                .is_some_and(|settled| settled.contains("stayed unreachable for 7 days")),
+            "{settled:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn five_failed_cleanups_raise_one_attention_item_that_success_clears() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        scheduler.set_terminal_cleanup_handler(Arc::new(FailingWorkspaceCleanup {
+            workspace_id: workspace_id.clone(),
+        }));
+
+        for attempt in 1..=4 {
+            clean_due(&scheduler, &workspace_id).await;
+            assert!(
+                cleanup_attention(&db, &workspace_id).await.is_empty(),
+                "attempt {attempt} is still an ordinary retry"
+            );
+        }
+        clean_due(&scheduler, &workspace_id).await;
+        let raised = cleanup_attention(&db, &workspace_id).await;
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].0, "open");
+        let details = sqlx::query_scalar::<_, String>(
+            "SELECT details_json FROM attention_projection WHERE dedupe_key = ?",
+        )
+        .bind(cleanup_attention_key(&workspace_id))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let details: serde_json::Value = serde_json::from_str(&details).unwrap();
+        assert_eq!(details["attempts"], 5);
+        assert_eq!(details["path"], worktree_path.to_string_lossy().as_ref());
+        assert!(details["last_cleanup_error"]
+            .as_str()
+            .unwrap()
+            .contains("cleanup observer failed"));
+
+        // Later retries keep failing and keep the one item untouched.
+        for _ in 0..3 {
+            clean_due(&scheduler, &workspace_id).await;
+        }
+        assert_eq!(cleanup_attention(&db, &workspace_id).await, raised);
+        let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.cleanup_attempts, 8);
+        assert!(worktree_path.exists());
+        let events = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event WHERE event_type = 'workspace.cleanup_failed'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(events, 1);
+
+        // Success clears it.
+        scheduler.set_terminal_cleanup_handler(Arc::new(FailingWorkspaceCleanup {
+            workspace_id: "another-workspace".to_owned(),
+        }));
+        clean_due(&scheduler, &workspace_id).await;
+        assert!(!worktree_path.exists());
+        let cleared = cleanup_attention(&db, &workspace_id).await;
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].0, "resolved");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_cleanup_reclaims_read_only_trees_and_broken_copies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let task_root = worktree_path.parent().unwrap().to_path_buf();
+        let cache = worktree_path.join("pkg/mod");
+        let broken = task_root.join("repo.broken-1700000000000");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(cache.join("module.go"), "package module\n").unwrap();
+        std::fs::write(broken.join("leftover"), "leftover").unwrap();
+        for (path, mode) in [
+            (cache.join("module.go"), 0o400),
+            (cache.clone(), 0o500),
+            (worktree_path.join("pkg"), 0o500),
+            (broken.join("leftover"), 0o400),
+            (broken.clone(), 0o500),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        clean_due(&scheduler, &workspace_id).await;
+
+        assert!(!task_root.exists());
+        let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.status, WorkspaceStatus::Cleaned);
+        assert_eq!(workspace.cleanup_attempts, 0);
     }
 }

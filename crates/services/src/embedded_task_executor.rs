@@ -393,14 +393,29 @@ impl EmbeddedTaskExecutor {
                 .await?
                 .ok_or_else(|| ServiceError::not_found("workspace", ctx.task_id.clone()))?,
         };
-        let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
-            &self.workspace_backend_router,
+        // The claim checked this workspace a moment ago; the turn starts
+        // now. Check it again here so a directory that vanished in between is
+        // recreated from the Task branch instead of failing the execution
+        // with Git's "not a git repository".
+        let task = TaskRepo::get_by_id(&*self.db, &ctx.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", ctx.task_id.clone()))?;
+        let workspace_root = crate::task_service::workspace::default_workspace_root();
+        let valid = crate::workspace_manager::WorkspaceManager::new(
             &self.db,
-            &workspace,
-            &crate::task_service::workspace::default_workspace_root(),
+            &workspace_root,
+            None,
+            &self.workspace_backend_router,
         )
+        .ensure_valid(&task, workspace, crate::workspace_manager::Purpose::Execute)
         .await?;
-        let worktree_path = resolved.embedded_path()?;
+        let worktree_path = valid.path().map(Path::to_path_buf).ok_or_else(|| {
+            ServiceError::from(
+                crate::workspace_backend::WorkspaceBackendError::OwnerUnsupported {
+                    owner_kind: valid.resolved().placement.owner_kind.clone(),
+                },
+            )
+        })?;
         let worktree_read_only =
             is_read_only_task_role(role) || executors::is_worktree_read_only(&ctx.agent_config);
         let before_sha = if worktree_read_only {

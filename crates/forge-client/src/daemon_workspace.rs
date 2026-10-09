@@ -1434,10 +1434,8 @@ impl DaemonWorkspaceBackend {
             head_sha,
             dirty,
             branch,
-            locked: owned
-                .path
-                .parent()
-                .is_some_and(|p| p.join(".forge.lock").exists()),
+            // Nothing creates a lock file; the field is kept by the protocol.
+            locked: false,
             active_execution_ids: owned
                 .execution_ids
                 .into_iter()

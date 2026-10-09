@@ -237,6 +237,16 @@ pub trait WorkspaceBackend: Send + Sync {
         spec: &ResetSpec,
     ) -> Result<PreparedWorkspace>;
     async fn cleanup(&self, placement: &WorkspacePlacement) -> Result<CleanupAck>;
+    /// Delete the placement's Task branch when Git proves, at this moment,
+    /// that its tip is contained in `target_branch`. Returns whether a branch
+    /// was deleted. An owner that cannot prove delivery keeps the branch.
+    async fn reclaim_delivered_branch(
+        &self,
+        _placement: &WorkspacePlacement,
+        _target_branch: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
     async fn harvest_outbox(
         &self,
         placement: &WorkspacePlacement,

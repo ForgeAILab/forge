@@ -1631,6 +1631,8 @@ export interface ActiveExecutionSummary {
 }
 
 export interface DaemonPressureSummary {
+  check_runs: number
+  borrowed_check_runs: number
   logical_cores: number | null
   build_jobs_per_run: number | null
   run_nice: number | null

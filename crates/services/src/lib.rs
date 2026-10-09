@@ -14,6 +14,7 @@ pub mod agent_turn_admission;
 pub mod attention_service;
 pub mod auth_service;
 pub(crate) mod chat_usage;
+pub mod check_runner;
 pub mod command_boundary;
 pub mod context_manifest;
 pub mod coordination_consumer;
@@ -107,6 +108,7 @@ pub mod workflow;
 pub mod workspace_backend;
 pub mod workspace_cleanup;
 pub mod workspace_execution_lock;
+pub(crate) mod workspace_manager;
 
 // Test-only failpoints used by the Gate A characterization suite.  These are
 // compiled out of normal library builds; they let the suite model a process
@@ -464,6 +466,14 @@ pub enum ServiceError {
 
     #[error("parent workspace required for task {parent_task_id}")]
     ParentWorkspaceRequired { parent_task_id: String },
+
+    /// The parent is terminal or in a review-phase gate (review, merging):
+    /// that state never schedules a subtask.
+    #[error("task {parent_task_id} is in `{state}` and no longer accepts subtasks; add subtasks before the parent enters review, or create a new root Task")]
+    SubtaskParentClosed {
+        parent_task_id: String,
+        state: String,
+    },
 
     #[error("workspace reset required for task {task_id}: {reason}")]
     WorkspaceResetRequired { task_id: String, reason: String },

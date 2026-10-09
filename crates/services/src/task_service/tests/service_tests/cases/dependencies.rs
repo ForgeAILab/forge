@@ -630,6 +630,193 @@ async fn cancelled_prerequisite_durably_blocks_dependents_until_link_is_removed(
     assert!(unblocked.error_annotation.is_none());
 }
 
+/// A dependant parked on a failed run, with `count` prerequisites, all then
+/// cancelled. Returns the park's columns as they were before the blocker.
+async fn parked_dependant_with_cancelled_prerequisites(
+    db: &Arc<SqliteDb>,
+    service: &TaskService,
+    count: usize,
+) -> (Task, Vec<String>, (String, String)) {
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(db).await;
+    let mut prerequisites = Vec::new();
+    for index in 0..count {
+        let prerequisite = service
+            .create_task(
+                project_id.clone(),
+                format!("Prerequisite {index}"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("prerequisite creates");
+        prerequisites.push(prerequisite.id);
+    }
+    let dependent = service
+        .create_task(
+            project_id,
+            "Dependent work",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dependent creates");
+    let annotation = json!({
+        "type": "executor_failed",
+        "blocking_reason": "executor_failed",
+        "message": "the run failed",
+    })
+    .to_string();
+    let blocked = json!({
+        "reason": "the run failed",
+        "kind": "internal_command_failed",
+        "created_at": now_rfc3339(),
+    })
+    .to_string();
+    sqlx::query(
+        "UPDATE task SET status = 'in_progress', error_annotation = ?, blocked_json = ?,
+                version = version + 1
+         WHERE id = ?",
+    )
+    .bind(&annotation)
+    .bind(&blocked)
+    .bind(&dependent.id)
+    .execute(db.pool())
+    .await
+    .expect("dependant parks");
+    for prerequisite in &prerequisites {
+        service
+            .add_task_dependency(&dependent.id, prerequisite)
+            .await
+            .expect("dependency creates");
+    }
+    for prerequisite in &prerequisites {
+        service
+            .cancel_task(prerequisite.clone())
+            .await
+            .expect("prerequisite cancels");
+        service.drain(&dependent.id).await.unwrap();
+    }
+    let dependent = TaskRepo::get_by_id(&**db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
+    (dependent, prerequisites, (annotation, blocked))
+}
+
+fn dependency_blocker(task: &Task) -> serde_json::Value {
+    serde_json::from_str(task.blocked_json.as_deref().expect("durable blocker"))
+        .expect("blocker parses")
+}
+
+/// A second cancelled dependency joins the blocker without stashing the
+/// blocker itself, removing one of two keeps the Task blocked on the other,
+/// and removing the last puts the displaced park back exactly once.
+#[tokio::test]
+async fn cancelled_dependencies_keep_and_restore_the_displaced_park_once() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (dependent, prerequisites, (annotation, blocked)) =
+        parked_dependant_with_cancelled_prerequisites(&db, &service, 2).await;
+
+    let blocker = dependency_blocker(&dependent);
+    assert_eq!(
+        blocker["details"]["cancelled_dependency_ids"],
+        json!(prerequisites)
+    );
+    let superseded = &blocker["details"]["superseded"];
+    assert_eq!(superseded["status"], "in_progress");
+    assert_eq!(superseded["error_annotation"], json!(annotation));
+    assert_eq!(superseded["blocked_json"], json!(blocked));
+    assert!(
+        !superseded["blocked_json"]
+            .as_str()
+            .unwrap()
+            .contains("dependency_gate"),
+        "the blocker never stashes itself"
+    );
+
+    service
+        .remove_task_dependency(&dependent.id, &prerequisites[0])
+        .await
+        .expect("first dependency removes");
+    let still_blocked = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let blocker = dependency_blocker(&still_blocked);
+    assert_eq!(
+        blocker["details"]["cancelled_dependency_ids"],
+        json!([prerequisites[1]])
+    );
+    assert_eq!(
+        blocker["details"]["superseded"]["blocked_json"],
+        json!(blocked)
+    );
+
+    service
+        .remove_task_dependency(&dependent.id, &prerequisites[1])
+        .await
+        .expect("last dependency removes");
+    let restored = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.error_annotation.as_deref(), Some(&*annotation));
+    assert_eq!(restored.blocked_json.as_deref(), Some(&*blocked));
+
+    // Nothing is left to restore a second time.
+    service
+        .remove_task_dependency(&dependent.id, &prerequisites[1])
+        .await
+        .expect("removing an absent dependency is a no-op");
+    let again = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.version, restored.version);
+}
+
+/// The displaced park belongs to the state it was taken in. A dependant that
+/// was cancelled, or moved to another state, while it was blocked gets a
+/// clear condition when the dependency is removed, not the stale park.
+#[tokio::test]
+async fn a_displaced_park_is_not_restored_over_a_task_that_moved_on() {
+    for status in ["cancelled", "done", "review"] {
+        let db = Arc::new(sqlite_db().await);
+        let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+        let (dependent, prerequisites, _) =
+            parked_dependant_with_cancelled_prerequisites(&db, &service, 1).await;
+        sqlx::query("UPDATE task SET status = ?, version = version + 1 WHERE id = ?")
+            .bind(status)
+            .bind(&dependent.id)
+            .execute(db.pool())
+            .await
+            .expect("dependant moves on");
+
+        service
+            .remove_task_dependency(&dependent.id, &prerequisites[0])
+            .await
+            .expect("dependency removes");
+        let current = TaskRepo::get_by_id(&*db, &dependent.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(current.error_annotation.is_none(), "{status}");
+        assert!(current.blocked_json.is_none(), "{status}");
+        assert!(current.failed_json.is_none(), "{status}");
+    }
+}
+
 #[tokio::test]
 async fn test_user_claim_bypasses_capacity_check() {
     let db = Arc::new(sqlite_db().await);
