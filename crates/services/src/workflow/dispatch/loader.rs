@@ -53,7 +53,19 @@ pub async fn load_agent_dispatch_context(
         },
     )
     .await?
-    .items;
+    .items
+    .into_iter()
+    // "A lifecycle hook was not run" is Forge's note on the Task record for
+    // the people operating it. It is not an instruction and not something an
+    // agent can act on, so it stays out of the prompt.
+    .filter(|comment| {
+        !(comment.author_type == db::CommentAuthorType::System
+            && comment
+                .idempotency_key
+                .as_deref()
+                .is_some_and(|key| key.starts_with(crate::lifecycle::HOOK_NOT_RUN_COMMENT_KEY)))
+    })
+    .collect::<Vec<_>>();
     let prior_reviews = ReviewRepo::list_by_task(&*db, task_id).await?;
     let parent_task = match task.parent_task_id.as_deref() {
         Some(parent_task_id) => TaskRepo::get_by_id(&*db, parent_task_id, false).await?,

@@ -843,6 +843,51 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - `workspace reset required for task <id>: recorded worktree path <path> runs through a symbolic link` / `… is a symbolic link` (new).
   - Lifecycle hooks: `worktree of workspace <id> is missing or is not a Git worktree; lifecycle hook OnTaskDone was not run` is now `worktree of workspace <id> is not usable (<reason>); lifecycle hook on_task_done was not run`.
   - Cleanup: `repository <path> is recorded for this workspace and is not reachable right now; workspace cleanup will be retried` (new).
+- **A worktree left off its Task branch recovers by itself (3.4 stage B,
+  part 2).** When a launch, review, check, hook or delivery finds the Task
+  worktree on another branch or a detached HEAD, Forge now puts it back
+  instead of failing the step with `workspace reset required`. If HEAD is
+  strictly ahead of the Task branch (the agent committed on a detached HEAD,
+  or after an interrupted rebase finished), the Task branch is advanced to
+  HEAD and checked out: no commit, file or uncommitted change is lost. If
+  HEAD and the Task branch have diverged, HEAD's commits are kept under
+  `refs/forge/rescued/<task id>/<UTC timestamp>` in the worktree's
+  repository, one Forge comment on the Task names the ref and the commit, and
+  the worktree returns to the Task branch so the step continues; those
+  commits are not part of what is reviewed and delivered until someone brings
+  them in. The checkout is never forced: if it would overwrite uncommitted
+  changes, nothing moves and the Task gets `workspace reset required` naming
+  the ref. A directory that is gone or is not a worktree was already
+  recreated from the Task branch inside the same step; that, and the repairs
+  above, spend no review or retry budget and happen at most once per step.
+  Unchanged: HEAD behind the Task branch is checked out only for a launch on
+  a clean tree. `refs/forge/rescued/*` refs are never deleted by Forge.
+  Error text that changed or is new:
+  - `workspace reset required for task <id>: worktree HEAD is on <ref>, not on Task branch '<branch>'; its <n> commit(s) are kept under refs/forge/rescued/<task id>/<ts>, and checking the Task branch out failed (uncommitted changes would be overwritten)` (new).
+  - `… HEAD has <n> commit(s) that are not on the Task branch, so the branch was not checked out; move them onto the Task branch (or reset the workspace to discard them)` is no longer produced; the rare failures to advance the branch or write the ref say so instead.
+  - Task comment (new): `The Task worktree was on <ref> with <n> commit(s) that are not on Task branch '<branch>', which has <m> commit(s) they do not build on. Forge kept those commits under `refs/forge/rescued/…` (<sha>) and put the worktree back on the Task branch. …`
+- **Every launch checks the workspace the same way (3.4 stage B, part 2).**
+  A claim on a server-owned workspace that is already ready now goes through
+  `WorkspaceManager::ensure_valid` instead of the backend's own check, and the
+  execution runner checks again at launch, so CLI executors get the guard
+  native executors had: a deleted directory is recreated and an off-branch
+  worktree is put back before anything is started there. Before, a CLI
+  executor could be started on whatever HEAD the worktree was left on. The
+  healthy claim costs one Git process instead of three. The native executor's
+  own check now uses the server's workspace root and repository-cache locks.
+  The terminal and the evidence-capture tool inspect the worktree first: a
+  directory that is present but is not the Task's worktree is refused (the
+  terminal with its existing path-guardrail error, evidence capture with
+  `Task workspace is unavailable: its worktree is not usable`). Plan,
+  staged-plan and execution-outbox files, which sit beside the worktree, are
+  read as before whether or not the worktree is there. A worktree that
+  belongs to a repository other than the recorded one is used as it is when
+  no recorded repository has the Task branch (a worktree made before its Repo
+  moved to another location); part 1 asked for a reset there. No REST, MCP,
+  event or CLI shape changes.
+- **The "lifecycle hook was not run" comment stays out of agent prompts (3.4
+  stage B, part 2).** It was loaded into coder, worker and read-only prompts
+  with the Task's other comments. It is still on the Task.
 - **A lifecycle hook that could not run is recorded on the Task (3.4 stage B,
   part 1).** When a script hook is skipped because the Task worktree is not
   usable, or cannot be started on its workspace owner, Forge now adds one

@@ -984,7 +984,7 @@ const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     // Manager and backend internals.
     ("services/src/workspace_manager.rs", 3),
     ("services/src/task_service/workspace.rs", 2),
-    ("services/src/workspace_backend/embedded.rs", 5),
+    ("services/src/workspace_backend/embedded.rs", 4),
     ("services/src/workspace_backend/review.rs", 10),
     ("review/src/workspace.rs", 2),
     // Pending conversion: owned by another job while this one landed.
@@ -1019,7 +1019,7 @@ fn raw_workspace_path_getter_uses_are_exactly_the_recorded_ones() {
         .collect::<Vec<_>>();
     recorded.sort();
     assert_eq!(found, recorded);
-    assert_eq!(found.iter().map(|(_, uses)| uses).sum::<usize>(), 26);
+    assert_eq!(found.iter().map(|(_, uses)| uses).sum::<usize>(), 25);
 }
 
 fn raw_path_uses(source: &str) -> usize {

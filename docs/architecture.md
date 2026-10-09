@@ -3563,9 +3563,9 @@ directory from a transient Git failure):
 |---|---|---|
 | Linked worktree, HEAD on the Task branch (or mid-rebase) | valid; a stale cleanup deadline is cleared | valid |
 | Directory missing, or present and unusable by Git | repaired or recreated from the Task branch (as above) | `Absent`; disk and the workspace row are untouched (a legacy row with no placement still gets its server placement recorded) |
-| Linked worktree of a repository other than the recorded one | moved aside as `<name>.broken-<ms>` and recreated from the Task branch; never relinked | `Absent` |
+| Linked worktree of a repository other than the recorded one | moved aside as `<name>.broken-<ms>` and recreated from the Task branch; never relinked. When no recorded repository has the Task branch (a worktree made before its Repo moved to another location), the worktree is the only home of the Task's work and is used as it is | `Absent`, or valid in the same exception |
 | The worktree path, or its Task root, is a symbolic link | `ResetRequired`; nothing is used, moved or deleted | `Absent` |
-| HEAD on another branch or detached, Task branch exists, no rebase in progress | Decided by what a checkout would lose. HEAD has commits the Task branch lacks: `ResetRequired` for every purpose, naming the count, because a checkout would leave them unreachable from the branch Forge reviews and delivers. HEAD is the Task branch's own commit: `git checkout <Task branch>` for every purpose, since no file changes and local changes are kept. HEAD is behind the Task branch: `Execute` checks the branch out when the tree is clean, else `ResetRequired`; the others return `ResetRequired`, so a candidate is never moved under them. `Reset` is the exception to all three: it returns the worktree as it is, flagged off-branch, for the caller's `git reset --hard HEAD` | valid, flagged off-branch |
+| HEAD on another branch or detached, Task branch exists, no rebase in progress | Put back on the Task branch without losing a commit. HEAD is the Task branch's own commit: `git checkout <Task branch>`; no file changes and local changes are kept. HEAD is strictly ahead of the Task branch (commits made on a detached HEAD, or after an interrupted rebase finished): the Task branch is advanced to HEAD with a compare-and-swap `git update-ref` and checked out; no file changes, local changes are kept (`Repair::FastForwardedTaskBranch`). HEAD and the Task branch have diverged: HEAD's commit is kept under `refs/forge/rescued/<task id>/<UTC timestamp>` in the worktree's repository, one Forge comment on the Task names the ref and the commit, and the Task branch is checked out (`Repair::RescuedOffBranchCommits`); the checkout is never forced, so when it would overwrite uncommitted changes nothing moves and the result is `ResetRequired` naming the ref. One ref and one comment per rescued commit, however often the state is seen. HEAD is behind the Task branch: `Execute` checks the branch out when the tree is clean, else `ResetRequired`; the others return `ResetRequired`. `Reset` is the exception to all of these: it returns the worktree as it is, flagged off-branch, for the caller's `git reset --hard HEAD` | valid, flagged off-branch |
 | Worktree and Task branch both gone | `ResetRequired`; the row is kept, except on the owning Task's launch path, which forgets it so the next launch starts from the default branch. A worktree of another repository that Git can still use is never forgotten | `Absent` |
 | Row not `ready` | `workspace for task … is not ready` | reports the disk as above |
 
@@ -3577,29 +3577,56 @@ deleted (a workspace outlives it); only a repair needs the row and reports
 `repo not found`. A Repo row of another Project is refused for every state. A directory that is a repository of its own, rather than a linked
 worktree, is not rejected yet. Daemon-owned placements keep the describe /
 prepare contract described above; the manager never interprets their handle.
-Callers: every `prepare_workspace` path (`Execute`: workspace creation, the
-reviewer cascade, retry-entry refresh, and claim when the owner reports the
-workspace missing), the native executor at the start of a turn (`Execute`),
-reassignment reset (`Reset`), review entry CI (`Check`), review rerun
-(`Review`), blocking `before_work` hooks (`Hook`), merge delivery and
-target-moved rebase (`Integrate`), and the lifecycle emitter (`Inspect`). A
-claim on a placement that is already `ready` still asks the backend's
-`describe` and does not go through the manager when the workspace exists. One
-Task run makes about four to eight manager calls (a blocking `before_work`
-hook, entry CI, a native turn start per execution, delivery, a rebase when the
-target moved, and one `Inspect` per lifecycle event that has script hooks).
-`ResetRequired` is never repaired by the caller: each one records its existing
-typed result (the `workspace_reset_required` annotation, the CI interruption
-with its entry barrier, a failed hook, a merge failure) and stops, so there is
-no reset-and-retry loop and no automatic recreation; the explicit workspace
-reset clears it. A source-scan test,
+Callers: every claim on a `ready` server placement (`Execute`; the launch guard
+all executor families share, CLI executors included), every `prepare_workspace`
+path (`Execute`: workspace creation, the reviewer cascade, retry-entry
+refresh), the execution runner at launch and the provider start parameters
+(`Execute`), the native executor at the start of a turn (`Execute`, with the
+Task service's workspace root and repository-cache locks), reassignment reset
+(`Reset`), review entry CI (`Check`), review rerun (`Review`), blocking
+`before_work` hooks (`Hook`), merge delivery and target-moved rebase
+(`Integrate`), and three read-only users (`Inspect`): the lifecycle emitter,
+the terminal before a shell opens, and evidence capture from a worktree file.
+A claim on a daemon placement still asks its owner's `describe`. One Task run
+with one coding execution and one review makes about seven to ten manager
+calls, each one Git process on a healthy worktree: claim (1, replacing the
+three Git processes of the backend `describe` it used before), runner launch
+(1), native turn start (1 per turn, native executors only), a blocking
+`before_work` hook (1), entry CI (1), review rerun or reviewer cascade (1),
+delivery (1), a rebase when the target moved (1), and one `Inspect` per
+lifecycle event that has script hooks.
+
+Repairs happen inside the call, once: a step that finds its directory gone or
+unusable gets it recreated from the Task branch and proceeds; a worktree off
+the Task branch is put back as in the table. None of this writes a Task row,
+so no review or retry budget is spent. What is left as `ResetRequired` cannot
+be repaired without losing something or without an operator decision (the
+Task branch is gone too, a symbolic link in the path, HEAD behind the Task
+branch under a step that must not move the tree, a checkout that would
+overwrite uncommitted changes). Callers do not retry it: each records its
+existing typed result and stops, so there is no reset loop. A claim fails the
+Task with `workspace_reset_required` / `workspace_failed`; a blocking
+`before_work` hook records the `workspace_reset_required` annotation and
+fails; review entry CI records the CI interruption with its entry barrier
+without charging the CI infrastructure budget; delivery and rebase return a
+merge failure of kind `workspace_error`. The explicit workspace reset, then
+the Task's `retry`, clears it.
+
+Files that sit beside the worktree in the Task root (the canonical plan,
+staged plans, execution outboxes) are located through
+`workspace_manager::task_root_anchor`. They outlive the worktree, so they are
+read and discarded whether or not the worktree is usable; the readers confine
+each file to the Task root themselves. A source-scan test,
 `workspace_manager::tests::raw_workspace_path_getters_have_no_new_callers`,
 records an upper bound per file for the remaining non-test uses of the raw
 path getters (`ResolvedWorkspace::embedded_path`,
-`Workspace::embedded_worktree_path_for_backend`,
-`EmbeddedWorkspaceBackend::recorded_server_path`). It fails when a file that
+`Workspace::embedded_worktree_path_for_backend`;
+`EmbeddedWorkspaceBackend::recorded_server_path` no longer exists). It fails when a file that
 is not listed uses one, or a listed file uses more than recorded; fewer uses
-pass.
+pass. `raw_workspace_path_getter_uses_are_exactly_the_recorded_ones` pins the
+exact set: the manager and the owner-local backends, plus `merge_service.rs`
+(2), `task_actions.rs` (1) and the admission-failure cleanup in
+`task_service.rs` (1).
 
 States progress from `reserved` to `preparing` to `ready`,
 which can become `disconnected`, then back to `ready` after reconciliation.
@@ -5418,7 +5445,8 @@ another repository or sits behind a symbolic link, the hook is not run, the
 emitter reports `workspace reset required`, and Forge adds one system comment
 to the Task saying which hook was not run and why (one per event, workspace and
 execution; a hook that could not be started on its owner is recorded the same
-way). It never runs in the user's own checkout instead.
+way). It never runs in the user's own checkout instead. That comment is for
+the Task record; agent prompt loading leaves it out.
 The primary-checkout context is used only where no worktree is expected: before
 the workspace is prepared, and when the directory is gone while or after Forge
 reclaims it (workspace `cleaning` or `cleaned`). Hooks run from the event bus

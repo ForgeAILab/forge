@@ -403,7 +403,7 @@ impl CoordinationToolProvider {
         }
     }
 
-    fn task_service_handle(&self) -> Option<Arc<TaskService>> {
+    pub(crate) fn task_service_handle(&self) -> Option<Arc<TaskService>> {
         self.task_service.read().ok().and_then(|slot| slot.clone())
     }
 
