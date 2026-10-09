@@ -85,9 +85,15 @@ impl CrashRecovery {
 
     #[tracing::instrument(skip(self))]
     pub async fn run_recovery(&self) -> Result<u64> {
-        crate::integration_owner::ServerIntegrationOwner::new(self.db.clone())
+        // Attempt receipts are bookkeeping; a failure to settle them must not
+        // stop crash recovery of executions, grants and Tasks. An intent left
+        // here is settled by the next admission on its checkout.
+        if let Err(error) = crate::integration_owner::ServerIntegrationOwner::new(self.db.clone())
             .reconcile_outstanding()
-            .await?;
+            .await
+        {
+            tracing::warn!(target: "services::recovery", %error, "integration attempt reconciliation failed at startup");
+        }
         // A server restart loses its sockets, not the CLI running on an owner.
         // Persist that suspension before either execution or grant recovery.
         for placement in

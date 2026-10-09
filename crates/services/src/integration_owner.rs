@@ -88,14 +88,21 @@ impl ServerIntegrationOwner {
             .outstanding_integration_effects("server", None)
             .await?
         {
+            // Only intents sharing an owner lock with the coming effect are
+            // its business. A rebase or check locks its workspace alone, so it
+            // must not queue behind another workspace's in-flight merge.
+            let workspace_only = |request: &IntegrationEffectRequest| {
+                matches!(
+                    request.kind,
+                    IntegrationOperationKind::Rebase | IntegrationOperationKind::Check
+                )
+            };
             if current.is_some_and(|current| {
                 current.fence.target_owner["location_id"]
                     != request.fence.target_owner["location_id"]
-                    || (matches!(
-                        request.kind,
-                        IntegrationOperationKind::Rebase | IntegrationOperationKind::Check
-                    ) && request.witness["workspace"]["handle"]
-                        != current.witness["workspace"]["handle"])
+                    || ((workspace_only(&request) || workspace_only(current))
+                        && request.witness["workspace"]["handle"]
+                            != current.witness["workspace"]["handle"])
             }) {
                 continue;
             }
@@ -114,6 +121,13 @@ impl ServerIntegrationOwner {
             let result = self.server_reconciliation_result(&request).await;
             let (result, state) = match result {
                 Ok(Some(result)) => (result, IntegrationOperationState::Succeeded),
+                // This owner holds the checkout lock, so a Task-step guard is
+                // gone. Its unproven effect settles terminally: today's step
+                // recovery re-reads Git and decides whether to repeat it. An
+                // uncertain receipt would refuse every later merge here.
+                Ok(None) | Err(_) if db::is_task_step(&request) => {
+                    (db::superseded_result(), IntegrationOperationState::Failed)
+                }
                 Ok(None) | Err(_) => (
                     json!({"kind":"infrastructure","message":"owner effect has no exact completion proof","head_sha":null,"rebase_in_progress":true}),
                     IntegrationOperationState::Uncertain,
@@ -249,7 +263,11 @@ impl ServerIntegrationOwner {
         else {
             return Ok(None);
         };
-        self.reconcile_checkout(Some(&request)).await?;
+        // Reconciliation is bookkeeping for a recorder: admission below settles
+        // any Task-step intent it could not, so a failure here never blocks.
+        if let Err(error) = self.reconcile_checkout(Some(&request)).await {
+            tracing::warn!(target: "services::integration_owner", %error, "integration reconciliation before a Task-step effect failed");
+        }
         Ok(Some(
             match self.db.begin_integration_effect(request).await? {
                 IntegrationEffectAdmission::Started(mut guard) => {
@@ -257,16 +275,19 @@ impl ServerIntegrationOwner {
                         return Ok(Some(IntegrationEffectAdmission::Refused(refusal)));
                     }
                     if guard.server_workspace_paths().await?.is_none() {
-                        let receipt = guard
+                        // The shadow attempt no longer describes this Task's
+                        // placement or target (it is passive until activation).
+                        // The step lease was verified above, so the Task-step
+                        // effect proceeds unrecorded instead of being refused.
+                        guard
                             .record(
                                 json!({"kind":"refused","reason":"witness_mismatch"}),
                                 IntegrationOperationState::Failed,
                             )
                             .await?;
-                        IntegrationEffectAdmission::Replay(receipt)
-                    } else {
-                        IntegrationEffectAdmission::Started(guard)
+                        return Ok(None);
                     }
+                    IntegrationEffectAdmission::Started(guard)
                 }
                 admission => admission,
             },

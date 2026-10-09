@@ -4973,9 +4973,13 @@ last fence check/start checkpoint → Git outside SQLite → short receipt trans
 `IntegrationEffectGuard` holds an in-process owner lock, not a write transaction.
 The durable intent distinguishes `started:false` from a potentially performed
 effect. A refusal after intent commit settles `not_performed`; an abandoned
-unstarted intent is reconciled the same way. A started intent never authorizes
-another effect without owner receipt lookup. A checkout with another unresolved
-started intent refuses a new effect. Receipt identity remains
+unstarted intent is reconciled the same way. A queue claim's started intent never
+authorizes another effect without owner receipt lookup, and a checkout with
+another unresolved started queue intent refuses a new effect. A Task-step intent
+never refuses anything (see "Task-step intents always settle" below). Only
+intents that share an owner lock are compared: a rebase or check locks its
+workspace alone, so one Task's rebase neither waits on nor is refused by another
+Task's in-flight merge into the same checkout. Receipt identity remains
 `(attempt_id, operation_kind, fence)` with the entire request checked against reuse.
 An uncertain receipt is replaced on reconciliation, not appended as a second
 receipt for the same key. An original owner can retain its receipt after lease
@@ -5013,14 +5017,55 @@ Review and Project edits; a queue owner guard does not replace that contract.
 On server recovery, local intents are reconciled before Task recovery. Before a
 new local effect, the same owner lock waits for any live effect to retain its
 receipt. A restarted server can prove an exact reviewed queue merge from the frozen
-candidate/target refs. Task-step reconciliation keeps today's existing ancestry
-and committed-rebase recovery proofs; unknown effects retain an uncertain receipt
-and their intent. On reconnect, the workspace client reconciles daemon attempt intents
+candidate/target refs. A queue claim's unknown effect retains an uncertain receipt
+and its intent. On reconnect, the workspace client reconciles daemon attempt intents
 before ordinary execution receipts and any new effect. The owner returns its
 retained receipt. An absent owner intent is fenced against delayed delivery and
 settles `not_performed`; an interrupted merge needs exact object proof. Receipt
 validation and attempt persistence precede ACK. No Git effect is repeated to
 reconstruct a result.
+
+**Task-step intents always settle.** Today's merge and rebase are bound to the
+Task step's lease (`lease_owner = task-step:<step id>`, `generation` = the step's
+claim count), not to a queue claim, and the Task step already owns recovery of
+its effect: the durable `merge_intent` / `merge_outcome` / `rebase_target` /
+`rebase_outcome` hook effects, the idempotent already-merged check, and
+interrupted-rebase recovery. The attempt receipt is therefore a record of the
+effect and never its result or a precondition of the next one:
+
+- A recorder error, a missing/oversized/contradictory owner receipt and a failed
+  receipt write are logged; the merge or rebase result the Task step computed is
+  returned unchanged. An error result is recorded `failed`, never `uncertain`.
+- A started Task-step intent whose guard is gone (server crash, dropped future,
+  daemon that never answered) is settled `failed` with an `infrastructure`
+  result by whichever comes first: startup reconciliation, the reconnect pass,
+  or the next admission that takes the same owner lock, which holds the lock the
+  dead guard held and so knows the effect is not running here. It never returns
+  `ReconciliationRequired`.
+- Reconciliation before a Task-step effect, at startup and on daemon reconnect
+  is best effort: a failure is logged and neither crash recovery, the reconnect
+  pass for run/merge intents, nor the effect is stopped.
+- When the shadow attempt no longer matches the Task's placement or target
+  branch, the step lease is still verified and the effect proceeds unrecorded.
+- On the daemon, a Task-step effect is not held to the location version (the
+  server changes it without telling the owner; only a queue claim freezes it),
+  and a Task-step journal intent left without an outcome by a daemon restart is
+  settled as interrupted, with a receipt, by the next Task-step request on that
+  checkout instead of refusing it.
+
+| Durable state (Task-step binding) | What moves it | When | Ends as |
+|---|---|---|---|
+| intent written, not started | startup / reconnect reconciliation, or the next admission on the checkout | next server start, daemon reconnect, or next merge/rebase there | receipt `failed` / `not_performed`; Task step retried by its lease |
+| intent started, guard alive | the effect itself; today's deadlines and protected completion | bounded by the step | receipt `succeeded` or `failed` |
+| intent started, guard gone | same three passes as above | next server start, reconnect, or next admission (step lease expiry reclaims the step) | receipt `failed` / `infrastructure`; step recovery re-reads Git |
+| owner receipt missing or invalid | settled at the reply, else by the lookup, else by the next admission | immediately, or as above | receipt `failed` / `infrastructure`; owner result still returned |
+| daemon journal intent without outcome | server lookup, else the next Task-step request on that checkout | reconnect, or next request | journal outcome `interrupted` plus receipt |
+| daemon never reconnects | today's owner-disconnected timeout fails the placement; machine removal settles the attempt | existing timeout / operator removal | receipt `failed` / `infrastructure`, Task handled by placement recovery |
+| machine or location removed mid-effect | the remover's transaction | at removal | receipt `failed`, attempt `parked` (or still `quarantined`), queue `suspended` |
+| queue `suspended` / attempt `quarantined` | nothing automatic: no worker runs before activation, and today's Task-step path does not read queue state | n/a | passive rows; stage D owns their exits |
+
+Queue-claim (`attempt`) intents keep the strict rule (uncertain until the owner's
+receipt). No production caller creates one before activation.
 
 Machine removal and permitted location deletion settle in-flight attempts with
 an infrastructure receipt/failure in the remover's transaction, suspend their

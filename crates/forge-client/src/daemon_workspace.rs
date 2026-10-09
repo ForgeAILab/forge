@@ -528,6 +528,8 @@ impl DaemonWorkspaceBackend {
             }
             true
         } else {
+            self.settle_orphaned_task_step_effect(&fence, &params)
+                .await?;
             self.admit_integration(&fence, method, &params)?;
             self.check_owner(&fence.daemon_id, &fence.runtime_id)?;
             if let Some((_, workspace)) = &existing {

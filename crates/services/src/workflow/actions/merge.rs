@@ -554,9 +554,14 @@ pub(crate) async fn target_moved_result(
                             if let Some(db::IntegrationEffectAdmission::Started(guard)) = admission {
                                 let (receipt, state) = match &result {
                                     Ok(outcome) => (crate::integration_owner::OwnerRebaseReceipt::Completed { outcome: outcome.clone() }, db::IntegrationOperationState::Succeeded),
-                                    Err(error) => (crate::integration_owner::OwnerRebaseReceipt::Infrastructure { message: crate::integration_effects::check::tail_bytes(&error.to_string(), 4096), head_sha: None, rebase_in_progress: true }, db::IntegrationOperationState::Uncertain),
+                                    Err(error) => (crate::integration_owner::OwnerRebaseReceipt::Infrastructure { message: crate::integration_effects::check::tail_bytes(&error.to_string(), 4096), head_sha: None, rebase_in_progress: true }, db::IntegrationOperationState::Failed),
                                 };
-                                guard.record(serde_json::json!(receipt), state).await?;
+                                // A record of the effect, never its result. A
+                                // failed rebase settles terminally: interrupted
+                                // rebase recovery decides the repeat.
+                                if let Err(error) = guard.record(serde_json::json!(receipt), state).await {
+                                    tracing::warn!(target: "services::workflow::merge", task_id = %ctx.task_id, %error, "rebase attempt receipt was not recorded");
+                                }
                             }
                             result?
                         }

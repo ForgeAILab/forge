@@ -91,6 +91,10 @@ async fn lock_owner(request: &IntegrationEffectRequest) -> Vec<tokio::sync::Owne
 }
 
 impl IntegrationEffectGuard {
+    pub fn request(&self) -> &IntegrationEffectRequest {
+        &self.request
+    }
+
     /// The last durable fence check, immediately before owner-side Git probes.
     /// A refused request is settled as not performed in the same transaction.
     pub async fn start(&mut self) -> Result<Option<IntegrationEffectRefusal>> {
@@ -132,6 +136,18 @@ impl IntegrationEffectGuard {
         tx.commit().await?;
         Ok(receipt)
     }
+}
+
+/// Today's Task-step recorders are bound to the step lease, not a queue lease.
+pub fn is_task_step(request: &IntegrationEffectRequest) -> bool {
+    request.fence.lease_owner.starts_with("task-step:")
+}
+
+/// Terminal settlement of a Task-step intent whose guard is gone before its
+/// receipt. It records that this owner made no claim about the effect; the
+/// Task step's own recovery decides whether to repeat it.
+pub fn superseded_result() -> Value {
+    serde_json::json!({"kind":"infrastructure","message":"task step ended before its effect receipt; step recovery decides whether to repeat","head_sha":null,"rebase_in_progress":true})
 }
 
 fn make_receipt(
@@ -487,18 +503,35 @@ impl SqliteDb {
                 .await?;
         if let Some(existing) = existing {
             let intent = parse_json(existing)?;
-            if intent["started"] == false {
-                let original: IntegrationEffectRequest =
-                    serde_json::from_value(intent["request"].clone())
-                        .map_err(|e| DbError::Check(e.to_string()))?;
-                let same_request = original == request;
-                let same_key = original.fence == request.fence && original.kind == request.kind;
-                let receipt = make_receipt(
-                    original,
-                    serde_json::json!({"kind":"not_performed"}),
-                    IntegrationOperationState::Failed,
-                );
-                record_in_tx(&mut tx, &receipt).await?;
+            let original: IntegrationEffectRequest =
+                serde_json::from_value(intent["request"].clone())
+                    .map_err(|e| DbError::Check(e.to_string()))?;
+            let started = intent["started"] != false;
+            let task_step = is_task_step(&original);
+            // A queue lease's started intent is an unknown effect: only its
+            // owner's receipt may settle it. A Task-step intent is different:
+            // this caller holds the owner lock that the step's guard held, so
+            // that guard is gone, and today's step recovery (durable hook
+            // effects, idempotent merge, interrupted-rebase recovery) decides
+            // whether the effect is repeated. It settles here, never blocks.
+            if started && !task_step {
+                return Ok(IntegrationEffectAdmission::Refused(
+                    IntegrationEffectRefusal::ReconciliationRequired,
+                ));
+            }
+            let same_request = original == request;
+            let same_key = original.fence == request.fence && original.kind == request.kind;
+            let receipt = make_receipt(
+                original,
+                if started {
+                    superseded_result()
+                } else {
+                    serde_json::json!({"kind":"not_performed"})
+                },
+                IntegrationOperationState::Failed,
+            );
+            record_in_tx(&mut tx, &receipt).await?;
+            if same_key || !task_step {
                 tx.commit().await?;
                 return Ok(if same_request {
                     IntegrationEffectAdmission::Replay(receipt)
@@ -510,9 +543,6 @@ impl SqliteDb {
                     })
                 });
             }
-            return Ok(IntegrationEffectAdmission::Refused(
-                IntegrationEffectRefusal::ReconciliationRequired,
-            ));
         }
         let other_intents: Vec<String> = sqlx::query_scalar("SELECT effect_intent_json FROM integration_attempt WHERE id<>? AND effect_intent_json IS NOT NULL AND json_extract(effect_intent_json,'$.request.fence.target_owner.location_id')=? AND json_extract(effect_intent_json,'$.request.fence.target_owner.owner_kind')=?")
             .bind(&request.fence.attempt_id).bind(request.fence.target_owner["location_id"].as_str()).bind(request.fence.target_owner["owner_kind"].as_str()).fetch_all(&mut *tx).await?;
@@ -521,15 +551,23 @@ impl SqliteDb {
             let original: IntegrationEffectRequest =
                 serde_json::from_value(intent["request"].clone())
                     .map_err(|e| DbError::Check(e.to_string()))?;
-            if matches!(
+            // Only an intent whose owner lock this caller holds can be judged
+            // here. A rebase or check locks its own workspace alone, so it
+            // neither blocks nor is blocked by another workspace's effect
+            // (two Tasks, one merging and one rebasing, is the normal case).
+            if (matches!(
                 original.kind,
                 IntegrationOperationKind::Rebase | IntegrationOperationKind::Check
-            ) && original.witness["workspace"]["handle"]
+            ) || matches!(
+                request.kind,
+                IntegrationOperationKind::Rebase | IntegrationOperationKind::Check
+            )) && original.witness["workspace"]["handle"]
                 != request.witness["workspace"]["handle"]
             {
                 continue;
             }
-            if intent["started"] != false {
+            let started = intent["started"] != false;
+            if started && !is_task_step(&original) {
                 return Ok(IntegrationEffectAdmission::Refused(
                     IntegrationEffectRefusal::ReconciliationRequired,
                 ));
@@ -538,7 +576,11 @@ impl SqliteDb {
                 &mut tx,
                 &make_receipt(
                     original,
-                    serde_json::json!({"kind":"not_performed"}),
+                    if started {
+                        superseded_result()
+                    } else {
+                        serde_json::json!({"kind":"not_performed"})
+                    },
                     IntegrationOperationState::Failed,
                 ),
             )
@@ -781,6 +823,210 @@ mod tests {
             .unwrap()
             .head_attempt_id
             .is_none());
+    }
+
+    /// One Task-step fixture: a ready server placement, a shadow attempt and
+    /// a claimable merging step for `task`.
+    async fn task_step_fixture(db: &SqliteDb, task: &str) {
+        use crate::TaskStepRepo;
+        crate::integration_queue::tests::seed_delivery(db, task).await;
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES(?,?,?,'server','l',?,1,'ready','scheduler','{}',?,?)").bind(format!("pl-{task}")).bind(format!("w-{task}")).bind(task).bind(format!("tree-{task}")).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let q = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        db.admit_integration_attempt(admission(&q, task, &format!("shadow-{task}")))
+            .await
+            .unwrap();
+        db.enqueue_step(&crate::EnqueueTaskStep {
+            id: format!("step-{task}"),
+            task_id: task.into(),
+            kind: "hooks".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: format!("step-{task}"),
+            chain_id: format!("chain-{task}"),
+            chain_position: 1,
+            expected_status: "merging".into(),
+            expected_version: 1,
+            expected_epoch: Some(0),
+            lane: "long".into(),
+            available_at: now,
+        })
+        .await
+        .unwrap();
+    }
+    fn task_step_witness(task: &str, head: &str) -> Value {
+        serde_json::json!({"workspace":{"workspace_id":format!("w-{task}"),"placement_id":format!("pl-{task}"),"generation":1,"owner":{"kind":"server"},"handle":format!("tree-{task}")},"target_branch":"main","expected_head_sha":head,"expected_target_sha":"target"})
+    }
+    async fn claim(db: &SqliteDb, task: &str) -> crate::TaskStep {
+        use crate::TaskStepRepo;
+        sqlx::query("UPDATE task_step SET lease_until='2000-01-01T00:00:00Z' WHERE task_id=? AND status='claimed'")
+            .bind(task)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.claim_step("owner", Some(task), "2099-01-01T00:00:00Z")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The wedge this guards: a Task-step merge that started and never wrote a
+    /// receipt (crash, dropped future, failed receipt write) used to leave an
+    /// intent that refused the Task's next claim and every other Task's merge
+    /// on the same checkout with `ReconciliationRequired`, forever.
+    #[tokio::test]
+    async fn orphaned_task_step_intent_never_refuses_a_later_claim_or_another_task() {
+        let db = fixture().await;
+        task_step_fixture(&db, "a").await;
+        task_step_fixture(&db, "b").await;
+        let first = claim(&db, "a").await;
+        let orphan = crate::task_writer::in_task_step(first, async {
+            let request = db
+                .task_step_integration_request(
+                    "w-a",
+                    IntegrationOperationKind::Merge,
+                    task_step_witness("a", "head-1"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let IntegrationEffectAdmission::Started(mut guard) =
+                db.begin_integration_effect(request.clone()).await.unwrap()
+            else {
+                panic!("first claim not admitted");
+            };
+            assert!(guard.start().await.unwrap().is_none());
+            // The step dies between the started intent and its receipt.
+            drop(guard);
+            request
+        })
+        .await;
+
+        // Another Task merges into the same checkout: admitted, not refused.
+        let other = claim(&db, "b").await;
+        crate::task_writer::in_task_step(other, async {
+            let request = db
+                .task_step_integration_request(
+                    "w-b",
+                    IntegrationOperationKind::Merge,
+                    task_step_witness("b", "head-b"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let IntegrationEffectAdmission::Started(mut guard) =
+                db.begin_integration_effect(request).await.unwrap()
+            else {
+                panic!("another Task's merge was refused by an orphaned intent");
+            };
+            assert!(guard.start().await.unwrap().is_none());
+            guard
+                .record(
+                    serde_json::json!({"kind":"completed"}),
+                    IntegrationOperationState::Succeeded,
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+        let settled = db
+            .integration_effect_receipt(&orphan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.operation_state, IntegrationOperationState::Failed);
+        assert_eq!(settled.result["kind"], "infrastructure");
+        let attempt = db
+            .integration_attempt(&orphan.fence.attempt_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(attempt.effect_intent_json.is_none());
+
+        // The same Task's next claim (a new step attempt) is admitted too,
+        // both after a settled orphan and directly over a fresh one.
+        for head in ["head-2", "head-3"] {
+            let next = claim(&db, "a").await;
+            crate::task_writer::in_task_step(next, async {
+                let request = db
+                    .task_step_integration_request(
+                        "w-a",
+                        IntegrationOperationKind::Merge,
+                        task_step_witness("a", head),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let IntegrationEffectAdmission::Started(mut guard) =
+                    db.begin_integration_effect(request).await.unwrap()
+                else {
+                    panic!("the Task's next claim was refused by its own orphaned intent");
+                };
+                assert!(guard.start().await.unwrap().is_none());
+            })
+            .await;
+        }
+    }
+
+    /// Two Tasks on one checkout, one merging and one rebasing after a target
+    /// move, is the normal contended case. A rebase locks only its workspace,
+    /// so another workspace's in-flight merge must not refuse it.
+    #[tokio::test]
+    async fn in_flight_merge_does_not_refuse_another_workspaces_rebase() {
+        let db = fixture().await;
+        task_step_fixture(&db, "a").await;
+        task_step_fixture(&db, "b").await;
+        let merging = claim(&db, "a").await;
+        let held = crate::task_writer::in_task_step(merging, async {
+            let request = db
+                .task_step_integration_request(
+                    "w-a",
+                    IntegrationOperationKind::Merge,
+                    task_step_witness("a", "head"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let IntegrationEffectAdmission::Started(mut guard) =
+                db.begin_integration_effect(request).await.unwrap()
+            else {
+                panic!("merge not admitted");
+            };
+            assert!(guard.start().await.unwrap().is_none());
+            guard
+        })
+        .await;
+        let rebasing = claim(&db, "b").await;
+        crate::task_writer::in_task_step(rebasing, async {
+            let request = db
+                .task_step_integration_request(
+                    "w-b",
+                    IntegrationOperationKind::Rebase,
+                    task_step_witness("b", "head-b"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let admission = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                db.begin_integration_effect(request),
+            )
+            .await
+            .expect("a rebase waited on another workspace's merge")
+            .unwrap();
+            assert!(matches!(admission, IntegrationEffectAdmission::Started(_)));
+        })
+        .await;
+        // The in-flight merge was neither settled nor disturbed.
+        held.record(
+            serde_json::json!({"kind":"completed"}),
+            IntegrationOperationState::Succeeded,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

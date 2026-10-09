@@ -24,6 +24,54 @@ impl DaemonWorkspaceBackend {
             .to_owned()
     }
 
+    /// A Task-step effect left without an outcome by an owner restart would
+    /// refuse every later effect on its checkout, and nothing looks it up once
+    /// its step has moved on. The caller holds this checkout's lock, so that
+    /// effect is not running: settle it as interrupted, with a receipt, and let
+    /// the new request through. A queue claim's intent is left for its lookup.
+    pub(super) async fn settle_orphaned_task_step_effect(
+        &self,
+        fence: &WorkspaceMutationFence,
+        params: &Value,
+    ) -> CommandResult<()> {
+        if !matches!(
+            fence.integration,
+            WorkspaceIntegrationBinding::TaskStepEffect { .. }
+        ) {
+            return Ok(());
+        }
+        let checkout = self.checkout_key(params);
+        let pending = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .integration_pending
+            .get(&checkout)
+            .cloned();
+        let Some(pending) = pending.filter(|pending| pending != &fence.operation_id) else {
+            return Ok(());
+        };
+        let Some(mut operation) = self.journal.operation(&pending).map_err(storage_error)? else {
+            return Ok(());
+        };
+        if operation.outcome.is_some()
+            || !matches!(
+                operation.fence.integration,
+                WorkspaceIntegrationBinding::TaskStepEffect { .. }
+            )
+        {
+            return Ok(());
+        }
+        operation.outcome = Some(Err(interrupted_error(&pending)));
+        let uncertain = operation.effect_started;
+        self.attach_integration_receipt(&mut operation, None, uncertain)
+            .await;
+        self.journal
+            .finish_operation(&operation)
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
     pub(super) fn admit_integration(
         &self,
         fence: &WorkspaceMutationFence,
@@ -100,13 +148,21 @@ impl DaemonWorkspaceBackend {
             .locations
             .get(location_id)
             .ok_or_else(|| refusal(IntegrationOwnerRefusal::ForeignOwner))?;
+        // A queue claim freezes the location generation it resolved. A Task
+        // step is bound to its step lease and placement instead: the server
+        // bumps a location's version for reasons this owner is never told
+        // (default toggles, provisioning notes), and the copy held here is
+        // only refreshed by a verify, so comparing it would refuse a live
+        // Task's merge until the daemon reconnects.
+        let queue_claim = matches!(
+            fence.integration,
+            WorkspaceIntegrationBinding::Attempt { .. }
+        );
         if location.daemon_id != fence.daemon_id
             || location.runtime_id != fence.runtime_id
-            || owner["generation"].as_i64() != Some(location.version)
-            || (matches!(
-                fence.integration,
-                WorkspaceIntegrationBinding::Attempt { .. }
-            ) && location.kind != DaemonRepoLocationKind::PrimaryCheckout)
+            || (queue_claim
+                && (owner["generation"].as_i64() != Some(location.version)
+                    || location.kind != DaemonRepoLocationKind::PrimaryCheckout))
         {
             return Err(refusal(IntegrationOwnerRefusal::ForeignOwner));
         }

@@ -1760,3 +1760,103 @@ async fn integration_receipt_lookup_survives_workspace_retirement() {
     };
     assert_eq!(result, first);
 }
+
+fn task_step_merge_params(
+    fixture: &Fixture,
+    id: &str,
+    head: &str,
+    target: &str,
+    step_attempts: i64,
+    location_version: i64,
+) -> WorkspaceReviewedMergeParams {
+    let mut request = attempt_request(
+        fixture,
+        head,
+        target,
+        step_attempts,
+        WorkspaceIntegrationKind::Merge,
+    );
+    request.fence.lease_owner = "task-step:step-1".into();
+    request.fence.target_owner["generation"] = serde_json::json!(location_version);
+    let mut params = merge_params(fixture, id, head, target, true);
+    params.merge.fence.integration = WorkspaceIntegrationBinding::TaskStepEffect { request };
+    params
+}
+
+/// The live daemon path. A normal Task merge must not be refused because the
+/// server's location version moved on without a verify (a default toggle), nor
+/// because an earlier Task-step effect on this checkout was left without an
+/// outcome by an owner restart and its step has since been replaced.
+#[tokio::test]
+async fn task_step_merge_survives_a_location_version_bump_and_an_orphaned_effect() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.path().join("candidate"), "candidate\n").unwrap();
+    let head = git::commit_all(fixture.path(), "candidate").await.unwrap();
+    let target = git::get_current_sha(&fixture.repo).await.unwrap();
+    let known = fixture.backend.state.lock().unwrap().locations["location-1"].version;
+
+    // An earlier claim's merge was journaled and started, then the owner died.
+    let orphan = task_step_merge_params(&fixture, "orphaned-merge", &head, &target, 1, known);
+    retain_intent(
+        &fixture,
+        METHOD_WORKSPACE_MERGE,
+        journal_request(&serde_json::to_value(&orphan).unwrap()),
+    );
+    {
+        let mut state = fixture.backend.state.lock().unwrap();
+        state
+            .integration_pending
+            .insert("location-1".into(), "orphaned-merge".into());
+    }
+
+    let params = task_step_merge_params(&fixture, "next-merge", &head, &target, 2, known + 7);
+    let merged = fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_MERGE,
+            serde_json::to_value(params).unwrap(),
+            Vec::new,
+        )
+        .await
+        .expect("a live Task-step merge was refused");
+    assert_eq!(merged["outcome"]["kind"], "done", "{merged}");
+    assert_eq!(
+        merged["integration_receipt"]["operation_state"],
+        "succeeded"
+    );
+    assert_eq!(git::get_current_sha(&fixture.repo).await.unwrap(), head);
+
+    // The orphan is settled with a receipt, not left to refuse later effects.
+    let settled = fixture
+        .journal
+        .operation("orphaned-merge")
+        .unwrap()
+        .unwrap()
+        .outcome
+        .expect("orphaned effect was left unsettled")
+        .unwrap_err();
+    assert_eq!(
+        settled.details.unwrap()["integration_receipt"]["result"]["kind"],
+        "infrastructure"
+    );
+
+    // A queue claim still freezes the location generation.
+    let mut stale = attempt_request(
+        &fixture,
+        &head,
+        &head,
+        1,
+        WorkspaceIntegrationKind::FastForward,
+    );
+    stale.fence.target_owner["generation"] = serde_json::json!(known + 7);
+    let error = fixture
+        .backend
+        .handle(
+            METHOD_WORKSPACE_MERGE,
+            serde_json::to_value(attempt_merge_params(&fixture, stale)).unwrap(),
+            Vec::new,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.details.unwrap()["refusal"], "foreign_owner");
+}
