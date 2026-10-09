@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row};
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
+mod delivery;
+mod worker_store;
+pub use delivery::*;
+pub use worker_store::*;
+
 pub const CHECK_INPUT_BYTES: usize = 131_072;
 pub const CHECK_STEPS_BYTES: usize = 262_144;
 pub const CHECK_OUTPUT_TAIL_BYTES: usize = 4096;
@@ -200,6 +205,9 @@ pub struct CheckRunFence {
 pub struct CheckRunCounts {
     pub by_state: BTreeMap<String, i64>,
     pub reusable_results: i64,
+    pub admitted_runs: i64,
+    pub waiting_for_capacity: i64,
+    pub borrowed_runs: i64,
 }
 
 #[async_trait]
@@ -721,6 +729,9 @@ impl CheckRunRepo for SqliteDb {
                 .map(|s| (s.to_string(), 0))
                 .collect(),
             reusable_results: 0,
+            admitted_runs: 0,
+            waiting_for_capacity: 0,
+            borrowed_runs: 0,
         };
         for row in sqlx::query("SELECT state,COUNT(*) AS n FROM check_run GROUP BY state")
             .fetch_all(self.pool())
@@ -731,6 +742,16 @@ impl CheckRunRepo for SqliteDb {
                 .insert(row.try_get("state")?, row.try_get("n")?);
         }
         counts.reusable_results = sqlx::query_scalar("SELECT COUNT(*) FROM check_result result JOIN check_run run ON run.id=result.run_id WHERE result.outcome='pass' AND result.certified=1 AND result.cacheable=1 AND run.cacheable=1 AND run.state='succeeded'").fetch_one(self.pool()).await?;
+        counts.admitted_runs=sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE admitted_at IS NOT NULL AND state IN ('running','cancelling','cleaning','uncertain')").fetch_one(self.pool()).await?;
+        counts.waiting_for_capacity=sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE state='queued' AND capacity_wait_since IS NOT NULL").fetch_one(self.pool()).await?;
+        let borrowed = format!(
+            "{} SELECT COALESCE(SUM(borrowed_check_runs),0) FROM occupancy",
+            include_str!("../machine_occupancy.sql")
+        );
+        counts.borrowed_runs = sqlx::query_scalar(&borrowed)
+            .bind(self.server_run_cap.embedded_machine_id())
+            .fetch_one(self.pool())
+            .await?;
         Ok(counts)
     }
 }

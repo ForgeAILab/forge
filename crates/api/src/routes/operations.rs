@@ -95,7 +95,8 @@ pub async fn dismiss_dead_letter(
 
 /// Admin snapshot including live worker backlog, periodic tick/restart health, supervised relay status,
 /// lasting dead-letter history, SQLite storage diagnostics and usage index charge.
-/// Includes passive check-run states and certified reusable-result counts.
+/// Includes durable check-run states, certified reusable evidence, admitted
+/// owner-machine checks, borrowed Task slots and check capacity waits.
 pub async fn get_operations_status(
     _admin: RequireAdmin,
     State(state): State<AppState>,

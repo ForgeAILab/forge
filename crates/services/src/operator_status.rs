@@ -365,6 +365,9 @@ impl OperatorStatusService {
         let check_runs = api_types::CheckRunStatus {
             by_state: check_counts.by_state,
             reusable_results: check_counts.reusable_results,
+            admitted_runs: check_counts.admitted_runs,
+            waiting_for_capacity: check_counts.waiting_for_capacity,
+            borrowed_runs: check_counts.borrowed_runs,
         };
         Ok(OperatorStatusResponse {
             overall_severity,
@@ -663,6 +666,8 @@ impl OperatorStatusService {
                     .unwrap_or_else(|| "server_host".to_owned()),
                 hostname: Some(row.hostname),
                 active_runs: row.capacity.active_runs().max(0) as u32,
+                check_runs: row.capacity.check_runs.max(0) as u32,
+                borrowed_check_runs: row.capacity.borrowed_check_runs.max(0) as u32,
                 max_concurrent_runs: row.capacity.max_concurrent_runs,
                 logical_cores: row
                     .daemon_id
@@ -1218,12 +1223,15 @@ mod tests {
     async fn machine_capacity_operations_uses_handle_identity() {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(r#"CREATE TABLE daemon (id TEXT, hostname TEXT, machine_id TEXT, max_concurrent_runs INTEGER, run_limit INTEGER, removed_at TEXT);
-            CREATE TABLE workspace_placement (workspace_id TEXT, agent_id TEXT, daemon_id TEXT, execution_daemon_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT);
-            CREATE TABLE execution (workspace_id TEXT, agent_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
+            CREATE TABLE workspace_placement (task_id TEXT, workspace_id TEXT, agent_id TEXT, daemon_id TEXT, execution_daemon_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT);
+            CREATE TABLE execution (task_id TEXT, workspace_id TEXT, agent_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
             CREATE TABLE agent_current (id TEXT, daemon_id TEXT);
             CREATE TABLE agent_chat_turn_job (responder_identity_id TEXT, status TEXT);
+            CREATE TABLE check_run (id TEXT, machine_id TEXT, state TEXT, admitted_at TEXT);
+            CREATE TABLE check_consumer (task_id TEXT, status_epoch INTEGER, run_id TEXT, cancelled_at TEXT);
+            CREATE TABLE task (id TEXT, status_epoch INTEGER, deleted_at TEXT);
             INSERT INTO daemon VALUES ('provider','Host','capacity-test-host',100,NULL,NULL);
-            INSERT INTO execution VALUES (NULL,NULL,'running','{"daemon_id":"provider"}');"#)
+            INSERT INTO execution VALUES (NULL,NULL,NULL,'running','{"daemon_id":"provider"}');"#)
             .execute(&pool).await.unwrap();
         let db = Arc::new(SqliteDb::new(pool));
         db.server_run_cap.set(Some(1), 1, "capacity-test-host");

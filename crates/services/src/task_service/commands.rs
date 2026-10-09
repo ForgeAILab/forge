@@ -724,6 +724,20 @@ impl TaskService {
                             .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
                     encode(Box::pin(self.execute_adaptive_task_command(input)).await?)
                 }
+                "apply_check_result" => {
+                    let delivery: db::CheckResultDelivery =
+                        serde_json::from_value(command.arguments.clone())
+                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    let step = db::task_writer::current_task_step().ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "a check result is applied only by its delivery step",
+                        )
+                    })?;
+                    let consumers = self.check_consumers.get().ok_or_else(|| {
+                        ServiceError::invalid_operation("check consumers are not composed")
+                    })?;
+                    encode(consumers.apply(&step.id, &delivery).await?)
+                }
                 _ => Err(ServiceError::invalid_operation("unknown Task command")),
             }
         })

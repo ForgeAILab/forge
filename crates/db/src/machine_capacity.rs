@@ -69,6 +69,9 @@ pub struct MachineCapacity {
     pub running_executions: i64,
     pub reservations: i64,
     pub active_chat_turns: i64,
+    pub check_runs: i64,
+    /// Informational: these checks share an already occupied Task slot.
+    pub borrowed_check_runs: i64,
     pub max_concurrent_runs: Option<i64>,
 }
 
@@ -77,6 +80,7 @@ impl MachineCapacity {
         self.running_executions
             .saturating_add(self.reservations)
             .saturating_add(self.active_chat_turns)
+            .saturating_add(self.check_runs)
     }
 
     pub fn has_capacity(self) -> bool {
@@ -155,7 +159,8 @@ pub async fn count_machine_capacity(
     embedded_machine_id: &str,
 ) -> Result<MachineCapacity> {
     let sql = format!("{} SELECT COALESCE(SUM(running_executions), 0) AS running_executions,
-        COALESCE(SUM(reservations), 0) AS reservations, COALESCE(SUM(active_chat_turns), 0) AS active_chat_turns
+        COALESCE(SUM(reservations), 0) AS reservations, COALESCE(SUM(active_chat_turns), 0) AS active_chat_turns,
+        COALESCE(SUM(check_runs), 0) AS check_runs, COALESCE(SUM(borrowed_check_runs), 0) AS borrowed_check_runs
         FROM occupancy WHERE machine_key = COALESCE(?, 'server_host')", include_str!("machine_occupancy.sql"));
     let row = sqlx::query(&sql)
         .bind(embedded_machine_id)
@@ -166,8 +171,27 @@ pub async fn count_machine_capacity(
         running_executions: row.try_get("running_executions")?,
         reservations: row.try_get("reservations")?,
         active_chat_turns: row.try_get("active_chat_turns")?,
+        check_runs: row.try_get("check_runs")?,
+        borrowed_check_runs: row.try_get("borrowed_check_runs")?,
         max_concurrent_runs,
     })
+}
+
+/// Whether this run can borrow the same Task's existing physical-machine slot.
+/// Evaluate inside the same BEGIN IMMEDIATE as admission. Chat cannot lend.
+pub async fn check_borrows_machine_slot(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    machine: Option<&str>,
+    embedded_machine_id: &str,
+) -> Result<bool> {
+    let sql=format!("{} SELECT EXISTS(SELECT 1 FROM physical_jobs p JOIN check_consumer c ON c.task_id=p.task_id JOIN task t ON t.id=c.task_id AND t.status_epoch=c.status_epoch AND t.deleted_at IS NULL WHERE c.run_id=? AND c.cancelled_at IS NULL AND (p.running_executions=1 OR p.reservations=1) AND p.machine_key=COALESCE(?,'server_host'))",include_str!("machine_occupancy.sql"));
+    Ok(sqlx::query_scalar(&sql)
+        .bind(embedded_machine_id)
+        .bind(run_id)
+        .bind(machine)
+        .fetch_one(&mut **tx)
+        .await?)
 }
 
 #[derive(Debug)]
@@ -188,7 +212,8 @@ pub async fn list_machine_capacity(
             ? AS reported, MIN(run_limit) AS admin FROM daemon WHERE id IN (SELECT id FROM embedded)
         UNION ALL SELECT id, id, hostname, max_concurrent_runs, run_limit FROM daemon WHERE removed_at IS NULL AND id NOT IN (SELECT id FROM embedded)
     ) SELECT m.*, COALESCE(o.running_executions, 0) AS running_executions,
-        COALESCE(o.reservations, 0) AS reservations, COALESCE(o.active_chat_turns, 0) AS active_chat_turns
+        COALESCE(o.reservations, 0) AS reservations, COALESCE(o.active_chat_turns, 0) AS active_chat_turns,
+        COALESCE(o.check_runs, 0) AS check_runs, COALESCE(o.borrowed_check_runs, 0) AS borrowed_check_runs
         FROM machines m LEFT JOIN occupancy o USING(machine_key)", include_str!("machine_occupancy.sql"));
     let rows = sqlx::query(&sql)
         .bind(embedded_machine_id)
@@ -204,6 +229,8 @@ pub async fn list_machine_capacity(
                     running_executions: row.try_get("running_executions")?,
                     reservations: row.try_get("reservations")?,
                     active_chat_turns: row.try_get("active_chat_turns")?,
+                    check_runs: row.try_get("check_runs")?,
+                    borrowed_check_runs: row.try_get("borrowed_check_runs")?,
                     max_concurrent_runs: effective_machine_cap(
                         row.try_get("reported")?,
                         row.try_get("admin")?,

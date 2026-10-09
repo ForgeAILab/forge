@@ -383,6 +383,17 @@ impl From<ServiceError> for ApiError {
                 message: "nested subtasks are unsupported".to_string(),
                 details: None,
             },
+            ServiceError::SubtaskParentClosed {
+                parent_task_id,
+                state,
+            } => Self {
+                status: StatusCode::CONFLICT,
+                code: "SUBTASK_PARENT_CLOSED",
+                message: format!(
+                    "task {parent_task_id} is in `{state}` and no longer accepts subtasks; add subtasks before the parent enters review, or create a new root Task"
+                ),
+                details: Some(json!({ "parent_task_id": parent_task_id, "state": state })),
+            },
             ServiceError::ParentWorkspaceRequired { parent_task_id } => Self {
                 status: StatusCode::CONFLICT,
                 code: "PARENT_WORKSPACE_REQUIRED",

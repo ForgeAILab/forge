@@ -996,8 +996,18 @@ Project's own records even when `capability_class` is read-only. Optional
 `depends_on_task_ids` must name accepted, non-cancelled Tasks in the same
 Project and every prerequisite must reach `done` before dispatch.
 If a prerequisite is later cancelled, Forge writes a typed durable blocker on
-each unfinished dependent instead of repeatedly rejecting dispatch. Removing
-the cancelled link clears that blocker once no cancelled prerequisites remain.
+each unfinished dependent instead of repeatedly rejecting dispatch. The blocker
+replaces the dependent's current condition (a hold or another park included),
+offers cancellation only, and keeps the displaced condition in
+`blocked.details.superseded` (`status`, `error_annotation`, `blocked_json`,
+`failed_json`: the Task's state and its three condition columns as they were;
+informational, clients must not write it). Removing the cancelled link restores
+that condition, or clears the blocker when there was none, once no cancelled
+prerequisites remain; a dependent that left that state meanwhile (cancelled,
+finished, moved) gets a clear condition instead. A Task action accepted while a
+prerequisite is unfinished stays accepted: the Task shows a `dispatch_refusal`
+wait offering `hold` and `cancel`, and the action runs when the prerequisite
+reaches `done` or the link is removed.
 `task_type`, when present, is the same closed enum as normal
 Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
 values are rejected before the command is admitted. Terminal Task delivery,
@@ -1043,7 +1053,7 @@ prerequisite edge between two Tasks in the bound Project. Its closed payload is
 Forge derives the Project from the authenticated binding and rejects a Task
 from another Project in either position. Adding refuses a cancelled
 prerequisite and a self-edge; removing the last cancelled prerequisite clears
-the dependency block it caused.
+the dependency block it caused and restores the condition that block displaced.
 
 Without this, `depends_on_task_ids` was settable only at `task.propose` and an
 Agent re-planning a graph had to cancel and recreate every downstream Task —
@@ -2744,7 +2754,11 @@ post-commit hooks (including CI, merge and dispatch) and follow-up cascades are 
 
 `parent_task_id` is the hierarchy pointer. A Task that names a parent is a
 direct child of a root coordination Task, inherits the root's shared workspace,
-and receives a `subtask_order` position. A root with one or more children is a
+and receives a `subtask_order` position. The parent must still be able to
+coordinate it: creating a subtask under a parent that is terminal or in a
+review-phase gate (`review`, `merging`) answers
+`409 SUBTASK_PARENT_CLOSED` with `details.parent_task_id` and `details.state`;
+send the parent back to work first. A parent in `merge_failed` accepts one. A root with one or more children is a
 non-executing coordination container: the root's implementation prompt is not
 dispatched. Its `coder` assignment is retained as the default worker, while
 other non-review role assignments are removed. A child with its own `coder`
@@ -2966,7 +2980,7 @@ relaunch a non-reviewer role while that human decision is outstanding.
 {"action":{"verb":"retry","fresh_session":true,"guidance":"The environment is repaired."},"version":7}
 ```
 
-The verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Hold, release and restart accept an optional audit reason; release embeds it in the resumed role prompt. Project Agent recovery requires a typed reason, as does Project Agent cancellation. Retry accepts optional `fresh_session`, `refresh_workspace`, `reset_budget`, `guidance`, and `reason`. A one-shot retry (`reset_budget:false`) requires a typed reason. Resetting the budget while a Review awaits a human preserves that decision and does not re-execute its reviewer. Send-back requires caller-typed non-whitespace guidance; offers supply no default guidance. Approval accepts `override` and an optional reason; omitted booleans use the selected offer's value; an override and a deferred finding require a typed reason. Cancellation accepts an optional reason and requires it from the bound Project Agent. Offers describe required inputs and cancellation propagation through `propagates`. `ActionParameter.required_when` describes conditional requirements, for example `{parameter:"reset_budget",value:false}` on retry reason. Only the owner may override. An offered `approve{override:true}` also preserves the old owner next-state advance: it stops current executions, skips the source exit guards, records the typed reason, and defers the next role to dispatch. Entry-check overrides and failed-review passes keep their specific offered apply plans. Copy an offered action instead of reconstructing eligibility from status.
+The verbs are `start`, `hold`, `release`, `retry`, `send_back`, `approve`, `restart`, and `cancel`. Hold, release and restart accept an optional audit reason; release embeds it in the resumed role prompt. Project Agent recovery requires a typed reason, as does Project Agent cancellation. Retry accepts optional `fresh_session`, `refresh_workspace`, `reset_budget`, `guidance`, and `reason`. A one-shot retry (`reset_budget:false`) requires a typed reason. Resetting the budget while a Review awaits a human preserves that decision and does not re-execute its reviewer. Send-back requires caller-typed non-whitespace guidance; offers supply no default guidance. Approval accepts `override` and an optional reason; omitted booleans use the selected offer's value; an override and a deferred finding require a typed reason. Cancellation accepts an optional reason and requires it from the bound Project Agent. Offers describe required inputs and cancellation propagation through `propagates`. `ActionParameter.required_when` describes conditional requirements, for example `{parameter:"reset_budget",value:false}` on retry reason. Only the owner may override. An offered `approve{override:true}` also preserves the old owner next-state advance: it stops current executions, skips the source exit guards, records the typed reason, and defers the next role to dispatch. Entry-check overrides and failed-review passes keep their specific offered apply plans. Copy an offered action instead of reconstructing eligibility from status. `start` is offered on a queued Task only while the Agent that will run it (the Task's coder in the default workflow) is available; taking it while that Agent is at capacity is accepted and the Task starts when a slot frees.
 
 Unavailable commands return HTTP 409, code `action_unavailable`, and current `details.available_actions`. When a worker or Project pause prevents dispatch, refusals also carry `denied_by` (`target_agent_paused` or `project_paused(<pause reason>)`) and `retry.scope:"turn"`; native denials retain the same cause and turn scope. Hold remains offered while waiting. A descriptor with one accepted boolean value is fixed; an omitted parameter uses that value. Other omitted preset parameters use the offer's action value. A contradictory fixed/preset value returns 409 `action_unavailable`. Optimistic version conflicts remain 409. Missing `version` yields 422; unknown fields and malformed payloads are refused. Blank required reason/guidance yields 400. Corrupt persisted Review details yield 500 before mutation. MCP unavailable errors use -32010.
 
@@ -5654,3 +5668,18 @@ pending proposals. Task payload declarations and legacy pending materialization 
 Charter adoption and evidence remain on their hand paths because their historical
 receipt retrieval after pause/ceiling changes would be narrowed by registry
 admission. Readiness also remains on its hand path.
+
+### Durable check orchestration observations (3.3 stage C, partial)
+
+`GET /api/v1/operations/status` extends `check_runs` with integer
+`admitted_runs`, `waiting_for_capacity` and `borrowed_runs`, in addition to
+`by_state` and `reusable_results`. Admitted includes running/cancelling/cleaning/
+uncertain runs. Capacity wait is a subset of queued runs; borrowed runs share an
+existing reservation/execution slot for the same Task and physical machine.
+
+Each `daemon_pressure` entry adds `check_runs` (checks taking their own slot)
+and `borrowed_check_runs` (informational). `active_runs` includes exclusive check
+slots; borrowed checks add no second slot. Agent pressure excludes checks.
+The supervised worker appears as `check-runs` in `periodic_workers`. There is no
+new REST check execution or result-application route, and daemon protocol 5 is
+unchanged. Existing CI consumers have not moved to the runner in this slice.

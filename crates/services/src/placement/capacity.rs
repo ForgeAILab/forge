@@ -37,12 +37,15 @@ mod tests {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(
             "CREATE TABLE daemon (id TEXT, machine_id TEXT);
-             CREATE TABLE execution (id TEXT, agent_id TEXT, workspace_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
+             CREATE TABLE execution (task_id TEXT, id TEXT, agent_id TEXT, workspace_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
              CREATE TABLE workspace_placement (
-                 id TEXT, workspace_id TEXT, agent_id TEXT, daemon_id TEXT,
+                 task_id TEXT, id TEXT, workspace_id TEXT, agent_id TEXT, daemon_id TEXT,
                  execution_daemon_id TEXT, state TEXT, reserved_until TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
              CREATE TABLE agent_current (id TEXT, daemon_id TEXT);
-             CREATE TABLE agent_chat_turn_job (responder_identity_id TEXT, status TEXT);",
+             CREATE TABLE agent_chat_turn_job (responder_identity_id TEXT, status TEXT);
+             CREATE TABLE check_run (id TEXT, machine_id TEXT, state TEXT, admitted_at TEXT);
+             CREATE TABLE check_consumer (task_id TEXT, status_epoch INTEGER, run_id TEXT, cancelled_at TEXT);
+             CREATE TABLE task (id TEXT, status_epoch INTEGER, deleted_at TEXT);",
         )
         .execute(&pool)
         .await
@@ -67,7 +70,7 @@ mod tests {
                 ('embedded-reservation', 'embedded-reservation', 'local', NULL, 'embedded', 'preparing'),
                 ('remote', 'remote', 'local', 'remote', NULL, 'reserved'),
                 ('ready', 'ready', 'local', NULL, NULL, 'ready');
-            INSERT INTO execution VALUES
+            INSERT INTO execution (id,agent_id,workspace_id,status,executor_config_snapshot_json) VALUES
                 ('direct', 'local', 'direct', 'running', NULL),
                 ('embedded', 'local', 'embedded', 'running', NULL),
                 ('remote', 'local', 'remote', 'running', NULL),
@@ -99,7 +102,7 @@ mod tests {
     async fn machine_capacity_ready_is_idle_and_expired_reservations_are_excluded() {
         let pool = pool().await;
         let mut tx = db::begin_immediate(&pool).await.unwrap();
-        sqlx::raw_sql("INSERT INTO workspace_placement VALUES
+        sqlx::raw_sql("INSERT INTO workspace_placement (id,workspace_id,agent_id,daemon_id,execution_daemon_id,state,reserved_until,updated_at) VALUES
             ('ready-launch','one','agent',NULL,NULL,'ready','2099-01-01T00:00:00Z',CURRENT_TIMESTAMP),
             ('idle','two','agent',NULL,NULL,'ready',NULL,CURRENT_TIMESTAMP),
             ('expired','three','agent',NULL,NULL,'preparing','2020-01-01T00:00:00Z',CURRENT_TIMESTAMP),
@@ -117,7 +120,7 @@ mod tests {
                 .reservations,
             0
         );
-        sqlx::query("INSERT INTO execution VALUES ('run','agent','one','running',NULL)")
+        sqlx::query("INSERT INTO execution (id,agent_id,workspace_id,status,executor_config_snapshot_json) VALUES ('run','agent','one','running',NULL)")
             .execute(&mut *tx)
             .await
             .unwrap();
@@ -167,7 +170,7 @@ mod tests {
 
         sqlx::raw_sql(
             "UPDATE workspace_placement SET state = 'ready' WHERE id = 'preparing';
-             INSERT INTO execution VALUES ('run', 'agent', 'one', 'running', NULL);",
+             INSERT INTO execution (id,agent_id,workspace_id,status,executor_config_snapshot_json) VALUES ('run', 'agent', 'one', 'running', NULL);",
         )
         .execute(&mut *transaction)
         .await
@@ -192,7 +195,7 @@ mod tests {
                 ('four', 'four', 'unpinned', 'other', 'other', 'ready'),
                 ('idle', 'idle', 'unpinned', 'daemon', NULL, 'ready'),
                 ('override', 'override', 'unpinned', 'daemon', 'other', 'ready');
-             INSERT INTO execution VALUES
+             INSERT INTO execution (id,agent_id,workspace_id,status,executor_config_snapshot_json) VALUES
                 ('one', 'unpinned', 'one', 'running', NULL),
                 ('two', 'unpinned', 'two', 'running', NULL),
                 ('other', 'unpinned', 'four', 'running', NULL),
@@ -228,7 +231,7 @@ mod tests {
         let mut transaction = db::begin_immediate(&pool).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO agent_current VALUES ('pinned', 'daemon'), ('moved', 'other');
-             INSERT INTO execution VALUES
+             INSERT INTO execution (id,agent_id,workspace_id,status,executor_config_snapshot_json) VALUES
                 ('pin', 'pinned', NULL, 'running', NULL),
                 ('snapshot', 'moved', NULL, 'running', '{\"daemon_id\":\"daemon\"}');",
         )

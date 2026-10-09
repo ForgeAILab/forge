@@ -492,6 +492,37 @@ impl TaskService {
             }
             return Ok(true);
         }
+        let dependency_gate = match error {
+            ServiceError::DependencyGate => true,
+            ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",
+            _ => false,
+        };
+        if dependency_gate && db::task_writer::owns_task(&current.id) {
+            let unsatisfied =
+                TaskDependencyRepo::unsatisfied_dependencies(&*self.db, &current.id).await?;
+            if !unsatisfied.is_empty()
+                && self
+                    .cancelled_dependency_ids(&current, &unsatisfied)
+                    .await?
+                    .is_empty()
+            {
+                // An unfinished dependency is a wait, not a refusal: the
+                // action stays accepted behind the same dependency wait an
+                // unstarted Task shows, and runs when the dependency
+                // settles (`wake_dependents_of_completed_task`) or its link
+                // is removed. Restoring the old park here turned the wait
+                // into an untyped `recovery_required: "dependency gate"`
+                // that offered the refused action again.
+                crate::deferred_dispatch::record_dispatch_disposition(
+                    &self.db,
+                    &current,
+                    &current.status,
+                    &error.to_string(),
+                )
+                .await?;
+                return Ok(true);
+            }
+        }
         let original = db::TaskMetadata::parse(task.metadata_json.as_deref())
             .ok()
             .and_then(|metadata| {
@@ -513,6 +544,19 @@ impl TaskService {
             });
         if let (Some(original), Some(raw)) = (original, raw) {
             if original.get("id") == raw.get("id") {
+                // A cancelled dependency is its own typed park, with its own
+                // exit: it carries the condition this action had cleared, in
+                // place of an untyped refusal that offers the action again.
+                if dependency_gate && db::task_writer::owns_task(&current.id) {
+                    let unsatisfied =
+                        TaskDependencyRepo::unsatisfied_dependencies(&*self.db, &current.id)
+                            .await?;
+                    let cancelled = self
+                        .cancelled_dependency_ids(&current, &unsatisfied)
+                        .await?;
+                    self.block_cancelled_dependencies(&current, &cancelled)
+                        .await?;
+                }
                 self.restore_failed_task_action(&current, &raw, error)
                     .await?;
             }
@@ -587,25 +631,9 @@ impl TaskService {
             queued.request.offer.reason.as_str(),
             "ready_to_start" | "initial_retry" | "role_retry" | "manually_held" | "merge_fix_retry"
         ) {
-            let role = workflow
-                .states
-                .iter()
-                .find(|state| state.name == task.status)
-                .and_then(crate::workflow::effective_role)
-                .or_else(|| {
-                    workflow
-                        .outgoing_trigger_targets(&task.status)
-                        .find_map(|(_, target)| {
-                            workflow
-                                .states
-                                .iter()
-                                .find(|state| state.name == target)
-                                .and_then(crate::workflow::effective_role)
-                        })
-                })
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation("queued action lost its workflow role")
-                })?;
+            let role = crate::workflow::action_role(&workflow, &task.status).ok_or_else(|| {
+                ServiceError::invalid_operation("queued action lost its workflow role")
+            })?;
             if queued
                 .request
                 .role_name

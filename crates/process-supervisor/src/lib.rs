@@ -1,9 +1,11 @@
 //! Owner of a command's process group and continuously drained output.
 //! Drop, cancellation and timeout use the same TERM / 500 ms / KILL sequence.
 use std::{
+    future::Future,
     io,
     process::{ExitStatus, Output, Stdio},
     sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -109,8 +111,32 @@ struct Stream {
     truncated: bool,
     eof: bool,
 }
+impl Stream {
+    fn keep(&mut self, capture: Capture, chunk: &[u8]) {
+        let count = chunk.len();
+        match capture {
+            Capture::All => self.bytes.extend_from_slice(chunk),
+            Capture::Prefix(limit) => {
+                let size = count.min(limit.saturating_sub(self.bytes.len()));
+                self.truncated |= size < count;
+                self.bytes.extend_from_slice(&chunk[..size]);
+            }
+            Capture::Tail(limit) => {
+                self.truncated |= self.bytes.len().saturating_add(count) > limit;
+                if count >= limit {
+                    self.bytes.clear();
+                    self.bytes.extend_from_slice(&chunk[count - limit..]);
+                } else {
+                    let remove = self.bytes.len().saturating_add(count).saturating_sub(limit);
+                    self.bytes.drain(..remove);
+                    self.bytes.extend_from_slice(chunk);
+                }
+            }
+        }
+    }
+}
 async fn drain(
-    mut pipe: impl AsyncRead + Unpin,
+    pipe: &mut (impl AsyncRead + Unpin),
     capture: Capture,
     retained: &mut Stream,
 ) -> io::Result<()> {
@@ -121,30 +147,35 @@ async fn drain(
             retained.eof = true;
             return Ok(());
         }
-        match capture {
-            Capture::All => retained.bytes.extend_from_slice(&chunk[..count]),
-            Capture::Prefix(limit) => {
-                let size = count.min(limit.saturating_sub(retained.bytes.len()));
-                retained.truncated |= size < count;
-                retained.bytes.extend_from_slice(&chunk[..size]);
+        retained.keep(capture, &chunk[..count]);
+    }
+}
+/// The most a bounded drain still takes from a pipe after its bound: more
+/// than any pipe buffer holds, so a descendant that never stops writing
+/// cannot keep a finished command reading.
+const FINAL_DRAIN_BYTES: usize = 4 * 1024 * 1024;
+/// A drain bound is wall-clock time, and a reader that was not scheduled
+/// during it has read nothing. So when a bound ends the wait, what the pipe
+/// already holds is still taken: read without waiting until end of file, a
+/// read that would block, or [`FINAL_DRAIN_BYTES`].
+async fn drain_ready(pipe: &mut (impl AsyncRead + Unpin), capture: Capture, retained: &mut Stream) {
+    let mut chunk = [0; 8192];
+    let mut budget = FINAL_DRAIN_BYTES;
+    while !retained.eof && budget > 0 {
+        let polled = {
+            // Exempt from the cooperative budget: a spent budget reports
+            // "pending" for a pipe that has bytes.
+            let read = tokio::task::unconstrained(pipe.read(&mut chunk));
+            tokio::pin!(read);
+            std::future::poll_fn(|context| Poll::Ready(read.as_mut().poll(context))).await
+        };
+        match polled {
+            Poll::Ready(Ok(0)) => retained.eof = true,
+            Poll::Ready(Ok(count)) => {
+                retained.keep(capture, &chunk[..count]);
+                budget = budget.saturating_sub(count);
             }
-            Capture::Tail(limit) => {
-                retained.truncated |= retained.bytes.len().saturating_add(count) > limit;
-                if count >= limit {
-                    retained.bytes.clear();
-                    retained
-                        .bytes
-                        .extend_from_slice(&chunk[count - limit..count]);
-                } else {
-                    let remove = retained
-                        .bytes
-                        .len()
-                        .saturating_add(count)
-                        .saturating_sub(limit);
-                    retained.bytes.drain(..remove);
-                    retained.bytes.extend_from_slice(&chunk[..count]);
-                }
-            }
+            Poll::Ready(Err(_)) | Poll::Pending => return,
         }
     }
 }
@@ -174,8 +205,8 @@ pub async fn run(
     #[cfg(not(unix))]
     command.kill_on_drop(true);
     let mut child = command.spawn()?;
-    let stdout_pipe = child.stdout.take().expect("piped stdout");
-    let stderr_pipe = child.stderr.take().expect("piped stderr");
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
     let leader = child.id();
     let mut group = Group { child, leader };
     let mut stdout = Stream::default();
@@ -215,8 +246,8 @@ pub async fn run(
         let drains_done = AtomicBool::new(false);
         let drains = async {
             let result = tokio::try_join!(
-                drain(stdout_pipe, capture, &mut stdout),
-                drain(stderr_pipe, capture, &mut stderr)
+                drain(&mut stdout_pipe, capture, &mut stdout),
+                drain(&mut stderr_pipe, capture, &mut stderr)
             );
             drains_done.store(true, Ordering::Release);
             result.map(|_| ())
@@ -259,6 +290,13 @@ pub async fn run(
         };
         (termination, status)
     };
+    // Every bounded path ends here with the readers stopped. Let the I/O
+    // driver report what arrived meanwhile, then take it.
+    if !(stdout.eof && stderr.eof) {
+        tokio::task::yield_now().await;
+        drain_ready(&mut stdout_pipe, capture, &mut stdout).await;
+        drain_ready(&mut stderr_pipe, capture, &mut stderr).await;
+    }
     // No uncancelled Git descendants are killed by guard destruction.
     group.leader = None;
     Ok(ProcessOutput {
