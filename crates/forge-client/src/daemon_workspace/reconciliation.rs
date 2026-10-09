@@ -6,6 +6,30 @@ impl DaemonWorkspaceBackend {
         params: WorkspaceReconcileParams,
     ) -> CommandResult<WorkspaceReconcileResult> {
         validate_id(&params.operation_id)?;
+        // The announcement reports what this owner held before the lookup.
+        let queue_fence = match &params.integration {
+            WorkspaceIntegrationBinding::Attempt { request } => Some(request.fence.clone()),
+            _ => None,
+        };
+        let known = queue_fence.as_ref().and_then(|fence| {
+            self.state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .integration_fences
+                .get(&fence.queue_id)
+                .cloned()
+        });
+        let announce = |intent| {
+            queue_fence
+                .as_ref()
+                .map(|fence| IntegrationFenceAnnouncement {
+                    queue_id: fence.queue_id.clone(),
+                    generation: known.as_ref().map(|known| known.generation),
+                    attempt_id: known.as_ref().map(|known| known.attempt_id.clone()),
+                    intent,
+                })
+        };
+        let mut intent = IntegrationIntentRecord::Retained;
         // A durable result is historical owner evidence. Cleanup or a newer
         // placement generation cannot make that receipt unreadable.
         if let Some(operation) = self
@@ -30,6 +54,7 @@ impl DaemonWorkspaceBackend {
                         Ok(result) => WorkspaceReconcileOutcome::Result { result },
                         Err(error) => WorkspaceReconcileOutcome::Error { error },
                     },
+                    owner_fence: announce(intent),
                 });
             }
         }
@@ -63,16 +88,40 @@ impl DaemonWorkspaceBackend {
                         "attempt lookup belongs to another workspace",
                     ));
                 }
-                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                let mut updated = state.clone();
-                // An absent intent proves no effect only after fencing a
-                // delayed request with the same identity on this owner.
-                updated.record_cancel_tombstone(&params.operation_id, unix_now());
-                self.journal
-                    .save_workspace_state(&updated)
-                    .map_err(storage_error)?;
-                *state = updated;
-                drop(state);
+                // A queue claim's absent intent proves "not performed" only
+                // on an owner that already knew the claim generation (it was
+                // announced, or an effect of it was admitted here). An owner
+                // hearing of the generation for the first time may have lost
+                // its state: the answer is "unknown", kept as a receipt so a
+                // repeated lookup cannot turn it into "not performed".
+                let unknown = queue_fence.as_ref().is_some_and(|fence| {
+                    known
+                        .as_ref()
+                        .is_none_or(|known| known.generation < fence.generation)
+                });
+                intent = if unknown {
+                    IntegrationIntentRecord::Unknown
+                } else if queue_fence.is_some() {
+                    IntegrationIntentRecord::NotPerformed
+                } else {
+                    IntegrationIntentRecord::Retained
+                };
+                {
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut updated = state.clone();
+                    // An absent intent proves no effect only after fencing a
+                    // delayed request with the same identity on this owner.
+                    updated.record_cancel_tombstone(&params.operation_id, unix_now());
+                    if let Some(fence) = &queue_fence {
+                        // The lookup itself raises the high-water mark; a lookup
+                        // of an older generation's intent leaves it alone.
+                        let _ = updated.advance_integration_fence(fence, unix_now());
+                    }
+                    self.journal
+                        .save_workspace_state(&updated)
+                        .map_err(storage_error)?;
+                    *state = updated;
+                }
                 let fence = WorkspaceMutationFence {
                     integration: params.integration.clone(),
                     daemon_id: params.workspace.daemon_id.clone(),
@@ -102,14 +151,32 @@ impl DaemonWorkspaceBackend {
                     request: serde_json::json!({"integration":params.integration}),
                     outcome: None,
                     acknowledged: false,
-                    effect_started: false,
+                    effect_started: unknown,
                 };
                 self.journal
                     .retain_entry(&JournalEntry::Operation {
                         operation: operation.clone(),
                     })
                     .map_err(storage_error)?;
-                operation
+                if unknown {
+                    let mut operation = operation.clone();
+                    let message = "this owner has no record of the claim generation; \
+                                   the result of the effect is unknown";
+                    operation.outcome = Some(Err(error(DAEMON_UNAVAILABLE, message)));
+                    self.attach_integration_receipt(&mut operation, None, true)
+                        .await;
+                    if let Some(Err(error)) = operation.outcome.as_mut() {
+                        if let Some(details) = error.details.as_mut() {
+                            details["integration_receipt"]["result"]["message"] =
+                                serde_json::json!(message);
+                        }
+                    }
+                    self.journal
+                        .finish_operation(&operation)
+                        .map_err(storage_error)?
+                } else {
+                    operation
+                }
             }
         };
         let fence = &operation.fence;
@@ -186,6 +253,7 @@ impl DaemonWorkspaceBackend {
             entry_id: operation.entry_id,
             operation_id: params.operation_id,
             outcome,
+            owner_fence: announce(intent),
         })
     }
 

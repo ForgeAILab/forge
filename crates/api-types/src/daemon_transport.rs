@@ -48,11 +48,12 @@ pub const PURPOSE_DENIED: &str = "purpose_denied";
 pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
-/// Revision 5 adds fence-free, retained owner check operations.
-pub const DAEMON_PROTOCOL_REVISION: u32 = 5;
-/// Every command RPC requires revision 5.
-pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 5;
-pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 5 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
+/// Revision 6 adds the integration owner wire: the fence announcement on
+/// lookup, `integration.announce`, and Git object export / import.
+pub const DAEMON_PROTOCOL_REVISION: u32 = 6;
+/// Every command RPC requires revision 6.
+pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 6;
+pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 6 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
 pub const DAEMON_CAPABILITY_USAGE_REPORTS: &str = "execution.terminal.usage_reports";
 pub const DAEMON_CAPABILITY_JOURNAL_ACK: &str = "journal.ack";
 pub const DAEMON_CAPABILITY_PLAN_TRANSPORT: &str = "execution.plan_transport";
@@ -725,6 +726,38 @@ pub struct WorkspaceReconcileResult {
     pub entry_id: String,
     pub operation_id: String,
     pub outcome: WorkspaceReconcileOutcome,
+    /// Present for a queue attempt lookup: what this owner knew about the
+    /// attempt's queue and intent before it answered.
+    pub owner_fence: Option<IntegrationFenceAnnouncement>,
+}
+
+/// What the owner's own records said about a looked-up attempt intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum IntegrationIntentRecord {
+    /// The journal held the intent; the receipt is the owner's evidence.
+    Retained,
+    /// The owner already knew this claim generation and holds no intent for
+    /// the operation: it never ran here, and it is now fenced off.
+    NotPerformed,
+    /// The owner had never been told of this claim generation, so its empty
+    /// journal proves nothing (lost or replaced owner state). Never a
+    /// permission to repeat the effect.
+    Unknown,
+}
+
+/// The owner's fence for a queue as it was before a lookup, and what its
+/// journal said. Lets the server tell "not performed" from "unknown".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationFenceAnnouncement {
+    pub queue_id: String,
+    /// Highest claim generation recorded for the queue; `None` when the owner
+    /// had no fence for it.
+    pub generation: Option<i64>,
+    pub attempt_id: Option<String>,
+    pub intent: IntegrationIntentRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1834,4 +1867,204 @@ pub enum DaemonCheckResult {
     Unknown {
         operation_id: String,
     },
+}
+
+pub const METHOD_INTEGRATION_ANNOUNCE: &str = "integration.announce";
+pub const METHOD_INTEGRATION_EXPORT_OBJECTS: &str = "integration.export_objects";
+pub const METHOD_INTEGRATION_IMPORT_OBJECTS: &str = "integration.import_objects";
+pub const METHOD_INTEGRATION_RELEASE_OBJECTS: &str = "integration.release_objects";
+/// Error code of a typed object-transfer refusal; `details.refusal` is an
+/// [`ObjectTransferRefusal`].
+pub const OBJECT_TRANSFER_REFUSED: &str = "object_transfer_refused";
+/// Largest Git object transfer between two checkouts.
+pub const MAX_OBJECT_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
+/// Largest decoded chunk in one export / import frame.
+pub const MAX_OBJECT_TRANSFER_CHUNK_BYTES: u64 = 1024 * 1024;
+
+/// The first message of a queue claim generation. The owner records the fence
+/// as its high-water mark for the queue (an older generation is refused
+/// `stale_fence`) and prunes what the new mark makes unreachable.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct IntegrationAnnounceParams {
+    pub daemon_id: String,
+    pub runtime_id: String,
+    pub fence: IntegrationOwnerFence,
+    /// Every queue that still targets this owner. When present, fences of
+    /// other queues are dropped.
+    pub live_queue_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationAnnounceResult {
+    pub queue_id: String,
+    /// The fence held for the queue before this announcement.
+    pub previous: Option<IntegrationOwnerFence>,
+    pub generation: i64,
+    pub pruned_fences: u32,
+    pub pruned_entries: u32,
+}
+
+/// Why an object transfer was refused. No refusal changes a repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ObjectTransferRefusal {
+    TooLarge {
+        #[ts(type = "number")]
+        bytes: u64,
+        #[ts(type = "number")]
+        max_bytes: u64,
+    },
+    Invalid {
+        reason: String,
+    },
+    MissingObject {
+        sha: String,
+    },
+    KeyConflict {
+        existing_sha: String,
+    },
+    StaleFence,
+}
+
+/// Read one chunk of the bundle holding `want` minus `have`. The first call
+/// for a key writes the bundle to owner-local staging; later calls (and
+/// retries) read the same file until it is released.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ExportObjectsParams {
+    pub daemon_id: String,
+    pub runtime_id: String,
+    pub fence: IntegrationOwnerFence,
+    /// Idempotency key, `[A-Za-z0-9._-]{1,128}`; see `object_transfer_key`.
+    pub key: String,
+    pub repo_location_id: String,
+    pub have: Vec<String>,
+    pub want: String,
+    #[ts(type = "number")]
+    pub max_bytes: u64,
+    #[ts(type = "number")]
+    pub offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ObjectExportReceipt {
+    pub key: String,
+    pub tip_sha: String,
+    /// Zero when the receiver's `have` commits already contain the tip.
+    #[ts(type = "number")]
+    pub total_bytes: u64,
+    /// Lower-case hex SHA-256 of the whole bundle.
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ExportObjectsResult {
+    pub receipt: ObjectExportReceipt,
+    #[ts(type = "number")]
+    pub offset: u64,
+    /// Standard base64 of at most [`MAX_OBJECT_TRANSFER_CHUNK_BYTES`].
+    pub data: String,
+    pub eof: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ObjectChunk {
+    #[ts(type = "number")]
+    pub total_bytes: u64,
+    pub sha256: String,
+    #[ts(type = "number")]
+    pub offset: u64,
+    pub data: String,
+    /// The owner verifies and imports once the last chunk is stored.
+    pub last: bool,
+}
+
+/// Without a chunk this only asks whether the key was already imported.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ImportObjectsParams {
+    pub daemon_id: String,
+    pub runtime_id: String,
+    pub fence: IntegrationOwnerFence,
+    pub key: String,
+    pub repo_location_id: String,
+    pub expected_tip_sha: String,
+    #[ts(type = "number")]
+    pub max_bytes: u64,
+    pub chunk: Option<ObjectChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ObjectImportReceipt {
+    pub key: String,
+    pub tip_sha: String,
+    /// Always `refs/forge/integration/<key>`.
+    pub ref_name: String,
+    /// The key was already imported; nothing was transferred this time.
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ImportObjectsResult {
+    Absent,
+    Receiving {
+        #[ts(type = "number")]
+        received_bytes: u64,
+    },
+    Imported {
+        receipt: ObjectImportReceipt,
+    },
+}
+
+/// Drop a key's owner-local staging (export bundle, partial import).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ReleaseObjectsParams {
+    pub daemon_id: String,
+    pub runtime_id: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ReleaseObjectsResult {
+    pub key: String,
+    pub removed: bool,
+}
+
+/// `inbound` brings the target tip to the Task's checkout before a rebase;
+/// `outbound` sends the candidate to the default checkout before the
+/// fast-forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ObjectTransferDirection {
+    Inbound,
+    Outbound,
+}
+
+/// One transfer per attempt, claim generation and direction.
+pub fn object_transfer_key(
+    attempt_id: &str,
+    generation: i64,
+    direction: ObjectTransferDirection,
+) -> String {
+    let direction = match direction {
+        ObjectTransferDirection::Inbound => "in",
+        ObjectTransferDirection::Outbound => "out",
+    };
+    format!("{attempt_id}-{generation}-{direction}")
 }

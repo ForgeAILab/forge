@@ -41,6 +41,10 @@ struct WorkspaceRegistry {
     handles: HashMap<String, OwnedWorkspace>,
     #[serde(default)]
     integration_fences: HashMap<String, IntegrationOwnerFence>,
+    /// When each queue's fence was last recorded (Unix seconds); the oldest
+    /// are dropped past [`integration_owner::MAX_INTEGRATION_FENCES`].
+    #[serde(default)]
+    integration_fence_seen: HashMap<String, u64>,
     #[serde(default)]
     integration_pending: HashMap<String, String>,
     /// Cancellation tombstones prevent a delayed request from starting after
@@ -227,6 +231,10 @@ impl DaemonWorkspaceBackend {
                 | METHOD_CHECK_RUN
                 | METHOD_CHECK_LOOKUP
                 | METHOD_CHECK_CANCEL
+                | METHOD_INTEGRATION_ANNOUNCE
+                | METHOD_INTEGRATION_EXPORT_OBJECTS
+                | METHOD_INTEGRATION_IMPORT_OBJECTS
+                | METHOD_INTEGRATION_RELEASE_OBJECTS
         )
     }
 
@@ -240,6 +248,18 @@ impl DaemonWorkspaceBackend {
             METHOD_CHECK_RUN => return encode(self.check_run(decode(params)?).await?),
             METHOD_CHECK_LOOKUP => return encode(self.check_lookup(decode(params)?).await?),
             METHOD_CHECK_CANCEL => return encode(self.check_cancel(decode(params)?).await?),
+            METHOD_INTEGRATION_ANNOUNCE => {
+                return encode(self.announce_integration(decode(params)?)?)
+            }
+            METHOD_INTEGRATION_EXPORT_OBJECTS => {
+                return encode(self.export_objects(decode(params)?).await?)
+            }
+            METHOD_INTEGRATION_IMPORT_OBJECTS => {
+                return encode(self.import_objects(decode(params)?).await?)
+            }
+            METHOD_INTEGRATION_RELEASE_OBJECTS => {
+                return encode(self.release_objects(decode(params)?).await?)
+            }
             _ => {}
         }
         if method == METHOD_WORKSPACE_CANCEL {
@@ -705,7 +725,18 @@ impl DaemonWorkspaceBackend {
                 *state = updated;
             }
         }
-        self.journal.acknowledge(params).map_err(storage_error)
+        let result = self.journal.acknowledge(params).map_err(storage_error)?;
+        if let Some(JournalEntry::Operation { operation }) = &entry {
+            if matches!(
+                operation.fence.integration,
+                WorkspaceIntegrationBinding::Attempt { .. }
+            ) {
+                // The server holds this receipt durably: the checkout's
+                // pending marker and superseded receipts can go.
+                self.prune_integration_state(None, Some(&operation.fence.operation_id))?;
+            }
+        }
+        Ok(result)
     }
 
     fn check_owner(&self, daemon_id: &str, runtime_id: &str) -> CommandResult<()> {
@@ -2308,5 +2339,6 @@ mod reconciliation;
 mod tests;
 
 mod integration_owner;
+mod object_transfer;
 
 mod check_owner;

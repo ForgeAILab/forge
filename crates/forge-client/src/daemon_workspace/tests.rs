@@ -991,6 +991,7 @@ async fn describe_lists_active_and_journaled_executions_for_this_handle() {
     assert_eq!(result.journaled_execution_ids, ["exec-1"]);
 }
 
+mod integration_wire;
 mod protocol;
 
 #[tokio::test]

@@ -1384,6 +1384,7 @@ dependencies = [
  "api",
  "api-types",
  "axum",
+ "base64",
  "check-executor",
  "chrono",
  "clap",
