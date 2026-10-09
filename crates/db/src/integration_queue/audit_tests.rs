@@ -259,7 +259,12 @@ async fn removing_a_machine_leaves_its_queue_evidence_and_later_deletion_working
 
 #[test]
 fn every_check_enum_in_the_migration_matches_its_rust_enum() {
-    let sql = include_str!("../../migrations/V202610080123__integration_queue.sql");
+    // The activation migration adds no enum column (its typed values live in
+    // the timings document), so the same scan must find nothing new in it.
+    let sql = concat!(
+        include_str!("../../migrations/V202610080123__integration_queue.sql"),
+        include_str!("../../migrations/V202610091612__integration_activation.sql")
+    );
     fn all<T: ToString>(values: &[T]) -> Vec<String> {
         values.iter().map(ToString::to_string).collect()
     }
