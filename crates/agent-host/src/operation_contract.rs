@@ -201,6 +201,19 @@ pub(crate) fn charter_content_schema() -> Value {
     )
 }
 
+/// Whether a property is an object with declared fields, directly, as a
+/// nullable alternative, or as the item of an array.
+fn declares_structure(schema: &Value) -> bool {
+    schema.get("properties").is_some()
+        || schema.get("items").is_some_and(declares_structure)
+        || ["anyOf", "oneOf"].iter().any(|keyword| {
+            schema
+                .get(*keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|variants| variants.iter().any(declares_structure))
+        })
+}
+
 fn advertised_proposal_line(
     spec: &operation_registry::OperationSpec<std::convert::Infallible>,
 ) -> String {
@@ -209,6 +222,16 @@ fn advertised_proposal_line(
         .iter()
         .any(|surface| surface.native_aggregate == "forge_main_orchestration_propose")
     {
+        // Field names alone cannot be called when a field is itself a
+        // structure: a Charter draft needs every section's shape, and the
+        // tool description is the only place a Main model is shown it.
+        let schema = &spec.input.schema;
+        let nested = schema["properties"]
+            .as_object()
+            .is_some_and(|properties| properties.values().any(declares_structure));
+        if nested {
+            return format!("{}: {}", spec.id, schema_signature(schema, 0));
+        }
         return spec.contract_line();
     }
     format!(
@@ -465,7 +488,11 @@ fn schema_signature(schema: &Value, depth: usize) -> String {
     if depth > MAX_DEPTH {
         return "object".to_owned();
     }
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+    // Derived registry schemas spell a nullable structure as `anyOf`.
+    if let Some(variants) = ["oneOf", "anyOf"]
+        .iter()
+        .find_map(|keyword| schema.get(*keyword).and_then(Value::as_array))
+    {
         return variants
             .iter()
             .map(|variant| schema_signature(variant, depth))
@@ -1224,6 +1251,48 @@ mod tests {
             evidence["properties"]["evidence_kind"]["type"]
                 .as_array()
                 .is_some_and(|kinds| kinds.contains(&json!("null")))
+        );
+    }
+
+    /// The Main description is the only place a model is shown the Charter
+    /// structure, so the generated draft line must carry every nested shape,
+    /// and the same shapes the hand adoption schema declares.
+    #[test]
+    fn main_charter_draft_line_advertises_the_nested_charter_shape() {
+        let operations = BTreeSet::from(["charter.draft".to_owned(), "genesis.start".to_owned()]);
+        let schema = orchestration_proposal_schema(&operations);
+        let description = schema["properties"]["payload"]["description"]
+            .as_str()
+            .expect("payload description");
+        let line = |operation: &str| {
+            description
+                .lines()
+                .find(|line| line.starts_with(&format!("- {operation}: ")))
+                .unwrap_or_else(|| panic!("{operation} line"))
+        };
+        let draft = line("charter.draft");
+        for (field, hand) in [
+            ("content", charter_content_schema()),
+            ("provenance", revision_provenance_schema()),
+        ] {
+            assert!(
+                draft.contains(&format!("{field}: {}", schema_signature(&hand, 0))),
+                "{field} shape is missing from: {draft}"
+            );
+        }
+        for field in [
+            "charter_id: string",
+            "expected_charter_version?: integer|null",
+            "project_mode: compact|standard",
+            "source_refs?: [{",
+        ] {
+            assert!(draft.contains(field), "{field}");
+        }
+        assert!(!draft.contains("{action") && !draft.contains(" action"));
+        assert_eq!(
+            line("genesis.start"),
+            "- genesis.start: {maturity?: one of prototype|mvp|production|critical, \
+             preferred_project_agent_identity_id?}"
         );
     }
 

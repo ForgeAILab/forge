@@ -171,7 +171,14 @@ base. The native `main_account_id` gate remains on `project.create` and
 `genesis.project_agent.select`; extending it to these direct commands would
 narrow that receipt retrieval. Stored preparations retain their exact arguments;
 the transport-only `action` is omitted from the advertised contracts and ignored
-before decoding, as the domain adapters already did. All other operations keep
+before decoding, as the domain adapters already did. `genesis.start` likewise
+accepts and discards an unadvertised `initial_idea`: the hand path decoded it
+and then replaced it with the leased user message. Both contracts accept every
+field their hand path read. The Charter draft is the one registered operation
+whose advertised line carries nested shapes (every Charter section and the
+provenance object, generated from the registry schema): the tool description is
+the only place a Main model is shown them, and a draft sent without them costs
+one correction turn per missing field. All other operations keep
 their hand paths; an operation never has both. Existing permission/binding checks enforce
 authority; spec/check parity is tested pending EffectiveAuthority. Domain
 semantic validation, transactions, workspace preparation, MCP projections and
@@ -218,7 +225,21 @@ hand paths. Literal fixtures from the real approved Charter/create and milestone
 command setup show that adoption and evidence return committed receipts after
 an identity pause or ceiling reduction. Registry admission would narrow those
 replays, so no partial move is retained. Readiness's base capture reached its
-bounded fixture-attempt limit; its dispatch and schema are unchanged. Project verification remains a disposable checkout with observed commands:
+bounded fixture-attempt limit; its dispatch and schema are unchanged. Moving
+adoption and evidence needs a registry receipt-retrieval step that runs before
+current authority is evaluated: an exact replay (same principal, scope,
+operation, dedupe key and input digest) returns the stored receipt unchanged
+whatever the caller's present pause state or ceiling, while any other call,
+including the same key with different input, is evaluated as a fresh command.
+The registered Main commands differ and must stay as they are: their replay is
+refused while the identity is paused or restricted, and allowed after the Main
+binding is replaced.
+
+A queued proposal (the six pending ones and `project.release.request`) refused
+for a missing permission still writes its `agent_action` row with status
+`denied`, as the queueing step did before these operations were registered. A
+call that could never have been queued (malformed payload, no Project target,
+Charter not adopted) writes none. Project verification remains a disposable checkout with observed commands:
 `project.validation` still requires the command observations for pass/fail and
 refuses manual attestation through the Project-Agent path. Setup-only availability
 now reports `charter_adoption_not_applicable` after setup completes, rather than

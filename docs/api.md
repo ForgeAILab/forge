@@ -1077,10 +1077,10 @@ mutation.
 
 The Main-only native `genesis.start` operation is a direct typed proposal under
 the account/Main Chat scope and requires `propose_discovery`. Its payload is
-closed: `action` must be `"start"`, with optional `maturity` and
-`preferred_project_agent_identity_id`. It deliberately accepts no account,
-chat, source-message, source-turn, or initial-idea authority; Forge derives those
-from the leased Main turn. The operation is absent from Project Agent, Worker,
+closed: optional `maturity` and `preferred_project_agent_identity_id`. `action`
+is not required; it and `initial_idea` are accepted and discarded. No account,
+chat, source-message, source-turn, or initial-idea value in the payload has any
+authority; Forge derives those from the leased Main turn. The operation is absent from Project Agent, Worker,
 and reviewer catalogs. Starting discovery is not Charter approval and does not
 create a Project.
 
@@ -5534,20 +5534,30 @@ fresh command.
 The transport-only `action` is ignored and no longer required or advertised.
 Genesis accepts optional nullable `maturity` and
 `preferred_project_agent_identity_id`; its user idea and source message/turn are
-server-derived. Main draft declares the actual command fields, including the
+server-derived, and a caller's `initial_idea` is accepted and discarded as it was
+before. Main draft declares every field its command reads, including the
 previously unadvertised `genesis_session_id`, `expected_charter_version`,
-`change_summary`, `source_refs`, `content_digest` and `render_digest`. Its full
-nested Charter and provenance types are checked at registry decode. A field or
-envelope violation produces one correction naming the operation, field and
-contract line, after current authority and forged-scope checks. Integer spellings
-normalize as for other registered operations; `payload: null` is read as `{}`.
-Payloads retain the 65,536 serialized UTF-8 byte ceiling. Native preparation still
-drops caller renderer fields, while direct command adapters retain their existing
-round-trip validation.
+`change_summary`, `source_refs`, `content_digest` and `render_digest`. Its
+advertised line still spells out every Charter section and the provenance
+object, now generated from the registry schema; those nested types are checked
+at registry decode. Every field either command accepted before is still
+accepted. A field or envelope violation produces one correction naming the
+operation, field and contract line, after current authority and forged-scope
+checks. Integer spellings normalize as for other registered operations;
+`payload: null` is read as `{}`. Payloads retain the 65,536 serialized UTF-8
+byte ceiling. Native preparation still drops caller renderer fields, while
+direct command adapters retain their existing round-trip validation.
+
+Main tool definitions are 8,551 bytes (8,558 before), Inquiry 3,971 (4,089),
+Project 23,870 (24,252), Project verification 25,119 (25,501) and Project setup
+15,517 (15,766).
 
 Pending proposals advertise their contract once, without registered root field
 aliases. Existing flat inputs still normalize from canonical registry field
-names. Task payload declarations and legacy pending materialization are unchanged.
+names: arguments are normalized before the tool schema is applied, and no
+provider request marks these tools strict. A `project.release.request` refused
+for a missing permission is recorded as a `denied` agent action, like the
+pending proposals. Task payload declarations and legacy pending materialization are unchanged.
 Charter adoption and evidence remain on their hand paths because their historical
 receipt retrieval after pause/ceiling changes would be narrowed by registry
 admission. Readiness also remains on its hand path.

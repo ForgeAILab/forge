@@ -105,12 +105,13 @@ impl CoordinationToolProvider {
         }
         Ok(())
     }
-    /// A pending proposal refused for a missing permission still leaves its
-    /// denied ledger row, as it did before these operations were registered:
-    /// the attempt stays visible and can never be approved. The denial the
+    /// A queued proposal (the six pending ones and the release candidate
+    /// request) refused for a missing permission still leaves its denied
+    /// ledger row, as it did before these operations were registered: the
+    /// attempt stays visible and can never be approved. The denial the
     /// caller receives is unchanged; nothing is recorded unless the action
     /// policy itself denies the same request.
-    async fn record_denied_pending_proposal(
+    async fn record_denied_queued_proposal(
         &self,
         actor: &str,
         scope: &CanonicalScope,
@@ -118,7 +119,8 @@ impl CoordinationToolProvider {
         arguments: &Value,
         denial: &AgentHostError,
     ) {
-        if !operation_registry::legacy_proposals::IDS.contains(&operation)
+        let release = operation == PROJECT_RELEASE_OPERATION;
+        if !(release || operation_registry::legacy_proposals::IDS.contains(&operation))
             || !matches!(denial, AgentHostError::StructuredOutcome(outcome)
                 if matches!(outcome.denied_by, Some(DeniedBy::PermissionMissing(_))))
             || contains_authority_override(arguments)
@@ -138,6 +140,21 @@ impl CoordinationToolProvider {
             required_argument(arguments, "correlation_id"),
         ) else {
             return;
+        };
+        // The release request has a closed contract and a Project target:
+        // a call that would have been refused before it was queued leaves
+        // no row, exactly as before.
+        let (payload, release_target) = if release {
+            let spec = CATALOG.lookup(operation).expect("registered proposal");
+            let (Ok(payload), Ok(target)) = (
+                spec.normalize_arguments(&payload),
+                self.authorization.direct_project_target(scope).await,
+            ) else {
+                return;
+            };
+            (payload, Some(target))
+        } else {
+            (payload, None)
         };
         if validate_proposal_payload(operation, &payload).is_err() {
             return;
@@ -159,7 +176,9 @@ impl CoordinationToolProvider {
         ) {
             return;
         }
-        let target_type = if operation == "session.action" {
+        let target_type = if release {
+            "project"
+        } else if operation == "session.action" {
             "scope"
         } else {
             scope_type
@@ -186,11 +205,11 @@ impl CoordinationToolProvider {
                 requested_permission: permission.to_owned(),
                 policy_reason: None,
                 target_type: Some(target_type.to_owned()),
-                target_id: Some(scope.scope_id.clone()),
+                target_id: Some(release_target.unwrap_or_else(|| scope.scope_id.clone())),
             })
             .await
         {
-            tracing::warn!(operation, %error, "denied pending proposal was not recorded");
+            tracing::warn!(operation, %error, "denied proposal was not recorded");
         }
     }
     pub(super) async fn registered_proposal(
@@ -213,7 +232,7 @@ impl CoordinationToolProvider {
             )?;
         } else if let Err(denial) = self.proposal_admission(actor, scope, operation).await {
             if !prepared {
-                self.record_denied_pending_proposal(actor, scope, operation, &arguments, &denial)
+                self.record_denied_queued_proposal(actor, scope, operation, &arguments, &denial)
                     .await;
             }
             return Err(denial);

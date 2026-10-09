@@ -144,13 +144,28 @@ fn serialized_tool_definitions() {
 /// A surface may shrink freely. Raise a ceiling only deliberately, in the
 /// change that explains why the prefix has to grow.
 const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
-    // E2: Main command contracts are one generated line; registered pending
-    // fields need no root aliases. Named tools state their purpose once.
-    // Hand Task declarations are unchanged, including their existing ceiling.
-    ("main", 5_386),
+    // Main was 8,558 and Inquiry 4,089 at 33e2a974. The orchestration read
+    // tool states its purpose once (-118 on both). The Main propose tool
+    // nets +111: its description is shorter and the unadvertised `action`
+    // discriminator is gone, but the generated Charter draft line now names
+    // the six fields its handler always read (`genesis_session_id`,
+    // `expected_charter_version`, `change_summary`, `source_refs`,
+    // `content_digest`, `render_digest`). That line keeps the whole nested
+    // Charter shape (about 3,000 bytes): the description is the only place
+    // a Main model is shown it, so it is not a saving to take.
+    ("main", 8_551),
     ("inquiry", 3_971),
-    ("project", 23_710),
-    ("project_verify_solo", 24_959),
+    // 24,252 and 25,501 at 435ff088, less 382: the pending proposals' eleven
+    // root aliases are no longer declared (-156; arguments are normalized
+    // before schema validation, and the flat fields are still lifted by
+    // registry field name), and the two Project orchestration descriptions
+    // state their purpose once (-226). Hand Task operations keep their
+    // payload fields declared.
+    ("project", 23_870),
+    ("project_verify_solo", 25_119),
+    // 15,766 at 435ff088, less 249: the `body`/`content` root aliases (-23)
+    // and the same two descriptions (-226). The hand Charter adoption
+    // schema dominates (12,418 bytes).
     ("project_setup", 15_517),
     ("worker", 6_062),
     ("reviewer", 4_829),

@@ -773,4 +773,21 @@ async fn genesis_start_contract_is_native_only_and_refuses_unknowns() {
         );
         assert_eq!(text.matches("expected genesis.start:").count(), 1, "{text}");
     }
+    // The hand path accepted a caller's `initial_idea` and replaced it with
+    // the leased user message before the request digest was taken, so the
+    // same call with the field is the same command: no correction turn.
+    let mut arguments = case["arguments"].clone();
+    arguments["payload"]["initial_idea"] = json!("A caller-authored idea is never the source");
+    assert_eq!(
+        p.propose(
+            MAIN_IDENTITY_ID,
+            &call_scope,
+            "e2",
+            "genesis.start",
+            arguments,
+        )
+        .await
+        .unwrap(),
+        case["replay"]
+    );
 }

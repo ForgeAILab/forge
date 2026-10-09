@@ -1023,6 +1023,13 @@ fn hand_main_payload_byte_limits_and_ignored_actions_are_explicit() {
             input["action"] = action;
             assert_eq!(spec.normalize_arguments(&input).unwrap(), plain);
         }
+        if *id == "genesis.start" {
+            // The idea text comes from the leased user message; a caller's
+            // copy was always discarded and is still accepted silently.
+            input["initial_idea"] = json!("Build a note app");
+            assert_eq!(spec.normalize_arguments(&input).unwrap(), plain);
+            assert!(!spec.contract_line().contains("initial_idea"));
+        }
         if *id == "charter.draft" {
             input["content"]["identity"]["working_name"] = json!("é".repeat(32768));
         } else {

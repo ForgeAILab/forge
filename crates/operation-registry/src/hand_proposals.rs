@@ -75,6 +75,10 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             "",
             &[
                 StructuralConstraint::IgnoredField("action"),
+                // The hand path decoded `initial_idea` and then replaced it
+                // with the leased user message: never advertised, never
+                // read, and still accepted rather than costing a turn.
+                StructuralConstraint::IgnoredField("initial_idea"),
                 StructuralConstraint::ClosedObject,
                 StructuralConstraint::MaxSerializedBytes(65536),
             ],

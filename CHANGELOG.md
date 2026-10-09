@@ -33,6 +33,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - **A Project Agent cannot queue `project.create` (3.8 slice E).** The
   agent-action policy refuses it from a Project scope or Project Chat, where
   it was never offered; it used to be queued for approval.
+- **Native `charter.draft` and `genesis.start` answer a malformed call
+  differently (3.8 slice E2).** Both Main commands are checked against one
+  registry contract. Every field either command accepted before is still
+  accepted, so a call that worked keeps working. A call with an unknown
+  payload or envelope field, which used to return a `validation_error`
+  outcome, now returns one tool error naming the operation, the field and the
+  expected contract, and the caller's authority is checked before its payload.
+  The `action` discriminator is no longer required or advertised: a call
+  without it used to be refused, and one that still sends it is accepted
+  whatever its value.
 - **Daemon protocol revision 4 (3.2 stage C, part 2b).** Workspace mutation
   and reconciliation messages now carry a required tagged `integration`
   binding (`task_step`, `task_step_effect` or `attempt`), and merge / rebase
@@ -687,6 +697,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   milestone and validation fields that stay accepted), Project setup 15,572
   to 15,766 (the pending `message.send` contract line and its `body` /
   `content` aliases).
+
+- **The two Main direct commands use generated registry contracts (3.8
+  slice E2).** `charter.draft` and `genesis.start` moved from hand-written
+  branches and schemas to the operation registry; domain authorization,
+  receipts and replay are unchanged, including replay of receipts written
+  before this change. The Charter draft line is generated from the registry
+  schema and still spells out every Charter section and the provenance
+  object; it now also names six fields the command always read
+  (`genesis_session_id`, `expected_charter_version`, `change_summary`,
+  `source_refs`, `content_digest`, `render_digest`). `genesis.start` still
+  accepts and discards `initial_idea`. The pending proposals no longer
+  declare their fields a second time at the root of `forge_scope_propose`;
+  flat calls are still accepted. The orchestration tools state their purpose
+  in one sentence. Tool definitions: Main 8,558 to 8,551 bytes, Inquiry 4,089
+  to 3,971, Project 24,252 to 23,870, Project verification 25,501 to 25,119,
+  Project setup 15,766 to 15,517. `project.charter.adoption`,
+  `project.evidence` and `project.readiness` keep their hand paths.
 
 - **Authority is resolved once per turn and pinned (3.8 slice D).** A native
   or CLI turn fixes its Agent Profile and permission ceiling at admission.
@@ -1568,6 +1595,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - **A setup-only operation refused after setup completed names the real
   cause (3.8 slice E).** The denial is `charter_adoption_not_applicable`
   instead of `charter_not_adopted`.
+- **A registered proposal's envelope error names what to fix (3.8 slice
+  E2).** An undeclared envelope field is answered with the operation, the
+  field and the expected contract instead of only "is not admitted".
 - **A pending proposal never reports a completed effect (3.8 slice E).**
   Replaying a legacy message, commitment, memory, review or session proposal
   whose ledger row was marked `executed` without a receipt is refused instead
