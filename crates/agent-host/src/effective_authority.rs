@@ -40,6 +40,7 @@ impl AuthorityBoundProvider {
         actor: &str,
         scope: &CanonicalScope,
         operation: &str,
+        fresh_effect: bool,
     ) -> Result<(), AgentHostError> {
         let scope_type = match scope.scope_type {
             crate::CanonicalScopeType::Account => "account",
@@ -54,31 +55,55 @@ impl AuthorityBoundProvider {
         }
         let spec = operation_registry::READ_CATALOG
             .lookup(operation)
-            .or_else(|| operation_registry::main_proposals::CATALOG.lookup(operation));
+            .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation));
         let Some(spec) = spec else {
             return Ok(());
         };
-        let current = self
-            .db
-            .resolve_effective_authority(
-                actor,
-                Some(&self.admitted.admitted_profile_id),
-                &self.admitted.scope_type,
-                &self.admitted.scope_id,
-                self.workspace,
-            )
-            .await;
-        let current = match current {
-            Ok(current) => current,
-            Err(db::DbError::NotFound) => {
-                let mut remaining = self
-                    .remaining
-                    .lock()
-                    .map_err(|_| AgentHostError::ProtectedPersistence)?;
-                remaining.active = false;
-                remaining.clone()
+        let identity = match &self.admitted.principal {
+            operation_registry::authority::Principal::MainAgent { identity_id }
+            | operation_registry::authority::Principal::ProjectAgent { identity_id, .. }
+            | operation_registry::authority::Principal::TaskAgent { identity_id, .. } => {
+                identity_id
             }
-            Err(_) => return Err(AgentHostError::ProtectedPersistence),
+            _ => {
+                return Err(AgentHostError::Authority(
+                    "native caller is not an admitted Agent".into(),
+                ));
+            }
+        };
+        if actor != identity {
+            return Err(AgentHostError::Authority(
+                "invocation identity differs from admitted authority".into(),
+            ));
+        }
+        let current = if fresh_effect {
+            let current = self
+                .db
+                .resolve_effective_authority(
+                    actor,
+                    Some(&self.admitted.admitted_profile_id),
+                    &self.admitted.scope_type,
+                    &self.admitted.scope_id,
+                    self.workspace,
+                )
+                .await;
+            match current {
+                Ok(current) => current,
+                Err(db::DbError::NotFound) => {
+                    let mut remaining = self
+                        .remaining
+                        .lock()
+                        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+                    remaining.active = false;
+                    remaining.clone()
+                }
+                Err(_) => return Err(AgentHostError::ProtectedPersistence),
+            }
+        } else {
+            self.remaining
+                .lock()
+                .map_err(|_| AgentHostError::ProtectedPersistence)?
+                .clone()
         };
         let bounded = {
             let mut remaining = self
@@ -110,6 +135,9 @@ impl AuthorityBoundProvider {
                     api_types::DeniedBy::PermissionMissing(permission)
                 }
                 AuthorityDenial::StateChanged => api_types::DeniedBy::CharterNotAdopted,
+                AuthorityDenial::SetupCompleted => {
+                    api_types::DeniedBy::CharterAdoptionNotApplicable
+                }
                 AuthorityDenial::Revoked => api_types::DeniedBy::AuthorityRevoked,
                 AuthorityDenial::PrincipalMismatch => api_types::DeniedBy::OperationNotInScope,
             };
@@ -150,8 +178,15 @@ impl ForgeToolProvider for AuthorityBoundProvider {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
-        self.check(actor, scope, operation).await?;
-        self.inner.read(actor, scope, operation, arguments).await
+        self.check(actor, scope, operation, false).await?;
+        let authority = self
+            .remaining
+            .lock()
+            .map_err(|_| AgentHostError::ProtectedPersistence)?
+            .clone();
+        self.inner
+            .read_admitted(actor, scope, operation, arguments, &authority)
+            .await
     }
     async fn proposal_denial(
         &self,
@@ -159,8 +194,16 @@ impl ForgeToolProvider for AuthorityBoundProvider {
         scope: &CanonicalScope,
         operation: &str,
     ) -> Result<(), AgentHostError> {
-        self.check(actor, scope, operation).await?;
-        self.inner.proposal_denial(actor, scope, operation).await
+        if operation_registry::PROPOSAL_CATALOG
+            .lookup(operation)
+            .is_some()
+        {
+            self.check(actor, scope, operation, true).await?;
+            // The provider keeps its own admission (the Main binding gate).
+            self.inner.proposal_denial(actor, scope, operation).await
+        } else {
+            self.inner.proposal_denial(actor, scope, operation).await
+        }
     }
     async fn read_denial(
         &self,
@@ -168,8 +211,7 @@ impl ForgeToolProvider for AuthorityBoundProvider {
         scope: &CanonicalScope,
         operation: &str,
     ) -> Result<(), AgentHostError> {
-        self.check(actor, scope, operation).await?;
-        self.inner.read_denial(actor, scope, operation).await
+        self.check(actor, scope, operation, false).await
     }
     async fn propose(
         &self,
@@ -179,7 +221,7 @@ impl ForgeToolProvider for AuthorityBoundProvider {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
-        self.check(actor, scope, operation).await?;
+        self.check(actor, scope, operation, true).await?;
         let authority = self
             .remaining
             .lock()
@@ -199,7 +241,7 @@ impl ForgeToolProvider for AuthorityBoundProvider {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
-        self.check(actor, scope, operation).await?;
+        self.check(actor, scope, operation, true).await?;
         let authority = self
             .remaining
             .lock()
@@ -340,7 +382,7 @@ mod tests {
         identity
     }
     #[tokio::test]
-    async fn pinned_provider_refuses_widening_and_current_revocation_without_effects() {
+    async fn pinned_reads_reuse_admission_and_effect_checks_narrow_monotonically() {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
         let db = Arc::new(db::SqliteDb::new(pool));
@@ -439,7 +481,7 @@ mod tests {
             .unwrap();
         assert!(
             next.evaluate(
-                operation_registry::main_proposals::CATALOG
+                operation_registry::PROPOSAL_CATALOG
                     .lookup("project.create")
                     .unwrap()
             )
@@ -459,6 +501,17 @@ mod tests {
         );
         assert_eq!(inner.0.load(Ordering::SeqCst), 1);
         select_policy(&db, r#"{"permissions":[]}"#).await;
+        provider
+            .read("agent", &scope, "account.summary", serde_json::json!({}))
+            .await
+            .unwrap();
+        // Reads retain the admission; a fresh proposal discovers revocation.
+        assert!(
+            provider
+                .proposal_denial("agent", &scope, "project.create")
+                .await
+                .is_err()
+        );
         let AgentHostError::StructuredOutcome(outcome) = provider
             .read("agent", &scope, "account.summary", serde_json::json!({}))
             .await
@@ -495,6 +548,16 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        replacement_turn
+            .read("agent", &scope, "account.summary", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(
+            replacement_turn
+                .proposal_denial("agent", &scope, "project.create")
+                .await
+                .is_err()
+        );
         let AgentHostError::StructuredOutcome(outcome) = replacement_turn
             .read("agent", &scope, "account.summary", serde_json::json!({}))
             .await
@@ -583,6 +646,53 @@ mod tests {
             outcome.denied_by,
             Some(api_types::DeniedBy::AuthorityRevoked)
         );
+        assert_eq!(inner.0.load(Ordering::SeqCst), 3);
+    }
+    #[tokio::test]
+    async fn registered_reads_never_reload_authority_within_an_admission() {
+        use operation_registry::authority::{AuthorityFacts, Principal};
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let admitted = EffectiveAuthority::resolve(AuthorityFacts {
+            principal: Principal::MainAgent {
+                identity_id: "agent".into(),
+            },
+            scope_type: "account".into(),
+            scope_id: "owner".into(),
+            profile_id: "profile".into(),
+            layers: vec![["read_account".into()].into_iter().collect()],
+            binding_id: None,
+            setup_required: false,
+            active: true,
+        });
+        let inner = Arc::new(CountingProvider::default());
+        let provider = AuthorityBoundProvider {
+            db: db.clone(),
+            inner: inner.clone(),
+            admitted: admitted.clone(),
+            remaining: std::sync::Mutex::new(admitted),
+            workspace: "deny",
+        };
+        let scope = CanonicalScope {
+            scope_type: crate::CanonicalScopeType::Account,
+            scope_id: "owner".into(),
+            workspace_access: crate::WorkspaceAccess::Deny,
+        };
+        db.pool().close().await;
+        provider
+            .read_denial("agent", &scope, "account.summary")
+            .await
+            .unwrap();
+        provider
+            .read("agent", &scope, "account.summary", serde_json::json!({}))
+            .await
+            .unwrap();
         assert_eq!(inner.0.load(Ordering::SeqCst), 1);
+        assert!(
+            provider
+                .read("forged", &scope, "account.summary", serde_json::json!({}))
+                .await
+                .is_err()
+        );
     }
 }

@@ -553,6 +553,7 @@
               "null"
             ]
           },
+          "body": {},
           "capability_class": {
             "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\").",
             "type": [
@@ -574,21 +575,17 @@
               "null"
             ]
           },
+          "commitment_id": {},
+          "content": {},
           "correlation_id": {
             "description": "Required non-null correlation id",
             "minLength": 1,
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "dedupe_key": {
             "description": "Required non-null idempotency key",
             "minLength": 1,
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "depends_on_task_id": {
             "description": "task.dependency: the single prerequisite Task the edge points at. Use task.dependency to change an existing graph; recreating Tasks changes their ids and orphans everything downstream.",
@@ -615,6 +612,7 @@
               "null"
             ]
           },
+          "due_at": {},
           "expected_board_revision": {
             "description": "task.adaptive: Project board revision precondition (work.read returns it as board_revision).",
             "type": [
@@ -629,6 +627,7 @@
               "null"
             ]
           },
+          "expected_version": {},
           "items": {
             "description": "task.adaptive split: non-empty ordered direct-child list; creates children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
             "items": {
@@ -661,6 +660,8 @@
               "null"
             ]
           },
+          "kind": {},
+          "memory_id": {},
           "milestone_id": {
             "description": "task.propose: optional; defaults to the active baseline's primary milestone.",
             "type": [
@@ -694,7 +695,7 @@
             ]
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- task.propose — create a Task in the bound Project. Fields: title (required); description (outcome, acceptance criteria, and owned repository-relative paths); priority (integer, higher runs sooner); task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); plan_item_id (optional traceability to a stable item in the active execution baseline, for example \"pi-2\"; when supplied, it must exist and may have only one non-cancelled Task); milestone_id (optional traceability, defaulting to the active baseline's primary milestone when one exists); capability_class (when supplied it must be one of the server-approved profiles: \"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", \"planning_read\" — and, when the baseline declares allowed classes, also one of those); risk_class (only when the baseline declares allowed classes). depends_on_task_ids (optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. Forge binds implementation authority to the Project's current approved Charter. Baseline references are optional traceability; never echo baseline ids or digests.\n- task.adaptive — apply one bounded adaptive command to a Task in the bound Project. Fields: action (required: \"split\", \"sequence\", or \"replace\"); source_task_id, expected_task_version, expected_board_revision, and rationale (all required; read both from work.read — the Task's version and the top-level board_revision; a version_conflict returns the current values in retry.arguments); split requires non-empty items of {title, description?, assignee_id?}; split creates ordered direct children under a non-executing coordination root; children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order. sequence manages that child order only and does not create a dependency graph. replace requires title and optional description. Project, scope, actor, permission, governance, and fixed-boundary values are server-derived and unknown fields are rejected.\n- task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n\n- task.dependency — add or remove one prerequisite edge between two Tasks in the bound Project. Fields: action (required: \"add\" or \"remove\"), task_id (the Task that waits), depends_on_task_id (the Task it waits for), and a non-empty rationale (all required). This is a DAG edge only: no parent/child hierarchy and no shared workspace. Adding refuses a cancelled prerequisite and a self-edge; removing the last cancelled prerequisite clears the dependency block it caused. Prefer this over cancelling and recreating Tasks, which changes their ids and orphans dependents.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- task.propose — create a Task in the bound Project. Fields: title (required); description (outcome, acceptance criteria, and owned repository-relative paths); priority (integer, higher runs sooner); task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); plan_item_id (optional traceability to a stable item in the active execution baseline, for example \"pi-2\"; when supplied, it must exist and may have only one non-cancelled Task); milestone_id (optional traceability, defaulting to the active baseline's primary milestone when one exists); capability_class (when supplied it must be one of the server-approved profiles: \"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", \"planning_read\" — and, when the baseline declares allowed classes, also one of those); risk_class (only when the baseline declares allowed classes). depends_on_task_ids (optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. Forge binds implementation authority to the Project's current approved Charter. Baseline references are optional traceability; never echo baseline ids or digests.\n- task.adaptive — apply one bounded adaptive command to a Task in the bound Project. Fields: action (required: \"split\", \"sequence\", or \"replace\"); source_task_id, expected_task_version, expected_board_revision, and rationale (all required; read both from work.read — the Task's version and the top-level board_revision; a version_conflict returns the current values in retry.arguments); split requires non-empty items of {title, description?, assignee_id?}; split creates ordered direct children under a non-executing coordination root; children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order. sequence manages that child order only and does not create a dependency graph. replace requires title and optional description. Project, scope, actor, permission, governance, and fixed-boundary values are server-derived and unknown fields are rejected.\n- task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n\n- task.dependency — add or remove one prerequisite edge between two Tasks in the bound Project. Fields: action (required: \"add\" or \"remove\"), task_id (the Task that waits), depends_on_task_id (the Task it waits for), and a non-empty rationale (all required). This is a DAG edge only: no parent/child hierarchy and no shared workspace. Adding refuses a cancelled prerequisite and a self-edge; removing the last cancelled prerequisite clears the dependency block it caused. Prefer this over cancelling and recreating Tasks, which changes their ids and orphans dependents.\n- commitment.update: {commitment_id?, content?, description?, due_at?, expected_version?, status?}; PENDING commitment proposal; no commitment is changed. Payload <=65536 serialized UTF-8 bytes.\n- memory.publish: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is published. Payload <=65536 serialized UTF-8 bytes.\n- memory.supersede: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is superseded. Payload <=65536 serialized UTF-8 bytes.\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.\n- session.action: {action?, content?, session_id?}; PENDING session proposal; no session is cancelled or steered. Payload <=65536 serialized UTF-8 bytes.",
             "properties": {
               "action": {
                 "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string.",
@@ -926,10 +927,7 @@
                 ]
               }
             },
-            "type": [
-              "object",
-              "null"
-            ]
+            "type": "object"
           },
           "plan_item_id": {
             "description": "task.propose: optional traceability to a stable plan-item id in the Project's active execution baseline (for example \"pi-2\"). When supplied, the id must exist in that baseline. Each plan item admits exactly one non-cancelled Task — never re-propose a plan item that already has one.",
@@ -970,6 +968,7 @@
               "null"
             ]
           },
+          "session_id": {},
           "source_task_id": {
             "description": "task.adaptive: source Task id in the bound Project.",
             "type": [
@@ -977,6 +976,7 @@
               "null"
             ]
           },
+          "status": {},
           "task_id": {
             "description": "task.action/task.dependency: required Task id in this Project.",
             "type": [
@@ -998,13 +998,15 @@
               "null"
             ]
           },
+          "value": {},
           "version": {
             "description": "task.action: required current Task version from the offered actions.",
             "type": [
               "integer",
               "null"
             ]
-          }
+          },
+          "visibility": {}
         },
         "required": [
           "operation",
@@ -1084,7 +1086,7 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: optional {limit}\n- project.observations: optional {limit, task_id}\n- skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
+            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: {limit?}\n- project.observations: {limit?, task_id?}\n- skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
             "type": "object"
           },
           "operation": {
@@ -1130,6 +1132,7 @@
           },
           "operation": {
             "enum": [
+              "project.charter.adoption",
               "project.decision",
               "project.document",
               "project.escalate",
@@ -1143,7 +1146,7 @@
             "type": "string"
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.decision: action=record_candidate|record_effective; required: [action, question, decision_class, expected_project_version]; shape: {action: record_candidate|record_effective, affected_artifact_refs?: [{artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}], affected_milestone_ids?: [string], affected_task_ids?: [string], decision_class: \"project_implementation\", decision_id?: string|null, expected_project_version: integer, options?: [string], question: string, rationale?: string|null, selected_outcome?: string|null}\n- project.document: action=draft_revision|propose_approval; required: [action, document_id, kind, title, expected_document_version, content]; shape: {action: draft_revision|propose_approval, base_revision_id?: string|null, content: {affected_artifact_ids?: [string], affected_decision_ids?: [string], alternatives?: [string], decision_informed: string, evidence?: [string], findings?: [string], inferences?: [string], question: string, recommendation?: string|null, scope: string, sources?: [{claim: string, id: string, is_inference: boolean, quality?: string|null, retrieved_at: string, title: string, url: string}], stopping_condition: string, uncertainty?: [string], unresolved_questions?: [string]}|{acceptance_matrix?: [{evidence?: [string], id: string, required: boolean, statement: string}], adaptive_envelope?: [string], boundaries?: [string], governing_charter_revision_id?: string|null, intended_deliverables?: [string], plan_items?: [{dependencies?: [string], id: string, outcome: string, task_ids?: [string]}], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], rollback_and_recovery?: [string]}|{acceptance_scenarios?: [any], actors?: [string], functional_requirements?: [string], journeys_and_flows?: [string], loading_empty_error_recovery_states?: [string], non_functional_and_safety_requirements?: [string], out_of_scope?: [string], problem_and_outcome: string, traceability?: [{artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}]}|{accessibility?: [string], component_states?: [string], design_tokens_reference?: string|null, experience_principles?: [string], flows?: [string], information_architecture?: [string], open_decisions?: [string], prototype_or_evidence_links?: [string], responsive_behavior?: [string]}|{alternatives_and_tradeoffs?: [string], components_and_data?: [string], concurrency?: [string], context_and_constraints: string, failure_and_recovery?: [string], interfaces?: [string], migrations?: [string], observability_and_operations?: [string], security_and_privacy?: [string], system_boundary?: [string], validation_plan?: [string]}|{acceptance_evidence_contract?: [any], dependencies?: [string], known_issues?: [string], linked_artifact_refs?: [{artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}], ordered_milestone_outcomes?: [string], release_notes?: [string], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], task_queries_or_ids?: [string]}, document_id: string, expected_document_version: integer, kind: research|delivery_brief|product_spec|design|architecture|execution_plan, title: string} OR action=approve; required: [action, document_id, kind, title, revision_id, content_digest, render_digest, expected_document_version]; shape: {action: \"approve\", content_digest: string, document_id: string, envelope_digest?: string|null, expected_document_version: integer, kind: research|delivery_brief|product_spec|design|architecture|execution_plan, render_digest: string, revision_id: string, title: string}\n- project.escalate: required: [need]; shape: {need: string, task_ids?: [string]}\n- project.evidence: action=attach|capture; required: [action, milestone_id, expected_milestone_version, caption, kind]; shape: {acceptance_check_ids?: [string], action: attach|capture, asset_id?: string|null, caption: string, checksum?: string|null, content?: string|null, expected_milestone_version: integer, filename?: string|null, kind: screenshot|walkthrough_video|log|report|other, milestone_id: string, path?: string|null, source_validation_id?: string|null, task_id?: string|null}\n- project.milestone: action=define|revise|set_primary; required: [action, expected_milestone_version]; shape: {action: define|revise|set_primary, content?: {acceptance_checks?: [{description: string, expected_result: string, id: string, latest_result?: string|null, latest_result_digest?: string|null, latest_result_id?: string|null, required: boolean, source_kind: manual|policy_waiver|task_validation}], charter_revision?: {artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}|null, dependencies?: [string], document_revisions?: [{artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}], evidence_requirements?: [{description: string, evidence_kind?: screenshot|walkthrough_video|log|report|other, id: string, required: boolean}], excluded_scope?: [string], included_scope?: [string], known_issues?: [string], name?: string, outcome?: string, risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], target_date?: string|null, task_ids?: [string]}, display_label?: string|null, expected_milestone_version: integer, milestone_id?: string|null, primary_milestone_id?: string|null}\n- project.readiness: action=evaluate; required: [action, milestone_id, milestone_version]; shape: {action: \"evaluate\", milestone_id: string, milestone_version: integer}\n- project.release.request: action=propose_candidate; required: [action, milestone_id, milestone_version, readiness_snapshot_id, readiness_digest]; shape: {action: \"propose_candidate\", milestone_id: string, milestone_version: integer, readiness_digest: string, readiness_snapshot_id: string}\n- project.review_config: action=set_ci_steps; required: [action, expected_project_version, ci_steps]; shape: {action: \"set_ci_steps\", ci_steps: [string], expected_project_version: integer, setup_steps?: [string]}\n- project.validation: action=record; required: [action, milestone_id, milestone_version, check_id, definition_revision_id, status, result, input_digest]; shape: {action: \"record\", check_id: string, definition_revision_id: string, evidence_asset_id?: string|null, governing_revision_ids?: [string], input_digest: string, milestone_id: string, milestone_version: integer, observed_command_ids?: [string], observed_task_id?: string|null, result: string, status: pass|fail|blocked|stale|unavailable}",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: action=draft_revision; required: [action, expected_charter_version, project_mode, maturity, content, provenance]; shape: {action: \"draft_revision\", base_revision_id?: string|null, charter_id?: string, content: {constraints_and_risks: {accessibility?: [string], agent_authority?: [string], data?: [string], integrations?: [string], launch?: [string], migration?: [string], operations?: [string], product?: [string], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], security_privacy_compliance?: [string], technology?: [string], time_and_budget?: [string]}, core_experience: {core_loop?: string|null, primary_outcome: string, principal_journeys?: [string]}, handoff_note?: {bounded_summary?: string|null, recommended_first_action?: string|null, unresolved_item_ids?: [string]}|null, identity: {lifecycle_intent?: string|null, maturity: prototype|mvp|production|critical, one_line_vision: string, project_type?: string|null, slug_proposal?: string|null, value_proposition?: string|null, working_name: string}, knowledge_ledger: {items?: [{blocking?: boolean, confidence?: low|medium|high|not_applicable, default_value?: string|null, falsification_evidence?: string|null, freshness_expires_at?: string|null, id: string, impact?: string|null, kind: observed_fact|user_decision|research_finding|assumption|hypothesis|open_decision|research_queue, normative: boolean, observed_at?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, provenance?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}], revisit_trigger?: string|null, statement: string, transfer_approved: boolean}]}, problem_and_people: {beneficiaries?: [string], current_alternatives?: [string], excluded_audiences?: [string], jobs_pains_opportunity?: [string], problem_or_opportunity: string, stakeholders?: [string], target_users?: [string]}, scaffold?: {packs?: [string], template: string}|null, scope: {explicit_non_goals?: [string], later_possibilities?: [string], must_have_outcomes?: [string], required_deliverables?: [string]}, success: {acceptance_statements?: [string], non_claims?: [string], qualitative_outcome?: string|null, required_evidence?: [string], success_signals?: [string]}}, expected_charter_version: integer, maturity: prototype|mvp|production|critical, project_mode: compact|standard, provenance: {author: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}, change_summary: string, material_diff?: string|null, operating_skill_revision?: string|null, profile_revision?: string|null, source_refs?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}]}, render_version?: string, rendered_view?: string}\n- project.decision: {action: one of record_candidate|record_effective, affected_artifact_refs?, affected_milestone_ids?, affected_task_ids?, decision_class: one of project_implementation, decision_id?, expected_project_version, options?, question, rationale?, selected_outcome?}; Record implementation decisions within the approved Charter. Payload <=65536 serialized UTF-8 bytes.\n- project.document: action=draft_revision {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=propose_approval {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=approve {content_digest, document_id, envelope_digest?, expected_document_version, kind?, render_digest, revision_id, title?}; Draft, propose or policy-authorize a bound Project Document. Payload <=65536 serialized UTF-8 bytes.\n- project.escalate: {need, task_ids?}; Ask the owner for the need blocking named Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.evidence: action=attach|capture; required: [action, milestone_id, expected_milestone_version, caption, kind]; shape: {acceptance_check_ids?: [string], action: attach|capture, asset_id?: string|null, caption: string, checksum?: string|null, content?: string|null, expected_milestone_version: integer, filename?: string|null, kind: screenshot|walkthrough_video|log|report|other, milestone_id: string, path?: string|null, source_validation_id?: string|null, task_id?: string|null}\n- project.milestone: action=define {content, display_label?, expected_milestone_version?, lifecycle?, milestone_id?, primary_milestone_id?, provenance?}; action=revise {base_revision_id?, content, display_label?, expected_milestone_version, lifecycle?, milestone_id, primary_milestone_id?, provenance?}; action=set_primary {content?, display_label?, expected_milestone_version, milestone_id?, primary_milestone_id?}; Define, revise or select a bound Project milestone. Payload <=65536 serialized UTF-8 bytes.\n- project.readiness: action=evaluate; required: [action, milestone_id, milestone_version]; shape: {action: \"evaluate\", milestone_id: string, milestone_version: integer}\n- project.release.request: {action: one of propose_candidate, milestone_id, milestone_version, readiness_digest, readiness_snapshot_id}; Queue an exact release candidate proposal; final release is user-only. Payload <=65536 serialized UTF-8 bytes.\n- project.review_config: {action: one of set_ci_steps, ci_steps, expected_project_version, setup_steps?}; Set independent review commands for subsequent Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.validation: {action: one of record, check_id, definition_revision_id, evidence_asset_id?, expected_milestone_version?, governing_revision_ids?, input_digest, milestone_id, milestone_version?, observed_command_ids?, observed_task_id?, result, status: one of pass|fail|blocked|stale|unavailable}; Record disposable-checkout observations; pass/fail require observed commands, manual attestation is user-only. Payload <=65536 serialized UTF-8 bytes.",
             "type": "object"
           }
         },
@@ -1337,6 +1340,7 @@
               "null"
             ]
           },
+          "body": {},
           "capability_class": {
             "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\").",
             "type": [
@@ -1358,21 +1362,17 @@
               "null"
             ]
           },
+          "commitment_id": {},
+          "content": {},
           "correlation_id": {
             "description": "Required non-null correlation id",
             "minLength": 1,
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "dedupe_key": {
             "description": "Required non-null idempotency key",
             "minLength": 1,
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "depends_on_task_id": {
             "description": "task.dependency: the single prerequisite Task the edge points at. Use task.dependency to change an existing graph; recreating Tasks changes their ids and orphans everything downstream.",
@@ -1399,6 +1399,7 @@
               "null"
             ]
           },
+          "due_at": {},
           "expected_board_revision": {
             "description": "task.adaptive: Project board revision precondition (work.read returns it as board_revision).",
             "type": [
@@ -1413,6 +1414,7 @@
               "null"
             ]
           },
+          "expected_version": {},
           "items": {
             "description": "task.adaptive split: non-empty ordered direct-child list; creates children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
             "items": {
@@ -1445,6 +1447,8 @@
               "null"
             ]
           },
+          "kind": {},
+          "memory_id": {},
           "milestone_id": {
             "description": "task.propose: optional; defaults to the active baseline's primary milestone.",
             "type": [
@@ -1478,7 +1482,7 @@
             ]
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- task.propose — create a Task in the bound Project. Fields: title (required); description (outcome, acceptance criteria, and owned repository-relative paths); priority (integer, higher runs sooner); task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); plan_item_id (optional traceability to a stable item in the active execution baseline, for example \"pi-2\"; when supplied, it must exist and may have only one non-cancelled Task); milestone_id (optional traceability, defaulting to the active baseline's primary milestone when one exists); capability_class (when supplied it must be one of the server-approved profiles: \"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", \"planning_read\" — and, when the baseline declares allowed classes, also one of those); risk_class (only when the baseline declares allowed classes). depends_on_task_ids (optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. Forge binds implementation authority to the Project's current approved Charter. Baseline references are optional traceability; never echo baseline ids or digests.\n- task.adaptive — apply one bounded adaptive command to a Task in the bound Project. Fields: action (required: \"split\", \"sequence\", or \"replace\"); source_task_id, expected_task_version, expected_board_revision, and rationale (all required; read both from work.read — the Task's version and the top-level board_revision; a version_conflict returns the current values in retry.arguments); split requires non-empty items of {title, description?, assignee_id?}; split creates ordered direct children under a non-executing coordination root; children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order. sequence manages that child order only and does not create a dependency graph. replace requires title and optional description. Project, scope, actor, permission, governance, and fixed-boundary values are server-derived and unknown fields are rejected.\n- task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n\n- task.dependency — add or remove one prerequisite edge between two Tasks in the bound Project. Fields: action (required: \"add\" or \"remove\"), task_id (the Task that waits), depends_on_task_id (the Task it waits for), and a non-empty rationale (all required). This is a DAG edge only: no parent/child hierarchy and no shared workspace. Adding refuses a cancelled prerequisite and a self-edge; removing the last cancelled prerequisite clears the dependency block it caused. Prefer this over cancelling and recreating Tasks, which changes their ids and orphans dependents.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- Split work along module boundaries, name the files each Task owns, and avoid Tasks that all edit one shared file.\n- task.propose — create a Task in the bound Project. Fields: title (required); description (outcome, acceptance criteria, and owned repository-relative paths); priority (integer, higher runs sooner); task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); plan_item_id (optional traceability to a stable item in the active execution baseline, for example \"pi-2\"; when supplied, it must exist and may have only one non-cancelled Task); milestone_id (optional traceability, defaulting to the active baseline's primary milestone when one exists); capability_class (when supplied it must be one of the server-approved profiles: \"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", \"planning_read\" — and, when the baseline declares allowed classes, also one of those); risk_class (only when the baseline declares allowed classes). depends_on_task_ids (optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; each prerequisite must reach done before this Task can dispatch). Give parallel Tasks disjoint files; use dependencies to order shared-file edits. Forge binds implementation authority to the Project's current approved Charter. Baseline references are optional traceability; never echo baseline ids or digests.\n- task.adaptive — apply one bounded adaptive command to a Task in the bound Project. Fields: action (required: \"split\", \"sequence\", or \"replace\"); source_task_id, expected_task_version, expected_board_revision, and rationale (all required; read both from work.read — the Task's version and the top-level board_revision; a version_conflict returns the current values in retry.arguments); split requires non-empty items of {title, description?, assignee_id?}; split creates ordered direct children under a non-executing coordination root; children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order. sequence manages that child order only and does not create a dependency graph. replace requires title and optional description. Project, scope, actor, permission, governance, and fixed-boundary values are server-derived and unknown fields are rejected.\n- task.action — apply one current available_actions offer with task_id, action (verb and parameters), and version. retry queues work; cancel stops obsolete work. An action_unavailable denial includes the current offers; correct the command from that answer. Agents may never set approve.override=true.\n\n- task.dependency — add or remove one prerequisite edge between two Tasks in the bound Project. Fields: action (required: \"add\" or \"remove\"), task_id (the Task that waits), depends_on_task_id (the Task it waits for), and a non-empty rationale (all required). This is a DAG edge only: no parent/child hierarchy and no shared workspace. Adding refuses a cancelled prerequisite and a self-edge; removing the last cancelled prerequisite clears the dependency block it caused. Prefer this over cancelling and recreating Tasks, which changes their ids and orphans dependents.\n- commitment.update: {commitment_id?, content?, description?, due_at?, expected_version?, status?}; PENDING commitment proposal; no commitment is changed. Payload <=65536 serialized UTF-8 bytes.\n- memory.publish: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is published. Payload <=65536 serialized UTF-8 bytes.\n- memory.supersede: {content?, description?, kind?, memory_id?, parameters?, title?, value?, visibility?}; PENDING memory proposal; no memory is superseded. Payload <=65536 serialized UTF-8 bytes.\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.\n- session.action: {action?, content?, session_id?}; PENDING session proposal; no session is cancelled or steered. Payload <=65536 serialized UTF-8 bytes.",
             "properties": {
               "action": {
                 "description": "task.action: required closed verb object: start, hold, release, retry, send_back, approve, restart, or cancel, including offered parameters. task.adaptive: \"split\", \"sequence\", or \"replace\". Other operations use their documented action string.",
@@ -1710,10 +1714,7 @@
                 ]
               }
             },
-            "type": [
-              "object",
-              "null"
-            ]
+            "type": "object"
           },
           "plan_item_id": {
             "description": "task.propose: optional traceability to a stable plan-item id in the Project's active execution baseline (for example \"pi-2\"). When supplied, the id must exist in that baseline. Each plan item admits exactly one non-cancelled Task — never re-propose a plan item that already has one.",
@@ -1754,6 +1755,7 @@
               "null"
             ]
           },
+          "session_id": {},
           "source_task_id": {
             "description": "task.adaptive: source Task id in the bound Project.",
             "type": [
@@ -1761,6 +1763,7 @@
               "null"
             ]
           },
+          "status": {},
           "task_id": {
             "description": "task.action/task.dependency: required Task id in this Project.",
             "type": [
@@ -1782,13 +1785,15 @@
               "null"
             ]
           },
+          "value": {},
           "version": {
             "description": "task.action: required current Task version from the offered actions.",
             "type": [
               "integer",
               "null"
             ]
-          }
+          },
+          "visibility": {}
         },
         "required": [
           "operation",
@@ -1868,7 +1873,7 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: optional {limit}\n- project.observations: optional {limit, task_id}\n- skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
+            "description": "Arguments by operation:\n- project.charter: no arguments\n- project.current_state: {limit?}\n- project.observations: {limit?, task_id?}\n- skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
             "type": "object"
           },
           "operation": {
@@ -1914,6 +1919,7 @@
           },
           "operation": {
             "enum": [
+              "project.charter.adoption",
               "project.decision",
               "project.document",
               "project.escalate",
@@ -1927,7 +1933,7 @@
             "type": "string"
           },
           "payload": {
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.decision: action=record_candidate|record_effective; required: [action, question, decision_class, expected_project_version]; shape: {action: record_candidate|record_effective, affected_artifact_refs?: [{artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}], affected_milestone_ids?: [string], affected_task_ids?: [string], decision_class: \"project_implementation\", decision_id?: string|null, expected_project_version: integer, options?: [string], question: string, rationale?: string|null, selected_outcome?: string|null}\n- project.document: action=draft_revision|propose_approval; required: [action, document_id, kind, title, expected_document_version, content]; shape: {action: draft_revision|propose_approval, base_revision_id?: string|null, content: {affected_artifact_ids?: [string], affected_decision_ids?: [string], alternatives?: [string], decision_informed: string, evidence?: [string], findings?: [string], inferences?: [string], question: string, recommendation?: string|null, scope: string, sources?: [{claim: string, id: string, is_inference: boolean, quality?: string|null, retrieved_at: string, title: string, url: string}], stopping_condition: string, uncertainty?: [string], unresolved_questions?: [string]}|{acceptance_matrix?: [{evidence?: [string], id: string, required: boolean, statement: string}], adaptive_envelope?: [string], boundaries?: [string], governing_charter_revision_id?: string|null, intended_deliverables?: [string], plan_items?: [{dependencies?: [string], id: string, outcome: string, task_ids?: [string]}], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], rollback_and_recovery?: [string]}|{acceptance_scenarios?: [any], actors?: [string], functional_requirements?: [string], journeys_and_flows?: [string], loading_empty_error_recovery_states?: [string], non_functional_and_safety_requirements?: [string], out_of_scope?: [string], problem_and_outcome: string, traceability?: [{artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}]}|{accessibility?: [string], component_states?: [string], design_tokens_reference?: string|null, experience_principles?: [string], flows?: [string], information_architecture?: [string], open_decisions?: [string], prototype_or_evidence_links?: [string], responsive_behavior?: [string]}|{alternatives_and_tradeoffs?: [string], components_and_data?: [string], concurrency?: [string], context_and_constraints: string, failure_and_recovery?: [string], interfaces?: [string], migrations?: [string], observability_and_operations?: [string], security_and_privacy?: [string], system_boundary?: [string], validation_plan?: [string]}|{acceptance_evidence_contract?: [any], dependencies?: [string], known_issues?: [string], linked_artifact_refs?: [{artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}], ordered_milestone_outcomes?: [string], release_notes?: [string], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], task_queries_or_ids?: [string]}, document_id: string, expected_document_version: integer, kind: research|delivery_brief|product_spec|design|architecture|execution_plan, title: string} OR action=approve; required: [action, document_id, kind, title, revision_id, content_digest, render_digest, expected_document_version]; shape: {action: \"approve\", content_digest: string, document_id: string, envelope_digest?: string|null, expected_document_version: integer, kind: research|delivery_brief|product_spec|design|architecture|execution_plan, render_digest: string, revision_id: string, title: string}\n- project.escalate: required: [need]; shape: {need: string, task_ids?: [string]}\n- project.evidence: action=attach|capture; required: [action, milestone_id, expected_milestone_version, caption, kind]; shape: {acceptance_check_ids?: [string], action: attach|capture, asset_id?: string|null, caption: string, checksum?: string|null, content?: string|null, expected_milestone_version: integer, filename?: string|null, kind: screenshot|walkthrough_video|log|report|other, milestone_id: string, path?: string|null, source_validation_id?: string|null, task_id?: string|null}\n- project.milestone: action=define|revise|set_primary; required: [action, expected_milestone_version]; shape: {action: define|revise|set_primary, content?: {acceptance_checks?: [{description: string, expected_result: string, id: string, latest_result?: string|null, latest_result_digest?: string|null, latest_result_id?: string|null, required: boolean, source_kind: manual|policy_waiver|task_validation}], charter_revision?: {artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}|null, dependencies?: [string], document_revisions?: [{artifact_id: string, content_digest: string, render_digest?: string|null, render_version?: string|null, revision_id: string}], evidence_requirements?: [{description: string, evidence_kind?: screenshot|walkthrough_video|log|report|other, id: string, required: boolean}], excluded_scope?: [string], included_scope?: [string], known_issues?: [string], name?: string, outcome?: string, risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], target_date?: string|null, task_ids?: [string]}, display_label?: string|null, expected_milestone_version: integer, milestone_id?: string|null, primary_milestone_id?: string|null}\n- project.readiness: action=evaluate; required: [action, milestone_id, milestone_version]; shape: {action: \"evaluate\", milestone_id: string, milestone_version: integer}\n- project.release.request: action=propose_candidate; required: [action, milestone_id, milestone_version, readiness_snapshot_id, readiness_digest]; shape: {action: \"propose_candidate\", milestone_id: string, milestone_version: integer, readiness_digest: string, readiness_snapshot_id: string}\n- project.review_config: action=set_ci_steps; required: [action, expected_project_version, ci_steps]; shape: {action: \"set_ci_steps\", ci_steps: [string], expected_project_version: integer, setup_steps?: [string]}\n- project.validation: action=record; required: [action, milestone_id, milestone_version, check_id, definition_revision_id, status, result, input_digest]; shape: {action: \"record\", check_id: string, definition_revision_id: string, evidence_asset_id?: string|null, governing_revision_ids?: [string], input_digest: string, milestone_id: string, milestone_version: integer, observed_command_ids?: [string], observed_task_id?: string|null, result: string, status: pass|fail|blocked|stale|unavailable}",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: action=draft_revision; required: [action, expected_charter_version, project_mode, maturity, content, provenance]; shape: {action: \"draft_revision\", base_revision_id?: string|null, charter_id?: string, content: {constraints_and_risks: {accessibility?: [string], agent_authority?: [string], data?: [string], integrations?: [string], launch?: [string], migration?: [string], operations?: [string], product?: [string], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], security_privacy_compliance?: [string], technology?: [string], time_and_budget?: [string]}, core_experience: {core_loop?: string|null, primary_outcome: string, principal_journeys?: [string]}, handoff_note?: {bounded_summary?: string|null, recommended_first_action?: string|null, unresolved_item_ids?: [string]}|null, identity: {lifecycle_intent?: string|null, maturity: prototype|mvp|production|critical, one_line_vision: string, project_type?: string|null, slug_proposal?: string|null, value_proposition?: string|null, working_name: string}, knowledge_ledger: {items?: [{blocking?: boolean, confidence?: low|medium|high|not_applicable, default_value?: string|null, falsification_evidence?: string|null, freshness_expires_at?: string|null, id: string, impact?: string|null, kind: observed_fact|user_decision|research_finding|assumption|hypothesis|open_decision|research_queue, normative: boolean, observed_at?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, provenance?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}], revisit_trigger?: string|null, statement: string, transfer_approved: boolean}]}, problem_and_people: {beneficiaries?: [string], current_alternatives?: [string], excluded_audiences?: [string], jobs_pains_opportunity?: [string], problem_or_opportunity: string, stakeholders?: [string], target_users?: [string]}, scaffold?: {packs?: [string], template: string}|null, scope: {explicit_non_goals?: [string], later_possibilities?: [string], must_have_outcomes?: [string], required_deliverables?: [string]}, success: {acceptance_statements?: [string], non_claims?: [string], qualitative_outcome?: string|null, required_evidence?: [string], success_signals?: [string]}}, expected_charter_version: integer, maturity: prototype|mvp|production|critical, project_mode: compact|standard, provenance: {author: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}, change_summary: string, material_diff?: string|null, operating_skill_revision?: string|null, profile_revision?: string|null, source_refs?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}]}, render_version?: string, rendered_view?: string}\n- project.decision: {action: one of record_candidate|record_effective, affected_artifact_refs?, affected_milestone_ids?, affected_task_ids?, decision_class: one of project_implementation, decision_id?, expected_project_version, options?, question, rationale?, selected_outcome?}; Record implementation decisions within the approved Charter. Payload <=65536 serialized UTF-8 bytes.\n- project.document: action=draft_revision {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=propose_approval {base_revision_id?, content, document_id, expected_digest?, expected_document_version?, kind, title}; action=approve {content_digest, document_id, envelope_digest?, expected_document_version, kind?, render_digest, revision_id, title?}; Draft, propose or policy-authorize a bound Project Document. Payload <=65536 serialized UTF-8 bytes.\n- project.escalate: {need, task_ids?}; Ask the owner for the need blocking named Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.evidence: action=attach|capture; required: [action, milestone_id, expected_milestone_version, caption, kind]; shape: {acceptance_check_ids?: [string], action: attach|capture, asset_id?: string|null, caption: string, checksum?: string|null, content?: string|null, expected_milestone_version: integer, filename?: string|null, kind: screenshot|walkthrough_video|log|report|other, milestone_id: string, path?: string|null, source_validation_id?: string|null, task_id?: string|null}\n- project.milestone: action=define {content, display_label?, expected_milestone_version?, lifecycle?, milestone_id?, primary_milestone_id?, provenance?}; action=revise {base_revision_id?, content, display_label?, expected_milestone_version, lifecycle?, milestone_id, primary_milestone_id?, provenance?}; action=set_primary {content?, display_label?, expected_milestone_version, milestone_id?, primary_milestone_id?}; Define, revise or select a bound Project milestone. Payload <=65536 serialized UTF-8 bytes.\n- project.readiness: action=evaluate; required: [action, milestone_id, milestone_version]; shape: {action: \"evaluate\", milestone_id: string, milestone_version: integer}\n- project.release.request: {action: one of propose_candidate, milestone_id, milestone_version, readiness_digest, readiness_snapshot_id}; Queue an exact release candidate proposal; final release is user-only. Payload <=65536 serialized UTF-8 bytes.\n- project.review_config: {action: one of set_ci_steps, ci_steps, expected_project_version, setup_steps?}; Set independent review commands for subsequent Tasks. Payload <=65536 serialized UTF-8 bytes.\n- project.validation: {action: one of record, check_id, definition_revision_id, evidence_asset_id?, expected_milestone_version?, governing_revision_ids?, input_digest, milestone_id, milestone_version?, observed_command_ids?, observed_task_id?, result, status: one of pass|fail|blocked|stale|unavailable}; Record disposable-checkout observations; pass/fail require observed commands, manual attestation is user-only. Payload <=65536 serialized UTF-8 bytes.",
             "type": "object"
           }
         },
@@ -1977,6 +1983,7 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "body": {},
           "causation_depth": {
             "maximum": 8,
             "minimum": 0,
@@ -1991,21 +1998,16 @@
               "null"
             ]
           },
+          "content": {},
           "correlation_id": {
             "description": "Required non-null correlation id",
             "minLength": 1,
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "dedupe_key": {
             "description": "Required non-null idempotency key",
             "minLength": 1,
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "operation": {
             "enum": [
@@ -2014,10 +2016,8 @@
             "type": "string"
           },
           "payload": {
-            "type": [
-              "object",
-              "null"
-            ]
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- message.send: {body?, content?}; PENDING message proposal; no message is sent. Payload <=65536 serialized UTF-8 bytes.",
+            "type": "object"
           }
         },
         "required": [
@@ -2098,7 +2098,7 @@
         "additionalProperties": false,
         "properties": {
           "arguments": {
-            "description": "Arguments by operation:\n- project.current_state: optional {limit}",
+            "description": "Arguments by operation:\n- project.current_state: {limit?}",
             "type": "object"
           },
           "operation": {
@@ -2147,7 +2147,7 @@
           },
           "payload": {
             "additionalProperties": false,
-            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: action=draft_revision; required: [action, expected_charter_version, project_mode, maturity, content, provenance]; shape: {action: \"draft_revision\", base_revision_id?: string|null, charter_id?: string, content: {constraints_and_risks: {accessibility?: [string], agent_authority?: [string], data?: [string], integrations?: [string], launch?: [string], migration?: [string], operations?: [string], product?: [string], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], security_privacy_compliance?: [string], technology?: [string], time_and_budget?: [string]}, core_experience: {core_loop?: string|null, primary_outcome: string, principal_journeys?: [string]}, handoff_note?: {bounded_summary?: string|null, recommended_first_action?: string|null, unresolved_item_ids?: [string]}|null, identity: {lifecycle_intent?: string|null, maturity: prototype|mvp|production|critical, one_line_vision: string, project_type?: string|null, slug_proposal?: string|null, value_proposition?: string|null, working_name: string}, knowledge_ledger: {items?: [{blocking?: boolean, confidence?: low|medium|high|not_applicable, default_value?: string|null, falsification_evidence?: string|null, freshness_expires_at?: string|null, id: string, impact?: string|null, kind: observed_fact|user_decision|research_finding|assumption|hypothesis|open_decision|research_queue, normative: boolean, observed_at?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, provenance?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}], revisit_trigger?: string|null, statement: string, transfer_approved: boolean}]}, problem_and_people: {beneficiaries?: [string], current_alternatives?: [string], excluded_audiences?: [string], jobs_pains_opportunity?: [string], problem_or_opportunity: string, stakeholders?: [string], target_users?: [string]}, scaffold?: {packs?: [string], template: string}|null, scope: {explicit_non_goals?: [string], later_possibilities?: [string], must_have_outcomes?: [string], required_deliverables?: [string]}, success: {acceptance_statements?: [string], non_claims?: [string], qualitative_outcome?: string|null, required_evidence?: [string], success_signals?: [string]}}, expected_charter_version: integer, maturity: prototype|mvp|production|critical, project_mode: compact|standard, provenance: {author: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}, change_summary: string, material_diff?: string|null, operating_skill_revision?: string|null, profile_revision?: string|null, source_refs?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}]}, render_version?: string, rendered_view?: string}\n\nSetup-only Project Agent adoption Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
+            "description": "Payload shape by operation (exact contract enforced server-side):\n- project.charter.adoption: action=draft_revision; required: [action, expected_charter_version, project_mode, maturity, content, provenance]; shape: {action: \"draft_revision\", base_revision_id?: string|null, charter_id?: string, content: {constraints_and_risks: {accessibility?: [string], agent_authority?: [string], data?: [string], integrations?: [string], launch?: [string], migration?: [string], operations?: [string], product?: [string], risks?: [{description: string, id: string, impact?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, revisit_trigger?: string|null, treatment?: string|null}], security_privacy_compliance?: [string], technology?: [string], time_and_budget?: [string]}, core_experience: {core_loop?: string|null, primary_outcome: string, principal_journeys?: [string]}, handoff_note?: {bounded_summary?: string|null, recommended_first_action?: string|null, unresolved_item_ids?: [string]}|null, identity: {lifecycle_intent?: string|null, maturity: prototype|mvp|production|critical, one_line_vision: string, project_type?: string|null, slug_proposal?: string|null, value_proposition?: string|null, working_name: string}, knowledge_ledger: {items?: [{blocking?: boolean, confidence?: low|medium|high|not_applicable, default_value?: string|null, falsification_evidence?: string|null, freshness_expires_at?: string|null, id: string, impact?: string|null, kind: observed_fact|user_decision|research_finding|assumption|hypothesis|open_decision|research_queue, normative: boolean, observed_at?: string|null, owner?: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}|null, provenance?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}], revisit_trigger?: string|null, statement: string, transfer_approved: boolean}]}, problem_and_people: {beneficiaries?: [string], current_alternatives?: [string], excluded_audiences?: [string], jobs_pains_opportunity?: [string], problem_or_opportunity: string, stakeholders?: [string], target_users?: [string]}, scaffold?: {packs?: [string], template: string}|null, scope: {explicit_non_goals?: [string], later_possibilities?: [string], must_have_outcomes?: [string], required_deliverables?: [string]}, success: {acceptance_statements?: [string], non_claims?: [string], qualitative_outcome?: string|null, required_evidence?: [string], success_signals?: [string]}}, expected_charter_version: integer, maturity: prototype|mvp|production|critical, project_mode: compact|standard, provenance: {author: {display_name?: string|null, id: string, kind: user|agent|worker|reviewer|service|system}, change_summary: string, material_diff?: string|null, operating_skill_revision?: string|null, profile_revision?: string|null, source_refs?: [{digest?: string|null, label?: string|null, observed_at?: string|null, revision_id?: string|null, source_id: string, source_kind: user|main_chat|project_chat|research|task|validation|document|decision|milestone|release|system}]}, render_version?: string, rendered_view?: string}\n\nProject Agent adoption or amendment Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
             "properties": {
               "action": {
                 "const": "draft_revision",

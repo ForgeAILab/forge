@@ -1514,7 +1514,7 @@ async fn terminal_denial_per_document_refusal_does_not_block_a_different_documen
         .unwrap();
     let denied = invoke_native(&*tool, json!({"operation":"project.document", "payload":{
         "action":"approve", "document_id":document_id, "revision_id":revision_id,
-        "kind":"research", "title":"Direct command research", "content_digest":content_digest, "render_digest":render_digest,
+        "content_digest":content_digest, "render_digest":render_digest,
         "expected_document_version":version}, "dedupe_key":"forbidden-approval", "correlation_id":"forbidden-approval"}), "same-turn", "approve").await;
     assert!(denied.is_error, "{denied:?}");
     assert_eq!(denied.value["denied_by"], "unspecified");
@@ -1542,7 +1542,22 @@ async fn terminal_denial_per_document_refusal_does_not_block_a_different_documen
 
 #[tokio::test]
 async fn terminal_denial_current_state_load_error_is_internal_and_not_recorded() {
-    let fixture = fixture().await;
+    // `native_tool` composes the Project Chat with `read_agent_chat`; the
+    // registered read enforces what that surface advertises, so the identity
+    // and binding must really hold it.
+    let fixture = fixture_with_permissions(
+        r#"{"permissions":["read_project","read_agent_chat","propose_project","propose_task","propose_commitment"]}"#,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE project_agent_binding SET permission_ceiling_json = ?
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(r#"{"allowed":["read_project","read_agent_chat","propose_project","propose_task","propose_commitment"]}"#)
+    .bind(PROJECT_ID)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
     let (scope, _) = project_chat_session(&fixture).await;
     let tool = native_tool(
         &fixture,
@@ -1563,7 +1578,7 @@ async fn terminal_denial_current_state_load_error_is_internal_and_not_recorded()
     )
     .await;
     assert!(failed.is_error);
-    assert_eq!(failed.value["code"], "internal_failure");
+    assert_eq!(failed.value["code"], "internal_failure", "{failed:?}");
     assert!(failed.value.get("denied_by").is_none());
     assert_eq!(
         count(

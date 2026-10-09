@@ -1045,6 +1045,17 @@ impl MainGenesisCommandService {
             } else {
                 None
             };
+        if let Some(admitted) = &admission {
+            admitted
+                .evaluate(
+                    operation_registry::main_proposals::CATALOG
+                        .lookup(MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION)
+                        .unwrap(),
+                )
+                .map_err(|_| ServiceError::AuthorizationDenied {
+                    message: "Project Agent selection requires admitted discovery authority".into(),
+                })?;
+        }
         let session_id = match input.request.genesis_session_id.as_deref() {
             Some(id) => id.to_owned(),
             None => sqlx::query_scalar::<_, String>(

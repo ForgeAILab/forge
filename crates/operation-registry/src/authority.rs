@@ -93,6 +93,9 @@ pub enum Principal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrincipalRule {
     BoundIdentity,
+    OwnedMain,
+    AgentAction,
+    ProjectOrOwnedIdentity,
     MainOrInquiry,
     MainChat,
     ProjectAgent,
@@ -128,6 +131,7 @@ pub enum AuthorityDenial {
     PermissionMissing(String),
     PrincipalMismatch,
     StateChanged,
+    SetupCompleted,
 }
 impl EffectiveAuthority {
     /// The only resolver. Call at admission, then intersect fresh facts with
@@ -184,12 +188,33 @@ impl EffectiveAuthority {
         let principal_ok = match requirement.principal_rule() {
             PrincipalRule::BoundIdentity => match &self.principal {
                 Principal::MainAgent { .. } => {
-                    matches!(self.scope_type.as_str(), "account" | "agent_chat")
+                    self.scope_type == "account"
+                        || (self.scope_type == "agent_chat" && self.binding_id.is_some())
                 }
                 Principal::ProjectAgent { .. } => {
                     matches!(self.scope_type.as_str(), "project" | "agent_chat")
                 }
                 Principal::TaskAgent { .. } => self.scope_type == "task",
+                _ => false,
+            },
+            PrincipalRule::OwnedMain => {
+                matches!(self.principal, Principal::MainAgent { .. })
+                    && matches!(self.scope_type.as_str(), "account" | "agent_chat")
+            }
+            PrincipalRule::ProjectOrOwnedIdentity => match &self.principal {
+                Principal::ProjectAgent { .. } => {
+                    matches!(self.scope_type.as_str(), "project" | "agent_chat")
+                }
+                Principal::MainAgent { .. } => self.scope_type == "agent",
+                _ => false,
+            },
+            PrincipalRule::AgentAction => match &self.principal {
+                Principal::MainAgent { .. } => {
+                    matches!(self.scope_type.as_str(), "account" | "agent_chat" | "agent")
+                }
+                Principal::ProjectAgent { .. } => {
+                    matches!(self.scope_type.as_str(), "project" | "agent_chat")
+                }
                 _ => false,
             },
             PrincipalRule::MainOrInquiry => {
@@ -200,6 +225,7 @@ impl EffectiveAuthority {
             PrincipalRule::MainChat => {
                 matches!(self.principal, Principal::MainAgent { .. })
                     && self.scope_type == "agent_chat"
+                    && self.binding_id.is_some()
             }
             PrincipalRule::ProjectAgent => {
                 matches!(self.principal, Principal::ProjectAgent { .. })
@@ -234,6 +260,8 @@ impl EffectiveAuthority {
         };
         if available {
             Ok(())
+        } else if requirement.availability() == crate::AvailabilityRule::SetupOnly {
+            Err(AuthorityDenial::SetupCompleted)
         } else {
             Err(AuthorityDenial::StateChanged)
         }
@@ -381,21 +409,21 @@ pub fn mcp_authority(user_id: &str, constrained_project: Option<&str>) -> Effect
 }
 /// Native registry specs and delegated MCP scope classifications are inputs
 /// to one evaluator, rather than independent permission predicates.
-pub enum RequiredPermission {
-    Named(&'static str),
+pub enum RequiredPermission<'a> {
+    Named(&'a str),
     Unavailable,
     None,
 }
 pub trait AuthorityRequirement {
     fn principal_rule(&self) -> PrincipalRule;
-    fn permission(&self, scope: &str) -> RequiredPermission;
+    fn permission(&self, scope: &str) -> RequiredPermission<'_>;
     fn availability(&self) -> crate::AvailabilityRule;
 }
 impl<E> AuthorityRequirement for &crate::OperationSpec<E> {
     fn principal_rule(&self) -> PrincipalRule {
         self.authority.principal
     }
-    fn permission(&self, scope: &str) -> RequiredPermission {
+    fn permission(&self, scope: &str) -> RequiredPermission<'_> {
         self.authority
             .permission(scope)
             .map_or(RequiredPermission::Unavailable, RequiredPermission::Named)
@@ -411,7 +439,7 @@ impl AuthorityRequirement for McpScopeRule {
             Self::BoundProject => PrincipalRule::DelegatedUser,
         }
     }
-    fn permission(&self, _: &str) -> RequiredPermission {
+    fn permission(&self, _: &str) -> RequiredPermission<'_> {
         RequiredPermission::None
     }
     fn availability(&self) -> crate::AvailabilityRule {

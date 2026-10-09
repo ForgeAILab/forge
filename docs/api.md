@@ -4510,7 +4510,7 @@ limit, setting `stdout_drain_incomplete`/`stderr_drain_incomplete` independently
 of size truncation. These booleans default to false when absent.
 
 The single daemon journal retains terminal reports with bounded plan/worklog/evidence
-outbox content, operation results, and cleanup acknowledgements. Revision 4 uses
+outbox content, operation results, and cleanup acknowledgements. Since revision 4 the daemon uses
 `journal.ack { entry_id }`. Retained terminal and cleanup results replay after
 reconnect until the server durably records their result and acknowledges it.
 Acknowledgement deletes the receipt; a repeated ack succeeds even if the receipt
@@ -5478,16 +5478,73 @@ transient `env` pairs, `cleanup_commands`, positive `cleanup_timeout_ms` (maximu
 30,000), an absolute RFC3339 `deadline`, and a target tagged `workspace` (existing
 workspace handle reference) or `exact_commit` (daemon/runtime/repository-location
 IDs and a full commit object ID). Run requests are limited to 128 KiB, 64 commands
-and 32 cleanup commands. Lookup/cancel take `{daemon_id, operation_id}`.
+and 32 cleanup commands, and the deadline may be at most 24 hours ahead. Lookup/cancel take `{daemon_id, operation_id}`.
 
 Replies are tagged `running`, `completed` (typed `CheckReceipt`), `interrupted`,
 or `unknown`. A duplicate key returns the same retained receipt or `running`,
 never another process; conflicting requests are refused. An unfinished retained
 intent after owner restart is `interrupted` and cannot be rerun under that key.
 Cancellation waits for tree termination and separately bounded declared cleanup.
-Receipts include redacted bounded tails/truncation, exit/timing/termination and
+A check key is retained until its deadline has passed (acknowledged receipts)
+or 24 hours longer (unacknowledged receipts and interrupted intents); after the
+deadline a duplicate request settles as `timed_out` without starting a command.
+Waiting for a busy checkout is bounded by the deadline and settles the key as
+`timed_out` with no command run.
+Receipts include redacted bounded tails/truncation, per-stream
+`stdout_drain_incomplete` / `stderr_drain_incomplete`, exit/timing/termination and
 cleanup evidence, owner/input identity and checkout witnesses. Today's daemon
 returns `not_attested` input identity. A transport timeout is uncertainty, not
 proof of process termination. The server runner owns persistence/certification
 and receipt acknowledgment. Revision-4 and older daemons require upgrade; the
 server's minimum/reported protocol revision is 5.
+
+
+### Native Project registry contracts (3.8 E)
+
+Native aggregate tool names are unchanged. `project.current_state` accepts an
+optional nullable row limit from 1 to 64; `project.observations` accepts optional
+nullable `task_id` and unsigned `limit`, clamping its row limit to 1–50. Integer
+fields accept integer-valued strings or floats through normalization. Unknown
+read fields and malformed scalar values are refused with an in-turn contract
+error after the authority check.
+
+Project review configuration, Documents, Decisions, milestones, validation,
+release-candidate proposals and escalation now use typed registry contracts.
+Document fields are specific to the selected action; milestone actions accept
+the operation's `milestone_id`, `display_label`, `primary_milestone_id` and
+`content` whichever action is named, as they always did. Fresh calls
+reject undeclared payload/envelope fields and forged server-derived authority or
+scope names. Omitted optional fields stay omitted, preserving receipt inputs;
+prepared calls retain their stored arguments. Proposal payloads are limited to
+65,536 serialized UTF-8 bytes. Generic proposal envelopes declare object payloads
+and non-null idempotency/correlation strings, matching preparation acceptance.
+A `null` or omitted payload on a registered proposal is read as `{}`, so the
+call is judged by the operation's own contract. A refused field is answered
+with one correction that names the operation, the field and the expected
+contract line. Document `approve` still accepts `kind`, `title` and
+`envelope_digest`, and `project.validation` still accepts
+`governing_revision_ids`; these were advertised before and are not read.
+
+The six legacy message, commitment, memory, review and session operations return
+pending proposals only. Their generated descriptions explicitly say no domain
+effect occurred. Their intent values remain opaque and their payload stays an
+open object of at most 65,536 serialized bytes, stored as sent: the declared
+fields are hints, and other fields are kept, not refused. No executor was added. A replay cannot report a
+receipt-less legacy row marked `executed` as a materialized effect.
+
+Ready Project Agents see the existing Charter amendment draft capability.
+Charter approval and final release remain user-only. In the agent-action
+policy, owned unbound identities retain Project-create and
+Project-Agent-selection proposal authority; a native Main proposal still needs
+the caller's active Main binding. A Project Agent can no longer queue
+`project.create` from its Project scope or Project Chat (it was never offered
+there). Other registered operations retain their binding requirements;
+identity-scoped legacy proposals cannot bypass the bound Project contract. In a
+Project Chat, `project.current_state` and `project.observations` are enforced
+with the permission that advertises them (`read_agent_chat`), like
+`project.charter`. Setup-only denials after
+setup completes name `charter_adoption_not_applicable`.
+
+These changes affect native tool contracts and agent-action admission; REST
+resource shapes and MCP projections are unchanged. Charter adoption, evidence
+and readiness retain their hand paths in this slice.

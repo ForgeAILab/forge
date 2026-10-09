@@ -867,10 +867,10 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         .as_array()
         .expect("ready Project operation enum");
     assert!(
-        !ready_operations
+        ready_operations
             .iter()
             .any(|value| value == PROJECT_CHARTER_ADOPTION_OPERATION),
-        "setup-only adoption must be absent from a ready Project scope"
+        "amendment drafting must be present in a ready Project scope"
     );
 
     let project_proposals = [
@@ -919,7 +919,16 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             release_arguments("matrix-release"),
         ),
     ];
-    for (operation, arguments) in project_proposals {
+    let migrated_inputs: Value = serde_json::from_str(include_str!(
+        "../../operation-registry/tests/project_inputs.json"
+    ))
+    .unwrap();
+    for (operation, mut arguments) in project_proposals {
+        if operation_registry::project_proposals::IDS.contains(&operation)
+            && operation != PROJECT_DOCUMENT_OPERATION
+        {
+            arguments["payload"] = migrated_inputs[operation].clone();
+        }
         let outcome = invoke_tool(
             &project,
             FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
@@ -3108,4 +3117,295 @@ async fn main_create_requires_an_approval_reference_and_only_ever_queues() {
             .unwrap();
         assert_eq!(count, 0, "{query}");
     }
+}
+
+/// Each case still uses the hand path when its literal fixture is captured.
+#[tokio::test]
+async fn project_registry_base_project_review_config() {
+    capture_project_proposal_case("project.review_config").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_document() {
+    capture_project_proposal_case("project.document").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_decision() {
+    capture_project_proposal_case("project.decision").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_milestone() {
+    capture_project_proposal_case("project.milestone").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_validation() {
+    capture_project_proposal_case("project.validation").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_release_request() {
+    capture_project_proposal_case("project.release.request").await;
+}
+#[tokio::test]
+async fn project_registry_base_project_escalate() {
+    capture_project_proposal_case("project.escalate").await;
+}
+#[tokio::test]
+async fn project_registry_base_message_send() {
+    capture_project_proposal_case("message.send").await;
+}
+#[tokio::test]
+async fn project_registry_base_commitment_update() {
+    capture_project_proposal_case("commitment.update").await;
+}
+#[tokio::test]
+async fn project_registry_base_memory_publish() {
+    capture_project_proposal_case("memory.publish").await;
+}
+#[tokio::test]
+async fn project_registry_base_memory_supersede() {
+    capture_project_proposal_case("memory.supersede").await;
+}
+#[tokio::test]
+async fn project_registry_base_review_request() {
+    capture_project_proposal_case("review.request").await;
+}
+#[tokio::test]
+async fn project_registry_base_session_action() {
+    capture_project_proposal_case("session.action").await;
+}
+async fn capture_project_proposal_case(operation: &'static str) {
+    use forge_agent_host::ForgeToolProvider;
+    use sqlx::Row;
+    let f = fixture(false).await;
+    let project_version = ProjectRepo::get_by_id(&*f.db, PROJECT_ID)
+        .await
+        .unwrap()
+        .unwrap()
+        .version;
+    if matches!(
+        operation,
+        PROJECT_EVIDENCE_OPERATION | PROJECT_VALIDATION_OPERATION | PROJECT_READINESS_OPERATION
+    ) {
+        sqlx::query("INSERT INTO project_milestone (id, project_id, milestone_sequence, milestone_key, lifecycle, created_at, updated_at) VALUES ('registry-milestone', ?, 1, 'M001', 'active', ?, ?)").bind(PROJECT_ID).bind(NOW).bind(NOW).execute(f.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO project_milestone_revision (id, milestone_id, revision, lifecycle, outcome, display_label, schema_version, render_version, rendered_view, content_digest, rendered_digest, author_type, created_at) VALUES ('registry-definition','registry-milestone',1,'approved','Deliver the requirement','Delivery','milestone-v1','render-v1','Delivered','definition-content','definition-render','user',?)").bind(NOW).execute(f.db.pool()).await.unwrap();
+        sqlx::query("UPDATE project_milestone SET current_definition_revision_id = 'registry-definition' WHERE id = 'registry-milestone'").execute(f.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO project_milestone_check (id, project_id, milestone_id, definition_revision_id, check_key, description, source_kind, expected_result, created_at, updated_at) VALUES ('delivery',?,'registry-milestone','registry-definition','delivery','Observe delivery','task_validation','Delivered',?,?)").bind(PROJECT_ID).bind(NOW).bind(NOW).execute(f.db.pool()).await.unwrap();
+    }
+    let key = format!("registry-{operation}");
+    let payload = match operation {
+        PROJECT_REVIEW_CONFIG_OPERATION => {
+            json!({"action":"set_ci_steps","expected_project_version":project_version,"ci_steps":["cargo test --lib"]})
+        }
+        PROJECT_DOCUMENT_OPERATION => document_arguments(
+            "registry-document",
+            "Registry research",
+            "registry-document",
+        )["payload"]
+            .clone(),
+        PROJECT_DECISION_OPERATION => {
+            json!({"action":"record_effective","expected_project_version":project_version,"decision_id":"registry-decision","question":"Choose implementation","options":["A","B"],"selected_outcome":"A","rationale":"Keep the scope bounded","decision_class":"project_implementation"})
+        }
+        PROJECT_MILESTONE_OPERATION => {
+            json!({"action":"define","expected_milestone_version":project_version,"content":{"name":"Delivery","outcome":"Deliver the requirement"}})
+        }
+        PROJECT_CHARTER_ADOPTION_OPERATION => {
+            sqlx::query("UPDATE project SET charter_status='legacy_unverified',charter_setup_required=1,current_charter_id=NULL,current_charter_revision_id=NULL WHERE id=?").bind(PROJECT_ID).execute(f.db.pool()).await.unwrap();
+            sqlx::query("DELETE FROM project_charter WHERE project_id=?")
+                .bind(PROJECT_ID)
+                .execute(f.db.pool())
+                .await
+                .unwrap();
+            let mut payload = adoption_arguments("registry-adoption")["payload"].clone();
+            payload["expected_charter_version"] = json!(0);
+            payload
+        }
+        PROJECT_EVIDENCE_OPERATION => {
+            sqlx::query("INSERT INTO media_asset (id,project_id,display_filename,content_type,byte_size,storage_key,checksum,availability,gc_state,created_at,updated_at) VALUES ('registry-asset',?,'proof.txt','text/plain',5,'proof.txt','registry-checksum','available','referenced',?,?)").bind(PROJECT_ID).bind(NOW).bind(NOW).execute(f.db.pool()).await.unwrap();
+            json!({"action":"attach","milestone_id":"registry-milestone","expected_milestone_version":1,"asset_id":"registry-asset","checksum":"registry-checksum","acceptance_check_ids":["delivery"],"caption":"Observed requirement","kind":"report"})
+        }
+        PROJECT_VALIDATION_OPERATION => {
+            json!({"action":"record","milestone_id":"registry-milestone","milestone_version":1,"check_id":"delivery","definition_revision_id":"registry-definition","status":"unavailable","result":"Independent execution has not run","input_digest":"registry-input"})
+        }
+        PROJECT_READINESS_OPERATION => {
+            json!({"action":"evaluate","milestone_id":"registry-milestone","milestone_version":1})
+        }
+        PROJECT_RELEASE_OPERATION => release_arguments("registry-release")["payload"].clone(),
+        "project.escalate" => json!({"need":"Confirm the delivery requirement","task_ids":[]}),
+        "session.action" => json!({"action":"cancel","session_id":"pending-session"}),
+        _ => json!({"content":"Pending proposal"}),
+    };
+    let arguments = json!({"operation":operation,"payload":payload,"dedupe_key":key,"correlation_id":format!("correlation-{key}")});
+    let first = f
+        .provider
+        .propose(
+            AGENT_ID,
+            &f.project_scope,
+            "session",
+            operation,
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+    if operation == "project.escalate" {
+        let replay = f
+            .provider
+            .propose(
+                AGENT_ID,
+                &f.project_scope,
+                "session",
+                operation,
+                arguments.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_wake_escalation WHERE project_id = ?")
+                .bind(PROJECT_ID)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        let snapshot = normalized_generated_values(
+            json!({"arguments":arguments,"first":first,"escalations":count}),
+        );
+        let fixtures: Value =
+            serde_json::from_str(include_str!("fixtures/project_registry_base.json")).unwrap();
+        assert_eq!(
+            snapshot, fixtures[operation],
+            "{operation} hand-path fixture"
+        );
+        return;
+    }
+    if !first["receipt_id"].is_string() {
+        assert!(
+            matches!(
+                first["status"].as_str(),
+                Some("pending_approval" | "approval_required")
+            ),
+            "{operation}: {first}"
+        );
+        assert_ne!(first["status"], "succeeded");
+        let replay = f
+            .provider
+            .propose(
+                AGENT_ID,
+                &f.project_scope,
+                "session",
+                operation,
+                arguments.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+        let row = sqlx::query("SELECT payload_json, payload_hash, policy_result, status FROM agent_action WHERE operation = ? AND dedupe_key = ?")
+                .bind(operation).bind(arguments["dedupe_key"].as_str().unwrap()).fetch_one(f.db.pool()).await.unwrap();
+        let snapshot = normalized_generated_values(
+            json!({"arguments":arguments,"first":first,"action":{"payload":serde_json::from_str::<Value>(&row.get::<String,_>("payload_json")).unwrap(),"payload_hash":row.get::<String,_>("payload_hash"),"policy_result":row.get::<String,_>("policy_result"),"status":row.get::<String,_>("status")}}),
+        );
+        let fixtures: Value =
+            serde_json::from_str(include_str!("fixtures/project_registry_base.json")).unwrap();
+        assert_eq!(
+            snapshot, fixtures[operation],
+            "{operation} hand-path fixture"
+        );
+        return;
+    }
+    let receipt_id = first["receipt_id"].as_str().unwrap();
+    let row = sqlx::query("SELECT principal_type, principal_id, scope_type, scope_id, operation, idempotency_key, input_digest, policy_result, outcome_json FROM command_receipt WHERE id = ?")
+            .bind(receipt_id).fetch_one(f.db.pool()).await.unwrap();
+    let receipt = json!({
+        "principal_type":row.get::<String,_>("principal_type"), "principal_id":row.get::<String,_>("principal_id"),
+        "scope_type":row.get::<String,_>("scope_type"), "scope_id":row.get::<String,_>("scope_id"),
+        "operation":row.get::<String,_>("operation"), "idempotency_key":row.get::<String,_>("idempotency_key"),
+        "input_digest":row.get::<String,_>("input_digest"), "policy_result":row.get::<String,_>("policy_result"),
+        "outcome":serde_json::from_str::<Value>(&row.get::<String,_>("outcome_json")).unwrap()
+    });
+    let replay = f
+        .provider
+        .propose(
+            AGENT_ID,
+            &f.project_scope,
+            "session",
+            operation,
+            arguments.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["receipt_id"], replay["receipt_id"]);
+    assert_eq!(first["event_id"], replay["event_id"]);
+    assert_eq!(
+        first["result"]["domain_result"],
+        replay["result"]["domain_result"]
+    );
+    assert_eq!(replay["replayed"], true);
+    // UUIDs and commit time are generated by the same domain command.
+    // Preserve every other field (including every receipt digest).
+    let snapshot =
+        normalized_generated_values(json!({"arguments":arguments,"first":first,"receipt":receipt}));
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/project_registry_base.json")).unwrap();
+    assert_eq!(
+        snapshot, fixtures[operation],
+        "{operation} hand-path fixture"
+    );
+}
+
+fn normalized_generated_values(value: Value) -> Value {
+    fn visit(value: &mut Value, ids: &mut std::collections::BTreeMap<String, String>) {
+        match value {
+            Value::String(text) if uuid::Uuid::parse_str(text).is_ok() => {
+                let next = format!("generated-id-{}", ids.len() + 1);
+                *text = ids.entry(text.clone()).or_insert(next).clone();
+            }
+            Value::String(text)
+                if text.contains('T') && text.ends_with('Z') && text.starts_with("2026-") =>
+            {
+                *text = "generated-time".into()
+            }
+            Value::Object(map) => {
+                for value in map.values_mut() {
+                    visit(value, ids);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, ids);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut value = value;
+    visit(&mut value, &mut std::collections::BTreeMap::new());
+    value
+}
+
+#[tokio::test]
+async fn pending_legacy_replay_cannot_claim_a_receiptless_completed_effect() {
+    use forge_agent_host::ForgeToolProvider;
+    let f = fixture(false).await;
+    let args = json!({"operation":"message.send","payload":{"content":"Pending intent"},"dedupe_key":"legacy-completion","correlation_id":"legacy-completion"});
+    let pending = f
+        .provider
+        .propose(
+            AGENT_ID,
+            &f.project_scope,
+            "session",
+            "message.send",
+            args.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending["status"], "pending_approval");
+    sqlx::query("UPDATE agent_action SET status='executed',version=version+1 WHERE id=?")
+        .bind(pending["id"].as_str().unwrap())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let error = f
+        .provider
+        .propose(AGENT_ID, &f.project_scope, "session", "message.send", args)
+        .await
+        .unwrap_err();
+    assert!(!format!("{error:?}").contains("status: Succeeded"));
 }

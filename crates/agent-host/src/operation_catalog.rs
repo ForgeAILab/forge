@@ -407,7 +407,7 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedProposal,
         input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::SetupOnly,
+        setup: OperationSetupExposure::Always,
         supported_scopes: PROJECT_SCOPES,
         classification: OperationClassification::DirectCommand,
         permission: OperationPermission::ProposeProject,

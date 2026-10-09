@@ -3455,7 +3455,7 @@ mod tests {
         registry.register(daemon_id.into(), connection);
         registry.dispatch_incoming_for_connection(daemon_id,id,api_types::DaemonFrame::Notification {
             method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
-            params:json!({"protocol_revision":3,"capabilities":["execution.terminal.usage_reports","journal.ack","workspace.v1","machine_probe.v1","repo_provision.v1"],"executor_capabilities":{},"workspace_run_policy":{"allowed_purposes":["environment_probe","repo_provision"]}}),
+            params:json!({"protocol_revision":api_types::DAEMON_PROTOCOL_REVISION,"capabilities":["execution.terminal.usage_reports","journal.ack","workspace.v1","machine_probe.v1","repo_provision.v1"],"executor_capabilities":{},"workspace_run_policy":{"allowed_purposes":["environment_probe","repo_provision"]}}),
         });
         // A capable codeless runtime used to bypass the no-check early return.
         let root = TempDir::new().unwrap();
@@ -5193,7 +5193,7 @@ mod tests {
         registry.register(daemon_id.into(), connection);
         registry.dispatch_incoming_for_connection(daemon_id,id,api_types::DaemonFrame::Notification{
             method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
-            params:json!({"protocol_revision":3,"capabilities":["workspace.v1",api_types::DAEMON_CAPABILITY_JOURNAL_ACK,api_types::DAEMON_CAPABILITY_USAGE_REPORTS],"executor_capabilities":{"shell":{"structured_events":true,"usage":true,"resume":true,"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["environment_setup","ci_step"]}})});
+            params:json!({"protocol_revision":api_types::DAEMON_PROTOCOL_REVISION,"capabilities":["workspace.v1",api_types::DAEMON_CAPABILITY_JOURNAL_ACK,api_types::DAEMON_CAPABILITY_USAGE_REPORTS],"executor_capabilities":{"shell":{"structured_events":true,"usage":true,"resume":true,"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["environment_setup","ci_step"]}})});
         let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
             .with_daemon_connections(registry);
         let environment: api_types::ProjectEnvironment = serde_json::from_value(

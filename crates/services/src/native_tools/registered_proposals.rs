@@ -2,12 +2,12 @@
 use super::*;
 use async_trait::async_trait;
 use operation_registry::main_proposals::{
-    self, MainProposalContext, ProjectAgentSelection, ProjectCreate,
+    MainProposalContext, ProjectAgentSelection, ProjectCreate,
 };
 use std::sync::LazyLock;
 
-pub(super) static CATALOG: LazyLock<main_proposals::Catalog<AgentHostError>> =
-    LazyLock::new(main_proposals::catalog);
+pub(super) static CATALOG: LazyLock<operation_registry::OperationCatalog<AgentHostError>> =
+    LazyLock::new(operation_registry::proposal_catalog);
 impl CoordinationToolProvider {
     pub(super) async fn registered_authority(
         &self,
@@ -21,8 +21,15 @@ impl CoordinationToolProvider {
         else {
             return Ok(());
         };
-        let authority = self
-            .db
+        let authority = self.resolve_registered_authority(actor, scope).await?;
+        self.evaluate_registered_authority(&authority, scope, spec)
+    }
+    pub(super) async fn resolve_registered_authority(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+    ) -> Result<operation_registry::authority::EffectiveAuthority, AgentHostError> {
+        self.db
             .resolve_effective_authority(
                 actor,
                 None,
@@ -35,7 +42,19 @@ impl CoordinationToolProvider {
                 },
             )
             .await
-            .map_err(|error| service_error(error.into()))?;
+            .map_err(|error| match error {
+                db::DbError::NotFound => service_error(error.into()),
+                // A persistence failure is not a denial: the boundary reports
+                // it as an internal failure that names the operation.
+                _ => AgentHostError::ProtectedPersistence,
+            })
+    }
+    pub(super) fn evaluate_registered_authority(
+        &self,
+        authority: &operation_registry::authority::EffectiveAuthority,
+        scope: &CanonicalScope,
+        spec: &operation_registry::OperationSpec<AgentHostError>,
+    ) -> Result<(), AgentHostError> {
         authority.evaluate(spec).map_err(|denial| {
             use operation_registry::authority::AuthorityDenial;
             let cause = match denial {
@@ -45,16 +64,17 @@ impl CoordinationToolProvider {
                 }
                 AuthorityDenial::PrincipalMismatch => DeniedBy::OperationNotInScope,
                 AuthorityDenial::StateChanged => DeniedBy::CharterNotAdopted,
+                AuthorityDenial::SetupCompleted => DeniedBy::CharterAdoptionNotApplicable,
             };
             AgentHostError::StructuredOutcome(Box::new(OrchestrationOutcome::terminal_denial(
-                operation,
+                spec.id,
                 outcome_scope(scope),
                 "authority",
                 cause,
             )))
         })
     }
-    pub(super) async fn main_proposal_admission(
+    pub(super) async fn proposal_admission(
         &self,
         actor: &str,
         scope: &CanonicalScope,
@@ -63,13 +83,115 @@ impl CoordinationToolProvider {
         let Some(spec) = CATALOG.lookup(operation) else {
             return Ok(());
         };
-        self.authorization
-            .main_account_id(actor, scope)
-            .await
-            .map_err(native_scope_error)?;
         let _ = spec;
+        self.main_proposal_binding(actor, scope, operation).await?;
         self.registered_authority(actor, scope, operation).await?;
         Ok(())
+    }
+    /// A native Main proposal still needs the caller's active Main binding.
+    /// The shared evaluator admits an owned unbound identity for the
+    /// AgentAction policy; the native boundary never did.
+    async fn main_proposal_binding(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+    ) -> Result<(), AgentHostError> {
+        if operation_registry::main_proposals::IDS.contains(&operation) {
+            self.authorization
+                .main_account_id(actor, scope)
+                .await
+                .map_err(native_scope_error)?;
+        }
+        Ok(())
+    }
+    /// A pending proposal refused for a missing permission still leaves its
+    /// denied ledger row, as it did before these operations were registered:
+    /// the attempt stays visible and can never be approved. The denial the
+    /// caller receives is unchanged; nothing is recorded unless the action
+    /// policy itself denies the same request.
+    async fn record_denied_pending_proposal(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: &Value,
+        denial: &AgentHostError,
+    ) {
+        if !operation_registry::legacy_proposals::IDS.contains(&operation)
+            || !matches!(denial, AgentHostError::StructuredOutcome(outcome)
+                if matches!(outcome.denied_by, Some(DeniedBy::PermissionMissing(_))))
+            || contains_authority_override(arguments)
+        {
+            return;
+        }
+        let Some(permission) = operation_permission(scope.scope_type, operation) else {
+            return;
+        };
+        let payload = match arguments.get("payload") {
+            Some(payload) if payload.is_object() => payload.clone(),
+            None | Some(Value::Null) => json!({}),
+            Some(_) => return,
+        };
+        let (Ok(dedupe_key), Ok(correlation_id)) = (
+            required_argument(arguments, "dedupe_key"),
+            required_argument(arguments, "correlation_id"),
+        ) else {
+            return;
+        };
+        if validate_proposal_payload(operation, &payload).is_err() {
+            return;
+        }
+        let scope_type = scope_type_name(scope.scope_type);
+        let payload_json = payload.to_string();
+        if !matches!(
+            self.actions
+                .evaluate_direct_command_policy(
+                    actor,
+                    scope_type,
+                    &scope.scope_id,
+                    permission,
+                    operation,
+                    Some(&payload_json),
+                )
+                .await,
+            Ok((AgentActionPolicyResult::Denied, _))
+        ) {
+            return;
+        }
+        let target_type = if operation == "session.action" {
+            "scope"
+        } else {
+            scope_type
+        };
+        if let Err(error) = self
+            .actions
+            .propose(ProposeActionInput {
+                id: None,
+                actor_identity_id: actor.to_owned(),
+                scope_type: scope_type.to_owned(),
+                scope_id: scope.scope_id.clone(),
+                operation: operation.to_owned(),
+                payload_json,
+                dedupe_key,
+                correlation_id,
+                causation_id: arguments
+                    .get("causation_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                causation_depth: arguments
+                    .get("causation_depth")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                requested_permission: permission.to_owned(),
+                policy_reason: None,
+                target_type: Some(target_type.to_owned()),
+                target_id: Some(scope.scope_id.clone()),
+            })
+            .await
+        {
+            tracing::warn!(operation, %error, "denied pending proposal was not recorded");
+        }
     }
     pub(super) async fn registered_proposal(
         &self,
@@ -82,14 +204,65 @@ impl CoordinationToolProvider {
     ) -> Result<Value, AgentHostError> {
         // Current authority precedes every payload diagnostic. Stored preparations
         // keep their exact arguments; only fresh calls consult the current spec.
-        self.main_proposal_admission(actor, scope, operation)
-            .await?;
+        if let Some(admitted) = admitted_authority {
+            self.main_proposal_binding(actor, scope, operation).await?;
+            self.evaluate_registered_authority(
+                admitted,
+                scope,
+                CATALOG.lookup(operation).expect("registered proposal"),
+            )?;
+        } else if let Err(denial) = self.proposal_admission(actor, scope, operation).await {
+            if !prepared {
+                self.record_denied_pending_proposal(actor, scope, operation, &arguments, &denial)
+                    .await;
+            }
+            return Err(denial);
+        }
         if contains_authority_override(&arguments) {
             return Err(AgentHostError::Authority(
                 "Forge orchestration scope and authority are server-derived".into(),
             ));
         }
         let spec = CATALOG.lookup(operation).expect("registered proposal");
+        if !prepared {
+            const FIELDS: &[&str] = &[
+                "operation",
+                "payload",
+                "dedupe_key",
+                "correlation_id",
+                "causation_id",
+                "causation_depth",
+            ];
+            let object = arguments
+                .as_object()
+                .ok_or_else(|| invalid_arguments("proposal must be an object".into()))?;
+            if let Some(field) = object
+                .keys()
+                .find(|field| !FIELDS.contains(&field.as_str()))
+            {
+                return Err(invalid_arguments(format!(
+                    "{operation}: envelope field `{field}` is not admitted"
+                )));
+            }
+            for field in ["dedupe_key", "correlation_id"] {
+                required_argument(&arguments, field)?;
+            }
+            if let Some(depth) = object.get("causation_depth") {
+                if !depth.as_i64().is_some_and(|depth| (0..=8).contains(&depth)) {
+                    return Err(invalid_arguments(
+                        "causation_depth must be an integer between 0 and 8".into(),
+                    ));
+                }
+            }
+            if object
+                .get("causation_id")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
+                return Err(invalid_arguments(
+                    "causation_id must be a string or null".into(),
+                ));
+            }
+        }
         let payload = if prepared {
             arguments["payload"].clone()
         } else {
@@ -180,7 +353,7 @@ impl MainProposalContext<AgentHostError> for super::registered_reads::Context<'_
         let account = self
             .provider
             .authorization
-            .main_account_id(self.actor_identity_id, self.scope)
+            .main_account_target(self.scope)
             .await
             .map_err(native_scope_error)?;
         self.provider

@@ -7,6 +7,8 @@
 //! actor or scope as tool arguments; those values are captured when the host
 //! composes the tools.
 
+#[cfg(test)]
+use crate::PROJECT_CURRENT_STATE_OPERATION;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -48,9 +50,8 @@ use crate::{
     AgentHostError, CanonicalScope, CanonicalScopeType, CommandAllowlist, WorkspaceAccess,
     operation_catalog::{
         MAIN_CHARTER_DRAFT_OPERATION, MAIN_INQUIRY_RUN_OPERATION, OperationExposure,
-        OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-        PROJECT_OBSERVATIONS_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-        TASK_WORKLOG_OPERATION, operation_names_for_surface,
+        OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, TASK_EVIDENCE_OPERATION,
+        TASK_PLAN_OPERATION, TASK_WORKLOG_OPERATION, operation_names_for_surface,
     },
     operation_contract::{
         coordination_payload_guidance, coordination_payload_properties,
@@ -177,6 +178,20 @@ pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError>;
+
+    /// A registered query evaluates the authority pinned at turn admission.
+    /// No fresh effect occurs, so the inner provider must not resolve again.
+    async fn read_admitted(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: Value,
+        authority: &operation_registry::authority::EffectiveAuthority,
+    ) -> Result<Value, AgentHostError> {
+        let _ = authority;
+        self.read(actor, scope, operation, arguments).await
+    }
 
     /// Persists one already-scope-bound proposal envelope.  The provider is
     /// responsible for applying Forge's policy intersection and for keeping
@@ -1625,7 +1640,7 @@ fn filter_operations(
         .filter(|operation| {
             if let Some(spec) = operation_registry::READ_CATALOG
                 .lookup(operation)
-                .or_else(|| operation_registry::main_proposals::CATALOG.lookup(operation))
+                .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation))
             {
                 if let Some(admitted) = admitted {
                     return admitted.evaluate(spec).is_ok();
@@ -1797,6 +1812,21 @@ fn unwrap_parameters_envelope(mut arguments: Value) -> Result<Value, RuntimeErro
         }
     }
     Ok(arguments)
+}
+
+/// Providers send `payload: null` (or omit it) for an operation they believe
+/// takes no fields. For a registered proposal that means the empty object, so
+/// the call reaches the operation's own contract instead of a type refusal.
+fn null_registered_payload_is_empty(arguments: &mut Value) {
+    let registered = arguments
+        .get("operation")
+        .and_then(Value::as_str)
+        .is_some_and(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_some());
+    if let (true, Some(object)) = (registered, arguments.as_object_mut()) {
+        if object.get("payload").is_none_or(Value::is_null) {
+            object.insert("payload".to_owned(), json!({}));
+        }
+    }
 }
 
 /// Canonicalize provider-friendly flat coordination fields into `payload`.
@@ -2215,14 +2245,33 @@ impl ForgeScopeProposeTool {
         let schema = if self.reject_authority_overrides {
             portable_const_schema(orchestration_proposal_schema(&self.operations))
         } else {
-            let mut payload_property = json!({"type": ["object", "null"]});
+            let registered = self
+                .operations
+                .iter()
+                .any(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_some());
+            let mut payload_property = if registered {
+                json!({"type":"object"})
+            } else {
+                json!({"type":["object","null"]})
+            };
             let guidance = coordination_payload_guidance(&self.operations);
             if !guidance.is_empty() {
                 payload_property["description"] = json!(guidance);
             }
             let payload_properties = coordination_payload_properties(&self.operations);
-            if let Some(properties) = payload_properties.as_ref() {
-                payload_property["properties"] = properties.clone();
+            // Hand operations on this tool still need their payload fields
+            // declared: a provider that only surfaces declared properties
+            // strips the rest. Registered operations rely on their generated
+            // contract line and the flat aliases, so their fields are not
+            // repeated inside `payload`.
+            let hand_operations = self
+                .operations
+                .iter()
+                .filter(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_none())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if let Some(properties) = coordination_payload_properties(&hand_operations) {
+                payload_property["properties"] = properties;
             }
             let mut schema = json!({
                 "type": "object",
@@ -2233,23 +2282,29 @@ impl ForgeScopeProposeTool {
                         "enum": self.operations.iter().collect::<Vec<_>>(),
                     },
                     "payload": payload_property,
-                    // Keep the existing nullable provider fields (notably
-                    // for Gemini). Normalization precedes schema validation;
-                    // non-null/nonblank identifiers are still enforced in
-                    // `prepare` and errors return to the model in-turn.
-                    "dedupe_key": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null idempotency key"},
-                    "correlation_id": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null correlation id"},
+                    // The envelope declares the same non-null identifiers preparation accepts.
+                    "dedupe_key": {"type": "string", "minLength": 1, "description": "Required non-null idempotency key"},
+                    "correlation_id": {"type": "string", "minLength": 1, "description": "Required non-null correlation id"},
                     "causation_id": string_or_null_schema(),
                     "causation_depth": {"type": ["integer", "null"], "minimum": 0, "maximum": 8}
                 },
                 "additionalProperties": false
             });
+            if !registered {
+                for field in ["dedupe_key", "correlation_id"] {
+                    schema["properties"][field]["type"] = json!(["string", "null"]);
+                }
+            }
             // Provider-friendly aliases. Normalization removes these and builds
             // the canonical payload object, so the service boundary still
             // sees exactly one envelope shape.
             if let Some(Value::Object(properties)) = payload_properties {
                 if let Some(root) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-                    root.extend(properties);
+                    root.extend(
+                        properties
+                            .into_iter()
+                            .filter(|(name, _)| name != "parameters"),
+                    );
                 }
             }
             schema
@@ -2275,6 +2330,7 @@ impl Tool for ForgeScopeProposeTool {
     fn normalize_arguments(&self, arguments: Value) -> Result<Value, RuntimeError> {
         let mut arguments = unwrap_parameters_envelope(arguments)?;
         lift_coordination_payload(&mut arguments, &self.operations)?;
+        null_registered_payload_is_empty(&mut arguments);
         Ok(arguments)
     }
 
@@ -2284,6 +2340,7 @@ impl Tool for ForgeScopeProposeTool {
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
         let mut arguments = arguments;
+        null_registered_payload_is_empty(&mut arguments);
         let operation = required_string(&arguments, "operation")?.to_owned();
         let operation = operation.as_str();
         if !self.operations.contains(operation) {
@@ -2291,7 +2348,7 @@ impl Tool for ForgeScopeProposeTool {
                 "Forge proposal operation is outside this scope",
             ));
         }
-        let registered = operation_registry::main_proposals::CATALOG.lookup(operation);
+        let registered = operation_registry::PROPOSAL_CATALOG.lookup(operation);
         if registered.is_some() {
             if let Err(error) = self
                 .provider
@@ -3117,53 +3174,9 @@ fn validate_orchestration_read_arguments(
             .validate_arguments(object.get("arguments").unwrap_or(&json!({})))
             .map_err(RuntimeError::tool);
     }
-    let allowed = match operation {
-        PROJECT_CURRENT_STATE_OPERATION => &["operation", "arguments"][..],
-        _ => &["operation", "arguments"][..],
-    };
-    // The operation wrapper is validated by the tool's schema.  This helper
-    // only guards the nested arguments object so a caller cannot smuggle a
-    // second scope/project selector through the read path.
-    if let Some(value) = object.get("arguments") {
-        let nested = value
-            .as_object()
-            .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
-        let nested_allowed: &[&str] = match operation {
-            PROJECT_CURRENT_STATE_OPERATION => &["limit"],
-            PROJECT_OBSERVATIONS_OPERATION => &["task_id", "limit"],
-            _ => &[],
-        };
-        if let Some(field) = nested
-            .keys()
-            .find(|field| !nested_allowed.contains(&field.as_str()))
-        {
-            return Err(RuntimeError::tool(format!(
-                "Forge orchestration read argument `{field}` is not admitted"
-            )));
-        }
-        if operation == PROJECT_CURRENT_STATE_OPERATION {
-            if let Some(limit) = nested.get("limit").and_then(Value::as_i64) {
-                if !(1..=64).contains(&limit) {
-                    return Err(RuntimeError::tool(
-                        "Project state read limit must be between 1 and 64",
-                    ));
-                }
-            } else if nested.contains_key("limit") {
-                return Err(RuntimeError::tool(
-                    "Project state read limit must be an integer",
-                ));
-            }
-        }
-    }
-    if let Some(field) = object
-        .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
-    {
-        return Err(RuntimeError::tool(format!(
-            "Forge orchestration read field `{field}` is not admitted"
-        )));
-    }
-    Ok(())
+    Err(RuntimeError::tool(
+        "Forge orchestration read operation has no registered contract",
+    ))
 }
 
 fn string_array(arguments: &Value, field: &str) -> Result<Vec<String>, RuntimeError> {
@@ -3763,7 +3776,7 @@ mod tests {
             .unwrap();
         assert!(
             validator.is_valid(&null_dedupe),
-            "a null dedupe_key passes the schema"
+            "the retained readiness hand envelope remains nullable"
         );
         let refused = tool
             .prepare(null_dedupe, &test_preparation_context("envelope"))
@@ -4515,8 +4528,14 @@ mod tests {
         );
         let arguments = orchestration_read_arguments_schema(PROJECT_CURRENT_STATE_OPERATION);
         assert_eq!(arguments["additionalProperties"], false);
-        assert_eq!(arguments["properties"]["limit"]["minimum"], 1);
-        assert_eq!(arguments["properties"]["limit"]["maximum"], 64);
+        assert_eq!(
+            arguments["properties"]["limit"]["minimum"].as_f64(),
+            Some(1.0)
+        );
+        assert_eq!(
+            arguments["properties"]["limit"]["maximum"].as_f64(),
+            Some(64.0)
+        );
         assert!(
             arguments["description"]
                 .as_str()
@@ -4785,15 +4804,15 @@ mod tests {
         assert_eq!(approval["additionalProperties"], false);
         assert_eq!(
             approval["required"],
+            // `kind` and `title` were required here and never read by the
+            // approval handler; they stay accepted but are no longer required.
             json!([
                 "action",
-                "document_id",
-                "kind",
-                "title",
-                "revision_id",
                 "content_digest",
+                "document_id",
+                "expected_document_version",
                 "render_digest",
-                "expected_document_version"
+                "revision_id"
             ])
         );
         for field in [
@@ -4801,12 +4820,17 @@ mod tests {
             "content_digest",
             "render_digest",
             "expected_document_version",
-            "envelope_digest",
         ] {
             assert!(
                 approval["properties"].get(field).is_some(),
                 "Document approval schema must expose exact {field}"
             );
+        }
+        // The approval handler never read `envelope_digest`, `kind` or
+        // `title`, but they were advertised for it: the closed variant
+        // still accepts them.
+        for unread in ["envelope_digest", "kind", "title"] {
+            assert!(approval["properties"].get(unread).is_some(), "{unread}");
         }
         assert!(
             approval["required"]

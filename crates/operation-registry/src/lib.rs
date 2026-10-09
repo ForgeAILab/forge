@@ -3,8 +3,10 @@
 
 pub mod authority;
 mod input_check;
+pub mod legacy_proposals;
 pub mod main_proposals;
 pub mod main_reads;
+pub mod project_proposals;
 pub mod project_reads;
 pub mod scope_reads;
 
@@ -34,6 +36,8 @@ pub trait OperationContext<E>:
     + project_reads::ProjectReadContext<E>
     + main_reads::MainReadContext<E>
     + main_proposals::MainProposalContext<E>
+    + project_proposals::ProjectProposalContext<E>
+    + legacy_proposals::LegacyProposalContext<E>
 {
 }
 impl<
@@ -41,7 +45,9 @@ impl<
         T: scope_reads::ScopeReadContext<E>
             + project_reads::ProjectReadContext<E>
             + main_reads::MainReadContext<E>
-            + main_proposals::MainProposalContext<E>,
+            + main_proposals::MainProposalContext<E>
+            + project_proposals::ProjectProposalContext<E>
+            + legacy_proposals::LegacyProposalContext<E>,
     > OperationContext<E> for T
 {
 }
@@ -87,6 +93,10 @@ pub struct SurfaceBinding {
 #[derive(Debug, Clone, Copy)]
 pub enum StructuralConstraint {
     ClosedObject,
+    MaxSerializedBytes(usize),
+    NonNullableOptional(&'static str),
+    UniqueItems(&'static str),
+    AtLeastOne(&'static [&'static str]),
     /// A field the existing transport adapter discards before decoding.
     IgnoredField(&'static str),
     Required(&'static str),
@@ -121,6 +131,31 @@ impl TypedInputContract {
     /// description and for validation errors: `no arguments`, or
     /// `{section: one of a|b, limit?}` (`?` marks an optional field).
     pub fn contract_line(&self) -> String {
+        if let Some(variants) = self.schema["oneOf"].as_array() {
+            return variants
+                .iter()
+                .map(|schema| {
+                    let action = schema["properties"]["action"]["enum"][0]
+                        .as_str()
+                        .expect("action tag");
+                    let fields = schema["properties"]
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .filter(|field| field.as_str() != "action")
+                        .map(|field| {
+                            let required = schema["required"]
+                                .as_array()
+                                .is_some_and(|names| names.contains(&json!(field)));
+                            format!("{field}{}", if required { "" } else { "?" })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("action={action} {{{fields}}}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+        }
         let fields = self
             .fields()
             .map(|(name, schema)| {
@@ -190,11 +225,56 @@ impl<E: Send + 'static> OperationSpec<E> {
         // Canonical contracts are embedded, so root schema/title annotations are redundant.
         schema.as_object_mut().unwrap().remove("$schema");
         schema.as_object_mut().unwrap().remove("title");
+        if let Some(variants) = schema["oneOf"].as_array() {
+            let mut fields = serde_json::Map::new();
+            for variant in variants {
+                for (key, value) in variant["properties"]
+                    .as_object()
+                    .expect("tagged input properties")
+                {
+                    if key == "action" {
+                        if let Some(existing) = fields.get_mut(key) {
+                            let existing: &mut Value = existing;
+                            existing["enum"]
+                                .as_array_mut()
+                                .unwrap()
+                                .extend(value["enum"].as_array().unwrap().iter().cloned());
+                            continue;
+                        }
+                    }
+                    fields.insert(key.clone(), value.clone());
+                }
+            }
+            schema["properties"] = Value::Object(fields);
+            schema["type"] = json!("object");
+        }
         schema["properties"] = schema.get("properties").cloned().unwrap_or(json!({}));
         schema["required"] = schema.get("required").cloned().unwrap_or(json!([]));
         for constraint in constraints {
             match constraint {
-                StructuralConstraint::ClosedObject => schema["additionalProperties"] = json!(false),
+                StructuralConstraint::ClosedObject => {
+                    schema["additionalProperties"] = json!(false);
+                    if let Some(variants) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
+                        for variant in variants {
+                            variant["additionalProperties"] = json!(false);
+                        }
+                    }
+                }
+                StructuralConstraint::MaxSerializedBytes(_) => {}
+                StructuralConstraint::NonNullableOptional(field) => {
+                    if let Some(kinds) = schema["properties"][*field]["type"].as_array_mut() {
+                        kinds.retain(|kind| kind != "null");
+                        if kinds.len() == 1 {
+                            schema["properties"][*field]["type"] = kinds[0].clone();
+                        }
+                    }
+                }
+                StructuralConstraint::UniqueItems(field) => {
+                    schema["properties"][*field]["uniqueItems"] = json!(true)
+                }
+                StructuralConstraint::AtLeastOne(fields) => {
+                    schema["anyOf"] = json!(fields.iter().map(|field| json!({"required":[field],"properties":{*field:{"type":"integer"}}})).collect::<Vec<_>>());
+                }
                 StructuralConstraint::IgnoredField(field) => {
                     schema["properties"].as_object_mut().unwrap().remove(*field);
                 }
@@ -209,6 +289,23 @@ impl<E: Send + 'static> OperationSpec<E> {
                 }
             }
         }
+        fn scalar_enums(value: &mut Value) {
+            if let Some(object) = value.as_object_mut() {
+                if let Some(values) = object.get("enum").and_then(Value::as_array) {
+                    if values.len() == 1 {
+                        object.insert("const".into(), values[0].clone());
+                    }
+                }
+                for value in object.values_mut() {
+                    scalar_enums(value);
+                }
+            } else if let Some(values) = value.as_array_mut() {
+                for value in values {
+                    scalar_enums(value);
+                }
+            }
+        }
+        scalar_enums(&mut schema);
         schema["required"]
             .as_array_mut()
             .unwrap()
@@ -329,7 +426,13 @@ pub fn registered_reads() -> Vec<&'static str> {
 }
 /// Every operation in the registry, independent of effect class.
 pub fn registered_operations() -> Vec<&'static str> {
-    let mut ids = [registered_reads(), main_proposals::IDS.to_vec()].concat();
+    let mut ids = [
+        registered_reads(),
+        main_proposals::IDS.to_vec(),
+        project_proposals::IDS.to_vec(),
+        legacy_proposals::IDS.to_vec(),
+    ]
+    .concat();
     ids.sort_unstable();
     ids
 }
@@ -345,6 +448,26 @@ pub fn read_catalog<E: Send + 'static>() -> OperationCatalog<E> {
 }
 pub static READ_CATALOG: LazyLock<OperationCatalog<std::convert::Infallible>> =
     LazyLock::new(read_catalog);
+
+/// All proposal projections and dispatch use this same domain concatenation.
+pub fn proposal_catalog<E: Send + 'static>() -> OperationCatalog<E> {
+    let ids = [
+        main_proposals::IDS,
+        project_proposals::IDS,
+        legacy_proposals::IDS,
+    ]
+    .concat();
+    OperationCatalog::new(
+        main_proposals::specs()
+            .into_iter()
+            .chain(project_proposals::specs())
+            .chain(legacy_proposals::specs()),
+        &ids,
+    )
+    .expect("complete proposal catalog")
+}
+pub static PROPOSAL_CATALOG: LazyLock<OperationCatalog<std::convert::Infallible>> =
+    LazyLock::new(proposal_catalog);
 
 #[cfg(test)]
 mod tests;

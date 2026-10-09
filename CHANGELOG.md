@@ -8,6 +8,31 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Registered native Project calls refuse undeclared fields (3.8 slice E).**
+  `project.current_state`, `project.observations`, `project.review_config`,
+  `project.document`, `project.decision`, `project.milestone`,
+  `project.validation`, `project.release.request` and `project.escalate`
+  are checked against one contract per operation. An unknown payload or
+  envelope field is answered with one correction naming the operation, the
+  field and the expected contract. Every payload field that was advertised
+  for an operation before is still accepted: Document `approve` still takes
+  `kind`, `title` and `envelope_digest`, milestone actions still take
+  `milestone_id`, `display_label`, `primary_milestone_id` and `content`
+  whichever action is named, and `project.validation` still takes
+  `governing_revision_ids`. Fields that were never advertised for the
+  operation are refused. The six pending proposals
+  (`message.send`, `commitment.update`, `memory.publish`, `memory.supersede`,
+  `review.request`, `session.action`) keep an open payload of at most 65,536
+  bytes that is stored as sent; only their envelope is checked. The
+  proposal envelope declares `dedupe_key` and `correlation_id` as non-null
+  strings. A `null` or omitted payload is still accepted and read as `{}`.
+- **Project Chat reads are enforced as advertised (3.8 slice E).**
+  `project.current_state` and `project.observations` called from a Project
+  Chat need `read_agent_chat`, the permission that already decided whether
+  the chat was offered them. A direct call without it used to succeed.
+- **A Project Agent cannot queue `project.create` (3.8 slice E).** The
+  agent-action policy refuses it from a Project scope or Project Chat, where
+  it was never offered; it used to be queued for approval.
 - **Daemon protocol revision 4 (3.2 stage C, part 2b).** Workspace mutation
   and reconciliation messages now carry a required tagged `integration`
   binding (`task_step`, `task_step_effect` or `attempt`), and merge / rebase
@@ -645,6 +670,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Project operations and pending proposals use generated registry contracts
+  (3.8 slice E).** Two Project reads, seven Project proposals and six pending
+  proposals moved from hand-written branches and flat schemas to the
+  operation registry; aggregate tool names are unchanged. Registered reads
+  evaluate the authority pinned at turn admission instead of resolving it
+  again, so a revocation during a turn stops reads at the next proposal or
+  the next turn. The agent-action policy uses the shared evaluator for
+  account, Project, Chat and identity scopes. Ready Project Agents are
+  offered Charter amendment drafting, which was already enforced; Charter
+  approval and final release stay user-only. `project.charter.adoption`,
+  `project.evidence` and `project.readiness` keep their hand paths. Tool
+  definitions: Project 24,104 to 24,252 bytes, Project verification 25,353
+  to 25,501 (160 bytes each name the previously advertised Document,
+  milestone and validation fields that stay accepted), Project setup 15,572
+  to 15,766 (the pending `message.send` contract line and its `body` /
+  `content` aliases).
 
 - **Authority is resolved once per turn and pinned (3.8 slice D).** A native
   or CLI turn fixes its Agent Profile and permission ceiling at admission.
@@ -1522,6 +1564,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **A setup-only operation refused after setup completed names the real
+  cause (3.8 slice E).** The denial is `charter_adoption_not_applicable`
+  instead of `charter_not_adopted`.
+- **A pending proposal never reports a completed effect (3.8 slice E).**
+  Replaying a legacy message, commitment, memory, review or session proposal
+  whose ledger row was marked `executed` without a receipt is refused instead
+  of returning success.
 
 - **An interrupted Git probe no longer outlives its caller.** The read-only
   probes around a merge or rebase (rebase-in-progress, conflict state, the

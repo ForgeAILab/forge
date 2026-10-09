@@ -114,7 +114,7 @@ ceiling per surface (`SURFACE_BYTE_CEILINGS`, the unit
 `scripts/measure-tool-definitions.py` prints). Raise a ceiling only on purpose.
 
 Registered reads are `account.summary`, `agent_chat.summary`, `project.charter`,
-`skill.section`, `genesis.project_agents.read`, `charter.read`,
+`skill.section`, `project.current_state`, `project.observations`, `genesis.project_agents.read`, `charter.read`,
 `charter.readiness`, `charter.diff`, `charter.approval_target`, `discovery.read`,
 `portfolio.read`, and `inquiry.run`. Main query handlers accept the registry's
 input types directly; their former dispatcher and handwritten decoders are
@@ -143,7 +143,7 @@ of the action, the user executor, and a Charter approval that belongs to the
 account and is not consumed. Selection uses the same integer
 coercion as reads and the same receipt-backed command service.
 
-Fresh proposals check current Main binding/policy first, then forged authority
+Fresh proposals check the registry's current principal/scope/permission rule first, then forged authority
 fields, then their payload contract, then the typed handler. The provider's
 preparation denial check also runs before payload diagnostics. Dispatch of the two registered
 proposals checks the entire envelope for authority/scope replacements; direct
@@ -179,6 +179,38 @@ operation to an existing domain module needs no edit to `lib.rs`. A new domain m
 specs and id list to the appropriate effect catalog. Reads and Main proposals
 use the same `OperationSpec` and typed decoding/dispatch machinery; registered
 operation inventory includes both catalogs.
+
+Project proposal specs now own `project.review_config`, `project.document`,
+`project.decision`, `project.milestone`, `project.validation`,
+`project.release.request` and `project.escalate`. Document and milestone actions
+have separate closed field contracts, each of which keeps every field that was
+advertised for the operation before the move; their provider projection is still one
+generated line per operation, with no conditional schema keywords. Fresh calls
+check authority before contract details. Commands receive the original admitted
+payload, preserving receipt digests; exact preparations bypass the current field
+contract while still running typed decoding and existing domain checks. Payload
+ceilings use serialized UTF-8 bytes (65,536), review command lengths use characters,
+and read limits use rows. Ready Project Agents also advertise the existing
+Charter amendment draft capability; no approval authority is added.
+
+`message.send`, `commitment.update`, `memory.publish`, `memory.supersede`,
+`review.request` and `session.action` are pending-intent specs with an open,
+size-capped payload that is stored as sent. Their
+results remain pending proposals, never success for a message, memory, commitment,
+review or session effect. No materializer was added. The same operation schema
+produces field aliases and the contract line. On a tool that mixes them with
+hand operations, registered fields are not repeated inside `payload`; the hand
+operations' payload fields stay declared there, because some providers drop
+undeclared nested fields. A `null` payload on a registered proposal is read as
+`{}`.
+
+`project.charter.adoption`, `project.evidence` and `project.readiness` retain their
+hand paths because their base receipt capture could not be proven exact in this
+slice. Project verification remains a disposable checkout with observed commands:
+`project.validation` still requires the command observations for pass/fail and
+refuses manual attestation through the Project-Agent path. Setup-only availability
+now reports `charter_adoption_not_applicable` after setup completes, rather than
+`charter_not_adopted`.
 
 ### Repository trait pattern
 
@@ -415,7 +447,7 @@ turn admission the protected session fixes the Profile ID and effective
 ceiling. Advertisement uses the registry evaluator against that ceiling and
 principal/scope/setup facts. Before registered dispatch, the provider loads
 fresh facts, intersects them with the admitted and remaining turn ceilings,
-and runs the same evaluator. Narrowing is monotonic within the running provider;
+and runs the same evaluator before a fresh effect. Registered reads evaluate the admitted/remaining turn authority without resolving it again at preparation or execution; Project query targets are pinned from that authority. Narrowing is monotonic within the running provider;
 restoring a permission later in that turn cannot revive its revoked grant. A widened Profile or binding never widens that turn; a missing or
 replaced binding, inactive identity, or permission revoked since admission
 returns typed `authority_revoked`. Current state can instead produce a typed
@@ -429,14 +461,12 @@ Chat carries `propose_task`, `propose_commitment`, `propose_memory` and
 `propose_session` once the Charter is adopted, but not the Project scope's
 `propose_review` or `propose_decision`. An owned identity without the Main
 binding keeps its account ceiling for the unregistered account operations;
-registered Main operations require the binding through their principal rule.
+Main reads require the binding through their principal rule. Owned unbound identities retain `project.create` and `genesis.project_agent.select` proposal authority in the agent-action policy; the native boundary still requires the active Main binding for both (`OrchestrationAuthorizationService::main_account_id`); Charter adoption, amendment approval and final release remain user-only.
 A stored document that fails to parse is logged with the identity and layer.
 
 Registered Main reads, Project Charter/doctrine reads, identity summaries,
 `genesis.project_agent.select` and `project.create` use this path. The
-approval-envelope `AgentAction` policy (`evaluate_action_policy`) still layers
-identity, Profile and scope ceilings itself, with the shared parser, until
-slice E. UI effective
+approval-envelope `AgentAction` policy (`evaluate_action_policy`) uses the same resolver/evaluator for account, Project, Chat and identity callers. Task assignment/terminal/reviewer checks remain on their existing path for slice F. The former `action_scope_access` check is removed. `main_account_id` remains as the native Main binding gate for Main proposals, `project.summary` in a Main Chat and Main public search, which the evaluator does not cover. A test-only frozen base policy compares each principal/scope/action cell, refuses any widening, and lists the one intended narrowing (a Project Agent queueing `project.create` from its Project scope or Chat). UI effective
 permissions and CLI composition use the same resolver. Existing exact-object,
 receipt-first replay, governing-policy and optimistic-version checks remain
 in command transactions; fresh Genesis Agent selection also evaluates
@@ -3472,7 +3502,7 @@ CLI adapter, streams
 execution logs back as `execution.log` notifications, and reports final status
 through `execution.terminal`.
 
-Protocol revision 3 independently negotiates `machine_probe.v1` for
+Protocol revision 4 independently negotiates `machine_probe.v1` for
 `machine.probe` and `repo_provision.v1` for `repo_location.provision`.
 A probe accepts named commands, 1–300 second timeouts, Project env, and an
 optional verified location ID. It returns exit status, timeout and a redacted
@@ -3493,21 +3523,22 @@ local policy purposes, `environment_probe` and `repo_provision`, and refusal is
 `run_purpose_denied`. Missing capabilities do not change connection health.
 Upgrade the server first: a daemon that opts into these new purposes needs a
 server from this release; an older server rejects the handshake because its
-run-purpose enum does not recognize them. Protocol revision remains 3.
+run-purpose enum does not recognize them. These capabilities did not change
+the protocol revision; the current revision is 4.
 
-Protocol revision 3 negotiates `workspace.v1` for `repo_location.verify`,
+Protocol revision 4 negotiates `workspace.v1` for `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
 `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
 Plan-writing roles on a daemon-owned workspace require `execution.plan_transport`.
-A revision-3 daemon without it can still run reviewers, interactive executions,
+A revision-4 daemon without it can still run reviewers, interactive executions,
 server-owned shared-mount executions, filesystem requests and PTYs. Deterministic
 placement refusals record a structured Task annotation naming the machine and
 missing capability. Dispatch waits until eligibility facts change, then clears
 the refusal and retries.
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 3 or newer), restarting each with its existing
+release (protocol revision 4 or newer), restarting each with its existing
 `--workspace-root`.
-A connection below revision 3 receives `daemon_upgrade_required` and cannot use any
+A connection below revision 4 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -3518,7 +3549,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 4, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.
