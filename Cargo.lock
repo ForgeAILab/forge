@@ -637,6 +637,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "check-executor"
+version = "0.13.12"
+dependencies = [
+ "api-types",
+ "chrono",
+ "executors",
+ "git",
+ "process-supervisor",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1370,6 +1384,7 @@ dependencies = [
  "api",
  "api-types",
  "axum",
+ "check-executor",
  "chrono",
  "clap",
  "cli-adapters",
@@ -1383,6 +1398,7 @@ dependencies = [
  "git",
  "libc",
  "portable-pty",
+ "process-supervisor",
  "reqwest",
  "serde",
  "serde_json",
@@ -1393,6 +1409,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "tokio-util",
  "tracing",
  "url",
  "uuid",
@@ -1623,6 +1640,7 @@ dependencies = [
 name = "git"
 version = "0.13.12"
 dependencies = [
+ "process-supervisor",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
@@ -2677,6 +2695,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-supervisor"
+version = "0.13.12"
+dependencies = [
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3007,6 +3034,7 @@ version = "0.13.12"
 dependencies = [
  "api-types",
  "async-trait",
+ "check-executor",
  "chrono",
  "db",
  "events",
@@ -3017,6 +3045,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -3324,6 +3353,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bcrypt",
+ "check-executor",
  "chrono",
  "cli-adapters",
  "config",

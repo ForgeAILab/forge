@@ -1,0 +1,15 @@
+[package]
+name = "process-supervisor"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "process", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

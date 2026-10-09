@@ -1,7 +1,8 @@
+#[cfg(test)]
+use std::process::Stdio;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Component, Path, PathBuf},
-    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -9,10 +10,7 @@ use std::{
 use api_types::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    process::Command,
-};
+use tokio::{io::AsyncReadExt, process::Command};
 use workspace::WorkspaceManager;
 
 use crate::{
@@ -226,6 +224,9 @@ impl DaemonWorkspaceBackend {
                 | METHOD_WORKSPACE_MERGE
                 | METHOD_WORKSPACE_RESET
                 | METHOD_WORKSPACE_CLEANUP
+                | METHOD_CHECK_RUN
+                | METHOD_CHECK_LOOKUP
+                | METHOD_CHECK_CANCEL
         )
     }
 
@@ -235,6 +236,12 @@ impl DaemonWorkspaceBackend {
         params: Value,
         active_ids: impl FnOnce() -> Vec<String>,
     ) -> CommandResult<Value> {
+        match method {
+            METHOD_CHECK_RUN => return encode(self.check_run(decode(params)?).await?),
+            METHOD_CHECK_LOOKUP => return encode(self.check_lookup(decode(params)?).await?),
+            METHOD_CHECK_CANCEL => return encode(self.check_cancel(decode(params)?).await?),
+            _ => {}
+        }
         if method == METHOD_WORKSPACE_CANCEL {
             return encode(self.cancel_command(decode(params)?).await?);
         }
@@ -381,9 +388,14 @@ impl DaemonWorkspaceBackend {
             }
         } else if self
             .journal
-            .operation(&request.operation_id)
+            .entry(&operation_entry_id(&request.operation_id))
             .map_err(storage_error)?
-            .is_some()
+            .is_some_and(|entry| {
+                matches!(
+                    entry,
+                    JournalEntry::Operation { .. } | JournalEntry::Check { .. }
+                )
+            })
         {
             WorkspaceCancelState::AlreadyFinished
         } else {
@@ -1558,11 +1570,65 @@ impl DaemonWorkspaceBackend {
         // Persist the version before launching; journal pressure after the
         // command exits must never discard its exit result.
         owned.version += 1;
+        let run_path = owned.path.clone();
+        let owner_runtime = owned.runtime_id.clone();
         self.save_workspace(&params.workspace_handle, owned)?;
         let start = Instant::now();
         let output_cap = usize::try_from(params.max_output_bytes)
             .unwrap_or(usize::MAX)
             .min(crate::daemon_persistence::MAX_CI_LOG_BYTES);
+        if params.purpose == WorkspaceRunPurpose::CiStep && params.max_output_bytes == u64::MAX {
+            let environment = params.env.iter().cloned().collect::<BTreeMap<_, _>>();
+            let receipt = check_executor::execute(check_executor::CheckExecution {
+                operation_id: &params.fence.operation_id,
+                spec: &check_executor::legacy_ci_spec(
+                    &params.command,
+                    &environment,
+                    params.timeout_secs,
+                    true,
+                ),
+                target: check_executor::CheckoutTarget::Workspace(&run_path),
+                owner: CheckOwnerIdentity {
+                    owner_kind: "daemon".into(),
+                    machine_id: Some(self.daemon_id.clone()),
+                    runtime_id: owner_runtime,
+                },
+                input_revisions: None,
+                environment: &environment,
+                deadline: None,
+                cancel: &tokio_util::sync::CancellationToken::new(),
+                permit: &check_executor::CheckPermit::already_admitted(),
+                cleanup: check_executor::CleanupPlan {
+                    commands: &[],
+                    timeout: check_executor::CLEANUP_TIMEOUT,
+                },
+                output_limit: output_cap,
+            })
+            .await;
+            if let Some(message) = receipt.infrastructure_message {
+                return Err(error(WORKSPACE_ERROR, message));
+            }
+            let output = receipt.commands.into_iter().next();
+            return Ok(WorkspaceRunResult {
+                entry_id: operation_entry_id(&params.fence.operation_id),
+                operation_id: params.fence.operation_id,
+                exit_code: output.as_ref().map_or(Some(0), |o| o.exit_code),
+                stdout: output
+                    .as_ref()
+                    .map_or_else(String::new, |o| o.stdout_tail.clone()),
+                stderr: output
+                    .as_ref()
+                    .map_or_else(String::new, |o| o.stderr_tail.clone()),
+                duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                timed_out: output
+                    .as_ref()
+                    .is_some_and(|o| o.outcome == CheckExecutionOutcome::TimedOut),
+                stdout_truncated: output.as_ref().is_some_and(|o| o.stdout_truncated),
+                stderr_truncated: output.as_ref().is_some_and(|o| o.stderr_truncated),
+                stdout_drain_incomplete: false,
+                stderr_drain_incomplete: false,
+            });
+        }
         let output = bounded_command(command, params.timeout_secs, output_cap, true).await?;
         let environment: BTreeMap<String, String> = params.env.into_iter().collect();
         let (stdout, stdout_truncated) = redacted_tail(&output.stdout, &environment, output_cap);
@@ -2073,35 +2139,6 @@ struct BoundedOutput {
     stderr_drain_incomplete: bool,
 }
 
-struct ProcessGroupGuard(Option<u32>);
-impl ProcessGroupGuard {
-    fn kill(&mut self) {
-        #[cfg(unix)]
-        if let Some(id) = self.0.take() {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", "--", &format!("-{id}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        #[cfg(windows)]
-        if let Some(id) = self.0.take() {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &id.to_string()])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
-}
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
 async fn bounded_command(
     command: Command,
     seconds: u64,
@@ -2118,126 +2155,38 @@ async fn bounded_command_inner(
     keep_tail: bool,
     kill_on_success: bool,
 ) -> CommandResult<BoundedOutput> {
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().map_err(io_error)?;
-    let mut group = ProcessGroupGuard(child.id());
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| error(WORKSPACE_ERROR, "child stdout is unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| error(WORKSPACE_ERROR, "child stderr is unavailable"))?;
-    let stdout_capture = Arc::new(Mutex::new(StreamCapture::default()));
-    let stderr_capture = Arc::new(Mutex::new(StreamCapture::default()));
-    let mut stdout_task = tokio::spawn(read_bounded_stream(
-        stdout,
-        cap,
-        keep_tail,
-        stdout_capture.clone(),
-    ));
-    let mut stderr_task = tokio::spawn(read_bounded_stream(
-        stderr,
-        cap,
-        keep_tail,
-        stderr_capture.clone(),
-    ));
-    let wait = if seconds == 0 {
-        Ok(child.wait().await)
-    } else {
-        tokio::time::timeout(Duration::from_secs(seconds), child.wait()).await
-    };
-    let (exit_code, timed_out) = match wait {
-        Ok(status) => (status.map_err(io_error)?.code(), false),
-        Err(_) => {
-            group.kill();
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            (None, true)
-        }
-    };
-    if kill_on_success {
-        group.kill();
-    } else {
-        group.0 = None;
-    }
-    let collect = async {
-        (&mut stdout_task)
-            .await
-            .map_err(|e| error(WORKSPACE_ERROR, e.to_string()))?
-            .map_err(io_error)?;
-        (&mut stderr_task)
-            .await
-            .map_err(|e| error(WORKSPACE_ERROR, e.to_string()))?
-            .map_err(io_error)?;
-        Ok::<_, DaemonErrorPayload>(())
-    };
-    match tokio::time::timeout(Duration::from_secs(2), collect).await {
-        Ok(result) => {
-            result?;
-        }
-        Err(_) => {
-            stdout_task.abort();
-            stderr_task.abort();
-        }
-    }
-    let stdout = stdout_capture.lock().unwrap_or_else(|p| p.into_inner());
-    let stderr = stderr_capture.lock().unwrap_or_else(|p| p.into_inner());
-    Ok(BoundedOutput {
-        exit_code,
-        stdout: stdout.bytes.clone(),
-        stderr: stderr.bytes.clone(),
-        timed_out,
-        stdout_truncated: stdout.seen > cap as u64,
-        stderr_truncated: stderr.seen > cap as u64,
-        stdout_drain_incomplete: !stdout.eof,
-        stderr_drain_incomplete: !stderr.eof,
-    })
-}
-
-#[derive(Default)]
-struct StreamCapture {
-    bytes: Vec<u8>,
-    seen: u64,
-    eof: bool,
-}
-
-async fn read_bounded_stream(
-    mut stream: impl AsyncRead + Unpin,
-    cap: usize,
-    keep_tail: bool,
-    capture: Arc<Mutex<StreamCapture>>,
-) -> std::io::Result<()> {
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let count = stream.read(&mut chunk).await?;
-        let mut capture = capture.lock().unwrap_or_else(|p| p.into_inner());
-        if count == 0 {
-            capture.eof = true;
-            break;
-        }
-        capture.seen += count as u64;
-        let tail = &mut capture.bytes;
-        if !keep_tail {
-            let remaining = cap.saturating_sub(tail.len());
-            tail.extend_from_slice(&chunk[..remaining.min(count)]);
-        } else if count >= cap {
-            tail.clear();
-            tail.extend_from_slice(&chunk[count - cap..count]);
+    let deadline = (seconds > 0).then(|| Instant::now() + Duration::from_secs(seconds));
+    let output = process_supervisor::run(
+        &mut command,
+        if keep_tail {
+            process_supervisor::Capture::Tail(cap)
         } else {
-            let remove = tail.len().saturating_add(count).saturating_sub(cap);
-            tail.drain(..remove);
-            tail.extend_from_slice(&chunk[..count]);
-        }
-    }
-    Ok(())
+            process_supervisor::Capture::Prefix(cap)
+        },
+        deadline,
+        &tokio_util::sync::CancellationToken::new(),
+        if kill_on_success {
+            process_supervisor::CompletionPolicy::StopDescendants
+        } else {
+            process_supervisor::CompletionPolicy::DrainFor(Duration::from_secs(2))
+        },
+    )
+    .await
+    .map_err(io_error)?;
+    Ok(BoundedOutput {
+        exit_code: if output.termination == process_supervisor::Termination::Exited {
+            output.status.code()
+        } else {
+            None
+        },
+        stdout: output.stdout,
+        stderr: output.stderr,
+        timed_out: output.termination == process_supervisor::Termination::TimedOut,
+        stdout_truncated: output.stdout_truncated,
+        stderr_truncated: output.stderr_truncated,
+        stdout_drain_incomplete: output.stdout_drain_incomplete,
+        stderr_drain_incomplete: output.stderr_drain_incomplete,
+    })
 }
 
 fn redacted_tail(
@@ -2361,3 +2310,5 @@ mod reconciliation;
 mod tests;
 
 mod integration_owner;
+
+mod check_owner;

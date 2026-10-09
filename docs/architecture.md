@@ -4997,11 +4997,11 @@ stops its Git process group before retaining a receipt with observed HEAD and
 rebase progress. Task-step merge cancellation keeps today's protected-completion
 behavior. Ordinary Task-step journal ACKs retain their existing lifecycle.
 
-Daemon protocol revision **4** requires the tagged `integration` binding on
+Daemon protocol revision **5** retains the tagged `integration` binding on
 mutation and reconciliation messages. `attempt` carries the queue fence and
 frozen witness; `task_step_effect` carries the existing Task step's attempt
 binding; `task_step` identifies other existing workspace operations. There is
-one revision-4 format, and revisions below 4 are refused with
+one revision-5 format, and revisions below 5 are refused with
 `daemon_upgrade_required` and an “upgrade the daemon” message. Upgrade the server
 then each daemon, preserving `--workspace-root`. Startup forward-migrates retained
 revision-3 journal intents/results in place; old wire decoding is never enabled.
@@ -7047,14 +7047,89 @@ Operator status adds `check_runs.by_state` (all eight states, zeros included)
 and `check_runs.reusable_results`. These are read-only observations, separate
 from machine occupancy and severity; no worker or capacity behavior is enabled.
 
-Stage B must share the existing 3.2 CI sequence/result types and extend its
-persistence-free owner process/transport seam with bounded process-tree
-supervision, output/truncation, owner input attestation, exact-commit build
-checkout, cancellation and cleanup receipts. It should be built with 3.2 stage
-C part 2's receipt/transport work, preserving stable operation IDs and placement
-fences, without introducing a second DB-writing CI pipeline. Stage C supplies
-admission/capacity, wall-deadline clamping, reconciliation and Task-step-only
+Stage B implements the persistence-free owner execution/transport seam below.
+Stage C supplies admission/capacity, reconciliation and Task-step-only
 request/application. It consumes these identities/repositories, adds only the
 fields it actually needs, and rechecks current authority on every hit/join.
-Queue-head gating, reviewer dependency layout and capacity borrowing remain
-later-stage decisions.
+It passes the run's recorded `applied_timeout_seconds` as an absolute owner
+wall deadline (default setting 1800 seconds); the two legacy policies retain
+unbounded CI until that runner's activation.
+
+### Owner check execution (3.3 stage B)
+
+`check-executor` is a persistence-free owner primitive. It receives a `CheckSpec`,
+local checkout target, operation ID, owner identity, explicit owner input
+revisions, deadline, cancellation token and a borrowed `CheckPermit`. It acquires
+no capacity, writes no check/Task/Review rows and publishes no events. Stage C
+must admit the physical machine, retain the stable operation intent, certify the
+receipt against the frozen spec and owner inputs, and apply it through Task steps.
+There is no cache, single-flight by check digest, recovery loop or timing cutover.
+
+`CheckoutTarget::ExactCommit` verifies a full lowercase commit object ID and
+clones an exact detached checkout into a unique `check-*/repo` directory under
+the owner's build area. Commands run at that repository root. This never resets
+or cleans the source checkout or Task worktree. HEAD/tracked-change witnesses
+are captured before removal; a changed managed candidate cannot pass. The
+managed directory is removed even after failure, timeout, cancellation or failed
+preparation. Removal has a separate settlement bound; unconfirmed removal is
+`uncertain` cleanup. Existing CI continues to run in its Task worktree; stage D
+owns the managed-checkout cutover.
+
+Each command runs through `process-supervisor`, the single process-group
+implementation shared with Git. It continuously drains both pipes, retains
+bounded redacted UTF-8 tails and sets truncation flags. Output size cannot fail a
+check. The command limit is clamped to the remaining absolute run deadline;
+wall exhaustion is `timed_out`. Cancellation, timeout and dropped futures stop
+the entire group with SIGTERM, a 500 ms grace period, then SIGKILL; the leader is
+reaped. Checks also stop descendants after normal shell exit. Git retains its
+normal-exit behavior; untouched daemon helpers retain their independent two-second
+post-exit drain bound and explicit incomplete-drain evidence. Declared cleanup always runs after settled run commands,
+using a fresh token and a separate bounded phase, including after failure,
+timeout and cancellation. Each cleanup command's own limit is also clamped.
+Tree termination grace is additional to the execution/cleanup deadline.
+An owner handler interrupted before returning has no certifiable completion:
+its retained intent reports `interrupted`, never a pass or permission to rerun.
+
+New execution policies clear ambient environment, disable login-profile loading
+and pass only declared keys plus the receiving machine's existing five build
+budget variables and niceness. The explicit frozen `legacy-server/1` and
+`legacy-daemon/1` policies preserve existing login-shell/environment/Git-variable
+behavior during caller migration. Project build overrides retain precedence.
+Attestation is computed on the owner from `ServerCheckExecutionInputs` before
+preparation; revision metadata must bind tools, assets, secrets and any declared
+cleanup policy. Owners without that evidence, including today's daemon, return
+`NotAttested`; a runtime ID is never an input attestation.
+
+`api-types::CheckReceipt` records operation/owner/input identity, ordered
+`CheckCommandReceipt` values (exit, typed outcome, duration, redacted tails,
+truncation, tree-stop evidence and timestamps), overall outcome, cleanup receipt,
+HEAD/tracked-change witnesses and started/finished times. It certifies execution
+facts only. A passing process with failed/timed-out/uncertain cleanup is not an
+overall pass. No declared cleanup plus `not_performed` cleanup may pass. Stage C
+must verify completeness, digest/scope, owner placement and attestation before
+certification; the receipt confers no semantic review authority.
+
+Daemon protocol **5** adds `check.run`, `check.lookup`, and `check.cancel`.
+`check.run` takes a fence-free stable operation ID, owner-resolved workspace
+handle or repository-location/exact-commit target, purpose, spec, transient env,
+pinned cleanup plan and absolute RFC3339 deadline. Local purpose authorization,
+placement generation/runtime validation and per-checkout mutation locking remain
+on the owner. The request is bounded to 128 KiB, 64 run commands and 32 cleanup
+commands; cleanup is at most 30 seconds and each retained stream tail is 4096
+bytes. The shared crash-safe daemon journal reserves receipt space before launch
+and retains sanitized check intents/results. An exact duplicate returns the
+same receipt or `running`; a different request under the key is refused. Lookup
+after reconnect returns the retained result; an unfinished intent without a live
+handler after restart returns `interrupted`. Cancellation uses the existing
+persistent operation tombstones and waits for process/cleanup settlement. Check
+keys survive journal acknowledgment, so acknowledged results cannot be relaunched.
+Upgrade the server first, then every daemon from that release and restart using
+the same workspace root. Revision-4 and older daemons are refused before dispatch.
+
+The legacy `integration_effects::check::CheckRun` is a thin phased adapter to the
+shared sequence/projection policy; each owner command uses the primitive before
+its existing recorder continues. Review-entry CI and manual `ReviewRunner` CI
+retain command order, cwd, inherited env, verdicts, comments/events and per-command
+receipt acknowledgment. No extra setup or managed checkout is enabled. Required
+conformance/setup, lifecycle/before-work, readiness/preflight/environment helper
+and agent-selected families retain their existing orchestration and check policy.

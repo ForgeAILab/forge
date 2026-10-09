@@ -85,6 +85,90 @@ impl DaemonWorkspaceClient {
         .await
         .map_err(|error| redact_remote_error(error, &params.remote_url))
     }
+    /// Persistence-free check transport. The stage-C runner retains the intent,
+    /// certifies the returned receipt and owns all acknowledgment/application.
+    pub async fn run_check(
+        &self,
+        daemon_id: &str,
+        params: DaemonCheckRunParams,
+    ) -> Result<DaemonCheckResult> {
+        let deadline = chrono::DateTime::parse_from_rfc3339(&params.deadline)
+            .map_err(|_| ServiceError::invalid_operation("invalid check deadline"))?;
+        let remaining = (deadline.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        let result = self
+            .check_request(
+                daemon_id,
+                METHOD_CHECK_RUN,
+                &params,
+                remaining
+                    .saturating_add(Duration::from_millis(params.cleanup_timeout_ms))
+                    .saturating_add(self.timeout),
+            )
+            .await?;
+        validate_check_result(daemon_id, &params.operation_id, &result)?;
+        Ok(result)
+    }
+    pub async fn lookup_check(
+        &self,
+        daemon_id: &str,
+        operation_id: &str,
+    ) -> Result<DaemonCheckResult> {
+        let result = self
+            .check_request(
+                daemon_id,
+                METHOD_CHECK_LOOKUP,
+                &DaemonCheckOperationParams {
+                    daemon_id: daemon_id.into(),
+                    operation_id: operation_id.into(),
+                },
+                self.timeout,
+            )
+            .await?;
+        validate_check_result(daemon_id, operation_id, &result)?;
+        Ok(result)
+    }
+    pub async fn cancel_check(
+        &self,
+        daemon_id: &str,
+        operation_id: &str,
+    ) -> Result<DaemonCheckResult> {
+        let result = self
+            .check_request(
+                daemon_id,
+                METHOD_CHECK_CANCEL,
+                &DaemonCheckOperationParams {
+                    daemon_id: daemon_id.into(),
+                    operation_id: operation_id.into(),
+                },
+                self.timeout.saturating_add(Duration::from_secs(31)),
+            )
+            .await?;
+        validate_check_result(daemon_id, operation_id, &result)?;
+        Ok(result)
+    }
+
+    async fn check_request<P: Serialize + Sync>(
+        &self,
+        daemon_id: &str,
+        method: &str,
+        params: &P,
+        timeout: Duration,
+    ) -> Result<DaemonCheckResult> {
+        let params = serde_json::to_value(params).map_err(|error| {
+            ServiceError::invalid_operation(format!("invalid check request: {error}"))
+        })?;
+        // Bypass workspace mutation recorders and their entry_id-shaped decoder.
+        // The durable check runner owns intent/result persistence and ACKs.
+        let value = self
+            .request_once(daemon_id, method, params, Some(timeout))
+            .await?;
+        serde_json::from_value(value).map_err(|error| {
+            ServiceError::invalid_operation(format!("invalid check owner reply: {error}")).into()
+        })
+    }
+
     pub fn new(registry: Arc<DaemonConnectionRegistry>) -> Self {
         Self {
             registry,
@@ -1647,6 +1731,29 @@ impl DaemonWorkspaceClient {
         .await?;
         Ok(receipt)
     }
+}
+
+fn validate_check_result(
+    daemon_id: &str,
+    operation_id: &str,
+    result: &DaemonCheckResult,
+) -> Result<()> {
+    let matches = match result {
+        DaemonCheckResult::Completed { receipt } => {
+            receipt.operation_id == operation_id
+                && receipt.owner.owner_kind == "daemon"
+                && receipt.owner.machine_id.as_deref() == Some(daemon_id)
+        }
+        DaemonCheckResult::Running { operation_id: id }
+        | DaemonCheckResult::Interrupted { operation_id: id }
+        | DaemonCheckResult::Unknown { operation_id: id } => id == operation_id,
+    };
+    if !matches {
+        return Err(
+            ServiceError::invalid_operation("check owner receipt identity mismatch").into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -48,21 +48,53 @@ pub async fn run_at(path: &Path, spec: &RunSpec) -> Result<RunResult> {
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
         }
         api_types::WorkspaceRunPurpose::CiStep if spec.max_output_bytes == usize::MAX => {
-            let mut command = review::workspace_command(path, &spec.command, &spec.env);
-            command.kill_on_drop(true);
-            if spec.timeout_secs == 0 {
-                command.output().await?
-            } else {
-                // An unbounded capture is still a bounded command when the
-                // caller supplied a deadline. Avoid overflowing limit + 1.
-                command
-                    .env_remove("GIT_DIR")
-                    .env_remove("GIT_WORK_TREE")
-                    .env_remove("GIT_INDEX_FILE");
-                tokio::time::timeout(Duration::from_secs(spec.timeout_secs), command.output())
-                    .await
-                    .map_err(|_| ServiceError::invalid_operation("review command timed out"))??
+            let receipt =
+                crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
+                    operation_id: "legacy-server-ci",
+                    spec: &check_executor::legacy_ci_spec(
+                        &spec.command,
+                        &spec.env,
+                        spec.timeout_secs,
+                        false,
+                    ),
+                    target: check_executor::CheckoutTarget::Workspace(path),
+                    owner: api_types::CheckOwnerIdentity {
+                        owner_kind: "server".into(),
+                        machine_id: None,
+                        runtime_id: "server".into(),
+                    },
+                    input_revisions: None,
+                    environment: &spec.env,
+                    deadline: None,
+                    cancel: &tokio_util::sync::CancellationToken::new(),
+                    permit: &check_executor::CheckPermit::already_admitted(),
+                    cleanup: check_executor::CleanupPlan {
+                        commands: &[],
+                        timeout: check_executor::CLEANUP_TIMEOUT,
+                    },
+                    output_limit: 1024 * 1024,
+                })
+                .await?;
+            if let Some(message) = receipt.infrastructure_message {
+                return Err(std::io::Error::other(message).into());
             }
+            let Some(output) = receipt.commands.into_iter().next() else {
+                return Ok(RunResult {
+                    exit_code: 0,
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    duration_ms: 0,
+                });
+            };
+            if output.outcome == api_types::CheckExecutionOutcome::TimedOut {
+                return Err(ServiceError::invalid_operation("review command timed out").into());
+            }
+            return Ok(RunResult {
+                exit_code: output.exit_code.unwrap_or(-1),
+                stdout_tail: output.stdout_tail,
+                stderr_tail: output.stderr_tail,
+                duration_ms: output.duration_ms,
+            });
         }
         api_types::WorkspaceRunPurpose::CiStep => review::run_workspace_command(
             path,
@@ -171,12 +203,20 @@ pub struct CheckRunOutcome {
 pub struct CheckRun<'a> {
     input: CheckRunInput<'a>,
     outcome: CheckRunOutcome,
+    sequence: check_executor::CheckSequence,
 }
 
 impl<'a> CheckRun<'a> {
     pub fn new(input: CheckRunInput<'a>) -> Self {
         let capacity = input.commands.len();
+        let spec = check_executor::legacy_ci_bundle(
+            input.commands,
+            input.environment,
+            0,
+            input.workspace.owner != super::EffectOwner::Server,
+        );
         Self {
+            sequence: check_executor::CheckSequence::new(spec),
             input,
             outcome: CheckRunOutcome {
                 commands: Vec::with_capacity(capacity),
@@ -185,17 +225,13 @@ impl<'a> CheckRun<'a> {
         }
     }
     pub fn next_command(&self) -> Option<CheckCommand> {
-        if self.outcome.failed_step_index.is_some() {
-            return None;
-        }
-        let index = self.outcome.commands.len();
-        let step = self.input.commands.get(index)?;
+        let (index, step) = self.sequence.next_command()?;
         Some(CheckCommand {
             index,
             started_at: chrono::Utc::now().to_rfc3339(),
             spec: RunSpec {
                 purpose: self.input.purpose,
-                command: step.clone(),
+                command: step.shell_text.clone(),
                 env: self.input.environment.clone(),
                 timeout_secs: self.input.deadline.map_or(0, |deadline| {
                     deadline
@@ -209,30 +245,25 @@ impl<'a> CheckRun<'a> {
     }
     pub fn completed(&mut self, command: CheckCommand, output: RunResult) {
         let finished_at = chrono::Utc::now().to_rfc3339();
-        let env = self.input.environment;
-        let stderr = executors::environment::redact_environment_values(&output.stderr_tail, env);
-        let stdout = executors::environment::redact_environment_values(&output.stdout_tail, env);
-        let output_tail = if stdout.is_empty() {
-            stderr.clone()
-        } else if stderr.is_empty() {
-            stdout.clone()
-        } else {
-            format!("{stdout}\n{stderr}")
-        };
-        let exit_code = if output.exit_code < 0 {
-            1
-        } else {
-            output.exit_code
-        };
-        self.outcome.commands.push(CheckCommandOutcome {
-            index: command.index,
-            command: command.spec.command,
-            exit_code,
-            stderr_tail: tail_bytes(&stderr, 4096),
-            output_tail: tail_bytes(&output_tail, 4096),
-            started_at: command.started_at,
+        let result = check_executor::command_outcome(
+            command.index,
+            command.spec.command,
+            check_executor::LegacyCommandOutput {
+                exit_code: Some(output.exit_code),
+                stdout: &output.stdout_tail,
+                stderr: &output.stderr_tail,
+            },
+            self.input.environment,
+            command.started_at,
             finished_at,
+        );
+        let exit_code = result.exit_code;
+        self.sequence.completed(if exit_code == 0 {
+            api_types::CheckExecutionOutcome::Passed
+        } else {
+            api_types::CheckExecutionOutcome::Failed
         });
+        self.outcome.commands.push(result);
         if exit_code != 0 {
             self.outcome.failed_step_index = Some(command.index);
         }
@@ -266,6 +297,25 @@ pub fn tail_bytes(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod environment_tests {
     use super::*;
+    #[tokio::test]
+    async fn legacy_ci_spawn_failure_keeps_its_git_io_error_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = run_at(
+            &directory.path().join("missing"),
+            &RunSpec {
+                purpose: api_types::WorkspaceRunPurpose::CiStep,
+                command: "true".into(),
+                env: Default::default(),
+                timeout_secs: 0,
+                max_output_bytes: usize::MAX,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result,Err(crate::workspace_backend::WorkspaceBackendError::Other(error)) if matches!(*error,ServiceError::Git(git::GitError::Io(_))))
+        );
+    }
+
     #[tokio::test]
     async fn environment_output_is_bounded_while_draining_both_streams() {
         let dir = tempfile::TempDir::new().unwrap();

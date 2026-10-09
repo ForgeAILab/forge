@@ -8,6 +8,9 @@ name = "forge-ctl"
 path = "src/main.rs"
 
 [dependencies]
+tokio-util = { version = "0.7", features = ["rt"] }
+check-executor = { path = "../check-executor" }
+process-supervisor = { path = "../process-supervisor" }
 api-types = { path = "../api-types" }
 cli-adapters = { path = "../cli-adapters" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

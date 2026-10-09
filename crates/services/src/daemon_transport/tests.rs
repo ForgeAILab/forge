@@ -1272,10 +1272,37 @@ async fn former_revision_three_handshake_requires_daemon_upgrade() {
     };
     assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
     assert!(error.message.contains("upgrade the daemon"));
-    assert!(error.message.contains("revision 4"));
+    assert!(error.message.contains("revision 5"));
     assert!(registry.get("revision-three").unwrap().needs_upgrade());
     assert!(!registry
         .get("revision-three")
         .unwrap()
         .protocol_allows_dispatch());
+}
+
+#[tokio::test]
+async fn revision_four_check_owner_is_refused_before_any_check_rpc() {
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("revision-four".into());
+    let id = connection.id();
+    registry.register("revision-four".into(), connection);
+    assert!(registry.dispatch_incoming_for_connection("revision-four",id,api_types::DaemonFrame::Notification {method:api_types::METHOD_DAEMON_HANDSHAKE.into(),params:json!({"protocol_revision":4,"capabilities":api_types::DAEMON_REQUIRED_CAPABILITIES})}));
+    let api_types::DaemonFrame::Error { error, .. } = outbound.recv().await.unwrap() else {
+        panic!("old daemon accepted")
+    };
+    assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
+    for method in [
+        api_types::METHOD_CHECK_RUN,
+        api_types::METHOD_CHECK_LOOKUP,
+        api_types::METHOD_CHECK_CANCEL,
+    ] {
+        let result: Result<serde_json::Value, _> = registry
+            .send_request("revision-four", method, json!({}), 1)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ServiceError::DaemonUpgradeRequired { .. })
+        ));
+    }
+    assert!(outbound.try_recv().is_err());
 }

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 pub mod integration;
-mod process;
+#[cfg(all(test, unix))]
+mod process_tests;
 mod remote;
 pub use remote::{normalize_remote_url, redact_remote_credentials};
 
@@ -64,7 +65,7 @@ pub async fn command_output(cwd: &Path, args: &[&str]) -> Result<std::process::O
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
-    Ok(process::output(&mut command).await?)
+    Ok(process_supervisor::output(&mut command).await?)
 }
 
 /// Bounded raw output with the same group ownership as mutating Git commands.
@@ -80,7 +81,7 @@ pub async fn command_output_bounded(
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
-    Ok(process::output_bounded(&mut command, Some(limit)).await?)
+    Ok(process_supervisor::output_bounded(&mut command, Some(limit)).await?)
 }
 
 pub async fn is_git_repo(path: &Path) -> bool {
@@ -280,7 +281,7 @@ pub async fn detect_interrupted_merge(worktree_path: &Path) -> Result<bool> {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
-    let result = process::output(&mut command).await?;
+    let result = process_supervisor::output(&mut command).await?;
     Ok(result.status.success())
 }
 
@@ -443,7 +444,7 @@ pub async fn continue_rebase_keeping_conflicts(worktree_path: &Path) -> Result<V
                 .env_remove("GIT_WORK_TREE")
                 .env_remove("GIT_INDEX_FILE")
                 .env("GIT_EDITOR", "true");
-            let output = process::output(&mut command).await?;
+            let output = process_supervisor::output(&mut command).await?;
             let continued = if output.status.success() {
                 Ok(())
             } else {
@@ -599,7 +600,7 @@ pub async fn detect_rebase_in_progress(worktree_path: &Path) -> Result<bool> {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
-    let result = process::output(&mut command).await?;
+    let result = process_supervisor::output(&mut command).await?;
     if result.status.success() {
         let git_path = String::from_utf8_lossy(&result.stdout).trim().to_string();
         let abs = if Path::new(&git_path).is_absolute() {
@@ -619,7 +620,7 @@ pub async fn detect_rebase_in_progress(worktree_path: &Path) -> Result<bool> {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
-    let result = process::output(&mut command).await?;
+    let result = process_supervisor::output(&mut command).await?;
     if result.status.success() {
         let git_path = String::from_utf8_lossy(&result.stdout).trim().to_string();
         let abs = if Path::new(&git_path).is_absolute() {
@@ -668,7 +669,7 @@ pub async fn conflict_paths(worktree_path: &Path) -> Result<Vec<String>> {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE");
-    let output = process::output(&mut command).await?;
+    let output = process_supervisor::output(&mut command).await?;
 
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()

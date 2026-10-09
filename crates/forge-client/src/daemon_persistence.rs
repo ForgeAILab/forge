@@ -44,6 +44,17 @@ pub enum JournalEntry {
     Operation {
         operation: JournalOperation,
     },
+    Check {
+        operation: JournalCheckOperation,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalCheckOperation {
+    pub entry_id: String,
+    pub operation_id: String,
+    pub request: Value,
+    pub receipt: Option<api_types::CheckReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +80,7 @@ impl JournalEntry {
         match self {
             Self::Terminal { report } => &report.terminal_report_id,
             Self::Operation { operation } => &operation.entry_id,
+            Self::Check { operation } => &operation.entry_id,
         }
     }
 
@@ -303,6 +315,42 @@ impl DaemonJournal {
             .map(|_| ())
     }
 
+    pub fn check_operation(&self, operation_id: &str) -> Result<Option<JournalCheckOperation>> {
+        match self.entry(&operation_entry_id(operation_id))? {
+            Some(JournalEntry::Check { operation }) if operation.operation_id == operation_id => {
+                Ok(Some(operation))
+            }
+            None => Ok(None),
+            _ => bail!("{TERMINAL_REPORT_CONFLICT}: check operation identity collision"),
+        }
+    }
+
+    pub fn finish_check(&self, operation: &JournalCheckOperation) -> Result<JournalCheckOperation> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let path = self.path_for_entry(&operation.entry_id)?;
+        self.current_usage()?;
+        let JournalEntry::Check { operation: intent } = read_entry(&path)? else {
+            bail!("check intent missing")
+        };
+        let JournalEntry::Check { operation } = sanitized_entry(&JournalEntry::Check {
+            operation: operation.clone(),
+        }) else {
+            unreachable!()
+        };
+        if intent.operation_id != operation.operation_id
+            || intent.request != operation.request
+            || intent.receipt.is_some()
+        {
+            bail!("{TERMINAL_REPORT_CONFLICT}: check intent mismatch");
+        }
+        let JournalEntry::Check { operation } =
+            self.write_entry(&JournalEntry::Check { operation })?
+        else {
+            unreachable!()
+        };
+        Ok(operation)
+    }
+
     pub fn operation(&self, operation_id: &str) -> Result<Option<JournalOperation>> {
         let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let path = self.path_for_entry(&operation_entry_id(operation_id))?;
@@ -371,6 +419,16 @@ impl DaemonJournal {
         }
         if matches!(&entry, JournalEntry::Operation { operation } if operation.outcome.is_none()) {
             bail!("cannot acknowledge an unfinished operation");
+        }
+        if matches!(&entry, JournalEntry::Check { operation } if operation.receipt.is_none()) {
+            bail!("cannot acknowledge an unfinished check");
+        }
+        // Check idempotency keys survive acknowledgment, just like attempts.
+        if matches!(&entry, JournalEntry::Check { .. }) {
+            return Ok(JournalAckResult {
+                entry_id: params.entry_id.clone(),
+                acknowledged: true,
+            });
         }
         // Attempt receipts survive acknowledgements: a repeated effect key
         // still returns its stored result. Their existing journal count/byte
@@ -730,6 +788,27 @@ pub(crate) fn journal_request(request: &Value) -> Value {
     let env = request_environment(request);
     if let Some(object) = retained.as_object_mut() {
         object.remove("_request_digest");
+        for pointer in ["/spec/commands", "/cleanup_commands"] {
+            if let Some(commands) = request.pointer(pointer).and_then(Value::as_array) {
+                let commands = commands
+                    .iter()
+                    .cloned()
+                    .map(|mut command| {
+                        if let Some(text) = command.get_mut("shell_text") {
+                            redact_text(text, &env);
+                        }
+                        command
+                    })
+                    .collect::<Vec<_>>();
+                if pointer == "/spec/commands" {
+                    if let Some(spec) = object.get_mut("spec").and_then(Value::as_object_mut) {
+                        spec.insert("commands".into(), serde_json::json!(commands));
+                    }
+                } else {
+                    object.insert("cleanup_commands".into(), serde_json::json!(commands));
+                }
+            }
+        }
         if let Some(command) = object.get_mut("command") {
             redact_text(command, &env);
         }
@@ -884,12 +963,58 @@ fn sanitized_entry(entry: &JournalEntry) -> JournalEntry {
             }
         }
     }
+    if let JournalEntry::Check { operation } = &mut retained {
+        let env = request_environment(&operation.request);
+        operation.request = journal_request(&operation.request);
+        if let Some(receipt) = operation.receipt.as_mut() {
+            for command in receipt
+                .commands
+                .iter_mut()
+                .chain(receipt.cleanup.commands.iter_mut())
+            {
+                command.command =
+                    executors::environment::redact_environment_values(&command.command, &env);
+                for (text, truncated) in [
+                    (&mut command.stdout_tail, &mut command.stdout_truncated),
+                    (&mut command.stderr_tail, &mut command.stderr_truncated),
+                ] {
+                    *text = executors::environment::redact_environment_values(text, &env);
+                    let mut start = text.len().saturating_sub(check_executor::OUTPUT_TAIL_BYTES);
+                    while !text.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    if start > 0 {
+                        *text = text[start..].to_owned();
+                        *truncated = true;
+                    }
+                }
+            }
+            for message in [
+                &mut receipt.infrastructure_message,
+                &mut receipt.cleanup.message,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *message = executors::environment::redact_environment_values(message, &env);
+            }
+        }
+    }
     retained
 }
 
 // Admission reserves room for a run's completion without logs. Other writes
 // cannot consume it while the command runs, including workspace-registry writes.
 fn run_result_reservation(entry: &JournalEntry) -> Result<u64> {
+    if let JournalEntry::Check { operation } = entry {
+        // 64 command receipts + 32 cleanup receipts, 4096-byte tails per
+        // stream, worst-case JSON escaping and the 128 KiB request manifest.
+        return Ok(if operation.receipt.is_none() {
+            8 * 1024 * 1024
+        } else {
+            0
+        });
+    }
     let JournalEntry::Operation { operation } = entry else {
         return Ok(0);
     };

@@ -1,6 +1,7 @@
 //! Passive mechanical-check identity. No process or persistence is dispatched here.
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use ts_rs::TS;
 
 pub const CHECK_SPEC_REVISION: u32 = 2;
 pub const CHECK_DIGEST_SCHEMA: &str = "forge.check-execution/2";
@@ -55,7 +56,7 @@ impl CheckPurpose {
 /// shares the run. A bundle that acts on a worktree carries that worktree's
 /// durable identity, so a second worktree at the same commit is still prepared.
 /// A script with no worktree at all is still owed to its own Task.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckScope {
     Commit,
@@ -69,7 +70,7 @@ pub enum CheckScope {
         task_id: String,
     },
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckWorkingDirectory {
     TaskRoot,
@@ -77,19 +78,19 @@ pub enum CheckWorkingDirectory {
     RepositoryOrProbeScratch,
     SuppliedDirectory,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckFailurePolicy {
     StopBundle,
     Continue,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckCacheability {
     Uncacheable,
     DeclaredControlledInputs,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct CheckCommandSpec {
     pub id: String,
     pub shell_text: String,
@@ -103,7 +104,7 @@ pub struct CheckCommandSpec {
     pub cacheability: CheckCacheability,
     pub requirement_ids: BTreeSet<String>,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct CheckSpec {
     pub schema_revision: u32,
     pub scope: CheckScope,
@@ -179,7 +180,7 @@ pub enum CheckEnvironmentValue {
     Removed,
     Volatile,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckEnvironmentIdentity {
     Attested {

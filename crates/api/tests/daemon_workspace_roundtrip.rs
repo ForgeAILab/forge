@@ -3893,3 +3893,112 @@ async fn integration_attempt_lost_reply_across_real_reconnect_settles_once() {
     .unwrap();
     assert_eq!(count, 1);
 }
+
+#[tokio::test]
+async fn check_spec_real_roundtrip_reconnect_and_duplicate_return_owner_receipt() {
+    let mut fixture = Fixture::new("check-owner-roundtrip").await;
+    let client = services::daemon_transport::workspace_client::DaemonWorkspaceClient::new(
+        fixture.harness.state.daemon_connections.clone(),
+    );
+    let daemon_id = fixture.daemon_id.clone();
+    let placement = &fixture.resolved.placement;
+    let operation_id = db::new_uuid_v4();
+    let params = DaemonCheckRunParams {
+        operation_id: operation_id.clone(),
+        target: DaemonCheckTarget::Workspace {
+            workspace: WorkspaceHandleReference {
+                daemon_id: daemon_id.clone(),
+                runtime_id: placement.runtime_id.clone().unwrap(),
+                placement_id: placement.id.clone(),
+                workspace_handle: placement.workspace_handle.clone().unwrap(),
+                generation: placement.generation as u64,
+            },
+        },
+        purpose: WorkspaceRunPurpose::CiStep,
+        spec: CheckSpec {
+            schema_revision: CHECK_SPEC_REVISION,
+            scope: CheckScope::Commit,
+            commands: vec![CheckCommandSpec {
+                id: "ci:0".into(),
+                shell_text: "printf run >> check-runs; sleep 3; printf owner-result".into(),
+                shell: "bash -lc".into(),
+                working_directory: CheckWorkingDirectory::TaskRoot,
+                environment_keys: Default::default(),
+                timeout_seconds: Some(5),
+                failure_policy: CheckFailurePolicy::StopBundle,
+                cacheability: CheckCacheability::Uncacheable,
+                requirement_ids: Default::default(),
+            }],
+            declares_cleanup: false,
+            configured_commands: 1,
+            blank_commands: vec![],
+            execution_policy: "legacy-daemon/1".into(),
+        },
+        env: vec![],
+        cleanup_commands: vec![],
+        cleanup_timeout_ms: 1000,
+        deadline: (chrono::Utc::now() + chrono::Duration::seconds(15)).to_rfc3339(),
+    };
+    let effect = client.run_check(&daemon_id, params.clone());
+    let disconnect = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    client
+                        .lookup_check(&daemon_id, &operation_id)
+                        .await
+                        .unwrap(),
+                    DaemonCheckResult::Running { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // A duplicate on the actual command stream starts nothing.
+        assert!(matches!(
+            client.run_check(&daemon_id, params.clone()).await.unwrap(),
+            DaemonCheckResult::Running { .. }
+        ));
+        fixture.link.take();
+        common::fake_daemon::wait_until_disconnected(&fixture.harness.state, &daemon_id).await;
+    };
+    let (lost, ()) = tokio::join!(effect, disconnect);
+    assert!(lost.is_err());
+    fixture.reconnect().await;
+    let receipt = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client
+                .lookup_check(&daemon_id, &operation_id)
+                .await
+                .unwrap()
+            {
+                DaemonCheckResult::Completed { receipt } => break receipt,
+                DaemonCheckResult::Running { .. } => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                result => panic!("unexpected lookup {result:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(
+        receipt.execution_inputs,
+        CheckEnvironmentIdentity::NotAttested
+    );
+    assert_eq!(receipt.commands[0].stdout_tail, "owner-result");
+    assert_eq!(
+        client.run_check(&daemon_id, params).await.unwrap(),
+        DaemonCheckResult::Completed { receipt }
+    );
+    let runs = fixture
+        .resolved
+        .run("cat check-runs", &BTreeMap::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(runs.stdout, "run");
+}

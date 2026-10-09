@@ -18,7 +18,7 @@ frontend:
 
 # Regenerate the web client's TypeScript bindings from api-types
 types:
-	FORGE_SKIP_WEB_BUILD=1 cargo test -p api-types --lib export_bindings
+	FORGE_SKIP_WEB_BUILD=1 cargo test -p api-types --lib export_typescript -- --ignored
 
 # Run all Rust tests
 test:

@@ -11,6 +11,7 @@ path = "src/lib.rs"
 test-support = ["cli-adapters/test-support"]
 
 [dependencies]
+check-executor = { path = "../check-executor" }
 operation-registry = { path = "../operation-registry" }
 api-types = { path = "../api-types" }
 cli-adapters = { path = "../cli-adapters" }

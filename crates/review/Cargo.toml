@@ -8,6 +8,8 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+tokio-util = { version = "0.7", features = ["rt"] }
+check-executor = { path = "../check-executor" }
 async-trait = "0.1"
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

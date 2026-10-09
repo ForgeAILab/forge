@@ -691,7 +691,14 @@ impl ReviewRunner {
                 reason,
             })?;
 
-        for (index, step) in ci_steps.iter().enumerate() {
+        let mut checks = check_executor::CheckSequence::new(check_executor::legacy_ci_bundle(
+            ci_steps,
+            &environment.env,
+            0,
+            false,
+        ));
+        while let Some((index, command)) = checks.next_command() {
+            let step = &command.shell_text;
             let started_at = now_rfc3339();
             let output = workspace.run(step, &environment.env, None).await?;
             let finished_at = now_rfc3339();
@@ -728,6 +735,11 @@ impl ReviewRunner {
                 .await?;
 
             step_results.push(result.clone());
+            checks.completed(if exit_code == 0 {
+                api_types::CheckExecutionOutcome::Passed
+            } else {
+                api_types::CheckExecutionOutcome::Failed
+            });
             if exit_code != 0 {
                 let failing_steps = vec![result];
                 return Ok((

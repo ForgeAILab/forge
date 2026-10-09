@@ -48,11 +48,11 @@ pub const PURPOSE_DENIED: &str = "purpose_denied";
 pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
-/// Revision 4 carries explicit integration authority and attempt identities.
-pub const DAEMON_PROTOCOL_REVISION: u32 = 4;
-/// Every command RPC requires revision 4.
-pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 4;
-pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 4 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
+/// Revision 5 adds fence-free, retained owner check operations.
+pub const DAEMON_PROTOCOL_REVISION: u32 = 5;
+/// Every command RPC requires revision 5.
+pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 5;
+pub const DAEMON_UPGRADE_REQUIRED_MESSAGE: &str = "upgrade the daemon to protocol revision 5 or newer by installing forge-ctl from the server's release, then restart it with the same --workspace-root; upgrade the server first, then every daemon";
 pub const DAEMON_CAPABILITY_USAGE_REPORTS: &str = "execution.terminal.usage_reports";
 pub const DAEMON_CAPABILITY_JOURNAL_ACK: &str = "journal.ack";
 pub const DAEMON_CAPABILITY_PLAN_TRANSPORT: &str = "execution.plan_transport";
@@ -1157,7 +1157,7 @@ mod tests {
             super::DAEMON_PROTOCOL_REVISION,
             &old
         ));
-        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 4);
+        assert_eq!(super::DAEMON_PROTOCOL_REVISION, 5);
         let probe: super::MachineProbeParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_location_id":null,"commands":[{"name":"cargo","command":"cargo --version","timeout_seconds":10}],"env":{}})).unwrap();
         assert_eq!(probe.commands[0].name, "cargo");
         let provision: super::RepoLocationProvisionParams = serde_json::from_value(serde_json::json!({"daemon_id":"d","runtime_id":"r","repo_id":"repo","remote_url":"file:///repository","default_branch":"main","timeout_seconds":1800})).unwrap();
@@ -1425,8 +1425,8 @@ mod tests {
             DAEMON_PROTOCOL_REVISION,
             &revision_2_capabilities
         ));
-        assert_eq!(DAEMON_PROTOCOL_REVISION, 4);
-        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 4);
+        assert_eq!(DAEMON_PROTOCOL_REVISION, 5);
+        assert_eq!(DAEMON_MIN_PROTOCOL_REVISION, 5);
     }
 
     #[test]
@@ -1778,4 +1778,60 @@ mod tests {
             }));
         }
     }
+}
+
+pub const METHOD_CHECK_RUN: &str = "check.run";
+pub const METHOD_CHECK_LOOKUP: &str = "check.lookup";
+pub const METHOD_CHECK_CANCEL: &str = "check.cancel";
+
+/// Paths are resolved by the physical owner from existing handles/locations.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonCheckTarget {
+    Workspace {
+        workspace: WorkspaceHandleReference,
+    },
+    ExactCommit {
+        daemon_id: String,
+        runtime_id: String,
+        repo_location_id: String,
+        commit_sha: String,
+    },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonCheckRunParams {
+    pub operation_id: String,
+    pub target: DaemonCheckTarget,
+    pub purpose: WorkspaceRunPurpose,
+    pub spec: crate::CheckSpec,
+    pub env: Vec<(String, String)>,
+    /// Owner cleanup policy, bound by spec.execution_policy, with its own limit.
+    pub cleanup_commands: Vec<crate::CheckCommandSpec>,
+    pub cleanup_timeout_ms: u64,
+    /// Absolute UTC wall deadline; retries cannot extend it.
+    pub deadline: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonCheckOperationParams {
+    pub daemon_id: String,
+    pub operation_id: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonCheckResult {
+    Running {
+        operation_id: String,
+    },
+    Completed {
+        receipt: Box<crate::CheckReceipt>,
+    },
+    /// No terminal receipt after an owner restart/handler interruption.
+    Interrupted {
+        operation_id: String,
+    },
+    Unknown {
+        operation_id: String,
+    },
 }

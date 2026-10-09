@@ -2105,16 +2105,16 @@ The daemon terminal contract transports the complete per-candidate usage
 vector and stable report IDs. A daemon retains its terminal notification until
 the server acknowledges the composite terminal/accounting transaction; a
 duplicate report is an idempotent no-op and a conflicting report is a
-conflict. The minimum command protocol revision is 4. A revision-3 daemon
+conflict. The minimum command protocol revision is 5. A revision-4 or older daemon
 receives `daemon_upgrade_required` with an instruction to install `forge-ctl`
-from the server's release (protocol revision 4 or newer). Every command RPC is
+from the server's release (protocol revision 5 or newer). Every command RPC is
 refused, including execution, repository verification, `fs.list`, `fs.branches`,
 workspace operations, and PTY terminals. REST maps the upgrade refusal to HTTP
 `409 daemon_upgrade_required` with `needs_human: true`; placement rejection
 includes that filter code in `rejected_candidates`. An upgrade-only dispatch
 refusal records an actionable blocker and creates no Execution; reservation
 returns the typed error without modifying the Task. The heartbeat sweep clears
-upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 4.
+upgrade blockers and wakes dispatch once a refused daemon reconnects at revision 5.
 Repository locations retain the upgrade reason in `last_error` after a verification
 attempt, without changing their verification status; pinned Agents expose
 `effective_status: "daemon_upgrade_required"`. Operator `daemon_issues[].issue`
@@ -4329,7 +4329,7 @@ blocked solely by the upgrade (ignoring facts absent from its revision-3
 handshake), with no candidate blocked solely by capacity or transient conditions.
 The dispatch-failure annotation and Task metadata record the refused daemon IDs.
 The heartbeat sweep clears upgrade refusals and wakes dispatch once a refused
-daemon reconnects at revision 4, even when a blocking annotation was preserved.
+daemon reconnects at revision 5, even when a blocking annotation was preserved.
 Dispatch failures preserve `manual_stop`, `workspace_error`, `agent_timeout`,
 `recovery_required`, `workspace_reset_required`, `max_turns_exceeded`,
 `before_work_hook_failed`, and `before_work_hook_timeout` annotations.
@@ -4420,7 +4420,7 @@ Publication failures persist exponential backoff and a visible wait annotation;
 unreachable owners use the durable `runtime_offline` owner wait. Plan operations
 wait behind running owner checks, and discard of missing/cleaned state succeeds.
 
-Plan-writing roles require `execution.plan_transport`; a revision-4 owner that
+Plan-writing roles require `execution.plan_transport`; a revision-5 owner that
 omits it is refused at placement with `capability_missing`, before an Execution
 exists. Dispatcher refusals name the machine and missing capability, remain
 quiescent until eligibility changes, and clear automatically when a machine
@@ -4431,16 +4431,16 @@ Server-owned and verified shared-mount plan files retain their layout and
 
 ### Workspace daemon protocol
 
-Protocol revision 4 negotiates `workspace.v1` and is required for every command
+Protocol revision 5 negotiates `workspace.v1` and is required for every command
 RPC, including execution, verification, filesystem browsing, and PTY terminals.
-Revision-1 and revision-2 daemons remain visible with `daemon_upgrade_required`. Upgrade-only
+Revision-4 and older daemons remain visible with `daemon_upgrade_required`. Upgrade-only
 Task admission refusals (as defined above) create no Execution and resume dispatch
 automatically after the daemon upgrade. Existing placements disconnect
 and wait at most `max_disconnect` (default 24 hours). The handshake includes per-executor adapter facts
 (`structured_events`, `usage`, `resume`, `cancel_ack`, `terminal_observed`) and
 the daemon's effective `workspace.run` policy; absent facts are unsupported.
 
-Revision 4 mutation and reconciliation requests carry a required tagged
+Revision 5 mutation and reconciliation requests carry a required tagged
 `integration` binding. Queue attempts carry the owner fence, attempt/effect key
 and frozen placement/HEAD/target witness; existing Task-step merge/rebase uses
 its current step binding. The owner returns typed `integration_owner_refused`
@@ -4465,7 +4465,7 @@ duplicate keys replay without Git. Old protocol revisions are rejected with
 | `workspace.cleanup` | Remove the workspace and acknowledge cleanup |
 
 `machine_probe.v1` and `repo_provision.v1` are independent optional handshake
-capabilities; protocol revision is 4. Upgrade the server before enabling
+capabilities; protocol revision is 5. Upgrade the server before enabling
 these new purposes on daemons: older servers reject their handshake enum values.
 Daemons missing the capabilities stay connected
 and unverified and existing locations use launch preflight. Their run-policy
@@ -5468,3 +5468,26 @@ values. Execution failure retries survive status
 changes until an explicit budget reset. Other kinds retain their natural
 contract/completion/interruption/exhaustion windows; reset additionally restores
 all persisted kinds. There is no lifetime execution maximum.
+
+
+#### Owner check protocol (revision 5)
+
+The daemon command stream adds `check.run` / `check.lookup` / `check.cancel`.
+Run carries a stable `operation_id` (no integration fence), a `spec`, `purpose`,
+transient `env` pairs, `cleanup_commands`, positive `cleanup_timeout_ms` (maximum
+30,000), an absolute RFC3339 `deadline`, and a target tagged `workspace` (existing
+workspace handle reference) or `exact_commit` (daemon/runtime/repository-location
+IDs and a full commit object ID). Run requests are limited to 128 KiB, 64 commands
+and 32 cleanup commands. Lookup/cancel take `{daemon_id, operation_id}`.
+
+Replies are tagged `running`, `completed` (typed `CheckReceipt`), `interrupted`,
+or `unknown`. A duplicate key returns the same retained receipt or `running`,
+never another process; conflicting requests are refused. An unfinished retained
+intent after owner restart is `interrupted` and cannot be rerun under that key.
+Cancellation waits for tree termination and separately bounded declared cleanup.
+Receipts include redacted bounded tails/truncation, exit/timing/termination and
+cleanup evidence, owner/input identity and checkout witnesses. Today's daemon
+returns `not_attested` input identity. A transport timeout is uncertainty, not
+proof of process termination. The server runner owns persistence/certification
+and receipt acknowledgment. Revision-4 and older daemons require upgrade; the
+server's minimum/reported protocol revision is 5.

@@ -689,6 +689,23 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     CreateCostEstimationRunRequest::export().expect("export CreateCostEstimationRunRequest");
     CostEstimationRunStatus::export().expect("export CostEstimationRunStatus");
     CostEstimationRun::export().expect("export CostEstimationRun");
+    CheckScope::export().expect("export CheckScope");
+    CheckWorkingDirectory::export().expect("export CheckWorkingDirectory");
+    CheckFailurePolicy::export().expect("export CheckFailurePolicy");
+    CheckCacheability::export().expect("export CheckCacheability");
+    CheckCommandSpec::export().expect("export CheckCommandSpec");
+    CheckSpec::export().expect("export CheckSpec");
+    CheckEnvironmentIdentity::export().expect("export CheckEnvironmentIdentity");
+    CheckOwnerIdentity::export().expect("export CheckOwnerIdentity");
+    CheckExecutionOutcome::export().expect("export CheckExecutionOutcome");
+    CheckCleanupOutcome::export().expect("export CheckCleanupOutcome");
+    CheckCommandReceipt::export().expect("export CheckCommandReceipt");
+    CheckCleanupReceipt::export().expect("export CheckCleanupReceipt");
+    CheckReceipt::export().expect("export CheckReceipt");
+    DaemonCheckTarget::export().expect("export DaemonCheckTarget");
+    DaemonCheckRunParams::export().expect("export DaemonCheckRunParams");
+    DaemonCheckOperationParams::export().expect("export DaemonCheckOperationParams");
+    DaemonCheckResult::export().expect("export DaemonCheckResult");
 }
 
 pub mod execution_outbox;
@@ -698,3 +715,6 @@ pub use project_escalations::*;
 
 pub mod check_spec;
 pub use check_spec::*;
+
+pub mod check_receipt;
+pub use check_receipt::*;

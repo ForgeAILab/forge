@@ -12,6 +12,8 @@ members = [
     "crates/cli-adapters",
     "crates/workspace",
     "crates/git",
+    "crates/process-supervisor",
+    "crates/check-executor",
     "crates/review",
     "crates/events",
     "crates/mcp-server",
