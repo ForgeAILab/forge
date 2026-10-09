@@ -831,7 +831,7 @@ impl legacy_proposals::LegacyProposalContext<&'static str> for RecordingContext 
 }
 
 #[tokio::test]
-async fn project_and_pending_contracts_close_fields_and_preserve_exact_inputs() {
+async fn project_contracts_close_fields_and_pending_payloads_stay_open() {
     let inputs: Value = serde_json::from_str(include_str!("../tests/project_inputs.json")).unwrap();
     let catalog = proposal_catalog();
     let context = RecordingContext(std::sync::Mutex::new(Vec::new()));
@@ -855,11 +855,21 @@ async fn project_and_pending_contracts_close_fields_and_preserve_exact_inputs() 
         );
         let mut unknown = input.clone();
         unknown["unexpected"] = json!(true);
-        let error = spec.normalize_arguments(&unknown).unwrap_err();
-        assert!(
-            error.contains("unexpected") && error.contains(id),
-            "{error}"
-        );
+        if legacy_proposals::IDS.contains(id) {
+            // A pending proposal's payload was always an open object that
+            // is stored as sent; undeclared fields are kept, not refused.
+            assert_eq!(
+                spec.normalize_arguments(&unknown).unwrap(),
+                unknown,
+                "{id} keeps undeclared pending fields"
+            );
+        } else {
+            let error = spec.normalize_arguments(&unknown).unwrap_err();
+            assert!(
+                error.contains("unexpected") && error.contains(id),
+                "{error}"
+            );
+        }
         // Historical preparations skip the new field contract, just as the
         // old hand handlers ignored fields they did not consume.
         assert!(
@@ -873,7 +883,7 @@ async fn project_and_pending_contracts_close_fields_and_preserve_exact_inputs() 
 }
 
 #[test]
-fn project_variants_refuse_fields_from_other_actions_and_enforce_limits() {
+fn project_variants_refuse_unadvertised_fields_and_enforce_limits() {
     let inputs: Value = serde_json::from_str(include_str!("../tests/project_inputs.json")).unwrap();
     let doc = project_proposals::CATALOG
         .lookup("project.document")
@@ -886,20 +896,48 @@ fn project_variants_refuse_fields_from_other_actions_and_enforce_limits() {
         .contains("revision_id"));
     let approval = json!({"action":"approve","document_id":"d","revision_id":"r","content_digest":"c","render_digest":"r","expected_document_version":1});
     doc.validate_arguments(&approval).unwrap();
-    for field in ["content", "kind", "title", "base_revision_id"] {
+    for field in ["content", "base_revision_id"] {
         let mut wrong = approval.clone();
         wrong[field] = json!("draft-only");
         assert!(doc.validate_arguments(&wrong).is_err(), "{field}");
     }
+    // `approve` was advertised with `kind`, `title` and `envelope_digest`
+    // before the registry move; a caller that still sends them is accepted.
+    let mut advertised = approval.clone();
+    advertised["kind"] = json!("design");
+    advertised["title"] = json!("Design");
+    advertised["envelope_digest"] = Value::Null;
+    assert_eq!(doc.normalize_arguments(&advertised).unwrap(), advertised);
     let milestone = project_proposals::CATALOG
         .lookup("project.milestone")
         .unwrap();
     let primary =
         json!({"action":"set_primary","expected_milestone_version":1,"primary_milestone_id":null});
     milestone.validate_arguments(&primary).unwrap();
+    // The milestone fields were advertised for every action before the
+    // registry move, so they stay accepted across actions. Fields that were
+    // never advertised for the operation are still refused.
+    let mut advertised = primary.clone();
+    advertised["content"] = json!({"name":"N","outcome":"O"});
+    advertised["milestone_id"] = Value::Null;
+    advertised["display_label"] = json!("Primary");
+    assert_eq!(
+        milestone.normalize_arguments(&advertised).unwrap(),
+        advertised
+    );
+    let mut define = inputs["project.milestone"].clone();
+    define["milestone_id"] = Value::Null;
+    define["primary_milestone_id"] = Value::Null;
+    milestone.validate_arguments(&define).unwrap();
     let mut wrong = primary;
-    wrong["content"] = json!({"name":"N","outcome":"O"});
+    wrong["base_revision_id"] = json!("revise-only");
     assert!(milestone.validate_arguments(&wrong).is_err());
+    let validation = project_proposals::CATALOG
+        .lookup("project.validation")
+        .unwrap();
+    let mut governed = inputs["project.validation"].clone();
+    governed["governing_revision_ids"] = json!(["charter-revision"]);
+    assert_eq!(validation.normalize_arguments(&governed).unwrap(), governed);
     let ci = project_proposals::CATALOG
         .lookup("project.review_config")
         .unwrap();

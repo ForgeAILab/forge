@@ -714,7 +714,7 @@ pub(crate) fn filter_candidate(
         && !needs_upgrade
         && (candidate
             .negotiated_revision
-            .is_none_or(|revision| revision < 3)
+            .is_none_or(|revision| revision < api_types::DAEMON_MIN_PROTOCOL_REVISION)
             || !candidate.workspace_v1)
     {
         filters.insert(WorkspaceProtocolMissing);
@@ -2337,10 +2337,9 @@ mod tests {
     }
 
     #[test]
-    fn revision_three_non_plan_roles_do_not_require_plan_transport() {
+    fn non_plan_roles_do_not_require_plan_transport() {
         for role in ["reviewer", "auditor", "interactive"] {
             let mut context = context();
-            context.candidates[0].negotiated_revision = Some(3);
             context.candidates[0].plan_transport = false;
             context.worktree_agents.push(context.claiming_agent.clone());
             context.claiming_agent.role = role.into();

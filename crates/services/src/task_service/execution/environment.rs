@@ -598,7 +598,7 @@ mod tests {
         // facts a real admitted daemon supplies; no readiness row is fabricated.
         registry.dispatch_incoming_for_connection(&daemon_id,connection_id,api_types::DaemonFrame::Notification {
             method:api_types::METHOD_DAEMON_HANDSHAKE.into(),
-            params:json!({"protocol_revision":3,"capabilities":["workspace.v1",api_types::DAEMON_CAPABILITY_JOURNAL_ACK,api_types::DAEMON_CAPABILITY_USAGE_REPORTS,api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT],"executor_capabilities":{"shell":{"structured_events":true,"usage":true,"resume":true,"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["environment_setup","ci_step"]}})});
+            params:json!({"protocol_revision":api_types::DAEMON_PROTOCOL_REVISION,"capabilities":["workspace.v1",api_types::DAEMON_CAPABILITY_JOURNAL_ACK,api_types::DAEMON_CAPABILITY_USAGE_REPORTS,api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT],"executor_capabilities":{"shell":{"structured_events":true,"usage":true,"resume":true,"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["environment_setup","ci_step"]}})});
         sqlx::query("UPDATE daemon SET detected_clis_json=? WHERE id=?")
             .bind(r#"[{"kind":"shell","availability":"authenticated"}]"#)
             .bind(&daemon_id)
@@ -862,7 +862,7 @@ mod tests {
             .clone();
         let daemon_id = daemon_workspace.placement.daemon_id.as_deref().unwrap();
         let connection = registry.get(daemon_id).unwrap();
-        registry.dispatch_incoming_for_connection(daemon_id, connection.id(), api_types::DaemonFrame::Notification { method:api_types::METHOD_DAEMON_HANDSHAKE.into(), params:json!({"protocol_revision":3,"capabilities":["workspace.v1",api_types::DAEMON_CAPABILITY_JOURNAL_ACK,api_types::DAEMON_CAPABILITY_USAGE_REPORTS,api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT],"executor_capabilities":{"shell":{"structured_events":true,"usage":true,"resume":true,"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["environment_setup","ci_step"]}}) });
+        registry.dispatch_incoming_for_connection(daemon_id, connection.id(), api_types::DaemonFrame::Notification { method:api_types::METHOD_DAEMON_HANDSHAKE.into(), params:json!({"protocol_revision":api_types::DAEMON_PROTOCOL_REVISION,"capabilities":["workspace.v1",api_types::DAEMON_CAPABILITY_JOURNAL_ACK,api_types::DAEMON_CAPABILITY_USAGE_REPORTS,api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT],"executor_capabilities":{"shell":{"structured_events":true,"usage":true,"resume":true,"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["environment_setup","ci_step"]}}) });
         sqlx::query("UPDATE daemon SET detected_clis_json = ? WHERE id = ?")
             .bind(r#"[{"kind":"shell","availability":"authenticated"}]"#)
             .bind(daemon_id)

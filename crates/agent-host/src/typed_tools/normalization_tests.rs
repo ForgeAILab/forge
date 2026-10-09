@@ -156,8 +156,13 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     // operations (-1,007) outweigh the pending legacy proposals' contract
     // lines and flat aliases (+995). Hand Task operations keep their payload
     // fields declared; that duplication is theirs to remove.
-    ("project", 24_092),
-    ("project_verify_solo", 25_341),
+    // Plus 160 each: the contract lines name the fields that were advertised
+    // before the registry move and are accepted again (Document approve
+    // `envelope_digest`, `kind`, `title`: 33; milestone cross-action
+    // `milestone_id`, `display_label`, `primary_milestone_id`, `content`:
+    // 102; validation `governing_revision_ids`: 25).
+    ("project", 24_252),
+    ("project_verify_solo", 25_501),
     // Setup gains 194 bytes: the required truthful PENDING message contract
     // and its body/content aliases add 200; the amendment wording adds 2; the new
     // current-state line saves 8. The unchanged hand Charter dominates

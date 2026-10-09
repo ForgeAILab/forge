@@ -4805,7 +4805,7 @@ mod tests {
         assert_eq!(
             approval["required"],
             // `kind` and `title` were required here and never read by the
-            // approval handler; the variant now lists only what it consumes.
+            // approval handler; they stay accepted but are no longer required.
             json!([
                 "action",
                 "content_digest",
@@ -4827,9 +4827,10 @@ mod tests {
             );
         }
         // The approval handler never read `envelope_digest`, `kind` or
-        // `title`; the closed variant refuses them with the contract line.
+        // `title`, but they were advertised for it: the closed variant
+        // still accepts them.
         for unread in ["envelope_digest", "kind", "title"] {
-            assert!(approval["properties"].get(unread).is_none(), "{unread}");
+            assert!(approval["properties"].get(unread).is_some(), "{unread}");
         }
         assert!(
             approval["required"]

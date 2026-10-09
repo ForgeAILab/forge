@@ -64,6 +64,15 @@ pub enum Document {
     },
     Approve {
         document_id: String,
+        // Advertised before the registry move and never read: still accepted.
+        #[serde(default)]
+        #[schemars(with = "DocumentKind")]
+        kind: Option<Value>,
+        #[serde(default)]
+        #[schemars(with = "String")]
+        title: Option<Value>,
+        #[schemars(with = "Option<String>")]
+        envelope_digest: Option<Value>,
         revision_id: String,
         content_digest: String,
         render_digest: String,
@@ -115,6 +124,11 @@ pub enum DefinitionLifecycle {
 pub enum Milestone {
     Define {
         content: MilestoneContent,
+        // Advertised for every action before the registry move: still accepted.
+        #[schemars(with = "Option<String>")]
+        milestone_id: Option<Value>,
+        #[schemars(with = "Option<String>")]
+        primary_milestone_id: Option<Value>,
         #[schemars(with = "Option<String>")]
         display_label: Option<Value>,
         lifecycle: Option<DefinitionLifecycle>,
@@ -126,6 +140,9 @@ pub enum Milestone {
     Revise {
         milestone_id: String,
         content: MilestoneContent,
+        // Advertised for every action before the registry move: still accepted.
+        #[schemars(with = "Option<String>")]
+        primary_milestone_id: Option<Value>,
         #[schemars(with = "Option<String>")]
         display_label: Option<Value>,
         lifecycle: Option<DefinitionLifecycle>,
@@ -138,6 +155,14 @@ pub enum Milestone {
     SetPrimary {
         #[schemars(with = "Option<String>")]
         primary_milestone_id: Option<Value>,
+        // Advertised for every action before the registry move: still accepted.
+        #[schemars(with = "Option<String>")]
+        milestone_id: Option<Value>,
+        #[schemars(with = "Option<String>")]
+        display_label: Option<Value>,
+        #[serde(default)]
+        #[schemars(with = "MilestoneContent")]
+        content: Option<Value>,
         #[schemars(range(min = 1))]
         expected_milestone_version: i64,
     },
@@ -176,6 +201,8 @@ pub struct Validation {
     pub observed_task_id: Option<Value>,
     #[schemars(with = "Option<String>")]
     pub evidence_asset_id: Option<Value>,
+    /// Advertised before the registry move and never read: still accepted.
+    pub governing_revision_ids: Option<Vec<String>>,
 }
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
