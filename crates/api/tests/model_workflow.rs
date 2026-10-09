@@ -2125,15 +2125,18 @@ async fn a_run_that_fails_after_a_project_pause_is_retried() {
     run_cases(cases).await;
 }
 
-/// OPEN, UNTRIAGED: found by a random run once the generator stopped stepping
-/// around failures after a Project pause (`FORGE_MODEL_SEED=45233331
-/// FORGE_MODEL_LONG=1`); minimized below. The coder Agent is paused, the
-/// running Task is held, the server crashes before the hold's steps run, and
-/// the Task is released. Once the Agent resumes the Task stays in
-/// `in_progress` with a `clear` condition and no run; `retry` is offered.
-/// The same crash under a paused Agent without the hold recovers.
+/// Found by a random run of this model (`FORGE_MODEL_SEED=45233331
+/// FORGE_MODEL_LONG=1`) and fixed with it; minimized below. The coder Agent
+/// is paused, the running Task is held and then released. The hold stopped
+/// the run with a `manual` resume policy, and a release taken while no Agent
+/// could run the Task (`release_to_dispatch_queue`,
+/// `services/src/task_service/actions.rs`) cleared the hold but left that
+/// policy, so the dispatcher's stopped-run park
+/// (`task_dispatcher/snapshot.rs`, `stopped_execution`) kept the Task in
+/// `in_progress` with a `clear` condition and no run once the Agent resumed.
+/// The release is the owner's decision on that run: it now marks it
+/// resumable and the Task runs again when its Agent can take it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open stall: hold, crash and release under a paused Agent leave the Task idle once the Agent resumes"]
 async fn a_task_released_after_a_crash_under_a_paused_agent_runs_again() {
     use Action::{Create, PauseAgent, Take};
     run_cases(vec![(

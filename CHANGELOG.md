@@ -1737,6 +1737,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A Task released while its Agent is paused runs again when the Agent
+  resumes.** Holding a running Task stops its run. Releasing the hold while
+  the Agent (or the Project) was paused cleared the hold but left the stopped
+  run waiting for a decision, so once the Agent resumed the Task stayed in
+  `in_progress` with a clear condition, no run and no park. The release now
+  counts as that decision and the Task is dispatched as soon as its Agent can
+  take it. Found by the model-based workflow test.
+
 - **A cancelled dependency no longer discards what its dependant was waiting
   on.** The `dependency_cancelled` blocker used to overwrite a hold, and to
   be skipped when the dependant was already parked for another reason: a

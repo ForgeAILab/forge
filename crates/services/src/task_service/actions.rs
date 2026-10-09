@@ -754,6 +754,46 @@ impl TaskService {
         reason: Option<&str>,
     ) -> Result<Task> {
         let task = &snapshot.task;
+        // The release is the owner's decision on the run the hold stopped:
+        // it may run again as soon as an Agent can take it. Left `Manual`,
+        // the stopped run kept the dispatcher away from a Task that showed
+        // no hold, no park and no run. The hold still parks the Task if the
+        // release below loses its version race.
+        for execution in snapshot.executions.iter().filter(|execution| {
+            execution.task_id == task.id
+                && execution.role != "interactive"
+                && matches!(
+                    execution.status,
+                    ExecutionStatus::Failed | ExecutionStatus::Cancelled
+                )
+                && matches!(
+                    execution.resume_policy,
+                    None | Some(db::ResumePolicy::Manual)
+                )
+        }) {
+            ExecutionRepo::update(
+                &*self.db,
+                db::UpdateExecution {
+                    id: execution.id.clone(),
+                    status: None,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: Some(Some(db::ResumePolicy::Auto)),
+                    stopped_at: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    summary: None,
+                    logs_path: None,
+                    before_sha: None,
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json: None,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
+        }
         let released = TaskRepo::update_recovery_metadata_if_no_running_execution(
             &*self.db,
             &task.id,
