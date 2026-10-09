@@ -770,6 +770,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Durable check runner, not yet used by any check (3.3 stage C).** The
+  server now starts a `check-runs` worker and has a durable path for running a
+  check: one run per identical request (same Project, repository, commit and
+  check definition), a result that later identical requests can reuse when the
+  check declares its inputs controlled, recovery after a server or daemon
+  restart without running the check twice, and a slot on the machine that
+  runs the check. No existing check uses it yet: review CI, merge CI and every
+  other check run exactly as before, and with no check requested the worker
+  makes five indexed reads a second and writes nothing. `GET /api/v1/operations`
+  gains `check_runs.admitted_runs`, `check_runs.waiting_for_capacity`,
+  `check_runs.borrowed_runs` and, per machine, `check_runs` and
+  `borrowed_check_runs`; a machine's `active_runs` includes checks that hold a
+  slot of their own. The fields are additive and zero until a check uses the
+  runner.
+
 - **Workspace cleanup finishes instead of failing the same way forever (3.4
   stage A).** Before removing a Task root, on the server and on a daemon,
   Forge gives the owner full access to every directory in it (`u+rwx`; files
@@ -788,6 +803,67 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   worktree path that is a symbolic link, and a repository located inside the
   Task root. The main working tree of a repository is never treated as a
   Task worktree.
+- **A workspace is checked against disk and Git immediately before it is
+  used (3.4 stage B, part 1).** A new internal accessor,
+  `WorkspaceManager::ensure_valid`, is now behind workspace preparation
+  (creation, the reviewer cascade, retry-entry refresh, and claim when the
+  workspace is reported missing), the start of a native executor turn,
+  reassignment reset, review entry CI, review rerun, blocking `before_work`
+  hooks, merge delivery and target-moved rebase on server-owned workspaces.
+  A claim on a workspace that is already ready still uses the backend's own
+  check.
+  Besides the existing checks (directory present, Git can use it), it now
+  refuses or repairs three more states. A worktree of a different repository
+  at the recorded path is moved aside (`<name>.broken-<ms>`) and recreated
+  from the Task branch. A worktree path or Task root that is a symbolic link
+  is never used: the Task gets `workspace reset required`. A worktree whose
+  HEAD is not on the Task branch (another branch, or detached outside a
+  rebase) is handled by what a checkout would lose. If HEAD has commits that
+  are not on the Task branch, nothing is checked out and the Task gets
+  `workspace reset required` naming how many: those commits would otherwise
+  drop out of what Forge reviews and delivers. If HEAD is the Task branch's
+  own commit, the branch is checked out (no file changes, uncommitted work is
+  kept). If HEAD is behind the Task branch, a launch checks the branch out
+  when there are no uncommitted changes; otherwise, and for review, checks,
+  hooks and delivery, the Task gets `workspace reset required`. Before this
+  change all of these ran on whatever HEAD was. Reassignment with a worktree
+  reset still discards uncommitted work at the current HEAD whatever branch
+  it is on. A native executor turn that starts on a deleted worktree now
+  recreates it from the Task branch instead of failing with `not a git
+  repository`. An interrupted rebase is left to the rebase owner as before.
+  `workspace reset required` is not repaired automatically; the workspace
+  reset clears it. A healthy worktree whose Repo row was deleted is now
+  accepted (it used to fail with `repo not found`); only a repair needs the
+  row. No REST, MCP, event or CLI shape changes. Healthy
+  workspaces behave as before; the check is one `git rev-parse` per use
+  (about 16 ms measured per call under a parallel test run), roughly four to
+  eight times per Task run.
+  Error text that changed or is new:
+  - `workspace reset required for task <id>: worktree HEAD is on <ref>, not on Task branch '<branch>'; …` (new; the tail says whether HEAD has commits the Task branch lacks, the worktree has uncommitted changes, or the candidate is not moved for this operation).
+  - `workspace reset required for task <id>: recorded worktree path <path> runs through a symbolic link` / `… is a symbolic link` (new).
+  - Lifecycle hooks: `worktree of workspace <id> is missing or is not a Git worktree; lifecycle hook OnTaskDone was not run` is now `worktree of workspace <id> is not usable (<reason>); lifecycle hook on_task_done was not run`.
+  - Cleanup: `repository <path> is recorded for this workspace and is not reachable right now; workspace cleanup will be retried` (new).
+- **A lifecycle hook that could not run is recorded on the Task (3.4 stage B,
+  part 1).** When a script hook is skipped because the Task worktree is not
+  usable, or cannot be started on its workspace owner, Forge now adds one
+  system comment to the Task naming the hook and the reason. Before, this
+  only reached the server log. Repeated events add no further comments. The
+  Task's state and annotations are not changed.
+- **Cleanup waits for a user repository that is temporarily away (3.4 stage
+  B, part 1).** If the Repo records a local checkout that is not on disk when
+  a terminal Task's workspace is cleaned up (an unmounted volume, a moved
+  directory) and Forge holds no clone of it, cleanup used to report success
+  and leave the worktree registration in that repository for good. It now
+  fails that attempt, keeps the worktree, retries with the existing backoff
+  and raises the cleanup attention item after five attempts; once the
+  repository is back, the registration and the Task root are removed. "Away"
+  means the checkout's parent directory is missing too, or is empty (an
+  unmounted mount point). A checkout that was deleted or moved while its
+  parent directory is still there is treated as gone, as before: the Task
+  root is removed at once. The wait is bounded: seven days after the
+  attention item was raised, the Task root is removed without the repository
+  and the item's details record why (`settled`); if the repository returns
+  later, `git worktree prune` in it drops the stale registration.
 - **A cleanup that keeps failing becomes one attention item (3.4 stage A).**
   After five failed attempts Forge raises a single Project attention item
   (category `progress_warning`, with the path, attempt count and last error)
@@ -1794,6 +1870,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `in_progress` with a clear condition, no run and no park. The release now
   counts as that decision and the Task is dispatched as soon as its Agent can
   take it. Found by the model-based workflow test.
+
+- **Output a finished command wrote just before its drain limit is no longer
+  dropped.** After a command exits, Forge reads its output for a bounded time
+  (2 seconds by default, when something the command started keeps the pipe open). That limit is
+  wall-clock time, so on a busy host the limit could pass before Forge had
+  read bytes the command had already written, and the end of the output was
+  lost. Forge now reads whatever the pipe already holds once the limit passes
+  (up to 4 MiB per stream), without waiting for more.
 
 - **A cancelled dependency no longer discards what its dependant was waiting
   on.** The `dependency_cancelled` blocker used to overwrite a hold, and to

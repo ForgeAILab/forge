@@ -14,6 +14,7 @@ pub mod agent_turn_admission;
 pub mod attention_service;
 pub mod auth_service;
 pub(crate) mod chat_usage;
+pub mod check_runner;
 pub mod command_boundary;
 pub mod context_manifest;
 pub mod coordination_consumer;
@@ -107,6 +108,7 @@ pub mod workflow;
 pub mod workspace_backend;
 pub mod workspace_cleanup;
 pub mod workspace_execution_lock;
+pub(crate) mod workspace_manager;
 
 // Test-only failpoints used by the Gate A characterization suite.  These are
 // compiled out of normal library builds; they let the suite model a process

@@ -205,6 +205,8 @@ pub struct DaemonPressureSummary {
     pub daemon_id: String,
     pub hostname: Option<String>,
     pub active_runs: u32,
+    pub check_runs: u32,
+    pub borrowed_check_runs: u32,
     #[ts(type = "number | null")]
     pub max_concurrent_runs: Option<i64>,
     pub logical_cores: Option<u32>,
@@ -459,7 +461,7 @@ impl std::fmt::Display for DeadLetterState {
     }
 }
 
-/// Passive check evidence counts; no durable check worker is active yet.
+/// Durable check worker evidence and machine admission counts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct CheckRunStatus {
@@ -467,4 +469,10 @@ pub struct CheckRunStatus {
     pub by_state: std::collections::BTreeMap<String, i64>,
     #[ts(type = "number")]
     pub reusable_results: i64,
+    #[ts(type = "number")]
+    pub admitted_runs: i64,
+    #[ts(type = "number")]
+    pub waiting_for_capacity: i64,
+    #[ts(type = "number")]
+    pub borrowed_runs: i64,
 }

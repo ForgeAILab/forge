@@ -94,3 +94,56 @@ async fn completion_policy_decides_what_outlives_a_normal_exit() {
         assert_eq!(output.descendants_stopped, !survives);
     }
 }
+
+/// A drain bound is wall-clock. Bytes the finished command wrote before the
+/// bound must survive a reader that was not scheduled in time to read them.
+#[tokio::test]
+async fn a_slow_reader_still_takes_what_the_finished_command_wrote() {
+    for _ in 0..20 {
+        // More than a pipe buffer, so the tail is still in the pipe when the
+        // leader exits, and a zero bound that ends the wait at once.
+        let mut command = shell("head -c 200000 /dev/zero | tr '\\0' x; printf END");
+        let output = run(
+            &mut command,
+            Capture::All,
+            None,
+            &CancellationToken::new(),
+            CompletionPolicy::DrainFor(Duration::ZERO),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.termination, Termination::Exited);
+        assert_eq!(output.stdout.len(), 200_003);
+        assert!(output.stdout.ends_with(b"END"));
+        assert!(!output.stdout_drain_incomplete);
+    }
+}
+
+/// The reader is starved past the bound while a descendant still holds the
+/// pipe: what was written before the bound is kept, and the command is not
+/// held until the descendant closes it.
+#[tokio::test]
+async fn a_starved_reader_keeps_bytes_written_before_the_bound() {
+    let mut command = shell("(sleep 0.2; printf late; sleep 5) & printf early");
+    let started = Instant::now();
+    let cancel = CancellationToken::new();
+    let (output, ()) = tokio::join!(
+        run(
+            &mut command,
+            Capture::All,
+            None,
+            &cancel,
+            CompletionPolicy::DrainFor(Duration::from_millis(600)),
+        ),
+        async {
+            // Hold the only runtime thread across the write and the bound.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            std::thread::sleep(Duration::from_millis(900));
+        }
+    );
+    let output = output.unwrap();
+    assert_eq!(output.termination, Termination::Exited);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "earlylate");
+    assert!(output.stdout_drain_incomplete);
+    assert!(started.elapsed() < Duration::from_secs(4));
+}

@@ -419,6 +419,10 @@ pub struct TaskService {
     pub(crate) task_step_replies: Arc<
         std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<Result<serde_json::Value>>>>,
     >,
+    /// Bound once by the runtime; the `apply_check_result` step applies
+    /// check results through it.
+    pub(crate) check_consumers:
+        Arc<std::sync::OnceLock<Arc<crate::check_runner::consumer::TaskCheckConsumers>>>,
     pub(crate) db: Arc<SqliteDb>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) merge_service: Option<Arc<MergeService>>,
@@ -527,6 +531,7 @@ impl TaskService {
             db,
             task_step_driver: Arc::default(),
             task_step_replies: Arc::default(),
+            check_consumers: Arc::default(),
             event_bus,
             merge_service: None,
             cleanup_scheduler: None,

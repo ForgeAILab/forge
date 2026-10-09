@@ -33,7 +33,7 @@ const SWEEP_LIMIT: i64 = 64;
 /// keeps failing becomes one operator attention item.
 const CLEANUP_ATTENTION_ATTEMPTS: i64 = 5;
 
-fn cleanup_attention_key(workspace_id: &str) -> String {
+pub(crate) fn cleanup_attention_key(workspace_id: &str) -> String {
     format!("workspace-cleanup:{workspace_id}")
 }
 
@@ -2693,6 +2693,180 @@ mod tests {
         .fetch_all(db.pool())
         .await
         .unwrap()
+    }
+
+    /// A workspace whose source is the user's own checkout at
+    /// `<root>/vol/user-repo`, recorded on the Repo, with Forge holding no
+    /// clone. `vol` stands for the volume the checkout lives on.
+    async fn user_repo_fixture(db: &Arc<SqliteDb>, root: &Path) -> (String, PathBuf, PathBuf) {
+        let (workspace_id, worktree_path) = seed_workspace(db, root, WorkspaceStatus::Ready).await;
+        let (cache, _branch) = fixture_source(db, root, &workspace_id).await;
+        let workspace = WorkspaceRepo::get_by_id(&**db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let user_repo = root.join("vol").join("user-repo");
+        std::fs::create_dir_all(user_repo.parent().unwrap()).unwrap();
+        std::fs::rename(&cache, &user_repo).unwrap();
+        fixture_git(
+            &user_repo,
+            &["worktree", "repair", &worktree_path.to_string_lossy()],
+        )
+        .await;
+        sqlx::query("UPDATE repo SET local_path = ? WHERE id = ?")
+            .bind(user_repo.to_string_lossy().as_ref())
+            .bind(&workspace.repo_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        (workspace_id, worktree_path, user_repo)
+    }
+
+    async fn worktree_registered(repo: &Path, worktree: &Path) -> bool {
+        fixture_git(repo, &["worktree", "list", "--porcelain"])
+            .await
+            .contains(worktree.to_string_lossy().as_ref())
+    }
+
+    /// A user's repository that is away right now (an unmounted volume) is
+    /// not a repository that is gone: cleanup keeps the worktree, retries, and
+    /// removes the registration from the user's repository once it is back.
+    #[tokio::test]
+    async fn recorded_repository_missing_right_now_is_retried_not_treated_as_gone() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path, user_repo) = user_repo_fixture(&db, temp.path()).await;
+        assert!(worktree_registered(&user_repo, &worktree_path).await);
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        // The volume is unmounted: the repository's parent is gone with it.
+        let volume = temp.path().join("vol");
+        let away = temp.path().join("vol.unmounted");
+        std::fs::rename(&volume, &away).unwrap();
+        for attempt in 1..=CLEANUP_ATTENTION_ATTEMPTS {
+            // An unmounted mount point may also be left behind as an empty
+            // directory: that is still "away".
+            if attempt == 2 {
+                std::fs::create_dir(&volume).unwrap();
+            }
+            clean_due(&scheduler, &workspace_id).await;
+            let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(row.status, WorkspaceStatus::Cleaned, "attempt {attempt}");
+            assert_eq!(row.cleanup_attempts, attempt);
+            assert!(row
+                .last_cleanup_error
+                .as_deref()
+                .unwrap()
+                .contains("is not reachable right now"));
+            assert!(worktree_path.exists(), "the worktree is kept for the retry");
+            assert_eq!(
+                cleanup_attention(&db, &workspace_id).await.len(),
+                usize::from(attempt == CLEANUP_ATTENTION_ATTEMPTS),
+                "attention is raised at the threshold, attempt {attempt}"
+            );
+        }
+
+        std::fs::remove_dir(&volume).unwrap();
+        std::fs::rename(&away, &volume).unwrap();
+        clean_due(&scheduler, &workspace_id).await;
+        let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, WorkspaceStatus::Cleaned);
+        assert!(!worktree_path.parent().unwrap().exists());
+        assert!(
+            !worktree_registered(&user_repo, &worktree_path).await,
+            "the registration is removed from the user's repository"
+        );
+        assert_eq!(cleanup_attention(&db, &workspace_id).await[0].0, "resolved");
+    }
+
+    /// A checkout deleted for good, in a directory that is still there, took
+    /// its worktree registrations with it: cleanup removes the Task root at
+    /// once instead of retrying for a repository that will never come back.
+    #[tokio::test]
+    async fn recorded_repository_deleted_for_good_is_cleaned_without_retries() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path, user_repo) = user_repo_fixture(&db, temp.path()).await;
+        std::fs::write(temp.path().join("vol").join("other-project"), "still here").unwrap();
+        std::fs::remove_dir_all(&user_repo).unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        clean_due(&scheduler, &workspace_id).await;
+
+        let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, WorkspaceStatus::Cleaned);
+        assert_eq!(row.cleanup_attempts, 0);
+        assert!(!worktree_path.parent().unwrap().exists());
+        assert!(cleanup_attention(&db, &workspace_id).await.is_empty());
+    }
+
+    /// Waiting for a repository that is away is bounded: a set time after the
+    /// attention item was raised, the Task root is removed without it and the
+    /// item records why.
+    #[tokio::test]
+    async fn recorded_repository_that_stays_away_stops_being_waited_for() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path, _user_repo) = user_repo_fixture(&db, temp.path()).await;
+        std::fs::rename(temp.path().join("vol"), temp.path().join("vol.unmounted")).unwrap();
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        for _ in 0..CLEANUP_ATTENTION_ATTEMPTS + 2 {
+            clean_due(&scheduler, &workspace_id).await;
+        }
+        assert!(worktree_path.exists(), "still waiting inside the bound");
+        assert_eq!(cleanup_attention(&db, &workspace_id).await[0].0, "open");
+
+        let raised = (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        sqlx::query("UPDATE attention_projection SET occurred_at = ? WHERE dedupe_key = ?")
+            .bind(raised)
+            .bind(cleanup_attention_key(&workspace_id))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        clean_due(&scheduler, &workspace_id).await;
+
+        let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, WorkspaceStatus::Cleaned);
+        assert!(!worktree_path.parent().unwrap().exists());
+        let (status, settled) = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, json_extract(details_json, '$.settled')
+             FROM attention_projection WHERE dedupe_key = ?",
+        )
+        .bind(cleanup_attention_key(&workspace_id))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "resolved");
+        assert!(
+            settled
+                .as_deref()
+                .is_some_and(|settled| settled.contains("stayed unreachable for 7 days")),
+            "{settled:?}"
+        );
     }
 
     #[tokio::test]

@@ -5692,3 +5692,18 @@ pending proposals. Task payload declarations and legacy pending materialization 
 Charter adoption and evidence remain on their hand paths because their historical
 receipt retrieval after pause/ceiling changes would be narrowed by registry
 admission. Readiness also remains on its hand path.
+
+### Durable check orchestration observations (3.3 stage C, partial)
+
+`GET /api/v1/operations/status` extends `check_runs` with integer
+`admitted_runs`, `waiting_for_capacity` and `borrowed_runs`, in addition to
+`by_state` and `reusable_results`. Admitted includes running/cancelling/cleaning/
+uncertain runs. Capacity wait is a subset of queued runs; borrowed runs share an
+existing reservation/execution slot for the same Task and physical machine.
+
+Each `daemon_pressure` entry adds `check_runs` (checks taking their own slot)
+and `borrowed_check_runs` (informational). `active_runs` includes exclusive check
+slots; borrowed checks add no second slot. Agent pressure excludes checks.
+The supervised worker appears as `check-runs` in `periodic_workers`. There is no
+new REST check execution or result-application route, and daemon protocol 5 is
+unchanged. Existing CI consumers have not moved to the runner in this slice.

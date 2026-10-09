@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::{
     lifecycle::{LifecycleHookContext, LifecycleHookRun, LifecycleHookRunner},
-    task_service::workspace::prepare_workspace,
+    task_service::workspace::prepare_workspace_for,
     workflow::{effective_role, HookAction, HookContext, HookResult},
 };
 
@@ -123,18 +123,17 @@ impl HookAction for RunBeforeWorkHooks {
                     if daemon_owned {
                         workspace
                     } else {
-                        match crate::task_service::workspace::ensure_valid(
+                        match crate::workspace_manager::WorkspaceManager::new(
                             &ctx.db,
                             &ctx.workspace_root,
-                            &task,
-                            workspace,
                             ctx.repo_cache_locks.clone(),
-                            false,
                             &ctx.workspace_backend_router,
                         )
+                        .ensure_valid(&task, workspace, crate::workspace_manager::Purpose::Hook)
                         .await
+                        .map_err(crate::ServiceError::from)
                         {
-                            Ok(workspace) => workspace,
+                            Ok(valid) => valid.into_workspace(),
                             Err(error @ crate::ServiceError::WorkspaceResetRequired { .. }) => {
                                 if let Err(annotation_error) =
                                     annotate_before_work_workspace_reset(ctx, &task, &error).await
@@ -166,13 +165,14 @@ impl HookAction for RunBeforeWorkHooks {
                     };
                 }
             },
-            None => match prepare_workspace(
+            None => match prepare_workspace_for(
                 &ctx.db,
                 &ctx.workspace_root,
                 &task,
                 &task.id,
                 ctx.repo_cache_locks.clone(),
                 &ctx.workspace_backend_router,
+                crate::workspace_manager::Purpose::Hook,
             )
             .await
             {

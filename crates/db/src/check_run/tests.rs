@@ -967,6 +967,10 @@ async fn upgrade_preserves_old_rows_and_never_seeds_cache() {
                 .file_name()
                 .to_string_lossy()
                 .ends_with("__check_run_identity.sql")
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with("__check_runner.sql")
         {
             continue;
         }

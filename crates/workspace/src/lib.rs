@@ -479,6 +479,16 @@ impl WorkspaceManager {
         Ok((task_root, absolute_root, absolute_path))
     }
 
+    /// Whether `worktree_path` is `<root>/<task_id>/<name>` with neither the
+    /// Task root nor the worktree a symbolic link: the rule
+    /// [`Self::cleanup_worktree`] deletes under, for callers that are about
+    /// to run something there. [`WorkspaceError::PathEscape`] otherwise.
+    pub async fn confine_worktree(&self, task_id: &str, worktree_path: &Path) -> Result<()> {
+        self.confined_task_root(task_id, worktree_path)
+            .await
+            .map(|_| ())
+    }
+
     pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
         let output = git_command()
             .args(["worktree", "prune", "--expire", "now"])

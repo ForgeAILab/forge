@@ -3544,6 +3544,63 @@ child always preserves its root's shared Workspace, including reassignment with
 `reset_worktree`. Daemon-owned delivery calls retain their prior owner-local
 path; damaged daemon worktrees require a reset, and daemon describe failures
 remain transient errors without triggering metadata repair.
+**The workspace manager is the validity accessor.**
+`services::workspace_manager::WorkspaceManager::ensure_valid(task, workspace,
+purpose)` is the one place a `ready` row becomes a directory a caller may run
+in. It never writes Task rows; it returns a `ValidWorkspace` (the row, its
+resolved placement, the checked path for a server placement, and what was
+repaired) or a typed `WorkspaceUnavailable`, which converts to the existing
+service errors (`ResetRequired` to `WorkspaceResetRequired`, `OwnerUnreachable`
+to `DaemonUnavailable`, `Busy` to a conflict, `Infrastructure` to the original
+error unchanged). `Purpose` is `Execute`, `Review`, `Check`, `Integrate`,
+`Hook`, `Reset` or `Inspect`. For a server-owned workspace it checks, with no
+network and one Git process on the healthy path (a single `git rev-parse` that
+resolves HEAD and names the repository, the Git directory and the checked-out
+ref; the older HEAD probe runs only when that fails, to tell an unusable
+directory from a transient Git failure):
+
+| Observed | `Execute`, `Review`, `Check`, `Integrate`, `Hook`, `Reset` | `Inspect` |
+|---|---|---|
+| Linked worktree, HEAD on the Task branch (or mid-rebase) | valid; a stale cleanup deadline is cleared | valid |
+| Directory missing, or present and unusable by Git | repaired or recreated from the Task branch (as above) | `Absent`; disk and the workspace row are untouched (a legacy row with no placement still gets its server placement recorded) |
+| Linked worktree of a repository other than the recorded one | moved aside as `<name>.broken-<ms>` and recreated from the Task branch; never relinked | `Absent` |
+| The worktree path, or its Task root, is a symbolic link | `ResetRequired`; nothing is used, moved or deleted | `Absent` |
+| HEAD on another branch or detached, Task branch exists, no rebase in progress | Decided by what a checkout would lose. HEAD has commits the Task branch lacks: `ResetRequired` for every purpose, naming the count, because a checkout would leave them unreachable from the branch Forge reviews and delivers. HEAD is the Task branch's own commit: `git checkout <Task branch>` for every purpose, since no file changes and local changes are kept. HEAD is behind the Task branch: `Execute` checks the branch out when the tree is clean, else `ResetRequired`; the others return `ResetRequired`, so a candidate is never moved under them. `Reset` is the exception to all three: it returns the worktree as it is, flagged off-branch, for the caller's `git reset --hard HEAD` | valid, flagged off-branch |
+| Worktree and Task branch both gone | `ResetRequired`; the row is kept, except on the owning Task's launch path, which forgets it so the next launch starts from the default branch. A worktree of another repository that Git can still use is never forgotten | `Absent` |
+| Row not `ready` | `workspace for task … is not ready` | reports the disk as above |
+
+The repository check compares the worktree's Git common directory with the
+placement's repository location, `Repo.local_path` and Forge's clone, whichever
+are on disk; with none on disk it is skipped and recovery reports the missing
+repository. A healthy worktree is valid even when its Repo row has been
+deleted (a workspace outlives it); only a repair needs the row and reports
+`repo not found`. A Repo row of another Project is refused for every state. A directory that is a repository of its own, rather than a linked
+worktree, is not rejected yet. Daemon-owned placements keep the describe /
+prepare contract described above; the manager never interprets their handle.
+Callers: every `prepare_workspace` path (`Execute`: workspace creation, the
+reviewer cascade, retry-entry refresh, and claim when the owner reports the
+workspace missing), the native executor at the start of a turn (`Execute`),
+reassignment reset (`Reset`), review entry CI (`Check`), review rerun
+(`Review`), blocking `before_work` hooks (`Hook`), merge delivery and
+target-moved rebase (`Integrate`), and the lifecycle emitter (`Inspect`). A
+claim on a placement that is already `ready` still asks the backend's
+`describe` and does not go through the manager when the workspace exists. One
+Task run makes about four to eight manager calls (a blocking `before_work`
+hook, entry CI, a native turn start per execution, delivery, a rebase when the
+target moved, and one `Inspect` per lifecycle event that has script hooks).
+`ResetRequired` is never repaired by the caller: each one records its existing
+typed result (the `workspace_reset_required` annotation, the CI interruption
+with its entry barrier, a failed hook, a merge failure) and stops, so there is
+no reset-and-retry loop and no automatic recreation; the explicit workspace
+reset clears it. A source-scan test,
+`workspace_manager::tests::raw_workspace_path_getters_have_no_new_callers`,
+records an upper bound per file for the remaining non-test uses of the raw
+path getters (`ResolvedWorkspace::embedded_path`,
+`Workspace::embedded_worktree_path_for_backend`,
+`EmbeddedWorkspaceBackend::recorded_server_path`). It fails when a file that
+is not listed uses one, or a listed file uses more than recorded; fewer uses
+pass.
+
 States progress from `reserved` to `preparing` to `ready`,
 which can become `disconnected`, then back to `ready` after reconciliation.
 Cleanup moves through `cleaning` to `cleaned`; failures use `failed`.
@@ -5390,14 +5447,33 @@ on daemon-owned workspaces are not deleted yet. Execution logs are retained;
 only `.codex-managed-home` (including task scratch) is removed from the Task's
 logs directory.
 
-Project lifecycle script hooks run in the Task worktree. When a server-owned
-workspace is on record and its worktree is missing or is a directory without
-Git metadata, the hook is not run and the emitter reports
-`workspace reset required`; it never runs in the user's own checkout instead.
+Project lifecycle script hooks run in the Task worktree. The emitter inspects a
+server-owned workspace through the workspace manager (`Purpose::Inspect`, which
+never repairs). When the worktree is missing, is not a Git worktree, belongs to
+another repository or sits behind a symbolic link, the hook is not run, the
+emitter reports `workspace reset required`, and Forge adds one system comment
+to the Task saying which hook was not run and why (one per event, workspace and
+execution; a hook that could not be started on its owner is recorded the same
+way). It never runs in the user's own checkout instead.
 The primary-checkout context is used only where no worktree is expected: before
 the workspace is prepared, and when the directory is gone while or after Forge
 reclaims it (workspace `cleaning` or `cleaned`). Hooks run from the event bus
 after the transition, so a hook failure never blocks a state change.
+Cleanup tells a repository that is away from one that is gone. When the Repo
+records a checkout (`local_path`) that is not on disk at that moment and Forge
+holds no clone, the cleanup attempt fails with `repository … is not reachable
+right now` and nothing is removed: the worktree registration lives in that
+repository and can only be removed once it is back. The attempt is retried with
+the usual backoff and raises the cleanup attention item at the threshold.
+"Away" is decided by what is on disk: the checkout's parent directory is
+missing too, or is an empty directory (an unmounted mount point). When the
+parent is there and holds other entries, the checkout itself was deleted or
+moved, its registrations went with it, and the Task root is reclaimed at once.
+The wait is bounded: seven days after the attention item was raised, the Task
+root is removed without the repository, the reason is written to the item's
+`details.settled`, and the success resolves it (`git worktree prune` in the
+repository drops the stale registration if it ever returns). A Repo row that
+is gone, or one with no checkout and no clone, is still reclaimed at once.
 A bounded sweep runs on startup and every ten minutes to backfill terminal Tasks,
 including missing worktrees and managed homes left by older installs. The
 deadline worker snapshots a bounded set of due rows before processing them, so
@@ -7415,3 +7491,149 @@ retain command order, cwd, inherited env, verdicts, comments/events and per-comm
 receipt acknowledgment. No extra setup or managed checkout is enabled. Required
 conformance/setup, lifecycle/before-work, readiness/preflight/environment helper
 and agent-selected families retain their existing orchestration and check policy.
+
+### Durable check runner and its Task-step consumer contract (3.3 stage C)
+
+`check_runner::CheckRunner::request` returns a consumer and `Hit(result)`,
+`Joined(run)` or `Scheduled(run)`. Selection and consumer insertion are one
+`BEGIN IMMEDIATE` transaction using the stage-A partial unique identity index.
+A repeated consumer key joins its original run, including a terminal failure;
+it never silently launches another attempt. A certified cacheable pass returns
+`Hit`. Uncacheable or failed idempotent evidence stays `Joined`, with the
+consumer's own `result_id`. New consumers never hit an uncacheable, unattested,
+failed, timed-out, uncertain or cleanup-failed result. Purpose belongs to the
+consumer, whole-run timeout belongs to the run, and neither divides the key.
+Forced execution still needs a new audited execution revision. The runner
+accepts at most 64 commands, consumer keys up to 512 bytes and wall bounds from 1 through 86,400
+seconds, matching the daemon's maximum retained operation deadline.
+
+The shared server/Solo runtime starts the supervised `check-runs` worker. It
+holds only check-repository and owner-effect ports; it writes no Task, Review,
+budget, comment, condition or domain event. Framework supervision owns worker
+health separately. At startup and on its one-second sweep it claims queued or
+expired runs with a 60-second lease and renews every 15 seconds while awaiting
+an owner. The stored operation UUID exists before admission. It persists a
+placement/generation/runtime intent and absolute deadline before `check.run`.
+Project environment values are resolved transiently, not copied to the intent.
+Server execution shares the integration owner's physical checkout lock and
+rechecks its dispatch lease, placement and exact candidate before starting.
+Daemon-local paths stay opaque to the server.
+
+Owner receipts are retained before result projection. Certification compares
+operation, pinned owner/runtime and execution-input identity, command order and
+completion, exit outcomes, timestamps, cleanup and (for reusable or canonical
+passes) exact HEAD/tracked-change witnesses. A malformed terminal receipt is
+infrastructure evidence, never a pass. Server receipts remain available in
+memory if their durable write has a transient failure. The worker records the
+immutable result before delivering it. Daemon `journal.ack` uses
+`forge:operation:<operation_id>` only after result durability. A fresh result
+is acknowledged on the next sweep; a refused or unanswered acknowledgement is
+retried no sooner than every 60 seconds, each attempt bounded to 5 seconds, and
+ends when the machine is removed, passes the disconnected-owner bound, or the
+result is 25 hours old (the daemon keeps a check entry for 24).
+
+An idle worker costs five indexed reads per second and no write: the sweep
+reads `check_run_state_lease` and the partial indexes
+`check_consumer_undelivered` and `check_run_unacknowledged`, which hold only
+rows that still need work, and it opens a write transaction only when one of
+them is non-empty. A run or consumer the sweep cannot process is logged and
+skipped; it never stops the sweep for the others. The worker touches only rows
+of `check_run`, `check_result` and `check_consumer` created through
+`CheckRunner::request`, and enqueues Task steps.
+
+Transport timeout/disconnect means `uncertain`. Recovery looks up the original
+operation; it never repeats `check.run` under that key. An owner reporting
+unknown/interrupted must first retain a cancellation tombstone, which fences a
+delayed dispatch frame. A retained receipt settles the original run. Unknown or
+interrupted after that stop fence, an owner past the existing configured
+workspace-disconnect bound, or removal of its machine settles infrastructure
+failure. Reconciliation releases its worker job between lookups while keeping
+machine occupancy and the single-flight key: the run keeps a 15-second lease,
+so it is looked up again every 15 seconds, not every sweep. An owner that is
+reachable but still answers "running" (or refuses to answer) 600 seconds past
+the run's settlement deadline is given up on: the run settles as an
+infrastructure failure that is **not** retried automatically, because nothing
+proved the process stopped. Every consumer is answered "no verdict", and a
+second run of that identity is an explicit decision. Scans use
+least-recently-attempted order. Infrastructure retry allowance is stored per consumer: two automatic
+retries, then one terminal infrastructure notification. Recovery rechecks the
+cache before retrying and reuses a pass certified by another consumer meanwhile.
+This prevents a silent second execution of a certified key.
+
+| Run state | Automatic exit | Bound/policy |
+| --- | --- | --- |
+| `queued` | Admit to `running`; all consumers stale: `cancelled`; owner removed or slot wait expired: infrastructure failure | Slot wait 1,800 seconds per attempt (with two automatic retries a consumer waits at most about 90 minutes before its Task is answered "no verdict"). Expiry settlement runs even when all 32 effect jobs are occupied. Queue time is excluded from wall time. |
+| `running` | Receipt to `cleaning`; lost reply or lost lease to `uncertain`; no consumers left: `cancelling`. A run taken over before its intent was stored launched nothing and settles as an infrastructure failure | Recorded wall limit (1–86,400 seconds) plus 65 seconds of settlement grace. Lease 60 seconds, renewed every 15; takeover within 60 seconds plus sweep delay. |
+| `cancelling` | Cancel reply with a receipt to `cleaning`; any other reply, or a lost lease, to `uncertain` | One cancel exchange, at most 61 seconds. |
+| `cleaning` | Immutable result to a terminal state; a lost lease to `uncertain`, which resumes from the retained receipt | One fenced transaction; takeover within 60 seconds plus sweep delay. |
+| `uncertain` | Receipt settles the original run; owner reports unknown or interrupted after a cancel tombstone: infrastructure failure (retried); machine removed or owner past the disconnected-owner bound: infrastructure failure (retried); owner still "running" or refusing: infrastructure failure, **not** retried | Lookup at most 30 seconds, cancel at most 61, repeated every 15 seconds. Hard bound: the smaller of the configured disconnected-owner bound and the run's wall limit + 65 + 600 seconds. Never a second `check.run` for the operation. |
+| `succeeded`, `failed`, `cancelled` | One `apply_check_result` Task step per consumer; owner acknowledgement | Delivery marker and enqueue share a transaction, on the sweep after settlement. An infrastructure failure is retried at most twice per consumer, then delivered as "no verdict". |
+
+| Consumer delivery state | Automatic exit | Bound |
+| --- | --- | --- |
+| Waiting for its run | The run's exits above; the consumer's Task leaving its status entry cancels the consumer | As the run. |
+| Result recorded, not delivered | Infrastructure failure with retries left: moved to the retry run; otherwise the delivery step is enqueued | Next sweep (one second). |
+| Delivered, not applied | The Task-step worker runs the step: applied, or stale (Task left the status entry, or another attempt is in charge) and the Task is untouched | The Task-step worker's own retry and dead-letter bounds. |
+
+Capacity admission uses the same SQLite writer transaction and shared occupancy
+query as executions, reservations and Chat turns. Checks use the physical
+checkout owner (`machine_id`), including server-owned shared mounts, and consume
+no Agent concurrency. Hits and joins acquire no slot. A check borrows a live
+reservation or execution slot for the same consumer Task on that same counted
+machine; Chat cannot lend. Borrowing is calculated on every occupancy read, so
+when the held slot ends or expires the running check accounts for its own slot.
+Running, cancelling, cleaning and uncertain admitted checks retain occupancy;
+queued checks do not. Slot release is observed by the periodic scan without a
+notification race. Operations includes admitted, borrowed and capacity-wait
+counts; per-machine `active_runs` includes exclusive check slots.
+
+Result delivery enqueues an entry-fenced `apply_check_result` Task command with
+consumer/result/run identities, exact commit and spec digest. The consumer's
+`delivery_step_id` and enqueue share a transaction. Its marker survives Task-step
+retention, so restart and pruning cannot enqueue a second notification. Already
+stale epochs are enqueued as superseded and leave the Task untouched.
+
+#### Task-step consumer contract
+
+`check_runner::consumer::TaskCheckConsumers` is the only way a Task step uses
+the runner. A consumer family (one per `CheckConsumerOrigin`) registers a
+`CheckConsumerFamily`. A step asks with `request(TaskCheckRequest)`, naming
+its Task, the status entry it runs under and its *authority*: the step or
+attempt that asks, as the family names it. The request is idempotent on
+(origin, Task, status entry, authority) and is refused when the Task has left
+that status entry or no family is registered. Its reply (`Hit`, `Joined`,
+`Scheduled`) is information only. Hit, joined or scheduled, the verdict always
+arrives as exactly one `apply_check_result` Task step, so there is one
+application path.
+
+`apply(step_id, delivery)` runs inside that step. It refuses (the step fails
+visibly) an envelope that is not carried by the consumer's recorded delivery
+step, or whose consumer, run, result, commit or spec digest differ from what
+is stored. It returns `stale` and leaves the Task untouched when the consumer
+was cancelled, the Task left the status entry, or the family's
+`current_authority` is no longer the one that asked. Otherwise it hands the
+family a `CheckVerdict`: `Result` (pass, fail, timed out or cancelled, for
+exactly the requested commit and spec) or `InfrastructureExhausted` (no
+verdict after the automatic retries: the family parks its Task with a
+retryable reason and records no failure of the candidate). The consumer is
+then marked applied; a redelivered step returns `already_applied`. A crash
+between the family's write and that mark redelivers once more, so a family's
+`apply` is idempotent on `consumer_id`.
+
+**No family is registered yet, and no execution family requests the runner.**
+Merge-path and review-entry CI, manual `ReviewRunner`, conformance,
+before-work and other checks retain their current orchestration, limits and
+verdicts. The 3.2 integration queue stays inactive. Still pending: the typed
+Task conditions for a check wait, a check-slot wait and exhausted check
+retries (with their `is_blocked`, offer and dispatcher rules), the
+review-entry and merge-path cutovers, canonical PATH/HOME declaration and
+managed-checkout/canonical-policy activation. Current owner dispatch uses the
+frozen legacy workspace policy and supplies no new server input attestation;
+configured checks remain uncacheable. A reusable result has no expiry: reuse
+ends only when the commit, spec digest or audited execution revision differs.
+No historical review or legacy CI row is promoted to cache.
+
+The owner supervision guarantees tested here cover normal cancellation, dropped
+futures, retained receipts and restart reconciliation. Abrupt process death
+between OS spawn and durable process-tree evidence, and escaped descendants,
+are not proven by the runner; the stage-B process-supervisor limits still apply.
