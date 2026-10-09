@@ -351,6 +351,16 @@ impl LifecycleEventEmitter {
         let resolved = resolved.filter(|workspace| {
             !before_execution || workspace.placement.owner_kind != db::PlacementOwnerKind::Server
         });
+        // A server workspace Forge is reclaiming or has reclaimed has no
+        // worktree to expect: once the directory is gone its hooks keep the
+        // primary-checkout context they always had (`on_task_done` commonly
+        // fires while or after a `done` Task is cleaned up).
+        let reclaimed = workspace.as_ref().is_some_and(|workspace| {
+            matches!(
+                workspace.status,
+                db::WorkspaceStatus::Cleaning | db::WorkspaceStatus::Cleaned
+            )
+        });
         let (repo_path, worktree_path) = match resolved.as_ref() {
             Some(resolved) => {
                 let (repo_path, handle) =
@@ -364,13 +374,33 @@ impl LifecycleEventEmitter {
                         resolved.placement.workspace_id
                     ));
                 }
-                let repo_path = if exists {
-                    repo_path
+                if !exists && reclaimed {
+                    (
+                        self.resolve_repo_path(
+                            &project,
+                            execution.as_ref(),
+                            workspace.as_ref(),
+                            None,
+                        )
+                        .await,
+                        None,
+                    )
+                } else if !exists {
+                    // The Task has a worktree on record and it is not usable.
+                    // Its hook must not run anywhere else, least of all in the
+                    // user's own checkout.
+                    return Err(crate::ServiceError::WorkspaceResetRequired {
+                        task_id: task.id.clone(),
+                        reason: format!(
+                            "worktree of workspace {} is missing or is not a Git worktree; \
+                             lifecycle hook {event:?} was not run",
+                            resolved.placement.workspace_id
+                        ),
+                    }
+                    .to_string());
                 } else {
-                    self.resolve_repo_path(&project, execution.as_ref(), workspace.as_ref(), None)
-                        .await
-                };
-                (repo_path, exists.then_some(handle))
+                    (repo_path, Some(handle))
+                }
             }
             None => (
                 self.resolve_repo_path(&project, execution.as_ref(), None, None)
@@ -506,11 +536,11 @@ impl LifecycleEventEmitter {
 
 async fn workspace_exists(workspace: &ResolvedWorkspace) -> Result<bool, String> {
     if workspace.placement.owner_kind == db::PlacementOwnerKind::Server {
-        // Lifecycle hooks previously accepted any existing directory, even
-        // while its Git metadata was being repaired.
+        // A directory without Git metadata is not a worktree: a hook run
+        // there would act on a tree that is not the Task's.
         return workspace
             .embedded_path()
-            .map(|path| path.exists())
+            .map(|path| path.join(".git").exists())
             .map_err(|error| error.to_string());
     }
     workspace
@@ -657,5 +687,213 @@ mod tests {
             .await
             .expect("emitter stops promptly")
             .expect("emitter task joins");
+    }
+
+    /// A Project whose `on_task_done` script hook drops a marker in its
+    /// working directory, a Task, and a workspace row for a worktree that is
+    /// not on disk. Returns the user's repository and the workspace id.
+    async fn seed_hook_fixture(
+        db: &SqliteDb,
+        root: &Path,
+        status: db::WorkspaceStatus,
+    ) -> (PathBuf, String, String) {
+        use db::{ProjectRepo, RepoRepo, TaskRepo, WorkspaceRepo};
+
+        let now = db::now_rfc3339();
+        let (project_id, repo_id, task_id, workspace_id) = (
+            db::new_uuid_v4(),
+            db::new_uuid_v4(),
+            db::new_uuid_v4(),
+            db::new_uuid_v4(),
+        );
+        let user_repo = root.join("user-repository");
+        std::fs::create_dir_all(&user_repo).unwrap();
+        git::init(&user_repo).await.unwrap();
+        git::commit_all(&user_repo, "initial commit").await.unwrap();
+        let settings = serde_json::json!({
+            "lifecycle_hooks": {
+                "on_task_done": [{"type": "script", "command": "touch hook-ran"}]
+            }
+        });
+        ProjectRepo::create(
+            db,
+            db::CreateProject {
+                id: project_id.clone(),
+                name: "Forge".to_owned(),
+                settings: settings.to_string(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        RepoRepo::create(
+            db,
+            db::CreateRepo {
+                id: repo_id.clone(),
+                project_id: project_id.clone(),
+                name: "repo".to_owned(),
+                remote_url: None,
+                local_path: Some(user_repo.to_string_lossy().into_owned()),
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        TaskRepo::create(
+            db,
+            db::CreateTask {
+                id: task_id.clone(),
+                project_id,
+                parent_task_id: None,
+                subtask_order: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Hook task".to_owned(),
+                description: None,
+                task_type: "task".to_owned(),
+                status: "done".to_owned(),
+                is_automation: false,
+                priority: 0,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        WorkspaceRepo::create(
+            db,
+            db::CreateWorkspace {
+                id: workspace_id.clone(),
+                task_id: task_id.clone(),
+                repo_id,
+                worktree_path: root
+                    .join("worktrees")
+                    .join(&task_id)
+                    .join("repo")
+                    .to_string_lossy()
+                    .into_owned(),
+                branch: ::workspace::task_branch_name(&task_id),
+                status,
+                before_sha: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        (user_repo, task_id, workspace_id)
+    }
+
+    async fn migrated_db() -> Arc<SqliteDb> {
+        let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        Arc::new(SqliteDb::new(pool))
+    }
+
+    #[tokio::test]
+    async fn script_hook_never_falls_back_to_the_user_repository_when_the_worktree_is_gone() {
+        let db = migrated_db().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let (user_repo, task_id, workspace_id) =
+            seed_hook_fixture(&db, temp.path(), db::WorkspaceStatus::Ready).await;
+        let emitter = LifecycleEventEmitter::new(Arc::clone(&db), Arc::new(PluginRegistry::new()));
+
+        // Missing directory.
+        let error = emitter
+            .emit_lifecycle_event(
+                &task_id,
+                None,
+                api_types::LifecycleEvent::OnTaskDone,
+                Some("review".to_owned()),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a missing worktree fails the hook");
+        assert!(error.contains("workspace reset required"), "{error}");
+        assert!(error.contains(&workspace_id), "{error}");
+        assert!(!user_repo.join("hook-ran").exists());
+
+        // A directory that is not a Git worktree is not the Task's tree either.
+        let worktree = temp.path().join("worktrees").join(&task_id).join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        emitter
+            .emit_lifecycle_event(
+                &task_id,
+                None,
+                api_types::LifecycleEvent::OnTaskDone,
+                Some("review".to_owned()),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a directory without Git metadata fails the hook");
+        assert!(!user_repo.join("hook-ran").exists());
+        assert!(!worktree.join("hook-ran").exists());
+    }
+
+    #[tokio::test]
+    async fn script_hook_of_a_reclaimed_workspace_keeps_its_primary_checkout_context() {
+        // `cleaning`: an `on_task_done` hook that fires while the `done`
+        // Task's worktree is being removed ran in the primary checkout before
+        // and still does; it must not start failing.
+        for status in [db::WorkspaceStatus::Cleaning, db::WorkspaceStatus::Cleaned] {
+            let db = migrated_db().await;
+            let temp = tempfile::TempDir::new().unwrap();
+            let (user_repo, task_id, _) = seed_hook_fixture(&db, temp.path(), status).await;
+            let emitter =
+                LifecycleEventEmitter::new(Arc::clone(&db), Arc::new(PluginRegistry::new()));
+
+            emitter
+                .emit_lifecycle_event(
+                    &task_id,
+                    None,
+                    api_types::LifecycleEvent::OnTaskDone,
+                    Some("review".to_owned()),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert!(user_repo.join("hook-ran").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn script_hook_runs_in_a_worktree_that_is_still_there_while_it_is_reclaimed() {
+        let db = migrated_db().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let (user_repo, task_id, _) =
+            seed_hook_fixture(&db, temp.path(), db::WorkspaceStatus::Cleaning).await;
+        let worktree = temp.path().join("worktrees").join(&task_id).join("repo");
+        git::create_worktree(&user_repo, "hook-worktree", &worktree)
+            .await
+            .unwrap();
+        let emitter = LifecycleEventEmitter::new(Arc::clone(&db), Arc::new(PluginRegistry::new()));
+
+        emitter
+            .emit_lifecycle_event(
+                &task_id,
+                None,
+                api_types::LifecycleEvent::OnTaskDone,
+                Some("review".to_owned()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(worktree.join("hook-ran").exists());
+        assert!(!user_repo.join("hook-ran").exists());
     }
 }

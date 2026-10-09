@@ -44,9 +44,11 @@ impl EmbeddedWorkspaceBackend {
         }
     }
 
-    async fn workspace_repo_source(&self, workspace: &db::Workspace) -> Result<PathBuf> {
+    /// The repository a workspace was created from, when it is still on disk:
+    /// the Repo's own checkout, else Forge's clone of it.
+    async fn recorded_repo_source(&self, workspace: &db::Workspace) -> Result<Option<PathBuf>> {
         let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id).await?;
-        if let Some(source) = repo
+        Ok(repo
             .as_ref()
             .and_then(|repo| {
                 repo.local_path
@@ -55,11 +57,15 @@ impl EmbeddedWorkspaceBackend {
                     .map(PathBuf::from)
                     .filter(|path| path.exists())
             })
-            .or_else(|| {
-                Some(self.workspace_root.join(".repos").join(&workspace.repo_id))
-                    .filter(|path| path.exists())
-            })
-        {
+            .or_else(|| Some(self.repo_cache_path(workspace)).filter(|path| path.exists())))
+    }
+
+    fn repo_cache_path(&self, workspace: &db::Workspace) -> PathBuf {
+        self.workspace_root.join(".repos").join(&workspace.repo_id)
+    }
+
+    async fn workspace_repo_source(&self, workspace: &db::Workspace) -> Result<PathBuf> {
+        if let Some(source) = self.recorded_repo_source(workspace).await? {
             return Ok(source);
         }
         // Workspace.repo_id survives Repo deletion. A surviving worktree can
@@ -410,10 +416,6 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
     async fn describe(&self, placement: &WorkspacePlacement) -> Result<WorkspaceState> {
         let workspace = self.workspace(placement).await?;
         let path = self.path(placement, &workspace);
-        let locked = match path.parent() {
-            Some(parent) => tokio::fs::try_exists(parent.join(".forge.lock")).await?,
-            None => false,
-        };
         let exists = tokio::fs::try_exists(path).await?;
         Ok(WorkspaceState {
             exists,
@@ -428,7 +430,9 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
             } else {
                 None
             },
-            locked,
+            // Server worktrees have no lock file; in-process keyed locks
+            // serialize their use.
+            locked: false,
             active_execution_ids: Vec::new(),
             journaled_execution_ids: Vec::new(),
         })
@@ -549,22 +553,82 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
 
     async fn cleanup(&self, placement: &WorkspacePlacement) -> Result<CleanupAck> {
         let workspace = self.workspace(placement).await?;
-        let source = self.workspace_repo_source(&workspace).await?;
+        let path = self.path(placement, &workspace);
+        let source = match self.recorded_repo_source(&workspace).await? {
+            Some(source) => source,
+            None => match self.workspace_repo_source(&workspace).await {
+                Ok(source) => source,
+                // Neither the repository nor a worktree that can name it is
+                // left, so there is no registration to remove: only the Task
+                // root remains. The absent cache path tells the manager that.
+                Err(_) => self.repo_cache_path(&workspace),
+            },
+        };
         let _guard = self
             .repo_cache_locks
             .acquire(&source.to_string_lossy())
             .await;
-        let path = self.path(placement, &workspace);
         let existed = tokio::fs::try_exists(&path).await?;
         match self
             .manager
             .cleanup_worktree(&workspace.task_id, &source, path)
             .await
         {
-            Ok(()) => Ok(CleanupAck { removed: existed }),
+            Ok(()) => {
+                if !existed && workspace.status != WorkspaceStatus::Cleaned {
+                    // Success with nothing at the recorded path: either the
+                    // directory was already removed, or the row names the
+                    // wrong place and the real one is still on disk.
+                    tracing::warn!(
+                        workspace_id = %workspace.id,
+                        task_id = %workspace.task_id,
+                        path = %path.display(),
+                        "workspace cleanup found no directory at the recorded path"
+                    );
+                }
+                Ok(CleanupAck { removed: existed })
+            }
             Err(WorkspaceError::NotFound) => Ok(CleanupAck { removed: false }),
             Err(error) => Err(error.into()),
         }
+    }
+
+    async fn reclaim_delivered_branch(
+        &self,
+        placement: &WorkspacePlacement,
+        target_branch: &str,
+    ) -> Result<bool> {
+        let workspace = self.workspace(placement).await?;
+        let Some(source) = self.recorded_repo_source(&workspace).await? else {
+            return Ok(false);
+        };
+        let _guard = self
+            .repo_cache_locks
+            .acquire(&source.to_string_lossy())
+            .await;
+        let outcome =
+            workspace::delete_delivered_task_branch(&source, &workspace.branch, target_branch)
+                .await?;
+        match &outcome {
+            workspace::TaskBranchReclaim::Deleted { tip } => tracing::info!(
+                task_id = %workspace.task_id,
+                branch = %workspace.branch,
+                %tip,
+                target_branch,
+                "deleted delivered Task branch"
+            ),
+            kept => tracing::debug!(
+                task_id = %workspace.task_id,
+                branch = %workspace.branch,
+                target_branch,
+                ?kept,
+                "kept Task branch"
+            ),
+        }
+        Ok(matches!(
+            outcome,
+            workspace::TaskBranchReclaim::Deleted { .. }
+        ))
     }
 
     async fn harvest_outbox(
