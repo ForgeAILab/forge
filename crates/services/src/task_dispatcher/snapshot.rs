@@ -417,8 +417,9 @@ impl TaskDispatcher {
                     {
                         f.terminal_execution = Some(e.id.clone());
                     }
+                    // A failure settles under the current Project revision
+                    // (see `annotate_executor_failure_block_with_retry`).
                     if e.status == ExecutionStatus::Failed
-                        && config_version == Some(project.version)
                         && !f.retry_pending
                         && metadata["last_execution_failure_execution_id"] != e.id
                         && !crate::project_environment::is_environment_pre_dispatch_failure(e)

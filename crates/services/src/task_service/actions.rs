@@ -1005,27 +1005,8 @@ impl TaskService {
                     .ok()
                 })
         });
-        let role_name = snapshot
-            .workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role)
-            .map(str::to_owned)
-            .or_else(|| {
-                snapshot
-                    .workflow
-                    .outgoing_trigger_targets(&task.status)
-                    .find_map(|(_, target)| {
-                        snapshot
-                            .workflow
-                            .states
-                            .iter()
-                            .find(|state| state.name == target)
-                            .and_then(crate::workflow::effective_role)
-                            .map(str::to_owned)
-                    })
-            });
+        let role_name =
+            crate::workflow::action_role(&snapshot.workflow, &task.status).map(str::to_owned);
         let assignment_id = role_name.as_deref().and_then(|role| {
             snapshot
                 .role_assignments

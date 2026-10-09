@@ -191,6 +191,57 @@ pub(crate) fn review_refresh_target(
 pub use dispatch::{AgentDispatchContext, AgentPrompt, PromptBuilder};
 pub use inherited_subtask_workflow::inherited_subtask_workflow;
 
+/// The state a claim enters from `status`: the first outgoing Active target,
+/// else the first Gate. System-only triggers count only from an Initial or
+/// Custom source.
+///
+/// A claim, the owner's `start` offer and the replay of a queued Task action
+/// all enter this state, so all three resolve it here.
+pub(crate) fn claim_target_state<'a>(
+    workflow: &'a WorkflowDefinition,
+    status: &str,
+) -> Option<&'a StateDefinition> {
+    let source_kind = workflow.state_kind(status);
+    let targets = workflow
+        .outgoing_trigger_targets(status)
+        .filter(|(trigger, _)| {
+            !trigger.system_only()
+                || matches!(source_kind, Some(StateKind::Initial | StateKind::Custom))
+        })
+        .filter_map(|(_, target)| workflow.states.iter().find(|state| state.name == target))
+        .collect::<Vec<_>>();
+    targets
+        .iter()
+        .find(|state| state.kind == StateKind::Active)
+        .or_else(|| targets.iter().find(|state| state.kind == StateKind::Gate))
+        .copied()
+}
+
+/// The role a role-launching Task action acts for in `status`: the role of
+/// the state itself, else the role of the state a claim would enter
+/// ([`claim_target_state`]). A state that has neither (it cannot be claimed)
+/// falls back to its first outgoing target that names a role.
+///
+/// The Agent an action is offered for, the role recorded with a queued action
+/// and the role its replay checks all come from here. Resolving them
+/// separately let `start` pick the Agent of one role and claim for another.
+pub(crate) fn action_role<'a>(workflow: &'a WorkflowDefinition, status: &str) -> Option<&'a str> {
+    let state_role = |name: &str| {
+        workflow
+            .states
+            .iter()
+            .find(|state| state.name == name)
+            .and_then(effective_role)
+    };
+    state_role(status)
+        .or_else(|| claim_target_state(workflow, status).and_then(effective_role))
+        .or_else(|| {
+            workflow
+                .outgoing_trigger_targets(status)
+                .find_map(|(_, target)| state_role(&target))
+        })
+}
+
 pub fn effective_role(state: &StateDefinition) -> Option<&str> {
     if let Some(role) = state.role.as_deref() {
         return Some(role);

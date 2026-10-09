@@ -44,6 +44,15 @@ impl TaskService {
                 "Task dependencies cannot reference a cancelled Task",
             ));
         }
+        // Adding a link that already exists is a no-op, not a constraint
+        // failure surfaced as an internal error.
+        if TaskDependencyRepo::list_dependencies(&*self.db, task_id)
+            .await?
+            .iter()
+            .any(|existing| existing == depends_on_id)
+        {
+            return Ok(());
+        }
         TaskDependencyRepo::add_dependency(&*self.db, task_id, depends_on_id, &now_rfc3339())
             .await?;
         Ok(())
@@ -186,10 +195,37 @@ impl TaskService {
         if cancelled_dependency_ids.is_empty() {
             return Ok(task.clone());
         }
-        if task.blocked_json.is_some() || task.failed_json.is_some() {
-            return Ok(task.clone());
-        }
+        // The blocker takes the place of whatever the Task was waiting on (a
+        // hold, a failure park, the saved condition of a queued action) and
+        // carries it, so removing the dependency puts it back.
+        let (cancelled_dependency_ids, superseded) = match dependency_block(task) {
+            Some(block) => {
+                let mut ids = block.cancelled_dependency_ids.clone();
+                for id in cancelled_dependency_ids {
+                    if !ids.contains(id) {
+                        ids.push(id.clone());
+                    }
+                }
+                if ids == block.cancelled_dependency_ids {
+                    return Ok(task.clone());
+                }
+                (ids, block.superseded)
+            }
+            None => (
+                cancelled_dependency_ids.to_vec(),
+                superseded_condition(task),
+            ),
+        };
+        self.write_dependency_block(task, &cancelled_dependency_ids, superseded)
+            .await
+    }
 
+    async fn write_dependency_block(
+        &self,
+        task: &Task,
+        cancelled_dependency_ids: &[String],
+        superseded: Option<Value>,
+    ) -> Result<Task> {
         let reason = format!(
             "required dependenc{} cancelled: {}",
             if cancelled_dependency_ids.len() == 1 {
@@ -229,7 +265,10 @@ impl TaskService {
             "created_at": now,
             "kind": api_types::FailureKind::WorkflowGuardRejected,
             "source": "dependency_gate",
-            "details": { "cancelled_dependency_ids": cancelled_dependency_ids },
+            "details": {
+                "cancelled_dependency_ids": cancelled_dependency_ids,
+                "superseded": superseded,
+            },
         })
         .to_string();
 
@@ -354,26 +393,46 @@ impl TaskService {
         .await
     }
 
+    /// Removing a cancelled dependency is the blocker's exit. While another
+    /// cancelled dependency remains the blocker names what is left; after the
+    /// last one the Task gets back the condition the blocker displaced, or a
+    /// clear one the dispatcher picks up.
     async fn clear_resolved_dependency_block(&self, task_id: &str) -> Result<()> {
         let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
             return Ok(());
         };
-        let dependency_block = task
-            .error_annotation
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<api_types::TaskBlockingAnnotation>(raw).ok())
-            .is_some_and(|annotation| annotation.blocking_reason == "dependency_cancelled");
-        if !dependency_block {
+        let Some(block) = dependency_block(&task) else {
             return Ok(());
-        }
+        };
         let dependencies = TaskDependencyRepo::list_dependencies(&*self.db, task_id).await?;
-        if !self
-            .cancelled_dependency_ids(&task, &dependencies)
-            .await?
-            .is_empty()
-        {
+        let remaining = self.cancelled_dependency_ids(&task, &dependencies).await?;
+        if !remaining.is_empty() {
+            if remaining != block.cancelled_dependency_ids {
+                self.write_dependency_block(&task, &remaining, block.superseded)
+                    .await?;
+            }
             return Ok(());
         }
+        // The displaced condition goes back only onto the Task it was taken
+        // from: a Task that has since finished, been cancelled or changed
+        // state has a newer story, and a stale hold or failure park written
+        // over it would name work that no longer exists.
+        let still_applies = !self.task_is_terminal(&task).await?
+            && block.superseded.as_ref().is_some_and(|superseded| {
+                superseded
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_none_or(|status| status == task.status)
+            });
+        let restored = |key: &str| {
+            block
+                .superseded
+                .as_ref()
+                .filter(|_| still_applies)
+                .and_then(|superseded| superseded.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
         TaskRepo::update(
             &*self.db,
             db::UpdateTask {
@@ -384,9 +443,9 @@ impl TaskService {
                 priority: None,
                 merge_config: None,
                 plan: None,
-                error_annotation: Some(None),
-                blocked_json: Some(None),
-                failed_json: None,
+                error_annotation: Some(restored("error_annotation")),
+                blocked_json: Some(restored("blocked_json")),
+                failed_json: Some(restored("failed_json")),
                 task_state_config: None,
                 parent_task_id: None,
                 updated_at: now_rfc3339(),
@@ -394,6 +453,18 @@ impl TaskService {
         )
         .await?;
         Ok(())
+    }
+
+    async fn task_is_terminal(&self, task: &Task) -> Result<bool> {
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &Actor::system(api_types::SystemComponent::Workflow),
+        );
+        Ok(workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal))
     }
 
     async fn task_is_cancelled(&self, task: &Task) -> Result<bool> {
@@ -411,4 +482,74 @@ impl TaskService {
                 .as_deref()
                 .unwrap_or(default_states::CANCELLED))
     }
+}
+
+/// The typed `dependency_cancelled` blocker a Task carries, if any.
+struct DependencyBlock {
+    cancelled_dependency_ids: Vec<String>,
+    /// The condition columns the blocker displaced.
+    superseded: Option<Value>,
+}
+
+fn dependency_block(task: &Task) -> Option<DependencyBlock> {
+    let annotation = task
+        .error_annotation
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<api_types::TaskBlockingAnnotation>(raw).ok())
+        .filter(|annotation| annotation.blocking_reason == "dependency_cancelled")?;
+    let cancelled_dependency_ids = annotation
+        .hook
+        .as_ref()
+        .and_then(|hook| hook.get("cancelled_dependency_ids"))
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let superseded = task
+        .blocked_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .map(|blocked| blocked["details"]["superseded"].clone())
+        .filter(Value::is_object);
+    Some(DependencyBlock {
+        cancelled_dependency_ids,
+        superseded,
+    })
+}
+
+/// What the Task is waiting on right now: its own condition columns, or the
+/// condition an accepted, not yet dispatched Task action saved.
+fn superseded_condition(task: &Task) -> Option<Value> {
+    let columns = |annotation: Option<&str>, blocked: Option<&str>, failed: Option<&str>| {
+        (annotation.is_some() || blocked.is_some() || failed.is_some()).then(|| {
+            json!({
+                "status": task.status,
+                "error_annotation": annotation,
+                "blocked_json": blocked,
+                "failed_json": failed,
+            })
+        })
+    };
+    columns(
+        task.error_annotation.as_deref(),
+        task.blocked_json.as_deref(),
+        task.failed_json.as_deref(),
+    )
+    .or_else(|| {
+        let queued = db::TaskMetadata::parse(task.metadata_json.as_deref())
+            .ok()?
+            .extra
+            .get(crate::deferred_dispatch::QUEUED_RECOVERY_KEY)
+            .cloned()?;
+        let saved = |key: &str| queued.get(key).and_then(Value::as_str);
+        columns(
+            saved("error_annotation"),
+            saved("blocked_json"),
+            saved("failed_json"),
+        )
+    })
 }

@@ -8,6 +8,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A subtask can no longer be created under a parent in review, integrating
+  or finished.** Creating a Task with a `parent_task_id` (REST, MCP, native
+  tools, `create_subtasks`) whose parent is terminal or in a review-phase
+  gate (`review`, `merging`) used to be accepted. Under a terminal parent,
+  or one whose review then passed, the subtask stayed in `todo` with a clear
+  condition and was never scheduled; it ran only if the parent was later
+  sent back to work. The call is now refused with
+  `409 SUBTASK_PARENT_CLOSED` (`-32602` with
+  `data.code = "SUBTASK_PARENT_CLOSED"` over MCP), naming the parent and its
+  state. Send the parent back to work first, or create a new root Task. A
+  parent in `merge_failed` still accepts a corrective subtask. Found by the
+  model-based workflow test.
 - **Forge deletes a Task branch once its change is delivered (3.4 stage
   A).** Task branches (`task/<first 8 characters of the Task id>`) used to
   stay in the repository forever. Now, when a server-owned workspace of a
@@ -1748,6 +1760,57 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   lost. Forge now reads whatever the pipe already holds once the limit passes
   (up to 4 MiB per stream), without waiting for more.
 
+- **A cancelled dependency no longer discards what its dependant was waiting
+  on.** The `dependency_cancelled` blocker used to overwrite a hold, and to
+  be skipped when the dependant was already parked for another reason: a
+  held Task ended up idle with a clear condition once the dependency was
+  removed, and a parked Task kept offering `retry`, `send_back` and
+  `restart`, each accepted and then refused as an untyped
+  `recovery_required: "dependency gate"` park that named no dependency. The
+  blocker now always replaces the current condition, names every cancelled
+  dependency, offers cancellation only, and keeps the displaced condition
+  (in `blocked.details.superseded`). Removing the last cancelled dependency
+  puts that condition back: a held Task is held again and offers `release`,
+  a parked Task offers its recovery again, and a Task that was waiting on
+  nothing is dispatched. The displaced condition is put back only while the
+  Task is still in the state it was taken in: a Task that was cancelled,
+  finished or moved meanwhile gets a clear condition instead of a stale park.
+  A Task action that was accepted before the dependency was cancelled ends
+  in the same typed blocker. An accepted action that meets an unfinished
+  dependency is no longer refused into the untyped park either: it stays
+  accepted, the Task shows the dependency wait an unstarted Task shows
+  (`dispatch_refusal`, offering `hold` and `cancel`), and the action runs
+  when the dependency finishes or its link is removed. Found by the
+  model-based workflow test.
+- **`start` on a queued Task no longer parks it as failed.** `start` was
+  offered for the Agent of the planning gate's role (any available Agent when
+  no planner is assigned) while the claim it makes enters `in_progress` for
+  the coder. With a different coder assigned the claim was refused, the Task
+  was parked `recovery_required` ("role 'coder' is assigned to a different
+  agent") and `retry` restored the same park. The offer, the queued action
+  and its replay now resolve the role the way a claim does, so `start` runs
+  the Task's coder: on a Task queued for capacity it is accepted and waits
+  for the slot, and it is not offered while that Agent is paused or offline
+  (resuming the Agent starts the Task).
+- **A run that fails after a Project edit, pause or resume is retried.** A
+  failure of a run dispatched under an older Project version was dropped:
+  no retry was scheduled, no blocker was written and the dispatcher's healer
+  skipped it, leaving the Task active with a `clear` condition and no run
+  until someone took `retry`. A failed run now spends the execution retry
+  budget and backs off (or blocks the Task when the budget is exhausted)
+  under the current Project, whichever version dispatched it; usage-limit
+  and provider-capacity failures, and failures reported by a daemon, follow
+  the same rule. Completions stay fenced to the Project version that
+  dispatched them. What fences a failure is that its run is still the
+  Task's current one: the Task is in the state, and the entry of that state,
+  the run was dispatched for, the run is the newest of its role and its
+  Agent still holds the role. A late failure of a run the Task has moved on
+  from, or that a newer run replaced, schedules nothing, spends no retry
+  and blocks nothing, on the server, usage-limit and daemon paths alike.
+
+- Adding a Task dependency that already exists is a no-op. It used to fail
+  the unique constraint and answer `500 internal_error`. Found by the new
+  model-based workflow test.
 - **A lifecycle script hook no longer runs in your own checkout when the
   Task worktree is gone (3.4 stage A).** If a server-owned workspace was on
   record but its directory was missing, a Project lifecycle hook silently ran

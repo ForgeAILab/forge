@@ -1104,11 +1104,20 @@ async fn reviewer_provider_unavailability_uses_bounded_task_retry_budget() {
         .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
         .await
         .expect("task claims");
-    sqlx::query("UPDATE execution SET role = 'reviewer' WHERE id = ?")
-        .bind(&claimed.execution.id)
-        .execute(db.pool())
-        .await
-        .expect("execution becomes reviewer-scoped");
+    // The run is rewritten into the review state's run, snapshot included: a
+    // failure only counts for the state entry its run was dispatched for.
+    sqlx::query(
+        "UPDATE execution
+         SET role = 'reviewer',
+             executor_config_snapshot_json = json_remove(
+                 json_set(executor_config_snapshot_json, '$.task_state', 'review'),
+                 '$.state_entry_token')
+         WHERE id = ?",
+    )
+    .bind(&claimed.execution.id)
+    .execute(db.pool())
+    .await
+    .expect("execution becomes reviewer-scoped");
     // A reviewer execution is only authorized while the Task is the
     // reviewer's to work, so move the Task with its assignment the way the
     // workflow would before the reviewer runs.
@@ -8168,8 +8177,12 @@ async fn superseded_project_revision_cannot_apply_completed_coder_guard_effects(
     assert_eq!(executions.items.len(), 1, "no follow-up may be launched");
 }
 
+/// A Project edit, pause or resume moves the Project version. A run that
+/// then fails must still be retried: dropping the failure left the Task
+/// active with no run, no retry and no park (model-based workflow test,
+/// `a_run_that_fails_after_a_project_pause_is_retried`).
 #[tokio::test]
-async fn superseded_project_revision_cannot_schedule_failed_execution_retry_or_block() {
+async fn failed_execution_from_a_superseded_project_revision_is_still_retried() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -8207,17 +8220,264 @@ async fn superseded_project_revision_cannot_schedule_failed_execution_retry_or_b
     service
         .annotate_executor_failure_block(&execution)
         .await
-        .expect("superseded failure is inert");
+        .expect("the failure is handled under the current revision");
 
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .expect("task loads")
         .expect("task exists");
     let metadata = current.metadata().expect("metadata parses");
-    assert!(metadata.extra.get("execution_retry_count").is_none());
-    assert!(metadata.extra.get("deferred_dispatch").is_none());
+    assert!(
+        metadata.extra.get("deferred_dispatch").is_some(),
+        "the retry is scheduled"
+    );
+    assert_eq!(
+        metadata
+            .extra
+            .get("last_execution_failure_execution_id")
+            .and_then(Value::as_str),
+        Some(execution.id.as_str()),
+        "the failure is recorded once"
+    );
     assert!(current.blocked_json.is_none());
     assert!(current.error_annotation.is_none());
+}
+
+/// A failed coder run dispatched under the Project revision before the
+/// current one. `snapshot` adds to its executor snapshot.
+async fn seed_failed_coder_execution_from_an_older_revision(
+    db: &SqliteDb,
+    task: &Task,
+    agent_id: &str,
+    snapshot: Value,
+) -> Execution {
+    let execution = seed_completed_coder_execution(db, task, agent_id, None).await;
+    let mut config = json!({
+        "executor_type": "shell",
+        "config": {},
+        "project_version": ProjectRepo::get_by_id(db, &task.project_id)
+            .await
+            .expect("project loads")
+            .expect("project exists")
+            .version,
+    });
+    for (key, value) in snapshot.as_object().into_iter().flatten() {
+        config[key] = value.clone();
+    }
+    sqlx::query(
+        "UPDATE execution
+         SET status = 'failed', error = 'executor failed', resume_policy = 'manual',
+             executor_config_snapshot_json = ?
+         WHERE id = ?",
+    )
+    .bind(config.to_string())
+    .bind(&execution.id)
+    .execute(db.pool())
+    .await
+    .expect("execution fails");
+    sqlx::query("UPDATE project SET version = version + 1 WHERE id = ?")
+        .bind(&task.project_id)
+        .execute(db.pool())
+        .await
+        .expect("project revision advances");
+    ExecutionRepo::get_by_id(db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists")
+}
+
+async fn failure_fence_fixture() -> (Arc<SqliteDb>, TaskService, Task, String) {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
+    (db, service, task, agent_id)
+}
+
+/// The failure left no trace on the Task: no retry, no charge, no blocker.
+async fn assert_failure_was_inert(db: &SqliteDb, task: &Task, why: &str) {
+    let current = TaskRepo::get_by_id(db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let metadata = current.metadata().expect("metadata parses");
+    assert!(metadata.extra.get("deferred_dispatch").is_none(), "{why}");
+    assert!(
+        metadata
+            .extra
+            .get("last_execution_failure_execution_id")
+            .is_none(),
+        "{why}"
+    );
+    assert_eq!(
+        db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+            .await
+            .expect("budget loads"),
+        0,
+        "{why}"
+    );
+    assert!(current.blocked_json.is_none(), "{why}");
+    assert!(current.error_annotation.is_none(), "{why}");
+    assert_eq!(current.version, task.version, "{why}");
+}
+
+fn failed_terminal_notification(execution: &Execution) -> api_types::ExecutionTerminalNotification {
+    serde_json::from_value(json!({
+        "terminal_report_id": new_uuid_v4(),
+        "execution_id": execution.id,
+        "exit_code": 1,
+        "signal": null,
+        "error": "executor failed",
+        "ts": now_rfc3339(),
+        "status": "failed",
+        "usage_reports": [],
+    }))
+    .expect("notification parses")
+}
+
+/// The fence on a failure is "still the Task's current run", not the Project
+/// revision: a late failure of a run that a newer run replaced must not
+/// schedule a second run beside it, spend budget, or block the Task.
+#[tokio::test]
+async fn failure_of_a_run_replaced_by_a_newer_run_is_inert_on_every_path() {
+    let (db, service, task, agent_id) = failure_fence_fixture().await;
+    let old =
+        seed_failed_coder_execution_from_an_older_revision(&db, &task, &agent_id, json!({})).await;
+    sqlx::query("UPDATE execution SET created_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+        .bind(&old.id)
+        .execute(db.pool())
+        .await
+        .expect("old run predates the new one");
+    let newer = seed_completed_coder_execution(&db, &task, &agent_id, None).await;
+    sqlx::query("UPDATE execution SET status = 'running' WHERE id = ?")
+        .bind(&newer.id)
+        .execute(db.pool())
+        .await
+        .expect("newer run is live");
+
+    service
+        .annotate_executor_failure_block(&old)
+        .await
+        .expect("server failure path");
+    assert_failure_was_inert(&db, &task, "server failure path").await;
+    service
+        .annotate_executor_unavailable_block(&old, Some(now_rfc3339()), json!([]))
+        .await
+        .expect("usage-limit path");
+    assert_failure_was_inert(&db, &task, "usage-limit path").await;
+    service
+        .settle_remote_terminal_postcommit(&old, &failed_terminal_notification(&old), false)
+        .await
+        .expect("daemon terminal path");
+    assert_failure_was_inert(&db, &task, "daemon terminal path").await;
+}
+
+/// A Task that left the state and came back (sent back, re-planned, reopened)
+/// is on a new entry of it: the old entry's run cannot charge the new one.
+#[tokio::test]
+async fn failure_of_a_run_from_an_earlier_state_entry_is_inert_on_every_path() {
+    let (db, service, task, agent_id) = failure_fence_fixture().await;
+    let old = seed_failed_coder_execution_from_an_older_revision(
+        &db,
+        &task,
+        &agent_id,
+        json!({ "task_state": "in_progress", "state_entry_token": "an-earlier-entry" }),
+    )
+    .await;
+
+    service
+        .annotate_executor_failure_block(&old)
+        .await
+        .expect("server failure path");
+    assert_failure_was_inert(&db, &task, "server failure path").await;
+    service
+        .annotate_executor_unavailable_block(&old, Some(now_rfc3339()), json!([]))
+        .await
+        .expect("usage-limit path");
+    assert_failure_was_inert(&db, &task, "usage-limit path").await;
+    service
+        .settle_remote_terminal_postcommit(&old, &failed_terminal_notification(&old), false)
+        .await
+        .expect("daemon terminal path");
+    assert_failure_was_inert(&db, &task, "daemon terminal path").await;
+}
+
+/// A Task the Project moved on from (cancelled, or in a state another role
+/// owns) is not blocked or retried by the old run's failure.
+#[tokio::test]
+async fn failure_of_a_run_whose_task_moved_on_is_inert() {
+    for status in ["cancelled", "review", "todo"] {
+        let (db, service, task, agent_id) = failure_fence_fixture().await;
+        let old =
+            seed_failed_coder_execution_from_an_older_revision(&db, &task, &agent_id, json!({}))
+                .await;
+        sqlx::query("UPDATE task SET status = ? WHERE id = ?")
+            .bind(status)
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .expect("task moves on");
+        service
+            .annotate_executor_failure_block(&old)
+            .await
+            .expect("server failure path");
+        service
+            .settle_remote_terminal_postcommit(&old, &failed_terminal_notification(&old), false)
+            .await
+            .expect("daemon terminal path");
+        assert_failure_was_inert(&db, &task, status).await;
+    }
+}
+
+/// The daemon terminal path retries a failure from an older Project revision,
+/// and a redelivered failure (or the dispatcher's healer after it) spends the
+/// retry budget once.
+#[tokio::test]
+async fn daemon_reported_failure_from_an_older_revision_is_retried_and_charged_once() {
+    let (db, service, task, agent_id) = failure_fence_fixture().await;
+    let old =
+        seed_failed_coder_execution_from_an_older_revision(&db, &task, &agent_id, json!({})).await;
+
+    for _ in 0..2 {
+        service
+            .settle_remote_terminal_postcommit(&old, &failed_terminal_notification(&old), false)
+            .await
+            .expect("daemon terminal path");
+        let old = ExecutionRepo::get_by_id(&*db, &old.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        service
+            .annotate_executor_failure_block(&old)
+            .await
+            .expect("healer path");
+    }
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let metadata = current.metadata().expect("metadata parses");
+    assert!(
+        metadata.extra.get("deferred_dispatch").is_some(),
+        "the retry is scheduled"
+    );
+    assert_eq!(
+        db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+            .await
+            .expect("budget loads"),
+        1,
+        "one failure spends one retry"
+    );
+    assert!(current.blocked_json.is_none());
 }
 
 #[tokio::test]
