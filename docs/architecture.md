@@ -3563,9 +3563,9 @@ directory from a transient Git failure):
 |---|---|---|
 | Linked worktree, HEAD on the Task branch (or mid-rebase) | valid; a stale cleanup deadline is cleared | valid |
 | Directory missing, or present and unusable by Git | repaired or recreated from the Task branch (as above) | `Absent`; disk and the workspace row are untouched (a legacy row with no placement still gets its server placement recorded) |
-| Linked worktree of a repository other than the recorded one | moved aside as `<name>.broken-<ms>` and recreated from the Task branch; never relinked. When no recorded repository has the Task branch (a worktree made before its Repo moved to another location), the worktree is the only home of the Task's work and is used as it is | `Absent`, or valid in the same exception |
+| Linked worktree of a repository other than the recorded one | moved aside as `<name>.broken-<ms>` and recreated from the Task branch; never relinked. When no recorded repository has the Task branch and the worktree is checked out on exactly that branch (a worktree made before its Repo moved to another location), the worktree is the only home of the Task's work and is used as it is; on any other branch it is never used | `Absent`, or valid in the same exception |
 | The worktree path, or its Task root, is a symbolic link | `ResetRequired`; nothing is used, moved or deleted | `Absent` |
-| HEAD on another branch or detached, Task branch exists, no rebase in progress | Put back on the Task branch without losing a commit. HEAD is the Task branch's own commit: `git checkout <Task branch>`; no file changes and local changes are kept. HEAD is strictly ahead of the Task branch (commits made on a detached HEAD, or after an interrupted rebase finished): the Task branch is advanced to HEAD with a compare-and-swap `git update-ref` and checked out; no file changes, local changes are kept (`Repair::FastForwardedTaskBranch`). HEAD and the Task branch have diverged: HEAD's commit is kept under `refs/forge/rescued/<task id>/<UTC timestamp>` in the worktree's repository, one Forge comment on the Task names the ref and the commit, and the Task branch is checked out (`Repair::RescuedOffBranchCommits`); the checkout is never forced, so when it would overwrite uncommitted changes nothing moves and the result is `ResetRequired` naming the ref. One ref and one comment per rescued commit, however often the state is seen. HEAD is behind the Task branch: `Execute` checks the branch out when the tree is clean, else `ResetRequired`; the others return `ResetRequired`. `Reset` is the exception to all of these: it returns the worktree as it is, flagged off-branch, for the caller's `git reset --hard HEAD` | valid, flagged off-branch |
+| HEAD on another branch or detached, Task branch exists, no rebase in progress | Put back on the Task branch without losing a commit. HEAD is the Task branch's own commit: `git checkout <Task branch>`; no file changes and local changes are kept. HEAD is strictly ahead of the Task branch (commits made on a detached HEAD, or after an interrupted rebase finished): the Task branch is advanced to HEAD with a compare-and-swap `git update-ref` and checked out; no file changes, local changes are kept (`Repair::FastForwardedTaskBranch`). The exception: when HEAD is already contained in the Repo's default branch (local or `origin`), its extra commits are the target's, not the Task's, and the Task branch is never advanced to them; that state is handled like HEAD behind the Task branch. HEAD and the Task branch have diverged: HEAD's commit is kept under `refs/forge/rescued/<task id>/<UTC timestamp>` in the worktree's repository, one Forge comment on the Task names the ref and the commit, and the Task branch is checked out (`Repair::RescuedOffBranchCommits`); the checkout is never forced, so when it would overwrite uncommitted changes nothing moves and the result is `ResetRequired` naming the ref. One ref and one comment per rescued commit, however often the state is seen; at most the five newest refs per Task are kept, all of a Task's are deleted when its workspace is cleaned up, and the comment is not loaded into agent prompts. HEAD is behind the Task branch: `Execute` checks the branch out when the tree is clean, else `ResetRequired`; the others return `ResetRequired`. `Reset` is the exception to all of these: it returns the worktree as it is, flagged off-branch, for the caller's `git reset --hard HEAD` | valid, flagged off-branch |
 | Worktree and Task branch both gone | `ResetRequired`; the row is kept, except on the owning Task's launch path, which forgets it so the next launch starts from the default branch. A worktree of another repository that Git can still use is never forgotten | `Absent` |
 | Row not `ready` | `workspace for task … is not ready` | reports the disk as above |
 
@@ -3580,8 +3580,10 @@ prepare contract described above; the manager never interprets their handle.
 Callers: every claim on a `ready` server placement (`Execute`; the launch guard
 all executor families share, CLI executors included), every `prepare_workspace`
 path (`Execute`: workspace creation, the reviewer cascade, retry-entry
-refresh), the execution runner at launch and the provider start parameters
-(`Execute`), the native executor at the start of a turn (`Execute`, with the
+refresh), the provider start parameters (`Execute`), the execution runner at
+launch (`claimed_path`: a filesystem-only confirmation that the worktree the
+claim just checked is still there and confined, no Git process, falling back
+to `Execute` when it is not), the native executor at the start of a turn (`Execute`, with the
 Task service's workspace root and repository-cache locks), reassignment reset
 (`Reset`), review entry CI (`Check`), review rerun (`Review`), blocking
 `before_work` hooks (`Hook`), merge delivery and target-moved rebase
@@ -3591,7 +3593,7 @@ A claim on a daemon placement still asks its owner's `describe`. One Task run
 with one coding execution and one review makes about seven to ten manager
 calls, each one Git process on a healthy worktree: claim (1, replacing the
 three Git processes of the backend `describe` it used before), runner launch
-(1), native turn start (1 per turn, native executors only), a blocking
+(0), native turn start (1 per turn, native executors only), a blocking
 `before_work` hook (1), entry CI (1), review rerun or reviewer cascade (1),
 delivery (1), a rebase when the target moved (1), and one `Inspect` per
 lifecycle event that has script hooks.
@@ -3616,7 +3618,11 @@ Files that sit beside the worktree in the Task root (the canonical plan,
 staged plans, execution outboxes) are located through
 `workspace_manager::task_root_anchor`. They outlive the worktree, so they are
 read and discarded whether or not the worktree is usable; the readers confine
-each file to the Task root themselves. A source-scan test,
+each file to the Task root themselves. The anchor refuses a recorded path
+that is relative, contains `..`, has no Task root above it, or is (or sits
+under a Task root that is) a symbolic link. It does not compare the path with
+the configured workspace root, because rows outlive a changed root. The
+anchors are counted by the same source-scan gate as the raw getters. A source-scan test,
 `workspace_manager::tests::raw_workspace_path_getters_have_no_new_callers`,
 records an upper bound per file for the remaining non-test uses of the raw
 path getters (`ResolvedWorkspace::embedded_path`,

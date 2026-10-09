@@ -55,16 +55,7 @@ pub async fn load_agent_dispatch_context(
     .await?
     .items
     .into_iter()
-    // "A lifecycle hook was not run" is Forge's note on the Task record for
-    // the people operating it. It is not an instruction and not something an
-    // agent can act on, so it stays out of the prompt.
-    .filter(|comment| {
-        !(comment.author_type == db::CommentAuthorType::System
-            && comment
-                .idempotency_key
-                .as_deref()
-                .is_some_and(|key| key.starts_with(crate::lifecycle::HOOK_NOT_RUN_COMMENT_KEY)))
-    })
+    .filter(|comment| !is_operator_note(comment))
     .collect::<Vec<_>>();
     let prior_reviews = ReviewRepo::list_by_task(&*db, task_id).await?;
     let parent_task = match task.parent_task_id.as_deref() {
@@ -488,10 +479,62 @@ fn tail_chars(value: &str, limit: usize) -> String {
     format!("[truncated]\n{}", &value[start..])
 }
 
+/// Forge's own notes on the Task record for the people operating it ("a
+/// lifecycle hook was not run", "off-branch commits were kept under a ref").
+/// They are not instructions and not something an agent can act on, so they
+/// stay out of the prompt.
+fn is_operator_note(comment: &db::TaskComment) -> bool {
+    comment.author_type == db::CommentAuthorType::System
+        && comment.idempotency_key.as_deref().is_some_and(|key| {
+            key.starts_with(crate::lifecycle::HOOK_NOT_RUN_COMMENT_KEY)
+                || key.starts_with(crate::workspace_manager::RESCUED_COMMENT_KEY)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use db::{CreateProject, CreateTask, ProjectRepo, TaskRepo};
+
+    #[test]
+    fn operator_notes_stay_out_of_agent_prompts() {
+        let comment = |author_type: db::CommentAuthorType, key: Option<&str>| db::TaskComment {
+            id: "c".to_owned(),
+            task_id: "task".to_owned(),
+            author_type,
+            author_id: None,
+            author_name: "Forge".to_owned(),
+            content: "note".to_owned(),
+            execution_id: None,
+            role: None,
+            worklog_kind: None,
+            idempotency_key: key.map(str::to_owned),
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        let system = || db::CommentAuthorType::System;
+        let hook = format!(
+            "{}task:before_review",
+            crate::lifecycle::HOOK_NOT_RUN_COMMENT_KEY
+        );
+        let rescued = format!(
+            "{}task:abc123",
+            crate::workspace_manager::RESCUED_COMMENT_KEY
+        );
+        assert!(is_operator_note(&comment(system(), Some(&hook))));
+        assert!(is_operator_note(&comment(system(), Some(&rescued))));
+        // Everything else is still loaded: other Forge comments, and a
+        // comment by anyone else whatever key it carries.
+        assert!(!is_operator_note(&comment(system(), None)));
+        assert!(!is_operator_note(&comment(
+            system(),
+            Some("review-result:1")
+        )));
+        assert!(!is_operator_note(&comment(
+            db::CommentAuthorType::User,
+            Some(&rescued)
+        )));
+    }
 
     #[test]
     fn new_execution_policy_does_not_resume_previous_execution() {

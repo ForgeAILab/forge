@@ -861,16 +861,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   recreated from the Task branch inside the same step; that, and the repairs
   above, spend no review or retry budget and happen at most once per step.
   Unchanged: HEAD behind the Task branch is checked out only for a launch on
-  a clean tree. `refs/forge/rescued/*` refs are never deleted by Forge.
+  a clean tree. A HEAD that is ahead of the Task branch only by commits the
+  target branch already has (the target was checked out in the worktree) never
+  advances the Task branch, which would have made the Task look delivered with
+  nothing to review; it is handled like a HEAD behind the Task branch. Forge
+  keeps at most the five newest `refs/forge/rescued/<task id>/*` refs per Task
+  and deletes all of a Task's when its workspace is cleaned up (after the
+  usual retention); the comment naming a rescue ref is not loaded into agent
+  prompts.
   Error text that changed or is new:
   - `workspace reset required for task <id>: worktree HEAD is on <ref>, not on Task branch '<branch>'; its <n> commit(s) are kept under refs/forge/rescued/<task id>/<ts>, and checking the Task branch out failed (uncommitted changes would be overwritten)` (new).
   - `… HEAD has <n> commit(s) that are not on the Task branch, so the branch was not checked out; move them onto the Task branch (or reset the workspace to discard them)` is no longer produced; the rare failures to advance the branch or write the ref say so instead.
   - Task comment (new): `The Task worktree was on <ref> with <n> commit(s) that are not on Task branch '<branch>', which has <m> commit(s) they do not build on. Forge kept those commits under `refs/forge/rescued/…` (<sha>) and put the worktree back on the Task branch. …`
 - **Every launch checks the workspace the same way (3.4 stage B, part 2).**
   A claim on a server-owned workspace that is already ready now goes through
-  `WorkspaceManager::ensure_valid` instead of the backend's own check, and the
-  execution runner checks again at launch, so CLI executors get the guard
-  native executors had: a deleted directory is recreated and an off-branch
+  `WorkspaceManager::ensure_valid` instead of the backend's own check, so CLI
+  executors get the guard native executors had (at launch the runner only
+  confirms on the filesystem that the claimed worktree is still there and
+  confined, starting no Git process, and falls back to the full check when it
+  is not): a deleted directory is recreated and an off-branch
   worktree is put back before anything is started there. Before, a CLI
   executor could be started on whatever HEAD the worktree was left on. The
   healthy claim costs one Git process instead of three. The native executor's
@@ -880,10 +889,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   terminal with its existing path-guardrail error, evidence capture with
   `Task workspace is unavailable: its worktree is not usable`). Plan,
   staged-plan and execution-outbox files, which sit beside the worktree, are
-  read as before whether or not the worktree is there. A worktree that
-  belongs to a repository other than the recorded one is used as it is when
-  no recorded repository has the Task branch (a worktree made before its Repo
-  moved to another location); part 1 asked for a reset there. No REST, MCP,
+  read as before whether or not the worktree is there, except that a recorded
+  worktree path that is relative, contains `..`, has no Task root above it, or
+  is (or sits under a Task root that is) a symbolic link is refused before any
+  of those files is read, written or deleted. A worktree that belongs to a
+  repository other than the recorded one is used as it is only when it is
+  checked out on the Task branch and no recorded repository has that branch
+  (a worktree made before its Repo moved to another location); part 1 asked
+  for a reset there. On any other branch it is never used. No REST, MCP,
   event or CLI shape changes.
 - **The "lifecycle hook was not run" comment stays out of agent prompts (3.4
   stage B, part 2).** It was loaded into coder, worker and read-only prompts

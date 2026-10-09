@@ -8,8 +8,8 @@
 //!
 //! The manager never writes Task rows: callers map the outcome through their
 //! existing producers. The one thing it records itself is a Forge comment
-//! naming the ref that keeps commits it moved HEAD away from. `From<WorkspaceUnavailable> for ServiceError` keeps the
-//! error variants the dispatcher, HTTP and MCP layers already match on.
+//! naming the ref that keeps commits it moved HEAD away from.
+//! `From<WorkspaceUnavailable> for ServiceError` keeps the error variants the dispatcher, HTTP and MCP layers already match on.
 
 use std::{
     path::{Path, PathBuf},
@@ -279,6 +279,45 @@ impl<'a> WorkspaceManager<'a> {
             .await
     }
 
+    /// The directory an execution the claim just admitted starts in.
+    ///
+    /// The claim checked this workspace against Git moments ago
+    /// (`prepare_claim_workspace`), so the launch does not start another Git
+    /// process between the spawn and the executor: it confirms on the
+    /// filesystem alone that the recorded worktree is still confined to its
+    /// Task root and still there. Anything else (directory gone, no Git
+    /// link, a symbolic link, a row that is not `ready`, a daemon placement)
+    /// takes the full [`Self::ensure_valid`] check and its repairs.
+    pub(crate) async fn claimed_path(
+        &self,
+        task: &Task,
+        workspace: Workspace,
+    ) -> Result<ValidWorkspace, WorkspaceUnavailable> {
+        let on_server = WorkspacePlacementRepo::get_by_workspace_id(self.db, &workspace.id)
+            .await?
+            .is_some_and(|placement| {
+                placement.owner_kind == PlacementOwnerKind::Server
+                    && placement.state == PlacementState::Ready
+            });
+        if on_server && workspace.status == WorkspaceStatus::Ready {
+            let resolved =
+                resolve_workspace_backend(self.db, self.workspace_root, &workspace, self.router)
+                    .await?;
+            let path = resolved.embedded_path()?;
+            if self
+                .confinement_violation(&workspace, &path)
+                .await?
+                .is_none()
+                && tokio::fs::try_exists(path.join(".git"))
+                    .await
+                    .unwrap_or(false)
+            {
+                return Ok(valid(workspace, resolved, path, Repair::None, true));
+            }
+        }
+        self.ensure_valid(task, workspace, Purpose::Execute).await
+    }
+
     async fn ensure_valid_inner(
         &self,
         task: &Task,
@@ -357,7 +396,8 @@ impl<'a> WorkspaceManager<'a> {
                 Ok(valid(workspace, resolved, path, Repair::None, false))
             }
             Observed::OffBranch { head } => {
-                self.return_to_task_branch(task, workspace, resolved, path, purpose, &head)
+                let target = repo.as_ref().map(|repo| repo.default_branch.as_str());
+                self.return_to_task_branch(task, workspace, resolved, path, purpose, &head, target)
                     .await
             }
             observed @ (Observed::Missing | Observed::Invalid | Observed::Foreign { .. }) => {
@@ -399,6 +439,11 @@ impl<'a> WorkspaceManager<'a> {
     /// - HEAD is strictly ahead of the Task branch (the agent committed on a
     ///   detached HEAD, or after an interrupted rebase finished): the Task
     ///   branch is advanced to HEAD and checked out. No file changes.
+    /// - HEAD is ahead of the Task branch only by commits the target branch
+    ///   already has (someone checked the target out here): the Task branch
+    ///   is never advanced to them, which would make the Task look delivered
+    ///   with nothing to review. Nothing needs keeping, so this is handled
+    ///   like a HEAD behind the Task branch.
     /// - HEAD has diverged from the Task branch: its commits are kept under
     ///   `refs/forge/rescued/<task>/<ts>`, a Forge comment on the Task says
     ///   so, and the Task branch is checked out. Git refuses the checkout
@@ -406,6 +451,7 @@ impl<'a> WorkspaceManager<'a> {
     ///   needs the explicit reset and the reason names the ref.
     /// - HEAD is behind the Task branch: the checkout moves the tree, so only
     ///   [`Purpose::Execute`] does it, and only on a clean worktree.
+    #[allow(clippy::too_many_arguments)]
     async fn return_to_task_branch(
         &self,
         task: &Task,
@@ -414,6 +460,7 @@ impl<'a> WorkspaceManager<'a> {
         path: PathBuf,
         purpose: Purpose,
         head: &str,
+        target_branch: Option<&str>,
     ) -> Result<ValidWorkspace, WorkspaceUnavailable> {
         let reset_required = |detail: &str| WorkspaceUnavailable::ResetRequired {
             task_id: workspace.task_id.clone(),
@@ -436,7 +483,10 @@ impl<'a> WorkspaceManager<'a> {
         };
         let mut repair = Repair::CheckedOutTaskBranch;
         let mut rescued_ref = None;
-        if ahead > 0 && behind == 0 {
+        let only_target_history = ahead > 0
+            && behind == 0
+            && target_branch_contains(&path, target_branch, &workspace.branch, &head_sha).await;
+        if ahead > 0 && behind == 0 && !only_target_history {
             // Compare-and-swap on the commit just compared: a Task branch
             // that moved in between is not overwritten.
             if !git_succeeds(&path, &["update-ref", &task_ref, &head_sha, &branch_sha]).await {
@@ -446,7 +496,7 @@ impl<'a> WorkspaceManager<'a> {
                 )));
             }
             repair = Repair::FastForwardedTaskBranch;
-        } else if ahead > 0 {
+        } else if ahead > 0 && behind > 0 {
             let Some(kept) = self
                 .rescue_off_branch_commits(task, &workspace, &path, head, &head_sha, ahead, behind)
                 .await
@@ -458,7 +508,7 @@ impl<'a> WorkspaceManager<'a> {
             };
             repair = Repair::RescuedOffBranchCommits;
             rescued_ref = Some(kept);
-        } else if behind > 0 {
+        } else if behind > 0 || only_target_history {
             if purpose != Purpose::Execute {
                 return Err(reset_required(
                     "the candidate is not moved for this operation",
@@ -543,6 +593,7 @@ impl<'a> WorkspaceManager<'a> {
                 if !git_succeeds(path, &["update-ref", &kept, head_sha]).await {
                     return None;
                 }
+                prune_rescued_refs(path, &namespace, RESCUED_REFS_PER_TASK).await;
                 kept
             }
         };
@@ -567,7 +618,7 @@ impl<'a> WorkspaceManager<'a> {
                 execution_id: None,
                 role: None,
                 worklog_kind: None,
-                idempotency_key: Some(format!("workspace-rescued:{}:{head_sha}", task.id)),
+                idempotency_key: Some(format!("{RESCUED_COMMENT_KEY}{}:{head_sha}", task.id)),
                 created_at: now.clone(),
                 updated_at: now,
             },
@@ -714,16 +765,23 @@ impl<'a> WorkspaceManager<'a> {
             let task_ref = format!("refs/heads/{}", workspace.branch);
             let foreign = !recorded.is_empty() && !recorded.contains(&identity.common_dir);
             // Replacing it needs the Task branch in a recorded repository.
-            // When none has it (a worktree made before its Repo moved to
-            // another location), this worktree is the only home of the
-            // Task's work and stays the one it runs in, as it always was.
-            if foreign && !any_repository_has_ref(&recorded, &task_ref).await {
+            // When none has it and this worktree is checked out on exactly
+            // the Task branch (a worktree made before its Repo moved to
+            // another location), it is the only home of the Task's work and
+            // stays the one it runs in, as it always was. A worktree of
+            // another repository on any other branch is not this Task's and
+            // nothing is run in it.
+            if foreign
+                && identity.head_ref == task_ref
+                && !any_repository_has_ref(&recorded, &task_ref).await
+            {
                 tracing::warn!(
                     task_id = %workspace.task_id,
                     workspace_id = %workspace.id,
                     worktree_repository = %identity.common_dir.display(),
-                    "worktree belongs to a repository other than the recorded one, which does \
-                     not have the Task branch; the worktree is used as it is"
+                    "worktree on the Task branch belongs to a repository other than the \
+                     recorded one, which does not have that branch; the worktree is used as \
+                     it is"
                 );
             } else if foreign {
                 return Ok(Observed::Foreign {
@@ -872,10 +930,40 @@ pub(crate) async fn inspect_path(
 /// recreated or is gone still has its plan). This is not a directory to run
 /// anything in; the readers confine every file to the Task root themselves.
 /// A daemon placement has no such path on this host.
+///
+/// The recorded path is refused before anything is read, written or deleted
+/// beside it when it is not absolute, contains `..`, has no Task root above
+/// it, or when it or its Task root is a symbolic link: the files would then
+/// land somewhere Forge did not create.
 pub(crate) fn task_root_anchor(
     resolved: &ResolvedWorkspace,
 ) -> Result<PathBuf, crate::workspace_backend::WorkspaceBackendError> {
-    resolved.embedded_path()
+    confined_anchor(resolved.embedded_path()?).map_err(Into::into)
+}
+
+fn confined_anchor(path: PathBuf) -> Result<PathBuf, ServiceError> {
+    let refused = |why: &str| {
+        ServiceError::invalid_operation(format!(
+            "recorded workspace path {} {why}; the Task-root files beside it are not touched",
+            path.display()
+        ))
+    };
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(refused("is not an absolute path without `..`"));
+    }
+    let Some(task_root) = path.parent().filter(|root| root.parent().is_some()) else {
+        return Err(refused("has no Task root above it"));
+    };
+    for checked in [task_root, path.as_path()] {
+        if std::fs::symlink_metadata(checked).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(refused("runs through a symbolic link"));
+        }
+    }
+    Ok(path)
 }
 
 /// [`task_root_anchor`] for a caller that holds only the placement row.
@@ -887,11 +975,12 @@ pub(crate) fn task_root_anchor_of(
             "workspace is not owned by the Forge host",
         ));
     }
-    placement
+    let path = placement
         .workspace_handle
         .as_deref()
         .map(PathBuf::from)
-        .ok_or_else(|| ServiceError::invalid_operation("workspace has no server handle"))
+        .ok_or_else(|| ServiceError::invalid_operation("workspace has no server handle"))?;
+    confined_anchor(path)
 }
 
 fn valid(
@@ -973,6 +1062,93 @@ async fn worktree_identity(path: &Path) -> Result<Option<WorktreeIdentity>, Work
 
 /// Refs that keep commits Forge moved a worktree's HEAD away from.
 pub(crate) const RESCUED_REF_NAMESPACE: &str = "refs/forge/rescued";
+
+/// The newest rescue refs kept per Task; older ones are deleted when a new
+/// one is written. All of them go when the workspace is reclaimed.
+pub(crate) const RESCUED_REFS_PER_TASK: usize = 5;
+
+/// Idempotency-key prefix of the Forge comment that names a rescue ref. It
+/// is a note for the people operating the Task and stays out of agent
+/// prompts.
+pub(crate) const RESCUED_COMMENT_KEY: &str = "workspace-rescued:";
+
+/// Rescue refs under `namespace`, newest first (their names end in a UTC
+/// timestamp).
+async fn rescued_refs_newest_first(git_dir: &Path, namespace: &str) -> Vec<String> {
+    let output = git_at(git_dir)
+        .args(["for-each-ref", "--sort=-refname", "--format=%(refname)"])
+        .arg(namespace)
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+async fn prune_rescued_refs(git_dir: &Path, namespace: &str, keep: usize) {
+    for stale in rescued_refs_newest_first(git_dir, namespace)
+        .await
+        .into_iter()
+        .skip(keep)
+    {
+        git_succeeds(git_dir, &["update-ref", "-d", &stale]).await;
+    }
+}
+
+/// Delete every rescue ref of the Task that owns `workspace`. Called when
+/// the workspace is reclaimed, after the retention its cleanup waited for:
+/// from then on the refs would only accumulate in the user's repository.
+/// Best effort; a daemon placement has none.
+pub(crate) async fn delete_rescued_refs(
+    workspace_root: &Path,
+    workspace: &Workspace,
+    resolved: &ResolvedWorkspace,
+) {
+    if resolved.placement.owner_kind != PlacementOwnerKind::Server {
+        return;
+    }
+    let namespace = format!("{RESCUED_REF_NAMESPACE}/{}", workspace.task_id);
+    let worktree = resolved.embedded_path().ok();
+    let clone = workspace_root.join(".repos").join(&workspace.repo_id);
+    for git_dir in worktree.iter().chain([&clone]) {
+        if tokio::fs::try_exists(git_dir).await.unwrap_or(false) {
+            prune_rescued_refs(git_dir, &namespace, 0).await;
+        }
+    }
+}
+
+/// Whether `sha` is already part of the target branch (local or its
+/// `origin` copy). An unknown target falls back to any branch other than
+/// the Task branch.
+async fn target_branch_contains(
+    path: &Path,
+    target_branch: Option<&str>,
+    task_branch: &str,
+    sha: &str,
+) -> bool {
+    let patterns = match target_branch.filter(|target| *target != task_branch) {
+        Some(target) => vec![
+            format!("refs/heads/{target}"),
+            format!("refs/remotes/origin/{target}"),
+        ],
+        None => vec!["refs/heads".to_owned(), "refs/remotes".to_owned()],
+    };
+    let output = git_at(path)
+        .args(["for-each-ref", "--format=%(refname)", "--contains", sha])
+        .args(&patterns)
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|name| name != format!("refs/heads/{task_branch}")),
+        _ => false,
+    }
+}
 
 async fn git_succeeds(path: &Path, args: &[&str]) -> bool {
     match git_at(path).args(args).output().await {

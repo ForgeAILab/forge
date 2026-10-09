@@ -466,18 +466,19 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-        // The claim checked this workspace; the launch happens now. Check it
-        // again so no executor family is started in a directory that
-        // vanished or left the Task branch in between. Every later use in
-        // this run (plan staging, outbox ingest and discard) takes this
-        // validated path.
+        // The claim checked this workspace against Git; the launch happens
+        // now. `claimed_path` confirms on the filesystem alone that the
+        // worktree is still there and confined (no Git process between the
+        // spawn and the executor) and falls back to the full check and its
+        // repairs when it is not. Every later use in this run (plan staging,
+        // outbox ingest and discard) takes this path.
         let valid = crate::workspace_manager::WorkspaceManager::new(
             &self.db,
             &self.workspace_root,
             self.repo_cache_locks.clone(),
             &self.workspace_backend_router,
         )
-        .ensure_valid(&task, workspace, crate::workspace_manager::Purpose::Execute)
+        .claimed_path(&task, workspace)
         .await?;
         let worktree_path = valid
             .path()
