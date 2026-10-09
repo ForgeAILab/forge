@@ -423,8 +423,17 @@ struct World {
     trace: Vec<String>,
 }
 
+/// Rounds a livelock is given before it is reported, and the least wall time
+/// it is given as well: a loaded runner makes every round slow, and work a
+/// run leaves to a spawned task is measured in time, not in rounds.
 const QUIESCENCE_BOUND: usize = 400;
-const QUIESCENCE_FLOOR: Duration = Duration::from_millis(60);
+const QUIESCENCE_PATIENCE: Duration = Duration::from_secs(90);
+/// How long the state must stay unchanged to count as settled. Work that a
+/// finished run hands to a spawned task has no row to watch while it is
+/// pending; on a loaded 4-core runner (eight tests, four workers each) that
+/// task can wait tens of milliseconds for a thread.
+const QUIESCENCE_FLOOR: Duration = Duration::from_millis(250);
+const BUSY_RETRIES: usize = 8;
 const SETTLE_ROUNDS: usize = 20;
 const INITIAL: [&str; 2] = ["backlog", "todo"];
 const TERMINAL: [&str; 2] = ["done", "cancelled"];
@@ -755,7 +764,9 @@ impl World {
             .await?;
         if !status.is_success() {
             // Refusing a child of a Task that already moved on is legitimate.
-            return Ok(format!("refused {status} {}", task["message"]));
+            // The code, not the message: the message names the parent by
+            // its random id, and the trace has to be the same on every run.
+            return Ok(format!("refused {status} {}", task["code"]));
         }
         let id = task["id"]
             .as_str()
@@ -826,18 +837,37 @@ impl World {
                 (false, false) if deadline > soon => json!(FROZEN),
                 _ => continue,
             };
-            db::TaskRepo::mutate_metadata(
-                &*self.live().state.db,
-                id,
-                None,
-                vec![db::TaskMetadataMutation::Set {
-                    key: "deferred_dispatch".to_owned(),
-                    value: deferral,
-                }],
-                &db::now_rfc3339(),
-            )
-            .await
-            .map_err(|error| format!("moving a deadline failed: {error}"))?;
+            // A Task with a step still queued (always, right after a crash)
+            // refuses a direct write as busy: run its steps and try again.
+            // The deadline is re-read on the next pass, so a write the steps
+            // made obsolete is harmless.
+            let mut attempt = 0;
+            loop {
+                let written = db::TaskRepo::mutate_metadata(
+                    &*self.live().state.db,
+                    id,
+                    None,
+                    vec![db::TaskMetadataMutation::Set {
+                        key: "deferred_dispatch".to_owned(),
+                        value: deferral.clone(),
+                    }],
+                    &db::now_rfc3339(),
+                )
+                .await;
+                match written {
+                    Ok(_) => break,
+                    Err(db::DbError::TaskBusy { .. }) if attempt < BUSY_RETRIES => {
+                        attempt += 1;
+                        self.live()
+                            .state
+                            .task_service
+                            .drain(id)
+                            .await
+                            .map_err(|error| format!("draining a busy Task failed: {error}"))?;
+                    }
+                    Err(error) => return Err(format!("moving a deadline failed: {error}")),
+                }
+            }
             moved += 1;
         }
         Ok(moved)
@@ -1078,7 +1108,11 @@ impl World {
         let mut unowned = Vec::new();
         let mut history = Vec::new();
         let mut changed = std::time::Instant::now();
-        for round in 0..QUIESCENCE_BOUND {
+        let started = changed;
+        for round in 0.. {
+            if round >= QUIESCENCE_BOUND && started.elapsed() >= QUIESCENCE_PATIENCE {
+                break;
+            }
             self.move_deadlines(false).await?;
             for (index, id) in self.tasks.iter().enumerate() {
                 self.live()
@@ -1336,6 +1370,23 @@ impl World {
                 } else {
                     wedge("no execution holds the capacity it waits for")
                 }
+            }
+            // An accepted action refused admission by an unfinished
+            // dependency waits for that Task; `cancel` stays on offer.
+            (_, "dispatch_refusal")
+                if unsettled(
+                    sqlx::query_scalar(
+                        "SELECT depends_on_id FROM task_dependency WHERE task_id = ?",
+                    )
+                    .bind(&self.tasks[index])
+                    .fetch_all(&self.live().pool)
+                    .await
+                    .map_err(|error| error.to_string())?,
+                )
+                .await?
+                    && offered(&["cancel"]) =>
+            {
+                Ok(())
             }
             // Deadline parks: the scheduler re-reads them at a wall-clock
             // deadline the model does not advance. Owner action is the exit
@@ -1995,6 +2046,35 @@ async fn a_parked_task_names_its_cancelled_dependency() {
     .await;
 }
 
+/// The adjacent gap: the dependency is unfinished, not cancelled. An accepted
+/// `send_back` or `retry` used to be refused by the dependency gate into the
+/// same untyped `recovery_required: "dependency gate"` park, which offered
+/// the refused action again. The action now stays accepted behind the
+/// dependency wait and runs when the dependency finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_accepted_action_waits_for_an_unfinished_dependency() {
+    use Action::{Create, Depend, Finish, Take};
+    let sequence = vec![
+        step(Create),
+        step(Take(0, "approve")),
+        step(Create),
+        step(Depend(0, 1)),
+        step(Take(0, "send_back")),
+        step(Take(0, "retry")),
+        step(Finish(1, Outcome::Success)),
+    ];
+    let name = "parked dependant, dependency unfinished";
+    let trace = run(&sequence, false)
+        .await
+        .unwrap_or_else(|failure| panic!("{}", report(name, &sequence, &failure)));
+    assert!(
+        !trace.iter().any(|line| line.contains("recovery_required")),
+        "{name}: the wait became an untyped park\n{}",
+        trace.join("\n")
+    );
+    run_cases(vec![(name.to_owned(), sequence)]).await;
+}
+
 /// Found by a random run of this model and fixed with it; minimized below.
 ///
 /// A coder run that failed after the Project's version changed (a pause, a
@@ -2094,6 +2174,13 @@ async fn a_subtask_of_a_settled_parent_is_scheduled_or_refused() {
 /// operation: coordination root <id> is not in its aggregate review state";
 /// the offered `restart` puts it back in `review` on the exhausted budget.
 /// The two alternate for ever and no offer leads anywhere else.
+///
+/// Root cause (read, not fixed): `retry` on an exhausted review budget is
+/// the implementation retry, which moves the Task to its working state; a
+/// coordination root has no implementation run, and the aggregate review
+/// guard (`services/src/task_service/execution/guards.rs:54`) then refuses
+/// it outside `review`. A root needs a review-only retry that resets the
+/// review budget in place (or `send_back` to add a corrective subtask).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "open wedge: a coordination root that fails aggregate review loops between retry and restart"]
 async fn a_coordination_root_that_fails_aggregate_review_can_recover() {
@@ -2116,6 +2203,18 @@ async fn a_coordination_root_that_fails_aggregate_review_can_recover() {
 /// `400 validation_error`: "the Task is settling a completed execution's plan
 /// artifact; retry after publication". An offered action must be accepted
 /// (invariant (b)).
+///
+/// Root cause (read, not fixed): the refusal is
+/// `ensure_plan_publication_transition_authority`
+/// (`services/src/task_service/execution.rs:277`), reached when the root's
+/// cancel cascades to its subtask
+/// (`services/src/workflow/actions/common.rs:136`; the engine entry
+/// `services/src/workflow/engine/mod.rs:807` applies the same guard), while
+/// the `cancel` offer (`services/src/task_actions.rs`) never consults a
+/// plan-publication claim. The subtask's claim outlives quiescence here, so
+/// waiting does not clear it. Cancellation has to abandon the claim
+/// (`abandon_brokered_plan_authority`) instead of being refused by it; that
+/// touches plan publication and is not a local change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "open: an offered cancel on a coordination root is refused while a plan artifact settles"]
 async fn an_offered_cancel_is_accepted_while_a_plan_artifact_settles() {
@@ -2143,6 +2242,13 @@ async fn an_offered_cancel_is_accepted_while_a_plan_artifact_settles() {
 /// which is right, but it says nothing: it sits in `todo` with a `clear`
 /// condition and offers `start` and `cancel`. Its exit is releasing the
 /// parent; the subtask should show that it waits for its parent.
+///
+/// Root cause (read, not fixed): the dispatcher's `Children` park for a
+/// subtask whose root does not allow dispatch
+/// (`services/src/task_dispatcher/next_step.rs`, `!f.child_ready`) is a
+/// scheduling decision only; nothing stores it, and the stored condition
+/// (`db/src/task_condition.rs`) has no reason for "waits for its parent".
+/// It needs a new typed condition, a public payload addition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "open stall: a subtask of a held parent waits with a clear condition"]
 async fn a_subtask_of_a_held_parent_shows_why_it_waits() {

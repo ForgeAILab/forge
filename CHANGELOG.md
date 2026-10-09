@@ -8,6 +8,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A subtask can no longer be created under a parent in review, integrating
+  or finished.** Creating a Task with a `parent_task_id` (REST, MCP, native
+  tools, `create_subtasks`) whose parent is terminal or in a review-phase
+  gate (`review`, `merging`) used to be accepted. Under a terminal parent,
+  or one whose review then passed, the subtask stayed in `todo` with a clear
+  condition and was never scheduled; it ran only if the parent was later
+  sent back to work. The call is now refused with
+  `409 SUBTASK_PARENT_CLOSED` (`-32602` with
+  `data.code = "SUBTASK_PARENT_CLOSED"` over MCP), naming the parent and its
+  state. Send the parent back to work first, or create a new root Task. A
+  parent in `merge_failed` still accepts a corrective subtask. Found by the
+  model-based workflow test.
 - **Forge deletes a Task branch once its change is delivered (3.4 stage
   A).** Task branches (`task/<first 8 characters of the Task id>`) used to
   stay in the repository forever. Now, when a server-owned workspace of a
@@ -1725,14 +1737,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
-- **A subtask can no longer be created under a parent that would never run
-  it.** Creating a Task with a `parent_task_id` (REST, MCP, native tools,
-  `create_subtasks`) whose parent is terminal, in review or integrating was
-  accepted; the subtask then stayed in `todo` with a clear condition and was
-  never scheduled. It is now refused with `409 SUBTASK_PARENT_CLOSED`
-  (`-32602` with `data.code = "SUBTASK_PARENT_CLOSED"` over MCP), naming the
-  parent and its state. Add subtasks before the parent enters review, or
-  create a new root Task. Found by the model-based workflow test.
 - **A cancelled dependency no longer discards what its dependant was waiting
   on.** The `dependency_cancelled` blocker used to overwrite a hold, and to
   be skipped when the dependant was already parked for another reason: a
@@ -1745,8 +1749,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   (in `blocked.details.superseded`). Removing the last cancelled dependency
   puts that condition back: a held Task is held again and offers `release`,
   a parked Task offers its recovery again, and a Task that was waiting on
-  nothing is dispatched. A Task action that was accepted before the
-  dependency was cancelled ends in the same typed blocker. Found by the
+  nothing is dispatched. The displaced condition is put back only while the
+  Task is still in the state it was taken in: a Task that was cancelled,
+  finished or moved meanwhile gets a clear condition instead of a stale park.
+  A Task action that was accepted before the dependency was cancelled ends
+  in the same typed blocker. An accepted action that meets an unfinished
+  dependency is no longer refused into the untyped park either: it stays
+  accepted, the Task shows the dependency wait an unstarted Task shows
+  (`dispatch_refusal`, offering `hold` and `cancel`), and the action runs
+  when the dependency finishes or its link is removed. Found by the
   model-based workflow test.
 - **`start` on a queued Task no longer parks it as failed.** `start` was
   offered for the Agent of the planning gate's role (any available Agent when
@@ -1767,7 +1778,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   under the current Project, whichever version dispatched it; usage-limit
   and provider-capacity failures, and failures reported by a daemon, follow
   the same rule. Completions stay fenced to the Project version that
-  dispatched them.
+  dispatched them. What fences a failure is that its run is still the
+  Task's current one: the Task is in the state, and the entry of that state,
+  the run was dispatched for, the run is the newest of its role and its
+  Agent still holds the role. A late failure of a run the Task has moved on
+  from, or that a newer run replaced, schedules nothing, spends no retry
+  and blocks nothing, on the server, usage-limit and daemon paths alike.
 
 - Adding a Task dependency that already exists is a no-op. It used to fail
   the unique constraint and answer `500 internal_error`. Found by the new

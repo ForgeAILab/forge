@@ -999,9 +999,15 @@ If a prerequisite is later cancelled, Forge writes a typed durable blocker on
 each unfinished dependent instead of repeatedly rejecting dispatch. The blocker
 replaces the dependent's current condition (a hold or another park included),
 offers cancellation only, and keeps the displaced condition in
-`blocked.details.superseded`. Removing the cancelled link restores that
-condition, or clears the blocker when there was none, once no cancelled
-prerequisites remain.
+`blocked.details.superseded` (`status`, `error_annotation`, `blocked_json`,
+`failed_json`: the Task's state and its three condition columns as they were;
+informational, clients must not write it). Removing the cancelled link restores
+that condition, or clears the blocker when there was none, once no cancelled
+prerequisites remain; a dependent that left that state meanwhile (cancelled,
+finished, moved) gets a clear condition instead. A Task action accepted while a
+prerequisite is unfinished stays accepted: the Task shows a `dispatch_refusal`
+wait offering `hold` and `cancel`, and the action runs when the prerequisite
+reaches `done` or the link is removed.
 `task_type`, when present, is the same closed enum as normal
 Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
 values are rejected before the command is admitted. Terminal Task delivery,
@@ -2749,9 +2755,10 @@ post-commit hooks (including CI, merge and dispatch) and follow-up cascades are 
 `parent_task_id` is the hierarchy pointer. A Task that names a parent is a
 direct child of a root coordination Task, inherits the root's shared workspace,
 and receives a `subtask_order` position. The parent must still be able to
-coordinate it: creating a subtask under a parent that is terminal, in review or
-integrating answers `409 SUBTASK_PARENT_CLOSED` with
-`details.parent_task_id` and `details.state`. A root with one or more children is a
+coordinate it: creating a subtask under a parent that is terminal or in a
+review-phase gate (`review`, `merging`) answers
+`409 SUBTASK_PARENT_CLOSED` with `details.parent_task_id` and `details.state`;
+send the parent back to work first. A parent in `merge_failed` accepts one. A root with one or more children is a
 non-executing coordination container: the root's implementation prompt is not
 dispatched. Its `coder` assignment is retained as the default worker, while
 other non-review role assignments are removed. A child with its own `coder`

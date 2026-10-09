@@ -1174,6 +1174,10 @@ impl TaskService {
         if task_blocked_by_execution(&task, &execution.id) {
             return Ok(());
         }
+        // The current-run fence (see `annotate_executor_failure_block_with_retry`).
+        if !super::execution_belongs_to_current_state_entry(&self.db, &task, execution).await? {
+            return Ok(());
+        }
         let usage_limited = attempts.as_array().is_some_and(|attempts| {
             attempts.iter().any(|attempt| {
                 attempt.get("outcome").and_then(Value::as_str) == Some("usage_exhausted")
@@ -1310,6 +1314,15 @@ impl TaskService {
     /// advances nothing, its retry is a new run admitted under current
     /// authority, and dropping it here left the Task active with no run, no
     /// retry and no park after any Project edit, pause or resume.
+    ///
+    /// What fences a failure instead is that the run is still the Task's
+    /// current one: the Task is in the state, and the entry of that state,
+    /// that the run was dispatched for; the state still belongs to the run's
+    /// role; and, inside the write itself, the run is the newest of its role
+    /// and its Agent still holds the role
+    /// (`latest_execution_authority_matches_in_tx`). A late failure of a run
+    /// the Task has moved on from, or that a newer run replaced, changes
+    /// nothing and spends no budget.
     async fn annotate_executor_failure_block_with_retry(
         &self,
         execution: &Execution,
@@ -1342,6 +1355,9 @@ impl TaskService {
             || (current_role == Some(crate::workflow::default_roles::CODER)
                 && execution.role == "executor");
         if !execution_still_owns_current_role {
+            return Ok(());
+        }
+        if !super::execution_belongs_to_current_state_entry(&self.db, &task, execution).await? {
             return Ok(());
         }
         if task_blocked_by_execution(&task, &execution.id) {

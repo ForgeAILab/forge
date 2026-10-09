@@ -413,10 +413,22 @@ impl TaskService {
             }
             return Ok(());
         }
+        // The displaced condition goes back only onto the Task it was taken
+        // from: a Task that has since finished, been cancelled or changed
+        // state has a newer story, and a stale hold or failure park written
+        // over it would name work that no longer exists.
+        let still_applies = !self.task_is_terminal(&task).await?
+            && block.superseded.as_ref().is_some_and(|superseded| {
+                superseded
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_none_or(|status| status == task.status)
+            });
         let restored = |key: &str| {
             block
                 .superseded
                 .as_ref()
+                .filter(|_| still_applies)
                 .and_then(|superseded| superseded.get(key))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
@@ -441,6 +453,18 @@ impl TaskService {
         )
         .await?;
         Ok(())
+    }
+
+    async fn task_is_terminal(&self, task: &Task) -> Result<bool> {
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &Actor::system(api_types::SystemComponent::Workflow),
+        );
+        Ok(workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal))
     }
 
     async fn task_is_cancelled(&self, task: &Task) -> Result<bool> {
@@ -503,6 +527,7 @@ fn superseded_condition(task: &Task) -> Option<Value> {
     let columns = |annotation: Option<&str>, blocked: Option<&str>, failed: Option<&str>| {
         (annotation.is_some() || blocked.is_some() || failed.is_some()).then(|| {
             json!({
+                "status": task.status,
                 "error_annotation": annotation,
                 "blocked_json": blocked,
                 "failed_json": failed,

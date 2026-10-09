@@ -5221,7 +5221,10 @@ and offers cancellation only. It replaces whatever condition the Task had (a
 hold, a failure park, the condition a queued action saved) and keeps it in
 `blocked.details.superseded`; a queued action refused by the dependency gate
 for a cancelled dependency settles into the same blocker, not an untyped
-`recovery_required` park. A queued action always offers Hold alongside cancel,
+`recovery_required` park, and one refused for an unfinished dependency stays
+queued behind a `dispatch_refusal` wait until the dependency finishes or its
+link is removed. The displaced condition records the state it was taken in and
+is restored only while the Task is still in that state. A queued action always offers Hold alongside cancel,
 even when a newer condition appears. Restart follows the resolver's explicit set
 of resettable condition kinds. Pause refusals preserve the typed wait cause and
 turn retry scope across REST, MCP, and native tools.
@@ -5245,8 +5248,9 @@ review gate declares, not the built-in `reviewer` name.
 decisions.
 
 A subtask can be created only while its parent can still coordinate it: in a
-backlog, initial or working state. A parent that is terminal, in its review
-gate or integrating never dispatches a child, so creating one there is refused
+backlog, initial or working state (`merge_failed` included). A parent that is
+terminal or in a review-phase gate (`review`, `merging`) never dispatches a
+child (the state rule of `coordination_root_allows_child_dispatch`), so creating one is refused
 with `SUBTASK_PARENT_CLOSED` (`ServiceError::SubtaskParentClosed`,
 `task_hierarchy::ensure_parent_accepts_subtasks`) instead of leaving an
 unscheduled Task behind.
@@ -5788,7 +5792,13 @@ cascade's intentional no-op into a reconciliation receipt. A failed coder or
 planner run is not fenced this way: a failure advances nothing, so it is
 retried (or blocks the Task) under the current Project revision whichever
 revision dispatched it. A Project edit, pause or resume therefore never
-leaves an active Task with no run, no pending retry and no park.
+leaves an active Task with no run, no pending retry and no park. A failure is
+fenced by run currency instead: the Task must be in the state and state entry
+the run was dispatched for (`execution_belongs_to_current_state_entry`), the
+state must still belong to the run's role, and the write itself requires the
+run to be the newest of its role with its Agent still assigned
+(`latest_execution_authority_matches_in_tx`). A failure that loses any of
+these changes nothing and spends no budget.
 
 **Dispatch failure entering an active state:** when a dispatch hook
 (`dispatch_role_agent` / `dispatch_fix_agent` / `dispatch_executor`) fails
