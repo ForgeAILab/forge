@@ -424,8 +424,19 @@ caching suppresses repeated effect dispatch and records one reminder per
 operation and turn. Preparation carries a server-generated typed denial to
 invocation before exposing input contract details.
 
+The scope ceiling table is literal and pinned by a test: a Project Agent
+Chat carries `propose_task`, `propose_commitment`, `propose_memory` and
+`propose_session` once the Charter is adopted, but not the Project scope's
+`propose_review` or `propose_decision`. An owned identity without the Main
+binding keeps its account ceiling for the unregistered account operations;
+registered Main operations require the binding through their principal rule.
+A stored document that fails to parse is logged with the identity and layer.
+
 Registered Main reads, Project Charter/doctrine reads, identity summaries,
-`genesis.project_agent.select` and `project.create` use this path. UI effective
+`genesis.project_agent.select` and `project.create` use this path. The
+approval-envelope `AgentAction` policy (`evaluate_action_policy`) still layers
+identity, Profile and scope ceilings itself, with the shared parser, until
+slice E. UI effective
 permissions and CLI composition use the same resolver. Existing exact-object,
 receipt-first replay, governing-policy and optimistic-version checks remain
 in command transactions; fresh Genesis Agent selection also evaluates

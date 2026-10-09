@@ -40,6 +40,34 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
                 .map(|(_, permission)| (*permission).to_owned())
         })
         .collect::<BTreeSet<_>>();
+    // The registered permission and effect class must still equal the host
+    // operation catalog's for every scope: the unregistered surfaces and the
+    // denial vocabulary read that catalog.
+    for spec in READ_CATALOG.iter() {
+        for scope_type in [
+            CanonicalScopeType::Account,
+            CanonicalScopeType::AgentChat,
+            CanonicalScopeType::Project,
+            CanonicalScopeType::Task,
+        ] {
+            let existing = crate::operation_permission(scope_type, spec.id);
+            assert_eq!(
+                spec.authority.permission(scope_type_name(scope_type)),
+                existing,
+                "{} {scope_type:?}",
+                spec.id
+            );
+            if existing.is_some() {
+                assert_eq!(
+                    spec.effect == operation_registry::EffectClass::Query,
+                    crate::operation_descriptor(scope_type, spec.id, None).classification
+                        == crate::OperationClassification::Query,
+                    "{} {scope_type:?}",
+                    spec.id
+                );
+            }
+        }
+    }
     for spec in specs {
         let (_, admitted_scopes, ready_only) = rows.iter().find(|r| r.0 == spec.id).unwrap();
         for (key, scope_type, project_chat) in [

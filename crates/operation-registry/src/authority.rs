@@ -277,13 +277,24 @@ pub fn scope_permissions(
     if scope == "agent_chat" && !project_chat {
         names.extend(["propose_discovery", "propose_handoff"]);
     }
-    if (scope == "project" || (scope == "agent_chat" && project_chat)) && !setup {
+    // A Project Agent Chat is narrower than the Project scope: it never
+    // carried review or decision proposals, and unifying the two tables must
+    // not add them.
+    if scope == "project" && !setup {
         names.extend([
             "propose_task",
             "propose_commitment",
             "propose_memory",
             "propose_review",
             "propose_decision",
+            "propose_session",
+        ]);
+    }
+    if scope == "agent_chat" && project_chat && !setup {
+        names.extend([
+            "propose_task",
+            "propose_commitment",
+            "propose_memory",
             "propose_session",
         ]);
     }
@@ -463,6 +474,38 @@ mod tests {
         reviewer.scope_type = "task".into();
         for spec in crate::main_proposals::CATALOG.iter() {
             assert!(reviewer.evaluate(spec).is_err());
+        }
+    }
+    /// The scope ceiling is pinned literally, row by row. Only the reviewer
+    /// row (`task_read` without `propose_review`) differs from the tables
+    /// this function replaced; any other change is a widening or a loss.
+    #[test]
+    fn scope_ceilings_match_the_replaced_tables() {
+        let set = |scope, workspace, project_chat, setup| {
+            scope_permissions(scope, workspace, project_chat, setup)
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for (scope, workspace, project_chat, setup, expected) in [
+            ("account", "deny", false, false, "propose_discovery,propose_handoff,propose_project,read_account"),
+            ("account", "account_scratch", false, false, "propose_discovery,read_account"),
+            ("project", "deny", false, true, "propose_message,propose_project,read_memory,read_project"),
+            ("project", "project_verify", false, false, "propose_commitment,propose_decision,propose_memory,propose_message,propose_project,propose_review,propose_session,propose_task,read_memory,read_project"),
+            ("agent_chat", "deny", false, false, "propose_discovery,propose_handoff,propose_message,propose_project,read_agent_chat,read_memory"),
+            ("agent_chat", "deny", false, true, "propose_discovery,propose_handoff,propose_message,propose_project,read_agent_chat,read_memory"),
+            ("agent_chat", "project_verify", true, true, "propose_message,propose_project,read_agent_chat,read_memory"),
+            ("agent_chat", "project_verify", true, false, "propose_commitment,propose_memory,propose_message,propose_project,propose_session,propose_task,read_agent_chat,read_memory"),
+            ("task", "task_read", false, false, "read_memory,read_task,task_read"),
+            ("task", "task_write", false, false, "read_memory,read_task,task_read,task_write"),
+            ("task", "deny", false, false, ""),
+            ("agent", "deny", false, false, ""),
+        ] {
+            assert_eq!(
+                set(scope, workspace, project_chat, setup),
+                expected,
+                "{scope} {workspace} project_chat={project_chat} setup={setup}"
+            );
         }
     }
     #[test]

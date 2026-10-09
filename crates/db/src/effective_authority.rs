@@ -2,7 +2,8 @@
 //! parsing or operation decisions live here; transactions retain their CAS.
 use crate::{Result, SqliteDb};
 use operation_registry::authority::{
-    permission_set, scope_permissions, AuthorityFacts, EffectiveAuthority, Principal,
+    parse_permissions, scope_permissions, AuthorityFacts, EffectiveAuthority, PermissionSet,
+    Principal,
 };
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
@@ -83,13 +84,34 @@ async fn load(
         && row.try_get::<Option<String>, _>("archived_at")?.is_none();
     let mut binding_id = None;
     let mut setup = false;
+    // A stored document that fails to parse grants nothing. That is correct,
+    // but an agent that silently lost every tool is undiagnosable, so name
+    // the identity and the layer where it happens.
+    let layer = |name: &str, document: &str| match parse_permissions(document) {
+        Ok(set) => set,
+        Err(error) => {
+            tracing::warn!(
+                identity_id,
+                layer = name,
+                code = error.code(),
+                "stored permission document grants no authority"
+            );
+            PermissionSet::new()
+        }
+    };
     let mut layers = vec![
-        permission_set(&row.try_get::<String, _>("account_permission_ceiling")?),
-        permission_set(&row.try_get::<String, _>("tool_policy_json")?),
+        layer(
+            "account_permission_ceiling",
+            &row.try_get::<String, _>("account_permission_ceiling")?,
+        ),
+        layer(
+            "admitted_profile_tool_policy",
+            &row.try_get::<String, _>("tool_policy_json")?,
+        ),
     ];
     // Selected policy can revoke the admitted profile, never widen it.
     if let Some(policy) = row.try_get::<Option<String>, _>("selected_policy")? {
-        layers.push(permission_set(&policy));
+        layers.push(layer("selected_profile_tool_policy", &policy));
     } else {
         active = false;
     }
@@ -99,7 +121,8 @@ async fn load(
         if let Some(binding) = binding {
             binding_id = Some(binding.try_get("id")?);
             setup = binding.try_get::<i64, _>("charter_setup_required")? != 0;
-            layers.push(permission_set(
+            layers.push(layer(
+                "project_binding_permission_ceiling",
                 &binding.try_get::<String, _>("permission_ceiling_json")?,
             ));
         } else {
@@ -119,11 +142,11 @@ async fn load(
         } else if scope_type == "account" {
             binding_id = sqlx::query_scalar("SELECT id FROM account_main_agent_binding WHERE account_id IS ? AND identity_id = ? AND account_id = ? AND state = 'active'")
                 .bind(owner.as_deref()).bind(identity_id).bind(scope_id).fetch_optional(&mut *connection).await?;
-            if binding_id.is_none() {
-                // An owned unbound identity can inspect itself, but has no
-                // global Main proposal authority to project in the UI.
-                layers.push(["read_account".to_owned()].into_iter().collect());
-            }
+            // An owned identity without the Main binding keeps the account
+            // ceiling it always had (public research and the legacy account
+            // operations are filtered against it). Every registered Main
+            // operation still requires the binding through its principal
+            // rule, so the missing binding grants nothing new.
         }
         Principal::MainAgent {
             identity_id: identity_id.to_owned(),

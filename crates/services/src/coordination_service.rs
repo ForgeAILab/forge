@@ -1340,66 +1340,49 @@ async fn evaluate_action_policy(
     {
         return Ok((AgentActionPolicyResult::Denied, Some(reason)));
     }
-    if let Some(spec) = operation_registry::READ_CATALOG
-        .lookup(operation)
-        .or_else(|| operation_registry::main_proposals::CATALOG.lookup(operation))
-    {
-        let authority = db
-            .resolve_effective_authority(actor_identity_id, None, scope_type, scope_id, "deny")
-            .await?;
-        if let Err(denial) = authority.evaluate(spec) {
-            let reason = match denial {
-                operation_registry::authority::AuthorityDenial::PermissionMissing(permission) => format!("permission {permission} is outside the server-issued identity/profile/scope ceiling"),
-                operation_registry::authority::AuthorityDenial::Revoked => "authority_revoked".to_owned(),
-                _ => "operation is outside the admitted authority or current state".to_owned(),
-            };
-            return Ok((AgentActionPolicyResult::Denied, Some(reason)));
-        }
-    } else {
-        let row = sqlx::query(
-            "SELECT paused, archived_at, account_permission_ceiling, selected_profile_id
+    let row = sqlx::query(
+        "SELECT paused, archived_at, account_permission_ceiling, selected_profile_id
          FROM agent_identity WHERE id = ?",
+    )
+    .bind(actor_identity_id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| ServiceError::not_found("agent identity", actor_identity_id))?;
+    let paused: i64 = row.try_get("paused")?;
+    let archived_at: Option<String> = row.try_get("archived_at")?;
+    if paused != 0 || archived_at.is_some() {
+        return Ok((
+            AgentActionPolicyResult::Denied,
+            Some("actor identity is paused or archived".to_owned()),
+        ));
+    }
+    let account_policy: String = row.try_get("account_permission_ceiling")?;
+    let profile_id: Option<String> = row.try_get("selected_profile_id")?;
+    let profile_policy = if let Some(profile_id) = profile_id {
+        sqlx::query_scalar::<_, String>(
+            "SELECT tool_policy_json FROM agent_profile WHERE id = ? AND identity_id = ?",
         )
+        .bind(profile_id)
         .bind(actor_identity_id)
         .fetch_optional(db.pool())
         .await?
-        .ok_or_else(|| ServiceError::not_found("agent identity", actor_identity_id))?;
-        let paused: i64 = row.try_get("paused")?;
-        let archived_at: Option<String> = row.try_get("archived_at")?;
-        if paused != 0 || archived_at.is_some() {
-            return Ok((
-                AgentActionPolicyResult::Denied,
-                Some("actor identity is paused or archived".to_owned()),
-            ));
-        }
-        let account_policy: String = row.try_get("account_permission_ceiling")?;
-        let profile_id: Option<String> = row.try_get("selected_profile_id")?;
-        let profile_policy = if let Some(profile_id) = profile_id {
-            sqlx::query_scalar::<_, String>(
-                "SELECT tool_policy_json FROM agent_profile WHERE id = ? AND identity_id = ?",
-            )
-            .bind(profile_id)
-            .bind(actor_identity_id)
-            .fetch_optional(db.pool())
-            .await?
-            .unwrap_or_else(|| "{}".to_owned())
-        } else {
-            "{}".to_owned()
-        };
-        let scope_permissions = scope_permissions(db, scope_type, scope_id).await?;
-        let account_permissions = permission_set(&account_policy);
-        let profile_permissions = permission_set(&profile_policy);
-        let authorized = account_permissions.contains(requested_permission)
-            && profile_permissions.contains(requested_permission)
-            && scope_permissions.contains(requested_permission);
-        if !authorized {
-            return Ok((
+        .unwrap_or_else(|| "{}".to_owned())
+    } else {
+        "{}".to_owned()
+    };
+    let scope_permissions = scope_permissions(db, scope_type, scope_id).await?;
+    let account_permissions = permission_set(&account_policy);
+    let profile_permissions = permission_set(&profile_policy);
+    let authorized = account_permissions.contains(requested_permission)
+        && profile_permissions.contains(requested_permission)
+        && scope_permissions.contains(requested_permission);
+    if !authorized {
+        return Ok((
             AgentActionPolicyResult::Denied,
             Some(format!(
                 "permission {requested_permission} is outside the server-issued identity/profile/scope ceiling"
             )),
         ));
-        }
     }
     if is_project_orchestration_mutation(operation) {
         let project_id = match scope_type {
@@ -1966,46 +1949,6 @@ mod tests {
     #[tokio::test]
     async fn main_orchestration_project_create_is_user_only_and_draft_is_direct() {
         let db = db().await;
-        let now = now_rfc3339();
-        if db::UserRepo::get_user_by_id(&*db, "user-1")
-            .await
-            .expect("owner lookup")
-            .is_none()
-        {
-            db::UserRepo::create_user(
-                &*db,
-                &db::User {
-                    id: "user-1".into(),
-                    email: "owner@example.test".into(),
-                    password_hash: "test".into(),
-                    display_name: None,
-                    is_admin: false,
-                    created_at: now.clone(),
-                    updated_at: now.clone(),
-                },
-            )
-            .await
-            .expect("owner");
-        }
-        let main = AgentRepo::get_by_id(&*db, "agent-a")
-            .await
-            .expect("main lookup")
-            .expect("main");
-        db::AccountMainAgentBindingRepo::create_main_binding(
-            &*db,
-            db::CreateAccountMainAgentBinding {
-                id: new_uuid_v4(),
-                account_id: "user-1".into(),
-                identity_id: main.id,
-                profile_id: main.profile_id,
-                autonomy_policy_json: "{}".into(),
-                tool_policy_revision: "test".into(),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await
-        .expect("active Main binding");
         let actions = AgentActionService::new(Arc::clone(&db));
         let draft = actions
             .propose(ProposeActionInput {

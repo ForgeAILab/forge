@@ -8,6 +8,35 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Reviewers get no workflow permission (3.8 slice D).** `propose_review` is
+  removed from the read-only Task ceiling and from the Task scope of the
+  agent-action policy, so a Task-scoped `review.request` or `review.propose`
+  agent action is refused as outside the scope ceiling. Native
+  reviewers never had a tool for these; review verdicts are still submitted
+  through the review result. The Project scope keeps `propose_review`.
+- **Conflicting or malformed permission documents are refused when written
+  (3.8 slice D).** Creating an Agent identity, publishing an Agent Profile or
+  creating or replacing a Project Agent binding with a permission document
+  whose `permissions` and `allowed` lists differ returns HTTP 400
+  `conflicting_permission_document` (MCP `-32602` with the same `data.code`).
+  A document that is not an array of non-empty strings, an object carrying
+  such an array under `permissions` or `allowed`, `{}` or `null` returns
+  `invalid_permission_document`. Both used to be stored. A conflicting
+  document already in the database used to resolve to its `permissions` list
+  (or to `allowed` in the Task proposal check) and now grants nothing; a
+  Project Agent turn on such a binding fails with "Project Agent binding has
+  no permission ceiling". Lists that differ only in order or duplicates are
+  not a conflict.
+- **A Project-scoped MCP credential no longer reaches account-wide tools
+  (3.8 slice D).** With a Project constraint, `forge_register_agent`,
+  `forge_list_agents`, `forge_create_project`, `forge_list_agent_profiles`,
+  `forge_list_agent_sessions`, `forge_get_agent_session`,
+  `forge_get_main_agent` and `forge_set_main_agent` are absent from
+  `tools/list` and refused on `tools/call` with `-32001` and
+  `data.code = "mcp_scope_denied"`, before their arguments are checked.
+  `forge_list_projects` returns only the bound Project. Credentials without a
+  Project constraint are unchanged.
+
 - **Main native reads refuse malformed arguments instead of ignoring them
   (3.8 slice C).** The eight Main reads are checked against a closed contract
   before they run. A refused call returns a tool error the model can correct
@@ -604,6 +633,27 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Authority is resolved once per turn and pinned (3.8 slice D).** A native
+  or CLI turn fixes its Agent Profile and permission ceiling at admission.
+  Selecting a broader Profile or widening a binding during the turn does not
+  extend it; the change applies from the next admitted turn. Before each
+  registered operation Forge re-reads the identity, selected Profile and
+  binding and applies whichever is stricter. A permission or binding that was
+  withdrawn since admission refuses the operation with
+  `denied_by: "authority_revoked"`, recorded once per turn, and restoring it
+  later in the same turn does not bring it back. `DeniedBy` gains the
+  `authority_revoked` value in the REST and generated TypeScript types.
+- **One parser reads every stored permission document (3.8 slice D).** The
+  identity ceiling, the Profile tool policy and the Project binding ceiling
+  were parsed by several separate functions that did not agree. They now
+  share one. Two consequences: Task proposal checks, which only read the object
+  forms, now also accept the plain array form the other checks always
+  accepted; and a document with one entry that is not a string, which used to
+  keep its valid entries, now grants nothing.
+- Task read summaries mark their workflow offers with
+  `available_actions_informational: true`: a read-only Task session has no
+  command tool for them.
 
 - **Passive check contract, digest and storage (3.3 stage A).** Nothing runs
   through it yet: entry CI, review CI, conformance, lifecycle scripts and
@@ -1414,6 +1464,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **Registered native operations are advertised exactly when they are
+  enforced (3.8 slice D).** One evaluator now decides both, for the fourteen
+  operations on the registry (the Main reads, the Project Charter and
+  doctrine reads, the two identity summaries, `genesis.project_agent.select`
+  and `project.create`). A Main operation is no longer offered to an identity
+  that holds no active Main binding and would have been refused on call.
+- **A permission ceiling stored as JSON `null` reads as an empty ceiling**
+  through the same parser as every other shape, and a stored permission
+  document that cannot be read is logged with the identity and the layer it
+  came from instead of leaving an agent silently without tools.
 
 - A full machine no longer lets a second waiting Task leave its initial state in the same dispatcher pass. For a moment after a Task's transition step settled, its queued role entry was not counted as an admission in flight, so the next waiter was moved to its work state and parked there on machine capacity. No second run started, the run cap held.
 - **A corrupt Task condition repairs itself again.** A stored condition that
