@@ -1944,3 +1944,125 @@ async fn a_stale_delivery_ends_only_its_own_wait_and_applies_nothing() {
     );
     assert_eq!(phase(&current), Some(CheckWaitPhase::Result));
 }
+
+#[tokio::test]
+async fn an_owners_retry_is_idempotent_and_never_reruns_a_stale_identity() {
+    let (_temp, store, runner) = fixture().await;
+    let (consumers, family) = consumers(&store, &runner, "attempt-1").await;
+    let asked = ask(&store, &consumers, task_request("attempt-1", 'a'))
+        .await
+        .unwrap();
+    let mut run = scheduled(asked);
+    let task = || async {
+        db::TaskRepo::get_by_id(&*store, "t", false)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let fail = |run: StoredCheckRun| {
+        let store = store.clone();
+        async move {
+            settle(
+                &store,
+                &run,
+                CheckResultOutcome::InfrastructureFailed,
+                CheckCleanup::NotPerformed,
+            )
+            .await
+        }
+    };
+    // The newest delivery step is the one that is still to be applied.
+    let apply_latest = || async {
+        let step = store
+            .task_steps("t")
+            .await
+            .unwrap()
+            .into_iter()
+            .rfind(|step| step.payload_json.contains("apply_check_result"))
+            .unwrap();
+        let envelope: db::CheckResultDelivery = serde_json::from_value(
+            serde_json::from_str::<serde_json::Value>(&step.payload_json).unwrap()["arguments"]
+                .clone(),
+        )
+        .unwrap();
+        in_claimed(&store, &step.id, consumers.apply(&step.id, &envelope))
+            .await
+            .unwrap()
+    };
+    for _ in 0..2 {
+        fail(run.clone()).await;
+        run = store
+            .retry_infrastructure_check(&run.id, &db::now_rfc3339())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    fail(run.clone()).await;
+    assert_eq!(store.enqueue_check_result_steps(10).await.unwrap(), 1);
+    assert_eq!(apply_latest().await, consumer::CheckApplyOutcome::Applied);
+    let exhausted = task().await;
+    assert_eq!(
+        phase(&exhausted.condition),
+        Some(CheckWaitPhase::InfrastructureExhausted)
+    );
+
+    // First click re-arms; a second click finds nothing exhausted.
+    assert!(in_step(&store, async {
+        consumers.retry_exhausted(&exhausted).await
+    })
+    .await
+    .unwrap());
+    assert!(!in_step(&store, async {
+        consumers.retry_exhausted(&task().await).await
+    })
+    .await
+    .unwrap());
+    // A redelivered retry step still holds the exhausted snapshot: it only
+    // restates the wait. Neither repeat schedules a second run or delivery.
+    assert!(in_step(&store, async {
+        consumers.retry_exhausted(&exhausted).await
+    })
+    .await
+    .unwrap());
+    assert_eq!(
+        phase(&condition(&store).await),
+        Some(CheckWaitPhase::Result)
+    );
+    assert_eq!(
+        store.retryable_check_runs(10).await.unwrap(),
+        vec![run.id.clone()]
+    );
+    assert_eq!(store.enqueue_check_result_steps(10).await.unwrap(), 0);
+
+    // The fresh budget is used up as well: the Task parks again, through a
+    // second delivery of its own.
+    for _ in 0..2 {
+        run = store
+            .retry_infrastructure_check(&run.id, &db::now_rfc3339())
+            .await
+            .unwrap()
+            .unwrap();
+        fail(run.clone()).await;
+    }
+    assert_eq!(store.enqueue_check_result_steps(10).await.unwrap(), 1);
+    assert_eq!(apply_latest().await, consumer::CheckApplyOutcome::Applied);
+    assert_eq!(
+        phase(&condition(&store).await),
+        Some(CheckWaitPhase::InfrastructureExhausted)
+    );
+    assert_eq!(family.applied.lock().unwrap().len(), 2);
+
+    // The candidate moved on inside the same status entry: retry lifts the
+    // stale park and does not run the old commit again.
+    *family.authority.lock().unwrap() = Some("attempt-2".into());
+    assert!(in_step(&store, async {
+        consumers.retry_exhausted(&task().await).await
+    })
+    .await
+    .unwrap());
+    let lifted = condition(&store).await;
+    assert_eq!(phase(&lifted), None);
+    assert!(lifted.check_witness().is_none() && !lifted.is_blocked());
+    assert!(store.retryable_check_runs(10).await.unwrap().is_empty());
+    assert_eq!(store.enqueue_check_result_steps(10).await.unwrap(), 0);
+}

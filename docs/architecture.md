@@ -7731,6 +7731,21 @@ Rules:
 - **One delivery per answer.** The delivery step's causation key is
   `check-result:<consumer>:<result>`, so a consumer re-armed by `retry` is
   answered again by its next result and never twice for one.
+- **Retry names the identity still in charge.** `retry_exhausted` re-arms the
+  consumer only while the family's `current_authority` is the one that asked.
+  When the candidate moved on inside the same status entry, the retry lifts
+  the stale park (`CheckCleared`) and runs nothing: the old commit is never
+  checked again, and the family in charge asks for its own identity. A
+  repeated `retry` (double click, redelivered step) re-arms nothing twice.
+- **One wait per status entry.** The condition holds a single check witness.
+  A later request in the same entry replaces it (that is how a newer attempt
+  takes over from a stale one), so a family must not keep two live consumers
+  for one Task entry at once: the second would hide the first, and its answer
+  would end the visible wait while the first is still running.
+- **Operator visibility.** `GET /api/v1/operations/status` lists every Task
+  parked as `infrastructure_exhausted` in `recent_errors` (entity type
+  `task_check_exhausted`, severity `attention`) until it is retried, cancelled
+  or leaves the status entry.
 
 **No production family is registered yet, and no execution family requests
 the runner.** Merge-path and review-entry CI, manual `ReviewRunner`,

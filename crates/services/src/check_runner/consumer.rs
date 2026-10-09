@@ -453,6 +453,23 @@ impl TaskCheckConsumers {
         {
             return Ok(false);
         }
+        // The consumer names one commit and one authority. When the Task's
+        // candidate moved on inside the same status entry, asking again would
+        // run the stale identity and its answer would be discarded: the stale
+        // park is lifted instead, and whoever is in charge now asks for its
+        // own identity.
+        let authority = authority_of(&state.consumer);
+        if authority.is_none()
+            || self
+                .family(state.consumer.origin)?
+                .current_authority(&task.id, state.consumer.status_epoch)
+                .await?
+                .as_deref()
+                != authority
+        {
+            self.clear_wait(&state.consumer).await?;
+            return Ok(true);
+        }
         if !self
             .store
             .rearm_exhausted_check_consumer(&wait.consumer_id)

@@ -793,6 +793,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   moves to mapping revision 6; every Task condition is recomputed once in the
   background after upgrade, and an older build that reads a database written
   by this one quarantines the Tasks it cannot read instead of guessing.
+  A Task whose checks could not run is also listed in
+  `GET /api/v1/operations/status` under `recent_errors` (entity type
+  `task_check_exhausted`, severity `attention`). `retry` on such a Task whose
+  candidate changed since the check was requested lifts the park and runs
+  nothing, so a superseded commit is never checked again.
+
+- **`make types` regenerates every TypeScript binding.** It ran only the
+  explicit `export_typescript` list and skipped the ts-rs export test of each
+  `#[ts(export)]` type, so a new or changed exported type was regenerated only
+  as a side effect of running the api-types test suite. It now runs both.
 
 - **Durable check runner, not yet used by any check (3.3 stage C).** The
   server now starts a `check-runs` worker and has a durable path for running a

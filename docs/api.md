@@ -3129,7 +3129,12 @@ and the condition returns to `result`. `consumer_id` is an opaque identity and
 `origin` names the family that asked (`entry`, `integration`, ...). New enum
 values: `ConditionOwner::check_runner`, `ConditionRecovery::wait_for_check`
 and `retry_check`. No route changes. No production path requests the runner
-yet, so these values appear only once review-entry CI moves onto it.
+yet, so these values appear only once review-entry CI moves onto it. When the
+Task's candidate changed since the exhausted check was requested, `retry`
+lifts the park and requests nothing for the old commit. While a Task is parked
+as `infrastructure_exhausted`, `GET /api/v1/operations/status` carries a
+`recent_errors` item with `entity_type = "task_check_exhausted"`,
+`entity_id` = the Task id and severity `attention`.
 Private witnesses retain repair/review lineage through real running states; a
 Task with a live execution is always `running`, never parked on integration.
 

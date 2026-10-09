@@ -300,6 +300,32 @@ async fn a_check_wait_is_read_through_rest_applied_by_the_step_worker_and_retrie
     )
     .await;
 
+    // The operator sees the park: it is infrastructure, not the change.
+    let exhausted_items = |status: &Value| {
+        status["recent_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| {
+                item["entity_type"] == "task_check_exhausted"
+                    && item["entity_id"] == created.id.as_str()
+            })
+            .count()
+    };
+    let operations = || async {
+        common::empty_request_with_bearer::<Value>(
+            &harness.app,
+            Method::GET,
+            "/api/v1/operations/status",
+            &common::admin_jwt(),
+            StatusCode::OK,
+        )
+        .await
+    };
+    let status = operations().await;
+    assert_eq!(exhausted_items(&status), 1, "{status}");
+    assert_ne!(status["overall_severity"], "healthy");
+
     // The owner is offered retry and cancel; retry asks again.
     let offered = offers(&harness, &created.id).await;
     let verbs: Vec<_> = offered
@@ -323,6 +349,7 @@ async fn a_check_wait_is_read_through_rest_applied_by_the_step_worker_and_retrie
     let retried = task(&harness, &created.id).await;
     assert_eq!(phase(&retried).as_deref(), Some("result"));
     assert_eq!(retried["condition"]["details"]["owner"], "check_runner");
+    assert_eq!(exhausted_items(&operations().await), 0);
     // The same consumer, on a fresh run, with its automatic retries back.
     assert_eq!(
         db.retryable_check_runs(10).await.unwrap(),
