@@ -13,9 +13,28 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+macro_rules! wait_for {
+    ($what:literal, $done:expr) => {{
+        let mut waited = 0;
+        while !$done {
+            waited += 1;
+            assert!(waited < 6000, "timed out waiting for {}", $what);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }};
+}
+
+/// The wall clock plus an offset that only grows. It cannot run behind or
+/// stand still: the storage fence (`fencing::verify`) compares a lease with
+/// the real wall clock, so a lease written under this clock is live for the
+/// fence for at least as long as it is for the worker. Expiry is therefore
+/// always simulated by moving this clock forward past `lease_until`, and the
+/// takeover is what fences the old holder (a new generation), not the fence's
+/// own clock. `a_holder_that_lost_its_lease_is_fenced_by_generation` pins it.
 struct TestClock(Mutex<chrono::Duration>);
 impl TestClock {
     fn advance(&self, seconds: i64) {
+        assert!(seconds >= 0, "the test clock only moves forward");
         *self.0.lock().unwrap() += chrono::Duration::seconds(seconds);
     }
 }
@@ -82,7 +101,7 @@ impl FakeSteps {
             };
             let current =
                 a.effect_seq == request.effect_seq && a.slot_generation == request.generation;
-            let mut done = |progressed: &mut bool| {
+            let done = |progressed: &mut bool| {
                 self.answered.lock().unwrap().insert(key.clone());
                 *progressed = true;
             };
@@ -201,11 +220,21 @@ struct FakeTransfer {
     remote: Mutex<HashSet<String>>,
     too_large: AtomicBool,
     calls: Mutex<Vec<ObjectTransferDirection>>,
+    keys: Mutex<Vec<String>>,
+    released: Mutex<Vec<ObjectTransferRelease>>,
 }
 #[async_trait]
 impl ObjectTransferPort for FakeTransfer {
     async fn transfer(&self, request: ObjectTransferRequest) -> Result<ObjectTransferOutcome> {
         self.calls.lock().unwrap().push(request.direction);
+        self.keys.lock().unwrap().push(api_types::object_transfer_key(
+            &request.fence.attempt_id,
+            request.fence.generation,
+            request.direction,
+        ));
+        assert_eq!(request.target.repo_location_id, "l-r");
+        assert_eq!(request.task.owner, EffectOwner::Server);
+        assert_eq!(request.have.len(), 1);
         Ok(if self.too_large.load(Ordering::SeqCst) {
             ObjectTransferOutcome::TooLarge {
                 bytes: request.max_bytes + 1,
@@ -214,12 +243,17 @@ impl ObjectTransferPort for FakeTransfer {
             ObjectTransferOutcome::Transferred { bytes: 1024 }
         })
     }
+    async fn release(&self, release: ObjectTransferRelease) -> Result<()> {
+        self.released.lock().unwrap().push(release);
+        Ok(())
+    }
 }
 
 struct GitFactsFake {
     db: Arc<SqliteDb>,
     transfer: Arc<FakeTransfer>,
     fail: AtomicBool,
+    paused: AtomicBool,
 }
 #[async_trait]
 impl IntegrationFactsPort for GitFactsFake {
@@ -264,10 +298,16 @@ impl IntegrationFactsPort for GitFactsFake {
             }
         };
         Ok(HeadFacts {
-            gate: if status == "merging" {
-                TaskGate::Live
-            } else {
+            gate: if status != "merging" {
                 TaskGate::Left
+            } else if self.paused.load(Ordering::SeqCst) {
+                TaskGate::ProjectPaused
+            } else {
+                TaskGate::Live
+            },
+            task_location: ObjectTransferEndpoint {
+                repo_location_id: format!("l-{}", queue.repo_id),
+                owner: EffectOwner::Server,
             },
             target_in_candidate: ancestor(target_tip.clone(), candidate_head.clone()).await,
             candidate_in_target: ancestor(candidate_head.clone(), target_tip.clone()).await,
@@ -327,6 +367,7 @@ impl World {
                 db: db.clone(),
                 transfer: transfer.clone(),
                 fail: AtomicBool::new(false),
+                paused: AtomicBool::new(false),
             }),
             temp,
             db,
@@ -924,8 +965,8 @@ async fn cancel_of_released_and_waiting_members_is_applied_by_the_sweep() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_against_the_permit_has_exactly_one_winner() {
-    // Both orders, then a real race.
-    for order in ["cancel_first", "commit_first", "race"] {
+    // Both orders; the real race is the next test.
+    for order in ["cancel_first", "commit_first"] {
         let world = World::new().await;
         let mut pump = Pump::new(world.worker());
         let ready = hold_in(&world, &mut pump, S::ReadyFf).await;
@@ -949,7 +990,7 @@ async fn cancel_against_the_permit_has_exactly_one_winner() {
                 assert_eq!(world.attempt(&ready.id).await.state, S::FfInflight);
                 cancel().await
             }
-            _ => tokio::join!(cancel(), driver.pass()).0,
+            _ => unreachable!(),
         };
         pump.drivers.push(driver);
         world.settle(&mut pump).await;
@@ -971,6 +1012,355 @@ async fn cancel_against_the_permit_has_exactly_one_winner() {
             _ => {}
         }
     }
+}
+
+/// The cancel request runs on another runtime thread, released together with
+/// the driver's cancel-or-commit pass. Whatever the interleaving: a granted
+/// cancel means no fast-forward, a refused one means the merge completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_racing_the_permit_on_another_thread_has_exactly_one_winner() {
+    let (mut cancels, mut merges) = (0, 0);
+    for round in 0..10 {
+        let world = World::new().await;
+        let mut pump = Pump::new(world.worker());
+        let ready = hold_in(&world, &mut pump, S::ReadyFf).await;
+        let tip = world.tip("r").await;
+        let mut driver = pump.drivers.pop().unwrap();
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        let cancel = tokio::spawn({
+            let (db, gate, ready) = (world.db.clone(), gate.clone(), ready.clone());
+            async move {
+                gate.wait().await;
+                // Vary who gets to the row first.
+                for _ in 0..round % 4 {
+                    tokio::task::yield_now().await;
+                }
+                db.request_integration_cancel(&ready.id, ready.revision, &db::now_rfc3339())
+                    .await
+            }
+        });
+        let pass = tokio::spawn(async move {
+            gate.wait().await;
+            let pass = driver.pass().await;
+            (driver, pass)
+        });
+        let cancelled = cancel.await.unwrap();
+        let (driver, pass) = pass.await.unwrap();
+        pass.unwrap();
+        pump.drivers.push(driver);
+        world.settle(&mut pump).await;
+        let end = world.attempt(&ready.id).await;
+        match cancelled {
+            Ok(_) => {
+                cancels += 1;
+                assert_eq!(end.state, S::Cancelled, "round {round}");
+                assert_eq!(world.tip("r").await, tip, "round {round}");
+                assert!(receipts_of(&world, &ready.id).await.is_empty());
+            }
+            // Lost the compare-and-set to the commit, or refused after it.
+            Err(db::DbError::VersionConflict | db::DbError::InvalidTransition) => {
+                merges += 1;
+                assert_eq!(end.state, S::Completed, "round {round}");
+                assert_eq!(Some(world.tip("r").await), end.candidate_sha);
+                assert_eq!(ff_successes(&world, &ready.id).await, 1);
+            }
+            Err(error) => panic!("round {round}: {error}"),
+        }
+    }
+    assert_eq!(cancels + merges, 10);
+}
+
+/// A real `git rebase` is running (held by a `pre-rebase` hook) when the
+/// cancel request arrives: the driver stops the effect, the owner records
+/// the cancelled receipt, and only then is the head released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_a_running_rebase_stops_git_and_releases_after_the_receipt() {
+    use std::os::unix::fs::PermissionsExt;
+    let world = World::new().await;
+    let mut pump = Pump::new(world.worker());
+    let held = hold_in(&world, &mut pump, S::Rebasing).await;
+    let candidate = held.candidate_sha.clone().unwrap();
+    let tip = world.tip("r").await;
+    let (running, hook) = (
+        world.temp.path().join("rebase-running"),
+        world.repo("r").join(".git/hooks/pre-rebase"),
+    );
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile :; do sleep 0.05; done\n",
+            running.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut driver = pump.drivers.pop().unwrap();
+    let pass = tokio::spawn(async move {
+        let pass = driver.pass().await;
+        (driver, pass)
+    });
+    wait_for!("git rebase to run", running.exists());
+    let running_attempt = world.attempt(&held.id).await;
+    assert_eq!(running_attempt.state, S::Rebasing);
+    assert_eq!(running_attempt.effect_intent_json.unwrap()["started"], true);
+    assert!(!pass.is_finished());
+    world
+        .db
+        .request_integration_cancel(
+            &held.id,
+            running_attempt.revision,
+            &db::now_rfc3339(),
+        )
+        .await
+        .unwrap();
+    let (driver, pass) = tokio::time::timeout(Duration::from_secs(20), pass)
+        .await
+        .expect("the cancel reaches the running rebase")
+        .unwrap();
+    assert_eq!(pass.unwrap(), Pass::Released);
+    drop(driver);
+    let end = world.attempt(&held.id).await;
+    assert_eq!(end.state, S::Cancelled);
+    assert!(end.effect_intent_json.is_none());
+    let receipts = receipts_of(&world, &held.id).await;
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].request.kind, IntegrationOperationKind::Rebase);
+    assert_eq!(receipts[0].result["kind"], "cancelled");
+    assert_eq!(
+        receipts[0].operation_state,
+        db::IntegrationOperationState::Failed
+    );
+    // Git was stopped before it changed anything.
+    assert_eq!(
+        git_out(&world.tree("a"), &["rev-parse", "HEAD"]).await,
+        Some(candidate)
+    );
+    assert!(!git::detect_rebase_in_progress(&world.tree("a"))
+        .await
+        .unwrap());
+    assert_eq!(world.tip("r").await, tip);
+    assert!(world
+        .steps
+        .actions("a")
+        .contains(&IntegrationStepAction::Clear));
+    assert!(world.queue_of(&held).await.head_attempt_id.is_none());
+    std::fs::remove_file(&hook).unwrap();
+}
+
+/// The process died inside the rebase: the intent is started and has no
+/// receipt. The owner settles it from Git under its own lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn takeover_of_a_started_rebase_is_settled_by_the_owner_from_git() {
+    for ran in [false, true] {
+        let world = World::new().await;
+        let mut pump = Pump::new(world.worker());
+        let a = hold_in(&world, &mut pump, S::Rebasing).await;
+        started_intent(&world, &a, IntegrationOperationKind::Rebase).await;
+        if ran {
+            // Git finished; the receipt was never written.
+            git_out(
+                &world.tree("a"),
+                &["rebase", a.target_tip_sha.as_deref().unwrap()],
+            )
+            .await
+            .unwrap();
+        }
+        drop(pump);
+        world.clock.advance(120);
+        let mut pump = Pump::new(world.worker());
+        let mut drivers = pump.worker.sweep_once().await.unwrap();
+        assert_eq!(world.attempt(&a.id).await.state, S::Reconciling);
+        pump.drivers.append(&mut drivers);
+        world.settle(&mut pump).await;
+        let end = world.attempt(&a.id).await;
+        assert_eq!(end.state, S::Completed, "ran={ran}");
+        assert_eq!(Some(world.tip("r").await), end.candidate_sha);
+        let receipts = receipts_of(&world, &a.id).await;
+        let kinds: Vec<_> = receipts
+            .iter()
+            .map(|receipt| (receipt.request.kind, receipt.result["kind"].to_string()))
+            .collect();
+        use IntegrationOperationKind::{FastForward, Rebase};
+        let expected = if ran {
+            // The finished rebase is proven and adopted: no second rebase.
+            vec![(Rebase, "\"completed\""), (FastForward, "\"completed\"")]
+        } else {
+            vec![
+                (Rebase, "\"not_performed\""),
+                (Rebase, "\"completed\""),
+                (FastForward, "\"completed\""),
+            ]
+        };
+        assert_eq!(
+            kinds,
+            expected
+                .into_iter()
+                .map(|(kind, result)| (kind, result.to_owned()))
+                .collect::<Vec<_>>(),
+            "ran={ran}"
+        );
+        // The rebased commit was checked before it merged.
+        assert!(world
+            .steps
+            .actions("a")
+            .contains(&IntegrationStepAction::RequestCheck));
+        assert_eq!(
+            world.queue_of(&a).await.state,
+            db::IntegrationQueueState::Open
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_holder_that_lost_its_lease_is_fenced_by_generation() {
+    let world = World::new().await;
+    world.steps.hold("a", IntegrationStepAction::Settle);
+    let mut old = Pump::new(world.worker());
+    let a = hold_in(&world, &mut old, S::AwaitingTaskStep).await;
+    let old_fence = world
+        .db
+        .integration_owner_fence(&a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The old lease runs out on the worker clock and another worker claims.
+    world.clock.advance(120);
+    let mut new = Pump::new(world.worker());
+    let mut drivers = new.worker.sweep_once().await.unwrap();
+    assert_eq!(drivers.len(), 1);
+    assert_eq!(drivers[0].generation(), old_fence.generation + 1);
+    new.drivers.append(&mut drivers);
+    // The old driver stops without a write, and the storage fence refuses
+    // its generation whatever the wall clock says about the old lease.
+    let before = world.attempt(&a.id).await.revision;
+    assert_eq!(old.drivers[0].pass().await.unwrap(), Pass::Lost);
+    assert_eq!(world.attempt(&a.id).await.revision, before);
+    let stale = IntegrationEffectRequest {
+        fence: old_fence,
+        kind: IntegrationOperationKind::Rebase,
+        witness: json!({"workspace":{"handle":"x"}}),
+    };
+    assert!(matches!(
+        world.db.begin_integration_effect(stale).await.unwrap(),
+        IntegrationEffectAdmission::Refused(db::IntegrationEffectRefusal::StaleFence)
+    ));
+    world.steps.unhold("a", IntegrationStepAction::Settle);
+    world.settle(&mut new).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_suspended_queue_tells_its_members_once_and_reopens_when_the_target_is_ready() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    let b = world.add_task("r", "b", "b.txt", "b\n").await;
+    sqlx::query("UPDATE repo_location SET status='unavailable' WHERE id='l-r'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let mut pump = Pump::new(world.worker());
+    for _ in 0..3 {
+        world.settle(&mut pump).await;
+        world.clock.advance(30);
+    }
+    let queue = world.queue_of(&a).await;
+    assert_eq!(queue.state, db::IntegrationQueueState::Suspended);
+    assert_eq!(
+        queue.last_error_kind,
+        Some(IntegrationFailureKind::TargetUnavailable)
+    );
+    for task in ["a", "b"] {
+        assert_eq!(
+            world.steps.actions(task),
+            vec![IntegrationStepAction::Park],
+            "{task}"
+        );
+    }
+    assert_eq!(world.attempt(&a.id).await.state, S::Queued);
+    sqlx::query("UPDATE repo_location SET status='ready' WHERE id='l-r'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.settle(&mut pump).await;
+    assert_eq!(
+        world.queue_of(&a).await.state,
+        db::IntegrationQueueState::Open
+    );
+    for attempt in [&a, &b] {
+        assert_eq!(world.attempt(&attempt.id).await.state, S::Completed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quarantined_queue_without_a_head_reopens_only_when_nothing_ran() {
+    let world = World::new().await;
+    let imported = world.add_task("r", "imported", "i.txt", "i\n").await;
+    let b = world.add_task("r", "b", "b.txt", "b\n").await;
+    // What the importer leaves: a quarantined member, a quarantined queue,
+    // no head and no lease.
+    sqlx::query("UPDATE integration_attempt SET state='quarantined',current_operation_state='uncertain' WHERE id=?")
+        .bind(&imported.id)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE integration_queue SET state='quarantined'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let mut pump = Pump::new(world.worker());
+    // An unknown result in the queue: it stays shut, without a write loop.
+    world.settle(&mut pump).await;
+    let shut = world.queue_of(&b).await;
+    assert_eq!(shut.state, db::IntegrationQueueState::Quarantined);
+    world.settle(&mut pump).await;
+    assert_eq!(world.queue_of(&b).await.revision, shut.revision);
+    assert_eq!(world.attempt(&b.id).await.state, S::Queued);
+    // The lookup resolved it: nothing was ever admitted for that member.
+    sqlx::query("UPDATE integration_attempt SET current_operation_state=NULL WHERE id=?")
+        .bind(&imported.id)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.clock.advance(61);
+    world.settle(&mut pump).await;
+    assert_eq!(
+        world.queue_of(&b).await.state,
+        db::IntegrationQueueState::Open
+    );
+    assert_eq!(world.attempt(&b.id).await.state, S::Completed);
+    // The pinned attempt is its owner's to retry.
+    assert_eq!(world.attempt(&imported.id).await.state, S::Quarantined);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_project_parks_with_backoff_and_one_task_step() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    world.facts.paused.store(true, Ordering::SeqCst);
+    let mut pump = Pump::new(world.worker());
+    let mut gaps = Vec::new();
+    for _ in 0..4 {
+        world.settle(&mut pump).await;
+        let parked = world.attempt(&a.id).await;
+        assert_eq!(parked.state, S::Parked);
+        assert!(parked
+            .failure_message
+            .as_deref()
+            .unwrap()
+            .starts_with("project_paused"));
+        let due = parse_time(parked.available_at.as_deref()).unwrap();
+        gaps.push((due - world.clock.now()).num_seconds());
+        world.clock.advance(gaps.last().unwrap() + 1);
+    }
+    assert!(
+        gaps.windows(2).all(|pair| pair[1] > pair[0]),
+        "the retry backs off: {gaps:?}"
+    );
+    assert_eq!(world.steps.actions("a"), vec![IntegrationStepAction::Park]);
+    world.facts.paused.store(false, Ordering::SeqCst);
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
 }
 
 /// state x crash point -> expected recovery. `moved`: the target moved
@@ -1116,9 +1506,9 @@ async fn crash_matrix_every_state_and_await_point_recovers_after_takeover() {
     }
 }
 
-/// A fast-forward intent admitted and started, as the owner leaves it when
-/// the process dies inside the effect.
-async fn started_ff_intent(world: &World, a: &IntegrationAttempt) {
+/// An intent admitted and started, as the owner leaves it when the process
+/// dies inside the effect.
+async fn started_intent(world: &World, a: &IntegrationAttempt, kind: IntegrationOperationKind) {
     let a = world.attempt(&a.id).await;
     let queue = world.queue_of(&a).await;
     let facts = world.facts.head_facts(&a, &queue).await.unwrap();
@@ -1126,6 +1516,11 @@ async fn started_ff_intent(world: &World, a: &IntegrationAttempt) {
         a.candidate_sha.clone().unwrap(),
         a.target_tip_sha.clone().unwrap(),
     );
+    let witness = if kind == IntegrationOperationKind::Rebase {
+        json!({"workspace":facts.workspace,"target_branch":"main","expected_head_sha":head,"expected_target_sha":target,"handoff_conflicts":true,"deadline_nanos":"120000000000"})
+    } else {
+        json!({"workspace":facts.workspace,"target_branch":"main","task_branch":facts.task_branch,"expected_head_sha":head,"expected_target_sha":target,"reviewed":{"commit_sha":head,"base_sha":target},"deadline_nanos":null})
+    };
     let request = IntegrationEffectRequest {
         fence: world
             .db
@@ -1133,8 +1528,8 @@ async fn started_ff_intent(world: &World, a: &IntegrationAttempt) {
             .await
             .unwrap()
             .unwrap(),
-        kind: IntegrationOperationKind::FastForward,
-        witness: json!({"workspace":facts.workspace,"target_branch":"main","task_branch":facts.task_branch,"expected_head_sha":head,"expected_target_sha":target,"reviewed":{"commit_sha":head,"base_sha":target},"deadline_nanos":null}),
+        kind,
+        witness,
     };
     let IntegrationEffectAdmission::Started(mut guard) =
         world.db.begin_integration_effect(request).await.unwrap()
@@ -1142,6 +1537,12 @@ async fn started_ff_intent(world: &World, a: &IntegrationAttempt) {
         panic!("not admitted");
     };
     assert!(guard.start().await.unwrap().is_none());
+}
+async fn started_ff_intent(world: &World, a: &IntegrationAttempt) {
+    started_intent(world, a, IntegrationOperationKind::FastForward).await;
+}
+async fn receipts_of(world: &World, attempt: &str) -> Vec<db::IntegrationEffectReceipt> {
+    serde_json::from_value(world.attempt(attempt).await.effect_receipts_json).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1305,6 +1706,16 @@ async fn parked_infrastructure_retries_then_needs_the_owner_and_transfer_cap_par
             ObjectTransferDirection::Outbound
         ]
     );
+    // One key per attempt, claim generation and direction; the refs of the
+    // finished attempt are released on both ends.
+    let keys = world.transfer.keys.lock().unwrap().clone();
+    assert_eq!(keys.len(), 2);
+    assert!(keys[0].starts_with(&format!("{}-", b.id)) && keys[0].ends_with("-in"));
+    assert!(keys[1].ends_with("-out"));
+    let released = world.transfer.released.lock().unwrap().clone();
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].attempt_id, b.id);
+    assert_eq!(released[0].target.repo_location_id, "l-r");
     let c = world.add_task("r", "c", "c.txt", "c\n").await;
     world.transfer.remote.lock().unwrap().insert("c".into());
     world.transfer.too_large.store(true, Ordering::SeqCst);
@@ -1411,17 +1822,6 @@ async fn an_idle_worker_writes_nothing() {
     }
     assert_eq!(digest(&world.db).await, before);
     assert_eq!(world.steps.requests.lock().unwrap().len(), steps);
-}
-
-macro_rules! wait_for {
-    ($what:literal, $done:expr) => {{
-        let mut waited = 0;
-        while !$done {
-            waited += 1;
-            assert!(waited < 6000, "timed out waiting for {}", $what);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }};
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

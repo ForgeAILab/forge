@@ -1,6 +1,10 @@
 //! The worker's seams. It consumes three ports (Task steps, read-only facts,
 //! object transfer) and provides two (enqueue notification, snapshot).
-use crate::{integration_effects::EffectWorkspace, Result};
+use crate::{
+    integration_effects::{EffectOwner, EffectWorkspace},
+    Result,
+};
+pub use api_types::ObjectTransferDirection;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use db::{
@@ -145,6 +149,9 @@ pub struct HeadFacts {
     pub rebase_in_progress: bool,
     /// The Task's checkout shares the default checkout's object store.
     pub shared_object_store: bool,
+    /// The repo location the Task's checkout belongs to (the other end of an
+    /// object transfer; the default checkout is the queue's target).
+    pub task_location: ObjectTransferEndpoint,
 }
 
 /// No Task, Review, event or Git-write capability.
@@ -157,20 +164,27 @@ pub trait IntegrationFactsPort: Send + Sync {
     ) -> Result<HeadFacts>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectTransferDirection {
-    /// Target tip to the Task's checkout, before the rebase.
-    Inbound,
-    /// Candidate to the default checkout, before the fast-forward.
-    Outbound,
+/// One checkout an object transfer reads from or writes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectTransferEndpoint {
+    pub repo_location_id: String,
+    pub owner: EffectOwner,
 }
+/// `Inbound`: the target tip goes to the Task's checkout before the rebase.
+/// `Outbound`: the candidate goes to the default checkout before the
+/// fast-forward. The key of one transfer is
+/// `api_types::object_transfer_key(fence.attempt_id, fence.generation, direction)`.
 #[derive(Debug, Clone)]
 pub struct ObjectTransferRequest {
     pub fence: IntegrationOwnerFence,
-    pub workspace: EffectWorkspace,
-    pub target_branch: String,
     pub direction: ObjectTransferDirection,
-    pub have: String,
+    /// The Task's checkout.
+    pub task: ObjectTransferEndpoint,
+    /// The queue's default checkout.
+    pub target: ObjectTransferEndpoint,
+    pub target_branch: String,
+    /// Commits the receiver already holds.
+    pub have: Vec<String>,
     pub want: String,
     pub max_bytes: u64,
 }
@@ -179,11 +193,22 @@ pub enum ObjectTransferOutcome {
     Transferred { bytes: u64 },
     TooLarge { bytes: u64 },
 }
+/// Every transfer ref and staging file of one attempt, on both checkouts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectTransferRelease {
+    pub attempt_id: String,
+    pub task: ObjectTransferEndpoint,
+    pub target: ObjectTransferEndpoint,
+}
 /// Moves commits between a non-default checkout and the default checkout.
-/// Idempotent by `(fence.attempt_id, direction, want)`.
+/// `transfer` is idempotent by its key (a repeat finds the import and moves
+/// nothing). `release` deletes `refs/forge/integration/<attempt>-*` and any
+/// staging on both ends; best effort and idempotent, called when the attempt
+/// leaves the slot.
 #[async_trait]
 pub trait ObjectTransferPort: Send + Sync {
     async fn transfer(&self, request: ObjectTransferRequest) -> Result<ObjectTransferOutcome>;
+    async fn release(&self, release: ObjectTransferRelease) -> Result<()>;
 }
 
 /// Provided by the worker. The step that admits an attempt calls it after

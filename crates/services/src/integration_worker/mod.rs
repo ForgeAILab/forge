@@ -51,6 +51,8 @@ pub struct IntegrationWorkerConfig {
     pub permit_lifetime: Duration,
     pub ff_owner_bound: Duration,
     pub reconcile_interval: Duration,
+    /// Longest gap between retries of a wait that has no end of its own.
+    pub soon_retry_max: Duration,
     /// Automatic retries of an infrastructure park, then the owner decides.
     pub infra_retry: Vec<Duration>,
     pub external_move_allowance: usize,
@@ -74,6 +76,7 @@ impl Default for IntegrationWorkerConfig {
             permit_lifetime: Duration::from_secs(120),
             ff_owner_bound: Duration::from_secs(30),
             reconcile_interval: Duration::from_secs(60),
+            soon_retry_max: Duration::from_secs(600),
             infra_retry: vec![
                 Duration::from_secs(30),
                 Duration::from_secs(120),
@@ -106,6 +109,8 @@ struct Shared {
     /// are claimable than `max_heads`.
     cursor: Option<String>,
     reconcile_after: HashMap<String, DateTime<Utc>>,
+    /// Queued members of a suspended queue whose Task was told, by queue.
+    suspended_told: HashMap<String, HashSet<String>>,
 }
 
 pub struct IntegrationQueueWorker {
@@ -510,24 +515,35 @@ impl IntegrationQueueWorker {
             if waiting {
                 return Ok(None);
             }
-            // No head: an imported quarantine. It leaves by its owner's
-            // retry (a successor admission), not by this worker.
-            let Some(head) = self.db.integration_head(&queue.id).await? else {
-                return Ok(None);
-            };
-            match head.state {
-                IntegrationAttemptState::Reconciling | IntegrationAttemptState::FfInflight => {}
-                IntegrationAttemptState::Quarantined => {
-                    self.advance(&head.id, IntegrationAttemptState::Reconciling, |_| {})
-                        .await?;
-                }
-                // The head resolved but the process died before the queue
-                // was re-opened: re-open with the stored witness.
-                _ => match self.reopen(&queue, &head).await {
-                    Ok(reopened) => queue = reopened,
+            match self.db.integration_head(&queue.id).await? {
+                // No head: an imported quarantine. Nothing was ever admitted
+                // for the member that pins it, and storage re-verifies that,
+                // so the queue re-opens for the members behind it. The pinned
+                // attempt itself stays quarantined for its owner's Retry.
+                None => match self.reopen_headless(&queue).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.defer_reconcile(&queue.id);
+                        return Ok(None);
+                    }
                     Err(error) => {
                         self.defer_reconcile(&queue.id);
                         return Err(error);
+                    }
+                },
+                Some(head) => match head.state {
+                    IntegrationAttemptState::Reconciling | IntegrationAttemptState::FfInflight => {}
+                    IntegrationAttemptState::Quarantined => {
+                        self.advance(&head.id, IntegrationAttemptState::Reconciling, |_| {})
+                            .await?;
+                    }
+                    // The head resolved but the process died before the queue
+                    // was re-opened: re-open with the stored witness.
+                    _ => {
+                        if let Err(error) = self.reopen(&queue, &head).await {
+                            self.defer_reconcile(&queue.id);
+                            return Err(error);
+                        }
                     }
                 },
             }
@@ -544,12 +560,94 @@ impl IntegrationQueueWorker {
             )
             .await
         {
-            Ok(claimed) => Ok(Some(HeadDriver::new(Arc::clone(self), &claimed))),
-            // Nothing eligible, lost the race, or the target is not ready
-            // (the claim committed `suspended`; the next sweep tries again).
-            Err(db::DbError::NotFound | db::DbError::VersionConflict) => Ok(None),
+            Ok(claimed) => {
+                self.shared
+                    .lock()
+                    .expect("integration worker state")
+                    .suspended_told
+                    .remove(&claimed.id);
+                Ok(Some(HeadDriver::new(Arc::clone(self), &claimed)))
+            }
+            Err(db::DbError::NotFound) => Ok(None),
+            // Lost the race, or the target is not ready (the claim committed
+            // `suspended`; the next sweep tries again).
+            Err(db::DbError::VersionConflict) => {
+                self.tell_suspended_members(&queue.id).await?;
+                Ok(None)
+            }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Each queued member of a suspended queue gets one `park` step, so its
+    /// Task shows why it waits (the step reads the queue's `last_error_kind`).
+    /// The key is the member's own `effect_seq`, so a repeat is a no-op.
+    async fn tell_suspended_members(&self, queue_id: &str) -> Result<()> {
+        let queue = self.queue(queue_id).await?;
+        if queue.state != IntegrationQueueState::Suspended {
+            return Ok(());
+        }
+        for member in self.db.integration_members(queue_id, 1000).await? {
+            // The waiting members, and a head the target vanished under.
+            let waits = member.state == IntegrationAttemptState::Queued
+                || queue.head_attempt_id.as_deref() == Some(&member.id);
+            if !waits || member.cancel_requested_at.is_some() {
+                continue;
+            }
+            let told = self
+                .shared
+                .lock()
+                .expect("integration worker state")
+                .suspended_told
+                .get(queue_id)
+                .is_some_and(|told| told.contains(&member.id));
+            if told {
+                continue;
+            }
+            self.steps
+                .enqueue_step(&Self::step_request(&member, IntegrationStepAction::Park))
+                .await?;
+            self.shared
+                .lock()
+                .expect("integration worker state")
+                .suspended_told
+                .entry(queue_id.to_owned())
+                .or_default()
+                .insert(member.id);
+        }
+        Ok(())
+    }
+
+    /// `Ok(false)`: no member of the queue can witness that nothing ran.
+    async fn reopen_headless(&self, queue: &IntegrationQueue) -> Result<bool> {
+        for member in self.db.integration_members(&queue.id, 1000).await? {
+            let untouched = member.effect_intent_json.is_none()
+                && member
+                    .effect_receipts_json
+                    .as_array()
+                    .is_some_and(Vec::is_empty);
+            if !untouched {
+                continue;
+            }
+            let queue = self.queue(&queue.id).await?;
+            return match self
+                .db
+                .reopen_integration_queue(
+                    &queue.id,
+                    queue.revision,
+                    &IntegrationQueueReopenWitness::NoEffect {
+                        attempt_id: member.id,
+                    },
+                )
+                .await
+            {
+                Ok(_) => Ok(true),
+                // Storage found an unsettled effect in the queue: it stays.
+                Err(db::DbError::Check(_)) => Ok(false),
+                Err(error) => Err(error.into()),
+            };
+        }
+        Ok(false)
     }
 
     /// Leave `quarantined` with evidence the storage re-verifies: the head's

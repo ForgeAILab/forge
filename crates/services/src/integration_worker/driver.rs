@@ -5,10 +5,11 @@
 use super::{
     is_conflict, later, parse_time, stamp, CrashPoint, HeadAction, HeadFacts, HeadTimeout,
     IntegrationQueueWorker, IntegrationStepAck, IntegrationStepAction, IntegrationStepOutcome,
-    ObjectTransferDirection, ObjectTransferOutcome, ObjectTransferRequest, TaskGate,
+    ObjectTransferDirection, ObjectTransferEndpoint, ObjectTransferOutcome, ObjectTransferRelease,
+    ObjectTransferRequest, TaskGate,
 };
 use crate::{
-    integration_effects::merge::ReviewedMergeObject,
+    integration_effects::{merge::ReviewedMergeObject, EffectOwner},
     integration_owner::{
         OwnerEffectRefusal, OwnerMergeReceipt, OwnerRebaseReceipt, ServerMergeRequest,
         ServerRebaseRequest,
@@ -125,6 +126,8 @@ pub struct HeadDriver {
     /// When this session first saw the head in its present state.
     since: Option<(S, DateTime<Utc>)>,
     result_checked: Option<DateTime<Utc>>,
+    /// The ends of an object transfer this session made for the head.
+    transferred: Option<ObjectTransferRelease>,
     stop: CancellationToken,
 }
 
@@ -137,6 +140,7 @@ impl HeadDriver {
             enqueued: HashSet::new(),
             since: None,
             result_checked: None,
+            transferred: None,
             stop: CancellationToken::new(),
         }
     }
@@ -190,6 +194,15 @@ impl HeadDriver {
         match self.step().await {
             Err(error) if is_conflict(&error) => Ok(Pass::Wait(self.w.config.conflict_backoff)),
             Ok(pass @ (Pass::Released | Pass::Lost)) => {
+                if pass == Pass::Released {
+                    if let Some(release) = self.transferred.take() {
+                        // Best effort: a leftover ref holds objects only; the
+                        // transfer owner also sweeps ended attempts at start.
+                        if let Err(error) = self.w.transfer.release(release).await {
+                            tracing::warn!(target: "services::integration_worker", queue_id = %self.queue_id, %error, "integration transfer refs were not released");
+                        }
+                    }
+                }
                 self.w.release_active(&self.queue_id);
                 Ok(pass)
             }
@@ -355,10 +368,25 @@ impl HeadDriver {
             .as_array()
             .cloned()
             .unwrap_or_default();
+        let parks = |entry: &&serde_json::Value| entry["kind"] == "worker_park";
         let counted = journal
             .iter()
-            .filter(|entry| entry["kind"] == "worker_park" && entry["counted"] == true)
+            .filter(parks)
+            .filter(|entry| entry["counted"] == true)
             .count();
+        // Parks for this same reason with nothing but the re-queue between
+        // them (`start` adds one to `effect_seq`; any step adds more).
+        let mut repeats = 0u32;
+        let mut seq = a.effect_seq;
+        for entry in journal.iter().rev().filter(parks) {
+            if entry["reason"] != reason.code() || entry["effect_seq"].as_i64() != Some(seq - 1) {
+                break;
+            }
+            repeats += 1;
+            seq -= 1;
+        }
+        let exhausted =
+            reason.retry() == Retry::Counted && self.w.config.infra_retry.get(counted).is_none();
         let (kind, available_at, message) = match reason.retry() {
             Retry::Counted => match self.w.config.infra_retry.get(counted) {
                 Some(delay) => (
@@ -372,16 +400,29 @@ impl HeadDriver {
                     format!("retries_exhausted: {}: {detail}", reason.code()),
                 ),
             },
+            // A wait with no end of its own (a paused Project, a target that
+            // is not ready): the retry backs off to `soon_retry_max`.
             Retry::Soon => (
                 reason.kind(),
-                Some(stamp(later(now, self.w.config.sweep_interval))),
+                Some(stamp(later(
+                    now,
+                    self.w
+                        .config
+                        .sweep_interval
+                        .saturating_mul(1u32 << repeats.min(16))
+                        .min(self.w.config.soon_retry_max),
+                ))),
                 format!("{}: {detail}", reason.code()),
             ),
             Retry::Owner => (reason.kind(), None, format!("{}: {detail}", reason.code())),
         };
-        self.enqueue(a, IntegrationStepAction::Park).await?;
+        // The Task was told when this wait began; a retry that ends in the
+        // same wait is not another Task step.
+        if repeats == 0 || exhausted {
+            self.enqueue(a, IntegrationStepAction::Park).await?;
+        }
         self.close_timings(a).await?;
-        let entry = json!({"kind":"worker_park","reason":reason.code(),"counted":reason.retry()==Retry::Counted,"at":stamp(now)});
+        let entry = json!({"kind":"worker_park","reason":reason.code(),"counted":reason.retry()==Retry::Counted,"effect_seq":a.effect_seq,"at":stamp(now)});
         self.w
             .advance(&a.id, S::Parked, move |a| {
                 let mut journal = a
@@ -554,15 +595,39 @@ impl HeadDriver {
                 (facts.target_tip.clone(), facts.candidate_head.clone())
             }
         };
+        let fence = self.fence(a).await?;
+        let target = ObjectTransferEndpoint {
+            repo_location_id: fence.target_owner["location_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            owner: match (
+                fence.target_owner["owner_kind"].as_str(),
+                fence.target_owner["daemon_id"].as_str(),
+                fence.target_owner["runtime_id"].as_str(),
+            ) {
+                (Some("daemon"), Some(daemon_id), Some(runtime_id)) => EffectOwner::Daemon {
+                    daemon_id: daemon_id.to_owned(),
+                    runtime_id: runtime_id.to_owned(),
+                },
+                _ => EffectOwner::Server,
+            },
+        };
+        self.transferred = Some(ObjectTransferRelease {
+            attempt_id: a.id.clone(),
+            task: facts.task_location.clone(),
+            target: target.clone(),
+        });
         let outcome = self
             .w
             .transfer
             .transfer(ObjectTransferRequest {
-                fence: self.fence(a).await?,
-                workspace: facts.workspace.clone(),
-                target_branch: queue.target_branch.clone(),
+                fence,
                 direction,
-                have,
+                task: facts.task_location.clone(),
+                target,
+                target_branch: queue.target_branch.clone(),
+                have: vec![have],
                 want,
                 max_bytes: self.w.config.transfer_cap_bytes,
             })
@@ -897,11 +962,11 @@ impl HeadDriver {
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(error) => {
-                // The receipt may or may not exist; the rows decide.
-                tracing::warn!(target: "services::integration_worker", attempt_id = %a.id, %error, "integration rebase returned no receipt");
-                return Ok(Pass::Wait(self.w.config.conflict_backoff));
-            }
+            // The receipt may or may not exist; the rows decide on the next
+            // pass. Returned as an error so that a rebase that keeps failing
+            // before its intent is counted and ends the session (the lease
+            // then paces the retries) instead of spinning at the backoff.
+            Err(error) => return Err(error),
         };
         self.w.fault(S::Rebasing, CrashPoint::AfterEffectReceipt)?;
         let elapsed = millis(started, self.w.clock.now());
@@ -1312,57 +1377,25 @@ impl HeadDriver {
         }
     }
 
-    /// Owner gap, worked around here until the server owner proves these
-    /// itself: a started queue-lease intent whose effect provably never moved
-    /// a ref is settled as not performed, under the owner's own lock.
-    async fn settle_unmoved(&self, a: &IntegrationAttempt, facts: &HeadFacts) -> Result<()> {
-        let Some(intent) = a.effect_intent_json.as_ref() else {
-            return Ok(());
-        };
-        let Ok(request) =
-            serde_json::from_value::<IntegrationEffectRequest>(intent["request"].clone())
-        else {
-            return Ok(());
-        };
-        let witness = &request.witness;
-        let unmoved = match request.kind {
-            IntegrationOperationKind::FastForward | IntegrationOperationKind::Merge => {
-                witness["expected_target_sha"].as_str() == Some(&facts.target_tip)
-                    && !facts.candidate_in_target
-            }
-            IntegrationOperationKind::Rebase => {
-                !facts.rebase_in_progress
-                    && witness["expected_head_sha"].as_str() == Some(&facts.candidate_head)
-            }
-            _ => false,
-        };
-        if !unmoved {
-            return Ok(());
-        }
-        if let Some(guard) = self.w.db.lock_integration_reconciliation(&request).await? {
-            guard
-                .record(
-                    json!({"kind":"not_performed","reason":"ref_unmoved"}),
-                    IntegrationOperationState::Failed,
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn reconcile(&mut self, a: IntegrationAttempt, queue: &IntegrationQueue) -> Result<Pass> {
         let mut a = a;
-        let facts = self.facts(&a, queue).await;
-        if a.effect_intent_json.is_some() {
-            if let Err(error) = self.w.owner.reconcile_outstanding().await {
+        if let Some(intent) = a.effect_intent_json.as_ref() {
+            // Only the owner settles an admitted effect, under its own
+            // checkout lock: a receipt, an exact proof, or "the ref never
+            // moved". The worker records nothing itself.
+            let outcome = match serde_json::from_value::<IntegrationEffectRequest>(
+                intent["request"].clone(),
+            ) {
+                Ok(request) => self.w.owner.reconcile_effect(&request).await,
+                Err(_) => self.w.owner.reconcile_outstanding().await,
+            };
+            if let Err(error) = outcome {
                 tracing::warn!(target: "services::integration_worker", attempt_id = %a.id, %error, "integration owner reconciliation failed");
             }
             a = self.w.attempt(&a.id).await?;
-            if let Ok(facts) = &facts {
-                self.settle_unmoved(&a, facts).await?;
-                a = self.w.attempt(&a.id).await?;
-            }
         }
+        // Read after the settlement, so the facts are never older than it.
+        let facts = self.facts(&a, queue).await;
         if a.effect_intent_json.is_some() {
             // Unknown result. Nothing is guessed: the queue is quarantined
             // with a typed reason and the reconcile timer keeps asking.
