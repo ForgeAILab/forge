@@ -2,9 +2,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CHECK_SPEC_REVISION: u32 = 1;
-pub const CHECK_DIGEST_SCHEMA: &str = "forge.check-execution/1";
+pub const CHECK_SPEC_REVISION: u32 = 2;
+pub const CHECK_DIGEST_SCHEMA: &str = "forge.check-execution/2";
 
+/// Why a consumer asked for a check. It selects the bundle the builder
+/// assembles and is recorded on the consumer row; it is NOT part of the spec
+/// or the digest, so two purposes needing the same commands share one run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckPurpose {
@@ -18,6 +21,53 @@ pub enum CheckPurpose {
     EnvironmentHelper,
     AgentSelected,
     QueueHeadCi,
+}
+impl CheckPurpose {
+    pub const ALL: &'static [Self] = &[
+        Self::EntryCi,
+        Self::ReviewCi,
+        Self::Conformance,
+        Self::BeforeWork,
+        Self::Lifecycle,
+        Self::EnvironmentPreflight,
+        Self::ReadinessProbe,
+        Self::EnvironmentHelper,
+        Self::AgentSelected,
+        Self::QueueHeadCi,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EntryCi => "entry_ci",
+            Self::ReviewCi => "review_ci",
+            Self::Conformance => "conformance",
+            Self::BeforeWork => "before_work",
+            Self::Lifecycle => "lifecycle",
+            Self::EnvironmentPreflight => "environment_preflight",
+            Self::ReadinessProbe => "readiness_probe",
+            Self::EnvironmentHelper => "environment_helper",
+            Self::AgentSelected => "agent_selected",
+            Self::QueueHeadCi => "queue_head_ci",
+        }
+    }
+}
+/// What one run of a bundle is good for, and therefore who may share it.
+/// A bundle that only reads a commit is `Commit`: any Task at that commit
+/// shares the run. A bundle that acts on a worktree carries that worktree's
+/// durable identity, so a second worktree at the same commit is still prepared.
+/// A script with no worktree at all is still owed to its own Task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckScope {
+    Commit,
+    /// `generation` is the workspace placement generation: a re-placed or
+    /// re-created worktree is a different target.
+    Workspace {
+        workspace_id: String,
+        generation: u64,
+    },
+    Task {
+        task_id: String,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,10 +106,16 @@ pub struct CheckCommandSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckSpec {
     pub schema_revision: u32,
-    pub purpose: CheckPurpose,
+    pub scope: CheckScope,
     pub commands: Vec<CheckCommandSpec>,
-    /// Defined now; no executor reads this until the durable-runner cutover.
-    pub whole_run_timeout_seconds: u64,
+    /// True when the bundle has a cleanup step the runner must perform after
+    /// the commands. No family configured today declares one.
+    pub declares_cleanup: bool,
+    /// Evidence only, excluded from the digest: how many steps the
+    /// configuration listed, and which of them (zero-based, in configured
+    /// order) were blank and therefore dropped from `commands`.
+    pub configured_commands: usize,
+    pub blank_commands: Vec<usize>,
     /// Runner policy identity, including inherited environment/removals and
     /// machine build policy. A policy change must change this revision.
     pub execution_policy: String,
@@ -73,11 +129,30 @@ impl CheckSpec {
                 .all(|command| command.cacheability == CheckCacheability::DeclaredControlledInputs)
     }
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_revision != CHECK_SPEC_REVISION
-            || self.whole_run_timeout_seconds == 0
-            || self.execution_policy.is_empty()
+        if self.schema_revision != CHECK_SPEC_REVISION || self.execution_policy.is_empty() {
+            return Err("invalid check spec revision or policy".into());
+        }
+        if match &self.scope {
+            CheckScope::Commit => false,
+            CheckScope::Workspace {
+                workspace_id,
+                generation,
+            } => workspace_id.is_empty() || *generation == 0,
+            CheckScope::Task { task_id } => task_id.is_empty(),
+        } {
+            return Err("check scope needs a workspace generation or a Task".into());
+        }
+        if self.commands.len() + self.blank_commands.len() != self.configured_commands
+            || self
+                .blank_commands
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .blank_commands
+                .last()
+                .is_some_and(|index| *index >= self.configured_commands)
         {
-            return Err("invalid check spec revision, policy or wall timeout".into());
+            return Err("blank steps must account for every configured step".into());
         }
         let mut ids = BTreeSet::new();
         for command in &self.commands {
@@ -170,13 +245,19 @@ impl CheckDigestInput {
                 .any(|v| matches!(v, CheckEnvironmentValue::Volatile))
     }
     /// Canonical compact UTF-8 JSON, recursive lexical object-key sorting,
-    /// ordered arrays and a schema envelope. Audit metadata is not semantic.
+    /// ordered arrays and a schema envelope. Audit metadata and the blank-step
+    /// record are not semantic: they change no command that runs.
     pub fn encoding(&self) -> Result<String, String> {
         self.validate()?;
+        let mut spec = serde_json::to_value(&self.spec).map_err(|e| e.to_string())?;
+        if let Some(fields) = spec.as_object_mut() {
+            fields.remove("configured_commands");
+            fields.remove("blank_commands");
+        }
         crate::canonical_json_with_schema(
             CHECK_DIGEST_SCHEMA,
             &serde_json::json!({
-                "spec": self.spec, "environment": self.environment,
+                "spec": spec, "environment": self.environment,
                 "environment_identity": self.environment_identity,
                 "execution_revision": self.execution_revision.number,
             }),

@@ -1,7 +1,11 @@
 {
   "spec": {
-    "schema_revision": 1,
-    "purpose": "conformance",
+    "schema_revision": 2,
+    "scope": {
+      "kind": "workspace",
+      "workspace_id": "workspace-1",
+      "generation": 3
+    },
     "commands": [
       {
         "id": "ci:0",
@@ -36,7 +40,11 @@
         ]
       }
     ],
-    "whole_run_timeout_seconds": 1800,
+    "declares_cleanup": false,
+    "configured_commands": 3,
+    "blank_commands": [
+      1
+    ],
     "execution_policy": "controlled-server/1"
   },
   "environment": {

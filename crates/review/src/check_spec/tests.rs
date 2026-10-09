@@ -22,10 +22,31 @@ fn config<'a>(
         event: LifecycleEvent::BeforeWork,
         role: "coder",
         owner_is_daemon: false,
-        has_workspace: true,
-        whole_run_timeout_seconds: 1800,
+        workspace: Some(CheckWorkspaceIdentity {
+            workspace_id: "w",
+            generation: 1,
+        }),
         queue_head_bundle: None,
     }
+}
+/// The execution digest of a built spec on an unattested owner.
+fn digest(spec: &CheckSpec) -> String {
+    CheckDigestInput {
+        spec: spec.clone(),
+        environment: spec
+            .commands
+            .iter()
+            .flat_map(|command| command.environment_keys.iter().cloned())
+            .map(|key| (key, CheckEnvironmentValue::Volatile))
+            .collect(),
+        environment_identity: CheckEnvironmentIdentity::NotAttested,
+        execution_revision: CheckExecutionRevision {
+            number: 0,
+            audit_ref: None,
+        },
+    }
+    .digest()
+    .unwrap()
 }
 fn commands(spec: &CheckSpec) -> Vec<&str> {
     spec.commands
@@ -146,7 +167,7 @@ fn lifecycle_families_select_scripts_and_preserve_timeouts_cwd_and_context_keys(
         spec.commands[0].working_directory,
         CheckWorkingDirectory::TaskRoot
     );
-    cfg.has_workspace = false;
+    cfg.workspace = None;
     let spec = build_check_spec(CheckPurpose::Lifecycle, &cfg).unwrap();
     assert_eq!(commands(&spec), ["async"]);
     assert_eq!(spec.commands[0].timeout_seconds, Some(7));
@@ -225,7 +246,11 @@ fn queue_head_contract_can_hold_either_future_gating_policy_without_a_default() 
         commands(&all),
         ["prepare", "task-one", "task-two", "linked-check"]
     );
-    assert_eq!(ci.purpose, all.purpose);
+    // Queue-head CI is entry CI's bundle: one identity, whoever asks.
+    assert_eq!(
+        digest(&ci),
+        digest(&build_check_spec(CheckPurpose::EntryCi, &cfg).unwrap())
+    );
 }
 
 #[test]
@@ -276,4 +301,213 @@ fn owner_hook_test_and_single_environment_helper_do_not_apply_bulk_filters() {
     let spec = build_check_spec(CheckPurpose::EnvironmentHelper, &cfg).unwrap();
     assert_eq!(commands(&spec), ["review-check"]);
     assert_eq!(spec.commands[0].timeout_seconds, Some(6));
+}
+
+fn every_family_fixture() -> (Value, ProjectEnvironment, [LifecycleHookDef; 2]) {
+    let environment = serde_json::from_value(
+        json!({"checks":[{"name":"probe","command":"probe-check","timeout_seconds":5}]}),
+    )
+    .unwrap();
+    let hooks = [
+        LifecycleHookDef::Script {
+            command: "prepare-worktree".into(),
+            timeout_seconds: 5,
+            blocking: true,
+        },
+        LifecycleHookDef::Script {
+            command: "notify".into(),
+            timeout_seconds: 5,
+            blocking: false,
+        },
+    ];
+    (source(), environment, hooks)
+}
+
+#[test]
+fn worktree_families_carry_the_workspace_identity_and_commit_families_never_do() {
+    use CheckFamilyScope::*;
+    let (with_setup, environment, hooks) = every_family_fixture();
+    let mut without_setup = with_setup.clone();
+    without_setup["project_settings"]["default_review_config"]["setup_steps"] = json!([]);
+    // The whole classification. `Probe` families follow the workspace only
+    // when they run in one.
+    let families = [
+        (CheckPurpose::EntryCi, &with_setup, None, Commit),
+        (CheckPurpose::ReviewCi, &with_setup, None, Commit),
+        (CheckPurpose::AgentSelected, &with_setup, None, Commit),
+        (
+            CheckPurpose::QueueHeadCi,
+            &with_setup,
+            Some(QueueHeadCheckBundle::CiOnly),
+            Commit,
+        ),
+        (CheckPurpose::Conformance, &without_setup, None, Commit),
+        (
+            CheckPurpose::QueueHeadCi,
+            &without_setup,
+            Some(QueueHeadCheckBundle::Conformance),
+            Commit,
+        ),
+        (CheckPurpose::Conformance, &with_setup, None, Worktree),
+        (
+            CheckPurpose::QueueHeadCi,
+            &with_setup,
+            Some(QueueHeadCheckBundle::Conformance),
+            Worktree,
+        ),
+        (CheckPurpose::BeforeWork, &with_setup, None, Worktree),
+        (CheckPurpose::Lifecycle, &with_setup, None, Worktree),
+        (
+            CheckPurpose::EnvironmentPreflight,
+            &with_setup,
+            None,
+            Worktree,
+        ),
+        (CheckPurpose::ReadinessProbe, &with_setup, None, Probe),
+        (CheckPurpose::EnvironmentHelper, &with_setup, None, Probe),
+    ];
+    for purpose in CheckPurpose::ALL {
+        assert!(families.iter().any(|(family, ..)| family == purpose));
+    }
+    for (purpose, source, bundle, expected) in families {
+        let build = |workspace: Option<(&str, u64)>, task: &str| {
+            let mut source = source.clone();
+            source["task_id"] = json!(task);
+            let mut cfg = config(&source, &environment, &hooks);
+            cfg.event = LifecycleEvent::BeforeWork;
+            cfg.queue_head_bundle = bundle;
+            cfg.workspace = workspace.map(|(workspace_id, generation)| CheckWorkspaceIdentity {
+                workspace_id,
+                generation,
+            });
+            build_check_spec(purpose, &cfg).unwrap()
+        };
+        let has_setup = std::ptr::eq(source, &with_setup);
+        assert_eq!(
+            check_family_scope(purpose, bundle, has_setup),
+            expected,
+            "{purpose:?}"
+        );
+        let first = build(Some(("w", 1)), "t");
+        let other_workspace = digest(&build(Some(("w2", 1)), "t2"));
+        let other_generation = digest(&build(Some(("w", 2)), "t"));
+        let no_workspace = build(None, "t");
+        let no_workspace_other_task = build(None, "t2");
+        match expected {
+            Commit => {
+                assert_eq!(first.scope, CheckScope::Commit, "{purpose:?}");
+                // Neither the workspace nor the Task reaches the identity.
+                assert_eq!(digest(&first), other_workspace, "{purpose:?}");
+                assert_eq!(digest(&first), other_generation, "{purpose:?}");
+                assert_eq!(digest(&first), digest(&no_workspace), "{purpose:?}");
+                assert_eq!(
+                    digest(&first),
+                    digest(&no_workspace_other_task),
+                    "{purpose:?}"
+                );
+            }
+            Worktree | Probe => {
+                assert_eq!(
+                    first.scope,
+                    CheckScope::Workspace {
+                        workspace_id: "w".into(),
+                        generation: 1
+                    },
+                    "{purpose:?}"
+                );
+                assert_ne!(digest(&first), other_workspace, "{purpose:?}");
+                assert_ne!(digest(&first), other_generation, "{purpose:?}");
+                if expected == Probe {
+                    assert_eq!(no_workspace.scope, CheckScope::Commit);
+                } else {
+                    // No worktree: still one run per Task, never shared.
+                    assert_eq!(
+                        no_workspace.scope,
+                        CheckScope::Task {
+                            task_id: "t".into()
+                        }
+                    );
+                    assert_ne!(digest(&no_workspace), digest(&no_workspace_other_task));
+                }
+            }
+        }
+    }
+    // A worktree family with neither a workspace nor a Task has no identity.
+    let mut anonymous = with_setup.clone();
+    anonymous.as_object_mut().unwrap().remove("task_id");
+    let mut cfg = config(&anonymous, &environment, &hooks);
+    cfg.workspace = None;
+    assert!(build_check_spec(CheckPurpose::BeforeWork, &cfg).is_err());
+    assert!(build_check_spec(CheckPurpose::EntryCi, &cfg).is_ok());
+}
+
+#[test]
+fn purpose_selects_the_bundle_and_is_not_in_the_spec_or_its_digest() {
+    let (source, environment, hooks) = every_family_fixture();
+    let mut cfg = config(&source, &environment, &hooks);
+    let entry = build_check_spec(CheckPurpose::EntryCi, &cfg).unwrap();
+    let review = build_check_spec(CheckPurpose::ReviewCi, &cfg).unwrap();
+    cfg.queue_head_bundle = Some(QueueHeadCheckBundle::CiOnly);
+    let queue_head = build_check_spec(CheckPurpose::QueueHeadCi, &cfg).unwrap();
+    assert_eq!(entry, review);
+    assert_eq!(entry, queue_head);
+    assert_eq!(digest(&entry), digest(&review));
+    assert_eq!(digest(&entry), digest(&queue_head));
+    assert!(!serde_json::to_string(&entry).unwrap().contains("purpose"));
+    // No family configured today declares a cleanup step.
+    for purpose in CheckPurpose::ALL {
+        assert!(!build_check_spec(*purpose, &cfg).unwrap().declares_cleanup);
+    }
+}
+
+#[test]
+fn blank_steps_are_dropped_recorded_and_an_all_blank_list_is_the_empty_auto_pass() {
+    let environment = ProjectEnvironment::default();
+    let build = |steps: Value| {
+        let mut source = source();
+        source["task_scope"]["config"]["review"]["ci_steps"] = steps;
+        let entry =
+            build_check_spec(CheckPurpose::EntryCi, &config(&source, &environment, &[])).unwrap();
+        let review =
+            build_check_spec(CheckPurpose::ReviewCi, &config(&source, &environment, &[])).unwrap();
+        assert_eq!(entry, review);
+        entry
+    };
+    let spec = build(json!(["first", "", "  \t", "second", "\n"]));
+    assert_eq!(commands(&spec), ["first", "second"]);
+    assert_eq!(spec.commands[1].id, "ci:1");
+    // Evidence can still say "step 3 of 5 was blank".
+    assert_eq!(spec.configured_commands, 5);
+    assert_eq!(spec.blank_commands, [1, 2, 4]);
+    let plain = build(json!(["first", "second"]));
+    assert_eq!(
+        (plain.configured_commands, plain.blank_commands.len()),
+        (2, 0)
+    );
+    assert_eq!(digest(&spec), digest(&plain));
+
+    let all_blank = build(json!(["", " "]));
+    let empty = build(json!([]));
+    assert!(all_blank.commands.is_empty() && empty.commands.is_empty());
+    assert_eq!(all_blank.blank_commands, [0, 1]);
+    assert_eq!(digest(&all_blank), digest(&empty));
+    assert!(!all_blank.cacheable() && !empty.cacheable());
+
+    // Blank hook and environment-check commands are dropped the same way.
+    let hooks = [LifecycleHookDef::Script {
+        command: " ".into(),
+        timeout_seconds: 5,
+        blocking: true,
+    }];
+    let source = source();
+    let spec = build_check_spec(
+        CheckPurpose::BeforeWork,
+        &config(&source, &environment, &hooks),
+    )
+    .unwrap();
+    assert!(spec.commands.is_empty());
+    assert_eq!(
+        (spec.configured_commands, spec.blank_commands),
+        (1, vec![0])
+    );
 }

@@ -28,10 +28,61 @@ pub struct CheckSpecConfiguration<'a> {
     pub event: LifecycleEvent,
     pub role: &'a str,
     pub owner_is_daemon: bool,
-    pub has_workspace: bool,
-    pub whole_run_timeout_seconds: u64,
+    /// The Task worktree the bundle would run in, when one exists: workspace
+    /// id and placement generation. Families that act on the worktree put it
+    /// in the run identity; families that only read a commit never do.
+    pub workspace: Option<CheckWorkspaceIdentity<'a>>,
     /// Stage A makes no queue-head gating decision; the future consumer chooses.
     pub queue_head_bundle: Option<QueueHeadCheckBundle>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CheckWorkspaceIdentity<'a> {
+    pub workspace_id: &'a str,
+    pub generation: u64,
+}
+
+/// Who may share one run of a family's bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckFamilyScope {
+    /// Only reads the commit: every Task at that commit shares the run.
+    Commit,
+    /// Acts on, or judges the state of, one worktree: scoped to the workspace
+    /// and its generation, or to the Task when there is no worktree.
+    Worktree,
+    /// A machine or directory probe: scoped to the workspace when it runs in
+    /// one, otherwise commit-scoped (no Task exists for it).
+    Probe,
+}
+
+/// The classification of every family. `has_setup` is whether a conformance
+/// bundle includes setup steps, which prepare the worktree before the checks.
+pub fn check_family_scope(
+    purpose: CheckPurpose,
+    queue_head_bundle: Option<QueueHeadCheckBundle>,
+    has_setup: bool,
+) -> CheckFamilyScope {
+    match purpose {
+        CheckPurpose::EntryCi | CheckPurpose::ReviewCi | CheckPurpose::AgentSelected => {
+            CheckFamilyScope::Commit
+        }
+        CheckPurpose::QueueHeadCi
+            if !matches!(queue_head_bundle, Some(QueueHeadCheckBundle::Conformance)) =>
+        {
+            CheckFamilyScope::Commit
+        }
+        CheckPurpose::Conformance | CheckPurpose::QueueHeadCi => {
+            if has_setup {
+                CheckFamilyScope::Worktree
+            } else {
+                CheckFamilyScope::Commit
+            }
+        }
+        CheckPurpose::BeforeWork | CheckPurpose::Lifecycle | CheckPurpose::EnvironmentPreflight => {
+            CheckFamilyScope::Worktree
+        }
+        CheckPurpose::ReadinessProbe | CheckPurpose::EnvironmentHelper => CheckFamilyScope::Probe,
+    }
 }
 
 /// A single builder describes all configured families. Existing commands have
@@ -53,11 +104,15 @@ pub fn build_check_spec(
     } else {
         purpose
     };
+    let mut has_setup = false;
     let mut spec = CheckSpec {
         schema_revision: CHECK_SPEC_REVISION,
-        purpose,
+        scope: CheckScope::Commit,
         commands: Vec::new(),
-        whole_run_timeout_seconds: config.whole_run_timeout_seconds,
+        // No family configured today has a cleanup step.
+        declares_cleanup: false,
+        configured_commands: 0,
+        blank_commands: Vec::new(),
         execution_policy: if config.owner_is_daemon {
             "legacy-daemon/1"
         } else {
@@ -73,6 +128,15 @@ pub fn build_check_spec(
                    failure_policy,
                    keys: &BTreeSet<String>,
                    requirements: BTreeSet<String>| {
+        // Production runs a blank step and it passes: `bash -lc ""` does
+        // nothing. Dropping it changes no outcome and runs nothing; the spec
+        // keeps where it was so evidence can still name it.
+        let position = spec.configured_commands;
+        spec.configured_commands += 1;
+        if command.trim().is_empty() {
+            spec.blank_commands.push(position);
+            return false;
+        }
         spec.commands.push(CheckCommandSpec {
             id,
             shell_text: command,
@@ -84,6 +148,7 @@ pub fn build_check_spec(
             cacheability: CheckCacheability::Uncacheable,
             requirement_ids: requirements,
         });
+        true
     };
     match family {
         CheckPurpose::EntryCi | CheckPurpose::ReviewCi => {
@@ -100,24 +165,24 @@ pub fn build_check_spec(
                 effective_review_config(config.source)?
             };
             if let Some(steps) = effective.get("ci_steps") {
-                for (index, step) in steps
-                    .as_array()
-                    .ok_or("review ci_steps must be an array")?
-                    .iter()
-                    .enumerate()
-                {
+                // IDs number the steps that run, so a list with blanks has
+                // the identity of the same list without them.
+                let mut kept = 0;
+                for step in steps.as_array().ok_or("review ci_steps must be an array")? {
                     let command = step
                         .as_str()
                         .ok_or("review ci_steps entries must be strings")?;
-                    add(
-                        format!("ci:{index}"),
+                    if add(
+                        format!("ci:{kept}"),
                         command.into(),
                         CheckWorkingDirectory::TaskRoot,
                         None,
                         CheckFailurePolicy::StopBundle,
                         &keys,
                         BTreeSet::new(),
-                    );
+                    ) {
+                        kept += 1;
+                    }
                 }
             }
         }
@@ -131,7 +196,7 @@ pub fn build_check_spec(
                     .unwrap_or(DEFAULT_CHECK_TIMEOUT_SECONDS),
             ));
             for (index, command) in context.setup_steps.into_iter().enumerate() {
-                add(
+                has_setup |= add(
                     format!("setup:{index}"),
                     command,
                     CheckWorkingDirectory::TaskRoot,
@@ -194,7 +259,7 @@ pub fn build_check_spec(
                 add(
                     format!("hook:{index}"),
                     command.clone(),
-                    if config.has_workspace {
+                    if config.workspace.is_some() {
                         CheckWorkingDirectory::TaskRoot
                     } else {
                         CheckWorkingDirectory::LifecycleFallback
@@ -257,6 +322,25 @@ pub fn build_check_spec(
         // and are not automatically promoted to authoritative candidate checks.
         CheckPurpose::AgentSelected => {}
     }
+    let workspace = config.workspace.map(|workspace| CheckScope::Workspace {
+        workspace_id: workspace.workspace_id.into(),
+        generation: workspace.generation,
+    });
+    spec.scope = match check_family_scope(purpose, config.queue_head_bundle, has_setup) {
+        CheckFamilyScope::Commit => CheckScope::Commit,
+        CheckFamilyScope::Probe => workspace.unwrap_or(CheckScope::Commit),
+        CheckFamilyScope::Worktree => match workspace {
+            Some(scope) => scope,
+            // A script with no worktree still runs once for its own Task.
+            None => CheckScope::Task {
+                task_id: config.source["task_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or("a worktree-scoped check needs a workspace or a Task")?
+                    .into(),
+            },
+        },
+    };
     spec.validate()?;
     Ok(spec)
 }
