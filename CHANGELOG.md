@@ -1672,6 +1672,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Adding a Task dependency that already exists is a no-op. It used to fail
+  the unique constraint and answer `500 internal_error`. Found by the new
+  model-based workflow test.
 - **A CI step can no longer hang on its own output (3.3 stage B).** On the
   server, a step that left a process holding its output pipe (a dev server
   started with `&`) never returned. Output is now read for at most two

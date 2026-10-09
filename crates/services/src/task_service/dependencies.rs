@@ -44,6 +44,15 @@ impl TaskService {
                 "Task dependencies cannot reference a cancelled Task",
             ));
         }
+        // Adding a link that already exists is a no-op, not a constraint
+        // failure surfaced as an internal error.
+        if TaskDependencyRepo::list_dependencies(&*self.db, task_id)
+            .await?
+            .iter()
+            .any(|existing| existing == depends_on_id)
+        {
+            return Ok(());
+        }
         TaskDependencyRepo::add_dependency(&*self.db, task_id, depends_on_id, &now_rfc3339())
             .await?;
         Ok(())
