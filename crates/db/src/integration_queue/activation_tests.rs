@@ -112,6 +112,8 @@ fn queue_graph_is_total_and_cancel_is_requestable_exactly_where_the_design_says(
     ] {
         assert!(!refused.cancel_requestable(), "{refused}");
     }
+    // Proven not landed: back to validation without a park in between.
+    assert!(Reconciling.exits().contains(&Queued));
     // Unchanged target: straight to the Task-step authorization, no rebase.
     assert!(Validating.exits().contains(&AwaitingTaskStep));
     // Every non-terminal state still has an exit after the additions.
@@ -513,9 +515,24 @@ async fn cancel_and_claim_race_on_real_connections_and_exactly_one_wins() {
                 assert_eq!(claimed, 1, "round {round}");
                 assert!(after.cancel_requested_at.is_none());
                 assert_eq!(queue.fence_generation, 1);
+                // The loser re-reads and asks the head instead.
+                db.request_integration_cancel(&after.id, after.revision, NOW)
+                    .await
+                    .unwrap();
             }
             Err(other) => panic!("unexpected cancel error {other:?}"),
         }
+        // Whoever won, the request is now durable and the worker's sweep
+        // returns it: as a member no claim will pick, or as the leased head.
+        let flagged = db
+            .cancel_requested_integration_attempts(None, 10)
+            .await
+            .unwrap();
+        assert_eq!(flagged.len(), 1, "round {round}");
+        assert_eq!(
+            (flagged[0].id.as_str(), flagged[0].state),
+            (a.id.as_str(), IntegrationAttemptState::Queued)
+        );
         // Free the Task for the next round.
         sqlx::query("DELETE FROM integration_queue WHERE id=?")
             .bind(&q.id)
@@ -580,17 +597,83 @@ async fn head_timings_are_cas_head_only_validated_and_bounded() {
     ));
     let mut negative = timings.clone();
     negative.ff_ms = Some(-1);
-    let mut crowded = timings.clone();
-    crowded.lost_races = vec![crowded.lost_races[0].clone(); INTEGRATION_LOST_RACES_MAX + 1];
     let mut undated = timings.clone();
     undated.lost_races[0].at = "soon".into();
-    for invalid in [negative, crowded, undated] {
+    let mut padded = timings.clone();
+    padded.lost_races[0].at = format!("2026-10-08T00:00:00.{}Z", "0".repeat(40));
+    let mut uncounted = timings.clone();
+    uncounted.lost_races_folded.external = -1;
+    for invalid in [negative, undated, padded, uncounted] {
         assert!(matches!(
             db.record_integration_head_timings(&recorded.id, recorded.revision, &invalid)
                 .await,
             Err(DbError::Check(_))
         ));
     }
+    // The 33rd lost race never fails the write: the oldest entries are folded
+    // into per-kind counts, the allowance count stays exact, and the largest
+    // document the repository can store is far inside the column bound.
+    let mut crowded = timings.clone();
+    crowded.rounds = i64::MAX;
+    for field in [
+        &mut crowded.queued_ms,
+        &mut crowded.validate_ms,
+        &mut crowded.transfer_ms,
+        &mut crowded.rebase_ms,
+        &mut crowded.step_wait_ms,
+        &mut crowded.ff_ms,
+        &mut crowded.head_total_ms,
+    ] {
+        *field = Some(i64::MAX);
+    }
+    crowded.check = Some(IntegrationCheckTiming::Ran {
+        slot_wait_ms: i64::MAX,
+        run_ms: i64::MAX,
+    });
+    crowded.lost_races_folded = IntegrationLostRaceCounts {
+        queue_member: 1 << 60,
+        external: 1 << 60,
+    };
+    crowded.lost_races = (0..INTEGRATION_LOST_RACES_MAX as i64 + 3)
+        .map(|n| IntegrationLostRace {
+            kind: if n < 2 {
+                IntegrationLostRaceKind::External
+            } else {
+                IntegrationLostRaceKind::QueueMember
+            },
+            round: i64::MAX - n,
+            at: "2026-10-08T00:00:00.123456789+00:00".into(),
+        })
+        .collect();
+    let external_before = crowded.external_target_moves();
+    let folded = db
+        .record_integration_head_timings(&recorded.id, recorded.revision, &crowded)
+        .await
+        .unwrap();
+    let stored = folded.phase_timings.clone().unwrap();
+    assert_eq!(stored.lost_races.len(), INTEGRATION_LOST_RACES_MAX);
+    assert_eq!(stored.lost_races[..], crowded.lost_races[3..]);
+    assert_eq!(
+        stored.lost_races_folded,
+        IntegrationLostRaceCounts {
+            queue_member: (1 << 60) + 1,
+            external: (1 << 60) + 2,
+        }
+    );
+    assert_eq!(stored.external_target_moves(), external_before);
+    assert_eq!(reread(&db, &a.id).await, folded);
+    let bytes: i64 = sqlx::query_scalar(
+        "SELECT length(CAST(phase_timings_json AS BLOB)) FROM integration_attempt WHERE id=?",
+    )
+    .bind(&a.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(bytes < 8192, "largest timings document is {bytes} bytes");
+    let recorded = db
+        .record_integration_head_timings(&folded.id, folded.revision, &timings)
+        .await
+        .unwrap();
     // A later state write keeps the document and cannot replace it.
     let mut moved = recorded.clone();
     moved.state = IntegrationAttemptState::Validating;
@@ -965,6 +1048,52 @@ async fn a_quarantined_queue_reopens_only_with_a_settled_receipt_of_its_own() {
             Err(DbError::Check(_))
         ));
     }
+    // The worker has not applied the receipt to its head yet: the queue stays
+    // shut, or a crash here would leave an open queue with an unread result.
+    for unresolved in ["reconciling", "ff_inflight"] {
+        exec(
+            &db,
+            &format!("UPDATE integration_attempt SET state='{unresolved}'"),
+        )
+        .await;
+        assert!(matches!(
+            db.reopen_integration_queue(&q.id, q.revision, &witness)
+                .await,
+            Err(DbError::Check(_))
+        ));
+    }
+    exec(&db, "UPDATE integration_attempt SET state='queued'").await;
+    // A settled receipt of an earlier member says nothing about this head.
+    add_task(&db, "old").await;
+    let mut earlier = admit(&db, &q, "old").await;
+    earlier.state = IntegrationAttemptState::Cancelled;
+    let earlier = db.transition_integration_attempt(earlier).await.unwrap();
+    // The admission moved the queue's revision.
+    let q = db.integration_queue(&q.id).await.unwrap().unwrap();
+    assert_eq!(q.state, IntegrationQueueState::Quarantined);
+    let mut old_receipt = serde_json::to_value(
+        db.integration_effect_receipt(&request)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    old_receipt["request"]["fence"]["attempt_id"] = earlier.id.clone().into();
+    sqlx::query("UPDATE integration_attempt SET effect_receipts_json=? WHERE id=?")
+        .bind(serde_json::json!([old_receipt]).to_string())
+        .bind(&earlier.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let stale = IntegrationQueueReopenWitness::SettledEffect {
+        attempt_id: earlier.id.clone(),
+        generation: fence.generation,
+        operation: IntegrationOperationKind::FastForward,
+    };
+    assert!(matches!(
+        db.reopen_integration_queue(&q.id, q.revision, &stale).await,
+        Err(DbError::Check(_))
+    ));
     // A ready target says nothing about an unknown merge.
     assert!(matches!(
         db.reopen_integration_queue(
@@ -1334,6 +1463,14 @@ async fn operator_ages_and_timing_samples_read_the_stored_times() {
         db.integration_timing_samples(since, 1).await.unwrap(),
         vec![timings(2)]
     );
+    // The bound is an instant: 13:00+02:00 is 11:00Z, between the two samples,
+    // though as text it sorts after both.
+    assert_eq!(
+        db.integration_timing_samples("2026-10-07T13:00:00+02:00", 10)
+            .await
+            .unwrap(),
+        vec![timings(2)]
+    );
     assert_plan_uses(&db, TIMING_SAMPLES_SQL, "integration_attempt_retention").await;
 }
 
@@ -1406,4 +1543,212 @@ async fn only_the_live_lease_holder_starts_another_round_and_the_old_fence_is_re
             .await,
         Err(DbError::VersionConflict)
     ));
+}
+
+/// The crash the witness rule must survive: the receipt arrived, the worker
+/// finished the attempt (slot released, attempt terminal) and died before it
+/// re-opened the queue. No claim accepts a quarantined queue without a head,
+/// so the finished attempt's own receipt has to be enough.
+#[tokio::test]
+async fn a_quarantined_queue_whose_head_already_finished_still_reopens() {
+    let db = fixture().await;
+    let (q, request) = uncertain_head(&db).await;
+    let q = db
+        .quarantine_integration_queue(
+            &q.id,
+            db.integration_queue(&q.id).await.unwrap().unwrap().revision,
+            "worker",
+            request.fence.generation,
+            IntegrationFailureKind::Timeout,
+            "merge result unknown",
+        )
+        .await
+        .unwrap();
+    db.lock_integration_reconciliation(&request)
+        .await
+        .unwrap()
+        .unwrap()
+        .record(
+            serde_json::json!({"kind":"not_performed"}),
+            IntegrationOperationState::Failed,
+        )
+        .await
+        .unwrap();
+    let mut head = reread(&db, &request.fence.attempt_id).await;
+    head.state = IntegrationAttemptState::Cancelled;
+    db.transition_integration_attempt(head).await.unwrap();
+    let released = db.integration_queue(&q.id).await.unwrap().unwrap();
+    assert_eq!(
+        (released.state, released.head_attempt_id.clone()),
+        (IntegrationQueueState::Quarantined, None)
+    );
+    // Nothing else moves it: not a claim, and the sweep keeps returning it.
+    assert!(matches!(
+        claim(&db, &q.id, NOW, LATER).await,
+        Err(DbError::VersionConflict)
+    ));
+    assert_eq!(
+        db.claimable_integration_queues(NOW, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    // Retention never removes the witness while the queue is quarantined.
+    assert_eq!(db.prune_integration_evidence(FAR, 10).await.unwrap(), 0);
+    let open = db
+        .reopen_integration_queue(
+            &q.id,
+            released.revision,
+            &IntegrationQueueReopenWitness::SettledEffect {
+                attempt_id: request.fence.attempt_id.clone(),
+                generation: request.fence.generation,
+                operation: IntegrationOperationKind::FastForward,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(open.state, IntegrationQueueState::Open);
+}
+
+/// A result proven not landed returns to validation directly: the head keeps
+/// its slot and lease, nothing waits for `available_at`. An unknown result
+/// cannot take that edge.
+#[tokio::test]
+async fn a_reconciled_head_requeues_in_place_only_once_its_effect_is_settled() {
+    let db = fixture().await;
+    let (q, request) = uncertain_head(&db).await;
+    exec(&db, "UPDATE integration_attempt SET state='reconciling'").await;
+    let requeue = |db: SqliteDb, id: String| async move {
+        let mut a = reread(&db, &id).await;
+        a.state = IntegrationAttemptState::Queued;
+        db.transition_integration_attempt(a).await
+    };
+    let id = request.fence.attempt_id.clone();
+    // Uncertain receipt, intent still recorded.
+    assert!(matches!(
+        requeue(db.clone(), id.clone()).await,
+        Err(DbError::InvalidTransition)
+    ));
+    db.lock_integration_reconciliation(&request)
+        .await
+        .unwrap()
+        .unwrap()
+        .record(
+            serde_json::json!({"kind":"not_performed"}),
+            IntegrationOperationState::Failed,
+        )
+        .await
+        .unwrap();
+    // No intent, but an operation still marked running is not settled either.
+    exec(
+        &db,
+        "UPDATE integration_attempt SET current_operation_state='running'",
+    )
+    .await;
+    assert!(matches!(
+        requeue(db.clone(), id.clone()).await,
+        Err(DbError::InvalidTransition)
+    ));
+    exec(
+        &db,
+        "UPDATE integration_attempt SET current_operation_state='failed'",
+    )
+    .await;
+    let queued = requeue(db.clone(), id.clone()).await.unwrap();
+    assert_eq!(queued.state, IntegrationAttemptState::Queued);
+    assert!(queued.current && queued.available_at.is_none());
+    let after = db.integration_queue(&q.id).await.unwrap().unwrap();
+    assert_eq!(
+        (&after.head_attempt_id, &after.lease_owner, after.revision),
+        (&q.head_attempt_id, &q.lease_owner, q.revision)
+    );
+    // The same guard closes the existing quarantined -> queued edge.
+    exec(
+        &db,
+        "UPDATE integration_attempt SET state='quarantined',current_operation_state='uncertain'",
+    )
+    .await;
+    assert!(matches!(
+        requeue(db.clone(), id).await,
+        Err(DbError::InvalidTransition)
+    ));
+}
+
+/// Timings are measurements: a document this build cannot read must not make
+/// the attempt unreadable, or every claim and transition of its queue fails.
+#[tokio::test]
+async fn an_unreadable_timings_document_reads_as_absent_and_is_replaced() {
+    let db = fixture().await;
+    let q = main_queue(&db).await;
+    let a = admit(&db, &q, "a").await;
+    exec(
+        &db,
+        "UPDATE integration_attempt SET phase_timings_json='{\"rounds\":\"many\"}'",
+    )
+    .await;
+    assert_eq!(reread(&db, &a.id).await.phase_timings, None);
+    claim(&db, &q.id, NOW, LATER).await.unwrap();
+    let mut head = reread(&db, &a.id).await;
+    head.state = IntegrationAttemptState::Validating;
+    let head = db.transition_integration_attempt(head).await.unwrap();
+    let timings = IntegrationPhaseTimings {
+        rounds: 1,
+        ..Default::default()
+    };
+    let head = db
+        .record_integration_head_timings(&head.id, head.revision, &timings)
+        .await
+        .unwrap();
+    assert_eq!(head.phase_timings, Some(timings));
+    exec(
+        &db,
+        "UPDATE integration_attempt SET state='completed',current=0,completed_at='2026-10-08T00:00:00+00:00',phase_timings_json='{\"rounds\":\"many\"}'",
+    )
+    .await;
+    assert!(db
+        .integration_timing_samples("2026-10-01T00:00:00Z", 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// A later migration that drops, renames or re-scopes an index named by
+/// `INDEXED BY` must fail here, not as a refused sweep in production.
+#[tokio::test]
+async fn hinted_statements_prepare_and_their_indexes_are_pinned() {
+    let db = fixture().await;
+    for (sql, index, definition) in [
+        (
+            EXPIRED_HEADS_SQL,
+            "integration_queue_expired_lease",
+            "CREATE INDEX integration_queue_expired_lease ON integration_queue(lease_until) WHERE lease_until IS NOT NULL",
+        ),
+        (
+            PRUNE_SQL,
+            "integration_attempt_prunable",
+            "CREATE INDEX integration_attempt_prunable ON integration_attempt(completed_at,id) WHERE completed_at IS NOT NULL AND (effect_receipts_json<>'[]' OR operation_receipts_json<>'[]' OR observations_json<>'[]')",
+        ),
+    ] {
+        assert!(sql.contains(&format!("INDEXED BY {index} ")), "{index}");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?"
+            )
+            .bind(index)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            definition
+        );
+        assert_plan_uses(&db, sql, index).await;
+    }
+    for unhinted in [
+        CLAIMABLE_QUEUES_SQL,
+        DUE_PARKED_SQL,
+        CANCEL_REQUESTED_SQL,
+        TIMING_SAMPLES_SQL,
+    ] {
+        assert!(!unhinted.contains("INDEXED BY"));
+    }
 }

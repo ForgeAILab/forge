@@ -86,22 +86,63 @@ pub struct IntegrationPhaseTimings {
     pub ff_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_total_ms: Option<i64>,
+    /// The newest `INTEGRATION_LOST_RACES_MAX` lost races, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lost_races: Vec<IntegrationLostRace>,
+    /// Older lost races, counted by kind when the list was full.
+    #[serde(default, skip_serializing_if = "IntegrationLostRaceCounts::is_zero")]
+    pub lost_races_folded: IntegrationLostRaceCounts,
 }
-/// More lost races than this are folded by the caller; the row stays bounded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationLostRaceCounts {
+    #[serde(default)]
+    pub queue_member: i64,
+    #[serde(default)]
+    pub external: i64,
+}
+impl IntegrationLostRaceCounts {
+    fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+}
+/// The stored list keeps this many lost races; `record_integration_head_timings`
+/// folds older ones into `lost_races_folded`, so a long-lived head can never
+/// fail a timings write or outgrow the column bound.
 pub const INTEGRATION_LOST_RACES_MAX: usize = 32;
+/// Longest accepted `IntegrationLostRace::at` (an RFC 3339 instant).
+const LOST_RACE_AT_MAX: usize = 40;
 impl IntegrationPhaseTimings {
-    /// Lost races that spend the "target moved" allowance.
+    /// Lost races that spend the "target moved" allowance, folded ones included.
     pub fn external_target_moves(&self) -> usize {
         self.lost_races
             .iter()
             .filter(|race| race.kind == IntegrationLostRaceKind::External)
             .count()
+            + usize::try_from(self.lost_races_folded.external).unwrap_or(0)
+    }
+    /// The document as stored: validated, with the oldest lost races beyond
+    /// the list bound folded into the per-kind counts.
+    fn stored(&self) -> Result<Self> {
+        self.validate()?;
+        let mut stored = self.clone();
+        let excess = stored
+            .lost_races
+            .len()
+            .saturating_sub(INTEGRATION_LOST_RACES_MAX);
+        for race in stored.lost_races.drain(..excess) {
+            let count = match race.kind {
+                IntegrationLostRaceKind::QueueMember => &mut stored.lost_races_folded.queue_member,
+                IntegrationLostRaceKind::External => &mut stored.lost_races_folded.external,
+            };
+            *count = count.saturating_add(1);
+        }
+        Ok(stored)
     }
     fn validate(&self) -> Result<()> {
         let mut durations = vec![
             Some(self.rounds),
+            Some(self.lost_races_folded.queue_member),
+            Some(self.lost_races_folded.external),
             self.queued_ms,
             self.validate_ms,
             self.transfer_ms,
@@ -118,8 +159,10 @@ impl IntegrationPhaseTimings {
             durations.extend([Some(*slot_wait_ms), Some(*run_ms)]);
         }
         if durations.into_iter().flatten().any(|value| value < 0)
-            || self.lost_races.len() > INTEGRATION_LOST_RACES_MAX
-            || self.lost_races.iter().any(|race| race.round < 1)
+            || self
+                .lost_races
+                .iter()
+                .any(|race| race.round < 1 || race.at.len() > LOST_RACE_AT_MAX)
         {
             return Err(DbError::Check("invalid integration timings".into()));
         }
@@ -176,15 +219,30 @@ pub struct IntegrationQueueAges {
     pub unsettled_effects: IntegrationAge,
 }
 
+// `INDEXED BY` is kept only where the planner, left alone, picks a plan that
+// grows with history (measured: the expired-lease sweep walks the queue primary
+// key, pruning walks every old terminal attempt through the retention index).
+// It cannot fail on data or statistics: a named index is refused when the
+// statement is prepared, from the schema and this text alone, so every such
+// statement is prepared against the migrated schema in
+// `hinted_statements_prepare_and_their_indexes_are_pinned`. The other sweeps
+// carry no hint; their plans are asserted by `EXPLAIN QUERY PLAN` tests.
 pub(super) const CLAIMABLE_QUEUES_SQL: &str = "SELECT q.* FROM integration_queue q WHERE q.id>? AND q.lease_until IS NULL AND ((q.head_attempt_id IS NOT NULL AND q.state<>'closed') OR q.state='quarantined' OR (q.state IN ('open','suspended') AND EXISTS(SELECT 1 FROM integration_attempt a WHERE a.queue_id=q.id AND a.current=1 AND a.state='queued' AND a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday(?))))) ORDER BY q.id LIMIT ?";
 pub(super) const EXPIRED_HEADS_SQL: &str = "SELECT * FROM integration_queue INDEXED BY integration_queue_expired_lease WHERE lease_until IS NOT NULL AND julianday(lease_until)<=julianday(?) AND id>? ORDER BY id LIMIT ?";
-pub(super) const DUE_PARKED_SQL: &str = "SELECT * FROM integration_attempt INDEXED BY integration_attempt_timed WHERE current=1 AND available_at IS NOT NULL AND state='parked' AND id>? AND julianday(available_at)<=julianday(?) ORDER BY id LIMIT ?";
-pub(super) const CANCEL_REQUESTED_SQL: &str = "SELECT * FROM integration_attempt INDEXED BY integration_attempt_cancel_requested WHERE current=1 AND cancel_requested_at IS NOT NULL AND id>? ORDER BY id LIMIT ?";
+pub(super) const DUE_PARKED_SQL: &str = "SELECT * FROM integration_attempt WHERE current=1 AND available_at IS NOT NULL AND state='parked' AND id>? AND julianday(available_at)<=julianday(?) ORDER BY id LIMIT ?";
+pub(super) const CANCEL_REQUESTED_SQL: &str = "SELECT * FROM integration_attempt WHERE current=1 AND cancel_requested_at IS NOT NULL AND id>? ORDER BY id LIMIT ?";
 pub(super) const PRUNE_SQL: &str = "UPDATE integration_attempt SET effect_receipts_json='[]',operation_receipts_json='[]',observations_json='[]',revision=revision+1,updated_at=? WHERE id IN (SELECT a.id FROM integration_attempt a INDEXED BY integration_attempt_prunable WHERE a.completed_at IS NOT NULL AND (a.effect_receipts_json<>'[]' OR a.operation_receipts_json<>'[]' OR a.observations_json<>'[]') AND a.completed_at<? AND julianday(a.completed_at)<julianday(?) AND a.current=0 AND a.state IN ('completed','cancelled','superseded') AND a.effect_intent_json IS NULL AND COALESCE(a.current_operation_state,'') NOT IN ('pending','running','uncertain') AND NOT EXISTS(SELECT 1 FROM json_each(a.effect_receipts_json) r WHERE json_extract(r.value,'$.operation_state')='uncertain') AND NOT EXISTS(SELECT 1 FROM integration_attempt live WHERE live.task_ref=a.task_ref AND live.current=1) AND NOT EXISTS(SELECT 1 FROM integration_queue q WHERE q.id=a.queue_id AND (q.state='quarantined' OR q.head_attempt_id=a.id)) ORDER BY a.completed_at,a.id LIMIT ?)";
-pub(super) const TIMING_SAMPLES_SQL: &str = "SELECT phase_timings_json FROM integration_attempt INDEXED BY integration_attempt_retention WHERE state='completed' AND completed_at>=? AND phase_timings_json IS NOT NULL ORDER BY completed_at DESC LIMIT ?";
+pub(super) const TIMING_SAMPLES_SQL: &str = "SELECT phase_timings_json FROM integration_attempt WHERE state='completed' AND completed_at>=? AND phase_timings_json IS NOT NULL ORDER BY completed_at DESC LIMIT ?";
 
 fn page(limit: u32) -> u32 {
     limit.clamp(1, 500)
+}
+/// `completed_at` is written as `now_rfc3339()` (UTC, `+00:00`). A bound that
+/// is compared with it as text must be the same instant in the same form.
+fn utc_text(value: &str) -> Result<String> {
+    Ok(integration_time(value)?
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339())
 }
 
 /// The Task step that cancels a Task calls this inside its own transaction,
@@ -363,8 +421,8 @@ impl IntegrationActivationRepo for SqliteDb {
         expected_revision: i64,
         timings: &IntegrationPhaseTimings,
     ) -> Result<IntegrationAttempt> {
-        timings.validate()?;
-        let json = serde_json::to_string(timings).map_err(|e| DbError::Check(e.to_string()))?;
+        let timings = timings.stored()?;
+        let json = serde_json::to_string(&timings).map_err(|e| DbError::Check(e.to_string()))?;
         let mut tx = begin_immediate(self.pool()).await?;
         let mut a = attempt_in_tx(&mut tx, attempt_id).await?;
         if a.revision != expected_revision {
@@ -393,7 +451,7 @@ impl IntegrationActivationRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         tx.commit().await?;
-        a.phase_timings = Some(timings.clone());
+        a.phase_timings = Some(timings);
         a.updated_at = now;
         a.revision += 1;
         Ok(a)
@@ -595,6 +653,25 @@ impl IntegrationActivationRepo for SqliteDb {
                         "integration reopen witness names no settled receipt of this queue".into(),
                     ));
                 }
+                // A quarantined queue is never claimed for a new head, so a
+                // head still reserved here is the one whose result was
+                // unknown: only its own receipt speaks for it, and not while
+                // the worker has yet to apply that receipt to the attempt.
+                if let Some(head) = q.head_attempt_id.as_deref() {
+                    if head != attempt_id {
+                        return Err(DbError::Check(
+                            "integration reopen witness does not name the queue head".into(),
+                        ));
+                    }
+                    if matches!(
+                        attempt_in_tx(&mut tx, head).await?.state,
+                        IntegrationAttemptState::FfInflight | IntegrationAttemptState::Reconciling
+                    ) {
+                        return Err(DbError::Check(
+                            "integration queue head is still unresolved".into(),
+                        ));
+                    }
+                }
                 let unsettled: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM integration_attempt WHERE queue_id=? AND current=1 AND (effect_intent_json IS NOT NULL OR current_operation_state IN ('running','uncertain')))")
                     .bind(queue_id)
                     .fetch_one(&mut *tx)
@@ -652,12 +729,12 @@ impl IntegrationActivationRepo for SqliteDb {
         Ok(q)
     }
     async fn prune_integration_evidence(&self, completed_before: &str, limit: u32) -> Result<u64> {
-        integration_time(completed_before)?;
+        let completed_before = utc_text(completed_before)?;
         let mut tx = begin_immediate(self.pool()).await?;
         let pruned = sqlx::query(PRUNE_SQL)
             .bind(now_rfc3339())
-            .bind(completed_before)
-            .bind(completed_before)
+            .bind(&completed_before)
+            .bind(&completed_before)
             .bind(page(limit))
             .execute(&mut *tx)
             .await?
@@ -697,17 +774,14 @@ impl IntegrationActivationRepo for SqliteDb {
         completed_since: &str,
         limit: u32,
     ) -> Result<Vec<IntegrationPhaseTimings>> {
-        integration_time(completed_since)?;
-        sqlx::query_scalar::<_, String>(TIMING_SAMPLES_SQL)
-            .bind(completed_since)
+        Ok(sqlx::query_scalar::<_, String>(TIMING_SAMPLES_SQL)
+            .bind(utc_text(completed_since)?)
             .bind(page(limit))
             .fetch_all(self.pool())
             .await?
             .into_iter()
-            .map(|raw| {
-                serde_json::from_str(&raw)
-                    .map_err(|e| DbError::Check(format!("invalid integration timings: {e}")))
-            })
-            .collect()
+            // As in the attempt reader: an unreadable document is no sample.
+            .filter_map(|raw| serde_json::from_str(&raw).ok())
+            .collect::<Vec<_>>())
     }
 }

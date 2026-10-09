@@ -297,13 +297,12 @@ fn map_attempt(row: sqlx::sqlite::SqliteRow) -> Result<IntegrationAttempt> {
         observations_dropped: row.try_get("observations_dropped")?,
         revision: row.try_get("revision")?,
         cancel_requested_at: row.try_get("cancel_requested_at")?,
+        // Timings are measurements. A document this build cannot read must
+        // not make the attempt unreadable (every claim and transition maps
+        // the row), so it reads as absent and the next write replaces it.
         phase_timings: row
             .try_get::<Option<String>, _>("phase_timings_json")?
-            .map(|raw| {
-                serde_json::from_str(&raw)
-                    .map_err(|e| DbError::Check(format!("invalid integration timings: {e}")))
-            })
-            .transpose()?,
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
     })
 }
 fn parse_json(s: String) -> Result<Value> {
@@ -630,6 +629,11 @@ pub const INTEGRATION_TRANSITIONS: &[(IntegrationAttemptState, &[IntegrationAtte
             IntegrationAttemptState::Applied,
             IntegrationAttemptState::Rebasing,
             IntegrationAttemptState::ReadyFf,
+            // Proven not landed: back to validation at no cost to the Task.
+            // `parked` would release the slot, wait for `available_at` and
+            // spend an infrastructure retry. Guarded in the transition: only
+            // with no intent and no running / uncertain operation left.
+            IntegrationAttemptState::Queued,
             IntegrationAttemptState::Parked,
             IntegrationAttemptState::Quarantined,
         ],
@@ -1291,6 +1295,25 @@ impl IntegrationQueueRepo for SqliteDb {
             return Err(DbError::InvalidTransition);
         }
         if old.state.terminal() || (old.state != a.state && !old.state.exits().contains(&a.state)) {
+            return Err(DbError::InvalidTransition);
+        }
+        // `queued` restarts an attempt from validation, so it is never a way
+        // out of an unknown result: the effect must be settled first.
+        if a.state == IntegrationAttemptState::Queued
+            && matches!(
+                old.state,
+                IntegrationAttemptState::Reconciling | IntegrationAttemptState::Quarantined
+            )
+            && (old.effect_intent_json.is_some()
+                || matches!(
+                    old.current_operation_state,
+                    Some(IntegrationOperationState::Running | IntegrationOperationState::Uncertain)
+                )
+                || matches!(
+                    a.current_operation_state,
+                    Some(IntegrationOperationState::Running | IntegrationOperationState::Uncertain)
+                ))
+        {
             return Err(DbError::InvalidTransition);
         }
         if old.queue_id != a.queue_id
