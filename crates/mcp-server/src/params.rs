@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use api_types::{LifecycleHooks, WorkflowTrigger};
-use db::{AgentStatus, PageRequest, SortOrder, TaskStatus};
+use db::{PageRequest, SortOrder, TaskStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -98,31 +98,6 @@ pub(crate) struct TransitionTaskParams {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct RegisterAgentParams {
-    pub(crate) name: String,
-    pub(crate) executor_type: String,
-    pub(crate) daemon_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ListAgentsParams {
-    pub(crate) status: Option<AgentStatusParam>,
-    pub(crate) cursor: Option<String>,
-    pub(crate) limit: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ListProjectsParams {
-    pub(crate) cursor: Option<String>,
-    pub(crate) limit: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct CreateProjectParams {
-    pub(crate) name: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct GetProjectParams {
     pub(crate) project_id: String,
 }
@@ -179,97 +154,6 @@ pub(crate) struct ReorderSubTasksParams {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct ListAgentProfilesParams {
-    pub(crate) identity_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ListAgentSessionsParams {
-    pub(crate) identity_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct GetAgentSessionParams {
-    pub(crate) session_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct BindMainAgentParams {
-    pub(crate) identity_id: String,
-    pub(crate) expected_version: i64,
-    #[serde(default)]
-    pub(crate) autonomy_policy: Value,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct BindProjectAgentParams {
-    pub(crate) project_id: String,
-    pub(crate) identity_id: String,
-    pub(crate) expected_version: i64,
-    #[serde(default)]
-    pub(crate) permission_ceiling: Value,
-    #[serde(default)]
-    pub(crate) autonomy_policy: Value,
-    #[serde(default)]
-    pub(crate) subscriptions: Vec<String>,
-    #[serde(default)]
-    pub(crate) wake_budget: i64,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct GetProjectAgentParams {
-    pub(crate) project_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ListAgentChatsParams {
-    pub(crate) cursor: Option<String>,
-    pub(crate) limit: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct GetAgentChatParams {
-    pub(crate) chat_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ListAgentChatMessagesParams {
-    pub(crate) chat_id: String,
-    pub(crate) before_sequence: Option<i64>,
-    pub(crate) cursor: Option<String>,
-    pub(crate) limit: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct SendAgentChatMessageParams {
-    pub(crate) chat_id: String,
-    pub(crate) content: String,
-    pub(crate) dedupe_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ListAgentHandoffsParams {
-    pub(crate) project_id: String,
-    pub(crate) cursor: Option<String>,
-    pub(crate) limit: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct GetAgentHandoffParams {
-    pub(crate) project_id: String,
-    pub(crate) handoff_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct CreateAgentHandoffParams {
-    pub(crate) project_id: String,
-    pub(crate) content: String,
-    pub(crate) source_message_id: Option<String>,
-    pub(crate) source_turn_job_id: Option<String>,
-    pub(crate) dedupe_key: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct SubTaskInput {
     pub(crate) title: String,
     #[serde(default)]
@@ -295,27 +179,6 @@ impl<'de> Deserialize<'de> for TaskStatusParam {
 
 impl From<TaskStatusParam> for TaskStatus {
     fn from(value: TaskStatusParam) -> Self {
-        value.0
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct AgentStatusParam(AgentStatus);
-
-impl<'de> Deserialize<'de> for AgentStatusParam {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        AgentStatus::from_str(&value)
-            .map(Self)
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-impl From<AgentStatusParam> for AgentStatus {
-    fn from(value: AgentStatusParam) -> Self {
         value.0
     }
 }

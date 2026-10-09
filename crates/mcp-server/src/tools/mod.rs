@@ -1,5 +1,6 @@
 mod descriptors;
 mod handlers;
+pub(crate) mod registry;
 
 use serde_json::Value;
 
@@ -15,6 +16,11 @@ pub(crate) async fn dispatch_tool(
     arguments: Value,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    if let Some(spec) = operation_registry::mcp::lookup(name) {
+        registry::authorize_resource(state, spec, &arguments, context).await?;
+        let input = spec.decode(arguments).map_err(registry::input_error)?;
+        return registry::dispatch(state, input, context).await;
+    }
     match name {
         "forge_create_task" => handlers::forge_create_task(state, arguments).await,
         "forge_create_sub_tasks" => handlers::forge_create_sub_tasks(state, arguments).await,
@@ -41,54 +47,14 @@ pub(crate) async fn dispatch_tool(
         "forge_list_executions" => handlers::forge_list_executions(state, arguments).await,
         "forge_update_task" => handlers::forge_update_task(state, arguments).await,
         "forge_transition_task" => handlers::forge_transition_task(state, arguments).await,
-        "forge_register_agent" => handlers::forge_register_agent(state, arguments, context).await,
-        "forge_list_agents" => handlers::forge_list_agents(state, arguments, context).await,
-        "forge_list_projects" => handlers::forge_list_projects(state, arguments, context).await,
         "forge_get_project" => handlers::forge_get_project(state, arguments).await,
-        "forge_create_project" => handlers::forge_create_project(state, arguments, context).await,
         "forge_update_project" => handlers::forge_update_project(state, arguments).await,
         "forge_update_project_lifecycle_hooks" => {
             handlers::forge_update_project_lifecycle_hooks(state, arguments).await
         }
         "forge_follow_up_execution" => handlers::forge_follow_up_execution(state, arguments).await,
-        "forge_list_agent_profiles" => {
-            handlers::forge_list_agent_profiles(state, arguments, context).await
-        }
-        "forge_list_agent_sessions" => {
-            handlers::forge_list_agent_sessions(state, arguments, context).await
-        }
-        "forge_get_agent_session" => {
-            handlers::forge_get_agent_session(state, arguments, context).await
-        }
-        "forge_get_main_agent" => handlers::forge_get_main_agent(state, arguments, context).await,
-        "forge_set_main_agent" => handlers::forge_set_main_agent(state, arguments, context).await,
         "forge_project_escalate" => {
             handlers::forge_project_escalate(state, arguments, context).await
-        }
-        "forge_get_project_agent" => {
-            handlers::forge_get_project_agent(state, arguments, context).await
-        }
-        "forge_set_project_agent" => {
-            handlers::forge_set_project_agent(state, arguments, context).await
-        }
-        "forge_list_agent_chats" => {
-            handlers::forge_list_agent_chats(state, arguments, context).await
-        }
-        "forge_get_agent_chat" => handlers::forge_get_agent_chat(state, arguments, context).await,
-        "forge_list_agent_chat_messages" => {
-            handlers::forge_list_agent_chat_messages(state, arguments, context).await
-        }
-        "forge_send_agent_chat_message" => {
-            handlers::forge_send_agent_chat_message(state, arguments, context).await
-        }
-        "forge_list_agent_handoffs" => {
-            handlers::forge_list_agent_handoffs(state, arguments, context).await
-        }
-        "forge_get_agent_handoff" => {
-            handlers::forge_get_agent_handoff(state, arguments, context).await
-        }
-        "forge_create_agent_handoff" => {
-            handlers::forge_create_agent_handoff(state, arguments, context).await
         }
         _ => Err(McpToolError::new(-32601, "method not found")),
     }

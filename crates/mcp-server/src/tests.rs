@@ -28,6 +28,9 @@ use crate::{
 #[path = "tests/project_contract.rs"]
 mod project_contract;
 
+#[path = "tests/registry_contract.rs"]
+mod registry_contract;
+
 fn run_async<T>(future: impl Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2927,7 +2930,8 @@ fn project_constrained_catalog_matches_call_authority_and_projects_only_the_boun
         for (name, rule) in MCP_OPERATIONS {
             assert_eq!(
                 scoped_names.contains(name),
-                *rule == McpScopeRule::BoundProject,
+                *rule == McpScopeRule::BoundProject
+                    && registry_contract::base_admitted("project_public", name),
                 "{name}"
             );
             if *rule == McpScopeRule::AccountInspection {

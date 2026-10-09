@@ -4700,7 +4700,8 @@ field and the expected contract, for example ``skill.section: argument
 `section` is required; expected skill.section: {section: one of ...}``. The
 remaining read operations retain their current schemas and validation.
 Provider-wrapped `parameters` calls still normalize before validation. MCP
-schemas are unchanged.
+Task/Project schemas remain unchanged; the account, identity and Chat MCP
+projection below derives schemas and strict typed decoding from the registry.
 
 Native agent tools return domain failures in-band as the structured tool value
 with the runtime error marker (`is_error: true`), so the model can branch on
@@ -4848,6 +4849,49 @@ continuation cursor; account grants retain the account-visible listing.
 Project/Chat/handoff/Task references remain restricted to that same bound
 Project. The credential acts as the authenticated delegated user, not the
 bound Project Agent.
+
+The account, identity, Agent binding, Chat and handoff tools use typed contracts
+in `operation-registry::mcp`. Each description is one generated summary line
+with the admitted fields. Names and result shapes are unchanged. Unknown fields
+on these 18 tools map to one `-32602` contract error. The in-band result has
+`structuredContent.code = "validation_error"` and bounded `details` carrying
+`code = "mcp_contract_invalid"`, the operation name and the expected contract. The
+registry checks delegated authority before reporting contract details. Required
+integer arguments retain MCP's strict JSON integer spelling; native integer
+coercions do not apply.
+
+The same evaluator determines the moved tools' connection-level advertisement
+and call admission. For a Project-constrained grant it loads the bound Project's
+current role on each list/call; a global administrator does not acquire a Project
+role through that status alone:
+
+| Grant / role | Moved tools offered |
+|---|---|
+| Account grant | All 18 names; each referenced identity, Project, Chat and handoff is authorized on call |
+| Project owner or Project `owner` / `admin` member | All ten Project-classified moved tools |
+| Project ordinary member | Those ten except `forge_set_project_agent` |
+| Visible Project without owner/member authority | `forge_list_projects`, `forge_list_agent_chats` |
+| Project not visible to the user | No moved tools |
+
+The eight account-wide names above are never offered to a constrained grant.
+For an account grant, the referenced Project determines member/owner/admin
+permissions; an authorized reference is still required even though the tool
+name is offered. `forge_register_agent.daemon_id` advertises nullable strings to
+account administrators and only the existing null no-op to other users.
+Its conditional field authority is also evaluated before
+contract decoding; a non-null value from a non-admin still returns `-32003`
+`admin_required`. A null or omitted daemon field retains its former meaning.
+The 24 unmoved Task/Project descriptors and their grant filtering retain the
+base behavior, including `forge_project_escalate`'s separate owner check.
+
+The generated schemas now describe accepted nullable optional strings/integers,
+opaque JSON `autonomy_policy` and `permission_ceiling` values, and registration's
+executor string rather than its incomplete executor enum. Domain rules still
+refuse protected embedded registration and malformed permission documents.
+`forge_set_project_agent.wake_budget` advertises and enforces its existing
+non-negative constraint. `forge_list_agent_chats` and
+`forge_list_agent_handoffs` retain their reserved, ignored `cursor` / `limit`
+fields and return all authorized records, with their existing result shapes.
 
 `forge_get_project` and `forge_list_projects` expose the current Project
 `version`. Both `forge_update_project` and
