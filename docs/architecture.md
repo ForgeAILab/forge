@@ -5357,6 +5357,87 @@ move to `queued` from `reconciling` or `quarantined` is refused while the
 attempt has an effect intent or a running / uncertain operation, so `queued`
 is never a way around an unknown result.
 
+### Integration queue worker (3.2 stage D, part 1d; not started until D2)
+
+`services::integration_worker` is the queue worker. Nothing constructs or
+starts it yet: `merging` still runs today's merge hooks, and the runtime gains
+no worker until D2 wires it. The module writes `integration_queue` and
+`integration_attempt` rows only. It calls no Git and writes no Task, Review,
+budget or event row; a source test (`worker_sources_stay_inside_the_boundary`)
+holds that line.
+
+Parts:
+
+- **Supervised loop** (`IntegrationQueueWorker::start` / `run`): one sweep per
+  wake (an enqueue notification, a head leaving its slot, or every 30 s), then
+  one driver task per claimed queue, at most 16 at a time. Claims rotate after
+  the queue claimed last, so no queue starves when more are claimable than the
+  cap. Shutdown stops each driver at its next await; a started fast-forward is
+  awaited to its receipt. An idle install is read-only.
+- **Sweeps** (each restarts its keyset cursor): cancel requests on attempts
+  that hold no slot; due `parked` attempts back to `queued`; expired heads
+  (takeover) and unleased queues with work. A quarantined queue is claimed
+  when its head is `reconciling` / `ff_inflight`; a `quarantined` head is put
+  back to `reconciling` once per reconcile interval (60 s); a head that
+  resolved before the queue was re-opened is re-opened with its stored
+  witness first.
+- **Head driver** (`HeadDriver`): a table-driven state machine (`HEAD_TABLE`:
+  per state the action, success edges, failure edges, timeout, cancel rule and
+  what a restart finds). Every attempt transition goes through one function
+  that re-reads the row first (a receipt, a timings write and a cancel request
+  all bump `revision`) and refuses an edge the table does not have. The lease
+  (60 s) is renewed when 15 s of it are used, re-reading the queue each time
+  because an admission bumps the queue revision.
+
+| Head state | Worker action | Leaves to |
+|---|---|---|
+| `queued` | stamp `started_at`, count the round | `validating`; `parked` past 9 rounds |
+| `validating` | read facts; move commits in when the Task is on another checkout | `applied` (already landed), `awaiting_task_step` (target unchanged: no check), `rebasing`, `needs_review` (candidate changed), `parked`, `cancelled` |
+| `rebasing` | fenced owner rebase with conflict handoff, or adopt a receipt recorded before a crash | `checking`, `ejected` (conflict paths), `parked`, `reconciling`, `cancelled` |
+| `checking` | wait for the verdict the `request_check` step asked for (check timeout + 300 s) | `awaiting_task_step`, `ejected` (red check), `parked`, `cancelled` |
+| `awaiting_task_step` | wait for the `settle` step's permit (300 s) | `ready_ff`, `needs_review`, `ejected`, `parked`, `cancelled` |
+| `ready_ff` | move commits out if needed; cancel-or-commit compare-and-set (permit lifetime 120 s) | `ff_inflight`, `awaiting_task_step`, `cancelled` |
+| `ff_inflight` | fenced owner fast-forward of the exact candidate | `applied`; `rebasing` in a new round when the target moved; `reconciling` otherwise |
+| `reconciling` | owner reconciliation, then a Git witness | `applied`, `queued` (proven not landed), `rebasing`, `quarantined` (unknown) |
+| `applied` | ready the `result` step; wait for its acknowledgment or for the Task to leave `merging` | `completed` |
+
+Rules the driver enforces:
+
+- A check runs only when the commit was rebased by the queue. An unchanged
+  target sends the reviewed commit straight to authorization and records
+  `Skipped { TargetUnchanged }`.
+- A rebase needed when the head gets the slot is recorded as a `queue_member`
+  lost race and is free. A target that moves while the head holds the slot can
+  only have been moved from outside Forge: it is recorded as `external`, starts
+  a new round (`start_integration_round`), and the sixth one parks the attempt
+  with `external_target_moves_exhausted`.
+- An unknown result is never guessed. The queue is quarantined with
+  `needs_fact`, the head becomes `quarantined`, and the queue re-opens only
+  with a settled receipt (or `NoEffect`) that the storage re-verifies.
+- Cancel against the permit: both are compare-and-set writes on the attempt
+  row and a cancel request is refused once `ff_inflight` is stored, so exactly
+  one wins. Before that point a cancel request wins even over a written permit.
+- Deciding steps (`request_check`, `settle`) are always asked under a fresh
+  `effect_seq`, and a step is enqueued before the attempt transition it
+  belongs to, so a crash between the two leaves a step, not a silent attempt.
+- Infrastructure parks retry after 30 s, 2 min and 10 min, then wait for the
+  owner. The park history is kept in `operation_receipts_json`.
+
+Ports (`integration_worker::ports`). Consumed, and to be implemented by D2:
+`IntegrationStepPort` (enqueue an `integration` Task step by causation key
+`integration:<attempt>:<effect_seq>:<action>`; make the protected `result`
+step runnable), `IntegrationFactsPort` (read-only Task gate and Git facts of
+the head), `ObjectTransferPort` (commits between a non-default checkout and
+the default checkout, 256 MiB cap). Provided: `IntegrationEnqueuePort`
+(wake the sweep after an admission) and `IntegrationSnapshotPort` (queue,
+members in order with position, state, timings; the read surface is built on
+it). Steps answer by writing `effect_ack_json` / `acknowledged_at` (and
+`permit_json`) on the attempt; the worker only reads them.
+
+Not in this part: daemon-owned targets (the head parks with
+`daemon_owner_unwired`), Task conditions and `park` steps for members of a
+suspended queue, and the Task-step consumer itself.
+
 ### Task condition actions
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.

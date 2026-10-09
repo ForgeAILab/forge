@@ -770,6 +770,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Integration queue worker, not started yet (3.2 stage D, part 1d).** The
+  server has the worker that will drive the per-branch merge queue (rebase,
+  check, fast-forward, takeover after a crash), but nothing starts it:
+  merging works exactly as before.
 - **Durable check runner, not yet used by any check (3.3 stage C).** The
   server now starts a `check-runs` worker and has a durable path for running a
   check: one run per identical request (same Project, repository, commit and
