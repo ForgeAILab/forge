@@ -42,5 +42,12 @@
     "title": "Question",
     "question": "Find the answer",
     "context": null
+  },
+  "project.current_state": {
+    "limit": 10
+  },
+  "project.observations": {
+    "limit": 20,
+    "task_id": null
   }
 }

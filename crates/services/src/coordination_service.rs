@@ -1,5 +1,7 @@
 use operation_registry::authority::permission_set;
-use std::{collections::BTreeSet, sync::Arc};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionApproval, AgentActionApprovalDecision,
@@ -646,6 +648,12 @@ impl AgentActionService {
             Some(&input.payload_json),
         )
         .await?;
+        if policy_result != AgentActionPolicyResult::Denied {
+            if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(&operation) {
+                spec.validate_arguments(&payload_value)
+                    .map_err(ServiceError::invalid_operation)?;
+            }
+        }
         let policy_reason = input.policy_reason.or(evaluated_reason);
         let status = match &policy_result {
             AgentActionPolicyResult::Allowed => AgentActionStatus::Proposed,
@@ -979,174 +987,71 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// be assigned to a Task.  Existing-but-inaccessible scopes are
 /// returned as a denial so the proposal can be audited without granting it;
 /// missing references are not disclosed as an actionable proposal.
-async fn action_scope_access(
+async fn task_action_scope_access(
     db: &SqliteDb,
     actor_identity_id: &str,
-    scope_type: &str,
     scope_id: &str,
     requested_permission: &str,
 ) -> Result<Option<String>> {
-    let owner_id =
-        sqlx::query_scalar::<_, Option<String>>("SELECT owner_id FROM agent_identity WHERE id = ?")
-            .bind(actor_identity_id)
-            .fetch_optional(db.pool())
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent identity", actor_identity_id))?;
-
-    match scope_type {
-        "account" => {
-            if owner_id.as_deref() != Some(scope_id) {
-                return Ok(Some(
-                    "actor identity is not owned by the requested account scope".to_owned(),
-                ));
-            }
-        }
-        "project" => {
-            let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project WHERE id = ?")
-                .bind(scope_id)
-                .fetch_one(db.pool())
-                .await?;
-            if exists == 0 {
-                return Err(ServiceError::not_found("project", scope_id));
-            }
-            let binding = sqlx::query(
-                "SELECT permission_ceiling_json FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active'",
-            )
-            .bind(scope_id)
-            .bind(actor_identity_id)
-            .fetch_optional(db.pool())
-            .await?;
-            let Some(binding) = binding else {
-                return Ok(Some(
-                    "actor identity has no active binding in the requested Project".to_owned(),
-                ));
-            };
-            let permission_ceiling: String = binding.try_get("permission_ceiling_json")?;
-            if !permission_set(&permission_ceiling).contains(requested_permission) {
-                return Ok(Some(
-                    "requested permission is outside the Project binding ceiling".to_owned(),
-                ));
-            }
-        }
-        "agent_chat" => {
-            let chat =
-                sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
-                    .bind(scope_id)
-                    .fetch_optional(db.pool())
-                    .await?;
-            let Some(chat) = chat else {
-                return Err(ServiceError::not_found("agent_chat", scope_id));
-            };
-            let kind: String = chat.try_get("kind")?;
-            match kind.as_str() {
-                "account_main" => {
-                    let account_id: Option<String> = chat.try_get("account_id")?;
-                    if owner_id != account_id {
-                        return Ok(Some(
-                            "actor identity does not own the requested Main Agent Chat".to_owned(),
-                        ));
-                    }
-                }
-                "project" => {
-                    let project_id: Option<String> = chat.try_get("project_id")?;
-                    let Some(project_id) = project_id else {
-                        return Ok(Some("Agent Chat has no Project binding".to_owned()));
-                    };
-                    let binding = sqlx::query_scalar::<_, String>(
-                        "SELECT permission_ceiling_json FROM project_agent_binding
-                         WHERE project_id = ? AND identity_id = ? AND state = 'active'",
-                    )
-                    .bind(project_id)
-                    .bind(actor_identity_id)
-                    .fetch_optional(db.pool())
-                    .await?;
-                    let Some(permission_ceiling) = binding else {
-                        return Ok(Some(
-                            "actor identity has no active Agent Chat binding".to_owned(),
-                        ));
-                    };
-                    if !permission_set(&permission_ceiling).contains(requested_permission) {
-                        return Ok(Some(
-                            "requested permission is outside the Agent Chat binding ceiling"
-                                .to_owned(),
-                        ));
-                    }
-                }
-                _ => return Ok(Some("Agent Chat kind is not admitted".to_owned())),
-            }
-        }
-        "task" => {
-            let task_exists = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM task WHERE id = ? AND deleted_at IS NULL",
-            )
-            .bind(scope_id)
-            .fetch_one(db.pool())
-            .await?;
-            if task_exists == 0 {
-                return Err(ServiceError::not_found("task", scope_id));
-            }
-            let task =
-                sqlx::query("SELECT status, assignee_type, assignee_id FROM task WHERE id = ?")
-                    .bind(scope_id)
-                    .fetch_one(db.pool())
-                    .await?;
-            let direct_assignee_type: Option<String> = task.try_get("assignee_type")?;
-            let direct_assignee_id: Option<String> = task.try_get("assignee_id")?;
-            let status: String = task.try_get("status")?;
-            let assignments = sqlx::query(
-                "SELECT role_name FROM task_role_assignment
+    let task_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM task WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(scope_id)
+    .fetch_one(db.pool())
+    .await?;
+    if task_exists == 0 {
+        return Err(ServiceError::not_found("task", scope_id));
+    }
+    let task = sqlx::query("SELECT status, assignee_type, assignee_id FROM task WHERE id = ?")
+        .bind(scope_id)
+        .fetch_one(db.pool())
+        .await?;
+    let direct_assignee_type: Option<String> = task.try_get("assignee_type")?;
+    let direct_assignee_id: Option<String> = task.try_get("assignee_id")?;
+    let status: String = task.try_get("status")?;
+    let assignments = sqlx::query(
+        "SELECT role_name FROM task_role_assignment
                  WHERE task_id = ? AND assignee_type = 'agent' AND assignee_id = ?",
-            )
-            .bind(scope_id)
-            .bind(actor_identity_id)
-            .fetch_all(db.pool())
-            .await?;
-            let assigned = direct_assignee_type.as_deref() == Some("agent")
-                && direct_assignee_id.as_deref() == Some(actor_identity_id)
-                || !assignments.is_empty();
-            if !assigned {
-                return Ok(Some(
-                    "actor identity is not assigned to the requested Task".to_owned(),
-                ));
-            }
-            if requested_permission == "task_write"
-                && matches!(status.as_str(), "done" | "cancelled")
-            {
-                return Ok(Some(
-                    "the Task workflow no longer admits writes in its terminal state".to_owned(),
-                ));
-            }
-            let roles = assignments
-                .iter()
-                .filter_map(|row| row.try_get::<String, _>("role_name").ok())
-                .collect::<Vec<_>>();
-            if requested_permission == "task_write"
-                && !roles.is_empty()
-                && roles
-                    .iter()
-                    .all(|role| role.eq_ignore_ascii_case("reviewer"))
-            {
-                return Ok(Some(
-                    "reviewer assignments cannot perform Task writes".to_owned(),
-                ));
-            }
-            if requested_permission == "propose_review"
-                && !roles.iter().any(|role| {
-                    role.eq_ignore_ascii_case("reviewer") || role.eq_ignore_ascii_case("review")
-                })
-            {
-                return Ok(Some(
-                    "the Task assignment does not admit review proposals".to_owned(),
-                ));
-            }
-        }
-        "agent" if actor_identity_id != scope_id => {
-            return Ok(Some(
-                "actor identity cannot act through another identity scope".to_owned(),
-            ));
-        }
-        _ => {}
+    )
+    .bind(scope_id)
+    .bind(actor_identity_id)
+    .fetch_all(db.pool())
+    .await?;
+    let assigned = direct_assignee_type.as_deref() == Some("agent")
+        && direct_assignee_id.as_deref() == Some(actor_identity_id)
+        || !assignments.is_empty();
+    if !assigned {
+        return Ok(Some(
+            "actor identity is not assigned to the requested Task".to_owned(),
+        ));
+    }
+    if requested_permission == "task_write" && matches!(status.as_str(), "done" | "cancelled") {
+        return Ok(Some(
+            "the Task workflow no longer admits writes in its terminal state".to_owned(),
+        ));
+    }
+    let roles = assignments
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("role_name").ok())
+        .collect::<Vec<_>>();
+    if requested_permission == "task_write"
+        && !roles.is_empty()
+        && roles
+            .iter()
+            .all(|role| role.eq_ignore_ascii_case("reviewer"))
+    {
+        return Ok(Some(
+            "reviewer assignments cannot perform Task writes".to_owned(),
+        ));
+    }
+    if requested_permission == "propose_review"
+        && !roles.iter().any(|role| {
+            role.eq_ignore_ascii_case("reviewer") || role.eq_ignore_ascii_case("review")
+        })
+    {
+        return Ok(Some(
+            "the Task assignment does not admit review proposals".to_owned(),
+        ));
     }
     Ok(None)
 }
@@ -1329,60 +1234,113 @@ async fn evaluate_action_policy(
     operation: &str,
     payload_json: Option<&str>,
 ) -> Result<(AgentActionPolicyResult, Option<String>)> {
-    if let Some(reason) = action_scope_access(
-        db,
-        actor_identity_id,
-        scope_type,
-        scope_id,
-        requested_permission,
-    )
-    .await?
-    {
-        return Ok((AgentActionPolicyResult::Denied, Some(reason)));
-    }
-    let row = sqlx::query(
-        "SELECT paused, archived_at, account_permission_ceiling, selected_profile_id
+    if scope_type == "task" {
+        if let Some(reason) =
+            task_action_scope_access(db, actor_identity_id, scope_id, requested_permission).await?
+        {
+            return Ok((AgentActionPolicyResult::Denied, Some(reason)));
+        }
+        let row = sqlx::query(
+            "SELECT paused, archived_at, account_permission_ceiling, selected_profile_id
          FROM agent_identity WHERE id = ?",
-    )
-    .bind(actor_identity_id)
-    .fetch_optional(db.pool())
-    .await?
-    .ok_or_else(|| ServiceError::not_found("agent identity", actor_identity_id))?;
-    let paused: i64 = row.try_get("paused")?;
-    let archived_at: Option<String> = row.try_get("archived_at")?;
-    if paused != 0 || archived_at.is_some() {
-        return Ok((
-            AgentActionPolicyResult::Denied,
-            Some("actor identity is paused or archived".to_owned()),
-        ));
-    }
-    let account_policy: String = row.try_get("account_permission_ceiling")?;
-    let profile_id: Option<String> = row.try_get("selected_profile_id")?;
-    let profile_policy = if let Some(profile_id) = profile_id {
-        sqlx::query_scalar::<_, String>(
-            "SELECT tool_policy_json FROM agent_profile WHERE id = ? AND identity_id = ?",
         )
-        .bind(profile_id)
         .bind(actor_identity_id)
         .fetch_optional(db.pool())
         .await?
-        .unwrap_or_else(|| "{}".to_owned())
-    } else {
-        "{}".to_owned()
-    };
-    let scope_permissions = scope_permissions(db, scope_type, scope_id).await?;
-    let account_permissions = permission_set(&account_policy);
-    let profile_permissions = permission_set(&profile_policy);
-    let authorized = account_permissions.contains(requested_permission)
-        && profile_permissions.contains(requested_permission)
-        && scope_permissions.contains(requested_permission);
-    if !authorized {
-        return Ok((
+        .ok_or_else(|| ServiceError::not_found("agent identity", actor_identity_id))?;
+        let paused: i64 = row.try_get("paused")?;
+        let archived_at: Option<String> = row.try_get("archived_at")?;
+        if paused != 0 || archived_at.is_some() {
+            return Ok((
+                AgentActionPolicyResult::Denied,
+                Some("actor identity is paused or archived".to_owned()),
+            ));
+        }
+        let account_policy: String = row.try_get("account_permission_ceiling")?;
+        let profile_id: Option<String> = row.try_get("selected_profile_id")?;
+        let profile_policy = if let Some(profile_id) = profile_id {
+            sqlx::query_scalar::<_, String>(
+                "SELECT tool_policy_json FROM agent_profile WHERE id = ? AND identity_id = ?",
+            )
+            .bind(profile_id)
+            .bind(actor_identity_id)
+            .fetch_optional(db.pool())
+            .await?
+            .unwrap_or_else(|| "{}".to_owned())
+        } else {
+            "{}".to_owned()
+        };
+        let scope_permissions =
+            operation_registry::authority::scope_permissions("task", "task_write", false, false);
+        let account_permissions = permission_set(&account_policy);
+        let profile_permissions = permission_set(&profile_policy);
+        let authorized = account_permissions.contains(requested_permission)
+            && profile_permissions.contains(requested_permission)
+            && scope_permissions.contains(requested_permission);
+        if !authorized {
+            return Ok((
             AgentActionPolicyResult::Denied,
             Some(format!(
                 "permission {requested_permission} is outside the server-issued identity/profile/scope ceiling"
             )),
         ));
+        }
+    } else {
+        use operation_registry::authority::{
+            AuthorityDenial, AuthorityRequirement, PrincipalRule, RequiredPermission,
+        };
+        struct ActionPermission<'a>(&'a str);
+        impl AuthorityRequirement for ActionPermission<'_> {
+            fn principal_rule(&self) -> PrincipalRule {
+                PrincipalRule::AgentAction
+            }
+            fn permission(&self, _: &str) -> RequiredPermission<'_> {
+                RequiredPermission::Named(self.0)
+            }
+            fn availability(&self) -> operation_registry::AvailabilityRule {
+                operation_registry::AvailabilityRule::Always
+            }
+        }
+        let authority = match db
+            .resolve_effective_authority(actor_identity_id, None, scope_type, scope_id, "deny")
+            .await
+        {
+            Ok(authority) => authority,
+            Err(db::DbError::NotFound) => {
+                return Ok((
+                    AgentActionPolicyResult::Denied,
+                    Some("direct Project command has no selected active profile".into()),
+                ))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(denial) = authority.evaluate(ActionPermission(requested_permission)) {
+            let reason = match denial {
+                AuthorityDenial::PermissionMissing(_) => format!("permission {requested_permission} is outside the server-issued identity/profile/scope ceiling"),
+                AuthorityDenial::Revoked => {
+                    let paused: i64=sqlx::query_scalar("SELECT paused OR archived_at IS NOT NULL FROM agent_identity WHERE id=?").bind(actor_identity_id).fetch_one(db.pool()).await?;
+                    if paused != 0 { "actor identity is paused or archived".into() } else { "actor identity has no active binding in the requested scope or is paused or archived".into() }
+                },
+                _ => "operation is denied by the canonical native operation catalog".into(),
+            };
+            return Ok((AgentActionPolicyResult::Denied, Some(reason)));
+        }
+        let canonical_operation = match operation {
+            "message.propose" => "message.send",
+            "commitment.propose" => "commitment.update",
+            "review.propose" => "review.request",
+            other => other,
+        };
+        if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(canonical_operation) {
+            if spec.authority.permission(scope_type) != Some(requested_permission)
+                || authority.evaluate(spec).is_err()
+            {
+                return Ok((
+                    AgentActionPolicyResult::Denied,
+                    Some("operation is denied by the canonical native operation catalog".into()),
+                ));
+            }
+        }
     }
     if is_project_orchestration_mutation(operation) {
         let project_id = match scope_type {
@@ -1522,106 +1480,9 @@ fn is_non_executable_authority_operation(operation: &str) -> bool {
     )
 }
 
-async fn scope_permissions(
-    db: &SqliteDb,
-    scope_type: &str,
-    scope_id: &str,
-) -> Result<BTreeSet<String>> {
-    let mut values: Vec<&str> = match scope_type {
-        "account" => &[
-            "read_account",
-            "propose_discovery",
-            "propose_project",
-            "propose_handoff",
-        ][..],
-        "project" => &[
-            "read_project",
-            "read_memory",
-            "propose_project",
-            "propose_task",
-            "propose_message",
-            "propose_commitment",
-            "propose_memory",
-            "propose_review",
-            "propose_decision",
-            "propose_session",
-        ][..],
-        "agent_chat" => &["read_agent_chat", "read_memory"][..],
-        "task" => &["read_task", "read_memory", "task_read", "task_write"][..],
-        "agent" => &["read_account", "propose_message"][..],
-        _ => &[][..],
-    }
-    .to_vec();
-    if scope_type == "agent_chat"
-        && sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM agent_chat
-             WHERE id = ? AND kind = 'project' AND project_id IS NOT NULL",
-        )
-        .bind(scope_id)
-        .fetch_one(db.pool())
-        .await?
-            > 0
-    {
-        // The owning Project and active binding are checked separately by
-        // action_scope_access.  Only a server-resolved Project Chat receives
-        // this extra capability; Main Chat remains permanently denied.
-        values.extend([
-            "propose_message",
-            "propose_project",
-            "propose_task",
-            "propose_commitment",
-            "propose_memory",
-            "propose_session",
-        ]);
-    } else if scope_type == "agent_chat"
-        && sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM agent_chat
-             WHERE id = ? AND kind = 'account_main' AND account_id IS NOT NULL",
-        )
-        .bind(scope_id)
-        .fetch_one(db.pool())
-        .await?
-            > 0
-    {
-        // Main Chat receives only global discovery/project organization and
-        // explicit handoff proposals. It never receives Project Task tools.
-        values.extend(["propose_discovery", "propose_project", "propose_handoff"]);
-    }
-    let project_id = match scope_type {
-        "project" => Some(scope_id.to_owned()),
-        "agent_chat" => sqlx::query_scalar::<_, Option<String>>(
-            "SELECT project_id FROM agent_chat
-             WHERE id = ? AND kind = 'project' LIMIT 1",
-        )
-        .bind(scope_id)
-        .fetch_optional(db.pool())
-        .await?
-        .flatten(),
-        _ => None,
-    };
-    if let Some(project_id) = project_id {
-        let setup_required = sqlx::query_scalar::<_, i64>(
-            "SELECT charter_setup_required FROM project WHERE id = ? LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(db.pool())
-        .await?
-        .is_some_and(|value| value != 0);
-        if setup_required {
-            values.retain(|permission| {
-                matches!(
-                    *permission,
-                    "read_project"
-                        | "read_agent_chat"
-                        | "read_memory"
-                        | "propose_message"
-                        | "propose_project"
-                )
-            });
-        }
-    }
-    Ok(values.into_iter().map(str::to_owned).collect())
-}
+#[cfg(test)]
+#[path = "coordination_service/base_policy.rs"]
+mod base_policy;
 
 #[cfg(test)]
 mod tests {
@@ -2430,5 +2291,202 @@ mod tests {
             "propose_task",
             None
         ));
+    }
+    /// Literal policy ranks captured on 49839d1c before replacing its checks.
+    #[tokio::test]
+    async fn action_policy_is_equal_or_stricter_than_base_table() {
+        let db = db().await;
+        let permissions = serde_json::json!({"permissions":["read_account","read_agent_chat","read_project","propose_discovery","propose_project","propose_task","propose_message","propose_commitment","propose_memory","propose_review","propose_decision","propose_session"]}).to_string();
+        sqlx::query("UPDATE agent_identity SET account_permission_ceiling = ?")
+            .bind(&permissions)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE project_agent_binding SET permission_ceiling_json = ? WHERE state = 'active'",
+        )
+        .bind(&permissions)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO user (id,email,password_hash,created_at,updated_at) VALUES ('user-1','policy@example.test','test','now','now')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT OR IGNORE INTO agent_chat (id,kind,account_id,created_at,updated_at) VALUES ('main-chat','account_main','user-1','now','now')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT OR IGNORE INTO agent_chat (id,kind,project_id,created_at,updated_at) VALUES ('project-chat','project','project-1','now','now')").execute(db.pool()).await.unwrap();
+        let main_chat: String = sqlx::query_scalar(
+            "SELECT id FROM agent_chat WHERE kind='account_main' AND account_id='user-1'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let project_chat: String = sqlx::query_scalar(
+            "SELECT id FROM agent_chat WHERE kind='project' AND project_id='project-1'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let operations = [
+            ("project.create", "propose_project", "create_from_approval"),
+            (
+                "genesis.project_agent.select",
+                "propose_discovery",
+                "select",
+            ),
+            ("genesis.start", "propose_discovery", "start"),
+            ("charter.draft", "propose_discovery", "save_revision"),
+            (
+                "project.charter.adoption",
+                "propose_project",
+                "draft_revision",
+            ),
+            ("project.review_config", "propose_project", "set_ci_steps"),
+            ("project.document", "propose_project", "draft_revision"),
+            ("project.document", "propose_project", "propose_approval"),
+            ("project.document", "propose_project", "approve"),
+            ("project.decision", "propose_project", "record_candidate"),
+            ("project.decision", "propose_project", "record_effective"),
+            ("project.milestone", "propose_project", "define"),
+            ("project.milestone", "propose_project", "revise"),
+            ("project.milestone", "propose_project", "set_primary"),
+            ("project.evidence", "propose_project", "attach"),
+            ("project.evidence", "propose_project", "capture"),
+            ("project.validation", "propose_project", "record"),
+            ("project.escalate", "propose_project", ""),
+            ("project.readiness", "propose_project", "evaluate"),
+            (
+                "project.release.request",
+                "propose_project",
+                "propose_candidate",
+            ),
+            ("message.send", "propose_message", ""),
+            ("message.propose", "propose_message", ""),
+            ("commitment.propose", "propose_commitment", ""),
+            ("review.propose", "propose_review", ""),
+            ("commitment.update", "propose_commitment", ""),
+            ("memory.publish", "propose_memory", ""),
+            ("memory.supersede", "propose_memory", ""),
+            ("session.action", "propose_session", "cancel"),
+            ("session.action", "propose_session", "steer"),
+            ("review.request", "propose_review", ""),
+        ];
+        // This table compares policy on loaded facts, not the Charter writer.
+        // Its minimal fixture deliberately has no authoritative Charter rows.
+        sqlx::query("DROP TRIGGER project_charter_pointer_guard_update")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut table = serde_json::Map::new();
+        for (state, setup, paused, restricted) in [
+            ("setup", 1, 0, false),
+            ("ready", 0, 0, false),
+            ("paused", 0, 1, false),
+            ("restricted", 0, 0, true),
+        ] {
+            sqlx::query("UPDATE project SET charter_setup_required = ?, charter_status = ?, current_charter_id = ?, current_charter_revision_id = ? WHERE id = 'project-1'")
+                .bind(setup).bind(if setup == 1 { "legacy_unverified" } else { "charter_backed" }).bind((setup==0).then_some("charter")).bind((setup==0).then_some("revision")).execute(db.pool()).await.unwrap();
+            sqlx::query("UPDATE agent_identity SET paused = ?")
+                .bind(paused)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            for actor in ["agent-a", "agent-b"] {
+                let profile_id = format!("policy-{state}-{actor}");
+                db::AgentProfileRepo::create_profile(
+                    &*db,
+                    db::CreateAgentProfile {
+                        id: profile_id.clone(),
+                        identity_id: actor.into(),
+                        backend_kind: "native".into(),
+                        executor_type: "native".into(),
+                        provider: None,
+                        model: None,
+                        reasoning_effort: None,
+                        permission_policy: None,
+                        prompt_template: None,
+                        capabilities_json: "{}".into(),
+                        tool_policy_json: if restricted {
+                            "{}".into()
+                        } else {
+                            permissions.clone()
+                        },
+                        config_json: "{}".into(),
+                        credential_ref: None,
+                        daemon_id: None,
+                        created_at: now_rfc3339(),
+                        updated_at: now_rfc3339(),
+                    },
+                )
+                .await
+                .unwrap();
+                sqlx::query("UPDATE agent_identity SET selected_profile_id = ? WHERE id = ?")
+                    .bind(profile_id)
+                    .bind(actor)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            for actor in ["agent-a", "agent-b"] {
+                for (scope, id) in [
+                    ("account", "user-1"),
+                    ("account", "other"),
+                    ("project", "project-1"),
+                    ("agent_chat", main_chat.as_str()),
+                    ("agent_chat", project_chat.as_str()),
+                    ("agent", actor),
+                ] {
+                    for (operation, permission, action) in operations {
+                        let payload = serde_json::json!({"action":action}).to_string();
+                        let (policy, _) = evaluate_action_policy(
+                            &db,
+                            actor,
+                            scope,
+                            id,
+                            permission,
+                            operation,
+                            Some(&payload),
+                        )
+                        .await
+                        .unwrap();
+                        let rank = match policy {
+                            AgentActionPolicyResult::Denied => 0,
+                            AgentActionPolicyResult::ApprovalRequired => 1,
+                            AgentActionPolicyResult::Allowed => 2,
+                        };
+                        let (base, _) = super::base_policy::evaluate_action_policy(
+                            &db,
+                            actor,
+                            scope,
+                            id,
+                            permission,
+                            operation,
+                            Some(&payload),
+                        )
+                        .await
+                        .unwrap();
+                        let base_rank = match base {
+                            AgentActionPolicyResult::Denied => 0,
+                            AgentActionPolicyResult::ApprovalRequired => 1,
+                            AgentActionPolicyResult::Allowed => 2,
+                        };
+                        assert!(rank <= base_rank, "widened {state}/{actor}/{scope}/{id}/{operation}/{action}: base={base_rank} new={rank}");
+                        if matches!(operation, "project.create" | "genesis.project_agent.select")
+                            && scope == "account"
+                            && id == "user-1"
+                            && state == "ready"
+                        {
+                            assert_eq!(
+                                rank, base_rank,
+                                "an owned unbound identity must keep proposal authority"
+                            );
+                            assert!(rank > 0);
+                        }
+                        table.insert(
+                            format!("{state}/{actor}/{scope}/{id}/{operation}/{action}"),
+                            Value::from(rank),
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(table.len(), 4 * 2 * 6 * operations.len());
     }
 }

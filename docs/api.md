@@ -5458,3 +5458,39 @@ values. Execution failure retries survive status
 changes until an explicit budget reset. Other kinds retain their natural
 contract/completion/interruption/exhaustion windows; reset additionally restores
 all persisted kinds. There is no lifetime execution maximum.
+
+
+### Native Project registry contracts (3.8 E)
+
+Native aggregate tool names are unchanged. `project.current_state` accepts an
+optional nullable row limit from 1 to 64; `project.observations` accepts optional
+nullable `task_id` and unsigned `limit`, clamping its row limit to 1–50. Integer
+fields accept integer-valued strings or floats through normalization. Unknown
+read fields and malformed scalar values are refused with an in-turn contract
+error after the authority check.
+
+Project review configuration, Documents, Decisions, milestones, validation,
+release-candidate proposals and escalation now use typed registry contracts.
+Document and milestone fields are specific to the selected action. Fresh calls
+reject undeclared payload/envelope fields and forged server-derived authority or
+scope names. Omitted optional fields stay omitted, preserving receipt inputs;
+prepared calls retain their stored arguments. Proposal payloads are limited to
+65,536 serialized UTF-8 bytes. Generic proposal envelopes declare object payloads
+and non-null idempotency/correlation strings, matching preparation acceptance.
+
+The six legacy message, commitment, memory, review and session operations return
+pending proposals only. Their generated descriptions explicitly say no domain
+effect occurred. Their intent values remain opaque; fresh payloads admit only
+the operation's declared fields. No executor was added. A replay cannot report a
+receipt-less legacy row marked succeeded as a materialized effect.
+
+Ready Project Agents see the existing Charter amendment draft capability.
+Charter approval and final release remain user-only. Owned unbound identities
+retain Project-create and Project-Agent-selection proposal authority. Other
+registered operations retain their binding requirements; identity-scoped legacy
+proposals cannot bypass the bound Project contract. Setup-only denials after
+setup completes name `charter_adoption_not_applicable`.
+
+These changes affect native tool contracts and agent-action admission; REST
+resource shapes and MCP projections are unchanged. Charter adoption, evidence
+and readiness retain their hand paths in this slice.

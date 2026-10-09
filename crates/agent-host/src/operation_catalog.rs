@@ -407,7 +407,7 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedProposal,
         input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::SetupOnly,
+        setup: OperationSetupExposure::Always,
         supported_scopes: PROJECT_SCOPES,
         classification: OperationClassification::DirectCommand,
         permission: OperationPermission::ProposeProject,
@@ -1256,24 +1256,20 @@ mod tests {
             operation_contract_permission(CanonicalScopeType::Account, TASK_ADAPTIVE_OPERATION),
             None
         );
-        assert!(
-            operation_names_for_surface(
-                OperationSurface::Coordination,
-                false,
-                OperationExposure::GenericProposal,
-            )
-            .iter()
-            .any(|operation| operation == TASK_ADAPTIVE_OPERATION)
-        );
-        assert!(
-            !operation_names_for_surface(
-                OperationSurface::Coordination,
-                true,
-                OperationExposure::GenericProposal,
-            )
-            .iter()
-            .any(|operation| operation == TASK_ADAPTIVE_OPERATION)
-        );
+        assert!(operation_names_for_surface(
+            OperationSurface::Coordination,
+            false,
+            OperationExposure::GenericProposal,
+        )
+        .iter()
+        .any(|operation| operation == TASK_ADAPTIVE_OPERATION));
+        assert!(!operation_names_for_surface(
+            OperationSurface::Coordination,
+            true,
+            OperationExposure::GenericProposal,
+        )
+        .iter()
+        .any(|operation| operation == TASK_ADAPTIVE_OPERATION));
     }
 
     #[test]
@@ -1296,24 +1292,20 @@ mod tests {
             operation_contract_permission(CanonicalScopeType::Task, TASK_PLAN_OPERATION),
             Some("task_read")
         );
-        assert!(
-            operation_names_for_surface(
-                OperationSurface::Coordination,
-                false,
-                OperationExposure::TypedProposal,
-            )
-            .iter()
-            .any(|operation| operation == TASK_PLAN_OPERATION)
-        );
-        assert!(
-            !operation_names_for_surface(
-                OperationSurface::Coordination,
-                true,
-                OperationExposure::TypedProposal,
-            )
-            .iter()
-            .any(|operation| operation == TASK_PLAN_OPERATION)
-        );
+        assert!(operation_names_for_surface(
+            OperationSurface::Coordination,
+            false,
+            OperationExposure::TypedProposal,
+        )
+        .iter()
+        .any(|operation| operation == TASK_PLAN_OPERATION));
+        assert!(!operation_names_for_surface(
+            OperationSurface::Coordination,
+            true,
+            OperationExposure::TypedProposal,
+        )
+        .iter()
+        .any(|operation| operation == TASK_PLAN_OPERATION));
         for scope in [
             CanonicalScopeType::Account,
             CanonicalScopeType::Project,

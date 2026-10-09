@@ -6,7 +6,10 @@
 //! call their shared command services, while approval-required mutations
 //! retain an `AgentAction` envelope.
 
+#[cfg(test)]
+use forge_agent_host::PROJECT_CURRENT_STATE_OPERATION;
 use operation_registry::authority::permission_set;
+mod project_proposals;
 mod registered_proposals;
 mod registered_reads;
 #[cfg(test)]
@@ -43,9 +46,8 @@ use forge_agent_host::{
     CommandObservation, ForgeToolProvider, OperationClassification, PublicSearchScope,
     WorkspaceAccess, MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_ESCALATE_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
+    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
     TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
     TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
@@ -637,13 +639,13 @@ impl CoordinationToolProvider {
 
     async fn discovery_read(
         &self,
-        actor_identity_id: &str,
+        _actor_identity_id: &str,
         scope: &CanonicalScope,
         input: operation_registry::main_reads::BoundedListQuery,
     ) -> Result<Value, AgentHostError> {
         let account_id = self
             .authorization
-            .main_account_id(actor_identity_id, scope)
+            .main_account_target(scope)
             .await
             .map_err(native_scope_error)?;
         let limit = input.limit.unwrap_or(10).clamp(1, 20) as i64;
@@ -675,13 +677,13 @@ impl CoordinationToolProvider {
 
     async fn portfolio_read(
         &self,
-        actor_identity_id: &str,
+        _actor_identity_id: &str,
         scope: &CanonicalScope,
         input: operation_registry::main_reads::BoundedListQuery,
     ) -> Result<Value, AgentHostError> {
         let account_id = self
             .authorization
-            .main_account_id(actor_identity_id, scope)
+            .main_account_target(scope)
             .await
             .map_err(native_scope_error)?;
         let limit = input.limit.unwrap_or(20).clamp(1, 20) as i64;
@@ -1950,13 +1952,13 @@ impl CoordinationToolProvider {
     /// Whether this caller may dispatch an inquiry: the runner, the owning
     /// account and the chat the run record hangs off.
     ///
-    /// `main_account_id` is what confines this to a Main Chat: it rejects a
+    /// The registry's MainChat rule confines this to a Main Chat: it rejects a
     /// Project Chat outright and requires an Account scope's id to be the
     /// caller's own, so an inquiry can only ever be run against the account
     /// that dispatched it.
     async fn inquiry_admission(
         &self,
-        actor_identity_id: &str,
+        _actor_identity_id: &str,
         scope: &CanonicalScope,
     ) -> Result<(Arc<dyn InquiryRunner>, String, String), AgentHostError> {
         let runner = self.inquiry_runner_handle().ok_or_else(|| {
@@ -1964,7 +1966,7 @@ impl CoordinationToolProvider {
         })?;
         let account_id = self
             .authorization
-            .main_account_id(actor_identity_id, scope)
+            .main_account_target(scope)
             .await
             .map_err(native_scope_error)?;
         // The run record hangs off the conversation the user is watching, so
@@ -2051,24 +2053,13 @@ impl CoordinationToolProvider {
 
     async fn project_observations_read(
         &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
-        arguments: Value,
+        _actor_identity_id: &str,
+        _scope: &CanonicalScope,
+        project_id: &str,
+        input: operation_registry::project_reads::ObservationsArguments,
     ) -> Result<Value, AgentHostError> {
-        let project_id = self
-            .authorization
-            .project_orchestration_target(actor_identity_id, scope)
-            .await
-            .map_err(native_scope_error)?;
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(20)
-            .clamp(1, 50) as i64;
-        let task_filter = arguments
-            .get("task_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let limit = input.limit.unwrap_or(20).clamp(1, 50) as i64;
+        let task_filter = input.task_id;
 
         let worklog = sqlx::query(
             "SELECT c.id, c.task_id, c.worklog_kind, c.role, c.execution_id,
@@ -2080,7 +2071,7 @@ impl CoordinationToolProvider {
                AND (? IS NULL OR c.task_id = ?)
              ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
         )
-        .bind(&project_id)
+        .bind(project_id)
         .bind(task_filter.as_deref())
         .bind(task_filter.as_deref())
         .bind(limit)
@@ -2098,7 +2089,7 @@ impl CoordinationToolProvider {
                AND (? IS NULL OR m.task_id = ?)
              ORDER BY m.created_at DESC, m.id DESC LIMIT ?",
         )
-        .bind(&project_id)
+        .bind(project_id)
         .bind(task_filter.as_deref())
         .bind(task_filter.as_deref())
         .bind(limit)
@@ -2156,14 +2147,10 @@ impl CoordinationToolProvider {
 
     async fn project_charter_read(
         &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
+        _actor_identity_id: &str,
+        _scope: &CanonicalScope,
+        project_id: &str,
     ) -> Result<Value, AgentHostError> {
-        let project_id = self
-            .authorization
-            .project_orchestration_target(actor_identity_id, scope)
-            .await
-            .map_err(native_scope_error)?;
         let row = sqlx::query(
             "SELECT c.id AS charter_id, c.project_mode, c.version AS charter_version,
                     r.id AS revision_id, r.revision, r.content_digest, r.rendered_digest,
@@ -2173,7 +2160,7 @@ impl CoordinationToolProvider {
                ON r.id = c.current_approved_revision_id AND r.lifecycle = 'approved'
              WHERE c.project_id = ?",
         )
-        .bind(&project_id)
+        .bind(project_id)
         .fetch_optional(self.db.pool())
         .await
         .map_err(|_| AgentHostError::ProtectedPersistence)?
@@ -2220,18 +2207,14 @@ impl CoordinationToolProvider {
 
     async fn project_skill_section_read(
         &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
+        _actor_identity_id: &str,
+        _scope: &CanonicalScope,
+        _project_id: &str,
         input: operation_registry::project_reads::SectionArguments,
     ) -> Result<Value, AgentHostError> {
         // Doctrine text is static server-owned content, but the read still
         // authenticates the Project binding so the operation cannot become an
         // unauthorized liveness probe for foreign scopes.
-        let _project_id = self
-            .authorization
-            .project_orchestration_target(actor_identity_id, scope)
-            .await
-            .map_err(native_scope_error)?;
         let section = input.section.as_str();
         let body = crate::operating_skills::project_skill_section(section).ok_or_else(|| {
             AgentHostError::Unsupported(format!(
@@ -2252,26 +2235,19 @@ impl CoordinationToolProvider {
 
     async fn project_current_state_read(
         &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
-        arguments: Value,
+        _actor_identity_id: &str,
+        _scope: &CanonicalScope,
+        project_id: &str,
+        input: operation_registry::project_reads::CurrentStateArguments,
     ) -> Result<Value, AgentHostError> {
-        let project_id = self
-            .authorization
-            .project_orchestration_target(actor_identity_id, scope)
-            .await
-            .map_err(native_scope_error)?;
-        let limit = arguments
-            .get("limit")
-            .and_then(Value::as_i64)
-            .map(|value| value.clamp(1, 64));
-        let projection = load_effective_project_state(&self.db, &project_id, limit)
+        let limit = input.limit.map(|value| value as i64);
+        let projection = load_effective_project_state(&self.db, project_id, limit)
             .await
             .map_err(|_| AgentHostError::ProtectedPersistence)?;
-        let execution_setup = crate::load_project_execution_setup(&self.db, &project_id)
+        let execution_setup = crate::load_project_execution_setup(&self.db, project_id)
             .await
             .map_err(|_| AgentHostError::ProtectedPersistence)?;
-        let adoption_charter = load_project_adoption_charter(&self.db, &project_id)
+        let adoption_charter = load_project_adoption_charter(&self.db, project_id)
             .await
             .map_err(|_| AgentHostError::ProtectedPersistence)?;
         serde_json::to_value(ProjectCurrentStateResponse {
@@ -2289,9 +2265,11 @@ impl CoordinationToolProvider {
         scope: &CanonicalScope,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
+        self.registered_authority(actor_identity_id, scope, "portfolio.read")
+            .await?;
         let account_id = self
             .authorization
-            .main_account_id(actor_identity_id, scope)
+            .main_account_target(scope)
             .await
             .map_err(native_scope_error)?;
         let project_id = arguments
@@ -2826,15 +2804,14 @@ impl CoordinationToolProvider {
         // setup exception is the bounded message channel plus the typed
         // adoption operation handled below.
         match operation {
-            "message.propose" | "message.send" => {
+            "message.propose" => {
                 let _ = self
                     .authorization
                     .project_orchestration_target(actor_identity_id, scope)
                     .await
                     .map_err(native_scope_error)?;
             }
-            "commitment.propose" | "commitment.update" | "memory.publish" | "memory.supersede"
-            | "session.action" | "review.propose" | "review.request"
+            "commitment.propose" | "review.propose"
                 if scope.scope_type != CanonicalScopeType::Task =>
             {
                 let _ = self
@@ -2860,12 +2837,7 @@ impl CoordinationToolProvider {
                     .map_err(native_scope_error)?;
                 (Some("project".to_owned()), Some(project_id))
             }
-            PROJECT_DOCUMENT_OPERATION
-            | PROJECT_MILESTONE_OPERATION
-            | PROJECT_EVIDENCE_OPERATION
-            | PROJECT_VALIDATION_OPERATION
-            | PROJECT_READINESS_OPERATION
-            | PROJECT_RELEASE_OPERATION => {
+            PROJECT_EVIDENCE_OPERATION | PROJECT_READINESS_OPERATION => {
                 let project_id = self
                     .authorization
                     .project_orchestration_target(actor_identity_id, scope)
@@ -2873,15 +2845,7 @@ impl CoordinationToolProvider {
                     .map_err(native_scope_error)?;
                 (Some("project".to_owned()), Some(project_id))
             }
-            PROJECT_DECISION_OPERATION => {
-                let project_id = self
-                    .authorization
-                    .project_orchestration_target(actor_identity_id, scope)
-                    .await
-                    .map_err(native_scope_error)?;
-                (Some("project".to_owned()), Some(project_id))
-            }
-            "message.propose" | "message.send" => (
+            "message.propose" => (
                 Some(scope_type_name(scope.scope_type).to_owned()),
                 Some(scope.scope_id.clone()),
             ),
@@ -2895,7 +2859,7 @@ impl CoordinationToolProvider {
                 let _ = project_id;
                 (Some("project".to_owned()), project_chat_target)
             }
-            "review.propose" | "review.request"
+            "review.propose"
                 if matches!(
                     scope.scope_type,
                     CanonicalScopeType::Project
@@ -2909,24 +2873,10 @@ impl CoordinationToolProvider {
                     Some(scope.scope_id.clone()),
                 )
             }
-            "commitment.propose" | "commitment.update" => (
+            "commitment.propose" => (
                 Some(scope_type_name(scope.scope_type).to_owned()),
                 Some(scope.scope_id.clone()),
             ),
-            "memory.publish" | "memory.supersede" => (
-                Some(scope_type_name(scope.scope_type).to_owned()),
-                Some(scope.scope_id.clone()),
-            ),
-            "session.action"
-                if matches!(
-                    scope.scope_type,
-                    CanonicalScopeType::Account
-                        | CanonicalScopeType::Project
-                        | CanonicalScopeType::AgentChat
-                ) =>
-            {
-                (Some("scope".to_owned()), Some(scope.scope_id.clone()))
-            }
             _ => {
                 return Err(AgentHostError::Authority(
                     "proposal operation is not admitted for this scope".into(),
@@ -3601,8 +3551,10 @@ impl CoordinationToolProvider {
         // identifiers are intentionally not accepted here.
         match search_scope {
             PublicSearchScope::Main => {
+                self.registered_authority(actor_identity_id, scope, "portfolio.read")
+                    .await?;
                 self.authorization
-                    .main_account_id(actor_identity_id, scope)
+                    .main_account_target(scope)
                     .await
                     .map_err(native_scope_error)?;
             }
@@ -4111,6 +4063,164 @@ impl CoordinationToolProvider {
         }
         AgentHostError::StructuredOutcome(Box::new(outcome))
     }
+    async fn read_internal(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: Value,
+        admitted: Option<&operation_registry::authority::EffectiveAuthority>,
+    ) -> Result<Value, AgentHostError> {
+        let resolved;
+        let admitted = if let Some(admitted) = admitted {
+            Some(admitted)
+        } else if registered_reads::CATALOG.lookup(operation).is_some() {
+            resolved = match self
+                .resolve_registered_authority(actor_identity_id, scope)
+                .await
+            {
+                Ok(authority) => authority,
+                Err(error) => {
+                    return Err(self
+                        .structured_boundary_error(
+                            actor_identity_id,
+                            scope,
+                            operation,
+                            &arguments,
+                            error,
+                        )
+                        .await)
+                }
+            };
+            Some(&resolved)
+        } else {
+            None
+        };
+        if let (Some(authority), Some(spec)) =
+            (admitted, registered_reads::CATALOG.lookup(operation))
+        {
+            if let Err(error) = self.evaluate_registered_authority(authority, scope, spec) {
+                return Err(self
+                    .structured_boundary_error(
+                        actor_identity_id,
+                        scope,
+                        operation,
+                        &arguments,
+                        error,
+                    )
+                    .await);
+            }
+        }
+        let boundary_arguments = arguments.clone();
+        match operation_descriptor(scope.scope_type, operation, None).classification {
+            OperationClassification::Query => {}
+            OperationClassification::Denied => {
+                return Err(AgentHostError::StructuredOutcome(Box::new(
+                    OrchestrationOutcome::terminal_denial(
+                        operation,
+                        outcome_scope(scope),
+                        correlation_id(&arguments, operation, scope),
+                        DeniedBy::OperationNotInScope,
+                    ),
+                )));
+            }
+            OperationClassification::DirectCommand
+            | OperationClassification::ApprovalRequiredAction => {
+                return Err(AgentHostError::Unsupported(
+                    "mutation operations execute through the proposal boundary".to_owned(),
+                ));
+            }
+        }
+        let result = if let Some(spec) = registered_reads::CATALOG.lookup(operation) {
+            let context = registered_reads::Context {
+                provider: self,
+                actor_identity_id,
+                scope,
+                proposal_arguments: None,
+                admitted_authority: admitted,
+            };
+            match spec.dispatch(&context, arguments).await {
+                Ok(result) => Ok(result),
+                Err(operation_registry::DispatchError::Handler(error)) => Err(error),
+                Err(operation_registry::DispatchError::InvalidInput(message)) => {
+                    Err(invalid_arguments(message))
+                }
+            }
+        } else {
+            match operation {
+                "memory.read" => {
+                    self.memory_read(actor_identity_id, scope, arguments, false)
+                        .await
+                }
+                "project.summary" | "task.summary" => {
+                    if operation == "project.summary"
+                        && scope.scope_type == CanonicalScopeType::AgentChat
+                    {
+                        self.project_summary_read(actor_identity_id, scope, arguments)
+                            .await
+                    } else {
+                        self.summary(actor_identity_id, scope).await
+                    }
+                }
+                "decisions.read" => {
+                    self.memory_read(actor_identity_id, scope, arguments, true)
+                        .await
+                }
+                "work.read" | "events.read" | "inbox.read" | "commitments.read"
+                | "delivery.read" => {
+                    self.scoped_rows(actor_identity_id, scope, operation, arguments)
+                        .await
+                }
+                _ => Err(AgentHostError::Unsupported(
+                    "Forge read operation is not implemented".to_owned(),
+                )),
+            }
+        };
+        if operation_contract(operation).is_some() {
+            match result {
+                Ok(result) => Self::structured_success(
+                    operation,
+                    scope,
+                    &correlation_id(&boundary_arguments, operation, scope),
+                    result,
+                    false,
+                ),
+                Err(error) => Err(self
+                    .structured_boundary_error(
+                        actor_identity_id,
+                        scope,
+                        operation,
+                        &boundary_arguments,
+                        error,
+                    )
+                    .await),
+            }
+        } else {
+            match result {
+                Err(error)
+                    if matches!(&error, AgentHostError::Authority(_))
+                        || matches!(
+                            &error,
+                            AgentHostError::StructuredOutcome(_)
+                                | AgentHostError::AgentPaused { .. }
+                                | AgentHostError::ProjectPaused { .. }
+                        ) =>
+                {
+                    Err(self
+                        .structured_boundary_error(
+                            actor_identity_id,
+                            scope,
+                            operation,
+                            &boundary_arguments,
+                            error,
+                        )
+                        .await)
+                }
+                other => other,
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn proposal_boundary(
         &self,
@@ -4386,135 +4496,24 @@ impl ForgeToolProvider for CoordinationToolProvider {
 
     async fn read(
         &self,
-        actor_identity_id: &str,
+        actor: &str,
         scope: &CanonicalScope,
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError> {
-        self.registered_authority(actor_identity_id, scope, operation)
-            .await?;
-        let boundary_arguments = arguments.clone();
-        match operation_descriptor(scope.scope_type, operation, None).classification {
-            OperationClassification::Query => {}
-            OperationClassification::Denied => {
-                return Err(AgentHostError::StructuredOutcome(Box::new(
-                    OrchestrationOutcome::terminal_denial(
-                        operation,
-                        outcome_scope(scope),
-                        correlation_id(&arguments, operation, scope),
-                        DeniedBy::OperationNotInScope,
-                    ),
-                )));
-            }
-            OperationClassification::DirectCommand
-            | OperationClassification::ApprovalRequiredAction => {
-                return Err(AgentHostError::Unsupported(
-                    "mutation operations execute through the proposal boundary".to_owned(),
-                ));
-            }
-        }
-        let result = if let Some(spec) = registered_reads::CATALOG.lookup(operation) {
-            let context = registered_reads::Context {
-                provider: self,
-                actor_identity_id,
-                scope,
-                proposal_arguments: None,
-                admitted_authority: None,
-            };
-            match spec.dispatch(&context, arguments).await {
-                Ok(result) => Ok(result),
-                Err(operation_registry::DispatchError::Handler(error)) => Err(error),
-                // The contract is checked before the handler authorizes the
-                // caller. A caller the handler would deny gets that denial,
-                // not the contract.
-                Err(operation_registry::DispatchError::InvalidInput(message)) => {
-                    Err(match context.main_read_denial(operation).await {
-                        Some(denial) => denial,
-                        None => invalid_arguments(message),
-                    })
-                }
-            }
-        } else {
-            match operation {
-                PROJECT_CURRENT_STATE_OPERATION => {
-                    self.project_current_state_read(actor_identity_id, scope, arguments)
-                        .await
-                }
-                PROJECT_OBSERVATIONS_OPERATION => {
-                    self.project_observations_read(actor_identity_id, scope, arguments)
-                        .await
-                }
-                "memory.read" => {
-                    self.memory_read(actor_identity_id, scope, arguments, false)
-                        .await
-                }
-                "project.summary" | "task.summary" => {
-                    if operation == "project.summary"
-                        && scope.scope_type == CanonicalScopeType::AgentChat
-                    {
-                        self.project_summary_read(actor_identity_id, scope, arguments)
-                            .await
-                    } else {
-                        self.summary(actor_identity_id, scope).await
-                    }
-                }
-                "decisions.read" => {
-                    self.memory_read(actor_identity_id, scope, arguments, true)
-                        .await
-                }
-                "work.read" | "events.read" | "inbox.read" | "commitments.read"
-                | "delivery.read" => {
-                    self.scoped_rows(actor_identity_id, scope, operation, arguments)
-                        .await
-                }
-                _ => Err(AgentHostError::Unsupported(
-                    "Forge read operation is not implemented".to_owned(),
-                )),
-            }
-        };
-        if operation_contract(operation).is_some() {
-            match result {
-                Ok(result) => Self::structured_success(
-                    operation,
-                    scope,
-                    &correlation_id(&boundary_arguments, operation, scope),
-                    result,
-                    false,
-                ),
-                Err(error) => Err(self
-                    .structured_boundary_error(
-                        actor_identity_id,
-                        scope,
-                        operation,
-                        &boundary_arguments,
-                        error,
-                    )
-                    .await),
-            }
-        } else {
-            match result {
-                Err(error)
-                    if matches!(&error, AgentHostError::Authority(_))
-                        || matches!(
-                            &error,
-                            AgentHostError::StructuredOutcome(_)
-                                | AgentHostError::AgentPaused { .. }
-                                | AgentHostError::ProjectPaused { .. }
-                        ) =>
-                {
-                    Err(self
-                        .structured_boundary_error(
-                            actor_identity_id,
-                            scope,
-                            operation,
-                            &boundary_arguments,
-                            error,
-                        )
-                        .await)
-                }
-                other => other,
-            }
-        }
+        self.read_internal(actor, scope, operation, arguments, None)
+            .await
+    }
+    async fn read_admitted(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: Value,
+        authority: &operation_registry::authority::EffectiveAuthority,
+    ) -> Result<Value, AgentHostError> {
+        self.read_internal(actor, scope, operation, arguments, Some(authority))
+            .await
     }
 
     async fn proposal_denial(
@@ -4523,7 +4522,7 @@ impl ForgeToolProvider for CoordinationToolProvider {
         scope: &CanonicalScope,
         operation: &str,
     ) -> Result<(), AgentHostError> {
-        self.main_proposal_admission(actor_identity_id, scope, operation)
+        self.proposal_admission(actor_identity_id, scope, operation)
             .await
     }
     async fn propose(
@@ -5160,6 +5159,7 @@ fn native_denial_cause(reason: &str, permission: Option<&str>) -> DeniedBy {
         | "direct Project command permission is outside the active binding ceiling" => {
             permission.map(|name| DeniedBy::PermissionMissing(name.to_owned())).unwrap_or(DeniedBy::Unspecified)
         }
+        "actor identity has no active binding in the requested scope or is paused or archived" => DeniedBy::AuthorityRevoked,
         "actor identity is paused or archived"
         | "Project Agent is paused or archived"
         | "direct Project command principal is paused or archived"
@@ -7975,5 +7975,53 @@ mod tests {
             local.is_err(),
             "localhost must not resolve for public search"
         );
+    }
+    #[tokio::test]
+    async fn setup_completed_denial_names_adoption_not_applicable() {
+        use operation_registry::authority::{AuthorityFacts, EffectiveAuthority, Principal};
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        let provider = CoordinationToolProvider::new(Arc::new(SqliteDb::new(pool)));
+        let mut spec = operation_registry::project_reads::specs::<AgentHostError>()
+            .into_iter()
+            .find(|spec| spec.id == "project.charter")
+            .unwrap();
+        spec.availability = operation_registry::AvailabilityRule::SetupOnly;
+        let mut authority = EffectiveAuthority::resolve(AuthorityFacts {
+            principal: Principal::ProjectAgent {
+                identity_id: "agent".into(),
+                project_id: "project".into(),
+            },
+            scope_type: "project".into(),
+            scope_id: "project".into(),
+            profile_id: "profile".into(),
+            layers: vec![["read_project".into()].into_iter().collect()],
+            binding_id: Some("binding".into()),
+            setup_required: false,
+            active: true,
+        });
+        let scope = CanonicalScope {
+            scope_type: CanonicalScopeType::Project,
+            scope_id: "project".into(),
+            workspace_access: WorkspaceAccess::Deny,
+        };
+        let AgentHostError::StructuredOutcome(outcome) = provider
+            .evaluate_registered_authority(&authority, &scope, &spec)
+            .unwrap_err()
+        else {
+            panic!("typed denial")
+        };
+        assert_eq!(
+            outcome.denied_by,
+            Some(DeniedBy::CharterAdoptionNotApplicable)
+        );
+        spec.availability = operation_registry::AvailabilityRule::ReadyOnly;
+        authority.setup_required = true;
+        let AgentHostError::StructuredOutcome(outcome) = provider
+            .evaluate_registered_authority(&authority, &scope, &spec)
+            .unwrap_err()
+        else {
+            panic!("typed denial")
+        };
+        assert_eq!(outcome.denied_by, Some(DeniedBy::CharterNotAdopted));
     }
 }

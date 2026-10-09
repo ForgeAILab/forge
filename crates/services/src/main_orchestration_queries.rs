@@ -34,6 +34,7 @@ use crate::{
 pub struct MainOrchestrationQueryService {
     db: Arc<SqliteDb>,
     authorization: OrchestrationAuthorizationService,
+    admitted: Option<operation_registry::authority::EffectiveAuthority>,
 }
 
 impl MainOrchestrationQueryService {
@@ -41,7 +42,57 @@ impl MainOrchestrationQueryService {
         Self {
             authorization: OrchestrationAuthorizationService::new(Arc::clone(&db)),
             db,
+            admitted: None,
         }
+    }
+
+    pub(crate) fn for_admission(
+        &self,
+        admitted: Option<&operation_registry::authority::EffectiveAuthority>,
+    ) -> Self {
+        let mut service = self.clone();
+        service.admitted = admitted.cloned();
+        service
+    }
+    async fn main_target(&self, actor: &str, scope: &CanonicalScope) -> Result<String> {
+        if !matches!(
+            scope.scope_type,
+            CanonicalScopeType::Account | CanonicalScopeType::AgentChat
+        ) {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "global Main Agent operation is unavailable in this scope".into(),
+            });
+        }
+        let resolved;
+        let authority = if let Some(admitted) = &self.admitted {
+            admitted
+        } else {
+            resolved = self
+                .db
+                .resolve_effective_authority(
+                    actor,
+                    None,
+                    if scope.scope_type == CanonicalScopeType::Account {
+                        "account"
+                    } else {
+                        "agent_chat"
+                    },
+                    &scope.scope_id,
+                    "deny",
+                )
+                .await?;
+            &resolved
+        };
+        authority
+            .evaluate(
+                operation_registry::READ_CATALOG
+                    .lookup("charter.read")
+                    .unwrap(),
+            )
+            .map_err(|_| ServiceError::AuthorizationDenied {
+                message: "Main query authority is unavailable in this scope".into(),
+            })?;
+        self.authorization.main_account_target(scope).await
     }
 
     pub async fn project_agents(
@@ -76,10 +127,7 @@ impl MainOrchestrationQueryService {
         scope: &CanonicalScope,
         query: CharterReadQuery,
     ) -> Result<Value> {
-        let account_id = self
-            .authorization
-            .main_account_id(actor_identity_id, scope)
-            .await?;
+        let account_id = self.main_target(actor_identity_id, scope).await?;
         let limit = 20_i64;
         let rows = sqlx::query(
             "SELECT id, genesis_session_id, current_draft_revision_id,
@@ -289,10 +337,7 @@ impl MainOrchestrationQueryService {
         session_id: Option<&str>,
         charter_id: Option<&str>,
     ) -> Result<(String, api_types::ProductGenesisSession)> {
-        let account_id = self
-            .authorization
-            .main_account_id(actor_identity_id, scope)
-            .await?;
+        let account_id = self.main_target(actor_identity_id, scope).await?;
         let session_id = match session_id {
             Some(session_id) if !session_id.trim().is_empty() => session_id.to_owned(),
             _ => {

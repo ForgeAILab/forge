@@ -1,4 +1,4 @@
-use super::tests::{ConfiguredSearchProvider, all_permissions, scope};
+use super::tests::{all_permissions, scope, ConfiguredSearchProvider};
 use super::*;
 
 /// Print actual compact provider definitions, not a reconstructed schema.
@@ -19,6 +19,7 @@ fn serialized_tool_definitions() {
         .collect();
     let workspace = tempfile::tempdir().unwrap();
     let root = workspace.path().to_str().unwrap();
+    let mut actual = serde_json::Map::new();
     for (name, scope_type, access, role, project, setup) in [
         (
             "main",
@@ -107,15 +108,7 @@ fn serialized_tool_definitions() {
             .iter()
             .map(|tool| tool.spec().to_schema())
             .collect();
-        let snapshot: Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/tool_definitions_normalized.json"
-        ))
-        .unwrap();
-        assert_eq!(
-            serde_json::to_value(&definitions).unwrap(),
-            snapshot[name],
-            "{name} schema snapshot"
-        );
+        actual.insert(name.to_owned(), serde_json::to_value(&definitions).unwrap());
         for definition in &definitions {
             let schema = &definition.input_schema;
             if definition.name.contains("scope_") || definition.name.contains("orchestration_") {
@@ -139,6 +132,11 @@ fn serialized_tool_definitions() {
             serde_json::to_string(&definitions).unwrap()
         );
     }
+    let snapshot: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/tool_definitions_normalized.json"
+    ))
+    .unwrap();
+    assert_eq!(Value::Object(actual), snapshot, "native schema snapshot");
 }
 
 /// Estimated-prefix ceilings per native surface, in compact UTF-8 bytes (the
@@ -154,9 +152,13 @@ const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
     ("inquiry", 4_089),
     // 24,048 and 25,297 at 172338b3, plus 56 each: the `skill.section`
     // argument line states the required enum instead of `optional {section}`.
-    ("project", 24_104),
-    ("project_verify_solo", 25_353),
-    ("project_setup", 15_572),
+    ("project", 19_502),
+    ("project_verify_solo", 20_751),
+    // Setup gains 194 bytes: the required truthful PENDING message contract
+    // and its body/content aliases add 200; the amendment wording adds 2; the new
+    // current-state line saves 8. The unchanged hand Charter dominates
+    // (12,526 bytes); no unrelated Task fields are added.
+    ("project_setup", 15_766),
     ("worker", 6_062),
     ("reviewer", 4_829),
     ("planner", 5_437),
@@ -741,18 +743,10 @@ async fn normalization_errors_never_fall_back_on_native_or_cli() {
     ] {
         let native = native_call(&composition, "forge_scope_propose", arguments.clone()).await;
         assert!(native.is_error);
-        assert!(
-            composition
-                .invoke_denied_chat_tool(
-                    "session",
-                    "turn",
-                    "call",
-                    "forge_scope_propose",
-                    arguments
-                )
-                .await
-                .is_err()
-        );
+        assert!(composition
+            .invoke_denied_chat_tool("session", "turn", "call", "forge_scope_propose", arguments)
+            .await
+            .is_err());
     }
     assert!(provider.0.lock().unwrap().is_empty());
 }
@@ -777,18 +771,10 @@ async fn missing_required_fields_and_unknown_properties_fail_both_paths() {
                 .await
                 .is_error
         );
-        assert!(
-            composition
-                .invoke_denied_chat_tool(
-                    "session",
-                    "turn",
-                    "call",
-                    "forge_scope_propose",
-                    arguments
-                )
-                .await
-                .is_err()
-        );
+        assert!(composition
+            .invoke_denied_chat_tool("session", "turn", "call", "forge_scope_propose", arguments)
+            .await
+            .is_err());
     }
     assert!(provider.0.lock().unwrap().is_empty());
 }
@@ -1001,12 +987,10 @@ async fn hook_failure_does_not_retry_schema_valid_raw_arguments() {
     })];
     let result = native_call(&composition, "forge_scope_propose", proposal()).await;
     assert!(result.is_error);
-    assert!(
-        result.content[0]
-            .as_text()
-            .unwrap()
-            .contains("normalization failed")
-    );
+    assert!(result.content[0]
+        .as_text()
+        .unwrap()
+        .contains("normalization failed"));
     let error = composition
         .invoke_denied_chat_tool("session", "turn", "call", "forge_scope_propose", proposal())
         .await

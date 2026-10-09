@@ -44,54 +44,53 @@ const SURFACES: &[SurfaceBinding] = &[
     },
 ];
 pub const IDS: &[&str] = &["genesis.project_agent.select", "project.create"];
-pub fn catalog<E: Send + 'static>() -> Catalog<E> {
-    OperationCatalog::new(
-        vec![
-            OperationSpec::typed(
-                "genesis.project_agent.select",
-                AuthorityRule {
-                    principal: authority::PrincipalRule::MainOrInquiry,
-                    permissions: &[
-                        ("account", "propose_discovery"),
-                        ("agent_chat", "propose_discovery"),
-                    ],
-                    binding: "account-owned active Main identity",
-                },
-                EffectClass::DirectCommand,
-                AvailabilityRule::Always,
-                SURFACES,
-                "Persist the exact Genesis Project Agent preference.",
-                "",
-                &[
-                    StructuralConstraint::IgnoredField("action"),
-                    StructuralConstraint::ClosedObject,
+pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
+    vec![
+        OperationSpec::typed(
+            "genesis.project_agent.select",
+            AuthorityRule {
+                principal: authority::PrincipalRule::OwnedMain,
+                permissions: &[
+                    ("account", "propose_discovery"),
+                    ("agent_chat", "propose_discovery"),
                 ],
-                |context, input| Box::pin(context.select_project_agent(input)),
-            ),
-            OperationSpec::typed(
-                "project.create",
-                AuthorityRule {
-                    principal: authority::PrincipalRule::MainOrInquiry,
-                    permissions: &[
-                        ("account", "propose_project"),
-                        ("agent_chat", "propose_project"),
-                        // Base permission family also maps Project; the Main
-                        // binding rule still excludes Project callers.
-                        ("project", "propose_project"),
-                    ],
-                    binding: "account-owned active Main identity; execution requires the user",
-                },
-                EffectClass::ApprovalRequired,
-                AvailabilityRule::Always,
-                SURFACES,
-                "Propose Project creation from an exact Charter approval.",
-                "",
-                &[],
-                |context, input| Box::pin(context.propose_project_create(input)),
-            ),
-        ],
-        IDS,
-    )
-    .expect("complete Main proposal catalog")
+                binding: "account-owned Main identity",
+            },
+            EffectClass::DirectCommand,
+            AvailabilityRule::Always,
+            SURFACES,
+            "Persist the exact Genesis Project Agent preference.",
+            "",
+            &[
+                StructuralConstraint::IgnoredField("action"),
+                StructuralConstraint::ClosedObject,
+            ],
+            |context, input| Box::pin(context.select_project_agent(input)),
+        ),
+        OperationSpec::typed(
+            "project.create",
+            AuthorityRule {
+                principal: authority::PrincipalRule::OwnedMain,
+                permissions: &[
+                    ("account", "propose_project"),
+                    ("agent_chat", "propose_project"),
+                    // Base permission family also maps Project; the Main
+                    // binding rule still excludes Project callers.
+                    ("project", "propose_project"),
+                ],
+                binding: "account-owned Main identity; execution requires the user",
+            },
+            EffectClass::ApprovalRequired,
+            AvailabilityRule::Always,
+            SURFACES,
+            "Propose Project creation from an exact Charter approval.",
+            "",
+            &[],
+            |context, input| Box::pin(context.propose_project_create(input)),
+        ),
+    ]
+}
+pub fn catalog<E: Send + 'static>() -> Catalog<E> {
+    OperationCatalog::new(specs(), IDS).expect("complete Main proposal catalog")
 }
 pub static CATALOG: LazyLock<Catalog<std::convert::Infallible>> = LazyLock::new(catalog);

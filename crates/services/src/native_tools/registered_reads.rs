@@ -31,16 +31,62 @@ impl operation_registry::scope_reads::ScopeReadContext<AgentHostError> for Conte
             .await
     }
 }
+impl Context<'_> {
+    fn project_target(&self) -> Result<&str, AgentHostError> {
+        match self
+            .admitted_authority
+            .map(|authority| &authority.principal)
+        {
+            Some(operation_registry::authority::Principal::ProjectAgent { project_id, .. }) => {
+                Ok(project_id)
+            }
+            _ => Err(AgentHostError::Authority(
+                "Project read has no admitted target".into(),
+            )),
+        }
+    }
+}
 #[async_trait]
 impl operation_registry::project_reads::ProjectReadContext<AgentHostError> for Context<'_> {
+    async fn current_state(
+        &self,
+        input: operation_registry::project_reads::CurrentStateArguments,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .project_current_state_read(
+                self.actor_identity_id,
+                self.scope,
+                self.project_target()?,
+                input,
+            )
+            .await
+    }
+    async fn observations(
+        &self,
+        input: operation_registry::project_reads::ObservationsArguments,
+    ) -> Result<Value, AgentHostError> {
+        self.provider
+            .project_observations_read(
+                self.actor_identity_id,
+                self.scope,
+                self.project_target()?,
+                input,
+            )
+            .await
+    }
     async fn project_charter(&self, _input: NoArguments) -> Result<Value, AgentHostError> {
         self.provider
-            .project_charter_read(self.actor_identity_id, self.scope)
+            .project_charter_read(self.actor_identity_id, self.scope, self.project_target()?)
             .await
     }
     async fn skill_section(&self, input: SectionArguments) -> Result<Value, AgentHostError> {
         self.provider
-            .project_skill_section_read(self.actor_identity_id, self.scope, input)
+            .project_skill_section_read(
+                self.actor_identity_id,
+                self.scope,
+                self.project_target()?,
+                input,
+            )
             .await
     }
 }
@@ -53,6 +99,7 @@ impl operation_registry::main_reads::MainReadContext<AgentHostError> for Context
     ) -> Result<Value, AgentHostError> {
         self.provider
             .main_queries
+            .for_admission(self.admitted_authority)
             .project_agents(self.actor_identity_id, self.scope, input)
             .await
             .map_err(super::service_error)
@@ -63,6 +110,7 @@ impl operation_registry::main_reads::MainReadContext<AgentHostError> for Context
     ) -> Result<Value, AgentHostError> {
         self.provider
             .main_queries
+            .for_admission(self.admitted_authority)
             .charter_read(self.actor_identity_id, self.scope, input)
             .await
             .map_err(super::native_scope_error)
@@ -73,6 +121,7 @@ impl operation_registry::main_reads::MainReadContext<AgentHostError> for Context
     ) -> Result<Value, AgentHostError> {
         self.provider
             .main_queries
+            .for_admission(self.admitted_authority)
             .charter_readiness(self.actor_identity_id, self.scope, input)
             .await
             .map_err(super::service_error)
@@ -83,6 +132,7 @@ impl operation_registry::main_reads::MainReadContext<AgentHostError> for Context
     ) -> Result<Value, AgentHostError> {
         self.provider
             .main_queries
+            .for_admission(self.admitted_authority)
             .charter_diff(self.actor_identity_id, self.scope, input)
             .await
             .map_err(super::service_error)
@@ -93,6 +143,7 @@ impl operation_registry::main_reads::MainReadContext<AgentHostError> for Context
     ) -> Result<Value, AgentHostError> {
         self.provider
             .main_queries
+            .for_admission(self.admitted_authority)
             .charter_approval_target(self.actor_identity_id, self.scope, input)
             .await
             .map_err(super::service_error)
@@ -120,35 +171,5 @@ impl operation_registry::main_reads::MainReadContext<AgentHostError> for Context
         self.provider
             .inquiry_run(self.actor_identity_id, self.scope, input)
             .await
-    }
-}
-
-impl Context<'_> {
-    /// The denial a Main read's handler would give this caller, if any. Each
-    /// handler authorizes the caller first, with these same checks and error
-    /// mappings; this runs them when the arguments never reach the handler.
-    pub(super) async fn main_read_denial(&self, operation: &str) -> Option<AgentHostError> {
-        if !operation_registry::main_reads::IDS.contains(&operation) {
-            return None;
-        }
-        if operation == forge_agent_host::MAIN_INQUIRY_RUN_OPERATION {
-            return self
-                .provider
-                .inquiry_admission(self.actor_identity_id, self.scope)
-                .await
-                .err();
-        }
-        let denied = self
-            .provider
-            .authorization
-            .main_account_id(self.actor_identity_id, self.scope)
-            .await
-            .err()?;
-        Some(match operation {
-            "charter.read" | "discovery.read" | "portfolio.read" => {
-                super::native_scope_error(denied)
-            }
-            _ => super::service_error(denied),
-        })
     }
 }

@@ -7,6 +7,8 @@
 //! actor or scope as tool arguments; those values are captured when the host
 //! composes the tools.
 
+#[cfg(test)]
+use crate::PROJECT_CURRENT_STATE_OPERATION;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -39,24 +41,24 @@ use agent_runtime::registry::{Permission, TrustClass};
 use agent_runtime::runtime::RuntimeBuilder;
 use api_types::{DeniedBy, OrchestrationOutcome, OutcomeCode, RetryAction};
 use async_trait::async_trait;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use tokio::process::Command;
 
 use agent_runtime::harness::{FetchTool, FetchTransport};
 
 use crate::{
-    AgentHostError, CanonicalScope, CanonicalScopeType, CommandAllowlist, WorkspaceAccess,
     operation_catalog::{
-        MAIN_CHARTER_DRAFT_OPERATION, MAIN_INQUIRY_RUN_OPERATION, OperationExposure,
-        OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-        PROJECT_OBSERVATIONS_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
-        TASK_WORKLOG_OPERATION, operation_names_for_surface,
+        operation_names_for_surface, OperationExposure, OperationSurface,
+        MAIN_CHARTER_DRAFT_OPERATION, MAIN_INQUIRY_RUN_OPERATION,
+        PROJECT_CHARTER_ADOPTION_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION,
+        TASK_WORKLOG_OPERATION,
     },
     operation_contract::{
         coordination_payload_guidance, coordination_payload_properties,
         orchestration_proposal_schema, orchestration_read_schema, portable_const_schema,
         string_or_null_schema, validate_orchestration_proposal_arguments,
     },
+    AgentHostError, CanonicalScope, CanonicalScopeType, CommandAllowlist, WorkspaceAccess,
 };
 
 /// Host-defined permission for a read-only Forge domain operation.
@@ -177,6 +179,20 @@ pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError>;
+
+    /// A registered query evaluates the authority pinned at turn admission.
+    /// No fresh effect occurs, so the inner provider must not resolve again.
+    async fn read_admitted(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: Value,
+        authority: &operation_registry::authority::EffectiveAuthority,
+    ) -> Result<Value, AgentHostError> {
+        let _ = authority;
+        self.read(actor, scope, operation, arguments).await
+    }
 
     /// Persists one already-scope-bound proposal envelope.  The provider is
     /// responsible for applying Forge's policy intersection and for keeping
@@ -1625,7 +1641,7 @@ fn filter_operations(
         .filter(|operation| {
             if let Some(spec) = operation_registry::READ_CATALOG
                 .lookup(operation)
-                .or_else(|| operation_registry::main_proposals::CATALOG.lookup(operation))
+                .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation))
             {
                 if let Some(admitted) = admitted {
                     return admitted.evaluate(spec).is_ok();
@@ -2215,14 +2231,28 @@ impl ForgeScopeProposeTool {
         let schema = if self.reject_authority_overrides {
             portable_const_schema(orchestration_proposal_schema(&self.operations))
         } else {
-            let mut payload_property = json!({"type": ["object", "null"]});
+            let registered = self
+                .operations
+                .iter()
+                .any(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_some());
+            let mut payload_property = if registered {
+                json!({"type":"object"})
+            } else {
+                json!({"type":["object","null"]})
+            };
             let guidance = coordination_payload_guidance(&self.operations);
             if !guidance.is_empty() {
                 payload_property["description"] = json!(guidance);
             }
             let payload_properties = coordination_payload_properties(&self.operations);
-            if let Some(properties) = payload_properties.as_ref() {
-                payload_property["properties"] = properties.clone();
+            if !self
+                .operations
+                .iter()
+                .any(|id| operation_registry::PROPOSAL_CATALOG.lookup(id).is_some())
+            {
+                if let Some(properties) = payload_properties.as_ref() {
+                    payload_property["properties"] = properties.clone();
+                }
             }
             let mut schema = json!({
                 "type": "object",
@@ -2233,23 +2263,29 @@ impl ForgeScopeProposeTool {
                         "enum": self.operations.iter().collect::<Vec<_>>(),
                     },
                     "payload": payload_property,
-                    // Keep the existing nullable provider fields (notably
-                    // for Gemini). Normalization precedes schema validation;
-                    // non-null/nonblank identifiers are still enforced in
-                    // `prepare` and errors return to the model in-turn.
-                    "dedupe_key": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null idempotency key"},
-                    "correlation_id": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null correlation id"},
+                    // The envelope declares the same non-null identifiers preparation accepts.
+                    "dedupe_key": {"type": "string", "minLength": 1, "description": "Required non-null idempotency key"},
+                    "correlation_id": {"type": "string", "minLength": 1, "description": "Required non-null correlation id"},
                     "causation_id": string_or_null_schema(),
                     "causation_depth": {"type": ["integer", "null"], "minimum": 0, "maximum": 8}
                 },
                 "additionalProperties": false
             });
+            if !registered {
+                for field in ["dedupe_key", "correlation_id"] {
+                    schema["properties"][field]["type"] = json!(["string", "null"]);
+                }
+            }
             // Provider-friendly aliases. Normalization removes these and builds
             // the canonical payload object, so the service boundary still
             // sees exactly one envelope shape.
             if let Some(Value::Object(properties)) = payload_properties {
                 if let Some(root) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-                    root.extend(properties);
+                    root.extend(
+                        properties
+                            .into_iter()
+                            .filter(|(name, _)| name != "parameters"),
+                    );
                 }
             }
             schema
@@ -2291,7 +2327,7 @@ impl Tool for ForgeScopeProposeTool {
                 "Forge proposal operation is outside this scope",
             ));
         }
-        let registered = operation_registry::main_proposals::CATALOG.lookup(operation);
+        let registered = operation_registry::PROPOSAL_CATALOG.lookup(operation);
         if registered.is_some() {
             if let Err(error) = self
                 .provider
@@ -3117,53 +3153,9 @@ fn validate_orchestration_read_arguments(
             .validate_arguments(object.get("arguments").unwrap_or(&json!({})))
             .map_err(RuntimeError::tool);
     }
-    let allowed = match operation {
-        PROJECT_CURRENT_STATE_OPERATION => &["operation", "arguments"][..],
-        _ => &["operation", "arguments"][..],
-    };
-    // The operation wrapper is validated by the tool's schema.  This helper
-    // only guards the nested arguments object so a caller cannot smuggle a
-    // second scope/project selector through the read path.
-    if let Some(value) = object.get("arguments") {
-        let nested = value
-            .as_object()
-            .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
-        let nested_allowed: &[&str] = match operation {
-            PROJECT_CURRENT_STATE_OPERATION => &["limit"],
-            PROJECT_OBSERVATIONS_OPERATION => &["task_id", "limit"],
-            _ => &[],
-        };
-        if let Some(field) = nested
-            .keys()
-            .find(|field| !nested_allowed.contains(&field.as_str()))
-        {
-            return Err(RuntimeError::tool(format!(
-                "Forge orchestration read argument `{field}` is not admitted"
-            )));
-        }
-        if operation == PROJECT_CURRENT_STATE_OPERATION {
-            if let Some(limit) = nested.get("limit").and_then(Value::as_i64) {
-                if !(1..=64).contains(&limit) {
-                    return Err(RuntimeError::tool(
-                        "Project state read limit must be between 1 and 64",
-                    ));
-                }
-            } else if nested.contains_key("limit") {
-                return Err(RuntimeError::tool(
-                    "Project state read limit must be an integer",
-                ));
-            }
-        }
-    }
-    if let Some(field) = object
-        .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
-    {
-        return Err(RuntimeError::tool(format!(
-            "Forge orchestration read field `{field}` is not admitted"
-        )));
-    }
-    Ok(())
+    Err(RuntimeError::tool(
+        "Forge orchestration read operation has no registered contract",
+    ))
 }
 
 fn string_array(arguments: &Value, field: &str) -> Result<Vec<String>, RuntimeError> {
@@ -3763,7 +3755,7 @@ mod tests {
             .unwrap();
         assert!(
             validator.is_valid(&null_dedupe),
-            "a null dedupe_key passes the schema"
+            "the retained readiness hand envelope remains nullable"
         );
         let refused = tool
             .prepare(null_dedupe, &test_preparation_context("envelope"))
@@ -4184,11 +4176,9 @@ mod tests {
             Some(Arc::new(TestProvider::default())),
         )
         .expect("Main composition");
-        assert!(
-            !composition
-                .tool_names()
-                .contains(&FORGE_PUBLIC_WEB_SEARCH_TOOL.to_owned())
-        );
+        assert!(!composition
+            .tool_names()
+            .contains(&FORGE_PUBLIC_WEB_SEARCH_TOOL.to_owned()));
     }
 
     #[test]
@@ -4203,10 +4193,9 @@ mod tests {
             Some(Arc::new(ConfiguredSearchProvider)),
         )
         .expect("Main composition");
-        assert!(
-            main.tool_names()
-                .contains(&FORGE_PUBLIC_WEB_SEARCH_TOOL.to_owned())
-        );
+        assert!(main
+            .tool_names()
+            .contains(&FORGE_PUBLIC_WEB_SEARCH_TOOL.to_owned()));
 
         let project_permissions = BTreeSet::from(["read_project".to_owned()]);
         let project = ScopeToolComposition::for_scope_with_permissions(
@@ -4218,11 +4207,9 @@ mod tests {
             Some(Arc::new(ConfiguredSearchProvider)),
         )
         .expect("Project composition");
-        assert!(
-            project
-                .tool_names()
-                .contains(&FORGE_PUBLIC_WEB_SEARCH_TOOL.to_owned())
-        );
+        assert!(project
+            .tool_names()
+            .contains(&FORGE_PUBLIC_WEB_SEARCH_TOOL.to_owned()));
 
         assert_eq!(
             public_search_scope(CanonicalScopeType::Account, false),
@@ -4277,12 +4264,10 @@ mod tests {
         )
         .expect("Agent Chat composition");
 
-        assert!(
-            composition
-                .tool_names()
-                .iter()
-                .all(|name| !name.starts_with("forge_task_"))
-        );
+        assert!(composition
+            .tool_names()
+            .iter()
+            .all(|name| !name.starts_with("forge_task_")));
         let error = composition
             .invoke_denied_chat_tool(
                 "session-chat",
@@ -4426,11 +4411,9 @@ mod tests {
         assert!(names.contains(&FORGE_MAIN_ORCHESTRATION_READ_TOOL.to_owned()));
         assert!(names.contains(&FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL.to_owned()));
         assert!(!names.contains(&FORGE_PROJECT_ORCHESTRATION_READ_TOOL.to_owned()));
-        assert!(
-            !names
-                .iter()
-                .any(|name| name.contains("task") || name.contains("workspace"))
-        );
+        assert!(!names
+            .iter()
+            .any(|name| name.contains("task") || name.contains("workspace")));
         let propose = composition
             .tools()
             .into_iter()
@@ -4444,19 +4427,15 @@ mod tests {
             .and_then(|operation| operation.get("enum"))
             .and_then(Value::as_array)
             .expect("Main operation enum");
-        assert!(
-            operations
-                .iter()
-                .any(|value| value == MAIN_PROJECT_CREATE_OPERATION)
-        );
+        assert!(operations
+            .iter()
+            .any(|value| value == MAIN_PROJECT_CREATE_OPERATION));
         assert!(operations.iter().any(|value| {
             value == crate::operation_catalog::MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION
         }));
-        assert!(
-            !operations
-                .iter()
-                .any(|value| value == PROJECT_DOCUMENT_OPERATION)
-        );
+        assert!(!operations
+            .iter()
+            .any(|value| value == PROJECT_DOCUMENT_OPERATION));
     }
 
     #[test]
@@ -4475,11 +4454,9 @@ mod tests {
         assert!(names.contains(&FORGE_PROJECT_ORCHESTRATION_READ_TOOL.to_owned()));
         assert!(names.contains(&FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL.to_owned()));
         assert!(!names.contains(&FORGE_MAIN_ORCHESTRATION_READ_TOOL.to_owned()));
-        assert!(
-            !names
-                .iter()
-                .any(|name| name.contains("task") || name.contains("workspace"))
-        );
+        assert!(!names
+            .iter()
+            .any(|name| name.contains("task") || name.contains("workspace")));
         let read = composition
             .tools()
             .into_iter()
@@ -4493,36 +4470,34 @@ mod tests {
             .and_then(|operation| operation.get("enum"))
             .and_then(Value::as_array)
             .expect("Project operation enum");
-        assert!(
-            operations
-                .iter()
-                .any(|value| value == PROJECT_CURRENT_STATE_OPERATION)
-        );
-        assert!(
-            !operations
-                .iter()
-                .any(|value| value == MAIN_CHARTER_READ_OPERATION)
-        );
+        assert!(operations
+            .iter()
+            .any(|value| value == PROJECT_CURRENT_STATE_OPERATION));
+        assert!(!operations
+            .iter()
+            .any(|value| value == MAIN_CHARTER_READ_OPERATION));
         // The declared envelope is a plain object (no oneOf) with the
         // per-operation guidance in the arguments description; the exact
         // per-operation argument schema stays available to validators.
         assert!(spec.input_schema.get("oneOf").is_none());
-        assert!(
-            spec.input_schema["properties"]["arguments"]["description"]
-                .as_str()
-                .expect("read guidance")
-                .contains(PROJECT_CURRENT_STATE_OPERATION)
-        );
+        assert!(spec.input_schema["properties"]["arguments"]["description"]
+            .as_str()
+            .expect("read guidance")
+            .contains(PROJECT_CURRENT_STATE_OPERATION));
         let arguments = orchestration_read_arguments_schema(PROJECT_CURRENT_STATE_OPERATION);
         assert_eq!(arguments["additionalProperties"], false);
-        assert_eq!(arguments["properties"]["limit"]["minimum"], 1);
-        assert_eq!(arguments["properties"]["limit"]["maximum"], 64);
-        assert!(
-            arguments["description"]
-                .as_str()
-                .expect("current state description")
-                .contains("EffectiveProjectState")
+        assert_eq!(
+            arguments["properties"]["limit"]["minimum"].as_f64(),
+            Some(1.0)
         );
+        assert_eq!(
+            arguments["properties"]["limit"]["maximum"].as_f64(),
+            Some(64.0)
+        );
+        assert!(arguments["description"]
+            .as_str()
+            .expect("current state description")
+            .contains("EffectiveProjectState"));
     }
 
     #[test]
@@ -4554,17 +4529,13 @@ mod tests {
         let operation_enum = spec.input_schema["properties"]["operation"]["enum"]
             .as_array()
             .expect("operation enum");
-        assert!(
-            operation_enum
-                .iter()
-                .any(|value| value == MAIN_CHARTER_DRAFT_OPERATION)
-        );
-        assert!(
-            spec.input_schema["properties"]["payload"]["description"]
-                .as_str()
-                .expect("payload guidance")
-                .contains(MAIN_CHARTER_DRAFT_OPERATION)
-        );
+        assert!(operation_enum
+            .iter()
+            .any(|value| value == MAIN_CHARTER_DRAFT_OPERATION));
+        assert!(spec.input_schema["properties"]["payload"]["description"]
+            .as_str()
+            .expect("payload guidance")
+            .contains(MAIN_CHARTER_DRAFT_OPERATION));
         let draft_payload = orchestration_payload_schema(MAIN_CHARTER_DRAFT_OPERATION);
         let payload = &draft_payload;
         for optional_render_field in ["rendered_view", "render_version"] {
@@ -4618,11 +4589,9 @@ mod tests {
                 "full Charter content must include {section}"
             );
         }
-        assert!(
-            operation_enum
-                .iter()
-                .any(|value| value == MAIN_PROJECT_CREATE_OPERATION)
-        );
+        assert!(operation_enum
+            .iter()
+            .any(|value| value == MAIN_PROJECT_CREATE_OPERATION));
         let create_payload = orchestration_payload_schema(MAIN_PROJECT_CREATE_OPERATION);
         assert_eq!(create_payload["required"], json!(["approval_id"]));
         assert_eq!(
@@ -4692,21 +4661,17 @@ mod tests {
             decision["properties"]["action"]["enum"],
             json!(["record_candidate", "record_effective"])
         );
-        assert!(
-            decision["description"]
-                .as_str()
-                .expect("decision description")
-                .contains("waivers")
-        );
+        assert!(decision["description"]
+            .as_str()
+            .expect("decision description")
+            .contains("waivers"));
         let readiness = orchestration_payload_schema(PROJECT_READINESS_OPERATION);
         for field in ["milestone_id", "milestone_version"] {
-            assert!(
-                readiness["required"]
-                    .as_array()
-                    .expect("readiness required fields")
-                    .iter()
-                    .any(|value| value == field)
-            );
+            assert!(readiness["required"]
+                .as_array()
+                .expect("readiness required fields")
+                .iter()
+                .any(|value| value == field));
         }
         let evidence = orchestration_payload_schema(PROJECT_EVIDENCE_OPERATION);
         for field in [
@@ -4764,12 +4729,10 @@ mod tests {
             release["properties"]["action"]["const"],
             "propose_candidate"
         );
-        assert!(
-            release["description"]
-                .as_str()
-                .expect("release candidate description")
-                .contains("never approves")
-        );
+        assert!(release["description"]
+            .as_str()
+            .expect("release candidate description")
+            .contains("never approves"));
         let document_payload = orchestration_payload_schema(PROJECT_DOCUMENT_OPERATION);
         let document_payload = &document_payload;
         assert_eq!(
@@ -4808,13 +4771,11 @@ mod tests {
                 "Document approval schema must expose exact {field}"
             );
         }
-        assert!(
-            approval["required"]
-                .as_array()
-                .expect("approval required fields")
-                .iter()
-                .all(|field| !matches!(field.as_str(), Some("content") | Some("base_revision_id")))
-        );
+        assert!(approval["required"]
+            .as_array()
+            .expect("approval required fields")
+            .iter()
+            .all(|field| !matches!(field.as_str(), Some("content") | Some("base_revision_id"))));
     }
 
     #[test]
@@ -4848,12 +4809,10 @@ mod tests {
         let payload = orchestration_payload_schema(PROJECT_CHARTER_ADOPTION_OPERATION);
         assert_eq!(payload["properties"]["action"]["const"], "draft_revision");
         assert_eq!(payload["additionalProperties"], false);
-        assert!(
-            payload["description"]
-                .as_str()
-                .expect("adoption description")
-                .contains("no current Charter")
-        );
+        assert!(payload["description"]
+            .as_str()
+            .expect("adoption description")
+            .contains("no current Charter"));
         for optional_render_field in ["rendered_view", "render_version"] {
             assert!(
                 !payload["required"]
@@ -5103,19 +5062,15 @@ mod tests {
 
     #[test]
     fn artifact_scope_content_is_not_mistaken_for_authority_override() {
-        assert!(
-            reject_authority_overrides(&json!({
-                "action": "draft_revision",
-                "content": {"scope": {"included": ["checkout"]}},
-            }))
-            .is_ok()
-        );
-        assert!(
-            reject_authority_overrides(&json!({
-                "scope": {"scope_type": "project", "scope_id": "forged"},
-            }))
-            .is_err()
-        );
+        assert!(reject_authority_overrides(&json!({
+            "action": "draft_revision",
+            "content": {"scope": {"included": ["checkout"]}},
+        }))
+        .is_ok());
+        assert!(reject_authority_overrides(&json!({
+            "scope": {"scope_type": "project", "scope_id": "forged"},
+        }))
+        .is_err());
     }
 
     #[tokio::test]
@@ -5292,7 +5247,7 @@ mod tests {
             .prepare(
                 json!({
                     "operation":"message.send",
-                    "payload": null,
+                    "payload": {},
                     "dedupe_key":"dedupe-1",
                     "correlation_id":"corr-1"
                 }),
@@ -5326,7 +5281,7 @@ mod tests {
             .prepare(
                 json!({
                     "operation":"message.send",
-                    "payload": null,
+                    "payload": {},
                     "dedupe_key":"dedupe-session",
                     "correlation_id":"corr-session"
                 }),

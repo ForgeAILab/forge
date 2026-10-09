@@ -26,79 +26,25 @@ impl OrchestrationAuthorizationService {
         Self { db }
     }
 
-    /// Resolve and authorize the account represented by a Main scope.
-    ///
-    /// The account is always derived from the persisted identity/chat binding;
-    /// model-supplied account identifiers are never consulted.
-    pub async fn main_account_id(
-        &self,
-        actor_identity_id: &str,
-        scope: &CanonicalScope,
-    ) -> Result<String> {
-        let owner_id = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT owner_id FROM agent_identity WHERE id = ?",
-        )
-        .bind(actor_identity_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten()
-        .ok_or_else(|| ServiceError::not_found("agent_identity", actor_identity_id.to_owned()))?;
-
-        let account_id = match scope.scope_type {
-            CanonicalScopeType::Account => {
-                if scope.scope_id != owner_id {
-                    return Err(ServiceError::AuthorizationDenied {
-                        message: "Main Agent scope is not bound to this identity".to_owned(),
-                    });
-                }
-                scope.scope_id.clone()
-            }
-            CanonicalScopeType::AgentChat => {
-                let row =
-                    sqlx::query("SELECT kind, account_id FROM agent_chat WHERE id = ? LIMIT 1")
-                        .bind(&scope.scope_id)
-                        .fetch_optional(self.db.pool())
-                        .await?
-                        .ok_or_else(|| {
-                            ServiceError::not_found("agent_chat", scope.scope_id.clone())
-                        })?;
-                let kind: String = row.try_get("kind")?;
-                if kind != "account_main" {
-                    return Err(ServiceError::AuthorizationDenied {
-                        message: "global Main Agent operations are unavailable in Project Chat"
-                            .to_owned(),
-                    });
-                }
-                row.try_get::<Option<String>, _>("account_id")?
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation("Main Agent account is unavailable")
-                    })?
-            }
-            _ => {
-                return Err(ServiceError::AuthorizationDenied {
-                    message: "global Main Agent operation is unavailable in this scope".to_owned(),
-                });
-            }
-        };
-
-        if owner_id != account_id {
-            return Err(ServiceError::AuthorizationDenied {
-                message: "actor identity does not own the Main Agent scope".to_owned(),
-            });
+    /// Derive the account target after the shared evaluator admits the caller.
+    /// This method loads no identity, Profile or binding policy.
+    pub(crate) async fn main_account_target(&self, scope: &CanonicalScope) -> Result<String> {
+        match scope.scope_type {
+            CanonicalScopeType::Account => Ok(scope.scope_id.clone()),
+            CanonicalScopeType::AgentChat => sqlx::query_scalar::<_, Option<String>>(
+                "SELECT account_id FROM agent_chat WHERE id = ? AND kind = 'account_main'",
+            )
+            .bind(&scope.scope_id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .flatten()
+            .ok_or_else(|| ServiceError::AuthorizationDenied {
+                message: "global Main Agent operations are unavailable in Project Chat".into(),
+            }),
+            _ => Err(ServiceError::AuthorizationDenied {
+                message: "global Main Agent operation is unavailable in this scope".into(),
+            }),
         }
-
-        let binding =
-            db::AccountMainAgentBindingRepo::get_active_main_binding(&*self.db, &account_id)
-                .await?
-                .ok_or_else(|| ServiceError::AuthorizationDenied {
-                    message: "Main Agent identity is not actively bound to this account".to_owned(),
-                })?;
-        if binding.identity_id != actor_identity_id || binding.state != "active" {
-            return Err(ServiceError::AuthorizationDenied {
-                message: "Main Agent identity is not actively bound to this account".to_owned(),
-            });
-        }
-        Ok(account_id)
     }
 
     /// Resolve the Project target for a direct command.

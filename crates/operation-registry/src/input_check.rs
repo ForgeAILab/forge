@@ -49,34 +49,199 @@ pub(crate) fn strip_ignored_fields(value: &mut Value, constraints: &[StructuralC
     }
 }
 
+/// Recursively enforce the derived contract, including the selected tagged
+/// variant. Conditional schema stays server-side; providers see one line.
+fn normalize_schema(schema: &Value, value: &Value, field: &str) -> Result<Value, String> {
+    let label = if field.is_empty() {
+        "arguments".into()
+    } else {
+        format!("argument `{field}`")
+    };
+    if let Some(variants) = schema["oneOf"].as_array() {
+        if variants
+            .iter()
+            .all(|variant| variant["properties"]["action"]["enum"].is_array())
+        {
+            let action = value
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or("argument `action` is required")?;
+            let variant = variants
+                .iter()
+                .find(|variant| {
+                    variant["properties"]["action"]["enum"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&Value::from(action))
+                })
+                .ok_or("argument `action` is outside this typed contract")?;
+            return normalize_schema(variant, value, field);
+        }
+    }
+    if let Some(variants) = schema["anyOf"].as_array() {
+        let mut last = None;
+        let mut found = None;
+        for variant in variants {
+            match normalize_schema(variant, value, field) {
+                Ok(value) => {
+                    found = Some(value);
+                    break;
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        if found.is_none() {
+            return Err(last.unwrap_or_else(|| format!("{label} has no admitted variant")));
+        }
+    }
+    let mut value = value.clone();
+    if admits(schema, "integer") && !admits(schema, "string") && !admits(schema, "number") {
+        if let Some(integer) = integer_spelling(&value) {
+            value = integer;
+        }
+    }
+    let accepts_type = |kind: &str| match kind {
+        "null" => value.is_null(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        _ => false,
+    };
+    let type_ok = match &schema["type"] {
+        Value::String(kind) => accepts_type(kind),
+        Value::Array(kinds) => kinds
+            .iter()
+            .any(|kind| kind.as_str().is_some_and(accepts_type)),
+        _ => true,
+    };
+    if !type_ok {
+        return Err(format!("{label} must have type {}", schema["type"]));
+    }
+    if let Some(values) = schema["enum"].as_array() {
+        if !values.contains(&value) {
+            return Err(format!(
+                "{label} must be one of: {}",
+                values
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    if !value.is_null() {
+        match schema["format"].as_str() {
+            Some("int64") if !value.is_i64() => return Err(format!("{label} is outside int64")),
+            Some("uint64") if !value.is_u64() => {
+                return Err(format!("{label} must be a non-negative integer"))
+            }
+            _ => {}
+        }
+    }
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if let Some(bound) = schema["minLength"].as_u64() {
+            if length < bound {
+                return Err(format!("{label} violates minLength {bound}"));
+            }
+        }
+        if let Some(bound) = schema["maxLength"].as_u64() {
+            if length > bound {
+                return Err(format!("{label} violates maxLength {bound}"));
+            }
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        if let Some(bound) = schema["minimum"].as_f64() {
+            if number < bound {
+                return Err(format!("{label} violates minimum {bound}"));
+            }
+        }
+        if let Some(bound) = schema["maximum"].as_f64() {
+            if number > bound {
+                return Err(format!("{label} violates maximum {bound}"));
+            }
+        }
+    }
+    if let Some(values) = value.as_array_mut() {
+        for keyword in ["minItems", "maxItems"] {
+            if let Some(bound) = schema[keyword].as_u64() {
+                if (keyword == "minItems" && values.len() < bound as usize)
+                    || (keyword == "maxItems" && values.len() > bound as usize)
+                {
+                    return Err(format!("{label} violates {keyword} {bound}"));
+                }
+            }
+        }
+        for (index, item) in values.iter_mut().enumerate() {
+            *item = normalize_schema(&schema["items"], item, &format!("{field}[{index}]"))?;
+        }
+        if schema["uniqueItems"] == true {
+            for (index, item) in values.iter().enumerate() {
+                if values[..index].contains(item) {
+                    return Err(format!("{label} must contain unique items"));
+                }
+            }
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        let properties = schema["properties"].as_object();
+        if schema["additionalProperties"] == false {
+            if let Some(key) = object
+                .keys()
+                .find(|key| !properties.is_some_and(|properties| properties.contains_key(*key)))
+            {
+                let path = if field.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{field}.{key}")
+                };
+                return Err(format!("argument `{path}` is not admitted"));
+            }
+        }
+        for required in schema["required"].as_array().into_iter().flatten() {
+            let key = required.as_str().expect("schema field name");
+            if !object.contains_key(key) {
+                return Err(format!("argument `{key}` is required"));
+            }
+        }
+        for (key, property) in properties.into_iter().flatten() {
+            if let Some(item) = object.get_mut(key) {
+                let path = if field.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{field}.{key}")
+                };
+                *item = normalize_schema(property, item, &path)?;
+            }
+        }
+    }
+    Ok(value)
+}
 impl TypedInputContract {
-    /// Validate envelope-normalized arguments and return their canonical
-    /// form: an integer field sent as an integer-valued string or float
-    /// becomes the integer. The advertised and canonical schemas are not
-    /// widened; the field stays an integer. The error names the offending
-    /// field; [`crate::OperationSpec::normalize_arguments`] adds the operation.
     pub(crate) fn normalize(&self, value: &Value) -> Result<Value, String> {
         let mut value = value.clone();
         strip_ignored_fields(&mut value, self.constraints);
-        let mut object = value
-            .as_object()
-            .ok_or("arguments must be an object")?
-            .clone();
+        value.as_object().ok_or("arguments must be an object")?;
         for constraint in self.constraints {
             match constraint {
                 StructuralConstraint::ClosedObject => {
-                    if let Some(key) = object
-                        .keys()
-                        .find(|key| !self.fields().any(|(name, _)| name == *key))
-                    {
-                        return Err(format!("argument `{key}` is not admitted"));
+                    if let Some(field) = value.as_object().unwrap().keys().find(|key| {
+                        !self.schema["properties"]
+                            .as_object()
+                            .is_some_and(|fields| fields.contains_key(*key))
+                    }) {
+                        return Err(format!("argument `{field}` is not admitted"));
                     }
                 }
-                StructuralConstraint::Required(field) if !object.contains_key(*field) => {
+                StructuralConstraint::Required(field) if value.get(*field).is_none() => {
                     return Err(format!("argument `{field}` is required"))
                 }
                 StructuralConstraint::StringEnum { field, values }
-                    if !object
+                    if !value
                         .get(*field)
                         .and_then(Value::as_str)
                         .is_some_and(|v| values.contains(&v)) =>
@@ -84,88 +249,27 @@ impl TypedInputContract {
                     return Err(format!(
                         "argument `{field}` must be one of: {}",
                         values.join(", ")
-                    ));
+                    ))
+                }
+                StructuralConstraint::MaxSerializedBytes(bound)
+                    if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > *bound =>
+                {
+                    return Err(format!("payload exceeds {bound} serialized UTF-8 bytes"))
+                }
+                StructuralConstraint::AtLeastOne(fields)
+                    if !fields
+                        .iter()
+                        .any(|field| value.get(*field).is_some_and(|value| !value.is_null())) =>
+                {
+                    return Err(format!(
+                        "at least one argument `{}` is required",
+                        fields.join("` or `")
+                    ))
                 }
                 _ => {}
             }
         }
-        for required in self.schema["required"].as_array().into_iter().flatten() {
-            let field = required.as_str().expect("schema field name");
-            if !object.contains_key(field) {
-                return Err(format!("argument `{field}` is required"));
-            }
-        }
-        for (field, schema) in self.fields() {
-            let Some(value) = object.get_mut(field) else {
-                continue;
-            };
-            if admits(schema, "integer") && !admits(schema, "string") && !admits(schema, "number") {
-                if let Some(integer) = integer_spelling(value) {
-                    *value = integer;
-                }
-            }
-            let value = &*value;
-            let accepts_type = |kind: &str| match kind {
-                "null" => value.is_null(),
-                "string" => value.is_string(),
-                "boolean" => value.is_boolean(),
-                "array" => value.is_array(),
-                "object" => value.is_object(),
-                "number" => value.is_number(),
-                "integer" => value.is_i64() || value.is_u64(),
-                _ => false,
-            };
-            let type_ok = match &schema["type"] {
-                Value::String(kind) => accepts_type(kind),
-                Value::Array(kinds) => kinds
-                    .iter()
-                    .any(|kind| kind.as_str().is_some_and(accepts_type)),
-                _ => true,
-            };
-            if !type_ok {
-                return Err(format!(
-                    "argument `{field}` must have type {}",
-                    schema["type"]
-                ));
-            }
-            if !value.is_null() {
-                match schema["format"].as_str() {
-                    Some("int64") if !value.is_i64() => {
-                        return Err(format!("argument `{field}` is outside int64"));
-                    }
-                    Some("uint64") if !value.is_u64() => {
-                        return Err(format!("argument `{field}` must be a non-negative integer"));
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(text) = value.as_str() {
-                let length = text.chars().count() as u64;
-                if let Some(bound) = schema["minLength"].as_u64() {
-                    if length < bound {
-                        return Err(format!("argument `{field}` violates minLength {bound}"));
-                    }
-                }
-                if let Some(bound) = schema["maxLength"].as_u64() {
-                    if length > bound {
-                        return Err(format!("argument `{field}` violates maxLength {bound}"));
-                    }
-                }
-            }
-            if let Some(number) = value.as_f64() {
-                if let Some(bound) = schema["minimum"].as_f64() {
-                    if number < bound {
-                        return Err(format!("argument `{field}` violates minimum {bound}"));
-                    }
-                }
-                if let Some(bound) = schema["maximum"].as_f64() {
-                    if number > bound {
-                        return Err(format!("argument `{field}` violates maximum {bound}"));
-                    }
-                }
-            }
-        }
-        let normalized = Value::Object(object);
+        let normalized = normalize_schema(&self.schema, &value, "")?;
         (self.decode)(normalized.clone())?;
         Ok(normalized)
     }

@@ -7,16 +7,18 @@
 use std::collections::BTreeSet;
 
 use agent_runtime::core::prelude::RuntimeError;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::operation_catalog::{
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_START_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ACTION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION, TASK_EVIDENCE_OPERATION,
-    TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_ESCALATE_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_READINESS_OPERATION,
+    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_DEPENDENCY_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PLAN_OPERATION, TASK_PROPOSE_OPERATION, TASK_WORKLOG_OPERATION,
+};
+#[cfg(test)]
+use crate::{
+    PROJECT_DOCUMENT_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
+    PROJECT_VALIDATION_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -67,19 +69,6 @@ pub(crate) fn provenance_ref_schema() -> Value {
             "observed_at": string_or_null_schema(),
         }),
         &["source_kind", "source_id"],
-    )
-}
-
-pub(crate) fn artifact_ref_schema() -> Value {
-    object_schema(
-        json!({
-            "artifact_id": {"type":"string","minLength":1},
-            "revision_id": {"type":"string","minLength":1},
-            "content_digest": {"type":"string","minLength":1},
-            "render_version": string_or_null_schema(),
-            "render_digest": string_or_null_schema(),
-        }),
-        &["artifact_id", "revision_id", "content_digest"],
     )
 }
 
@@ -212,34 +201,45 @@ pub(crate) fn charter_content_schema() -> Value {
     )
 }
 
-pub(crate) fn document_content_schema() -> Value {
-    json!({
-        "oneOf": [
-            object_schema(json!({
-                "question":{"type":"string","minLength":1},
-                "decision_informed":{"type":"string","minLength":1},
-                "scope":{"type":"string","minLength":1},
-                "stopping_condition":{"type":"string","minLength":1},
-                "sources":{"type":"array","items":object_schema(json!({
-                    "id":{"type":"string","minLength":1},"url":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"retrieved_at":{"type":"string","minLength":1},"quality":string_or_null_schema(),"claim":{"type":"string","minLength":1},"is_inference":{"type":"boolean"}
-                }), &["id","url","title","retrieved_at","claim","is_inference"])},
-                "findings":string_array_schema(),"evidence":string_array_schema(),"inferences":string_array_schema(),"alternatives":string_array_schema(),"recommendation":string_or_null_schema(),"uncertainty":string_array_schema(),"unresolved_questions":string_array_schema(),"affected_artifact_ids":string_array_schema(),"affected_decision_ids":string_array_schema()
-            }), &["question","decision_informed","scope","stopping_condition"]),
-            object_schema(json!({
-                "intended_deliverables":string_array_schema(),"boundaries":string_array_schema(),"plan_items":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"dependencies":string_array_schema(),"task_ids":string_array_schema()}), &["id","outcome"])},"acceptance_matrix":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1},"statement":{"type":"string","minLength":1},"evidence":string_array_schema(),"required":{"type":"boolean"}}), &["id","statement","required"])},"risks":{"type":"array","items":charter_risk_schema()},"rollback_and_recovery":string_array_schema(),"adaptive_envelope":string_array_schema(),"governing_charter_revision_id":string_or_null_schema()
-            }), &[]),
-            object_schema(json!({
-                "problem_and_outcome":{"type":"string","minLength":1},"actors":string_array_schema(),"journeys_and_flows":string_array_schema(),"functional_requirements":string_array_schema(),"loading_empty_error_recovery_states":string_array_schema(),"acceptance_scenarios":{"type":"array"},"non_functional_and_safety_requirements":string_array_schema(),"out_of_scope":string_array_schema(),"traceability":{"type":"array","items":artifact_ref_schema()}
-            }), &["problem_and_outcome"]),
-            object_schema(json!({"experience_principles":string_array_schema(),"information_architecture":string_array_schema(),"flows":string_array_schema(),"design_tokens_reference":string_or_null_schema(),"component_states":string_array_schema(),"responsive_behavior":string_array_schema(),"accessibility":string_array_schema(),"prototype_or_evidence_links":string_array_schema(),"open_decisions":string_array_schema()}), &[]),
-            object_schema(json!({"context_and_constraints":{"type":"string","minLength":1},"system_boundary":string_array_schema(),"components_and_data":string_array_schema(),"interfaces":string_array_schema(),"security_and_privacy":string_array_schema(),"concurrency":string_array_schema(),"failure_and_recovery":string_array_schema(),"observability_and_operations":string_array_schema(),"migrations":string_array_schema(),"alternatives_and_tradeoffs":string_array_schema(),"validation_plan":string_array_schema()}), &["context_and_constraints"]),
-            object_schema(json!({"ordered_milestone_outcomes":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"linked_artifact_refs":{"type":"array","items":artifact_ref_schema()},"task_queries_or_ids":string_array_schema(),"acceptance_evidence_contract":{"type":"array"},"release_notes":string_array_schema(),"known_issues":string_array_schema()}), &[]),
-        ]
-    })
+/// A flat alias is a provider transport aid. Full nested constraints are
+/// evaluated from the canonical spec, never conditional provider keywords.
+fn portable_property(mut value: Value) -> Value {
+    if value == true {
+        return json!({});
+    }
+    if let Some(object) = value.as_object_mut() {
+        for keyword in [
+            "oneOf", "anyOf", "allOf", "not", "if", "then", "else", "$ref", "$defs",
+        ] {
+            object.remove(keyword);
+        }
+        if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+            for property in properties.values_mut() {
+                *property = portable_property(property.clone());
+            }
+        }
+        if let Some(items) = object.get_mut("items") {
+            *items = portable_property(items.clone());
+        }
+    }
+    value
+}
+
+fn advertised_proposal_line(
+    spec: &operation_registry::OperationSpec<std::convert::Infallible>,
+) -> String {
+    if operation_registry::main_proposals::IDS.contains(&spec.id) {
+        return spec.contract_line();
+    }
+    format!(
+        "{}; {} Payload <=65536 serialized UTF-8 bytes.",
+        spec.contract_line(),
+        spec.summary
+    )
 }
 
 pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
-    if let Some(spec) = operation_registry::main_proposals::CATALOG.lookup(operation) {
+    if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
         return spec.canonical_schema();
     }
     match operation {
@@ -294,118 +294,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "content",
                 "provenance",
             ],
-            "Setup-only Project Agent adoption Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
-        ),
-        PROJECT_REVIEW_CONFIG_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"set_ci_steps"},
-                "expected_project_version":{"type":"integer","minimum":1,"description":"Copy the current Project version from project.current_state. A conflict returns the replacement value."},
-                "ci_steps":{
-                    "type":"array",
-                    "maxItems":16,
-                    "uniqueItems":true,
-                    "items":{"type":"string","minLength":1,"maxLength":2048},
-                    "description":"Deterministic repository-native commands required for each subsequent Task review. An empty array deliberately clears the defaults. This replaces ci_steps and preserves the Project's reviewer prompt and requirement policy."
-                },
-                "setup_steps":{
-                    "type":"array",
-                    "maxItems":16,
-                    "uniqueItems":true,
-                    "items":{"type":"string","minLength":1,"maxLength":2048},
-                    "description":"Optional commands that prepare each detached clean review checkout before ci_steps run, such as pnpm install --frozen-lockfile, npm ci, pip install -r requirements.txt, or bundle install. Omit to preserve the current setup_steps; send an empty array to clear them."
-                }
-            }),
-            &["action", "expected_project_version", "ci_steps"],
-            "Set the bound Project's default clean-checkout setup and independent review commands before proposing implementation Tasks. Read project.current_state first and preserve a non-empty user configuration unless the Project's repository or validation policy has materially changed. Setup commands run before checks when a Task next enters review; they do not retroactively rerun a completed review.",
-        ),
-        PROJECT_DOCUMENT_OPERATION => {
-            let document_kinds = json!({
-                "type":"string",
-                "enum":["research","delivery_brief","product_spec","design","architecture","execution_plan"]
-            });
-            let identity = json!({
-                "document_id":{"type":"string","minLength":1},
-                "kind":document_kinds,
-                "title":{"type":"string","minLength":1},
-            });
-            let draft_properties = {
-                let mut properties = identity.clone();
-                properties["action"] = json!({"enum":["draft_revision","propose_approval"]});
-                properties["base_revision_id"] = string_or_null_schema();
-                properties["expected_document_version"] = json!({"type":"integer","minimum":1});
-                properties["content"] = document_content_schema();
-                properties
-            };
-            let draft = object_schema(
-                draft_properties,
-                &[
-                    "action",
-                    "document_id",
-                    "kind",
-                    "title",
-                    "expected_document_version",
-                    "content",
-                ],
-            );
-            let approval = object_schema(
-                {
-                    let mut properties = identity;
-                    properties["action"] = json!({"const":"approve"});
-                    properties["revision_id"] = json!({"type":"string","minLength":1});
-                    properties["content_digest"] = json!({"type":"string","minLength":1});
-                    properties["render_digest"] = json!({"type":"string","minLength":1});
-                    properties["expected_document_version"] = json!({"type":"integer","minimum":1});
-                    properties["envelope_digest"] = string_or_null_schema();
-                    properties
-                },
-                &[
-                    "action",
-                    "document_id",
-                    "kind",
-                    "title",
-                    "revision_id",
-                    "content_digest",
-                    "render_digest",
-                    "expected_document_version",
-                ],
-            );
-            // Keep the operation-level property contract discoverable for
-            // clients that inspect `action.enum`, while the closed oneOf
-            // variants make draft/proposal versus policy-scoped approval
-            // payloads exact and disallow cross-action fields.
-            json!({
-                "type":"object",
-                "required":["action","document_id","kind","title","expected_document_version"],
-                "properties":{
-                    "action":{"type":"string","enum":["draft_revision","propose_approval","approve"]},
-                    "document_id":{"type":"string","minLength":1},
-                    "kind":{"type":"string","enum":["research","delivery_brief","product_spec","design","architecture","execution_plan"]},
-                    "title":{"type":"string","minLength":1},
-                    "base_revision_id":string_or_null_schema(),
-                    "revision_id":{"type":"string","minLength":1},
-                    "expected_document_version":{"type":"integer","minimum":1},
-                    "content":document_content_schema(),
-                    "content_digest":{"type":"string","minLength":1},
-                    "render_digest":{"type":"string","minLength":1},
-                    "envelope_digest":string_or_null_schema()
-                },
-                "oneOf":[draft, approval],
-                "additionalProperties":false
-            })
-        }
-        PROJECT_DECISION_OPERATION => described_object_schema(
-            json!({"action":{"enum":["record_candidate","record_effective"]},"question":{"type":"string","minLength":1},"options":string_array_schema(),"selected_outcome":string_or_null_schema(),"rationale":string_or_null_schema(),"decision_class":{"const":"project_implementation"},"expected_project_version":{"type":"integer","minimum":1},"decision_id":string_or_null_schema(),"affected_artifact_refs":{"type":"array","items":artifact_ref_schema()},"affected_task_ids":string_array_schema(),"affected_milestone_ids":string_array_schema()}),
-            &[
-                "action",
-                "question",
-                "decision_class",
-                "expected_project_version",
-            ],
-            "Project Agent decisions are limited to implementation choices inside the approved Project Charter. User-scope decisions, policy decisions, waivers, and manual approvals are user-only actions outside this tool.",
-        ),
-        PROJECT_MILESTONE_OPERATION => object_schema(
-            json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Stable canonical id; preserve it across milestone revisions."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"source_kind":{"type":"string","enum":["manual","policy_waiver","task_validation"],"description":"Only source kinds with a current authoritative result path are admitted. Use manual for a genuinely human observation, and task_validation for an integrated check an agent can run and record through project.validation."},"expected_result":{"type":"string","minLength":1},"latest_result":string_or_null_schema(),"latest_result_id":string_or_null_schema(),"latest_result_digest":string_or_null_schema()}), &["id","description","required","source_kind","expected_result"])},"evidence_requirements":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Use the exact acceptance-check id this evidence proves."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]}}), &["id","description","required"])},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
-            &["action", "expected_milestone_version"],
+            "Project Agent adoption or amendment Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
         ),
         PROJECT_EVIDENCE_OPERATION => described_object_schema(
             json!({"action":{"enum":["attach","capture"],"description":"attach binds an existing Project media asset (asset_id + checksum required). capture stores an artifact your own verification run produced and attaches it in the same call: supply exactly one of content or path, never asset_id/checksum."},"milestone_id":{"type":"string","minLength":1},"expected_milestone_version":{"type":"integer","minimum":1},"asset_id":{"type":["string","null"],"minLength":1,"description":"attach only: the existing Project media asset to bind."},"task_id":string_or_null_schema(),"source_validation_id":{"type":["string","null"],"minLength":1,"description":"The id of the recorded validation RESULT this artifact backs — the `validation_id`/result id returned by `project.validation` (`record`), never the acceptance-check id. Record the check result first, then capture its proof citing that returned id."},"acceptance_check_ids":string_array_schema(),"caption":{"type":"string","minLength":1},"kind":{"type":"string","enum":["screenshot","walkthrough_video","log","report","other"]},"checksum":{"type":["string","null"],"minLength":1,"description":"attach only: SHA-256 of the named asset's bytes."},"content":{"type":["string","null"],"minLength":1,"description":"capture only: inline text artifact (for example a verification report)."},"path":{"type":["string","null"],"minLength":1,"description":"capture only: a file path under your Project workspace root (forge/ or checkout/)."},"filename":{"type":["string","null"],"minLength":1,"description":"capture only: display filename override, no path separators."}}),
@@ -418,44 +307,9 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             ],
             "Evidence for a milestone acceptance check. attach an existing asset, or capture the proof your own verification run produced — the server creates the Project media asset and attaches it atomically. Never create a Task just to produce evidence.",
         ),
-        PROJECT_VALIDATION_OPERATION => object_schema(
-            json!({"action":{"const":"record"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1},"check_id":{"type":"string","minLength":1,"description":"Stable acceptance-check id on the milestone's current definition revision. The check's source_kind must not be manual."},"definition_revision_id":{"type":"string","minLength":1},"status":{"type":"string","enum":["pass","fail","blocked","stale","unavailable"]},"result":{"type":"string","minLength":1,"description":"What was actually observed, in the Agent's own words."},"input_digest":{"type":"string","minLength":1,"description":"Digest of the exact inputs observed, so a repeat of the same observation replays instead of appending."},"observed_command_ids":{"type":"array","items":{"type":"string","minLength":1},"description":"The observation_id values forge_task_command returned for the commands you ran in your checkout to settle this check. Required for a pass or fail: the server verifies each one is a command you ran in this Project after the delivered Task landed. A Task's or reviewer's report is narration and cannot stand in for one."},"observed_task_id":{"type":["string","null"],"minLength":1,"description":"The delivered Task whose result you exercised, for traceability only; it settles nothing by itself. Never name a Task that did not actually run: the server verifies it belongs to this Project and reached a delivered state."},"evidence_asset_id":{"type":["string","null"],"minLength":1,"description":"Optional id of an artifact backing this observation: one the observed Task captured through `task.evidence`, or one you captured yourself through `project.evidence` (`capture`)."},"governing_revision_ids":string_array_schema()}),
-            &[
-                "action",
-                "milestone_id",
-                "milestone_version",
-                "check_id",
-                "definition_revision_id",
-                "status",
-                "result",
-                "input_digest",
-            ],
-        ),
-        PROJECT_ESCALATE_OPERATION => described_object_schema(
-            json!({"need":{"type":"string","minLength":1,"maxLength":4096},"task_ids":{"type":"array","maxItems":100,"items":{"type":"string","minLength":1}}}),
-            &["need"],
-            "Ask the Project owner for the exact need blocking named Tasks; creates one Notification and Attention item.",
-        ),
         PROJECT_READINESS_OPERATION => object_schema(
             json!({"action":{"const":"evaluate"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1}}),
             &["action", "milestone_id", "milestone_version"],
-        ),
-        PROJECT_RELEASE_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"propose_candidate"},
-                "milestone_id":{"type":"string","minLength":1},
-                "milestone_version":{"type":"integer","minimum":1},
-                "readiness_snapshot_id":{"type":"string","minLength":1},
-                "readiness_digest":{"type":"string","minLength":1}
-            }),
-            &[
-                "action",
-                "milestone_id",
-                "milestone_version",
-                "readiness_snapshot_id",
-                "readiness_digest",
-            ],
-            "Project Agent release candidate only. Invoke this only for an exact current ReadinessSnapshot whose result is ready. A blocked, failed, or stale snapshot must be reported with every canonical blocker and must never be described as a release proposal or as Known Issues: None. This submits a user-release request; it never approves, executes, or creates a final release manifest.",
         ),
         TASK_PROPOSE_OPERATION => described_object_schema(
             json!({
@@ -873,6 +727,13 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "cancelling and recreating Tasks, which changes their ids and orphans dependents."
         ));
     }
+    let mut lines = lines.into_iter().map(str::to_owned).collect::<Vec<_>>();
+    lines.extend(
+        operations
+            .iter()
+            .filter_map(|operation| operation_registry::PROPOSAL_CATALOG.lookup(operation))
+            .map(advertised_proposal_line),
+    );
     if lines.is_empty() {
         String::new()
     } else {
@@ -895,16 +756,24 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
     // surface. Listing the names here meant a new operation silently got a
     // payload surface with none of its fields declared, which is invisible
     // until a provider that only surfaces declared properties strips them.
-    let has_generic_coordination = operations
-        .iter()
-        .any(|operation| crate::operation_catalog::is_coordination_generic_proposal(operation));
+    let has_generic_coordination = operations.iter().any(|operation| {
+        crate::operation_catalog::is_coordination_generic_proposal(operation)
+            && operation_registry::PROPOSAL_CATALOG
+                .lookup(operation)
+                .is_none()
+    });
+    let has_registered = operations.iter().any(|operation| {
+        operation_registry::PROPOSAL_CATALOG
+            .lookup(operation)
+            .is_some()
+    });
     let has_task_execution_command = operations.iter().any(|operation| {
         matches!(
             operation.as_str(),
             TASK_PLAN_OPERATION | TASK_WORKLOG_OPERATION | TASK_EVIDENCE_OPERATION
         )
     });
-    if !has_generic_coordination && !has_task_execution_command {
+    if !has_generic_coordination && !has_task_execution_command && !has_registered {
         return None;
     }
     let mut properties = if has_generic_coordination {
@@ -1073,6 +942,16 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             "items": {"type":"string","minLength":1}
         });
     }
+    for operation in operations {
+        let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) else {
+            continue;
+        };
+        for (name, property) in spec.input.schema["properties"].as_object().unwrap() {
+            if properties.get(name).is_none() {
+                properties[name] = portable_property(property.clone());
+            }
+        }
+    }
     Some(properties)
 }
 
@@ -1088,8 +967,8 @@ pub(crate) fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Va
     let mut guidance =
         vec!["Payload shape by operation (exact contract enforced server-side):".to_owned()];
     for operation in operations {
-        if let Some(spec) = operation_registry::main_proposals::CATALOG.lookup(operation) {
-            guidance.push(format!("- {}", spec.contract_line()));
+        if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
+            guidance.push(format!("- {}", advertised_proposal_line(spec)));
             continue;
         }
         let summary = orchestration_payload_summary(&orchestration_payload_schema(operation));
@@ -1131,24 +1010,7 @@ pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
     if let Some(spec) = operation_registry::READ_CATALOG.lookup(operation) {
         return spec.canonical_schema();
     }
-    match operation {
-        PROJECT_OBSERVATIONS_OPERATION => described_object_schema(
-            json!({
-                "task_id":string_or_null_schema(),
-                "limit":{"type":["integer","null"],"minimum":1,"maximum":50}
-            }),
-            &[],
-            "Read what Task runs in this Project actually reported: worklog entries with the execution and role that wrote them, and the artifacts those runs captured. Captured text (a log or report) is returned inline so you can read what was observed; binary artifacts return their metadata and asset id. Use this to check an observation before citing it in `project.validation`, and to decide whether an outcome needs a corrective Task.",
-        ),
-        PROJECT_CURRENT_STATE_OPERATION => described_object_schema(
-            json!({
-                "limit":{"type":"integer","minimum":1,"maximum":64}
-            }),
-            &[],
-            "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector.",
-        ),
-        _ => object_schema(json!({}), &[]),
-    }
+    object_schema(json!({}), &[])
 }
 
 pub(crate) fn orchestration_read_schema(operations: &BTreeSet<String>) -> Value {
@@ -1210,7 +1072,7 @@ pub(crate) fn validate_orchestration_proposal_arguments(
             "Forge orchestration proposal field `{field}` is not admitted"
         )));
     }
-    if operation_registry::main_proposals::CATALOG
+    if operation_registry::PROPOSAL_CATALOG
         .lookup(operation)
         .is_none()
     {
@@ -1289,11 +1151,11 @@ pub(crate) fn validate_orchestration_proposal_arguments(
 mod tests {
     use super::*;
     use crate::operation_catalog::{
-        MIGRATED_OPERATION_CONTRACTS, OperationInputContract, OperationOutputContract,
+        OperationInputContract, OperationOutputContract, MIGRATED_OPERATION_CONTRACTS,
         SHARED_ORCHESTRATION_OUTCOME,
     };
     use crate::{
-        MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
+        MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
     };
 
     #[test]
@@ -1302,14 +1164,12 @@ mod tests {
         let description = schema["description"].as_str().unwrap();
         assert!(description.split_whitespace().count() <= 25);
         let c = crate::operation_contract(crate::PROJECT_ESCALATE_OPERATION).unwrap();
-        assert!(
-            !c.supported_scopes
-                .contains(&crate::CanonicalScopeType::Account)
-        );
-        assert!(
-            !c.supported_scopes
-                .contains(&crate::CanonicalScopeType::Task)
-        );
+        assert!(!c
+            .supported_scopes
+            .contains(&crate::CanonicalScopeType::Account));
+        assert!(!c
+            .supported_scopes
+            .contains(&crate::CanonicalScopeType::Task));
         assert_eq!(
             crate::classify_operation(
                 crate::PROJECT_ESCALATE_OPERATION,
@@ -1344,7 +1204,7 @@ mod tests {
                     schema["properties"]["approval_id"],
                     json!({"type":"string","minLength":1})
                 );
-                let spec = operation_registry::main_proposals::CATALOG
+                let spec = operation_registry::PROPOSAL_CATALOG
                     .lookup(contract.operation)
                     .unwrap();
                 spec.validate_arguments(
@@ -1356,11 +1216,10 @@ mod tests {
                     json!({"approval_id":null}),
                     json!({"approval_id":""}),
                 ] {
-                    assert!(
-                        spec.validate_arguments(&refused)
-                            .unwrap_err()
-                            .contains("approval_id")
-                    );
+                    assert!(spec
+                        .validate_arguments(&refused)
+                        .unwrap_err()
+                        .contains("approval_id"));
                 }
             } else {
                 assert_eq!(
@@ -1411,15 +1270,11 @@ mod tests {
             &milestone["properties"]["content"]["properties"]["evidence_requirements"]["items"];
         assert_eq!(
             evidence["properties"]["evidence_kind"]["enum"],
-            json!([
-                "screenshot",
-                "walkthrough_video",
-                "log",
-                "report",
-                "other",
-                null
-            ])
+            json!(["screenshot", "walkthrough_video", "log", "report", "other"])
         );
+        assert!(evidence["properties"]["evidence_kind"]["type"]
+            .as_array()
+            .is_some_and(|kinds| kinds.contains(&json!("null"))));
     }
 
     #[test]
@@ -1509,12 +1364,10 @@ mod tests {
                 "adoption payload content must expose required field {required}"
             );
         }
-        assert!(
-            payload["description"]
-                .as_str()
-                .expect("adoption payload description")
-                .contains("Payload shape by operation")
-        );
+        assert!(payload["description"]
+            .as_str()
+            .expect("adoption payload description")
+            .contains("Payload shape by operation"));
     }
 
     #[test]
@@ -1556,22 +1409,20 @@ mod tests {
             assert_eq!(guidance.matches(rule).count(), 1);
             assert!(!guidance.contains(crate::MERGE_FRIENDLY_LAYOUT_GUIDANCE));
         }
-        assert!(
-            !coordination_payload_guidance(&BTreeSet::from([TASK_WORKLOG_OPERATION.to_owned()]))
-                .contains(rule)
-        );
+        assert!(!coordination_payload_guidance(&BTreeSet::from([
+            TASK_WORKLOG_OPERATION.to_owned()
+        ]))
+        .contains(rule));
     }
 
     #[test]
     fn task_proposal_requires_an_explicit_review_scope_decision() {
         let schema = orchestration_payload_schema(TASK_PROPOSE_OPERATION);
-        assert!(
-            schema["required"]
-                .as_array()
-                .expect("required fields")
-                .iter()
-                .any(|field| field == "review_requirement_ids")
-        );
+        assert!(schema["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field == "review_requirement_ids"));
         assert_eq!(
             schema["properties"]["review_requirement_ids"]["type"],
             "array"
@@ -1597,18 +1448,14 @@ mod tests {
         assert!(guidance.contains("prerequisite DAG edges only"));
         assert!(guidance.contains("not a parent/child hierarchy or workspace sharing"));
         let properties = coordination_payload_properties(&operations).expect("flat properties");
-        assert!(
-            properties["depends_on_task_ids"]["description"]
-                .as_str()
-                .expect("flat prerequisite guidance")
-                .contains("prerequisite DAG edges only")
-        );
-        assert!(
-            properties["description"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("owned repository-relative paths")
-        );
+        assert!(properties["depends_on_task_ids"]["description"]
+            .as_str()
+            .expect("flat prerequisite guidance")
+            .contains("prerequisite DAG edges only"));
+        assert!(properties["description"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("owned repository-relative paths"));
         // A field the server requires but the flat surface never declares is
         // a field a declared-properties-only provider cannot send at all:
         // the Task can then never be created, however the model writes it.
@@ -1642,13 +1489,11 @@ mod tests {
         assert_eq!(schema["properties"]["setup_steps"]["maxItems"], 16);
         assert_eq!(schema["properties"]["setup_steps"]["uniqueItems"], true);
         for required in ["action", "expected_project_version", "ci_steps"] {
-            assert!(
-                schema["required"]
-                    .as_array()
-                    .expect("required fields")
-                    .iter()
-                    .any(|field| field == required)
-            );
+            assert!(schema["required"]
+                .as_array()
+                .expect("required fields")
+                .iter()
+                .any(|field| field == required));
         }
     }
 
@@ -1832,18 +1677,14 @@ mod tests {
                 "adaptive guidance must distinguish {phrase}: {adaptive_description}"
             );
         }
-        assert!(
-            variants[0]["description"]
-                .as_str()
-                .expect("split variant guidance")
-                .contains("ordered direct children")
-        );
-        assert!(
-            variants[1]["description"]
-                .as_str()
-                .expect("sequence variant guidance")
-                .contains("does not create a dependency graph")
-        );
+        assert!(variants[0]["description"]
+            .as_str()
+            .expect("split variant guidance")
+            .contains("ordered direct children"));
+        assert!(variants[1]["description"]
+            .as_str()
+            .expect("sequence variant guidance")
+            .contains("does not create a dependency graph"));
         let properties = schema["properties"].as_object().expect("properties");
         for forbidden in [
             "project_id",
@@ -1880,18 +1721,14 @@ mod tests {
         assert!(properties.get("action").is_some());
         assert!(properties.get("source_task_id").is_some());
         assert!(properties.get("ordered_task_ids").is_some());
-        assert!(
-            properties["items"]["description"]
-                .as_str()
-                .expect("split property guidance")
-                .contains("non-executing coordination root")
-        );
-        assert!(
-            properties["ordered_task_ids"]["description"]
-                .as_str()
-                .expect("sequence property guidance")
-                .contains("does not create a dependency graph")
-        );
+        assert!(properties["items"]["description"]
+            .as_str()
+            .expect("split property guidance")
+            .contains("non-executing coordination root"));
+        assert!(properties["ordered_task_ids"]["description"]
+            .as_str()
+            .expect("sequence property guidance")
+            .contains("does not create a dependency graph"));
     }
 
     #[test]

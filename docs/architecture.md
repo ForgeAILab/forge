@@ -114,7 +114,7 @@ ceiling per surface (`SURFACE_BYTE_CEILINGS`, the unit
 `scripts/measure-tool-definitions.py` prints). Raise a ceiling only on purpose.
 
 Registered reads are `account.summary`, `agent_chat.summary`, `project.charter`,
-`skill.section`, `genesis.project_agents.read`, `charter.read`,
+`skill.section`, `project.current_state`, `project.observations`, `genesis.project_agents.read`, `charter.read`,
 `charter.readiness`, `charter.diff`, `charter.approval_target`, `discovery.read`,
 `portfolio.read`, and `inquiry.run`. Main query handlers accept the registry's
 input types directly; their former dispatcher and handwritten decoders are
@@ -143,7 +143,7 @@ of the action, the user executor, and a Charter approval that belongs to the
 account and is not consumed. Selection uses the same integer
 coercion as reads and the same receipt-backed command service.
 
-Fresh proposals check current Main binding/policy first, then forged authority
+Fresh proposals check the registry's current principal/scope/permission rule first, then forged authority
 fields, then their payload contract, then the typed handler. The provider's
 preparation denial check also runs before payload diagnostics. Dispatch of the two registered
 proposals checks the entire envelope for authority/scope replacements; direct
@@ -179,6 +179,33 @@ operation to an existing domain module needs no edit to `lib.rs`. A new domain m
 specs and id list to the appropriate effect catalog. Reads and Main proposals
 use the same `OperationSpec` and typed decoding/dispatch machinery; registered
 operation inventory includes both catalogs.
+
+Project proposal specs now own `project.review_config`, `project.document`,
+`project.decision`, `project.milestone`, `project.validation`,
+`project.release.request` and `project.escalate`. Document and milestone actions
+have separate closed field contracts; their provider projection is still one
+generated line per operation, with no conditional schema keywords. Fresh calls
+check authority before contract details. Commands receive the original admitted
+payload, preserving receipt digests; exact preparations bypass the current field
+contract while still running typed decoding and existing domain checks. Payload
+ceilings use serialized UTF-8 bytes (65,536), review command lengths use characters,
+and read limits use rows. Ready Project Agents also advertise the existing
+Charter amendment draft capability; no approval authority is added.
+
+`message.send`, `commitment.update`, `memory.publish`, `memory.supersede`,
+`review.request` and `session.action` are closed pending-intent specs. Their
+results remain pending proposals, never success for a message, memory, commitment,
+review or session effect. No materializer was added. The same operation schema
+produces field aliases and the contract line; mixed Project coordination payloads
+avoid duplicating their flat property declarations inside `payload`.
+
+`project.charter.adoption`, `project.evidence` and `project.readiness` retain their
+hand paths because their base receipt capture could not be proven exact in this
+slice. Project verification remains a disposable checkout with observed commands:
+`project.validation` still requires the command observations for pass/fail and
+refuses manual attestation through the Project-Agent path. Setup-only availability
+now reports `charter_adoption_not_applicable` after setup completes, rather than
+`charter_not_adopted`.
 
 ### Repository trait pattern
 
@@ -415,7 +442,7 @@ turn admission the protected session fixes the Profile ID and effective
 ceiling. Advertisement uses the registry evaluator against that ceiling and
 principal/scope/setup facts. Before registered dispatch, the provider loads
 fresh facts, intersects them with the admitted and remaining turn ceilings,
-and runs the same evaluator. Narrowing is monotonic within the running provider;
+and runs the same evaluator before a fresh effect. Registered reads evaluate the admitted/remaining turn authority without resolving it again at preparation or execution; Project query targets are pinned from that authority. Narrowing is monotonic within the running provider;
 restoring a permission later in that turn cannot revive its revoked grant. A widened Profile or binding never widens that turn; a missing or
 replaced binding, inactive identity, or permission revoked since admission
 returns typed `authority_revoked`. Current state can instead produce a typed
@@ -429,14 +456,12 @@ Chat carries `propose_task`, `propose_commitment`, `propose_memory` and
 `propose_session` once the Charter is adopted, but not the Project scope's
 `propose_review` or `propose_decision`. An owned identity without the Main
 binding keeps its account ceiling for the unregistered account operations;
-registered Main operations require the binding through their principal rule.
+Main reads require the binding through their principal rule. Owned unbound identities retain `project.create` and `genesis.project_agent.select` proposal authority; Charter adoption, amendment approval and final release remain user-only.
 A stored document that fails to parse is logged with the identity and layer.
 
 Registered Main reads, Project Charter/doctrine reads, identity summaries,
 `genesis.project_agent.select` and `project.create` use this path. The
-approval-envelope `AgentAction` policy (`evaluate_action_policy`) still layers
-identity, Profile and scope ceilings itself, with the shared parser, until
-slice E. UI effective
+approval-envelope `AgentAction` policy (`evaluate_action_policy`) uses the same resolver/evaluator for account, Project, Chat and identity callers. Task assignment/terminal/reviewer checks remain on their existing path for slice F. The former `action_scope_access` and `main_account_id` checks are removed; a test-only frozen base policy compares each principal/scope/action cell and refuses any widening. UI effective
 permissions and CLI composition use the same resolver. Existing exact-object,
 receipt-first replay, governing-policy and optimistic-version checks remain
 in command transactions; fresh Genesis Agent selection also evaluates

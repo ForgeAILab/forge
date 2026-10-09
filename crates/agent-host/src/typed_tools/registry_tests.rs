@@ -18,13 +18,28 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
         ("inquiry.run", "M", false),
         ("portfolio.read", "AM", false),
         ("project.charter", "PC", true),
+        ("project.current_state", "PC", false),
+        ("project.observations", "PC", true),
         ("skill.section", "PC", true),
         ("genesis.project_agent.select", "AM", false),
         ("project.create", "AM", false),
+        ("project.review_config", "PC", true),
+        ("project.document", "PC", true),
+        ("project.decision", "PC", true),
+        ("project.milestone", "PC", true),
+        ("project.validation", "PC", true),
+        ("project.release.request", "PC", true),
+        ("project.escalate", "PC", true),
+        ("message.send", "PC", false),
+        ("commitment.update", "PC", true),
+        ("memory.publish", "PC", true),
+        ("memory.supersede", "PC", true),
+        ("review.request", "P", true),
+        ("session.action", "PC", true),
     ];
     let specs = READ_CATALOG
         .iter()
-        .chain(operation_registry::main_proposals::CATALOG.iter())
+        .chain(operation_registry::PROPOSAL_CATALOG.iter())
         .collect::<Vec<_>>();
     assert_eq!(
         specs.iter().map(|s| s.id).collect::<BTreeSet<_>>(),
@@ -555,5 +570,94 @@ async fn integer_spellings_are_admitted_at_preparation() {
                 "{id} {malformed}: {error}"
             );
         }
+    }
+}
+
+#[test]
+fn each_registered_proposal_projects_only_its_own_fields() {
+    for spec in operation_registry::PROPOSAL_CATALOG.iter() {
+        let one = BTreeSet::from([spec.id.to_owned()]);
+        let fields = coordination_payload_properties(&one).unwrap();
+        assert_eq!(
+            fields.as_object().unwrap().keys().collect::<Vec<_>>(),
+            spec.input.schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            "{}",
+            spec.id
+        );
+        let tool = ForgeScopeProposeTool::new(
+            "actor".into(),
+            scope(CanonicalScopeType::Project, WorkspaceAccess::Deny),
+            vec![spec.id.into()],
+            Arc::new(RecordingProvider::default()),
+        );
+        let schema = tool.spec().input_schema;
+        for field in ["dedupe_key", "correlation_id"] {
+            assert_eq!(schema["properties"][field]["type"], "string");
+        }
+        assert_eq!(schema["properties"]["payload"]["type"], "object");
+    }
+}
+
+#[tokio::test]
+async fn moved_proposals_refuse_unknown_and_forged_envelope_fields_before_dispatch() {
+    let inputs: Value = serde_json::from_str(include_str!(
+        "../../../operation-registry/tests/project_inputs.json"
+    ))
+    .unwrap();
+    for id in operation_registry::project_proposals::IDS
+        .iter()
+        .chain(operation_registry::legacy_proposals::IDS)
+    {
+        let tool = ForgeScopeProposeTool::named(
+            "actor".into(),
+            scope(CanonicalScopeType::Project, WorkspaceAccess::Deny),
+            vec![(*id).into()],
+            Arc::new(RecordingProvider::default()),
+            FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+            "Project",
+        );
+        let args = json!({"operation":id,"payload":inputs[*id],"dedupe_key":"key","correlation_id":"correlation"});
+        tool.prepare(args.clone(), &test_preparation_context("valid-proposal"))
+            .await
+            .unwrap();
+        let mut unknown = args.clone();
+        unknown["payload"]["unexpected"] = json!(true);
+        let error = tool
+            .prepare(unknown, &test_preparation_context("unknown-proposal"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(id) && error.contains("unexpected"),
+            "{error}"
+        );
+        for field in crate::operation_catalog::SERVER_DERIVED_FIELDS
+            .iter()
+            .chain(&["project_id"])
+        {
+            let mut forged = args.clone();
+            forged[*field] = json!("forged");
+            let error = tool
+                .prepare(forged, &test_preparation_context("forged-proposal"))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("server-derived") && !error.contains("expected"),
+                "{id} {field}: {error}"
+            );
+        }
+        let mut forged = args.clone();
+        forged["extra"] = json!({"authority":"forged"});
+        let error = tool
+            .prepare(forged, &test_preparation_context("nested-forgery"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("server-derived") && !error.contains("expected"));
     }
 }

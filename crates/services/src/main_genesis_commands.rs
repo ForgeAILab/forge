@@ -1013,8 +1013,6 @@ impl MainGenesisCommandService {
             return self.replay_project_agent_selection(receipt).await;
         }
 
-        self.authorize_current_principal(&input.principal, &account_id)
-            .await?;
         if input.policy_result != "allowed" || input.requested_permission != "propose_discovery" {
             return Err(ServiceError::AuthorizationDenied {
                 message: "Project Agent selection requires admitted Main discovery authority"
@@ -1045,6 +1043,17 @@ impl MainGenesisCommandService {
             } else {
                 None
             };
+        if let Some(admitted) = &admission {
+            admitted
+                .evaluate(
+                    operation_registry::main_proposals::CATALOG
+                        .lookup(MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION)
+                        .unwrap(),
+                )
+                .map_err(|_| ServiceError::AuthorizationDenied {
+                    message: "Project Agent selection requires admitted discovery authority".into(),
+                })?;
+        }
         let session_id = match input.request.genesis_session_id.as_deref() {
             Some(id) => id.to_owned(),
             None => sqlx::query_scalar::<_, String>(

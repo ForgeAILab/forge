@@ -8,13 +8,16 @@ fn catalog_is_complete_unique_and_deterministic() {
     assert_eq!(ids, registered_reads());
     assert_eq!(
         registered_operations().len(),
-        registered_reads().len() + main_proposals::IDS.len()
+        registered_reads().len()
+            + main_proposals::IDS.len()
+            + project_proposals::IDS.len()
+            + legacy_proposals::IDS.len()
     );
     assert_eq!(
         ids.len(),
         scope_reads::IDS.len() + project_reads::IDS.len() + main_reads::IDS.len()
     );
-    assert!(READ_CATALOG.lookup("project.current_state").is_none());
+    assert!(READ_CATALOG.lookup("project.current_state").is_some());
     assert!(OperationCatalog::<()>::new(scope_reads::specs(), &registered_reads()).is_err());
     assert!(OperationCatalog::<()>::new(
         scope_reads::specs().into_iter().chain(scope_reads::specs()),
@@ -100,6 +103,8 @@ fn contract_lines_are_generated_from_the_spec() {
             "inquiry.run: {context?, question, title}",
             "portfolio.read: {limit?}",
             "project.charter: no arguments",
+            "project.current_state: {limit?}",
+            "project.observations: {limit?, task_id?}",
             "skill.section: {section: one of research|documents|scope_change|tasks|milestones|release}",
         ]
     );
@@ -201,6 +206,18 @@ impl scope_reads::ScopeReadContext<&'static str> for RecordingContext {
 }
 #[async_trait::async_trait]
 impl project_reads::ProjectReadContext<&'static str> for RecordingContext {
+    async fn current_state(
+        &self,
+        input: project_reads::CurrentStateArguments,
+    ) -> Result<Value, &'static str> {
+        self.record_decoded("project.current_state", input.limit)
+    }
+    async fn observations(
+        &self,
+        input: project_reads::ObservationsArguments,
+    ) -> Result<Value, &'static str> {
+        self.record_decoded("project.observations", input.limit)
+    }
     async fn project_charter(&self, _: NoArguments) -> Result<Value, &'static str> {
         self.record("project.charter")
     }
@@ -382,6 +399,8 @@ async fn integer_fields_decode_integer_valued_strings_and_floats_as_the_integer(
             ("charter.readiness", "expected_charter_version"),
             ("discovery.read", "limit"),
             ("portfolio.read", "limit"),
+            ("project.current_state", "limit"),
+            ("project.observations", "limit"),
         ]
     );
     let catalog = read_catalog();
@@ -748,4 +767,164 @@ fn ignored_action_fields_preserve_the_base_handler_acceptance_set() {
             }
         }
     }
+}
+
+#[async_trait::async_trait]
+impl project_proposals::ProjectProposalContext<&'static str> for RecordingContext {
+    async fn review_config(
+        &self,
+        _: project_proposals::ReviewConfig,
+    ) -> Result<Value, &'static str> {
+        self.record("project.review_config")
+    }
+    async fn document(&self, _: project_proposals::Document) -> Result<Value, &'static str> {
+        self.record("project.document")
+    }
+    async fn decision(&self, _: project_proposals::Decision) -> Result<Value, &'static str> {
+        self.record("project.decision")
+    }
+    async fn milestone(&self, _: project_proposals::Milestone) -> Result<Value, &'static str> {
+        self.record("project.milestone")
+    }
+    async fn validation(&self, _: project_proposals::Validation) -> Result<Value, &'static str> {
+        self.record("project.validation")
+    }
+    async fn release_request(
+        &self,
+        _: project_proposals::ReleaseRequest,
+    ) -> Result<Value, &'static str> {
+        self.record("project.release.request")
+    }
+    async fn escalate(&self, _: project_proposals::Escalation) -> Result<Value, &'static str> {
+        self.record("project.escalate")
+    }
+}
+#[async_trait::async_trait]
+impl legacy_proposals::LegacyProposalContext<&'static str> for RecordingContext {
+    async fn pending_message(&self, _: legacy_proposals::Message) -> Result<Value, &'static str> {
+        self.record("message.send")
+    }
+    async fn pending_commitment(
+        &self,
+        _: legacy_proposals::Commitment,
+    ) -> Result<Value, &'static str> {
+        self.record("commitment.update")
+    }
+    async fn pending_memory_publish(
+        &self,
+        _: legacy_proposals::Memory,
+    ) -> Result<Value, &'static str> {
+        self.record("memory.publish")
+    }
+    async fn pending_memory_supersede(
+        &self,
+        _: legacy_proposals::Memory,
+    ) -> Result<Value, &'static str> {
+        self.record("memory.supersede")
+    }
+    async fn pending_review(&self, _: legacy_proposals::Review) -> Result<Value, &'static str> {
+        self.record("review.request")
+    }
+    async fn pending_session(&self, _: legacy_proposals::Session) -> Result<Value, &'static str> {
+        self.record("session.action")
+    }
+}
+
+#[tokio::test]
+async fn project_and_pending_contracts_close_fields_and_preserve_exact_inputs() {
+    let inputs: Value = serde_json::from_str(include_str!("../tests/project_inputs.json")).unwrap();
+    let catalog = proposal_catalog();
+    let context = RecordingContext(std::sync::Mutex::new(Vec::new()));
+    for id in project_proposals::IDS.iter().chain(legacy_proposals::IDS) {
+        let spec = catalog.lookup(id).unwrap();
+        let input = inputs[*id].clone();
+        assert!(
+            jsonschema::validator_for(&spec.canonical_schema())
+                .unwrap()
+                .is_valid(&input),
+            "{id}"
+        );
+        assert_eq!(
+            spec.normalize_arguments(&input).unwrap(),
+            input,
+            "{id} preserves receipt bytes"
+        );
+        assert_eq!(
+            spec.dispatch(&context, input.clone()).await.unwrap()["handler"],
+            *id
+        );
+        let mut unknown = input.clone();
+        unknown["unexpected"] = json!(true);
+        let error = spec.normalize_arguments(&unknown).unwrap_err();
+        assert!(
+            error.contains("unexpected") && error.contains(id),
+            "{error}"
+        );
+        // Historical preparations skip the new field contract, just as the
+        // old hand handlers ignored fields they did not consume.
+        assert!(
+            spec.dispatch_prepared(&context, unknown).await.is_ok(),
+            "{id}"
+        );
+        for field in spec.input.schema["properties"].as_object().unwrap().keys() {
+            assert!(spec.contract_line().contains(field), "{id}: {field}");
+        }
+    }
+}
+
+#[test]
+fn project_variants_refuse_fields_from_other_actions_and_enforce_limits() {
+    let inputs: Value = serde_json::from_str(include_str!("../tests/project_inputs.json")).unwrap();
+    let doc = project_proposals::CATALOG
+        .lookup("project.document")
+        .unwrap();
+    let mut draft = inputs["project.document"].clone();
+    draft["revision_id"] = json!("other-action");
+    assert!(doc
+        .normalize_arguments(&draft)
+        .unwrap_err()
+        .contains("revision_id"));
+    let approval = json!({"action":"approve","document_id":"d","revision_id":"r","content_digest":"c","render_digest":"r","expected_document_version":1});
+    doc.validate_arguments(&approval).unwrap();
+    for field in ["content", "kind", "title", "base_revision_id"] {
+        let mut wrong = approval.clone();
+        wrong[field] = json!("draft-only");
+        assert!(doc.validate_arguments(&wrong).is_err(), "{field}");
+    }
+    let milestone = project_proposals::CATALOG
+        .lookup("project.milestone")
+        .unwrap();
+    let primary =
+        json!({"action":"set_primary","expected_milestone_version":1,"primary_milestone_id":null});
+    milestone.validate_arguments(&primary).unwrap();
+    let mut wrong = primary;
+    wrong["content"] = json!({"name":"N","outcome":"O"});
+    assert!(milestone.validate_arguments(&wrong).is_err());
+    let ci = project_proposals::CATALOG
+        .lookup("project.review_config")
+        .unwrap();
+    for steps in [
+        json!(["cargo test", "cargo test"]),
+        json!(["x".repeat(2049)]),
+        json!(vec!["x"; 17]),
+    ] {
+        let mut input = inputs[ci.id].clone();
+        input["ci_steps"] = steps;
+        assert!(ci.validate_arguments(&input).is_err());
+    }
+    let mut input = inputs[ci.id].clone();
+    input["setup_steps"] = Value::Null;
+    assert!(
+        ci.validate_arguments(&input).is_err(),
+        "omitted setup is accepted, explicit null is not"
+    );
+    let pending = legacy_proposals::CATALOG.lookup("message.send").unwrap();
+    let utf8 = json!({"content":"é".repeat(32768)});
+    assert!(pending
+        .validate_arguments(&utf8)
+        .unwrap_err()
+        .contains("serialized UTF-8 bytes"));
+    pending
+        .validate_arguments(&json!({"content":"é".repeat(32750)}))
+        .unwrap();
 }

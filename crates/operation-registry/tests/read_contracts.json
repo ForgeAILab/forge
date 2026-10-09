@@ -244,5 +244,43 @@
       "section"
     ],
     "type": "object"
+  },
+  "project.current_state": {
+    "type": "object",
+    "properties": {
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 1.0,
+        "maximum": 64.0
+      }
+    },
+    "required": [],
+    "additionalProperties": false,
+    "description": "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector."
+  },
+  "project.observations": {
+    "type": "object",
+    "properties": {
+      "limit": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0.0
+      },
+      "task_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [],
+    "additionalProperties": false
   }
 }

@@ -66,15 +66,22 @@ async fn load(
             .bind(admitted_profile_id).bind(identity_id).fetch_optional(&mut *connection).await?
             .ok_or(crate::DbError::NotFound)?;
     let owner: Option<String> = row.try_get("owner_id")?;
-    let chat_project = if scope_type == "agent_chat" {
-        sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM agent_chat WHERE id = ?")
-            .bind(scope_id)
-            .fetch_optional(&mut *connection)
-            .await?
-            .flatten()
+    let chat = if scope_type == "agent_chat" {
+        Some(
+            sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
+                .bind(scope_id)
+                .fetch_optional(&mut *connection)
+                .await?
+                .ok_or(crate::DbError::NotFound)?,
+        )
     } else {
         None
     };
+    let chat_project = chat.as_ref().and_then(|chat| {
+        chat.try_get::<Option<String>, _>("project_id")
+            .ok()
+            .flatten()
+    });
     let project_id = if scope_type == "project" {
         Some(scope_id.to_owned())
     } else {
@@ -82,6 +89,21 @@ async fn load(
     };
     let mut active = row.try_get::<i64, _>("paused")? == 0
         && row.try_get::<Option<String>, _>("archived_at")?.is_none();
+    active &= match scope_type {
+        "account" => owner.as_deref() == Some(scope_id),
+        "agent" => identity_id == scope_id,
+        "agent_chat" if chat_project.is_none() => chat.as_ref().is_some_and(|chat| {
+            chat.try_get::<String, _>("kind").ok().as_deref() == Some("account_main")
+                && owner.is_some()
+                && chat
+                    .try_get::<Option<String>, _>("account_id")
+                    .ok()
+                    .flatten()
+                    == owner
+        }),
+        "project" | "agent_chat" => true,
+        _ => false,
+    };
     let mut binding_id = None;
     let mut setup = false;
     // A stored document that fails to parse grants nothing. That is correct,
@@ -116,6 +138,13 @@ async fn load(
         active = false;
     }
     let principal = if let Some(project_id) = project_id {
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project WHERE id = ?")
+            .bind(&project_id)
+            .fetch_one(&mut *connection)
+            .await?;
+        if exists == 0 {
+            return Err(crate::DbError::NotFound);
+        }
         let binding = sqlx::query("SELECT b.id, b.permission_ceiling_json, p.charter_setup_required FROM project_agent_binding b JOIN project p ON p.id = b.project_id WHERE b.project_id = ? AND b.identity_id = ? AND b.state = 'active'")
                 .bind(&project_id).bind(identity_id).fetch_optional(&mut *connection).await?;
         if let Some(binding) = binding {
@@ -138,7 +167,6 @@ async fn load(
         if scope_type == "agent_chat" {
             binding_id = sqlx::query_scalar("SELECT b.id FROM account_main_agent_binding b JOIN agent_chat c ON c.account_id = b.account_id AND c.kind = 'account_main' WHERE c.id = ? AND b.identity_id = ? AND b.account_id IS ? AND b.state = 'active'")
                 .bind(scope_id).bind(identity_id).bind(owner.as_deref()).fetch_optional(&mut *connection).await?;
-            active &= binding_id.is_some();
         } else if scope_type == "account" {
             binding_id = sqlx::query_scalar("SELECT id FROM account_main_agent_binding WHERE account_id IS ? AND identity_id = ? AND account_id = ? AND state = 'active'")
                 .bind(owner.as_deref()).bind(identity_id).bind(scope_id).fetch_optional(&mut *connection).await?;
@@ -152,12 +180,14 @@ async fn load(
             identity_id: identity_id.to_owned(),
         }
     };
-    layers.push(scope_permissions(
-        scope_type,
-        workspace,
-        chat_project.is_some(),
-        setup,
-    ));
+    layers.push(if scope_type == "agent" {
+        ["read_account", "propose_message"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        scope_permissions(scope_type, workspace, chat_project.is_some(), setup)
+    });
     Ok(EffectiveAuthority::resolve(AuthorityFacts {
         principal,
         scope_type: scope_type.to_owned(),
