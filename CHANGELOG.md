@@ -778,24 +778,41 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Task worktree.
 - **A workspace is checked against disk and Git immediately before it is
   used (3.4 stage B, part 1).** A new internal accessor,
-  `WorkspaceManager::ensure_valid`, is now behind claim, launch preparation,
+  `WorkspaceManager::ensure_valid`, is now behind workspace preparation
+  (creation, the reviewer cascade, retry-entry refresh, and claim when the
+  workspace is reported missing), the start of a native executor turn,
   reassignment reset, review entry CI, review rerun, blocking `before_work`
   hooks, merge delivery and target-moved rebase on server-owned workspaces.
+  A claim on a workspace that is already ready still uses the backend's own
+  check.
   Besides the existing checks (directory present, Git can use it), it now
   refuses or repairs three more states. A worktree of a different repository
   at the recorded path is moved aside (`<name>.broken-<ms>`) and recreated
   from the Task branch. A worktree path or Task root that is a symbolic link
   is never used: the Task gets `workspace reset required`. A worktree whose
   HEAD is not on the Task branch (another branch, or detached outside a
-  rebase) is put back on it at launch when it has no uncommitted changes;
-  with uncommitted changes, and for review, checks, hooks and delivery, the
-  Task gets `workspace reset required` instead of running on the wrong
-  branch. An interrupted rebase is left to the rebase owner as before. No
-  REST, MCP, event or CLI shape changes. Healthy workspaces behave as before;
-  the check adds one `git rev-parse` per use (about 25 ms measured per call
-  with the existing probe, under a parallel test run).
+  rebase) is handled by what a checkout would lose. If HEAD has commits that
+  are not on the Task branch, nothing is checked out and the Task gets
+  `workspace reset required` naming how many: those commits would otherwise
+  drop out of what Forge reviews and delivers. If HEAD is the Task branch's
+  own commit, the branch is checked out (no file changes, uncommitted work is
+  kept). If HEAD is behind the Task branch, a launch checks the branch out
+  when there are no uncommitted changes; otherwise, and for review, checks,
+  hooks and delivery, the Task gets `workspace reset required`. Before this
+  change all of these ran on whatever HEAD was. Reassignment with a worktree
+  reset still discards uncommitted work at the current HEAD whatever branch
+  it is on. A native executor turn that starts on a deleted worktree now
+  recreates it from the Task branch instead of failing with `not a git
+  repository`. An interrupted rebase is left to the rebase owner as before.
+  `workspace reset required` is not repaired automatically; the workspace
+  reset clears it. A healthy worktree whose Repo row was deleted is now
+  accepted (it used to fail with `repo not found`); only a repair needs the
+  row. No REST, MCP, event or CLI shape changes. Healthy
+  workspaces behave as before; the check is one `git rev-parse` per use
+  (about 16 ms measured per call under a parallel test run), roughly four to
+  eight times per Task run.
   Error text that changed or is new:
-  - `workspace reset required for task <id>: worktree HEAD is on <ref>, not on Task branch '<branch>'; …` (new).
+  - `workspace reset required for task <id>: worktree HEAD is on <ref>, not on Task branch '<branch>'; …` (new; the tail says whether HEAD has commits the Task branch lacks, the worktree has uncommitted changes, or the candidate is not moved for this operation).
   - `workspace reset required for task <id>: recorded worktree path <path> runs through a symbolic link` / `… is a symbolic link` (new).
   - Lifecycle hooks: `worktree of workspace <id> is missing or is not a Git worktree; lifecycle hook OnTaskDone was not run` is now `worktree of workspace <id> is not usable (<reason>); lifecycle hook on_task_done was not run`.
   - Cleanup: `repository <path> is recorded for this workspace and is not reachable right now; workspace cleanup will be retried` (new).
@@ -812,9 +829,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   and leave the worktree registration in that repository for good. It now
   fails that attempt, keeps the worktree, retries with the existing backoff
   and raises the cleanup attention item after five attempts; once the
-  repository is back, the registration and the Task root are removed. If the
-  checkout was deleted for good, clear or correct the Repo's local path, or
-  dismiss the attention item and remove `<workspace root>/<task id>` by hand.
+  repository is back, the registration and the Task root are removed. "Away"
+  means the checkout's parent directory is missing too, or is empty (an
+  unmounted mount point). A checkout that was deleted or moved while its
+  parent directory is still there is treated as gone, as before: the Task
+  root is removed at once. The wait is bounded: seven days after the
+  attention item was raised, the Task root is removed without the repository
+  and the item's details record why (`settled`); if the repository returns
+  later, `git worktree prune` in it drops the stale registration.
 - **A cleanup that keeps failing becomes one attention item (3.4 stage A).**
   After five failed attempts Forge raises a single Project attention item
   (category `progress_warning`, with the path, attempt count and last error)

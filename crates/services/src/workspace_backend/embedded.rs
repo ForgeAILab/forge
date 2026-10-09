@@ -30,6 +30,12 @@ enum RecordedRepoSource {
     NotRecorded,
 }
 
+/// How long cleanup keeps waiting for a recorded repository that is away,
+/// counted from the cleanup attention item. After it the Task root is removed
+/// without the repository, so a checkout that never comes back cannot hold a
+/// worktree, and a retry every hour, forever.
+const AWAY_REPOSITORY_WAIT_DAYS: i64 = 7;
+
 pub struct EmbeddedWorkspaceBackend {
     db: Arc<SqliteDb>,
     manager: WorkspaceManager,
@@ -77,6 +83,71 @@ impl EmbeddedWorkspaceBackend {
             Some(local) => RecordedRepoSource::MissingNow(local),
             None => RecordedRepoSource::NotRecorded,
         })
+    }
+
+    /// Whether a recorded repository that is not on disk is gone for good,
+    /// with the evidence, or `None` while it may only be away.
+    ///
+    /// Gone: its parent directory is there and holds other entries, so the
+    /// volume is mounted and the repository itself was deleted or moved.
+    /// Away: the parent is missing too, or is an empty directory (what an
+    /// unmounted mount point looks like). Away is bounded: once the cleanup
+    /// attention item has been open for [`AWAY_REPOSITORY_WAIT_DAYS`] the
+    /// wait ends, and the item records why before success resolves it.
+    async fn absent_repository_is_gone(
+        &self,
+        workspace: &db::Workspace,
+        source: &Path,
+    ) -> Result<Option<String>> {
+        if let Some(parent) = source.parent() {
+            if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+                if entries.next_entry().await.ok().flatten().is_some() {
+                    return Ok(Some(format!(
+                        "{} is present and the repository is not in it",
+                        parent.display()
+                    )));
+                }
+            }
+        }
+        let dedupe_key = crate::workspace_cleanup::cleanup_attention_key(&workspace.id);
+        let raised_at = sqlx::query_scalar::<_, String>(
+            "SELECT occurred_at FROM attention_projection
+             WHERE dedupe_key = ? AND status <> 'resolved'
+             ORDER BY occurred_at LIMIT 1",
+        )
+        .bind(&dedupe_key)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(ServiceError::from)?;
+        let Some(raised_at) = raised_at
+            .as_deref()
+            .and_then(|raised_at| chrono::DateTime::parse_from_rfc3339(raised_at).ok())
+        else {
+            return Ok(None);
+        };
+        let waited = chrono::Utc::now().signed_duration_since(raised_at);
+        if waited < chrono::Duration::days(AWAY_REPOSITORY_WAIT_DAYS) {
+            return Ok(None);
+        }
+        let evidence = format!(
+            "repository {} stayed unreachable for {AWAY_REPOSITORY_WAIT_DAYS} days after the \
+             cleanup attention item was raised; the Task root was removed without it. If the \
+             repository comes back, run `git worktree prune` in it",
+            source.display()
+        );
+        sqlx::query(
+            "UPDATE attention_projection
+             SET details_json = json_set(details_json, '$.settled', ?), updated_at = ?,
+                 version = version + 1
+             WHERE dedupe_key = ? AND status <> 'resolved'",
+        )
+        .bind(&evidence)
+        .bind(db::now_rfc3339())
+        .bind(&dedupe_key)
+        .execute(self.db.pool())
+        .await
+        .map_err(ServiceError::from)?;
+        Ok(Some(evidence))
     }
 
     fn repo_cache_path(&self, workspace: &db::Workspace) -> PathBuf {
@@ -575,17 +646,37 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
         let path = self.path(placement, &workspace);
         let source = match self.recorded_repo_source(&workspace).await? {
             RecordedRepoSource::Present(source) => source,
-            // Removing the Task root now would report success and leave the
-            // registration in the user's repository for good. Fail instead:
+            // A repository that is away (an unmounted volume) still holds
+            // the worktree registration: removing the Task root now would
+            // report success and leave it there for good. Fail instead, so
             // the scheduler retries with backoff and raises one attention
-            // item when the repository stays away.
+            // item. A repository that is gone took its registrations with
+            // it: only the Task root is left, and the absent cache path
+            // tells the manager that.
             RecordedRepoSource::MissingNow(source) => {
-                return Err(ServiceError::invalid_operation(format!(
-                    "repository {} is recorded for this workspace and is not reachable right now; \
-                     workspace cleanup will be retried",
-                    source.display()
-                ))
-                .into());
+                match self.absent_repository_is_gone(&workspace, &source).await? {
+                    Some(evidence) => {
+                        tracing::warn!(
+                            workspace_id = %workspace.id,
+                            task_id = %workspace.task_id,
+                            repository = %source.display(),
+                            worktree = %path.display(),
+                            evidence,
+                            "recorded repository is gone; removing the Task root without it \
+                             (if the repository was moved, `git worktree prune` there drops \
+                             the stale registration)"
+                        );
+                        self.repo_cache_path(&workspace)
+                    }
+                    None => {
+                        return Err(ServiceError::invalid_operation(format!(
+                            "repository {} is recorded for this workspace and is not reachable \
+                             right now; workspace cleanup will be retried",
+                            source.display()
+                        ))
+                        .into());
+                    }
+                }
             }
             RecordedRepoSource::NotRecorded => match self.workspace_repo_source(&workspace).await {
                 Ok(source) => source,

@@ -45,6 +45,11 @@ pub(crate) enum Purpose {
     Integrate,
     /// Run a lifecycle hook. May recreate; never moves HEAD.
     Hook,
+    /// Discard uncommitted work before a reassigned worker starts. May
+    /// recreate; a worktree off the Task branch is returned as it is
+    /// (`on_task_branch() == false`), because the caller's reset is the
+    /// repair and must not be refused for the state it is about to clear.
+    Reset,
     /// Read-only projection. Never changes disk or rows and does not require
     /// a `ready` row; an unusable workspace is reported as
     /// [`WorkspaceUnavailable::Absent`].
@@ -100,8 +105,9 @@ impl ValidWorkspace {
         self.repair
     }
 
-    /// False only for [`Purpose::Inspect`] on a worktree whose HEAD is not on
-    /// the Task branch; every other purpose refuses that state.
+    /// False only for [`Purpose::Inspect`] and [`Purpose::Reset`] on a
+    /// worktree whose HEAD is not on the Task branch; every other purpose
+    /// puts it back or refuses that state.
     pub(crate) fn on_task_branch(&self) -> bool {
         self.on_task_branch
     }
@@ -286,15 +292,24 @@ impl<'a> WorkspaceManager<'a> {
             ))
             .into());
         }
-        let repo = RepoRepo::get_by_id(self.db, &workspace.repo_id)
-            .await?
-            .filter(|repo| repo.project_id == task.project_id)
-            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
+        // A workspace outlives its Repo row. A healthy worktree does not need
+        // the row, so only a repair asks for it; a row that belongs to
+        // another Project is refused outright, as before.
+        let repo_missing = || ServiceError::not_found("repo", workspace.repo_id.clone());
+        let repo = RepoRepo::get_by_id(self.db, &workspace.repo_id).await?;
+        if repo
+            .as_ref()
+            .is_some_and(|repo| repo.project_id != task.project_id)
+        {
+            return Err(repo_missing().into());
+        }
         let resolved =
             resolve_workspace_backend(self.db, self.workspace_root, &workspace, self.router)
                 .await?;
         let path = resolved.embedded_path()?;
-        let observed = self.observe(&workspace, &repo, &resolved, &path).await?;
+        let observed = self
+            .observe(&workspace, repo.as_ref(), &resolved, &path)
+            .await?;
 
         if purpose == Purpose::Inspect {
             return match observed {
@@ -323,12 +338,18 @@ impl<'a> WorkspaceManager<'a> {
                 task_id: workspace.task_id.clone(),
                 reason,
             }),
+            Observed::OffBranch { .. } if purpose == Purpose::Reset => {
+                let workspace = clear_workspace_cleanup_after(self.db, workspace).await?;
+                Ok(valid(workspace, resolved, path, Repair::None, false))
+            }
             Observed::OffBranch { head } => {
                 self.return_to_task_branch(workspace, resolved, path, purpose, &head)
                     .await
             }
             observed @ (Observed::Missing | Observed::Invalid | Observed::Foreign { .. }) => {
+                let repo = repo.ok_or_else(repo_missing)?;
                 let owner_task_id = workspace.task_id.clone();
+                let foreign = matches!(observed, Observed::Foreign { .. });
                 let recovered = recover_missing_worktree(
                     self.db,
                     self.workspace_root,
@@ -336,9 +357,11 @@ impl<'a> WorkspaceManager<'a> {
                     &owner_task_id,
                     workspace,
                     self.repo_cache_locks.clone(),
-                    delete_missing_workspace,
+                    // A directory Git can still use is never left without
+                    // its row, whatever the recorded repository says.
+                    delete_missing_workspace && !foreign,
                     self.router,
-                    matches!(observed, Observed::Foreign { .. }),
+                    foreign,
                 )
                 .await?;
                 let workspace = clear_workspace_cleanup_after(self.db, recovered).await?;
@@ -355,9 +378,15 @@ impl<'a> WorkspaceManager<'a> {
         }
     }
 
-    /// Only [`Purpose::Execute`] may move HEAD, and only when nothing would be
-    /// lost: every other purpose acts on a candidate that must not change
-    /// under it.
+    /// Put HEAD back on the Task branch only when nothing can be lost.
+    ///
+    /// - HEAD holds commits the Task branch lacks: never checked out for any
+    ///   purpose. Leaving them would make them unreachable from the branch
+    ///   Forge reviews and delivers, and the Task would finish without them.
+    /// - HEAD is the Task branch's own commit: the checkout changes no file,
+    ///   so every repairing purpose may do it, with or without local changes.
+    /// - HEAD is behind the Task branch: the checkout moves the tree, so only
+    ///   [`Purpose::Execute`] does it, and only on a clean worktree.
     async fn return_to_task_branch(
         &self,
         workspace: Workspace,
@@ -373,34 +402,61 @@ impl<'a> WorkspaceManager<'a> {
                 workspace.branch
             ),
         };
-        if purpose != Purpose::Execute {
+        let task_ref = format!("refs/heads/{}", workspace.branch);
+        let Some((ahead, behind)) = divergence(&path, &task_ref).await else {
             return Err(reset_required(
-                "the candidate is not moved for this operation",
+                "HEAD could not be compared with the Task branch",
             ));
+        };
+        if ahead > 0 {
+            return Err(reset_required(&format!(
+                "HEAD has {ahead} commit(s) that are not on the Task branch, so the branch was \
+                 not checked out; move them onto the Task branch (or reset the workspace to \
+                 discard them)"
+            )));
         }
-        let clean = git::is_worktree_clean(&path)
-            .await
-            .map_err(ServiceError::from)?;
-        if !clean {
-            return Err(reset_required(
-                "the worktree has uncommitted changes, so the branch was not checked out",
-            ));
+        if behind > 0 {
+            if purpose != Purpose::Execute {
+                return Err(reset_required(
+                    "the candidate is not moved for this operation",
+                ));
+            }
+            let clean = git::is_worktree_clean(&path)
+                .await
+                .map_err(ServiceError::from)?;
+            if !clean {
+                return Err(reset_required(
+                    "the worktree has uncommitted changes, so the branch was not checked out",
+                ));
+            }
         }
-        if let Err(error) = git::checkout_branch(&path, &workspace.branch).await {
-            tracing::warn!(
-                task_id = %workspace.task_id,
-                workspace_id = %workspace.id,
-                branch = %workspace.branch,
-                %error,
-                "could not put the worktree back on its Task branch"
-            );
-            return Err(reset_required("checking the Task branch out failed"));
+        let checkout = git_at(&path)
+            .args(["checkout", "--quiet", &workspace.branch, "--"])
+            .output()
+            .await;
+        match checkout {
+            Ok(output) if output.status.success() => {}
+            failed => {
+                let error = match failed {
+                    Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                    Err(error) => error.to_string(),
+                };
+                tracing::warn!(
+                    task_id = %workspace.task_id,
+                    workspace_id = %workspace.id,
+                    branch = %workspace.branch,
+                    %error,
+                    "could not put the worktree back on its Task branch"
+                );
+                return Err(reset_required("checking the Task branch out failed"));
+            }
         }
         tracing::info!(
             task_id = %workspace.task_id,
             workspace_id = %workspace.id,
             branch = %workspace.branch,
             previous_head = head,
+            purpose = ?purpose,
             "worktree put back on its Task branch"
         );
         let workspace = clear_workspace_cleanup_after(self.db, workspace).await?;
@@ -496,25 +552,46 @@ impl<'a> WorkspaceManager<'a> {
         })
     }
 
-    /// No network and at most two Git processes: the existing HEAD probe and
-    /// one `rev-parse` naming the repository, the Git directory and HEAD.
+    /// No network and, for a healthy worktree, one Git process: a `rev-parse`
+    /// that resolves HEAD and names the repository, the Git directory and the
+    /// checked-out ref. Only when that fails is the launch-path probe run, so
+    /// an unusable directory and a transient Git failure are told apart by
+    /// the rule recovery has always used.
     async fn observe(
         &self,
         workspace: &Workspace,
-        repo: &db::Repo,
+        repo: Option<&db::Repo>,
         resolved: &ResolvedWorkspace,
         path: &Path,
     ) -> Result<Observed, WorkspaceUnavailable> {
         if let Some(reason) = self.confinement_violation(workspace, path).await? {
             return Ok(Observed::Escapes { reason });
         }
-        match worktree_readiness(path).await? {
-            WorktreeReadiness::Missing => return Ok(Observed::Missing),
-            WorktreeReadiness::Invalid => return Ok(Observed::Invalid),
-            WorktreeReadiness::Ready => {}
+        let io = |error| ServiceError::Git(git::GitError::Io(error));
+        if !tokio::fs::try_exists(path).await.map_err(io)? {
+            return Ok(Observed::Missing);
         }
-        let Some(identity) = worktree_identity(path).await? else {
+        if !tokio::fs::try_exists(path.join(".git")).await.map_err(io)? {
             return Ok(Observed::Invalid);
+        }
+        #[cfg(test)]
+        let identity = if crate::task_service::workspace::worktree_probe_failure_injected(path) {
+            None
+        } else {
+            worktree_identity(path).await?
+        };
+        #[cfg(not(test))]
+        let identity = worktree_identity(path).await?;
+        let Some(identity) = identity else {
+            // Git could not describe the directory. The probe decides whether
+            // it is unusable (recreate) or Git failed for another reason
+            // (the error is returned and the caller retries). A directory the
+            // probe accepts is used as before, without the newer checks.
+            return Ok(match worktree_readiness(path).await? {
+                WorktreeReadiness::Missing => Observed::Missing,
+                WorktreeReadiness::Invalid => Observed::Invalid,
+                WorktreeReadiness::Ready => Observed::Healthy,
+            });
         };
         // A linked worktree names the repository it belongs to; it is judged
         // against a recorded repository that is on disk now. A directory that
@@ -601,7 +678,7 @@ impl<'a> WorkspaceManager<'a> {
     async fn recorded_common_dirs(
         &self,
         workspace: &Workspace,
-        repo: &db::Repo,
+        repo: Option<&db::Repo>,
         resolved: &ResolvedWorkspace,
     ) -> Vec<PathBuf> {
         let mut sources = Vec::new();
@@ -611,8 +688,7 @@ impl<'a> WorkspaceManager<'a> {
             sources.push(PathBuf::from(location.path));
         }
         if let Some(local) = repo
-            .local_path
-            .as_deref()
+            .and_then(|repo| repo.local_path.as_deref())
             .map(str::trim)
             .filter(|path| !path.is_empty())
         {
@@ -687,6 +763,7 @@ async fn worktree_identity(path: &Path) -> Result<Option<WorktreeIdentity>, Work
             "--path-format=absolute",
             "--git-common-dir",
             "--absolute-git-dir",
+            "HEAD",
             "--symbolic-full-name",
             "HEAD",
         ])
@@ -698,8 +775,8 @@ async fn worktree_identity(path: &Path) -> Result<Option<WorktreeIdentity>, Work
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut lines = stdout.lines();
-    let (Some(common_dir), Some(git_dir), Some(head_ref)) =
-        (lines.next(), lines.next(), lines.next())
+    let (Some(common_dir), Some(git_dir), Some(_head_sha), Some(head_ref)) =
+        (lines.next(), lines.next(), lines.next(), lines.next())
     else {
         return Ok(None);
     };
@@ -716,6 +793,27 @@ async fn worktree_identity(path: &Path) -> Result<Option<WorktreeIdentity>, Work
         head_ref: head_ref.to_owned(),
         rebase_in_progress,
     }))
+}
+
+/// Commits HEAD has that `full_ref` lacks, and commits `full_ref` has that
+/// HEAD lacks. `None` when Git cannot compare them.
+async fn divergence(path: &Path, full_ref: &str) -> Option<(u64, u64)> {
+    let output = git_at(path)
+        .args([
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("HEAD...{full_ref}"),
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut counts = stdout.split_whitespace();
+    Some((counts.next()?.parse().ok()?, counts.next()?.parse().ok()?))
 }
 
 async fn ref_exists(path: &Path, full_ref: &str) -> bool {

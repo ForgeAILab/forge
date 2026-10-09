@@ -3553,34 +3553,53 @@ repaired) or a typed `WorkspaceUnavailable`, which converts to the existing
 service errors (`ResetRequired` to `WorkspaceResetRequired`, `OwnerUnreachable`
 to `DaemonUnavailable`, `Busy` to a conflict, `Infrastructure` to the original
 error unchanged). `Purpose` is `Execute`, `Review`, `Check`, `Integrate`,
-`Hook` or `Inspect`. For a server-owned workspace it checks, with no network
-and two Git processes on the healthy path:
+`Hook`, `Reset` or `Inspect`. For a server-owned workspace it checks, with no
+network and one Git process on the healthy path (a single `git rev-parse` that
+resolves HEAD and names the repository, the Git directory and the checked-out
+ref; the older HEAD probe runs only when that fails, to tell an unusable
+directory from a transient Git failure):
 
-| Observed | `Execute`, `Review`, `Check`, `Integrate`, `Hook` | `Inspect` |
+| Observed | `Execute`, `Review`, `Check`, `Integrate`, `Hook`, `Reset` | `Inspect` |
 |---|---|---|
 | Linked worktree, HEAD on the Task branch (or mid-rebase) | valid; a stale cleanup deadline is cleared | valid |
 | Directory missing, or present and unusable by Git | repaired or recreated from the Task branch (as above) | `Absent`; disk and the workspace row are untouched (a legacy row with no placement still gets its server placement recorded) |
 | Linked worktree of a repository other than the recorded one | moved aside as `<name>.broken-<ms>` and recreated from the Task branch; never relinked | `Absent` |
 | The worktree path, or its Task root, is a symbolic link | `ResetRequired`; nothing is used, moved or deleted | `Absent` |
-| HEAD on another branch or detached, Task branch exists, no rebase in progress | `Execute`: `git checkout <Task branch>` when the tree is clean, else `ResetRequired`. The others: `ResetRequired`; HEAD is never moved under a candidate | valid, flagged off-branch |
-| Worktree and Task branch both gone | `ResetRequired`; the row is kept, except on the owning Task's launch path, which forgets it so the next launch starts from the default branch | `Absent` |
+| HEAD on another branch or detached, Task branch exists, no rebase in progress | Decided by what a checkout would lose. HEAD has commits the Task branch lacks: `ResetRequired` for every purpose, naming the count, because a checkout would leave them unreachable from the branch Forge reviews and delivers. HEAD is the Task branch's own commit: `git checkout <Task branch>` for every purpose, since no file changes and local changes are kept. HEAD is behind the Task branch: `Execute` checks the branch out when the tree is clean, else `ResetRequired`; the others return `ResetRequired`, so a candidate is never moved under them. `Reset` is the exception to all three: it returns the worktree as it is, flagged off-branch, for the caller's `git reset --hard HEAD` | valid, flagged off-branch |
+| Worktree and Task branch both gone | `ResetRequired`; the row is kept, except on the owning Task's launch path, which forgets it so the next launch starts from the default branch. A worktree of another repository that Git can still use is never forgotten | `Absent` |
 | Row not `ready` | `workspace for task … is not ready` | reports the disk as above |
 
 The repository check compares the worktree's Git common directory with the
 placement's repository location, `Repo.local_path` and Forge's clone, whichever
 are on disk; with none on disk it is skipped and recovery reports the missing
-repository. A directory that is a repository of its own, rather than a linked
+repository. A healthy worktree is valid even when its Repo row has been
+deleted (a workspace outlives it); only a repair needs the row and reports
+`repo not found`. A Repo row of another Project is refused for every state. A directory that is a repository of its own, rather than a linked
 worktree, is not rejected yet. Daemon-owned placements keep the describe /
 prepare contract described above; the manager never interprets their handle.
-Callers: claim and every `prepare_workspace` path (`Execute`), reassignment
-reset (`Execute`), review entry CI (`Check`), review rerun (`Review`), blocking
-`before_work` hooks (`Hook`), merge delivery and target-moved rebase
-(`Integrate`), and the lifecycle emitter (`Inspect`). A source-scan test,
+Callers: every `prepare_workspace` path (`Execute`: workspace creation, the
+reviewer cascade, retry-entry refresh, and claim when the owner reports the
+workspace missing), the native executor at the start of a turn (`Execute`),
+reassignment reset (`Reset`), review entry CI (`Check`), review rerun
+(`Review`), blocking `before_work` hooks (`Hook`), merge delivery and
+target-moved rebase (`Integrate`), and the lifecycle emitter (`Inspect`). A
+claim on a placement that is already `ready` still asks the backend's
+`describe` and does not go through the manager when the workspace exists. One
+Task run makes about four to eight manager calls (a blocking `before_work`
+hook, entry CI, a native turn start per execution, delivery, a rebase when the
+target moved, and one `Inspect` per lifecycle event that has script hooks).
+`ResetRequired` is never repaired by the caller: each one records its existing
+typed result (the `workspace_reset_required` annotation, the CI interruption
+with its entry barrier, a failed hook, a merge failure) and stops, so there is
+no reset-and-retry loop and no automatic recreation; the explicit workspace
+reset clears it. A source-scan test,
 `workspace_manager::tests::raw_workspace_path_getters_have_no_new_callers`,
-lists every remaining non-test use of the raw path getters
-(`ResolvedWorkspace::embedded_path`,
+records an upper bound per file for the remaining non-test uses of the raw
+path getters (`ResolvedWorkspace::embedded_path`,
 `Workspace::embedded_worktree_path_for_backend`,
-`EmbeddedWorkspaceBackend::recorded_server_path`) and fails when one is added.
+`EmbeddedWorkspaceBackend::recorded_server_path`). It fails when a file that
+is not listed uses one, or a listed file uses more than recorded; fewer uses
+pass.
 
 States progress from `reserved` to `preparing` to `ready`,
 which can become `disconnected`, then back to `ready` after reconciliation.
@@ -5394,9 +5413,16 @@ records a checkout (`local_path`) that is not on disk at that moment and Forge
 holds no clone, the cleanup attempt fails with `repository … is not reachable
 right now` and nothing is removed: the worktree registration lives in that
 repository and can only be removed once it is back. The attempt is retried with
-the usual backoff and raises the cleanup attention item at the threshold. A
-Repo row that is gone, or one with no checkout and no clone, is still reclaimed
-at once.
+the usual backoff and raises the cleanup attention item at the threshold.
+"Away" is decided by what is on disk: the checkout's parent directory is
+missing too, or is an empty directory (an unmounted mount point). When the
+parent is there and holds other entries, the checkout itself was deleted or
+moved, its registrations went with it, and the Task root is reclaimed at once.
+The wait is bounded: seven days after the attention item was raised, the Task
+root is removed without the repository, the reason is written to the item's
+`details.settled`, and the success resolves it (`git worktree prune` in the
+repository drops the stale registration if it ever returns). A Repo row that
+is gone, or one with no checkout and no clone, is still reclaimed at once.
 A bounded sweep runs on startup and every ten minutes to backfill terminal Tasks,
 including missing worktrees and managed homes left by older installs. The
 deadline worker snapshots a bounded set of due rows before processing them, so

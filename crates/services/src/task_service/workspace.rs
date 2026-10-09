@@ -1748,6 +1748,16 @@ fn inject_worktree_probe_failure(path: &Path, failure: InjectedWorktreeProbeFail
         .insert(path.to_path_buf(), failure);
 }
 
+/// Whether a probe failure is waiting for `path`, so the workspace manager
+/// lets the probe report it instead of its own cheaper check.
+#[cfg(test)]
+pub(crate) fn worktree_probe_failure_injected(path: &Path) -> bool {
+    injected_worktree_probe_failures()
+        .lock()
+        .expect("worktree probe injection lock")
+        .contains_key(path)
+}
+
 #[cfg(test)]
 fn take_injected_worktree_probe_failure(path: &Path) -> Option<InjectedWorktreeProbeFailure> {
     injected_worktree_probe_failures()

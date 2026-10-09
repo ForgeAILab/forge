@@ -9,8 +9,17 @@ use crate::task_service::workspace::{
     tests::{seed_project_with_real_repo, seed_task, sqlite_db},
 };
 
-const REPAIRING: [Purpose; 5] = [
+const REPAIRING: [Purpose; 6] = [
     Purpose::Execute,
+    Purpose::Review,
+    Purpose::Check,
+    Purpose::Integrate,
+    Purpose::Hook,
+    Purpose::Reset,
+];
+
+/// Purposes that act on the candidate without being allowed to move it.
+const CANDIDATE: [Purpose; 4] = [
     Purpose::Review,
     Purpose::Check,
     Purpose::Integrate,
@@ -21,6 +30,9 @@ struct Fixture {
     db: SqliteDb,
     repo_dir: TempDir,
     root: TempDir,
+    /// The workspace root as Forge is configured with it: `root`, or a
+    /// symbolic link to it.
+    root_path: PathBuf,
     task: Task,
     workspace: Workspace,
     path: PathBuf,
@@ -29,25 +41,40 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::behind(None).await
+    }
+
+    /// `link`: reach the workspace root through this symbolic link, the way
+    /// `/tmp` and `/var` are reached on macOS.
+    async fn behind(link: Option<PathBuf>) -> Self {
         let db = sqlite_db().await;
         let repo_dir = TempDir::new().expect("repo dir creates");
         let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
         let root = TempDir::new().expect("workspace root creates");
+        let root_path = match link {
+            #[cfg(unix)]
+            Some(link) => {
+                std::os::unix::fs::symlink(root.path(), &link).expect("root link creates");
+                link
+            }
+            _ => root.path().to_path_buf(),
+        };
         let task = seed_task(&db, &project_id, None).await;
-        let workspace = prepare_workspace_for_test(&db, root.path(), &task, &task.id, None)
+        let workspace = prepare_workspace_for_test(&db, &root_path, &task, &task.id, None)
             .await
             .expect("workspace creates");
         assert_eq!(workspace.status, WorkspaceStatus::Ready);
         let path = PathBuf::from(workspace.embedded_worktree_path_for_backend());
         let router = crate::lifecycle::context::embedded_workspace_router_for_test(
             Arc::new(db.clone()),
-            root.path().to_path_buf(),
+            root_path.clone(),
             None,
         );
         Self {
             db,
             repo_dir,
             root,
+            root_path,
             task,
             workspace,
             path,
@@ -63,7 +90,7 @@ impl Fixture {
 
     async fn check(&self, purpose: Purpose) -> Result<ValidWorkspace, WorkspaceUnavailable> {
         let workspace = self.row().await.expect("workspace row exists");
-        WorkspaceManager::new(&self.db, self.root.path(), None, &self.router)
+        WorkspaceManager::new(&self.db, &self.root_path, None, &self.router)
             .ensure_valid(&self.task, workspace, purpose)
             .await
     }
@@ -296,6 +323,34 @@ async fn worktree_of_another_repository_is_moved_aside_and_recreated() {
     assert_eq!(fixture.siblings(), ["repo"]);
 }
 
+/// A worktree Git can still use is never left without its row. When it
+/// belongs to another repository and the recorded one no longer has the Task
+/// branch, the create-or-reuse path asks for the reset and keeps the row and
+/// the directory, with whatever work is in it.
+#[tokio::test]
+async fn usable_worktree_of_another_repository_is_never_forgotten() {
+    let fixture = Fixture::new().await;
+    let _other = replace_with_worktree_of_another_repository(&fixture);
+    std::fs::write(fixture.path.join("uncommitted.txt"), "work in progress").unwrap();
+    git(
+        fixture.repo_dir.path(),
+        &["update-ref", "-d", &fixture.task_ref()],
+    );
+
+    let workspace = fixture.row().await.expect("workspace row exists");
+    let result = WorkspaceManager::new(&fixture.db, &fixture.root_path, None, &fixture.router)
+        .ensure_valid_or_forget(&fixture.task, workspace, Purpose::Execute)
+        .await;
+
+    assert_reset_required(result, "are both gone");
+    assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
+    assert_eq!(fixture.siblings(), ["repo"]);
+    assert_eq!(
+        std::fs::read_to_string(fixture.path.join("uncommitted.txt")).unwrap(),
+        "work in progress"
+    );
+}
+
 /// Known gap, pinned so a change is deliberate: a directory that is a
 /// repository of its own (not a linked worktree) is accepted, as before. Many
 /// existing fixtures model a Task worktree that way.
@@ -318,8 +373,86 @@ async fn standalone_repository_at_the_recorded_path_is_still_accepted() {
     }
 }
 
+/// HEAD off the Task branch at the Task branch's own commit: checking the
+/// branch out changes no file, so every purpose that repairs does it, with
+/// local changes kept.
 #[tokio::test]
-async fn clean_worktree_off_the_task_branch_returns_to_it_only_for_execute() {
+async fn worktree_off_the_task_branch_at_its_commit_is_put_back_without_loss() {
+    for detach in [false, true] {
+        for purpose in [Purpose::Execute].into_iter().chain(CANDIDATE) {
+            let fixture = Fixture::new().await;
+            let switch: &[&str] = if detach {
+                &["checkout", "-q", "--detach"]
+            } else {
+                &["checkout", "-q", "-b", "elsewhere"]
+            };
+            git(&fixture.path, switch);
+            std::fs::write(fixture.path.join("uncommitted.txt"), "work in progress").unwrap();
+            let off = fixture.head_ref();
+            assert_ne!(off, fixture.task_ref());
+
+            let inspected = fixture
+                .check(Purpose::Inspect)
+                .await
+                .expect("inspect reads it");
+            assert!(!inspected.on_task_branch());
+            assert_eq!(fixture.head_ref(), off, "inspect never moves HEAD");
+
+            let valid = fixture.check(purpose).await.expect("put back");
+            assert_eq!(valid.repair(), Repair::CheckedOutTaskBranch, "{purpose:?}");
+            assert!(valid.on_task_branch());
+            assert_eq!(fixture.head_ref(), fixture.task_ref());
+            assert_eq!(
+                std::fs::read_to_string(fixture.path.join("uncommitted.txt")).unwrap(),
+                "work in progress",
+                "{purpose:?} keeps uncommitted work"
+            );
+        }
+    }
+}
+
+/// HEAD behind the Task branch: the checkout moves the tree. Only a launch
+/// does that, and only when the worktree is clean.
+#[tokio::test]
+async fn worktree_behind_the_task_branch_returns_to_it_only_for_a_clean_launch() {
+    let fixture = Fixture::new().await;
+    git(
+        &fixture.path,
+        &["commit", "-q", "--allow-empty", "-m", "task work"],
+    );
+    git(&fixture.path, &["checkout", "-q", "--detach", "HEAD~1"]);
+    let off = fixture.head_ref();
+
+    for purpose in CANDIDATE {
+        assert_reset_required(fixture.check(purpose).await, "candidate is not moved");
+        assert_eq!(fixture.head_ref(), off, "{purpose:?} never moves HEAD");
+    }
+
+    std::fs::write(fixture.path.join("uncommitted.txt"), "work in progress").unwrap();
+    assert_reset_required(fixture.check(Purpose::Execute).await, "uncommitted changes");
+    assert_eq!(fixture.head_ref(), off);
+    assert!(fixture.path.join("uncommitted.txt").exists());
+    assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
+    let error = ServiceError::from(fixture.check(Purpose::Execute).await.err().unwrap());
+    assert!(matches!(
+        error,
+        ServiceError::WorkspaceResetRequired { ref task_id, .. } if *task_id == fixture.task.id
+    ));
+
+    std::fs::remove_file(fixture.path.join("uncommitted.txt")).unwrap();
+    let valid = fixture
+        .check(Purpose::Execute)
+        .await
+        .expect("a clean launch checks out");
+    assert_eq!(valid.repair(), Repair::CheckedOutTaskBranch);
+    assert_eq!(fixture.head_ref(), fixture.task_ref());
+}
+
+/// Commits made on a detached HEAD or another branch are not on the Task
+/// branch. Checking the Task branch out would leave them unreachable and the
+/// Task would finish without them, so no purpose does it.
+#[tokio::test]
+async fn commits_off_the_task_branch_are_never_left_behind_by_a_checkout() {
     for detach in [false, true] {
         let fixture = Fixture::new().await;
         let switch: &[&str] = if detach {
@@ -328,51 +461,86 @@ async fn clean_worktree_off_the_task_branch_returns_to_it_only_for_execute() {
             &["checkout", "-q", "-b", "elsewhere"]
         };
         git(&fixture.path, switch);
+        std::fs::write(fixture.path.join("work.txt"), "the Task's work").unwrap();
+        git(&fixture.path, &["add", "work.txt"]);
+        git(
+            &fixture.path,
+            &["commit", "-q", "-m", "work off the branch"],
+        );
         let off = fixture.head_ref();
-        assert_ne!(off, fixture.task_ref());
+        let commit = git(&fixture.path, &["rev-parse", "HEAD"]);
 
-        for purpose in [
-            Purpose::Review,
-            Purpose::Check,
-            Purpose::Integrate,
-            Purpose::Hook,
-        ] {
-            assert_reset_required(fixture.check(purpose).await, "not on Task branch");
+        for purpose in [Purpose::Execute].into_iter().chain(CANDIDATE) {
+            assert_reset_required(
+                fixture.check(purpose).await,
+                "1 commit(s) that are not on the Task branch",
+            );
             assert_eq!(fixture.head_ref(), off, "{purpose:?} never moves HEAD");
+            assert_eq!(git(&fixture.path, &["rev-parse", "HEAD"]), commit);
         }
-        let inspected = fixture
-            .check(Purpose::Inspect)
-            .await
-            .expect("inspect reads it");
-        assert!(!inspected.on_task_branch());
-        assert_eq!(fixture.head_ref(), off);
-
-        let valid = fixture
-            .check(Purpose::Execute)
-            .await
-            .expect("execute checks out");
-        assert_eq!(valid.repair(), Repair::CheckedOutTaskBranch);
-        assert!(valid.on_task_branch());
-        assert_eq!(fixture.head_ref(), fixture.task_ref());
+        assert!(fixture.path.join("work.txt").exists());
+        assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
     }
 }
 
+/// The reassignment reset discards uncommitted work at the current HEAD. It
+/// is handed a worktree off the Task branch as it is, dirty or not.
 #[tokio::test]
-async fn dirty_worktree_off_the_task_branch_needs_a_reset() {
+async fn reset_purpose_accepts_a_dirty_worktree_off_the_task_branch() {
     let fixture = Fixture::new().await;
     git(&fixture.path, &["checkout", "-q", "-b", "elsewhere"]);
+    git(
+        &fixture.path,
+        &["commit", "-q", "--allow-empty", "-m", "work off the branch"],
+    );
     std::fs::write(fixture.path.join("uncommitted.txt"), "work in progress").unwrap();
+    let commit = git(&fixture.path, &["rev-parse", "HEAD"]);
 
-    assert_reset_required(fixture.check(Purpose::Execute).await, "uncommitted changes");
+    let valid = fixture
+        .check(Purpose::Reset)
+        .await
+        .expect("the reset path is not refused");
+    assert_eq!(valid.repair(), Repair::None);
+    assert!(!valid.on_task_branch());
+    assert_eq!(valid.path(), Some(fixture.path.as_path()));
     assert_eq!(fixture.head_ref(), "refs/heads/elsewhere");
+    assert_eq!(git(&fixture.path, &["rev-parse", "HEAD"]), commit);
     assert!(fixture.path.join("uncommitted.txt").exists());
-    assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
+}
 
-    let error = ServiceError::from(fixture.check(Purpose::Execute).await.err().unwrap());
-    assert!(matches!(
-        error,
-        ServiceError::WorkspaceResetRequired { ref task_id, .. } if *task_id == fixture.task.id
-    ));
+/// A workspace root behind a symbolic link (`/tmp` and `/var` on macOS, a
+/// relocated data directory) is an ordinary root: only the Task root and the
+/// worktree themselves must be real directories.
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_root_behind_a_symbolic_link_is_healthy_and_repairable() {
+    let links = TempDir::new().expect("link dir creates");
+    let fixture = Fixture::behind(Some(links.path().join("root-link"))).await;
+    assert!(
+        fixture.path.starts_with(links.path()),
+        "the recorded path runs through the link: {}",
+        fixture.path.display()
+    );
+    assert!(!fixture.path.starts_with(fixture.root.path()));
+
+    for purpose in REPAIRING.into_iter().chain([Purpose::Inspect]) {
+        let valid = fixture.check(purpose).await.expect("healthy behind a link");
+        assert_eq!(valid.repair(), Repair::None, "{purpose:?}");
+        assert!(valid.on_task_branch(), "{purpose:?}");
+        assert_eq!(valid.path(), Some(fixture.path.as_path()));
+    }
+
+    std::fs::remove_dir_all(&fixture.path).unwrap();
+    let valid = fixture
+        .check(Purpose::Execute)
+        .await
+        .expect("recreated behind a link");
+    assert_eq!(valid.repair(), Repair::Recovered);
+    assert!(fixture.path.join(".git").exists());
+    fixture
+        .check(Purpose::Review)
+        .await
+        .expect("healthy after the repair");
 }
 
 /// Git detaches HEAD for the length of a rebase. The rebase owner aborts or
@@ -615,13 +783,16 @@ const RAW_PATH_GETTERS: [&str; 3] = [
     "recorded_server_path(",
 ];
 
-/// Non-test uses of a raw path getter, per file, relative to `crates/`.
+/// Non-test uses of a raw path getter, per file, relative to `crates/`: an
+/// upper bound for each file that still has any.
 ///
 /// The first group is the manager and the owner-local backend it is built
 /// on. The second group is callers that still take an unchecked path and are
-/// converted by the stage named beside them. Adding a caller anywhere fails
-/// this test: go through `WorkspaceManager::ensure_valid` instead. Converting
-/// one fails it too, until its entry here is lowered or removed.
+/// converted by the stage named beside them. A raw getter in a file that is
+/// not listed, or more uses in a listed file than recorded, fails this test:
+/// go through `WorkspaceManager::ensure_valid` instead. Fewer uses pass, so
+/// converting a caller or refactoring one of these files needs no edit here;
+/// lower the entry when convenient.
 const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     // Manager and backend internals.
     ("services/src/workspace_manager.rs", 2),
@@ -635,7 +806,6 @@ const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     ("services/src/task_service/execution.rs", 1), // 3.4 C
     ("services/src/task_service/execution/runner.rs", 7), // 3.4 C
     // Pending conversion: 3.4 B part 2.
-    ("services/src/embedded_task_executor.rs", 1),
     ("services/src/lifecycle/plugin.rs", 1),
     ("services/src/native_tools.rs", 1),
     ("services/src/plan_artifact.rs", 5),
@@ -723,16 +893,41 @@ fn raw_workspace_path_getters_have_no_new_callers() {
         scan_raw_path_uses(crates, &crates.join(source), &mut found);
     }
     found.sort();
-    let mut expected = RAW_PATH_CALLERS
+    let over = raw_path_callers_over_the_bound(&found);
+    assert!(
+        over.is_empty(),
+        "raw workspace path getters ({RAW_PATH_GETTERS:?}) have new callers: {over:?} \
+         (file, uses found, uses recorded). Take the path from \
+         WorkspaceManager::ensure_valid."
+    );
+}
+
+/// Files whose raw getter uses exceed their recorded bound (0 when unlisted).
+fn raw_path_callers_over_the_bound(found: &[(String, usize)]) -> Vec<(String, usize, usize)> {
+    found
         .iter()
-        .map(|(file, uses)| ((*file).to_owned(), *uses))
-        .collect::<Vec<_>>();
-    expected.sort();
+        .filter_map(|(file, uses)| {
+            let recorded = RAW_PATH_CALLERS
+                .iter()
+                .find(|(listed, _)| listed == file)
+                .map_or(0, |(_, recorded)| *recorded);
+            (*uses > recorded).then(|| (file.clone(), *uses, recorded))
+        })
+        .collect()
+}
+
+#[test]
+fn raw_path_gate_allows_fewer_uses_and_refuses_more_or_new_files() {
+    let (listed, recorded) = RAW_PATH_CALLERS[0];
+    assert!(raw_path_callers_over_the_bound(&[(listed.to_owned(), recorded)]).is_empty());
+    assert!(raw_path_callers_over_the_bound(&[(listed.to_owned(), recorded - 1)]).is_empty());
     assert_eq!(
-        found, expected,
-        "raw workspace path getters ({RAW_PATH_GETTERS:?}) are used outside the recorded \
-         callers. Take the path from WorkspaceManager::ensure_valid; if a caller was \
-         converted, lower its entry in RAW_PATH_CALLERS."
+        raw_path_callers_over_the_bound(&[(listed.to_owned(), recorded + 1)]),
+        [(listed.to_owned(), recorded + 1, recorded)]
+    );
+    assert_eq!(
+        raw_path_callers_over_the_bound(&[("services/src/new_caller.rs".to_owned(), 1)]),
+        [("services/src/new_caller.rs".to_owned(), 1, 0)]
     );
 }
 

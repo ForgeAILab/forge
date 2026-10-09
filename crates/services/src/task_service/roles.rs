@@ -1062,15 +1062,17 @@ impl TaskService {
             .ok_or_else(|| ServiceError::not_found("workspace", task.id.clone()))?;
             let resolved = self.resolve_task_workspace(&workspace).await?;
             if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
-                // The reassigned worker launches here next: validate it as a
-                // launch, then discard the previous worker's uncommitted work.
+                // The reassigned worker launches here next. `Reset` repairs
+                // a missing or unusable worktree and accepts one whose HEAD
+                // is off the Task branch: discarding the previous worker's
+                // uncommitted work at the current HEAD is this path's job.
                 let valid = crate::workspace_manager::WorkspaceManager::new(
                     &self.db,
                     &self.workspace_root,
                     self.repo_cache_locks.clone(),
                     &self.workspace_backend_router,
                 )
-                .ensure_valid(task, workspace, crate::workspace_manager::Purpose::Execute)
+                .ensure_valid(task, workspace, crate::workspace_manager::Purpose::Reset)
                 .await?;
                 let worktree_path = valid.path().ok_or_else(|| {
                     ServiceError::invalid_operation("server workspace has no validated path")
