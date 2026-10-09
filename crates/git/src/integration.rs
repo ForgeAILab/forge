@@ -162,6 +162,10 @@ pub const MAX_OBJECT_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
 /// The only ref namespace an object import may write.
 pub const INTEGRATION_REF_PREFIX: &str = "refs/forge/integration/";
 const EXPORT_REF_PREFIX: &str = "refs/forge/export/";
+const QUARANTINE_PREFIX: &str = "forge-incoming-";
+/// A ref write runs the repository's `reference-transaction` hook. A transfer
+/// must not run repository code, so its ref writes disable hooks.
+const NO_HOOKS: [&str; 2] = ["-c", "core.hooksPath=/dev/null"];
 
 /// Why an object transfer was refused. Every refusal leaves the repository's
 /// refs, object store and work tree as they were.
@@ -291,7 +295,7 @@ struct ExportRef<'a> {
 impl Drop for ExportRef<'_> {
     fn drop(&mut self) {
         let _ = std::process::Command::new("git")
-            .args(["update-ref", "-d", &self.name])
+            .args([NO_HOOKS[0], NO_HOOKS[1], "update-ref", "-d", &self.name])
             .current_dir(self.repo)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -301,6 +305,57 @@ impl Drop for ExportRef<'_> {
             .stderr(std::process::Stdio::null())
             .status();
     }
+}
+
+/// Remove what a crashed transfer can leave in a repository: export pin refs
+/// (`refs/forge/export/*`) and import quarantine directories. Call it only
+/// when no transfer is running on the repository (owner start). It touches
+/// no branch, tag, imported `refs/forge/integration/*` ref or work tree.
+/// Returns how many leftovers were removed.
+pub fn sweep_transfer_leftovers(repo: &Path) -> usize {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let mut removed = 0;
+    if let Some(refs) = git(&["for-each-ref", "--format=%(refname)", EXPORT_REF_PREFIX]) {
+        for name in refs
+            .lines()
+            .filter(|name| name.starts_with(EXPORT_REF_PREFIX))
+        {
+            if git(&[NO_HOOKS[0], NO_HOOKS[1], "update-ref", "-d", name]).is_some() {
+                removed += 1;
+            }
+        }
+    }
+    let Some(common) = git(&["rev-parse", "--git-common-dir"]) else {
+        return removed;
+    };
+    let common = repo.join(common.trim());
+    if let Ok(entries) = std::fs::read_dir(&common) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(QUARANTINE_PREFIX)
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && std::fs::remove_dir_all(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 /// The receipt of an import that already happened for this key, if any.
@@ -336,6 +391,11 @@ pub async fn export_objects(
     if !commit_exists(repo, want).await? {
         return Err(ObjectTransferError::MissingObject { sha: want.into() });
     }
+    if let Some(bad) = have.iter().find(|sha| !is_object_id(sha)) {
+        return Err(ObjectTransferError::Invalid {
+            reason: format!("`have` entry is not a full object id: {bad:.80}"),
+        });
+    }
     // A commit the source does not hold cannot be a bundle prerequisite.
     let mut exclusions = Vec::new();
     for sha in have {
@@ -363,7 +423,11 @@ pub async fn export_objects(
         repo,
         name: export_ref.clone(),
     };
-    let output = crate::command_output(repo, &["update-ref", &pinned.name, want]).await?;
+    let output = crate::command_output(
+        repo,
+        &[NO_HOOKS[0], NO_HOOKS[1], "update-ref", &pinned.name, want],
+    )
+    .await?;
     if !output.status.success() {
         return Err(invalid("could not pin the exported commit", &output));
     }
@@ -470,7 +534,7 @@ pub async fn import_objects(
             .unwrap_or_default();
         let quarantine = RemoveOnDrop {
             path: common.join(format!(
-                "forge-incoming-{key}-{}-{nonce}",
+                "{QUARANTINE_PREFIX}{key}-{}-{nonce}",
                 std::process::id()
             )),
             armed: true,
@@ -570,8 +634,18 @@ pub async fn import_objects(
     }
     // Create-only: a concurrent import of another object under this key loses.
     let zero = "0".repeat(expected_tip.len());
-    let output =
-        crate::command_output(repo, &["update-ref", &ref_name, expected_tip, &zero]).await?;
+    let output = crate::command_output(
+        repo,
+        &[
+            NO_HOOKS[0],
+            NO_HOOKS[1],
+            "update-ref",
+            &ref_name,
+            expected_tip,
+            &zero,
+        ],
+    )
+    .await?;
     if !output.status.success() {
         return match imported_objects(repo, key, expected_tip).await? {
             Some(replay) => Ok(replay),
@@ -942,5 +1016,163 @@ mod transfer_tests {
             }
         }
         assert!(cancelled > 0, "no run was cancelled");
+    }
+
+    /// A hook that would fire on any ref write or object arrival.
+    fn arm_hooks(repo: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for name in [
+            "reference-transaction",
+            "post-update",
+            "pre-receive",
+            "update",
+            "post-receive",
+            "post-checkout",
+            "post-merge",
+        ] {
+            let path = hooks.join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\necho {name} >> '{}'\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transfer_runs_no_repository_hook_or_configured_program() {
+        let pair = pair();
+        let marker = pair.staging.join("ran");
+        for repo in [&pair.source, &pair.target] {
+            arm_hooks(repo, &marker);
+            // Configuration that names a program: none of it may be started.
+            for (key, value) in [
+                ("core.fsmonitor", "touch"),
+                ("core.sshCommand", "touch"),
+                ("uploadpack.packObjectsHook", "touch"),
+                ("filter.x.clean", "touch"),
+                ("filter.x.smudge", "touch"),
+            ] {
+                let value = format!("{value} '{}' #", marker.display());
+                git(repo, &["config", key, &value]);
+            }
+        }
+        let bundle = pair.staging.join("a.bundle");
+        let have = vec![pair.base.clone()];
+        export_objects(&pair.source, "k", &have, &pair.tip, &bundle, u64::MAX)
+            .await
+            .unwrap();
+        import_objects(&pair.target, "k", Some(&bundle), &pair.tip, u64::MAX)
+            .await
+            .unwrap();
+        import_objects(&pair.target, "k", Some(&bundle), &pair.tip, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(sweep_transfer_leftovers(&pair.source), 0);
+        assert!(
+            !marker.exists(),
+            "ran: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_have_and_want_are_refused_before_git_reads_them() {
+        let pair = pair();
+        let bundle = pair.staging.join("a.bundle");
+        for have in ["--all", "main", "HEAD~1", "../x", &pair.base[..39]] {
+            let result = export_objects(
+                &pair.source,
+                "k",
+                &[have.to_owned()],
+                &pair.tip,
+                &bundle,
+                u64::MAX,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ObjectTransferError::Invalid { .. })),
+                "{have}: {result:?}"
+            );
+        }
+        for want in ["--all", "main", "refs/heads/main", ""] {
+            let result = export_objects(&pair.source, "k", &[], want, &bundle, u64::MAX).await;
+            assert!(
+                matches!(result, Err(ObjectTransferError::MissingObject { .. })),
+                "{want}: {result:?}"
+            );
+        }
+        assert!(!bundle.exists());
+        assert_eq!(git(&pair.source, &["for-each-ref", "refs/forge"]), "");
+    }
+
+    #[tokio::test]
+    async fn the_start_sweep_removes_crash_leftovers_and_nothing_else() {
+        let pair = pair();
+        let bundle = pair.staging.join("a.bundle");
+        export_objects(&pair.source, "k", &[], &pair.tip, &bundle, u64::MAX)
+            .await
+            .unwrap();
+        import_objects(&pair.target, "k", Some(&bundle), &pair.tip, u64::MAX)
+            .await
+            .unwrap();
+        let clean = snapshot(&pair.target);
+        // What a process killed mid-export and mid-import leaves behind.
+        git(
+            &pair.target,
+            &["update-ref", "refs/forge/export/dead", &pair.base],
+        );
+        let quarantine = pair.target.join(".git/forge-incoming-dead-1-2");
+        std::fs::create_dir_all(quarantine.join("pack")).unwrap();
+        std::fs::write(quarantine.join("pack/x.pack"), b"partial").unwrap();
+        assert_ne!(snapshot(&pair.target), clean);
+        assert_eq!(sweep_transfer_leftovers(&pair.target), 2);
+        assert_eq!(snapshot(&pair.target), clean);
+        assert_eq!(sweep_transfer_leftovers(&pair.target), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_imports_of_one_key_bind_one_ref_and_the_rest_replay() {
+        let pair = pair();
+        let bundle = pair.staging.join("a.bundle");
+        export_objects(&pair.source, "k", &[], &pair.tip, &bundle, u64::MAX)
+            .await
+            .unwrap();
+        let mut runs = Vec::new();
+        for _ in 0..4 {
+            let (target, bundle, tip) = (pair.target.clone(), bundle.clone(), pair.tip.clone());
+            runs.push(tokio::spawn(async move {
+                import_objects(&target, "k", Some(&bundle), &tip, u64::MAX).await
+            }));
+        }
+        let mut fresh = 0;
+        for run in runs {
+            let import = run.await.unwrap().unwrap();
+            assert_eq!(import.tip_sha, pair.tip);
+            fresh += usize::from(!import.replayed);
+        }
+        assert_eq!(fresh, 1, "exactly one import binds the ref");
+        git(&pair.target, &["fsck", "--strict", "--no-dangling"]);
+        assert_eq!(
+            git(
+                &pair.target,
+                &["for-each-ref", "--format=%(refname)", "refs/forge"]
+            ),
+            "refs/forge/integration/k"
+        );
+        // Another object under the same key is a conflict, never a move.
+        assert!(matches!(
+            import_objects(&pair.target, "k", None, &pair.base, u64::MAX).await,
+            Err(ObjectTransferError::KeyConflict { .. })
+        ));
+        let leftovers: Vec<_> = std::fs::read_dir(pair.target.join(".git"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("forge-incoming-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 }

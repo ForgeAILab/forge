@@ -25,9 +25,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   nothing out). A queue attempt lookup now also returns `owner_fence`, which
   says whether the machine can vouch that an effect was not performed
   (`not_performed`) or cannot (`unknown`, kept as an uncertain result; Forge
-  never guesses a merge result). `journal.ack` of a queue attempt entry no
+  never guesses a merge result). The server announces a claim before it
+  marks any effect of it started, so `unknown` only arises when a machine
+  lost its state, never for a frame that simply did not arrive. An
+  interrupted transfer is restarted from its first chunk, not resumed. The
+  transfer runs no repository hook. `journal.ack` of a queue attempt entry no
   longer keeps the entry forever: it is deleted once a newer claim of the
-  same queue is recorded. The on-disk daemon journal needs no conversion:
+  same queue is recorded, or 7 days after the acknowledgement. Staging under
+  `.forge/transfer` and leftovers of a killed transfer are removed when the
+  daemon starts. The on-disk daemon journal needs no conversion:
   revision-5 entries, including in-flight integration intents, are read
   unchanged.
 - **A subtask can no longer be created under a parent in review, integrating

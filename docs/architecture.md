@@ -5168,38 +5168,66 @@ not call any of it. It adds what the worker needs from an owner.
   generation, so its empty journal proves nothing: lost or replaced owner
   state). For `unknown` the daemon retains an `uncertain` receipt, so asking
   again never turns it into `not_performed`, and the server records the effect
-  as uncertain. Forge never guesses a merge result. The worker must therefore
-  announce every claim generation before its first effect; a claim that was
-  never announced and whose first effect frame was lost reads as `unknown`.
+  as uncertain. Forge never guesses a merge result. The rule that keeps a
+  healthy merge from ever reading as `unknown`: the queue transport
+  (`DaemonWorkspaceClient::integration_effect`) sends the announcement itself,
+  before the intent is marked started. So when a started effect is looked up,
+  the daemon was told of its generation: a frame that never arrived reads
+  `not_performed`, and `unknown` can only mean the daemon's registry was lost
+  or replaced. A refused or undelivered announcement leaves no intent. Today's
+  merges are Task-step effects, not queue attempts: their lookups carry no
+  `owner_fence` and behave as before.
 - *Journal retention.* `journal.ack` for a queue attempt entry marks it
   acknowledged (no longer replayed to the server) and clears the checkout's
   pending marker. The entry is deleted when the queue's fence passes its
-  generation, or when the queue's fence is dropped (its key then gets a 7-day
-  cancellation tombstone). Fences are dropped when the server's
-  `live_queue_ids` no longer lists their queue, and as the least recently
-  recorded past 1024 fences. Pending markers of settled operations are dropped
-  on every acknowledgement and announcement. A revision-5 journal needs no
-  conversion; an in-flight attempt intent and its fence are read unchanged.
+  generation, when the queue's fence is dropped, or 7 days after the
+  acknowledgement for a queue that never claims again (in the last two cases
+  its key gets a 7-day cancellation tombstone, so a late duplicate is refused
+  and not run). Acknowledged receipts do not count against the pending-entry
+  bound. Fences are dropped when the server's `live_queue_ids` no longer lists
+  their queue (the announced queue always stays), and as the least recently
+  recorded past 1024 fences. A fence is never dropped, by either rule, while
+  its queue has a journal entry the server has not acknowledged: dropping it
+  would let an older claim in and turn a lookup into `unknown`. Such fences
+  are bounded by the journal's own entry bound. Pending markers of settled
+  operations are dropped on every acknowledgement and announcement. A
+  revision-5 journal needs no conversion; an in-flight attempt intent and its
+  fence are read unchanged.
 - *Object transfer.* A Task placed on a non-default checkout will be merged
   into the repository's default checkout (stage D2). Its commits travel as a
   thin Git bundle: `export_objects` on the source owner, `import_objects` on
   the target owner, one algorithm (`git::integration`) for the server owner
   (local) and the daemon (`integration.export_objects`,
   `integration.import_objects`, `integration.release_objects`, 1 MiB chunks,
-  staging under `.forge/transfer`, removed on release and after 24 hours). The
-  cap is 256 MiB; a larger transfer is refused `too_large` before any byte is
-  stored on the target. The import checks size and SHA-256, runs `git bundle
-  verify`, unpacks into a quarantine directory inside the Git directory,
-  re-checks the pack with `git index-pack --strict`, requires the expected tip
-  and full connectivity, and only then moves the pack into the object store
-  and creates `refs/forge/integration/<key>` (create-only). Ref names inside
-  the bundle are never used, no other ref moves, nothing is checked out. The
-  key is `<attempt>-<generation>-in|out`; an import whose ref already names
-  the expected tip returns its receipt (`replayed`) without reading or
+  staging under `.forge/transfer`, removed on release, after 24 hours and at
+  daemon start). The cap is 256 MiB; a larger transfer is refused `too_large`
+  before any byte is stored on the target, and a chunk that runs past the
+  declared size is refused before it is written. Chunks arrive in order; a
+  transfer is never resumed part way: after a lost connection or a daemon
+  restart the sender starts the key again from its first chunk and the owner
+  drops what it had staged. The import checks size and SHA-256, runs `git
+  bundle verify`, unpacks into a quarantine directory inside the Git
+  directory, re-checks the pack with `git index-pack --strict`, requires the
+  expected tip and full connectivity, and only then moves the pack into the
+  object store and creates `refs/forge/integration/<key>` (create-only: of two
+  concurrent imports of a key one binds the ref and the other replays). Ref
+  names inside the bundle are never used, no other ref moves, nothing is
+  checked out, and the index and work tree are not read. `have` and `want`
+  must be full object ids. The ref writes run with hooks disabled
+  (`core.hooksPath=/dev/null`), so no repository hook runs; none of the Git
+  commands used starts a program named in repository configuration. The key
+  is `<attempt>-<generation>-in|out`; an import whose ref already names the
+  expected tip returns its receipt (`replayed`) without reading or
   transferring anything. A refused, failed or cancelled transfer leaves both
-  repositories unchanged and no temporary file. Transfers carry the queue
-  fence (stale claims are refused) but are not journaled effects and write no
-  attempt receipt: the Git ref is the receipt.
+  repositories unchanged and no temporary file. A killed process can leave
+  an export pin ref (`refs/forge/export/<key>`) or a quarantine directory
+  (`forge-incoming-*` in the Git directory): the daemon removes both from
+  every verified checkout when it starts
+  (`git::integration::sweep_transfer_leftovers`); the server owner does not
+  call that sweep yet (stage D1d). Transfers carry the queue fence (stale
+  claims are refused) but are not journaled effects and write no attempt
+  receipt: the Git ref is the receipt. Imported refs are not deleted by this
+  stage; stage D2 deletes them when the attempt ends.
 
 The existing `V202610082317__integration_fencing.sql` columns retain their bounds:
 16 KiB fence, 64 KiB intent, 128 KiB per receipt, 1 MiB receipt array. This stage

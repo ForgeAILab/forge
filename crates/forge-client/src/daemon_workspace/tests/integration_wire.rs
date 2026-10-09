@@ -850,3 +850,283 @@ async fn object_transfer_refusals_leave_the_target_and_staging_untouched() {
     assert!(transfer.staging().is_empty());
     assert_eq!(transfer.target().await, before);
 }
+
+/// Make every journal entry look as if it was last written `age` ago.
+fn age_journal(fixture: &Fixture, age: Duration) {
+    for entry in std::fs::read_dir(fixture.journal.directory()).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("entry-"))
+        {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+        }
+    }
+}
+
+/// A queue whose effect the server has not acknowledged keeps its fence at
+/// the 1025th queue and when the server's live list leaves it out: its old
+/// claim stays refused and its lookup never turns "unknown".
+#[tokio::test]
+async fn a_queue_with_unacknowledged_work_keeps_its_fence_past_every_bound() {
+    let fixture = Fixture::new().await;
+    let head = git::get_current_sha(fixture.path()).await.unwrap();
+    let request = attempt_request(
+        &fixture,
+        &head,
+        &head,
+        2,
+        WorkspaceIntegrationKind::FastForward,
+    );
+    let queue = request.fence.queue_id.clone();
+    announce(&fixture.backend, &request.fence, None)
+        .await
+        .unwrap();
+    let mut intent = attempt_merge_params(&fixture, request.clone());
+    intent.merge.fence.operation_id = request.operation_id();
+    retain_intent(
+        &fixture,
+        METHOD_WORKSPACE_MERGE,
+        serde_json::to_value(intent).unwrap(),
+    );
+    {
+        let mut state = fixture.backend.state.lock().unwrap();
+        // The busy queue is the least recently recorded of all.
+        state.integration_fence_seen.insert(queue.clone(), 0);
+        for index in 0..integration_owner::MAX_INTEGRATION_FENCES + 5 {
+            let mut fence = request.fence.clone();
+            fence.queue_id = format!("bulk-{index:05}");
+            state
+                .advance_integration_fence(&fence, 1_000 + index as u64)
+                .unwrap();
+        }
+    }
+    let mut newest = request.fence.clone();
+    newest.queue_id = "queue-new".into();
+    let result = announce(&fixture.backend, &newest, None).await.unwrap();
+    assert_eq!(result.pruned_fences, 7);
+    {
+        let state = fixture.backend.state.lock().unwrap();
+        assert_eq!(
+            state.integration_fences.len(),
+            integration_owner::MAX_INTEGRATION_FENCES
+        );
+        assert_eq!(state.integration_fences[&queue], request.fence);
+        assert!(!state.integration_fences.contains_key("bulk-00006"));
+        assert!(state.integration_fences.contains_key("bulk-00007"));
+    }
+    // A live list that omits the busy queue (and the announced one).
+    let result = announce(&fixture.backend, &newest, Some(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.pruned_fences as usize,
+        integration_owner::MAX_INTEGRATION_FENCES - 2
+    );
+    let restarted = restart(&fixture);
+    {
+        let state = restarted.state.lock().unwrap();
+        let mut kept: Vec<_> = state.integration_fences.keys().cloned().collect();
+        kept.sort();
+        assert_eq!(kept, vec![queue.clone(), "queue-new".to_owned()]);
+    }
+    // The older claim of the busy queue is still fenced off.
+    let mut older = request.fence.clone();
+    older.generation = 1;
+    let refused = announce(&restarted, &older, None).await.unwrap_err();
+    assert_eq!(refused.details.unwrap()["refusal"], "stale_fence");
+    let found = lookup(&restarted, &fixture, &request).await;
+    let announcement = found.owner_fence.unwrap();
+    assert_eq!(announcement.generation, Some(2));
+    assert_ne!(announcement.intent, IntegrationIntentRecord::Unknown);
+}
+
+/// A queue that never claims again does not keep its acknowledged receipt
+/// for ever: after the retention it is replaced by a tombstone, so the
+/// journal of a long-lived daemon with many idle queues stays bounded.
+#[tokio::test]
+async fn an_idle_queue_receipt_expires_into_a_tombstone() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.path().join("candidate"), "candidate\n").unwrap();
+    let head = git::commit_all(fixture.path(), "candidate").await.unwrap();
+    let target = git::get_current_sha(&fixture.repo).await.unwrap();
+    let request = attempt_request(
+        &fixture,
+        &head,
+        &target,
+        1,
+        WorkspaceIntegrationKind::FastForward,
+    );
+    let operation_id = request.operation_id();
+    let params = serde_json::to_value(attempt_merge_params(&fixture, request.clone())).unwrap();
+    let first = fixture
+        .backend
+        .handle(METHOD_WORKSPACE_MERGE, params.clone(), Vec::new)
+        .await
+        .unwrap();
+    let ack = JournalAckParams {
+        entry_id: first["entry_id"].as_str().unwrap().into(),
+    };
+    fixture.backend.acknowledge_journal(&ack).await.unwrap();
+    // Inside the retention a repeated acknowledgement prunes nothing.
+    age_journal(&fixture, Duration::from_secs(6 * 24 * 60 * 60));
+    fixture.backend.acknowledge_journal(&ack).await.unwrap();
+    assert!(fixture.journal.operation(&operation_id).unwrap().is_some());
+    age_journal(&fixture, Duration::from_secs(8 * 24 * 60 * 60));
+    let mut other = request.fence.clone();
+    other.queue_id = "queue-other".into();
+    let announced = announce(&fixture.backend, &other, None).await.unwrap();
+    assert_eq!(announced.pruned_entries, 1);
+    assert!(fixture.journal.operation(&operation_id).unwrap().is_none());
+    // The queue's fence stays; a late duplicate of the key is not run again.
+    assert!(fixture
+        .backend
+        .state
+        .lock()
+        .unwrap()
+        .integration_fences
+        .contains_key(&request.fence.queue_id));
+    let reflog = local_git(&fixture.repo, &["reflog", "--all"])
+        .await
+        .unwrap();
+    assert!(fixture
+        .backend
+        .handle(METHOD_WORKSPACE_MERGE, params, Vec::new)
+        .await
+        .is_err());
+    assert_eq!(
+        local_git(&fixture.repo, &["reflog", "--all"])
+            .await
+            .unwrap(),
+        reflog
+    );
+}
+
+async fn send_chunk(
+    transfer: &Transfer,
+    backend: &DaemonWorkspaceBackend,
+    key: &str,
+    chunk: ObjectChunk,
+) -> CommandResult<ImportObjectsResult> {
+    call(
+        backend,
+        METHOD_INTEGRATION_IMPORT_OBJECTS,
+        transfer.import(key, Some(chunk)),
+    )
+    .await
+}
+
+/// The connection drops after the first chunk; then the daemon restarts.
+/// Nothing staged survives the restart, crash leftovers in the checkout are
+/// swept, a tail without its head is refused, and the sender's restart from
+/// the first chunk imports the exact object.
+#[tokio::test]
+async fn an_interrupted_transfer_restarts_from_its_first_chunk() {
+    let transfer = transfer().await;
+    let backend = &transfer.fixture.backend;
+    let key = "attempt-1-1-out";
+    let first: ExportObjectsResult = call(
+        backend,
+        METHOD_INTEGRATION_EXPORT_OBJECTS,
+        transfer.export(key, MAX_OBJECT_TRANSFER_BYTES, 0),
+    )
+    .await
+    .unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&first.data)
+        .unwrap();
+    let middle = bytes.len() / 2;
+    let chunk = |range: std::ops::Range<usize>, last| ObjectChunk {
+        total_bytes: first.receipt.total_bytes,
+        sha256: first.receipt.sha256.clone(),
+        offset: range.start as u64,
+        data: base64::engine::general_purpose::STANDARD.encode(&bytes[range]),
+        last,
+    };
+    let clean = transfer.target().await;
+    assert_eq!(
+        send_chunk(&transfer, backend, key, chunk(0..middle, false))
+            .await
+            .unwrap(),
+        ImportObjectsResult::Receiving {
+            received_bytes: middle as u64
+        }
+    );
+    // Same daemon, new connection: the sender starts over and the chunk
+    // that was already stored is replaced, not appended.
+    assert_eq!(
+        send_chunk(&transfer, backend, key, chunk(0..middle, false))
+            .await
+            .unwrap(),
+        ImportObjectsResult::Receiving {
+            received_bytes: middle as u64
+        }
+    );
+    assert!(transfer
+        .staging()
+        .iter()
+        .any(|name| name.ends_with(".part")));
+    // A daemon killed mid-export and mid-import leaves these in a checkout.
+    let clone = transfer.fixture.dir.path().join("secondary");
+    local_git(
+        &clone,
+        &["update-ref", "refs/forge/export/dead", &transfer.base],
+    )
+    .await
+    .unwrap();
+    let quarantine = clone.join(".git/forge-incoming-dead-1-2");
+    std::fs::create_dir_all(quarantine.join("pack")).unwrap();
+    let restarted = restart(&transfer.fixture);
+    assert!(transfer.staging().is_empty(), "{:?}", transfer.staging());
+    assert!(!quarantine.exists());
+    assert_eq!(transfer.target().await, clean);
+    // A tail without its head, a chunk past the declared size and an
+    // offset that overflows are refused and stage nothing.
+    let mut long = chunk(0..middle, false);
+    long.total_bytes = middle as u64 - 1;
+    let mut wrapped = chunk(0..middle, false);
+    wrapped.offset = u64::MAX;
+    for bad in [chunk(middle..bytes.len(), true), long, wrapped] {
+        let refused = send_chunk(&transfer, &restarted, key, bad)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refusal_of(refused),
+            ObjectTransferRefusal::Invalid { .. }
+        ));
+        assert!(transfer.staging().is_empty(), "{:?}", transfer.staging());
+    }
+    assert_eq!(transfer.target().await, clean);
+    assert_eq!(
+        send_chunk(&transfer, &restarted, key, chunk(0..middle, false))
+            .await
+            .unwrap(),
+        ImportObjectsResult::Receiving {
+            received_bytes: middle as u64
+        }
+    );
+    let ImportObjectsResult::Imported { receipt } =
+        send_chunk(&transfer, &restarted, key, chunk(middle..bytes.len(), true))
+            .await
+            .unwrap()
+    else {
+        panic!("not imported")
+    };
+    assert!(!receipt.replayed);
+    assert_eq!(receipt.tip_sha, transfer.tip);
+    assert_eq!(
+        local_git(&clone, &["rev-parse", &receipt.ref_name])
+            .await
+            .unwrap(),
+        transfer.tip
+    );
+    assert!(transfer
+        .staging()
+        .iter()
+        .all(|name| !name.ends_with(".part")));
+}

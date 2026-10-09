@@ -4483,9 +4483,11 @@ refusals use error code `object_transfer_refused` with `details.refusal`:
 `{kind: too_large, bytes, max_bytes}` (cap 256 MiB), `{kind: invalid, reason}`,
 `{kind: missing_object, sha}`, `{kind: key_conflict, existing_sha}` or
 `{kind: stale_fence}`. An announcement of an older claim is refused
-`integration_owner_refused` / `stale_fence`. `journal.ack` of a queue attempt
-entry keeps the receipt until a newer fence of its queue is recorded. See
-`docs/architecture.md` for the rules.
+`integration_owner_refused` / `stale_fence`. `have` and `want` are full object
+ids. Import chunks arrive in order and `offset: 0` starts a key over; a
+transfer is restarted, never resumed, after a lost connection. `journal.ack`
+of a queue attempt entry keeps the receipt until a newer fence of its queue is
+recorded, or for 7 days. See `docs/architecture.md` for the rules.
 
 | Method | Owner operation |
 | --- | --- |

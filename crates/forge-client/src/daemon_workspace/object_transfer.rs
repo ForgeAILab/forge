@@ -64,6 +64,35 @@ async fn sha256_file(path: &Path) -> CommandResult<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Daemon start: no transfer survives a restart (the sender starts a key
+/// over from its first chunk), so all staging goes, and so do the pin refs
+/// and quarantine directories a killed transfer left in a checkout.
+pub(super) fn sweep_at_start(workspace_root: &Path, state: &WorkspaceRegistry) {
+    let staging = workspace_root.join(TRANSFER_DIRECTORY);
+    if std::fs::symlink_metadata(&staging).is_ok_and(|metadata| metadata.is_dir()) {
+        if let Ok(entries) = std::fs::read_dir(&staging) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                } else {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+    for location in state.locations.values() {
+        let Ok(path) = location.path.canonicalize() else {
+            continue;
+        };
+        if path.starts_with(workspace_root) && path.join(".git").exists() {
+            let removed = git::integration::sweep_transfer_leftovers(&path);
+            if removed > 0 {
+                tracing::info!(path = %path.display(), removed, "removed leftovers of an interrupted object transfer");
+            }
+        }
+    }
+}
+
 impl DaemonWorkspaceBackend {
     fn transfer_staging(&self) -> CommandResult<PathBuf> {
         let directory = self.workspace_root.join(TRANSFER_DIRECTORY);
@@ -249,8 +278,17 @@ impl DaemonWorkspaceBackend {
             std::fs::remove_file(&part).map_err(io_error)?;
             stored = 0;
         }
-        let end = chunk.offset + data.len() as u64;
-        if end > chunk.total_bytes || chunk.offset > stored {
+        // The declared size was checked against the cap above, so nothing
+        // past it (and so nothing past 256 MiB) is ever written.
+        let Some(end) = chunk
+            .offset
+            .checked_add(data.len() as u64)
+            .filter(|end| *end <= chunk.total_bytes)
+        else {
+            let _ = std::fs::remove_file(&part);
+            return Err(invalid("chunk runs past the declared transfer size"));
+        };
+        if chunk.offset > stored {
             let _ = std::fs::remove_file(&part);
             return Err(invalid("chunk does not continue the stored transfer"));
         }

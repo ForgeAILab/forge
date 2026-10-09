@@ -1658,6 +1658,20 @@ impl DaemonWorkspaceClient {
         })
         .expect("binding serializes");
         params["operation_id"] = serde_json::json!(wire.operation_id());
+        // The owner learns the claim generation before the intent can be
+        // marked started. From then on an owner that answers a lookup of this
+        // generation with "unknown" has lost state; an owner that merely never
+        // received the effect frame answers "not performed". A refused or
+        // undelivered announcement leaves no intent behind.
+        self.announce_integration_fence(
+            daemon_id,
+            request.fence.target_owner["runtime_id"]
+                .as_str()
+                .unwrap_or_default(),
+            &wire.fence,
+            None,
+        )
+        .await?;
         let mut guard = match db
             .begin_integration_effect(request.clone())
             .await
@@ -1932,7 +1946,9 @@ impl DaemonWorkspaceClient {
     /// Push a verified bundle to a daemon checkout and import it there under
     /// `refs/forge/integration/<key>`. `bundle` is ignored for an export of
     /// zero bytes. A refused, failed or cancelled import leaves no staging
-    /// and no change on the owner.
+    /// and no change on the owner. A transfer is never resumed part way: a
+    /// repeated call (after a lost connection, say) sends the bundle again
+    /// from its first byte, which makes the owner drop what it had staged.
     pub async fn import_objects(
         &self,
         target: DaemonObjectEndpoint<'_>,

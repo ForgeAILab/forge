@@ -168,6 +168,7 @@ impl DaemonWorkspaceBackend {
             }
         }
         let state = journal.load_workspace_state()?;
+        object_transfer::sweep_at_start(&workspace_root, &state);
         Ok(Self {
             manager: WorkspaceManager::new(workspace_root.join(WORKTREE_DIRECTORY)),
             workspace_root,

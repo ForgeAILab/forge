@@ -742,8 +742,9 @@ pub enum IntegrationIntentRecord {
     /// the operation: it never ran here, and it is now fenced off.
     NotPerformed,
     /// The owner had never been told of this claim generation, so its empty
-    /// journal proves nothing (lost or replaced owner state). Never a
-    /// permission to repeat the effect.
+    /// journal proves nothing. The server announces a generation before it
+    /// marks any effect of it started, so this means lost or replaced owner
+    /// state. Never a permission to repeat the effect.
     Unknown,
 }
 
@@ -1998,6 +1999,11 @@ pub struct ExportObjectsResult {
     pub eof: bool,
 }
 
+/// One piece of a bundle being sent to an owner. Chunks arrive in order:
+/// `offset` must equal the bytes already stored (a repeat of bytes already
+/// stored is accepted and ignored; a gap is refused and drops the staging).
+/// `offset` 0 always starts the key over. Nothing past `total_bytes`, and
+/// nothing past the 256 MiB cap, is written.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ObjectChunk {
