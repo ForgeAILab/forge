@@ -579,8 +579,16 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         append_owner_advance(snapshot, &mut offers);
         return offers;
     }
+    // A coordination root runs only its aggregate review role. Held in any
+    // other state, its release launches nothing: it lets its subtasks run.
+    let root_role_refused = snapshot.coordination_root
+        && role.is_some_and(|role| {
+            !crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
+                .allows_execution(&task.status, role)
+        });
     if held {
-        if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() {
+        if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() && !root_role_refused
+        {
             offer(
                 TaskAction::Release { reason: None },
                 &[],
@@ -1010,6 +1018,12 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         && !snapshot.coordination_root
         && (snapshot.has_agent && !snapshot.project_paused)
         && snapshot.dependencies_satisfied
+        // A subtask its parent does not let run cannot be started: the
+        // exit is on the parent, which the condition names.
+        && !task
+            .condition
+            .reasons()
+            .any(|reason| matches!(reason, db::ParkReason::Parent { .. }))
         && workflow
             .outgoing_trigger_targets(&task.status)
             .any(|(_, target)| {

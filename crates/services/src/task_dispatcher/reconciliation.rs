@@ -553,11 +553,12 @@ impl TaskDispatcher {
                 facts: &p.facts,
             });
             // Ownerless diagnoses now live in the condition; never write a legacy annotation.
-            let visible = matches!(&next, Next::Park(park) if matches!(&park.reason, Reason::WorkflowInvalid{..}) || matches!(&park.reason, Reason::UnknownCondition{owner} if owner == next_step::PUBLICATION_OWNER || owner == next_step::ENTRY_HOOKS_OWNER));
+            let visible = matches!(&next, Next::Park(park) if matches!(&park.reason, Reason::WorkflowInvalid{..} | Reason::ParentWait{..}) || matches!(&park.reason, Reason::UnknownCondition{owner} if owner == next_step::PUBLICATION_OWNER || owner == next_step::ENTRY_HOOKS_OWNER));
             let current_visible = p.read.condition.reasons().any(|r| {
                 matches!(
                     r,
                     db::ParkReason::WorkflowInvalid { .. }
+                        | db::ParkReason::Parent { .. }
                         | db::ParkReason::UnknownCondition {
                             source: db::ConditionSource {
                                 field: db::LegacyConditionField::SchedulePark,

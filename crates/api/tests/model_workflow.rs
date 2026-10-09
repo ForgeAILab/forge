@@ -1360,6 +1360,37 @@ impl World {
                     wedge("every child is settled and nothing is offered")
                 }
             }
+            // A subtask its parent does not let run: the exit is on the
+            // parent, which must exist, be open and (when it is held) offer
+            // its release.
+            (_, "parent") => {
+                let parent = task["condition"]["primary"]["parent_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let cause = task["condition"]["primary"]["cause"]
+                    .as_str()
+                    .unwrap_or_default();
+                let Some(parent_index) = self.tasks.iter().position(|id| *id == parent) else {
+                    return wedge("the parent it names is not a Task of this Project");
+                };
+                if !unsettled(vec![parent]).await? {
+                    return wedge("the parent it waits for is settled");
+                }
+                if cause == "held" {
+                    let (_, offers) = self.offers(parent_index).await?;
+                    if !offers
+                        .iter()
+                        .any(|offer| offer["action"]["verb"] == "release")
+                    {
+                        return wedge("its held parent offers no release");
+                    }
+                }
+                if verbs.contains(&"start") {
+                    return wedge("`start` is offered although the parent does not let it run");
+                }
+                Ok(())
+            }
             (_, "capacity") => {
                 let mut busy = false;
                 for other in 0..self.tasks.len() {
@@ -1486,7 +1517,7 @@ impl World {
                 }
                 // These wait for other Tasks, not for the owner.
                 if !matches!(kind, "parked" | "failed")
-                    || matches!(reason, "dependencies" | "children" | "capacity")
+                    || matches!(reason, "dependencies" | "children" | "capacity" | "parent")
                 {
                     continue;
                 }
@@ -2243,21 +2274,18 @@ async fn an_offered_cancel_is_accepted_while_a_plan_artifact_settles() {
     .await;
 }
 
-/// OPEN STALL found by a random run with `CreateChild` generated. A subtask
-/// created under a held parent is accepted and never dispatched while the
-/// hold lasts (`task_hierarchy::coordination_root_allows_child_dispatch`),
-/// which is right, but it says nothing: it sits in `todo` with a `clear`
-/// condition and offers `start` and `cancel`. Its exit is releasing the
-/// parent; the subtask should show that it waits for its parent.
-///
-/// Root cause (read, not fixed): the dispatcher's `Children` park for a
-/// subtask whose root does not allow dispatch
-/// (`services/src/task_dispatcher/next_step.rs`, `!f.child_ready`) is a
-/// scheduling decision only; nothing stores it, and the stored condition
-/// (`db/src/task_condition.rs`) has no reason for "waits for its parent".
-/// It needs a new typed condition, a public payload addition.
+/// Found by a random run with `CreateChild` generated and fixed with it. A
+/// subtask created under a held parent is accepted and never dispatched while
+/// the hold lasts (`task_hierarchy::coordination_root_allows_child_dispatch`),
+/// which is right, but it said nothing: it sat in `todo` with a `clear`
+/// condition and offered `start` and `cancel`. The dispatcher's park for it
+/// (`services/src/task_dispatcher/next_step.rs`) was a scheduling decision
+/// nothing stored. It is now the visible schedule park `ParentWait`: the
+/// subtask is `parked` on the typed reason `parent`, naming the parent and
+/// the cause, and offers no `start`. The same run found that releasing the
+/// held parent queued a role the root may not run and put the hold back;
+/// the release now clears the hold and the subtask runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "open stall: a subtask of a held parent waits with a clear condition"]
 async fn a_subtask_of_a_held_parent_shows_why_it_waits() {
     use Action::{Create, CreateChild, Take};
     run_cases(vec![(

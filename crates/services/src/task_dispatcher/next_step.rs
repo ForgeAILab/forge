@@ -55,6 +55,12 @@ pub enum Reason {
     ReviewGrace,
     ProjectPaused,
     Children,
+    /// A subtask whose parent does not let it run. Visible: the stored
+    /// condition names the parent and the cause.
+    ParentWait {
+        parent_id: String,
+        cause: String,
+    },
     HumanWork,
     AgentUnavailable,
     Capacity,
@@ -129,6 +135,8 @@ pub struct Facts {
     pub root_advance: bool,
     pub root_role_allowed: bool,
     pub child_ready: bool,
+    /// The parent that does not let this subtask run, and why.
+    pub parent_wait: Option<(String, String)>,
     pub disposition_current: bool,
     pub stopped_execution: bool,
     pub reviewer_ready: bool,
@@ -195,6 +203,8 @@ fn condition_park(condition: &TaskCondition) -> Next {
         ParkReason::RemoteCancelPending { .. } => (Owner::Machine, Action::AcknowledgeCancellation),
         ParkReason::Dependencies { .. } => (Owner::ProjectAgent, Action::CompleteDependencies),
         ParkReason::Children { .. } => (Owner::ProjectAgent, Action::SettleChildren),
+        ParkReason::Parent { cause, .. } if cause == "held" => (Owner::User, Action::ReleaseHold),
+        ParkReason::Parent { .. } => (Owner::ProjectAgent, Action::SettleChildren),
         ParkReason::Environment { .. } | ParkReason::PlacementDenied { .. } => {
             (Owner::Machine, Action::RepairAndRetry)
         }
@@ -365,6 +375,27 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     // An unfinished or cancelled dependency is not a park of its own: the
     // admission attempt meets the dependency gate, which writes the visible
     // refusal (and blocks on a cancelled dependency) exactly as before.
+    if let Some((parent_id, cause)) = &f.parent_wait {
+        return if cause == "held" {
+            park(
+                Reason::ParentWait {
+                    parent_id: parent_id.clone(),
+                    cause: cause.clone(),
+                },
+                Owner::User,
+                Action::ReleaseHold,
+            )
+        } else {
+            park(
+                Reason::ParentWait {
+                    parent_id: parent_id.clone(),
+                    cause: cause.clone(),
+                },
+                Owner::ProjectAgent,
+                Action::SettleChildren,
+            )
+        };
+    }
     if !f.child_ready || (f.root && !f.root_role_allowed) {
         return park(
             Reason::Children,

@@ -3054,6 +3054,18 @@ a settled Task, is evidence, not a current exception; a reviewer run that is
 merely live does not clear it. Legacy
 metadata remains private and does not need to be parsed by public wait readers.
 
+A `parked` condition's `primary` (and each entry of `additional`) is a typed
+reason with its own `kind`; clients must render a kind they do not know as a
+plain wait. The reason `parent` (`parent_id`, `cause`) is shown by a subtask
+its parent does not let run: `cause` is `held` (the owner holds the parent;
+releasing the parent is the exit), `blocked` (the parent is parked on a failure
+or a blocked entry; recovering the parent is the exit) or `not_coordinating`
+(the parent is in a state that runs no subtasks, such as `backlog`). It is a
+wait, not a failure: `details.failure_kind` stays empty, `start` is not offered
+on the subtask while it lasts, and it clears by itself when the parent lets its
+subtasks run again. A subtask that only waits for an earlier sibling shows no
+such reason.
+
 A stored condition this build cannot decode projects a `parked` condition whose
 primary reason is `unknown_condition` with `source.field = condition_json`. Its
 `problem` says which of two classes it is:

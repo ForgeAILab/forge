@@ -5252,7 +5252,20 @@ Agent as a proxy for all child work. A `coder` assignment on the root is the
 default worker for children that have no own `coder`; converting a Task into a
 coordination root keeps that assignment and removes other non-review roles.
 The root's aggregate review role also remains assignable and is the only role
-that may execute on the root, only while the root is in its review state. The
+that may execute on the root, only while the root is in its review state. A
+subtask whose root does not let it run
+(`task_hierarchy::coordination_root_allows_child_dispatch` is false: the root
+is held, parked on a failure or a blocked entry, or in a state that runs no
+subtasks) says so: the dispatcher resolves `Reason::ParentWait` for it
+(`task_dispatcher/next_step.rs`), which is one of the visible schedule parks
+(`db::task_condition::readers::owner_park`), so the subtask's stored condition
+is `parked` with the typed reason `parent { parent_id, cause }` (`held`,
+`blocked`, `not_coordinating`). It is a wait without a diagnostic or failure
+kind, `start` is not offered on the subtask meanwhile, and the park is cleared
+on the pass that finds the root coordinating again (a change of the root's
+condition or status marks its children for the scheduler). Releasing a held
+root that already has subtasks launches no role for it (`release` takes the
+`held_waiting` path): the hold is cleared and its subtasks run. The
 root `coder` never executes there. The review role is whatever the workflow's
 review gate declares, not the built-in `reviewer` name.
 `services::task_hierarchy::RootRolePolicy` owns these assignment and execution

@@ -1737,6 +1737,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A subtask whose parent is held (or otherwise not running subtasks) shows
+  why it waits.** Such a subtask sat in `todo` with a clear condition and
+  offered `start`, which could not run it. Its condition is now `parked` with
+  the new typed reason `parent` (`parent_id`, `cause`: `held`, `blocked` or
+  `not_coordinating`), `start` is no longer offered on it, and it is
+  dispatched as soon as the parent lets its subtasks run. `condition.primary`
+  can therefore carry a `kind` older clients have not seen (`parent`).
+  Releasing a held parent that already has subtasks used to be accepted and
+  then put the hold back with "coordination root ... is not in its aggregate
+  review state"; it now clears the hold and the subtasks run. Found by the
+  model-based workflow test.
+
 - **Retrying a parent Task whose aggregate review failed no longer loops
   between `retry` and `restart`.** A parent Task (one with subtasks) parked in
   `review` on "review retry budget exhausted" offered `retry`, which moved it

@@ -493,6 +493,15 @@ pub(crate) fn owner_park(raw: &Value) -> Option<(ParkReason, TaskBlockingAnnotat
             park_diagnostic("workflow_invalid", &message),
         ));
     }
+    if let Some(v) = r.get("ParentWait") {
+        let parent_id = v["parent_id"].as_str()?.to_owned();
+        let cause = v["cause"].as_str()?.to_owned();
+        let message = format!("This subtask waits for its parent Task {parent_id} ({cause}).");
+        return Some((
+            ParkReason::Parent { parent_id, cause },
+            park_diagnostic("parent_wait", &message),
+        ));
+    }
     let owner = r.get("UnknownCondition")?["owner"].as_str()?;
     if !matches!(owner, "plan publication cleanup" | "entry hooks") {
         return None;
@@ -525,6 +534,47 @@ pub(super) fn apply_owner_park(mut condition: TaskCondition, raw: Option<&Value>
         .is_some_and(|p| p.diagnostic_present || p.interruption_present || p.hard_failure)
     {
         return condition;
+    }
+    if let ParkReason::Parent { cause, .. } = &reason {
+        // A wait, not a failure: the subtask shows what it waits for and
+        // nothing about it needs repair. Its exit is on the parent.
+        let owner = if cause == "held" {
+            api_types::ConditionOwner::User
+        } else {
+            api_types::ConditionOwner::ProjectAgent
+        };
+        return match condition {
+            TaskCondition::Clear { mut evidence } => {
+                evidence
+                    .presentation
+                    .get_or_insert_with(Default::default)
+                    .owner = Some(owner);
+                TaskCondition::Parked {
+                    primary: reason,
+                    additional: Vec::new(),
+                    resume: ConditionContinuation::Reconcile,
+                    since: None,
+                    evidence,
+                }
+            }
+            TaskCondition::Parked {
+                primary,
+                mut additional,
+                resume,
+                since,
+                evidence,
+            } => {
+                additional.push(reason);
+                TaskCondition::Parked {
+                    primary,
+                    additional,
+                    resume,
+                    since,
+                    evidence,
+                }
+            }
+            other => other,
+        };
     }
     let e = condition.evidence_mut();
     let read = e.presentation.get_or_insert_with(Default::default);

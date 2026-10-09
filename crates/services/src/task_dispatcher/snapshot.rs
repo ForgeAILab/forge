@@ -354,10 +354,29 @@ impl TaskDispatcher {
                         != api_types::CanonicalPhase::Review
                     && pw.state_kind(&t.status) != Some(StateKind::Terminal)));
         if let Some(parent) = &r.parent {
-            f.child_ready =
-                crate::task_hierarchy::coordination_root_allows_child_dispatch(parent, &pw)
-                    && crate::task_hierarchy::next_incomplete_child(&r.siblings, &pw)
-                        .is_some_and(|c| c.id == t.id);
+            let allowed =
+                crate::task_hierarchy::coordination_root_allows_child_dispatch(parent, &pw);
+            f.child_ready = allowed
+                && crate::task_hierarchy::next_incomplete_child(&r.siblings, &pw)
+                    .is_some_and(|c| c.id == t.id);
+            if !allowed {
+                let held = matches!(
+                    &parent.condition,
+                    TaskCondition::Parked {
+                        primary: ParkReason::Held { .. },
+                        ..
+                    }
+                ) || parent.condition.read().failure_kind
+                    == Some(api_types::FailureKind::ManualStop);
+                let cause = if held {
+                    "held"
+                } else if crate::task_hierarchy::root_blocked(parent) {
+                    "blocked"
+                } else {
+                    "not_coordinating"
+                };
+                f.parent_wait = Some((parent.id.clone(), cause.to_owned()));
+            }
         }
         if let Some(role) = role {
             f.root_role_allowed = !f.root
