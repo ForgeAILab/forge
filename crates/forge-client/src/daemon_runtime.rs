@@ -1264,7 +1264,7 @@ mod tests {
             ),
             (
                 METHOD_WORKSPACE_PREPARE,
-                serde_json::json!({"daemon_id":"daemon-1", "runtime_id":"runtime-1", "placement_id":"placement-1", "operation_id":"prepare-1", "generation":1, "expected":{"kind":"base_sha", "sha":sha}, "repo_location_id":"location-1", "workspace_id":"workspace-1", "task_id":"task-1", "base_ref":"main", "branch":"task/outbox"}),
+                serde_json::json!({"integration":{"kind":"task_step"}, "daemon_id":"daemon-1", "runtime_id":"runtime-1", "placement_id":"placement-1", "operation_id":"prepare-1", "generation":1, "expected":{"kind":"base_sha", "sha":sha}, "repo_location_id":"location-1", "workspace_id":"workspace-1", "task_id":"task-1", "base_ref":"main", "branch":"task/outbox"}),
             ),
         ] {
             let response = runtime

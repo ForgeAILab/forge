@@ -78,15 +78,36 @@ fn signal_group(signal: &str, leader: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-async fn read_all(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+async fn read_all(
+    pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+    limit: Option<usize>,
+) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     if let Some(mut pipe) = pipe {
-        pipe.read_to_end(&mut bytes).await?;
+        if let Some(limit) = limit {
+            pipe.take(limit.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() > limit {
+                return Err(std::io::Error::other(
+                    "review command output exceeds size budget",
+                ));
+            }
+        } else {
+            pipe.read_to_end(&mut bytes).await?;
+        }
     }
     Ok(bytes)
 }
 
 pub(crate) async fn output(command: &mut Command) -> std::io::Result<Output> {
+    output_bounded(command, None).await
+}
+
+pub(crate) async fn output_bounded(
+    command: &mut Command,
+    limit: Option<usize>,
+) -> std::io::Result<Output> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -104,8 +125,11 @@ pub(crate) async fn output(command: &mut Command) -> std::io::Result<Output> {
         child,
         finished: false,
     };
-    let (status, stdout, stderr) =
-        tokio::try_join!(group.child.wait(), read_all(stdout), read_all(stderr))?;
+    let (status, stdout, stderr) = tokio::try_join!(
+        group.child.wait(),
+        read_all(stdout, limit),
+        read_all(stderr, limit)
+    )?;
     // Hooks that outlive a finished Git are not ours to stop.
     group.finished = true;
     Ok(Output {

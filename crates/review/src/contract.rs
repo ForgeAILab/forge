@@ -9,7 +9,7 @@ use crate::{CommandLimits, ReviewWorkspace};
 const MAX_CONTEXT_BYTES: usize = 96 * 1024;
 const MAX_PREPARED_PROMPT_BYTES: usize = 192 * 1024;
 const MAX_REPORT_BYTES: usize = 128 * 1024;
-pub(crate) const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
+pub const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const MAX_CANDIDATE_PATH_BYTES: usize = 64 * 1024;
 const CHARTER_REQUIREMENT_ROOTS: [(&str, bool); 11] = [
     ("/identity/one_line_vision", false),

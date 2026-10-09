@@ -116,67 +116,35 @@ impl DaemonWorkspaceBackend {
                 handoff_conflicts,
             } => {
                 validate_branch(&owned.path, &target_branch).await?;
-                let target =
-                    resolve_commit(&owned.path, &format!("refs/heads/{target_branch}")).await?;
-                let in_progress = git::detect_rebase_in_progress(&owned.path)
-                    .await
-                    .map_err(git_error)?;
-                if in_progress && !handoff_conflicts {
-                    // Resume an interrupted rebase the way a fresh
-                    // conflicting one ends without handoff.
-                    git::abort_rebase(&owned.path).await.map_err(git_error)?;
-                    WorkspaceOwnerOperationOutcome::Conflict {
-                        details: "aborted interrupted rebase".into(),
-                        conflict_paths: Vec::new(),
+                let target = match &params.fence.integration {
+                    WorkspaceIntegrationBinding::Attempt { request } => request.witness
+                        ["expected_target_sha"]
+                        .as_str()
+                        .ok_or_else(|| error(INVALID_INPUT, "rebase witness has no target object"))?
+                        .to_owned(),
+                    _ => {
+                        resolve_commit(&owned.path, &format!("refs/heads/{target_branch}")).await?
                     }
-                } else if in_progress {
-                    match git::continue_rebase_keeping_conflicts(&owned.path).await {
-                        Ok(conflict_paths) => WorkspaceOwnerOperationOutcome::Conflict {
-                            details: "resumed interrupted rebase".into(),
-                            conflict_paths,
-                        },
-                        Err(git::GitError::UnsupportedRebaseConflict { details }) => {
-                            WorkspaceOwnerOperationOutcome::UnsupportedConflict { details }
-                        }
-                        Err(error) => return Err(git_error(error)),
-                    }
-                } else if !git::is_worktree_clean(&owned.path)
+                };
+                match git::integration::rebase(&owned.path, &target, handoff_conflicts)
                     .await
                     .map_err(git_error)?
                 {
-                    WorkspaceOwnerOperationOutcome::Dirty {
-                        files: git::status_porcelain(&owned.path)
-                            .await
-                            .map_err(git_error)?,
+                    git::integration::RebaseOutcome::Rebased => {
+                        WorkspaceOwnerOperationOutcome::Rebased
                     }
-                } else {
-                    match git::rebase(&owned.path, &target).await {
-                        Ok(()) => WorkspaceOwnerOperationOutcome::Rebased,
-                        Err(git::GitError::MergeConflict { stderr, .. }) => {
-                            if !handoff_conflicts {
-                                git::abort_rebase(&owned.path).await.map_err(git_error)?;
-                                WorkspaceOwnerOperationOutcome::Conflict {
-                                    details: stderr,
-                                    conflict_paths: Vec::new(),
-                                }
-                            } else {
-                                match git::continue_rebase_keeping_conflicts(&owned.path).await {
-                                    Ok(conflict_paths) => {
-                                        WorkspaceOwnerOperationOutcome::Conflict {
-                                            details: stderr,
-                                            conflict_paths,
-                                        }
-                                    }
-                                    Err(git::GitError::UnsupportedRebaseConflict { details }) => {
-                                        WorkspaceOwnerOperationOutcome::UnsupportedConflict {
-                                            details,
-                                        }
-                                    }
-                                    Err(failure) => return Err(git_error(failure)),
-                                }
-                            }
-                        }
-                        Err(failure) => return Err(git_error(failure)),
+                    git::integration::RebaseOutcome::Conflict {
+                        details,
+                        conflict_paths,
+                    } => WorkspaceOwnerOperationOutcome::Conflict {
+                        details,
+                        conflict_paths,
+                    },
+                    git::integration::RebaseOutcome::UnsupportedConflict { details } => {
+                        WorkspaceOwnerOperationOutcome::UnsupportedConflict { details }
+                    }
+                    git::integration::RebaseOutcome::Dirty { files } => {
+                        WorkspaceOwnerOperationOutcome::Dirty { files }
                     }
                 }
             }

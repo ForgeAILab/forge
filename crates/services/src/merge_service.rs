@@ -577,69 +577,107 @@ impl MergeService {
         )
         .await?;
 
-        self.db.protect_step_integration().await?;
-        let review_guard = match self.db.lock_review_integration(&task_id).await {
-            Ok(guard) => guard,
-            Err(db::DbError::Check(reason)) => {
-                return Ok(MergeOutcome::ReviewRequired { reason });
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let target_sha =
+        let observed_target =
             crate::integration_effects::merge::target_tip(repo_path, &target_branch).await?;
-        if let Some(hook) = crate::workflow::engine::durable::current_hook(&task_id) {
-            db::note_integration_target(
-                &hook.step.id,
-                hook.index,
-                Some(&worktree_sha),
-                &target_sha,
-            );
-        }
-        let task_branch = workspace::task_branch_name(&task_id);
-        let effect = crate::integration_effects::merge::MergeEffectInput {
-            workspace: input.workspace,
-            worktree_path,
-            repo_path,
-            target_branch: &target_branch,
-            task_branch: &task_branch,
-            diagnostic_entity_id: &task_id,
-            before_sha: &before_sha,
-            expected_head_sha: &worktree_sha,
-            observed_target_sha: &target_sha,
-            reviewed: review_guard.candidate.as_ref().map(|candidate| {
-                crate::integration_effects::merge::ReviewedMergeObject {
-                    commit_sha: candidate.commit_sha.clone(),
-                    base_sha: candidate.base_sha.clone(),
-                }
-            }),
+        let owner = crate::integration_owner::ServerIntegrationOwner::new(self.db.clone());
+        let receipt_guard = match owner.admit_task_step(input.workspace, db::IntegrationOperationKind::Merge,
+            serde_json::json!({"workspace":input.workspace,"target_branch":target_branch,"expected_head_sha":worktree_sha,"expected_target_sha":observed_target})).await? {
+            None => None,
+            Some(db::IntegrationEffectAdmission::Started(guard)) => Some(guard),
+            Some(db::IntegrationEffectAdmission::Replay(receipt)) => {
+                let receipt: crate::integration_owner::OwnerMergeReceipt = serde_json::from_value(receipt.result).map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+                return match receipt {
+                    crate::integration_owner::OwnerMergeReceipt::Completed { outcome } => Ok(outcome),
+                    _ => Err(ServiceError::invalid_operation("prior merge effect did not complete")),
+                };
+            }
+            Some(db::IntegrationEffectAdmission::Refused(reason)) => return Err(ServiceError::invalid_operation(format!("integration owner refused {reason:?}"))),
         };
-        let already_merged =
-            match crate::integration_effects::merge::validate_merge_candidate(&effect).await? {
-                crate::integration_effects::merge::MergeCandidateOutcome::Ready {
-                    already_merged,
-                } => already_merged,
-                crate::integration_effects::merge::MergeCandidateOutcome::Refused(outcome) => {
-                    return Ok(outcome)
+        let result = async {
+            self.db.protect_step_integration().await?;
+            let review_guard = match self.db.lock_review_integration(&task_id).await {
+                Ok(guard) => guard,
+                Err(db::DbError::Check(reason)) => {
+                    return Ok(MergeOutcome::ReviewRequired { reason });
                 }
+                Err(error) => return Err(error.into()),
             };
-        let applied =
-            crate::integration_effects::merge::apply_merge(&effect, already_merged).await?;
-        // Preserve the original guard lifetime on the exact-object refusal.
-        if matches!(
-            applied,
-            crate::integration_effects::merge::MergeApplyOutcome::ExactObjectMismatch
-        ) {
-            return crate::integration_effects::merge::merge_result(
-                &effect,
-                already_merged,
+            let target_sha =
+                crate::integration_effects::merge::target_tip(repo_path, &target_branch).await?;
+            if let Some(hook) = crate::workflow::engine::durable::current_hook(&task_id) {
+                db::note_integration_target(
+                    &hook.step.id,
+                    hook.index,
+                    Some(&worktree_sha),
+                    &target_sha,
+                );
+            }
+            let task_branch = workspace::task_branch_name(&task_id);
+            let effect = crate::integration_effects::merge::MergeEffectInput {
+                workspace: input.workspace,
+                worktree_path,
+                repo_path,
+                target_branch: &target_branch,
+                task_branch: &task_branch,
+                diagnostic_entity_id: &task_id,
+                before_sha: &before_sha,
+                expected_head_sha: &worktree_sha,
+                observed_target_sha: &target_sha,
+                reviewed: review_guard.candidate.as_ref().map(|candidate| {
+                    crate::integration_effects::merge::ReviewedMergeObject {
+                        commit_sha: candidate.commit_sha.clone(),
+                        base_sha: candidate.base_sha.clone(),
+                    }
+                }),
+            };
+            let already_merged =
+                match crate::integration_effects::merge::validate_merge_candidate(&effect).await? {
+                    crate::integration_effects::merge::MergeCandidateOutcome::Ready {
+                        already_merged,
+                    } => already_merged,
+                    crate::integration_effects::merge::MergeCandidateOutcome::Refused(outcome) => {
+                        return Ok(outcome)
+                    }
+                };
+            let applied =
+                crate::integration_effects::merge::apply_merge(&effect, already_merged).await?;
+            // Preserve the original guard lifetime on the exact-object refusal.
+            if matches!(
                 applied,
-            )
-            .await;
+                crate::integration_effects::merge::MergeApplyOutcome::ExactObjectMismatch
+            ) {
+                return crate::integration_effects::merge::merge_result(
+                    &effect,
+                    already_merged,
+                    applied,
+                )
+                .await;
+            }
+            review_guard.release().await?;
+            crate::integration_effects::merge::merge_result(&effect, already_merged, applied).await
         }
-        review_guard.release().await?;
-        let outcome =
-            crate::integration_effects::merge::merge_result(&effect, already_merged, applied)
-                .await?;
+        .await;
+        if let Some(guard) = receipt_guard {
+            let (receipt, state) = match &result {
+                Ok(outcome) => (
+                    crate::integration_owner::OwnerMergeReceipt::Completed {
+                        outcome: outcome.clone(),
+                    },
+                    db::IntegrationOperationState::Succeeded,
+                ),
+                Err(error) => (
+                    crate::integration_owner::OwnerMergeReceipt::Infrastructure {
+                        message: crate::integration_effects::check::tail_bytes(
+                            &error.to_string(),
+                            4096,
+                        ),
+                    },
+                    db::IntegrationOperationState::Uncertain,
+                ),
+            };
+            guard.record(serde_json::json!(receipt), state).await?;
+        }
+        let outcome = result?;
         if let MergeOutcome::Done { after_sha, .. } = &outcome {
             self.record_merge_execution_evidence(
                 &execution.id,

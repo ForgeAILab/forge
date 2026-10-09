@@ -41,6 +41,10 @@ type CommandResult<T> = std::result::Result<T, DaemonErrorPayload>;
 struct WorkspaceRegistry {
     locations: HashMap<String, VerifiedLocation>,
     handles: HashMap<String, OwnedWorkspace>,
+    #[serde(default)]
+    integration_fences: HashMap<String, IntegrationOwnerFence>,
+    #[serde(default)]
+    integration_pending: HashMap<String, String>,
     /// Cancellation tombstones prevent a delayed request from starting after
     /// an `unknown` acknowledgment, including after an owner restart. Each
     /// maps the operation id to its acknowledgment time (Unix seconds) and is
@@ -132,7 +136,7 @@ pub struct DaemonWorkspaceBackend {
     journal: Arc<DaemonJournal>,
     manager: WorkspaceManager,
     state: Mutex<WorkspaceRegistry>,
-    operation_lock: tokio::sync::Mutex<()>,
+    owner_locks: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     provision_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     running_commands: Mutex<HashMap<String, RunningWorkspaceCommand>>,
 }
@@ -169,10 +173,38 @@ impl DaemonWorkspaceBackend {
             policy,
             journal,
             state: Mutex::new(state),
-            operation_lock: tokio::sync::Mutex::new(()),
+            owner_locks: Mutex::new(HashMap::new()),
             provision_locks: Mutex::new(HashMap::new()),
             running_commands: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn owner_lock(&self, checkout: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.owner_locks.lock().unwrap_or_else(|p| p.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(checkout).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(checkout.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn lock_checkouts(&self, params: &Value) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut keys = vec![self.checkout_key(params)];
+        if let Some(handle) = params["workspace_handle"].as_str() {
+            keys.push(format!("workspace:{handle}"));
+        }
+        keys.sort();
+        keys.dedup();
+        // Resolve all strong references before waiting so later acquisitions
+        // cannot create a second mutex for a queued owner of the same key.
+        let locks: Vec<_> = keys.iter().map(|key| self.owner_lock(key)).collect();
+        let mut guards = Vec::new();
+        for lock in locks {
+            guards.push(lock.lock_owned().await);
+        }
+        guards
     }
 
     pub fn run_policy(&self) -> &WorkspaceRunPolicy {
@@ -217,8 +249,21 @@ impl DaemonWorkspaceBackend {
             return self.handle_inner(method, params, active_ids).await;
         }
         let fence: WorkspaceMutationFence = decode(params.clone())?;
-        let id = fence.operation_id;
+        let id = fence.operation_id.clone();
         validate_id(&id)?;
+        if matches!(
+            fence.integration,
+            WorkspaceIntegrationBinding::Attempt { .. }
+                | WorkspaceIntegrationBinding::TaskStepEffect { .. }
+        ) {
+            if let Some(operation) = self.journal.operation(&id).map_err(storage_error)? {
+                if operation.method == method && operation.request == journal_request(&params) {
+                    if let Some(outcome) = operation.outcome {
+                        return outcome;
+                    }
+                }
+            }
+        }
         let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
         let (finished, completed) = tokio::sync::watch::channel(None);
         {
@@ -249,7 +294,31 @@ impl DaemonWorkspaceBackend {
             finished,
             state: WorkspaceCancelState::Killed,
         };
-        let result = if method == METHOD_WORKSPACE_MERGE {
+        let integration = matches!(
+            fence.integration,
+            WorkspaceIntegrationBinding::Attempt { .. }
+                | WorkspaceIntegrationBinding::TaskStepEffect { .. }
+        );
+        let owner_deadline = match &fence.integration {
+            WorkspaceIntegrationBinding::Attempt { request } => request.witness["deadline_nanos"]
+                .as_str()
+                .map(|value| value.parse::<u64>().map(Duration::from_nanos))
+                .transpose()
+                .map_err(|_| error(INVALID_INPUT, "invalid integration deadline"))?,
+            _ => None,
+        };
+        let deadline = async {
+            match owner_deadline {
+                Some(duration) => tokio::time::sleep(duration).await,
+                None => std::future::pending().await,
+            }
+        };
+        let mut timed_out = false;
+        let mut result = if method == METHOD_WORKSPACE_MERGE
+            && !matches!(
+                fence.integration,
+                WorkspaceIntegrationBinding::Attempt { .. }
+            ) {
             // Integration finishes before a cancel acknowledgement. The
             // server fences an unreachable owner until this handler settles.
             let result = self.handle_inner(method, params, active_ids).await;
@@ -259,12 +328,22 @@ impl DaemonWorkspaceBackend {
             tokio::select! {
                 biased;
                 _ = cancelled.changed() => Err(error(WORKSPACE_ERROR, "workspace operation was cancelled")),
+                _ = deadline => { timed_out = true; Err(error(DAEMON_TIMEOUT, "integration effect timed out")) },
                 result = self.handle_inner(method, params, active_ids) => {
                     guard.state = WorkspaceCancelState::AlreadyFinished;
                     result
                 }
             }
         };
+        if integration && guard.state == WorkspaceCancelState::Killed {
+            self.settle_interrupted_integration(&guard.id, timed_out)
+                .await?;
+            if let Some(operation) = self.journal.operation(&guard.id).map_err(storage_error)? {
+                if let Some(outcome) = operation.outcome {
+                    result = outcome;
+                }
+            }
+        }
         // The selected future has been dropped here. Its ProcessGroupGuard
         // kills descendants before the completion acknowledgment is visible.
         drop(guard);
@@ -350,7 +429,7 @@ impl DaemonWorkspaceBackend {
                 error
             })?);
         }
-        let _guard = self.operation_lock.lock().await;
+        let _guards = self.lock_checkouts(&params).await;
         // Capture activity after acquiring the mutation lock. An execution
         // may have started while this request was waiting for another RPC.
         let active_ids = active_ids();
@@ -438,7 +517,10 @@ impl DaemonWorkspaceBackend {
             }
             // Prepare, reset and cleanup can finish a durable intent after a
             // process restart. Shell and merge intents require inspection.
-            if !matches!(
+            if matches!(
+                fence.integration,
+                WorkspaceIntegrationBinding::Attempt { .. }
+            ) || !matches!(
                 method,
                 METHOD_WORKSPACE_PREPARE | METHOD_WORKSPACE_RESET | METHOD_WORKSPACE_CLEANUP
             ) {
@@ -446,6 +528,7 @@ impl DaemonWorkspaceBackend {
             }
             true
         } else {
+            self.admit_integration(&fence, method, &params)?;
             self.check_owner(&fence.daemon_id, &fence.runtime_id)?;
             if let Some((_, workspace)) = &existing {
                 self.check_generation(fence.generation, workspace.generation, recreating)?;
@@ -466,6 +549,11 @@ impl DaemonWorkspaceBackend {
                 request: params.clone(),
                 outcome: None,
                 acknowledged: false,
+                effect_started: !matches!(
+                    fence.integration,
+                    WorkspaceIntegrationBinding::Attempt { .. }
+                        | WorkspaceIntegrationBinding::TaskStepEffect { .. }
+                ),
             };
             self.journal
                 .retain_entry(&JournalEntry::Operation { operation })
@@ -476,6 +564,29 @@ impl DaemonWorkspaceBackend {
             if !discard_plan || existing.is_some() {
                 self.workspace(&reference(&fence, handle), recreating)?;
             }
+        }
+        if let Err(failure) = self.verify_integration_objects(&fence).await {
+            let mut operation = self
+                .journal
+                .operation(&fence.operation_id)
+                .map_err(storage_error)?
+                .ok_or_else(|| error(WORKSPACE_ERROR, "integration intent missing"))?;
+            operation.outcome = Some(Err(failure.clone()));
+            self.attach_integration_receipt(&mut operation, None, false)
+                .await;
+            self.journal
+                .finish_operation(&operation)
+                .map_err(storage_error)?;
+            return operation.outcome.expect("settled refusal");
+        }
+        if matches!(
+            fence.integration,
+            WorkspaceIntegrationBinding::Attempt { .. }
+                | WorkspaceIntegrationBinding::TaskStepEffect { .. }
+        ) {
+            self.journal
+                .start_operation(&fence.operation_id)
+                .map_err(storage_error)?;
         }
         let mut outcome = if discard_plan && existing.is_none() {
             encode(WorkspaceOwnerOperationResult {
@@ -531,6 +642,8 @@ impl DaemonWorkspaceBackend {
         }
         operation.request = params;
         operation.outcome = Some(outcome.clone());
+        self.attach_integration_receipt(&mut operation, None, false)
+            .await;
         self.journal
             .finish_operation(&operation)
             .map_err(storage_error)?
@@ -542,7 +655,15 @@ impl DaemonWorkspaceBackend {
         &self,
         params: &JournalAckParams,
     ) -> CommandResult<JournalAckResult> {
-        let _guard = self.operation_lock.lock().await;
+        let entry = self
+            .journal
+            .entry(&params.entry_id)
+            .map_err(storage_error)?;
+        let lock_request = match &entry {
+            Some(JournalEntry::Operation { operation }) => operation.request.clone(),
+            _ => serde_json::json!({}),
+        };
+        let _guards = self.lock_checkouts(&lock_request).await;
         if let Some(JournalEntry::Operation { operation }) = self
             .journal
             .entry(&params.entry_id)
@@ -1349,7 +1470,17 @@ impl DaemonWorkspaceBackend {
     }
 
     pub async fn register_execution(&self, execution_id: &str, path: &Path) -> CommandResult<()> {
-        let _guard = self.operation_lock.lock().await;
+        let checkout = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .handles
+            .iter()
+            .find(|(_, owned)| owned.path == path)
+            .map(|(handle, _)| format!("workspace:{handle}"))
+            .unwrap_or_else(|| "unowned".into());
+        let lock = self.owner_lock(&checkout);
+        let _guard = lock.lock().await;
         let found = self
             .state
             .lock()
@@ -1672,52 +1803,23 @@ impl DaemonWorkspaceBackend {
                 return Ok(WorkspaceMergeOutcome::UnresolvedConflictMarkers { paths });
             }
         }
-        git::checkout_branch(target, &params.target_branch)
-            .await
-            .map_err(git_error)?;
-        if git::get_current_sha(target).await.map_err(git_error)? != params.expected_target_sha {
-            return Ok(WorkspaceMergeOutcome::TargetMoved {
-                reason: "integration target changed during checkout".into(),
-                target_branch: params.target_branch.clone(),
-            });
-        }
         let before_sha = params.expected_target_sha.clone();
-        let merged = if reviewed_commit_sha.is_some() {
-            match local_git(target, &["merge", "--ff-only", &head]).await {
-                Ok(_) => Ok(()),
-                Err(error) => {
-                    return Ok(WorkspaceMergeOutcome::ReviewRequired {
-                        reason: error.message,
-                    })
-                }
-            }
-        } else {
-            git::merge_branch_into(target, &head).await
-        };
-        match merged {
-            Ok(()) => {
-                let after_sha = git::get_current_sha(target).await.map_err(git_error)?;
-                if reviewed_commit_sha.is_some() && after_sha != head {
-                    return Ok(WorkspaceMergeOutcome::TargetMoved {
-                        reason: "integration target changed during merge; reviewed content was not integrated".into(),
-                        target_branch: params.target_branch.clone(),
-                    });
-                }
-                Ok(WorkspaceMergeOutcome::Done {
-                    before_sha,
-                    after_sha,
-                    branch: params.target_branch.clone(),
-                })
-            }
-            Err(git::GitError::MergeConflict { stderr, .. }) => {
+        match git::integration::apply_merge(target, &params.target_branch, &head, reviewed_commit_sha.is_some(), false, Some(&params.expected_target_sha), git::integration::FastForwardLimits { deadline: Duration::from_secs(30), output_bytes: MAX_DIFF_BYTES }).await.map_err(git_error)? {
+            git::integration::MergeApplyOutcome::Applied => Ok(WorkspaceMergeOutcome::Done {
+                before_sha, after_sha: git::get_current_sha(target).await.map_err(git_error)?, branch: params.target_branch.clone(),
+            }),
+            git::integration::MergeApplyOutcome::ReviewRequired { reason } => {
+                let reason = if let Some(stderr) = reason.strip_prefix("git evidence unavailable: ") { format!("git merge --ff-only {head} failed: {stderr}") } else { reason };
+                Ok(WorkspaceMergeOutcome::ReviewRequired { reason })
+            },
+            git::integration::MergeApplyOutcome::TargetMoved => Ok(WorkspaceMergeOutcome::TargetMoved { reason: "integration target changed during checkout".into(), target_branch: params.target_branch.clone() }),
+            git::integration::MergeApplyOutcome::ExactObjectMismatch => Ok(WorkspaceMergeOutcome::TargetMoved { reason: "integration target changed during merge; reviewed content was not integrated".into(), target_branch: params.target_branch.clone() }),
+            git::integration::MergeApplyOutcome::ManualFailed(git::GitError::MergeConflict { stderr, .. }) => {
                 let conflict_paths = git::conflict_paths(target).await.map_err(git_error)?;
                 git::abort_merge(target).await.map_err(git_error)?;
-                Ok(WorkspaceMergeOutcome::Conflict {
-                    details: stderr,
-                    conflict_paths,
-                })
+                Ok(WorkspaceMergeOutcome::Conflict { details: stderr, conflict_paths })
             }
-            Err(error) => Err(git_error(error)),
+            git::integration::MergeApplyOutcome::ManualFailed(error) => Err(git_error(error)),
         }
     }
 
@@ -2255,3 +2357,5 @@ mod reconciliation;
 
 #[cfg(test)]
 mod tests;
+
+mod integration_owner;

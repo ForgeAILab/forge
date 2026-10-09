@@ -390,6 +390,7 @@ impl SqliteDb {
         if changed.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
+        crate::integration_queue::settle_removed_integration_owner(&mut tx, None, Some(id)).await?;
         // Every Task these cancellations fence, deleted ones included.
         let fenced: Vec<String> = sqlx::query_scalar("SELECT id FROM task WHERE id IN (SELECT w.task_id FROM pending_remote_cancel c JOIN workspace w ON w.id=c.workspace_id WHERE c.daemon_id=?1) OR id IN (SELECT e.task_id FROM pending_remote_cancel c JOIN execution e ON e.workspace_id=c.workspace_id WHERE c.daemon_id=?1)")
             .bind(id)

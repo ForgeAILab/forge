@@ -654,6 +654,7 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
                 }
                 None => serde_json::to_value(api_types::WorkspaceCleanupParams {
                     fence: api_types::WorkspaceMutationFence {
+                        integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                         daemon_id: daemon_id.to_owned(),
                         runtime_id: placement.runtime_id.ok_or_else(|| {
                             ServiceError::invalid_operation("cleanup placement has no runtime")

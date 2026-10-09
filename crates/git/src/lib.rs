@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+pub mod integration;
 mod process;
 mod remote;
 pub use remote::{normalize_remote_url, redact_remote_credentials};
@@ -40,14 +41,7 @@ pub struct BranchList {
 }
 
 async fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
-    let output = process::output(&mut command).await?;
+    let output = command_output(cwd, args).await?;
 
     if !output.status.success() {
         return Err(GitError::CommandFailed {
@@ -58,6 +52,35 @@ async fn run_git(cwd: &Path, args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Raw Git output through the cancellation-owned process group. The caller may
+/// select a deadline or cancel token; dropping this future stops descendants.
+pub async fn command_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    Ok(process::output(&mut command).await?)
+}
+
+/// Bounded raw output with the same group ownership as mutating Git commands.
+pub async fn command_output_bounded(
+    cwd: &Path,
+    args: &[&str],
+    limit: usize,
+) -> Result<std::process::Output> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    Ok(process::output_bounded(&mut command, Some(limit)).await?)
 }
 
 pub async fn is_git_repo(path: &Path) -> bool {
@@ -250,15 +273,14 @@ pub async fn abort_merge(worktree_path: &Path) -> Result<()> {
 pub async fn detect_interrupted_merge(worktree_path: &Path) -> Result<bool> {
     // For worktrees, .git is a file pointing to the actual git dir.
     // Check via git rev-parse instead.
-    let result = Command::new("git")
-        .kill_on_drop(true)
+    let mut command = Command::new("git");
+    command
         .args(["rev-parse", "--verify", "MERGE_HEAD"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+        .env_remove("GIT_INDEX_FILE");
+    let result = process::output(&mut command).await?;
     Ok(result.status.success())
 }
 
@@ -570,15 +592,14 @@ fn diff_destination_path(header: &str) -> Option<String> {
 
 /// Detect if a rebase is in progress via `git rev-parse`.
 pub async fn detect_rebase_in_progress(worktree_path: &Path) -> Result<bool> {
-    let result = Command::new("git")
-        .kill_on_drop(true)
+    let mut command = Command::new("git");
+    command
         .args(["rev-parse", "--git-path", "rebase-merge"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+        .env_remove("GIT_INDEX_FILE");
+    let result = process::output(&mut command).await?;
     if result.status.success() {
         let git_path = String::from_utf8_lossy(&result.stdout).trim().to_string();
         let abs = if Path::new(&git_path).is_absolute() {
@@ -591,15 +612,14 @@ pub async fn detect_rebase_in_progress(worktree_path: &Path) -> Result<bool> {
         }
     }
 
-    let result = Command::new("git")
-        .kill_on_drop(true)
+    let mut command = Command::new("git");
+    command
         .args(["rev-parse", "--git-path", "rebase-apply"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+        .env_remove("GIT_INDEX_FILE");
+    let result = process::output(&mut command).await?;
     if result.status.success() {
         let git_path = String::from_utf8_lossy(&result.stdout).trim().to_string();
         let abs = if Path::new(&git_path).is_absolute() {
@@ -641,15 +661,14 @@ pub async fn detect_conflict_state(worktree_path: &Path) -> Result<ConflictOpera
 
 /// List paths with unresolved conflicts.
 pub async fn conflict_paths(worktree_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .kill_on_drop(true)
+    let mut command = Command::new("git");
+    command
         .args(["diff", "--name-only", "--diff-filter=U"])
         .current_dir(worktree_path)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .await?;
+        .env_remove("GIT_INDEX_FILE");
+    let output = process::output(&mut command).await?;
 
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()

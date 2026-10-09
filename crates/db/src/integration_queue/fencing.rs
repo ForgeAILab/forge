@@ -2,14 +2,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct IntegrationOwnerFence {
-    pub queue_id: String,
-    pub attempt_id: String,
-    pub generation: i64,
-    pub lease_owner: String,
-    pub target_owner: Value,
-}
+pub use api_types::IntegrationOwnerFence;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrationEffectRefusal {
@@ -41,48 +34,209 @@ pub enum IntegrationEffectAdmission {
     Refused(IntegrationEffectRefusal),
 }
 
-/// The write guard prevents claim/takeover from invalidating a fence between
-/// its last check and Git. Intent was committed before acquiring this guard.
-/// Dropping it leaves that intent unresolved, never permission to repeat Git.
+/// Serializes one owner's checkout without retaining SQLite's single writer.
+/// Intent and receipt transactions are short; a dropped guard leaves a durable
+/// checkpoint that distinguishes an admitted request from a started effect.
 pub struct IntegrationEffectGuard {
-    transaction: Transaction<'static, Sqlite>,
+    pool: sqlx::SqlitePool,
     request: IntegrationEffectRequest,
+    _owner_locks: Vec<tokio::sync::OwnedMutexGuard<()>>,
 }
+
+async fn lock_owner(request: &IntegrationEffectRequest) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    type OwnerLocks = Mutex<std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<OwnerLocks> = OnceLock::new();
+    let owner = &request.fence.target_owner;
+    let prefix = format!(
+        "{}:{}:{}",
+        owner["owner_kind"], owner["daemon_id"], owner["runtime_id"]
+    );
+    let source = request.witness["workspace"]["handle"].as_str();
+    let mut keys = Vec::new();
+    if !matches!(
+        request.kind,
+        IntegrationOperationKind::Rebase | IntegrationOperationKind::Check
+    ) || source.is_none()
+    {
+        keys.push(format!("{prefix}:location:{}", owner["location_id"]));
+    }
+    if let Some(source) = source {
+        keys.push(format!("{prefix}:workspace:{source}"));
+    }
+    keys.sort();
+    keys.dedup();
+    let locks = {
+        let mut registry = LOCKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        registry.retain(|_, lock| lock.strong_count() > 0);
+        keys.into_iter()
+            .map(|key| {
+                if let Some(lock) = registry.get(&key).and_then(Weak::upgrade) {
+                    return lock;
+                }
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                registry.insert(key, Arc::downgrade(&lock));
+                lock
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut guards = Vec::new();
+    for lock in locks {
+        guards.push(lock.lock_owned().await);
+    }
+    guards
+}
+
 impl IntegrationEffectGuard {
+    /// The last durable fence check, immediately before owner-side Git probes.
+    /// A refused request is settled as not performed in the same transaction.
+    pub async fn start(&mut self) -> Result<Option<IntegrationEffectRefusal>> {
+        let mut tx = begin_immediate(&self.pool).await?;
+        if let Some(refusal) = verify(&mut tx, &self.request.fence).await? {
+            let receipt = make_receipt(
+                self.request.clone(),
+                serde_json::json!({"kind":"not_performed","reason":format!("{refusal:?}")}),
+                IntegrationOperationState::Failed,
+            );
+            record_in_tx(&mut tx, &receipt).await?;
+            tx.commit().await?;
+            return Ok(Some(refusal));
+        }
+        sqlx::query("UPDATE integration_attempt SET effect_intent_json=json_set(effect_intent_json,'$.started',json('true')),revision=revision+1,updated_at=? WHERE id=?")
+            .bind(now_rfc3339()).bind(&self.request.fence.attempt_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(None)
+    }
+
+    pub async fn record_owner_receipt(self, receipt: IntegrationEffectReceipt) -> Result<()> {
+        if receipt.request != self.request {
+            return Err(DbError::IdempotencyConflict);
+        }
+        let mut tx = begin_immediate(&self.pool).await?;
+        record_in_tx(&mut tx, &receipt).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn record(
-        mut self,
+        self,
         result: Value,
         operation_state: IntegrationOperationState,
     ) -> Result<IntegrationEffectReceipt> {
-        if !matches!(
-            operation_state,
-            IntegrationOperationState::Succeeded
-                | IntegrationOperationState::Failed
-                | IntegrationOperationState::Uncertain
-        ) {
-            return Err(DbError::Check(
-                "receipt must describe a settled or uncertain effect".into(),
-            ));
-        }
-        let receipt = IntegrationEffectReceipt {
-            request: self.request,
-            result,
-            operation_state,
-            recorded_at: now_rfc3339(),
-        };
-        let payload = serde_json::to_string(&receipt).map_err(|e| DbError::Check(e.to_string()))?;
-        if payload.len() > 131072 {
-            return Err(DbError::Check("effect receipt exceeds bound".into()));
-        }
-        let changed = sqlx::query("UPDATE integration_attempt SET effect_receipts_json=json_insert(effect_receipts_json,'$[#]',json(?)),effect_intent_json=CASE WHEN ?='uncertain' THEN effect_intent_json ELSE NULL END,current_operation_state=?,updated_at=?,revision=revision+1 WHERE id=? AND slot_generation=?")
-            .bind(payload).bind(operation_state.to_string()).bind(operation_state.to_string()).bind(&receipt.recorded_at).bind(&receipt.request.fence.attempt_id).bind(receipt.request.fence.generation)
-            .execute(&mut *self.transaction).await?.rows_affected();
-        if changed != 1 {
-            return Err(DbError::NotFound);
-        }
-        self.transaction.commit().await?;
+        let receipt = make_receipt(self.request, result, operation_state);
+        let mut tx = begin_immediate(&self.pool).await?;
+        record_in_tx(&mut tx, &receipt).await?;
+        tx.commit().await?;
         Ok(receipt)
     }
+}
+
+fn make_receipt(
+    request: IntegrationEffectRequest,
+    result: Value,
+    operation_state: IntegrationOperationState,
+) -> IntegrationEffectReceipt {
+    IntegrationEffectReceipt {
+        request,
+        result,
+        operation_state,
+        recorded_at: now_rfc3339(),
+    }
+}
+
+async fn record_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    receipt: &IntegrationEffectReceipt,
+) -> Result<()> {
+    if !matches!(
+        receipt.operation_state,
+        IntegrationOperationState::Succeeded
+            | IntegrationOperationState::Failed
+            | IntegrationOperationState::Uncertain
+    ) {
+        return Err(DbError::Check(
+            "receipt must describe a settled or uncertain effect".into(),
+        ));
+    }
+    let payload = serde_json::to_string(receipt).map_err(|e| DbError::Check(e.to_string()))?;
+    if payload.len() > 131072 {
+        return Err(DbError::Check("effect receipt exceeds bound".into()));
+    }
+    let intent: Option<String> =
+        sqlx::query_scalar("SELECT effect_intent_json FROM integration_attempt WHERE id=?")
+            .bind(&receipt.request.fence.attempt_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let intent = intent.map(parse_json).transpose()?;
+    if intent.as_ref().and_then(|i| i.get("request"))
+        != Some(&serde_json::to_value(&receipt.request).map_err(|e| DbError::Check(e.to_string()))?)
+    {
+        return Err(DbError::VersionConflict);
+    }
+    // Retain the original effect's receipt even after observation ownership has
+    // transferred. The frozen intent, not the new slot generation, is its key.
+    let mut receipts = receipts_in_tx(tx, &receipt.request.fence.attempt_id).await?;
+    if let Some(existing) = receipts.iter_mut().find(|existing| {
+        existing.request.fence == receipt.request.fence
+            && existing.request.kind == receipt.request.kind
+    }) {
+        if existing.request != receipt.request {
+            return Err(DbError::IdempotencyConflict);
+        }
+        if existing.operation_state != IntegrationOperationState::Uncertain {
+            return if existing == receipt {
+                Ok(())
+            } else {
+                Err(DbError::IdempotencyConflict)
+            };
+        }
+        *existing = receipt.clone();
+    } else {
+        receipts.push(receipt.clone());
+    }
+    let receipts = serde_json::to_string(&receipts).map_err(|e| DbError::Check(e.to_string()))?;
+    sqlx::query("UPDATE integration_attempt SET effect_receipts_json=?,effect_intent_json=CASE WHEN ?='uncertain' THEN effect_intent_json ELSE NULL END,current_operation_state=?,updated_at=?,revision=revision+1 WHERE id=?")
+        .bind(receipts).bind(receipt.operation_state.to_string()).bind(receipt.operation_state.to_string()).bind(&receipt.recorded_at).bind(&receipt.request.fence.attempt_id).execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Permanent infrastructure loss settles attempts in the remover's transaction.
+/// Quarantine is retained; settlement cannot grant a fresh effect or Task action.
+pub(crate) async fn settle_removed_integration_owner(
+    tx: &mut Transaction<'_, Sqlite>,
+    location: Option<&str>,
+    daemon: Option<&str>,
+) -> Result<()> {
+    let rows: Vec<String> = sqlx::query_scalar("SELECT effect_intent_json FROM integration_attempt WHERE effect_intent_json IS NOT NULL AND ((? IS NOT NULL AND json_extract(effect_intent_json,'$.request.fence.target_owner.location_id')=?) OR (? IS NOT NULL AND json_extract(effect_intent_json,'$.request.fence.target_owner.daemon_id')=?))")
+        .bind(location).bind(location).bind(daemon).bind(daemon).fetch_all(&mut **tx).await?;
+    let message = if daemon.is_some() {
+        "integration owner machine removed"
+    } else {
+        "integration owner location removed"
+    };
+    for raw in rows {
+        let intent = parse_json(raw)?;
+        let request: IntegrationEffectRequest = serde_json::from_value(intent["request"].clone())
+            .map_err(|e| DbError::Check(e.to_string()))?;
+        let receipt = make_receipt(
+            request,
+            serde_json::json!({"kind":"infrastructure","message":message,"head_sha":null,"rebase_in_progress":true}),
+            IntegrationOperationState::Failed,
+        );
+        record_in_tx(tx, &receipt).await?;
+        sqlx::query("UPDATE integration_attempt SET state=CASE WHEN state='quarantined' OR EXISTS(SELECT 1 FROM integration_queue q WHERE q.id=integration_attempt.queue_id AND q.state='quarantined') THEN 'quarantined' ELSE 'parked' END,failure_kind='infrastructure',failure_message=?,revision=revision+1,updated_at=? WHERE id=?")
+            .bind(message).bind(now_rfc3339()).bind(&receipt.request.fence.attempt_id).execute(&mut **tx).await?;
+    }
+    // Location deletion's existing queue update owns its single revision
+    // increment and target-unconfigured projection in this transaction.
+    if daemon.is_some() {
+        sqlx::query("UPDATE integration_queue SET state=CASE WHEN state='quarantined' THEN state ELSE 'suspended' END,lease_owner=NULL,lease_until=NULL,last_error_kind='infrastructure',last_error=?,revision=revision+1,updated_at=? WHERE state<>'closed' AND ((? IS NOT NULL AND target_location_id=?) OR (? IS NOT NULL AND json_extract(target_owner_json,'$.daemon_id')=?))")
+        .bind(message).bind(now_rfc3339()).bind(location).bind(location).bind(daemon).bind(daemon).execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 async fn receipts_in_tx(
@@ -101,6 +255,14 @@ async fn verify(
     tx: &mut Transaction<'_, Sqlite>,
     fence: &IntegrationOwnerFence,
 ) -> Result<Option<IntegrationEffectRefusal>> {
+    if let Some(step_id) = fence.lease_owner.strip_prefix("task-step:") {
+        if !crate::task_writer::owns_step(step_id) {
+            return Ok(Some(IntegrationEffectRefusal::StaleFence));
+        }
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM integration_attempt a JOIN task_step s ON s.task_id=a.task_ref JOIN task t ON t.id=s.task_id JOIN workspace_placement p ON p.task_id=a.task_ref AND (a.workspace_ref IS NULL OR p.workspace_id=a.workspace_ref) JOIN repo_location l ON l.id=p.repo_location_id WHERE a.id=? AND a.queue_id=? AND a.current=1 AND s.id=? AND s.status='claimed' AND s.attempts=? AND (s.entry_fenced=0 OR (t.status=s.expected_status AND t.status_epoch=s.expected_epoch)) AND p.state='ready' AND l.status='ready' AND l.id=? AND l.version=?)")
+            .bind(&fence.attempt_id).bind(&fence.queue_id).bind(step_id).bind(fence.generation).bind(fence.target_owner["location_id"].as_str()).bind(fence.target_owner["generation"].as_i64()).fetch_one(&mut **tx).await?;
+        return Ok((!valid).then_some(IntegrationEffectRefusal::StaleFence));
+    }
     let q = queue_in_tx(tx, &fence.queue_id).await?;
     let a = attempt_in_tx(tx, &fence.attempt_id).await?;
     if q.lease_until
@@ -143,7 +305,114 @@ async fn verify(
     Ok(None)
 }
 
+/// The original owner may reconcile after its lease expired or was replaced.
+/// This guard grants observation/receipt authority only, never effect authority.
+pub struct IntegrationReconciliationGuard {
+    pool: sqlx::SqlitePool,
+    pub request: IntegrationEffectRequest,
+    pub started: bool,
+    _owner_locks: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+impl IntegrationReconciliationGuard {
+    pub async fn record(
+        self,
+        result: Value,
+        state: IntegrationOperationState,
+    ) -> Result<IntegrationEffectReceipt> {
+        let receipt = make_receipt(self.request, result, state);
+        let mut tx = begin_immediate(&self.pool).await?;
+        record_in_tx(&mut tx, &receipt).await?;
+        tx.commit().await?;
+        Ok(receipt)
+    }
+    pub async fn record_owner_receipt(self, receipt: IntegrationEffectReceipt) -> Result<()> {
+        if receipt.request != self.request {
+            return Err(DbError::IdempotencyConflict);
+        }
+        let mut tx = begin_immediate(&self.pool).await?;
+        record_in_tx(&mut tx, &receipt).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
 impl SqliteDb {
+    /// Bind the existing Task step to its shadow attempt without claiming or
+    /// activating the queue. Placement follows today's Task, including when
+    /// its location differs from the configured future queue target.
+    pub async fn task_step_integration_request(
+        &self,
+        workspace_id: &str,
+        kind: IntegrationOperationKind,
+        witness: Value,
+    ) -> Result<Option<IntegrationEffectRequest>> {
+        let Some(step) = crate::task_writer::current_task_step() else {
+            return Ok(None);
+        };
+        let row = sqlx::query("SELECT a.id,a.queue_id,l.id AS location_id,l.owner_kind,l.daemon_id,l.runtime_id,l.version FROM integration_attempt a JOIN workspace_placement p ON p.workspace_id=? AND p.task_id=a.task_ref JOIN repo_location l ON l.id=p.repo_location_id WHERE a.current=1 AND a.task_ref=? AND a.queue_id IS NOT NULL")
+            .bind(workspace_id).bind(&step.task_id).fetch_optional(self.pool()).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let fence = IntegrationOwnerFence {
+            queue_id: row.try_get("queue_id")?,
+            attempt_id: row.try_get("id")?,
+            generation: step.attempts,
+            lease_owner: format!("task-step:{}", step.id),
+            target_owner: serde_json::json!({"location_id":row.try_get::<String,_>("location_id")?,"owner_kind":row.try_get::<String,_>("owner_kind")?,"daemon_id":row.try_get::<Option<String>,_>("daemon_id")?,"runtime_id":row.try_get::<Option<String>,_>("runtime_id")?,"generation":row.try_get::<i64,_>("version")?}),
+        };
+        Ok(Some(IntegrationEffectRequest {
+            fence,
+            kind,
+            witness,
+        }))
+    }
+
+    /// Bounded restart/reconnect input, indexed by the retained owner witness.
+    pub async fn outstanding_integration_effects(
+        &self,
+        owner_kind: &str,
+        daemon_id: Option<&str>,
+    ) -> Result<Vec<IntegrationEffectRequest>> {
+        let rows: Vec<String> = sqlx::query_scalar("SELECT effect_intent_json FROM integration_attempt WHERE effect_intent_json IS NOT NULL AND json_extract(effect_intent_json,'$.request.fence.target_owner.owner_kind')=? AND (? IS NULL OR json_extract(effect_intent_json,'$.request.fence.target_owner.daemon_id')=?) ORDER BY updated_at,id LIMIT 128")
+            .bind(owner_kind).bind(daemon_id).bind(daemon_id).fetch_all(self.pool()).await?;
+        rows.into_iter()
+            .map(|raw| {
+                let intent = parse_json(raw)?;
+                serde_json::from_value(intent["request"].clone())
+                    .map_err(|e| DbError::Check(e.to_string()))
+            })
+            .collect()
+    }
+
+    pub async fn lock_integration_reconciliation(
+        &self,
+        request: &IntegrationEffectRequest,
+    ) -> Result<Option<IntegrationReconciliationGuard>> {
+        let locks = lock_owner(request).await;
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT effect_intent_json FROM integration_attempt WHERE id=?")
+                .bind(&request.fence.attempt_id)
+                .fetch_optional(self.pool())
+                .await?
+                .flatten();
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let intent = parse_json(raw)?;
+        if intent["request"]
+            != serde_json::to_value(request).map_err(|e| DbError::Check(e.to_string()))?
+        {
+            return Ok(None);
+        }
+        Ok(Some(IntegrationReconciliationGuard {
+            pool: self.pool().clone(),
+            request: request.clone(),
+            started: intent["started"] != false,
+            _owner_locks: locks,
+        }))
+    }
+
     pub async fn integration_owner_fence(
         &self,
         attempt_id: &str,
@@ -185,6 +454,7 @@ impl SqliteDb {
                 "effect intent exceeds bound or has no witness".into(),
             ));
         }
+        let locks = lock_owner(&request).await;
         let mut tx = begin_immediate(self.pool()).await?;
         if let Some(receipt) = receipts_in_tx(&mut tx, &request.fence.attempt_id)
             .await?
@@ -215,28 +485,79 @@ impl SqliteDb {
                 .bind(&request.fence.attempt_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        if existing.is_some() {
+        if let Some(existing) = existing {
+            let intent = parse_json(existing)?;
+            if intent["started"] == false {
+                let original: IntegrationEffectRequest =
+                    serde_json::from_value(intent["request"].clone())
+                        .map_err(|e| DbError::Check(e.to_string()))?;
+                let same_request = original == request;
+                let same_key = original.fence == request.fence && original.kind == request.kind;
+                let receipt = make_receipt(
+                    original,
+                    serde_json::json!({"kind":"not_performed"}),
+                    IntegrationOperationState::Failed,
+                );
+                record_in_tx(&mut tx, &receipt).await?;
+                tx.commit().await?;
+                return Ok(if same_request {
+                    IntegrationEffectAdmission::Replay(receipt)
+                } else {
+                    IntegrationEffectAdmission::Refused(if same_key {
+                        IntegrationEffectRefusal::RequestConflict
+                    } else {
+                        IntegrationEffectRefusal::ReconciliationRequired
+                    })
+                });
+            }
             return Ok(IntegrationEffectAdmission::Refused(
                 IntegrationEffectRefusal::ReconciliationRequired,
             ));
+        }
+        let other_intents: Vec<String> = sqlx::query_scalar("SELECT effect_intent_json FROM integration_attempt WHERE id<>? AND effect_intent_json IS NOT NULL AND json_extract(effect_intent_json,'$.request.fence.target_owner.location_id')=? AND json_extract(effect_intent_json,'$.request.fence.target_owner.owner_kind')=?")
+            .bind(&request.fence.attempt_id).bind(request.fence.target_owner["location_id"].as_str()).bind(request.fence.target_owner["owner_kind"].as_str()).fetch_all(&mut *tx).await?;
+        for raw in other_intents {
+            let intent = parse_json(raw)?;
+            let original: IntegrationEffectRequest =
+                serde_json::from_value(intent["request"].clone())
+                    .map_err(|e| DbError::Check(e.to_string()))?;
+            if matches!(
+                original.kind,
+                IntegrationOperationKind::Rebase | IntegrationOperationKind::Check
+            ) && original.witness["workspace"]["handle"]
+                != request.witness["workspace"]["handle"]
+            {
+                continue;
+            }
+            if intent["started"] != false {
+                return Ok(IntegrationEffectAdmission::Refused(
+                    IntegrationEffectRefusal::ReconciliationRequired,
+                ));
+            }
+            record_in_tx(
+                &mut tx,
+                &make_receipt(
+                    original,
+                    serde_json::json!({"kind":"not_performed"}),
+                    IntegrationOperationState::Failed,
+                ),
+            )
+            .await?;
         }
         // Keep the digest in the frozen intent to diagnose reused input keys.
         let digest = Sha256::digest(json.as_bytes())
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        let intent = serde_json::json!({"request":request,"digest":digest});
+        let intent = serde_json::json!({"request":request,"digest":digest,"started":false});
         sqlx::query("UPDATE integration_attempt SET effect_intent_json=?,operation_kind=?,current_operation_state='running',revision=revision+1,updated_at=? WHERE id=?")
             .bind(intent.to_string()).bind(request.kind.to_string()).bind(now_rfc3339()).bind(&request.fence.attempt_id).execute(&mut *tx).await?;
         tx.commit().await?;
-        let mut tx = begin_immediate(self.pool()).await?;
-        if let Some(refusal) = verify(&mut tx, &request.fence).await? {
-            return Ok(IntegrationEffectAdmission::Refused(refusal));
-        }
         Ok(IntegrationEffectAdmission::Started(
             IntegrationEffectGuard {
-                transaction: tx,
+                pool: self.pool().clone(),
                 request,
+                _owner_locks: locks,
             },
         ))
     }
@@ -252,8 +573,8 @@ impl IntegrationEffectGuard {
             return Ok(None);
         }
         let w = &self.request.witness["workspace"];
-        let row=sqlx::query("SELECT p.workspace_id,p.generation,p.owner_kind,p.workspace_handle,w.worktree_path,l.path FROM workspace_placement p JOIN workspace w ON w.id=p.workspace_id JOIN integration_attempt a ON a.task_ref=p.task_id JOIN integration_queue q ON q.id=a.queue_id JOIN repo_location l ON l.id=q.target_location_id WHERE p.id=? AND a.id=? AND p.state='ready' AND w.repo_id=q.repo_id AND q.target_branch=? AND (a.workspace_ref IS NULL OR a.workspace_ref=p.workspace_id) AND (a.placement_ref IS NULL OR a.placement_ref=p.id)")
-            .bind(w["placement_id"].as_str()).bind(&self.request.fence.attempt_id).bind(self.request.witness["target_branch"].as_str()).fetch_optional(&mut *self.transaction).await?;
+        let row=sqlx::query("SELECT p.workspace_id,p.generation,p.owner_kind,p.workspace_handle,w.worktree_path,l.path FROM workspace_placement p JOIN workspace w ON w.id=p.workspace_id JOIN integration_attempt a ON a.task_ref=p.task_id JOIN integration_queue q ON q.id=a.queue_id JOIN repo_location l ON l.id=? WHERE p.id=? AND a.id=? AND p.state='ready' AND w.repo_id=q.repo_id AND q.target_branch=? AND (a.workspace_ref IS NULL OR a.workspace_ref=p.workspace_id) AND (a.placement_ref IS NULL OR a.placement_ref=p.id)")
+            .bind(self.request.fence.target_owner["location_id"].as_str()).bind(w["placement_id"].as_str()).bind(&self.request.fence.attempt_id).bind(self.request.witness["target_branch"].as_str()).fetch_optional(&self.pool).await?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -378,11 +699,12 @@ mod tests {
     async fn dropped_owner_guard_keeps_durable_intent_and_never_repeats_an_unknown_effect() {
         let (db, f) = claimed().await;
         let r = request(f);
-        let IntegrationEffectAdmission::Started(g) =
+        let IntegrationEffectAdmission::Started(mut g) =
             db.begin_integration_effect(r.clone()).await.unwrap()
         else {
             panic!("not admitted")
         };
+        assert!(g.start().await.unwrap().is_none());
         drop(g);
         assert!(db.integration_effect_receipt(&r).await.unwrap().is_none());
         assert!(matches!(
@@ -402,6 +724,148 @@ mod tests {
             Err(DbError::InvalidTransition)
         ));
     }
+    #[tokio::test]
+    async fn task_step_binds_unobserved_shadow_workspace_without_claiming_queue() {
+        use crate::TaskStepRepo;
+        let db = fixture().await;
+        crate::integration_queue::tests::seed_delivery(&db, "a").await;
+        let path: String = sqlx::query_scalar("SELECT worktree_path FROM workspace WHERE id='w-a'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES('pl','w-a','a','server','l',?,1,'ready','scheduler','{}',?,?)").bind(&path).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let q = db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let attempt = db
+            .admit_integration_attempt(admission(&q, "a", "unobserved-workspace"))
+            .await
+            .unwrap();
+        assert!(attempt.workspace_ref.is_none());
+        db.enqueue_step(&crate::EnqueueTaskStep {
+            id: "nullable-step".into(),
+            task_id: "a".into(),
+            kind: "hooks".into(),
+            payload_json: "{}".into(),
+            causation_step_id: None,
+            causation_key: "nullable-step".into(),
+            chain_id: "nullable-chain".into(),
+            chain_position: 1,
+            expected_status: "merging".into(),
+            expected_version: 1,
+            expected_epoch: Some(0),
+            lane: "long".into(),
+            available_at: now,
+        })
+        .await
+        .unwrap();
+        let step = db
+            .claim_step("owner", Some("a"), "2099-01-01T00:00:00Z")
+            .await
+            .unwrap()
+            .unwrap();
+        crate::task_writer::in_task_step(step, async {
+            let witness = serde_json::json!({"workspace":{"workspace_id":"w-a","placement_id":"pl","generation":1,"owner":{"kind":"server"},"handle":path},"target_branch":"main","expected_head_sha":"head","expected_target_sha":"target"});
+            let request = db.task_step_integration_request("w-a", IntegrationOperationKind::Merge, witness).await.unwrap().unwrap();
+            let IntegrationEffectAdmission::Started(mut guard) = db.begin_integration_effect(request).await.unwrap() else { panic!("not admitted"); };
+            assert!(guard.start().await.unwrap().is_none());
+            assert!(guard.server_workspace_paths().await.unwrap().is_some());
+            guard.record(serde_json::json!({"kind":"not_performed"}), IntegrationOperationState::Failed).await.unwrap();
+        }).await;
+        assert!(db
+            .integration_queue(&q.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_attempt_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn intent_without_effect_settles_not_performed() {
+        let (db, f) = claimed().await;
+        let r = request(f);
+        let IntegrationEffectAdmission::Started(g) =
+            db.begin_integration_effect(r.clone()).await.unwrap()
+        else {
+            panic!("not admitted")
+        };
+        drop(g);
+        let IntegrationEffectAdmission::Replay(receipt) =
+            db.begin_integration_effect(r.clone()).await.unwrap()
+        else {
+            panic!("not settled")
+        };
+        assert_eq!(receipt.result["kind"], "not_performed");
+        assert_eq!(receipt.operation_state, IntegrationOperationState::Failed);
+        assert!(db
+            .integration_attempt(&r.fence.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .effect_intent_json
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn refusal_after_intent_commits_settles_not_performed() {
+        let (db, f) = claimed().await;
+        let r = request(f);
+        let IntegrationEffectAdmission::Started(mut g) =
+            db.begin_integration_effect(r.clone()).await.unwrap()
+        else {
+            panic!("not admitted")
+        };
+        sqlx::query("UPDATE integration_queue SET lease_until='2000-01-01T00:00:00Z' WHERE id=?")
+            .bind(&r.fence.queue_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            g.start().await.unwrap(),
+            Some(IntegrationEffectRefusal::StaleFence)
+        );
+        drop(g);
+        let receipt = db.integration_effect_receipt(&r).await.unwrap().unwrap();
+        assert_eq!(receipt.result["kind"], "not_performed");
+        assert!(db
+            .integration_attempt(&r.fence.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .effect_intent_json
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn effect_guard_does_not_hold_sqlite_writer() {
+        let (db, f) = claimed().await;
+        let IntegrationEffectAdmission::Started(mut g) =
+            db.begin_integration_effect(request(f)).await.unwrap()
+        else {
+            panic!("not admitted")
+        };
+        assert!(g.start().await.unwrap().is_none());
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            let mut tx = begin_immediate(db.pool()).await.unwrap();
+            sqlx::query("UPDATE repo SET name='second writer' WHERE id='r'")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        })
+        .await
+        .expect("effect retained SQLite's writer");
+        g.record(
+            serde_json::json!({"kind":"rebased"}),
+            IntegrationOperationState::Succeeded,
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn deleting_the_repo_removes_an_attempt_that_holds_a_fence_and_a_receipt() {
         let (db, f) = claimed().await;
@@ -461,6 +925,180 @@ mod tests {
         );
         assert_eq!(refused.fence_generation, q.fence_generation);
     }
+    #[tokio::test]
+    async fn location_removal_settles_inflight_effect_and_preserves_quarantine() {
+        for quarantined in [false, true] {
+            let (db, f) = claimed().await;
+            let request = request(f.clone());
+            let IntegrationEffectAdmission::Started(mut guard) =
+                db.begin_integration_effect(request.clone()).await.unwrap()
+            else {
+                panic!("not admitted");
+            };
+            assert!(guard.start().await.unwrap().is_none());
+            if quarantined {
+                sqlx::query("UPDATE integration_queue SET state='quarantined' WHERE id=?")
+                    .bind(&f.queue_id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            crate::RepoLocationRepo::delete(&db, "l").await.unwrap();
+            let receipt = db
+                .integration_effect_receipt(&request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.result["kind"], "infrastructure");
+            assert_eq!(receipt.operation_state, IntegrationOperationState::Failed);
+            let attempt = db
+                .integration_attempt(&f.attempt_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(attempt.effect_intent_json.is_none());
+            assert_eq!(
+                attempt.failure_kind,
+                Some(IntegrationFailureKind::Infrastructure)
+            );
+            let queue = db.integration_queue(&f.queue_id).await.unwrap().unwrap();
+            assert_eq!(
+                queue.state,
+                if quarantined {
+                    IntegrationQueueState::Quarantined
+                } else {
+                    IntegrationQueueState::Suspended
+                }
+            );
+            assert_eq!(
+                queue.last_error_kind,
+                Some(IntegrationFailureKind::TargetUnconfigured)
+            );
+            // A late original owner cannot overwrite the permanent-loss receipt.
+            assert!(guard
+                .record(
+                    serde_json::json!({"kind":"rebased"}),
+                    IntegrationOperationState::Succeeded
+                )
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_removal_settles_attempt_and_preserves_quarantine() {
+        for quarantined in [false, true] {
+            let db = fixture().await;
+            let now = now_rfc3339();
+            sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES ('d','remote-machine','host','linux','aarch64','offline',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+            sqlx::query("INSERT INTO runtime(id,daemon_id,kind,workspace_root,status,labels_json,created_at,updated_at) VALUES ('rt','d','codex','root','offline','{}',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+            sqlx::query("UPDATE repo_location SET owner_kind='daemon',daemon_id='d',runtime_id='rt' WHERE id='l'").execute(db.pool()).await.unwrap();
+            let q = db
+                .create_or_get_integration_queue("r", "main")
+                .await
+                .unwrap();
+            let a = db
+                .admit_integration_attempt(admission(&q, "a", "removed-machine"))
+                .await
+                .unwrap();
+            let q = db.integration_queue(&q.id).await.unwrap().unwrap();
+            db.claim_integration_queue(&q.id, q.revision, "worker", &now, "2099-01-01T00:00:00Z")
+                .await
+                .unwrap();
+            let fence = db.integration_owner_fence(&a.id).await.unwrap().unwrap();
+            let request = request(fence.clone());
+            let IntegrationEffectAdmission::Started(mut guard) =
+                db.begin_integration_effect(request.clone()).await.unwrap()
+            else {
+                panic!("not admitted");
+            };
+            assert!(guard.start().await.unwrap().is_none());
+            if quarantined {
+                sqlx::query("UPDATE integration_queue SET state='quarantined' WHERE id=?")
+                    .bind(&q.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            db.remove_daemon("d", "admin", true, "local-host", false)
+                .await
+                .unwrap();
+            let settled = db.integration_attempt(&a.id).await.unwrap().unwrap();
+            assert!(settled.effect_intent_json.is_none());
+            assert_eq!(
+                settled.failure_kind,
+                Some(IntegrationFailureKind::Infrastructure)
+            );
+            assert_eq!(
+                settled.current_operation_state,
+                Some(IntegrationOperationState::Failed)
+            );
+            let receipt = db
+                .integration_effect_receipt(&request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.result["kind"], "infrastructure");
+            let q = db.integration_queue(&q.id).await.unwrap().unwrap();
+            assert_eq!(
+                q.state,
+                if quarantined {
+                    IntegrationQueueState::Quarantined
+                } else {
+                    IntegrationQueueState::Suspended
+                }
+            );
+            assert!(q.lease_owner.is_none());
+            drop(guard);
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_receipt_reconciliation_keeps_one_attempt_key() {
+        let (db, f) = claimed().await;
+        let request = request(f);
+        let IntegrationEffectAdmission::Started(mut guard) =
+            db.begin_integration_effect(request.clone()).await.unwrap()
+        else {
+            panic!("not admitted");
+        };
+        assert!(guard.start().await.unwrap().is_none());
+        guard
+            .record(
+                serde_json::json!({"kind":"infrastructure"}),
+                IntegrationOperationState::Uncertain,
+            )
+            .await
+            .unwrap();
+        let reconciliation = db
+            .lock_integration_reconciliation(&request)
+            .await
+            .unwrap()
+            .unwrap();
+        reconciliation
+            .record(
+                serde_json::json!({"kind":"completed"}),
+                IntegrationOperationState::Succeeded,
+            )
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT json_array_length(effect_receipts_json) FROM integration_attempt WHERE id=?",
+        )
+        .bind(&request.fence.attempt_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(db
+            .integration_attempt(&request.fence.attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .effect_intent_json
+            .is_none());
+    }
+
     #[tokio::test]
     async fn fencing_json_bounds_and_effect_enum_sql_parity() {
         let (db, f) = claimed().await;
@@ -596,11 +1234,12 @@ mod takeover_tests {
             kind: IntegrationOperationKind::Rebase,
             witness: serde_json::json!({"workspace":"w"}),
         };
-        let IntegrationEffectAdmission::Started(g) =
+        let IntegrationEffectAdmission::Started(mut g) =
             db.begin_integration_effect(request.clone()).await.unwrap()
         else {
             panic!("not admitted")
         };
+        assert!(g.start().await.unwrap().is_none());
         drop(g);
         let next = db
             .claim_integration_queue(

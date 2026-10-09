@@ -106,6 +106,7 @@ impl DaemonLink {
                                 request: params.clone(),
                                 outcome: None,
                                 acknowledged: false,
+                                effect_started: true,
                             },
                         })
                         .expect("interrupted intent retained");
@@ -2650,6 +2651,7 @@ async fn remote_plan_owner_publication_restore_and_discard_are_fenced() {
     let daemon = placement.daemon_id.as_deref().unwrap();
     let params = |operation| WorkspaceOwnerOperationParams {
         fence: WorkspaceMutationFence {
+            integration: api_types::WorkspaceIntegrationBinding::TaskStep,
             daemon_id: daemon.into(),
             runtime_id: placement.runtime_id.clone().unwrap(),
             placement_id: placement.id.clone(),
@@ -2788,6 +2790,7 @@ async fn remote_plan_operations_wait_for_workspace_run_and_discard_cleaned_state
         .with_timeout(Duration::from_millis(10));
     let params = |operation| WorkspaceOwnerOperationParams {
         fence: WorkspaceMutationFence {
+            integration: api_types::WorkspaceIntegrationBinding::TaskStep,
             daemon_id: daemon.into(),
             runtime_id: placement.runtime_id.clone().unwrap(),
             placement_id: placement.id.clone(),
@@ -3580,6 +3583,7 @@ async fn daemon_merge_rebase_and_check_primitives_write_no_server_tables_or_even
             .unwrap();
         let operation_id = db::new_uuid_v4();
         let fence = WorkspaceMutationFence {
+            integration: api_types::WorkspaceIntegrationBinding::TaskStep,
             daemon_id: fixture.daemon_id.clone(),
             runtime_id: placement.runtime_id.clone().unwrap(),
             placement_id: placement.id.clone(),
@@ -3692,4 +3696,200 @@ async fn daemon_merge_rebase_and_check_primitives_write_no_server_tables_or_even
         assert!(fixture.runtime.journal().pending().unwrap().iter().any(|entry| matches!(entry,
             JournalEntry::Operation { operation } if operation.fence.operation_id == operation_id && operation.outcome.is_some() && !operation.acknowledged)));
     }
+}
+
+#[tokio::test]
+async fn integration_attempt_lost_reply_across_real_reconnect_settles_once() {
+    use db::IntegrationQueueRepo;
+    let mut fixture = Fixture::new("forge-integration-attempt-reconnect").await;
+    let candidate = fixture.candidate().await;
+    let database = fixture.harness.state.db.clone();
+    let placement = fixture.resolved.placement.clone();
+    let workspace = WorkspaceRepo::get_by_id(&*database, &placement.workspace_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let task = TaskRepo::get_by_id(&*database, &placement.task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
+        .bind(&task.id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let queue = database
+        .create_or_get_integration_queue(&workspace.repo_id, "main")
+        .await
+        .unwrap();
+    let attempt = database
+        .admit_integration_attempt(db::IntegrationAttempt::new(
+            Some(queue.id.clone()),
+            task.id,
+            task.project_id,
+            "reconnect-attempt".into(),
+            task.status,
+            epoch,
+            task.version,
+        ))
+        .await
+        .unwrap();
+    let queue = database
+        .integration_queue(&queue.id)
+        .await
+        .unwrap()
+        .unwrap();
+    database
+        .claim_integration_queue(
+            &queue.id,
+            queue.revision,
+            "reconnect-worker",
+            &db::now_rfc3339(),
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    let fence = database
+        .integration_owner_fence(&attempt.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let witness = json!({"workspace":{"workspace_id":placement.workspace_id,"placement_id":placement.id,"generation":placement.generation,"handle":placement.workspace_handle,"owner":{"kind":"daemon","daemon_id":placement.daemon_id,"runtime_id":placement.runtime_id}},"target_branch":"main","task_branch":workspace.branch,"expected_head_sha":candidate,"expected_target_sha":fixture.base_sha,"reviewed":{"commit_sha":candidate,"base_sha":fixture.base_sha}});
+    let request = db::IntegrationEffectRequest {
+        fence,
+        kind: db::IntegrationOperationKind::FastForward,
+        witness,
+    };
+    let params = serde_json::to_value(WorkspaceReviewedMergeParams {
+        merge: WorkspaceMergeParams {
+            fence: WorkspaceMutationFence {
+                integration: WorkspaceIntegrationBinding::TaskStep,
+                daemon_id: fixture.daemon_id.clone(),
+                runtime_id: placement.runtime_id.clone().unwrap(),
+                placement_id: placement.id.clone(),
+                operation_id: "assigned-by-attempt-sink".into(),
+                generation: placement.generation as u64,
+                expected: WorkspaceOperationExpected::BaseSha {
+                    sha: candidate.clone(),
+                },
+            },
+            workspace_handle: placement.workspace_handle.clone().unwrap(),
+            repo_location_id: placement.repo_location_id.clone(),
+            target_branch: "main".into(),
+            expected_target_sha: fixture.base_sha.clone(),
+            handed_off_paths: Vec::new(),
+        },
+        reviewed_commit_sha: Some(candidate.clone()),
+    })
+    .unwrap();
+    let client = services::daemon_transport::workspace_client::DaemonWorkspaceClient::new(
+        fixture.harness.state.daemon_connections.clone(),
+    )
+    .with_receipts(database.clone());
+    fixture
+        .link
+        .as_ref()
+        .unwrap()
+        .drop_replies
+        .lock()
+        .unwrap()
+        .insert(METHOD_WORKSPACE_MERGE.into());
+    let effect = client.integration_effect(
+        &fixture.daemon_id,
+        request.clone(),
+        METHOD_WORKSPACE_MERGE,
+        params.clone(),
+        Duration::from_secs(10),
+    );
+    let owner_finished = async {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while git::get_current_sha(&fixture.checkout).await.unwrap() != candidate {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // This closes the actual WebSocket, failing the server's pending reply.
+        fixture.link.take();
+        common::fake_daemon::wait_until_disconnected(&fixture.harness.state, &fixture.daemon_id)
+            .await;
+    };
+    let (lost_reply, _) = tokio::join!(effect, owner_finished);
+    assert!(lost_reply.is_err());
+    assert!(database
+        .integration_attempt(&attempt.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .effect_intent_json
+        .is_some());
+    let reflog = git::command_output(&fixture.checkout, &["reflog", "--all"])
+        .await
+        .unwrap()
+        .stdout;
+    let objects = git::command_output(&fixture.checkout, &["count-objects", "-v"])
+        .await
+        .unwrap()
+        .stdout;
+    fixture.reconnect().await;
+    client
+        .reconcile_integration_attempts(&fixture.daemon_id)
+        .await
+        .unwrap();
+    let receipt = client
+        .integration_effect(
+            &fixture.daemon_id,
+            request.clone(),
+            METHOD_WORKSPACE_MERGE,
+            params,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt.operation_state,
+        db::IntegrationOperationState::Succeeded
+    );
+    assert_eq!(receipt.result["outcome"]["Done"]["after_sha"], candidate);
+    assert_eq!(
+        git::command_output(&fixture.checkout, &["reflog", "--all"])
+            .await
+            .unwrap()
+            .stdout,
+        reflog
+    );
+    assert_eq!(
+        git::command_output(&fixture.checkout, &["count-objects", "-v"])
+            .await
+            .unwrap()
+            .stdout,
+        objects
+    );
+    assert_eq!(
+        fixture
+            .link
+            .as_ref()
+            .unwrap()
+            .requests(METHOD_WORKSPACE_MERGE)
+            .len(),
+        0
+    );
+    let settled = database
+        .integration_attempt(&attempt.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(settled.effect_intent_json.is_none());
+    assert_eq!(
+        settled.current_operation_state,
+        Some(db::IntegrationOperationState::Succeeded)
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT json_array_length(effect_receipts_json) FROM integration_attempt WHERE id=?",
+    )
+    .bind(&attempt.id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
 }

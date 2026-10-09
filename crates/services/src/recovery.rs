@@ -85,6 +85,9 @@ impl CrashRecovery {
 
     #[tracing::instrument(skip(self))]
     pub async fn run_recovery(&self) -> Result<u64> {
+        crate::integration_owner::ServerIntegrationOwner::new(self.db.clone())
+            .reconcile_outstanding()
+            .await?;
         // A server restart loses its sockets, not the CLI running on an owner.
         // Persist that suspension before either execution or grant recovery.
         for placement in
@@ -2887,6 +2890,7 @@ pub(crate) async fn reconcile_workspace_placement(
                 daemon_id,
                 api_types::WorkspacePrepareParams {
                     fence: api_types::WorkspaceMutationFence {
+                        integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                         daemon_id: reference.daemon_id.clone(),
                         runtime_id: reference.runtime_id.clone(),
                         placement_id: placement.id.clone(),

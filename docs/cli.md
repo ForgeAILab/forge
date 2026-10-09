@@ -455,7 +455,7 @@ The daemon reads `workspace.run.allow` from `daemon.yaml` beside its credentials
 This dispatch policy has the trust limits described above.
 
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 3 or newer), restarting each with its existing
+release (protocol revision 4 or newer), restarting each with its existing
 `--workspace-root`.
 A revision-2 connection receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
@@ -468,7 +468,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the revision-3 handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 4, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.

@@ -259,7 +259,8 @@ impl DaemonConnection {
             return None;
         }
         let handshake = retained.clone()?;
-        let workspace_incapable = handshake.protocol_revision < 3
+        let workspace_incapable = handshake.protocol_revision
+            < api_types::DAEMON_MIN_PROTOCOL_REVISION
             || !handshake
                 .capabilities
                 .iter()

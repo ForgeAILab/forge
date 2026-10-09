@@ -384,6 +384,7 @@ impl ResolvedWorkspace {
                 &reference.daemon_id,
                 WorkspaceOwnerOperationParams {
                     fence: WorkspaceMutationFence {
+                        integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                         daemon_id: reference.daemon_id.clone(),
                         runtime_id: reference.runtime_id,
                         placement_id: reference.placement_id,
@@ -419,6 +420,7 @@ impl ResolvedWorkspace {
                 &reference.daemon_id,
                 WorkspaceOwnerOperationParams {
                     fence: WorkspaceMutationFence {
+                        integration: api_types::WorkspaceIntegrationBinding::TaskStep,
                         daemon_id: reference.daemon_id.clone(),
                         runtime_id: reference.runtime_id,
                         placement_id: reference.placement_id,

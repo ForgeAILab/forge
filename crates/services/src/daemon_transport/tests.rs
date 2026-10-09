@@ -1256,3 +1256,26 @@ async fn revision_two_refuses_all_commands_but_an_unknown_handshake_is_not_an_up
     }
     assert!(outbound.try_recv().is_err());
 }
+
+#[tokio::test]
+async fn former_revision_three_handshake_requires_daemon_upgrade() {
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("revision-three".into());
+    let id = connection.id();
+    registry.register("revision-three".into(), connection);
+    assert!(registry.dispatch_incoming_for_connection("revision-three", id, api_types::DaemonFrame::Notification {
+        method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params: json!({"protocol_revision":3,"capabilities":api_types::DAEMON_REQUIRED_CAPABILITIES}),
+    }));
+    let api_types::DaemonFrame::Error { error, .. } = outbound.recv().await.unwrap() else {
+        panic!("old daemon accepted");
+    };
+    assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
+    assert!(error.message.contains("upgrade the daemon"));
+    assert!(error.message.contains("revision 4"));
+    assert!(registry.get("revision-three").unwrap().needs_upgrade());
+    assert!(!registry
+        .get("revision-three")
+        .unwrap()
+        .protocol_allows_dispatch());
+}
