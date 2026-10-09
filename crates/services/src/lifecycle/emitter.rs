@@ -367,14 +367,19 @@ impl LifecycleEventEmitter {
                     crate::lifecycle::context::workspace_context_paths(&self.db, resolved)
                         .await
                         .map_err(|error| error.to_string())?;
-                let exists = workspace_exists(resolved).await?;
-                if !exists && resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+                let unusable = match workspace.as_ref() {
+                    Some(workspace) => self.unusable_reason(&task, workspace, resolved).await?,
+                    None => None,
+                };
+                if unusable.is_some()
+                    && resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon
+                {
                     return Err(format!(
                         "workspace {} does not exist on its owner",
                         resolved.placement.workspace_id
                     ));
                 }
-                if !exists && reclaimed {
+                if unusable.is_some() && reclaimed {
                     (
                         self.resolve_repo_path(
                             &project,
@@ -385,19 +390,29 @@ impl LifecycleEventEmitter {
                         .await,
                         None,
                     )
-                } else if !exists {
+                } else if let Some(reason) = unusable {
                     // The Task has a worktree on record and it is not usable.
                     // Its hook must not run anywhere else, least of all in the
                     // user's own checkout.
-                    return Err(crate::ServiceError::WorkspaceResetRequired {
+                    let message = crate::ServiceError::WorkspaceResetRequired {
                         task_id: task.id.clone(),
                         reason: format!(
-                            "worktree of workspace {} is missing or is not a Git worktree; \
-                             lifecycle hook {event:?} was not run",
-                            resolved.placement.workspace_id
+                            "worktree of workspace {} is not usable ({reason}); \
+                             lifecycle hook {} was not run",
+                            resolved.placement.workspace_id,
+                            lifecycle_event_name(event),
                         ),
                     }
-                    .to_string());
+                    .to_string();
+                    self.record_hook_not_run(
+                        &task,
+                        event,
+                        &resolved.placement.workspace_id,
+                        resolved_execution_id.as_deref(),
+                        &message,
+                    )
+                    .await;
+                    return Err(message);
                 } else {
                     (repo_path, Some(handle))
                 }
@@ -409,6 +424,7 @@ impl LifecycleEventEmitter {
             ),
         };
         let log_dir = resolve_log_dir(execution.as_ref(), resolved_execution_id.as_deref());
+        let recorded_execution_id = resolved_execution_id.clone();
 
         let ctx = LifecycleHookContext {
             env: crate::lifecycle::project_env(&project.settings),
@@ -428,19 +444,118 @@ impl LifecycleEventEmitter {
 
         match resolved.as_ref().filter(|_| ctx.worktree_path.is_some()) {
             Some(resolved) => {
-                LifecycleHookRunner::run_workspace_hooks(
+                let unavailable = LifecycleHookRunner::run_workspace_hooks(
                     ctx,
                     &hooks,
                     Arc::clone(&self.plugin_registry),
                     resolved,
                 )
-                .await
+                .await;
+                for (index, error) in unavailable {
+                    self.record_hook_not_run(
+                        &task,
+                        event,
+                        &format!("{}:{index}", resolved.placement.workspace_id),
+                        recorded_execution_id.as_deref(),
+                        &format!(
+                            "lifecycle hook {} #{index} was not run: {error}",
+                            lifecycle_event_name(event)
+                        ),
+                    )
+                    .await;
+                }
             }
             None => {
                 LifecycleHookRunner::run_hooks(ctx, &hooks, Arc::clone(&self.plugin_registry)).await
             }
         }
         Ok(())
+    }
+
+    /// Why the Task's recorded workspace cannot host a hook right now, or
+    /// `None` when it can. A server worktree is inspected by the workspace
+    /// manager, which never changes disk for a hook that fires after the
+    /// fact; a daemon answers for its own placement.
+    async fn unusable_reason(
+        &self,
+        task: &Task,
+        workspace: &Workspace,
+        resolved: &ResolvedWorkspace,
+    ) -> Result<Option<String>, String> {
+        if resolved.placement.owner_kind != db::PlacementOwnerKind::Server {
+            return Ok((!workspace_exists(resolved).await?)
+                .then(|| "workspace does not exist on its owner".to_owned()));
+        }
+        let root = crate::task_service::workspace::default_workspace_root();
+        match crate::workspace_manager::WorkspaceManager::new(
+            &self.db,
+            &root,
+            None,
+            &self.workspace_backend_router,
+        )
+        .ensure_valid(
+            task,
+            workspace.clone(),
+            crate::workspace_manager::Purpose::Inspect,
+        )
+        .await
+        {
+            Ok(valid) => {
+                if !valid.on_task_branch() {
+                    // Still the Task's own worktree: an after-the-fact hook
+                    // keeps running there, as it always has.
+                    warn!(
+                        task_id = %task.id,
+                        workspace_id = %workspace.id,
+                        branch = %valid.workspace().branch,
+                        "lifecycle hook runs in a worktree whose HEAD is not on the Task branch"
+                    );
+                }
+                Ok(None)
+            }
+            Err(crate::workspace_manager::WorkspaceUnavailable::Absent { reason }) => {
+                Ok(Some(reason))
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// A hook that could not run is part of the Task's record, not only a
+    /// server log line: one Forge comment per event, workspace and execution.
+    async fn record_hook_not_run(
+        &self,
+        task: &Task,
+        event: api_types::LifecycleEvent,
+        scope: &str,
+        execution_id: Option<&str>,
+        message: &str,
+    ) {
+        let now = db::now_rfc3339();
+        let created = db::TaskCommentRepo::create_comment(
+            &*self.db,
+            db::CreateTaskComment {
+                id: db::new_uuid_v4(),
+                task_id: task.id.clone(),
+                author_type: db::CommentAuthorType::System,
+                author_id: None,
+                author_name: "Forge".to_owned(),
+                content: message.to_owned(),
+                execution_id: None,
+                role: None,
+                worklog_kind: None,
+                idempotency_key: Some(format!(
+                    "lifecycle-hook-not-run:{}:{scope}:{}",
+                    lifecycle_event_name(event),
+                    execution_id.unwrap_or("none")
+                )),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await;
+        if let Err(error) = created {
+            warn!(task_id = %task.id, %error, "failed to record a lifecycle hook that was not run");
+        }
     }
 
     async fn load_task(&self, task_id: &str) -> Result<Task, String> {
@@ -534,15 +649,18 @@ impl LifecycleEventEmitter {
     }
 }
 
-async fn workspace_exists(workspace: &ResolvedWorkspace) -> Result<bool, String> {
-    if workspace.placement.owner_kind == db::PlacementOwnerKind::Server {
-        // A directory without Git metadata is not a worktree: a hook run
-        // there would act on a tree that is not the Task's.
-        return workspace
-            .embedded_path()
-            .map(|path| path.join(".git").exists())
-            .map_err(|error| error.to_string());
+fn lifecycle_event_name(event: api_types::LifecycleEvent) -> &'static str {
+    match event {
+        api_types::LifecycleEvent::BeforeWork => "before_work",
+        api_types::LifecycleEvent::OnWorkStart => "on_work_start",
+        api_types::LifecycleEvent::OnWorkStop => "on_work_stop",
+        api_types::LifecycleEvent::OnTaskDone => "on_task_done",
+        api_types::LifecycleEvent::OnTaskCancel => "on_task_cancel",
     }
+}
+
+/// Daemon placements only: the owner says whether its workspace exists.
+async fn workspace_exists(workspace: &ResolvedWorkspace) -> Result<bool, String> {
     workspace
         .backend
         .describe(&workspace.placement)
@@ -839,6 +957,72 @@ mod tests {
             .expect_err("a directory without Git metadata fails the hook");
         assert!(!user_repo.join("hook-ran").exists());
         assert!(!worktree.join("hook-ran").exists());
+    }
+
+    /// A hook that could not run is on the Task's record, once, not only in
+    /// the server log.
+    #[tokio::test]
+    async fn hook_that_was_not_run_is_recorded_on_the_task_once() {
+        let db = migrated_db().await;
+        let temp = tempfile::TempDir::new().unwrap();
+        let (user_repo, task_id, workspace_id) =
+            seed_hook_fixture(&db, temp.path(), db::WorkspaceStatus::Ready).await;
+        let emitter = LifecycleEventEmitter::new(Arc::clone(&db), Arc::new(PluginRegistry::new()));
+
+        let mut errors = Vec::new();
+        for _ in 0..2 {
+            errors.push(
+                emitter
+                    .emit_lifecycle_event(
+                        &task_id,
+                        None,
+                        api_types::LifecycleEvent::OnTaskDone,
+                        Some("review".to_owned()),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect_err("a missing worktree fails the hook"),
+            );
+        }
+        assert!(!user_repo.join("hook-ran").exists());
+
+        let comments = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT author_type, author_name, content FROM task_comment WHERE task_id = ?",
+        )
+        .bind(&task_id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            comments.len(),
+            1,
+            "one entry for repeated events: {comments:?}"
+        );
+        let (author_type, author_name, content) = &comments[0];
+        assert_eq!(author_type, "system");
+        assert_eq!(author_name, "Forge");
+        assert_eq!(content, &errors[0]);
+        assert!(
+            content.contains("lifecycle hook on_task_done was not run"),
+            "{content}"
+        );
+        assert!(content.contains(&workspace_id), "{content}");
+        assert!(
+            content.contains("worktree directory is missing"),
+            "{content}"
+        );
+        let annotation = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT error_annotation FROM task WHERE id = ?",
+        )
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            annotation, None,
+            "a finished Task is not blocked by its hook"
+        );
     }
 
     #[tokio::test]

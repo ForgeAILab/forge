@@ -79,13 +79,14 @@ impl HookAction for RunCiSteps {
             };
         };
 
-        let workspace = match crate::task_service::workspace::prepare_workspace(
+        let workspace = match crate::task_service::workspace::prepare_workspace_for(
             &ctx.db,
             &ctx.workspace_root,
             &task,
             &task.id,
             ctx.repo_cache_locks.clone(),
             &ctx.workspace_backend_router,
+            crate::workspace_manager::Purpose::Check,
         )
         .await
         {

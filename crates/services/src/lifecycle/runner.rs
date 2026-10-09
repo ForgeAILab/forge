@@ -50,8 +50,8 @@ impl LifecycleHookRunner {
         hooks: &[api_types::LifecycleHookDef],
         plugin_registry: Arc<PluginRegistry>,
         workspace: &ResolvedWorkspace,
-    ) {
-        Self::run_hooks_inner(ctx, hooks, plugin_registry, Some(workspace)).await;
+    ) -> Vec<(usize, String)> {
+        Self::run_hooks_inner(ctx, hooks, plugin_registry, Some(workspace)).await
     }
 
     async fn run_hooks_inner(
@@ -59,7 +59,10 @@ impl LifecycleHookRunner {
         hooks: &[api_types::LifecycleHookDef],
         plugin_registry: Arc<PluginRegistry>,
         workspace: Option<&ResolvedWorkspace>,
-    ) {
+    ) -> Vec<(usize, String)> {
+        // Hooks that could not be started at all, by index. A hook that ran
+        // and failed has its own log entry.
+        let mut unavailable = Vec::new();
         for (index, hook) in hooks.iter().enumerate() {
             match hook {
                 api_types::LifecycleHookDef::Script {
@@ -81,10 +84,13 @@ impl LifecycleHookRunner {
                         Ok(mut run) => {
                             run.log_path = Self::write_log_entry(&ctx, index, &run.entry)
                         }
-                        Err(error) => warn!(
-                            event = %event_name(&ctx.event), task_id = %ctx.task_id,
-                            hook_index = index, %error, "lifecycle workspace hook unavailable"
-                        ),
+                        Err(error) => {
+                            warn!(
+                                event = %event_name(&ctx.event), task_id = %ctx.task_id,
+                                hook_index = index, %error, "lifecycle workspace hook unavailable"
+                            );
+                            unavailable.push((index, error.to_string()));
+                        }
                     }
                 }
                 api_types::LifecycleHookDef::Plugin {
@@ -114,6 +120,7 @@ impl LifecycleHookRunner {
                 }
             }
         }
+        unavailable
     }
 
     pub async fn run_blocking_before_work_hooks(

@@ -371,13 +371,14 @@ impl TaskService {
         execution.workspace_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("executor execution missing workspace_id")
         })?;
-        let workspace = prepare_workspace(
+        let workspace = super::workspace::prepare_workspace_for(
             &self.db,
             &self.workspace_root,
             task,
             &task.id,
             self.repo_cache_locks.clone(),
             &self.workspace_backend_router,
+            crate::workspace_manager::Purpose::Review,
         )
         .await?;
         let workspace_io = self.review_workspace_io(&workspace).await?;

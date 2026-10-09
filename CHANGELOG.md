@@ -776,6 +776,45 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   worktree path that is a symbolic link, and a repository located inside the
   Task root. The main working tree of a repository is never treated as a
   Task worktree.
+- **A workspace is checked against disk and Git immediately before it is
+  used (3.4 stage B, part 1).** A new internal accessor,
+  `WorkspaceManager::ensure_valid`, is now behind claim, launch preparation,
+  reassignment reset, review entry CI, review rerun, blocking `before_work`
+  hooks, merge delivery and target-moved rebase on server-owned workspaces.
+  Besides the existing checks (directory present, Git can use it), it now
+  refuses or repairs three more states. A worktree of a different repository
+  at the recorded path is moved aside (`<name>.broken-<ms>`) and recreated
+  from the Task branch. A worktree path or Task root that is a symbolic link
+  is never used: the Task gets `workspace reset required`. A worktree whose
+  HEAD is not on the Task branch (another branch, or detached outside a
+  rebase) is put back on it at launch when it has no uncommitted changes;
+  with uncommitted changes, and for review, checks, hooks and delivery, the
+  Task gets `workspace reset required` instead of running on the wrong
+  branch. An interrupted rebase is left to the rebase owner as before. No
+  REST, MCP, event or CLI shape changes. Healthy workspaces behave as before;
+  the check adds one `git rev-parse` per use (about 25 ms measured per call
+  with the existing probe, under a parallel test run).
+  Error text that changed or is new:
+  - `workspace reset required for task <id>: worktree HEAD is on <ref>, not on Task branch '<branch>'; …` (new).
+  - `workspace reset required for task <id>: recorded worktree path <path> runs through a symbolic link` / `… is a symbolic link` (new).
+  - Lifecycle hooks: `worktree of workspace <id> is missing or is not a Git worktree; lifecycle hook OnTaskDone was not run` is now `worktree of workspace <id> is not usable (<reason>); lifecycle hook on_task_done was not run`.
+  - Cleanup: `repository <path> is recorded for this workspace and is not reachable right now; workspace cleanup will be retried` (new).
+- **A lifecycle hook that could not run is recorded on the Task (3.4 stage B,
+  part 1).** When a script hook is skipped because the Task worktree is not
+  usable, or cannot be started on its workspace owner, Forge now adds one
+  system comment to the Task naming the hook and the reason. Before, this
+  only reached the server log. Repeated events add no further comments. The
+  Task's state and annotations are not changed.
+- **Cleanup waits for a user repository that is temporarily away (3.4 stage
+  B, part 1).** If the Repo records a local checkout that is not on disk when
+  a terminal Task's workspace is cleaned up (an unmounted volume, a moved
+  directory) and Forge holds no clone of it, cleanup used to report success
+  and leave the worktree registration in that repository for good. It now
+  fails that attempt, keeps the worktree, retries with the existing backoff
+  and raises the cleanup attention item after five attempts; once the
+  repository is back, the registration and the Task root are removed. If the
+  checkout was deleted for good, clear or correct the Repo's local path, or
+  dismiss the attention item and remove `<workspace root>/<task id>` by hand.
 - **A cleanup that keeps failing becomes one attention item (3.4 stage A).**
   After five failed attempts Forge raises a single Project attention item
   (category `progress_warning`, with the path, attempt count and last error)

@@ -9,6 +9,8 @@ use sqlx::{Sqlite, Transaction};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+use crate::workspace_manager::Purpose;
+
 /// Preserve Git and filesystem failures as typed transient service errors.
 /// Dispatch dispositions are for stable governance refusals; converting these
 /// failures to `InvalidOperation` text would park a Task until an unrelated
@@ -21,7 +23,7 @@ fn map_workspace_error(error: ::workspace::WorkspaceError) -> ServiceError {
     }
 }
 
-async fn resolve_workspace_backend(
+pub(crate) async fn resolve_workspace_backend(
     db: &SqliteDb,
     workspace_root: &Path,
     workspace: &Workspace,
@@ -1241,19 +1243,48 @@ pub(crate) async fn prepare_workspace(
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     router: &crate::workspace_backend::WorkspaceBackendRouter,
 ) -> Result<Workspace> {
-    Ok(
-        prepare_workspace_owned(db, workspace_root, task, task_id, repo_cache_locks, router)
-            .await?
-            .0,
+    prepare_workspace_for(
+        db,
+        workspace_root,
+        task,
+        task_id,
+        repo_cache_locks,
+        router,
+        Purpose::Execute,
     )
+    .await
 }
 
-/// Return the persisted workspace only after its recorded owner can use it.
+/// Create or validate the Task's workspace for `purpose`. Creation is one of
+/// the repairs; an existing row is checked by the workspace manager.
+pub(crate) async fn prepare_workspace_for(
+    db: &SqliteDb,
+    workspace_root: &Path,
+    task: &Task,
+    task_id: &str,
+    repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    router: &crate::workspace_backend::WorkspaceBackendRouter,
+    purpose: Purpose,
+) -> Result<Workspace> {
+    Ok(prepare_workspace_owned(
+        db,
+        workspace_root,
+        task,
+        task_id,
+        repo_cache_locks,
+        router,
+        purpose,
+    )
+    .await?
+    .0)
+}
+
+/// The validated workspace for an integration caller (delivery, rebase).
 ///
-/// Server-owned workspaces are checked as real Git worktrees and recovered
-/// from their surviving Task branch when their directory or Git metadata is
-/// missing. Daemon-owned placements retain the existing describe/prepare
-/// behavior; Forge never interprets their opaque handle as a local path.
+/// Every check and repair lives in
+/// [`crate::workspace_manager::WorkspaceManager::ensure_valid`]; this entry
+/// point remains for the merge and rebase owners, which pass whether the row
+/// is forgotten when its Task branch is gone.
 pub(crate) async fn ensure_valid(
     db: &SqliteDb,
     workspace_root: &Path,
@@ -1263,87 +1294,55 @@ pub(crate) async fn ensure_valid(
     delete_missing_workspace: bool,
     router: &crate::workspace_backend::WorkspaceBackendRouter,
 ) -> Result<Workspace> {
-    if let Some(placement) = WorkspacePlacementRepo::get_by_workspace_id(db, &workspace.id).await? {
-        if placement.owner_kind == PlacementOwnerKind::Daemon {
-            match placement.state {
-                PlacementState::Ready => {}
-                PlacementState::Disconnected => {
-                    return Err(ServiceError::DaemonUnavailable {
-                        daemon_id: placement.daemon_id.unwrap_or_default(),
-                    })
-                }
-                _ => {
-                    return Err(ServiceError::WorkspaceResetRequired {
-                        task_id: task.id.clone(),
-                        reason: format!("workspace placement is {}", placement.state),
-                    })
-                }
-            }
-            let resolved = router.resolve(db, &workspace).await?;
-            let needs_recreation = match resolved.backend.describe(&resolved.placement).await {
-                Ok(state) => !state.exists,
-                Err(error) => return Err(error.into()),
-            };
-            if needs_recreation {
-                if sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM execution WHERE workspace_id = ? AND status = 'running')")
-                    .bind(&workspace.id).fetch_one(db.pool()).await? {
-                    return Err(ServiceError::conflict("workspace still has a running execution"));
-                }
-                let recovered = resolved
-                    .backend
-                    .prepare(
-                        &resolved.placement,
-                        &crate::workspace_backend::PrepareSpec {
-                            base_ref: workspace.before_sha.clone().ok_or_else(|| {
-                                ServiceError::WorkspaceResetRequired {
-                                    task_id: workspace.task_id.clone(),
-                                    reason: "workspace has no recorded recovery base".to_owned(),
-                                }
-                            })?,
-                        },
-                    )
-                    .await?;
-                let mut update = crate::placement::admission::placement_update(&resolved.placement);
-                update.workspace_handle = Some(Some(recovered.handle));
-                WorkspacePlacementRepo::update(db, update).await?;
-            }
-            return clear_workspace_cleanup_after(db, workspace).await;
-        }
-    }
+    ensure_valid_for(
+        db,
+        workspace_root,
+        task,
+        workspace,
+        repo_cache_locks,
+        delete_missing_workspace,
+        router,
+        Purpose::Integrate,
+    )
+    .await
+}
 
-    if workspace.status != WorkspaceStatus::Ready {
-        return Err(ServiceError::invalid_operation(format!(
-            "workspace for task {} is not ready",
-            workspace.task_id
-        )));
-    }
-    let repo = RepoRepo::get_by_id(db, &workspace.repo_id)
-        .await?
-        .filter(|repo| repo.project_id == task.project_id)
-        .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
-    let resolved = resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
-    let worktree_path = resolved.embedded_path()?;
-    match worktree_readiness(&worktree_path).await? {
-        WorktreeReadiness::Ready => clear_workspace_cleanup_after(db, workspace).await,
-        WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
-            let owner_task_id = workspace.task_id.clone();
-            clear_workspace_cleanup_after(
-                db,
-                recover_missing_worktree(
-                    db,
-                    workspace_root,
-                    &repo,
-                    &owner_task_id,
-                    workspace,
-                    repo_cache_locks,
-                    delete_missing_workspace,
-                    router,
-                )
-                .await?,
-            )
+#[allow(clippy::too_many_arguments)]
+async fn ensure_valid_for(
+    db: &SqliteDb,
+    workspace_root: &Path,
+    task: &Task,
+    workspace: Workspace,
+    repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    delete_missing_workspace: bool,
+    router: &crate::workspace_backend::WorkspaceBackendRouter,
+    purpose: Purpose,
+) -> Result<Workspace> {
+    let manager = crate::workspace_manager::WorkspaceManager::new(
+        db,
+        workspace_root,
+        repo_cache_locks,
+        router,
+    );
+    let valid = if delete_missing_workspace {
+        manager
+            .ensure_valid_or_forget(task, workspace, purpose)
             .await
-        }
+    } else {
+        manager.ensure_valid(task, workspace, purpose).await
+    };
+    let valid = valid?;
+    if valid.repair() != crate::workspace_manager::Repair::None {
+        info!(
+            task_id = %task.id,
+            workspace_id = %valid.workspace().id,
+            placement_id = %valid.resolved().placement.id,
+            purpose = ?purpose,
+            repair = ?valid.repair(),
+            "workspace repaired before use"
+        );
     }
+    Ok(valid.into_workspace())
 }
 
 fn worktree_describe_needs_recreation(
@@ -1363,6 +1362,7 @@ pub(crate) async fn prepare_workspace_owned(
     task_id: &str,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     router: &crate::workspace_backend::WorkspaceBackendRouter,
+    purpose: Purpose,
 ) -> Result<(Workspace, bool)> {
     let authority = resolve_task_repository_authority(db, task).await?;
     let owner_task_id = task.parent_task_id.as_deref().unwrap_or(task_id);
@@ -1380,7 +1380,7 @@ pub(crate) async fn prepare_workspace_owned(
                 )
                 .await?;
                 return Ok((
-                    ensure_valid(
+                    ensure_valid_for(
                         db,
                         workspace_root,
                         task,
@@ -1388,6 +1388,7 @@ pub(crate) async fn prepare_workspace_owned(
                         repo_cache_locks,
                         false,
                         router,
+                        purpose,
                     )
                     .await?,
                     false,
@@ -1422,7 +1423,7 @@ pub(crate) async fn prepare_workspace_owned(
             .await?;
         if workspace.status == WorkspaceStatus::Ready {
             return Ok((
-                ensure_valid(
+                ensure_valid_for(
                     db,
                     workspace_root,
                     task,
@@ -1430,6 +1431,7 @@ pub(crate) async fn prepare_workspace_owned(
                     repo_cache_locks,
                     false,
                     router,
+                    purpose,
                 )
                 .await?,
                 false,
@@ -1480,6 +1482,7 @@ pub(crate) async fn prepare_workspace_owned(
                         repo_cache_locks,
                         true,
                         router,
+                        false,
                     )
                     .await?,
                 )
@@ -1489,7 +1492,7 @@ pub(crate) async fn prepare_workspace_owned(
         }
         if workspace.status == WorkspaceStatus::Ready {
             return Ok((
-                ensure_valid(
+                ensure_valid_for(
                     db,
                     workspace_root,
                     task,
@@ -1497,6 +1500,7 @@ pub(crate) async fn prepare_workspace_owned(
                     repo_cache_locks,
                     true,
                     router,
+                    purpose,
                 )
                 .await?,
                 false,
@@ -1543,8 +1547,11 @@ async fn ensure_workspace_repository_current(
     })
 }
 
+/// Recreate the worktree from its surviving Task branch. `foreign` is the
+/// workspace manager's finding that a usable Git directory at the recorded
+/// path belongs to another repository: it is moved aside, never relinked.
 #[allow(clippy::too_many_arguments)]
-async fn recover_missing_worktree(
+pub(crate) async fn recover_missing_worktree(
     db: &SqliteDb,
     workspace_root: &std::path::Path,
     repo: &db::Repo,
@@ -1553,13 +1560,15 @@ async fn recover_missing_worktree(
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     delete_missing_workspace: bool,
     router: &crate::workspace_backend::WorkspaceBackendRouter,
+    foreign: bool,
 ) -> Result<Workspace> {
     let resolved = resolve_workspace_backend(db, workspace_root, &workspace, router).await?;
     let existing_path = resolved.embedded_path()?;
-    let readiness = worktree_readiness(&existing_path).await?;
-    if matches!(readiness, WorktreeReadiness::Ready) {
-        return Ok(workspace);
-    }
+    let readiness = match worktree_readiness(&existing_path).await? {
+        WorktreeReadiness::Ready if foreign => WorktreeReadiness::Invalid,
+        WorktreeReadiness::Ready => return Ok(workspace),
+        readiness => readiness,
+    };
     warn!(
         task_id = task_id,
         workspace_id = %workspace.id,
@@ -1577,6 +1586,7 @@ async fn recover_missing_worktree(
     }
 
     if matches!(readiness, WorktreeReadiness::Invalid)
+        && !foreign
         && try_repair_worktree_gitdir(Path::new(&repo_source), &existing_path).await
     {
         info!(
@@ -2224,7 +2234,10 @@ async fn persist_recovered_workspace(
 /// Reusing a workspace revives its shared delivery branch. Any cleanup
 /// deadline left by a previously terminal child is stale and must be cleared
 /// before a new execution can rely on the worktree.
-async fn clear_workspace_cleanup_after(db: &SqliteDb, workspace: Workspace) -> Result<Workspace> {
+pub(crate) async fn clear_workspace_cleanup_after(
+    db: &SqliteDb,
+    workspace: Workspace,
+) -> Result<Workspace> {
     if workspace.cleanup_after.is_none() {
         return Ok(workspace);
     }
@@ -2547,12 +2560,12 @@ fn write_scratch_workspace_boundary(workspace: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use db::{create_sqlite_pool, run_migrations, CreateProject, CreateRepo, UpdateProject};
     use tempfile::TempDir;
 
-    async fn sqlite_db() -> SqliteDb {
+    pub(crate) async fn sqlite_db() -> SqliteDb {
         let pool = create_sqlite_pool("sqlite::memory:")
             .await
             .expect("pool creates");
@@ -2616,7 +2629,11 @@ mod tests {
         (project_id, repo_id)
     }
 
-    async fn seed_task(db: &SqliteDb, project_id: &str, parent_task_id: Option<String>) -> Task {
+    pub(crate) async fn seed_task(
+        db: &SqliteDb,
+        project_id: &str,
+        parent_task_id: Option<String>,
+    ) -> Task {
         let now = now_rfc3339();
         TaskRepo::create(
             db,
@@ -4416,7 +4433,7 @@ mod tests {
         );
     }
 
-    async fn seed_project_with_real_repo(
+    pub(crate) async fn seed_project_with_real_repo(
         db: &SqliteDb,
         repo_path: &std::path::Path,
     ) -> (String, String) {

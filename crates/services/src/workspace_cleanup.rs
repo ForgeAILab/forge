@@ -2695,6 +2695,84 @@ mod tests {
         .unwrap()
     }
 
+    /// A user's repository that is away right now (an unmounted volume) is
+    /// not a repository that is gone: cleanup keeps the worktree, retries, and
+    /// removes the registration from the user's repository once it is back.
+    #[tokio::test]
+    async fn recorded_repository_missing_right_now_is_retried_not_treated_as_gone() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let (cache, _branch) = fixture_source(&db, temp.path(), &workspace_id).await;
+        let workspace = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Make the source the user's own checkout, recorded on the Repo.
+        let user_repo = temp.path().join("user-repo");
+        std::fs::rename(&cache, &user_repo).unwrap();
+        fixture_git(
+            &user_repo,
+            &["worktree", "repair", &worktree_path.to_string_lossy()],
+        )
+        .await;
+        sqlx::query("UPDATE repo SET local_path = ? WHERE id = ?")
+            .bind(user_repo.to_string_lossy().as_ref())
+            .bind(&workspace.repo_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let registered = |repo: PathBuf, worktree: PathBuf| async move {
+            fixture_git(&repo, &["worktree", "list", "--porcelain"])
+                .await
+                .contains(worktree.to_string_lossy().as_ref())
+        };
+        assert!(registered(user_repo.clone(), worktree_path.clone()).await);
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+
+        let away = temp.path().join("user-repo.unmounted");
+        std::fs::rename(&user_repo, &away).unwrap();
+        for attempt in 1..=CLEANUP_ATTENTION_ATTEMPTS {
+            clean_due(&scheduler, &workspace_id).await;
+            let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(row.status, WorkspaceStatus::Cleaned, "attempt {attempt}");
+            assert_eq!(row.cleanup_attempts, attempt);
+            assert!(row
+                .last_cleanup_error
+                .as_deref()
+                .unwrap()
+                .contains("is not reachable right now"));
+            assert!(worktree_path.exists(), "the worktree is kept for the retry");
+            assert_eq!(
+                cleanup_attention(&db, &workspace_id).await.len(),
+                usize::from(attempt == CLEANUP_ATTENTION_ATTEMPTS),
+                "attention is raised at the threshold, attempt {attempt}"
+            );
+        }
+
+        std::fs::rename(&away, &user_repo).unwrap();
+        clean_due(&scheduler, &workspace_id).await;
+        let row = WorkspaceRepo::get_by_id(&*db, &workspace_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, WorkspaceStatus::Cleaned);
+        assert!(!worktree_path.parent().unwrap().exists());
+        assert!(
+            !registered(user_repo.clone(), worktree_path.clone()).await,
+            "the registration is removed from the user's repository"
+        );
+        assert_eq!(cleanup_attention(&db, &workspace_id).await[0].0, "resolved");
+    }
+
     #[tokio::test]
     async fn five_failed_cleanups_raise_one_attention_item_that_success_clears() {
         let db = sqlite_db().await;

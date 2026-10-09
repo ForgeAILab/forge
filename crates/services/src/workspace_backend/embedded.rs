@@ -21,6 +21,15 @@ use crate::{
     ServiceError,
 };
 
+/// Where the repository a workspace was created from is right now.
+enum RecordedRepoSource {
+    Present(PathBuf),
+    /// The Repo records this checkout and it is not on disk at this moment.
+    MissingNow(PathBuf),
+    /// The Repo row is gone or records no checkout, and Forge holds no clone.
+    NotRecorded,
+}
+
 pub struct EmbeddedWorkspaceBackend {
     db: Arc<SqliteDb>,
     manager: WorkspaceManager,
@@ -44,20 +53,30 @@ impl EmbeddedWorkspaceBackend {
         }
     }
 
-    /// The repository a workspace was created from, when it is still on disk:
-    /// the Repo's own checkout, else Forge's clone of it.
-    async fn recorded_repo_source(&self, workspace: &db::Workspace) -> Result<Option<PathBuf>> {
+    /// The repository a workspace was created from: the Repo's own checkout,
+    /// else Forge's clone of it. A checkout that is recorded and not on disk
+    /// at this moment (an unmounted volume, a moved directory) is reported as
+    /// such, never as "no repository": its worktree registration is still
+    /// there to remove once it is reachable again.
+    async fn recorded_repo_source(&self, workspace: &db::Workspace) -> Result<RecordedRepoSource> {
         let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id).await?;
-        Ok(repo
-            .as_ref()
-            .and_then(|repo| {
-                repo.local_path
-                    .as_deref()
-                    .filter(|path| !path.trim().is_empty())
-                    .map(PathBuf::from)
-                    .filter(|path| path.exists())
-            })
-            .or_else(|| Some(self.repo_cache_path(workspace)).filter(|path| path.exists())))
+        let local = repo.as_ref().and_then(|repo| {
+            repo.local_path
+                .as_deref()
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from)
+        });
+        if let Some(local) = local.as_ref().filter(|path| path.exists()) {
+            return Ok(RecordedRepoSource::Present(local.clone()));
+        }
+        let cache = self.repo_cache_path(workspace);
+        if cache.exists() {
+            return Ok(RecordedRepoSource::Present(cache));
+        }
+        Ok(match local {
+            Some(local) => RecordedRepoSource::MissingNow(local),
+            None => RecordedRepoSource::NotRecorded,
+        })
     }
 
     fn repo_cache_path(&self, workspace: &db::Workspace) -> PathBuf {
@@ -65,7 +84,7 @@ impl EmbeddedWorkspaceBackend {
     }
 
     async fn workspace_repo_source(&self, workspace: &db::Workspace) -> Result<PathBuf> {
-        if let Some(source) = self.recorded_repo_source(workspace).await? {
+        if let RecordedRepoSource::Present(source) = self.recorded_repo_source(workspace).await? {
             return Ok(source);
         }
         // Workspace.repo_id survives Repo deletion. A surviving worktree can
@@ -555,8 +574,20 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
         let workspace = self.workspace(placement).await?;
         let path = self.path(placement, &workspace);
         let source = match self.recorded_repo_source(&workspace).await? {
-            Some(source) => source,
-            None => match self.workspace_repo_source(&workspace).await {
+            RecordedRepoSource::Present(source) => source,
+            // Removing the Task root now would report success and leave the
+            // registration in the user's repository for good. Fail instead:
+            // the scheduler retries with backoff and raises one attention
+            // item when the repository stays away.
+            RecordedRepoSource::MissingNow(source) => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "repository {} is recorded for this workspace and is not reachable right now; \
+                     workspace cleanup will be retried",
+                    source.display()
+                ))
+                .into());
+            }
+            RecordedRepoSource::NotRecorded => match self.workspace_repo_source(&workspace).await {
                 Ok(source) => source,
                 // Neither the repository nor a worktree that can name it is
                 // left, so there is no registration to remove: only the Task
@@ -599,7 +630,8 @@ impl WorkspaceBackend for EmbeddedWorkspaceBackend {
         target_branch: &str,
     ) -> Result<bool> {
         let workspace = self.workspace(placement).await?;
-        let Some(source) = self.recorded_repo_source(&workspace).await? else {
+        let RecordedRepoSource::Present(source) = self.recorded_repo_source(&workspace).await?
+        else {
             return Ok(false);
         };
         let _guard = self
