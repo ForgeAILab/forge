@@ -190,7 +190,8 @@ operation inventory includes both catalogs.
 Project proposal specs now own `project.review_config`, `project.document`,
 `project.decision`, `project.milestone`, `project.validation`,
 `project.release.request` and `project.escalate`. Document and milestone actions
-have separate closed field contracts; their provider projection is still one
+have separate closed field contracts, each of which keeps every field that was
+advertised for the operation before the move; their provider projection is still one
 generated line per operation, with no conditional schema keywords. Fresh calls
 check authority before contract details. Commands receive the original admitted
 payload, preserving receipt digests; exact preparations bypass the current field
@@ -200,7 +201,8 @@ and read limits use rows. Ready Project Agents also advertise the existing
 Charter amendment draft capability; no approval authority is added.
 
 `message.send`, `commitment.update`, `memory.publish`, `memory.supersede`,
-`review.request` and `session.action` are closed pending-intent specs. Their
+`review.request` and `session.action` are pending-intent specs with an open,
+size-capped payload that is stored as sent. Their
 results remain pending proposals, never success for a message, memory, commitment,
 review or session effect. No materializer was added. The operation schema produces the contract line and the canonical field names
 used by normalization. Registered pending fields are no longer duplicated as
@@ -3512,7 +3514,7 @@ CLI adapter, streams
 execution logs back as `execution.log` notifications, and reports final status
 through `execution.terminal`.
 
-Protocol revision 3 independently negotiates `machine_probe.v1` for
+Protocol revision 4 independently negotiates `machine_probe.v1` for
 `machine.probe` and `repo_provision.v1` for `repo_location.provision`.
 A probe accepts named commands, 1–300 second timeouts, Project env, and an
 optional verified location ID. It returns exit status, timeout and a redacted
@@ -3533,21 +3535,22 @@ local policy purposes, `environment_probe` and `repo_provision`, and refusal is
 `run_purpose_denied`. Missing capabilities do not change connection health.
 Upgrade the server first: a daemon that opts into these new purposes needs a
 server from this release; an older server rejects the handshake because its
-run-purpose enum does not recognize them. Protocol revision remains 3.
+run-purpose enum does not recognize them. These capabilities did not change
+the protocol revision; the current revision is 4.
 
-Protocol revision 3 negotiates `workspace.v1` for `repo_location.verify`,
+Protocol revision 4 negotiates `workspace.v1` for `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
 `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
 Plan-writing roles on a daemon-owned workspace require `execution.plan_transport`.
-A revision-3 daemon without it can still run reviewers, interactive executions,
+A revision-4 daemon without it can still run reviewers, interactive executions,
 server-owned shared-mount executions, filesystem requests and PTYs. Deterministic
 placement refusals record a structured Task annotation naming the machine and
 missing capability. Dispatch waits until eligibility facts change, then clears
 the refusal and retries.
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 3 or newer), restarting each with its existing
+release (protocol revision 4 or newer), restarting each with its existing
 `--workspace-root`.
-A connection below revision 3 receives `daemon_upgrade_required` and cannot use any
+A connection below revision 4 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -3558,7 +3561,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 3, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 4, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.

@@ -105,6 +105,94 @@ impl CoordinationToolProvider {
         }
         Ok(())
     }
+    /// A pending proposal refused for a missing permission still leaves its
+    /// denied ledger row, as it did before these operations were registered:
+    /// the attempt stays visible and can never be approved. The denial the
+    /// caller receives is unchanged; nothing is recorded unless the action
+    /// policy itself denies the same request.
+    async fn record_denied_pending_proposal(
+        &self,
+        actor: &str,
+        scope: &CanonicalScope,
+        operation: &str,
+        arguments: &Value,
+        denial: &AgentHostError,
+    ) {
+        if !operation_registry::legacy_proposals::IDS.contains(&operation)
+            || !matches!(denial, AgentHostError::StructuredOutcome(outcome)
+                if matches!(outcome.denied_by, Some(DeniedBy::PermissionMissing(_))))
+            || contains_authority_override(arguments)
+        {
+            return;
+        }
+        let Some(permission) = operation_permission(scope.scope_type, operation) else {
+            return;
+        };
+        let payload = match arguments.get("payload") {
+            Some(payload) if payload.is_object() => payload.clone(),
+            None | Some(Value::Null) => json!({}),
+            Some(_) => return,
+        };
+        let (Ok(dedupe_key), Ok(correlation_id)) = (
+            required_argument(arguments, "dedupe_key"),
+            required_argument(arguments, "correlation_id"),
+        ) else {
+            return;
+        };
+        if validate_proposal_payload(operation, &payload).is_err() {
+            return;
+        }
+        let scope_type = scope_type_name(scope.scope_type);
+        let payload_json = payload.to_string();
+        if !matches!(
+            self.actions
+                .evaluate_direct_command_policy(
+                    actor,
+                    scope_type,
+                    &scope.scope_id,
+                    permission,
+                    operation,
+                    Some(&payload_json),
+                )
+                .await,
+            Ok((AgentActionPolicyResult::Denied, _))
+        ) {
+            return;
+        }
+        let target_type = if operation == "session.action" {
+            "scope"
+        } else {
+            scope_type
+        };
+        if let Err(error) = self
+            .actions
+            .propose(ProposeActionInput {
+                id: None,
+                actor_identity_id: actor.to_owned(),
+                scope_type: scope_type.to_owned(),
+                scope_id: scope.scope_id.clone(),
+                operation: operation.to_owned(),
+                payload_json,
+                dedupe_key,
+                correlation_id,
+                causation_id: arguments
+                    .get("causation_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                causation_depth: arguments
+                    .get("causation_depth")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                requested_permission: permission.to_owned(),
+                policy_reason: None,
+                target_type: Some(target_type.to_owned()),
+                target_id: Some(scope.scope_id.clone()),
+            })
+            .await
+        {
+            tracing::warn!(operation, %error, "denied pending proposal was not recorded");
+        }
+    }
     pub(super) async fn registered_proposal(
         &self,
         actor: &str,
@@ -123,8 +211,12 @@ impl CoordinationToolProvider {
                 scope,
                 CATALOG.lookup(operation).expect("registered proposal"),
             )?;
-        } else {
-            self.proposal_admission(actor, scope, operation).await?;
+        } else if let Err(denial) = self.proposal_admission(actor, scope, operation).await {
+            if !prepared {
+                self.record_denied_pending_proposal(actor, scope, operation, &arguments, &denial)
+                    .await;
+            }
+            return Err(denial);
         }
         if contains_authority_override(&arguments) {
             return Err(AgentHostError::Authority(

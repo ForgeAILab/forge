@@ -11,14 +11,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - **Registered native Project calls refuse undeclared fields (3.8 slice E).**
   `project.current_state`, `project.observations`, `project.review_config`,
   `project.document`, `project.decision`, `project.milestone`,
-  `project.validation`, `project.release.request`, `project.escalate` and the
-  six pending proposals (`message.send`, `commitment.update`,
-  `memory.publish`, `memory.supersede`, `review.request`, `session.action`)
+  `project.validation`, `project.release.request` and `project.escalate`
   are checked against one contract per operation. An unknown payload or
   envelope field is answered with one correction naming the operation, the
-  field and the expected contract. Document and milestone actions accept only
-  their own fields: Document `approve` no longer takes `kind`, `title` or
-  `envelope_digest`, which it required or allowed and never read. The
+  field and the expected contract. Every payload field that was advertised
+  for an operation before is still accepted: Document `approve` still takes
+  `kind`, `title` and `envelope_digest`, milestone actions still take
+  `milestone_id`, `display_label`, `primary_milestone_id` and `content`
+  whichever action is named, and `project.validation` still takes
+  `governing_revision_ids`. Fields that were never advertised for the
+  operation are refused. The six pending proposals
+  (`message.send`, `commitment.update`, `memory.publish`, `memory.supersede`,
+  `review.request`, `session.action`) keep an open payload of at most 65,536
+  bytes that is stored as sent; only their envelope is checked. The
   proposal envelope declares `dedupe_key` and `correlation_id` as non-null
   strings. A `null` or omitted payload is still accepted and read as `{}`.
 - **Project Chat reads are enforced as advertised (3.8 slice E).**
@@ -677,9 +682,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   offered Charter amendment drafting, which was already enforced; Charter
   approval and final release stay user-only. `project.charter.adoption`,
   `project.evidence` and `project.readiness` keep their hand paths. Tool
-  definitions: Project 24,104 to 24,092 bytes, Project verification 25,353
-  to 25,341, Project setup 15,572 to 15,766 (the pending `message.send`
-  contract line and its `body` / `content` aliases).
+  definitions: Project 24,104 to 24,252 bytes, Project verification 25,353
+  to 25,501 (160 bytes each name the previously advertised Document,
+  milestone and validation fields that stay accepted), Project setup 15,572
+  to 15,766 (the pending `message.send` contract line and its `body` /
+  `content` aliases).
 
 - **Authority is resolved once per turn and pinned (3.8 slice D).** A native
   or CLI turn fixes its Agent Profile and permission ceiling at admission.

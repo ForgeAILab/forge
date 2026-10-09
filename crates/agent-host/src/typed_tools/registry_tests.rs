@@ -639,15 +639,24 @@ async fn moved_proposals_refuse_unknown_and_forged_envelope_fields_before_dispat
             .unwrap();
         let mut unknown = args.clone();
         unknown["payload"]["unexpected"] = json!(true);
-        let error = tool
+        let prepared = tool
             .prepare(unknown, &test_preparation_context("unknown-proposal"))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains(id) && error.contains("unexpected"),
-            "{error}"
-        );
+            .await;
+        if operation_registry::legacy_proposals::IDS.contains(id) {
+            // A pending proposal's payload is an open object stored as
+            // sent; an undeclared field is kept, not refused.
+            assert_eq!(
+                prepared.unwrap().arguments()["payload"]["unexpected"],
+                true,
+                "{id}"
+            );
+        } else {
+            let error = prepared.unwrap_err().to_string();
+            assert!(
+                error.contains(id) && error.contains("unexpected"),
+                "{error}"
+            );
+        }
         for field in crate::operation_catalog::SERVER_DERIVED_FIELDS
             .iter()
             .chain(&["project_id"])
