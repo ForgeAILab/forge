@@ -1047,9 +1047,17 @@ impl DaemonWorkspaceClient {
         params: Value,
         timeout: Option<Duration>,
     ) -> Result<Value> {
+        let connection = self
+            .registry
+            .get(daemon_id)
+            .filter(|connection| !connection.is_stale())
+            .ok_or_else(|| ServiceError::DaemonUnavailable {
+                daemon_id: daemon_id.to_owned(),
+            })?;
+        self.registry
+            .ensure_protocol_dispatchable(daemon_id, &connection)?;
         let mut exchange = crate::integration_effects::rpc::RpcExchange::prepare(
-            Arc::clone(&self.registry),
-            daemon_id,
+            connection,
             method,
             params.clone(),
         )?;

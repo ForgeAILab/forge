@@ -47,12 +47,22 @@ pub async fn run_at(path: &Path, spec: &RunSpec) -> Result<RunResult> {
             .map_err(|_| ServiceError::invalid_operation("review command timed out"))?
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
         }
-        api_types::WorkspaceRunPurpose::CiStep
-            if spec.timeout_secs == 0 && spec.max_output_bytes == usize::MAX =>
-        {
-            review::workspace_command(path, &spec.command, &spec.env)
-                .output()
-                .await?
+        api_types::WorkspaceRunPurpose::CiStep if spec.max_output_bytes == usize::MAX => {
+            let mut command = review::workspace_command(path, &spec.command, &spec.env);
+            command.kill_on_drop(true);
+            if spec.timeout_secs == 0 {
+                command.output().await?
+            } else {
+                // An unbounded capture is still a bounded command when the
+                // caller supplied a deadline. Avoid overflowing limit + 1.
+                command
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_WORK_TREE")
+                    .env_remove("GIT_INDEX_FILE");
+                tokio::time::timeout(Duration::from_secs(spec.timeout_secs), command.output())
+                    .await
+                    .map_err(|_| ServiceError::invalid_operation("review command timed out"))??
+            }
         }
         api_types::WorkspaceRunPurpose::CiStep => review::run_workspace_command(
             path,
@@ -187,7 +197,12 @@ impl<'a> CheckRun<'a> {
                 purpose: self.input.purpose,
                 command: step.clone(),
                 env: self.input.environment.clone(),
-                timeout_secs: self.input.deadline.map_or(0, |deadline| deadline.as_secs()),
+                timeout_secs: self.input.deadline.map_or(0, |deadline| {
+                    deadline
+                        .as_secs()
+                        .saturating_add(u64::from(deadline.subsec_nanos() != 0))
+                        .max(1)
+                }),
                 max_output_bytes: self.input.max_output_bytes,
             },
         })

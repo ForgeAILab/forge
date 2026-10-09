@@ -3,14 +3,14 @@ use crate::{
     daemon_transport::{
         lock,
         workspace_client::{Result, WorkspaceClientError},
-        DaemonConnection, DaemonConnectionRegistry,
+        DaemonConnection,
     },
     ServiceError,
 };
 use api_types::*;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 // Kept alive by the recorder until its post-exchange bookkeeping completes.
@@ -27,7 +27,6 @@ impl Drop for PendingRequest {
 /// Preparing has only in-memory effects; it gives the consumer the same point
 /// at which to record admission before any frame is sent.
 pub struct RpcExchange {
-    registry: Arc<DaemonConnectionRegistry>,
     daemon_id: String,
     method: String,
     params: Value,
@@ -36,20 +35,14 @@ pub struct RpcExchange {
 }
 
 impl RpcExchange {
-    pub fn prepare(
-        registry: Arc<DaemonConnectionRegistry>,
-        daemon_id: &str,
-        method: &str,
-        params: Value,
-    ) -> Result<Self> {
+    pub fn prepare(connection: DaemonConnection, method: &str, params: Value) -> Result<Self> {
+        let daemon_id = connection.daemon_id.clone();
         let unavailable = || ServiceError::DaemonUnavailable {
-            daemon_id: daemon_id.to_owned(),
+            daemon_id: daemon_id.clone(),
         };
-        let connection = registry
-            .get(daemon_id)
-            .filter(|connection| !connection.is_stale())
-            .ok_or_else(unavailable)?;
-        registry.ensure_protocol_dispatchable(daemon_id, &connection)?;
+        if connection.is_stale() || !connection.protocol_allows_dispatch() {
+            return Err(unavailable().into());
+        }
         let request_id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         lock(&connection.pending).insert(request_id.clone(), sender);
@@ -57,13 +50,10 @@ impl RpcExchange {
             connection: connection.clone(),
             request_id: request_id.clone(),
         };
-        if !registry.is_current(daemon_id, connection.id())
-            || !connection.protocol_allows_dispatch()
-        {
+        if connection.is_stale() || !connection.protocol_allows_dispatch() {
             return Err(unavailable().into());
         }
         Ok(Self {
-            registry,
             daemon_id: daemon_id.to_owned(),
             method: method.to_owned(),
             params,
@@ -80,6 +70,9 @@ impl RpcExchange {
             daemon_id: daemon_id.to_owned(),
         };
         let connection = &self.pending.connection;
+        if connection.is_stale() || !connection.protocol_allows_dispatch() {
+            return Err(unavailable().into());
+        }
         let frame = DaemonFrame::Request {
             id: self.pending.request_id.clone(),
             method: method.to_owned(),
@@ -111,7 +104,7 @@ impl RpcExchange {
                 }
             } => {
                 let value = result?;
-                if !self.registry.is_current(daemon_id, connection.id()) { return Err(unavailable().into()); }
+                if connection.is_stale() || !connection.protocol_allows_dispatch() { return Err(unavailable().into()); }
                 Ok(value)
             }
             _ = stale.changed() => Err(unavailable().into()),

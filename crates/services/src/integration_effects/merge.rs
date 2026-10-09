@@ -4,7 +4,7 @@ use crate::{Result, ServiceError};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReviewedMergeObject {
     pub commit_sha: String,
     pub base_sha: String,

@@ -840,7 +840,7 @@ async fn target_resolver_follows_the_repo_setting_and_suspends_instead_of_guessi
         (Open, Some("l".into()), None)
     );
     // Both, but the default is a daemon checkout while local_path is set:
-    // the two settings disagree, so nothing is chosen.
+    // the repo location is authoritative regardless of the local_path hint.
     sqlx::query("UPDATE repo_location SET is_default=0 WHERE id='l'")
         .execute(db.pool())
         .await
@@ -851,7 +851,7 @@ async fn target_resolver_follows_the_repo_setting_and_suspends_instead_of_guessi
         .unwrap();
     assert_eq!(
         resolve("r", "both-daemon-default").await,
-        (Suspended, None, Some(TargetAmbiguous))
+        (Open, Some("copy".into()), None)
     );
     // A default server checkout at a different path than local_path.
     sqlx::query("UPDATE repo_location SET is_default=0 WHERE id='copy'")
@@ -864,7 +864,7 @@ async fn target_resolver_follows_the_repo_setting_and_suspends_instead_of_guessi
         .unwrap();
     assert_eq!(
         resolve("r", "path-mismatch").await,
-        (Suspended, None, Some(TargetAmbiguous))
+        (Open, Some("l".into()), None)
     );
     // The configured location exists but is not ready: named, not usable.
     sqlx::query("UPDATE repo_location SET status='unavailable' WHERE id='dl'")
@@ -893,7 +893,7 @@ async fn target_resolver_follows_the_repo_setting_and_suspends_instead_of_guessi
         resolve("remote", "two-defaults").await,
         (Suspended, None, Some(TargetAmbiguous))
     );
-    // A queue keeps the resolution it was created with (no refresh yet).
+    // Merely reading a queue preserves its snapshot; claim refreshes it.
     assert_eq!(
         resolve("r", "server-only").await,
         (Open, Some("l".into()), None)
@@ -928,3 +928,180 @@ async fn stage_b_rows_are_disposable_and_reimport_after_discard_is_not_blocked()
     assert!(!current);
     assert!(facts.contains("existing_attempt_identity"));
 }
+
+#[tokio::test]
+async fn claim_refreshes_default_location_and_recovers_a_suspended_queue_under_cas() {
+    let db = fixture().await;
+    let q = db
+        .create_or_get_integration_queue("r", "main")
+        .await
+        .unwrap();
+    db.admit_integration_attempt(admission(&q, "a", "refresh"))
+        .await
+        .unwrap();
+    let q = db.integration_queue(&q.id).await.unwrap().unwrap();
+    sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) SELECT 'new',repo_id,owner_kind,'new-target',kind,1,status,created_at,updated_at FROM repo_location WHERE id='l'").execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE repo_location SET is_default=0 WHERE id='l'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.claim_integration_queue(
+            &q.id,
+            q.revision - 1,
+            "stale",
+            "2026-10-08T00:00:00Z",
+            "2026-10-08T00:01:00Z"
+        )
+        .await,
+        Err(DbError::VersionConflict)
+    ));
+    assert_eq!(db.integration_queue(&q.id).await.unwrap().unwrap(), q);
+    let claimed = db
+        .claim_integration_queue(
+            &q.id,
+            q.revision,
+            "winner",
+            "2026-10-08T00:00:00Z",
+            "2026-10-08T00:01:00Z",
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.target_location_id.as_deref(), Some("new"));
+    assert_eq!(
+        claimed.target_owner_json.as_ref().unwrap()["location_id"],
+        "new"
+    );
+    assert_eq!(claimed.revision, q.revision + 1);
+    // Unavailable resolution is durable even though the claim is refused.
+    sqlx::query("UPDATE repo_location SET status='unavailable' WHERE id='new'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.claim_integration_queue(
+            &q.id,
+            claimed.revision,
+            "next",
+            "2026-10-08T00:02:00Z",
+            "2026-10-08T00:03:00Z"
+        )
+        .await,
+        Err(DbError::VersionConflict)
+    ));
+    let suspended = db.integration_queue(&q.id).await.unwrap().unwrap();
+    assert_eq!(suspended.state, IntegrationQueueState::Suspended);
+    assert_eq!(
+        suspended.last_error_kind,
+        Some(IntegrationFailureKind::TargetUnavailable)
+    );
+    assert_eq!(suspended.fence_generation, claimed.fence_generation);
+    sqlx::query("UPDATE repo_location SET status='ready' WHERE id='new'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let recovered = db
+        .claim_integration_queue(
+            &q.id,
+            suspended.revision,
+            "next",
+            "2026-10-08T00:02:00Z",
+            "2026-10-08T00:03:00Z",
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.state, IntegrationQueueState::Open);
+    assert_eq!(recovered.last_error_kind, None);
+    assert_eq!(recovered.head_attempt_id, claimed.head_attempt_id);
+    assert_eq!(recovered.fence_generation, claimed.fence_generation + 1);
+}
+
+async fn assert_resolver_row(row: &str) {
+    let db = fixture().await;
+    let mut repo = "r";
+    let mut expected_location = Some("l");
+    let mut expected_failure = None;
+    match row {
+        "server_only" => {}
+        "daemon_only" => {
+            seed_daemon_repo(&db).await;
+            repo = "remote";
+            expected_location = Some("dl");
+        }
+        "both_server_default" | "both_daemon_default" => {
+            seed_daemon_repo(&db).await;
+            sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,daemon_id,runtime_id,path,kind,is_default,status,created_at,updated_at) VALUES('copy','r','daemon','d','rt','copy','primary_checkout',0,'ready',?,?)").bind(FIXED_TIME).bind(FIXED_TIME).execute(db.pool()).await.unwrap();
+            if row == "both_daemon_default" {
+                sqlx::query("UPDATE repo_location SET is_default=CASE WHEN id='copy' THEN 1 ELSE 0 END WHERE repo_id='r'").execute(db.pool()).await.unwrap();
+                expected_location = Some("copy");
+            }
+        }
+        "path_mismatch" => {
+            sqlx::query("UPDATE repo_location SET path='different-checkout' WHERE id='l'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        "no_default" => {
+            sqlx::query("UPDATE repo_location SET is_default=0 WHERE repo_id='r'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE repo SET local_path=NULL WHERE id='r'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            expected_location = None;
+            expected_failure = Some(IntegrationFailureKind::TargetUnconfigured);
+        }
+        "two_defaults" => {
+            sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) SELECT 'second',repo_id,owner_kind,'second',kind,1,status,created_at,updated_at FROM repo_location WHERE id='l'").execute(db.pool()).await.unwrap();
+            expected_location = None;
+            expected_failure = Some(IntegrationFailureKind::TargetAmbiguous);
+        }
+        "not_ready" => {
+            sqlx::query("UPDATE repo_location SET status='unavailable' WHERE id='l'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            expected_failure = Some(IntegrationFailureKind::TargetUnavailable);
+        }
+        _ => panic!("unknown resolver row"),
+    }
+    let q = db
+        .create_or_get_integration_queue(repo, "main")
+        .await
+        .unwrap();
+    assert_eq!(q.target_location_id.as_deref(), expected_location);
+    assert_eq!(q.last_error_kind, expected_failure);
+    assert_eq!(
+        q.state,
+        if expected_failure.is_some() {
+            IntegrationQueueState::Suspended
+        } else {
+            IntegrationQueueState::Open
+        }
+    );
+}
+macro_rules! resolver_row {
+    ($name:ident,$row:literal) => {
+        #[tokio::test]
+        async fn $name() {
+            assert_resolver_row($row).await;
+        }
+    };
+}
+resolver_row!(resolver_server_only, "server_only");
+resolver_row!(resolver_daemon_only, "daemon_only");
+resolver_row!(resolver_both_server_default, "both_server_default");
+resolver_row!(
+    resolver_both_daemon_default_with_local_path,
+    "both_daemon_default"
+);
+resolver_row!(
+    resolver_server_default_at_different_local_path,
+    "path_mismatch"
+);
+resolver_row!(resolver_no_default, "no_default");
+resolver_row!(resolver_two_defaults, "two_defaults");
+resolver_row!(resolver_not_ready, "not_ready");

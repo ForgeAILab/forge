@@ -3635,8 +3635,12 @@ async fn daemon_merge_rebase_and_check_primitives_write_no_server_tables_or_even
         let before = table_digests(&fixture.harness.state.db).await;
         let mut events = fixture.harness.state.event_bus.subscribe();
         let mut exchange = RpcExchange::prepare(
-            Arc::clone(&fixture.harness.state.daemon_connections),
-            &fixture.daemon_id,
+            fixture
+                .harness
+                .state
+                .daemon_connections
+                .get(&fixture.daemon_id)
+                .unwrap(),
             method,
             request.clone(),
         )

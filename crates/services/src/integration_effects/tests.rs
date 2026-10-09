@@ -69,26 +69,10 @@ fn effects_have_no_persistence_or_task_capability_imports() {
             );
         }
     }
-    // The connection registry also carries the event bus and the execution
-    // handlers. The socket exchange may only look a connection up and ask
-    // whether it is still the current one.
-    let rpc: String = include_str!("rpc.rs").split_whitespace().collect();
-    let mut used: Vec<&str> = rpc
-        .split("registry.")
-        .skip(1)
-        .map(|rest| {
-            rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .next()
-                .unwrap_or_default()
-        })
-        .collect();
-    used.sort_unstable();
-    used.dedup();
-    assert_eq!(
-        used,
-        ["ensure_protocol_dispatchable", "get", "is_current"],
-        "rpc reaches beyond connection lookup on the registry"
-    );
+    // The socket primitive receives one connection and has no registry capability.
+    let rpc = include_str!("rpc.rs");
+    assert!(!rpc.contains("DaemonConnectionRegistry"));
+    assert!(!rpc.contains("registry."));
 }
 
 #[test]
@@ -354,4 +338,33 @@ fn canonical_ci_spec_matches_the_existing_check_run_input_and_sequence() {
         redaction_values: vec![],
     };
     assert_eq!(evidence.commands.len(), spec.commands.len());
+}
+
+#[tokio::test]
+async fn subsecond_check_deadline_is_bounded_instead_of_becoming_zero() {
+    let workspace = EffectWorkspace {
+        workspace_id: "w".into(),
+        placement_id: "p".into(),
+        generation: 1,
+        owner: EffectOwner::Server,
+        handle: "h".into(),
+    };
+    let commands = vec!["exec sleep 20".into()];
+    let env = Default::default();
+    for bound in [4096, usize::MAX] {
+        let run = check::CheckRun::new(check::CheckRunInput {
+            workspace: &workspace,
+            commands: &commands,
+            purpose: api_types::WorkspaceRunPurpose::CiStep,
+            environment: &env,
+            deadline: Some(std::time::Duration::from_millis(10)),
+            max_output_bytes: bound,
+        });
+        let command = run.next_command().unwrap();
+        assert_eq!(command.spec.timeout_secs, 1);
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        assert!(check::run_at(dir.path(), &command.spec).await.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
 }

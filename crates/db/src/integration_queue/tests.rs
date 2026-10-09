@@ -670,7 +670,12 @@ async fn additive_migration_preserves_every_status_and_legacy_marker_then_replay
     let source = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"));
     for file in std::fs::read_dir(source).unwrap() {
         let file = file.unwrap();
-        if file.file_name().to_str().unwrap() != "V202610080123__integration_queue.sql" {
+        if ![
+            "V202610080123__integration_queue.sql",
+            "V202610082317__integration_fencing.sql",
+        ]
+        .contains(&file.file_name().to_str().unwrap())
+        {
             std::fs::copy(file.path(), dir.path().join(file.file_name())).unwrap();
         }
     }
@@ -707,7 +712,7 @@ async fn additive_migration_preserves_every_status_and_legacy_marker_then_replay
             .fetch_one(&pool)
             .await
             .unwrap(),
-        migration_count + 1
+        migration_count + 2
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM integration_queue")
