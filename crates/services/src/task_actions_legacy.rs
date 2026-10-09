@@ -576,8 +576,16 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         append_owner_advance(snapshot, &mut offers);
         return offers;
     }
+    // Mirrors `task_actions`: a held coordination root's release launches
+    // no role outside its aggregate review.
+    let root_role_refused = snapshot.coordination_root
+        && role.is_some_and(|role| {
+            !crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
+                .allows_execution(&task.status, role)
+        });
     if held {
-        if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() {
+        if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() && !root_role_refused
+        {
             offer(
                 TaskAction::Release { reason: None },
                 &[],
@@ -729,6 +737,24 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 &[Owner],
                 "failed_review_override",
                 "Override Failed Review",
+            );
+        }
+        // A parent Task whose aggregate review cannot pass needs corrective
+        // work, and a parent in review accepts no new subtask. Sending it
+        // back reopens it, held, so a corrective subtask can be added; its
+        // release runs that subtask and the aggregate review after it.
+        if task.status == "review"
+            && snapshot.coordination_root
+            && target(WorkflowTrigger::Reject).is_some()
+        {
+            offer(
+                TaskAction::SendBack {
+                    guidance: String::new(),
+                },
+                &["guidance"],
+                &[Owner],
+                "root_review_reopen",
+                "Reopen for a Corrective Subtask",
             );
         }
         if !(task.status == "review"

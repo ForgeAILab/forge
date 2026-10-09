@@ -585,6 +585,253 @@ fn rebase_state(outcome: &OwnerRebaseReceipt) -> IntegrationOperationState {
     }
 }
 
+/// How an object transfer step ended. A refusal or a cancellation leaves no
+/// temporary file and no change in either repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectTransferOutcome<T> {
+    Done(T),
+    Refused(api_types::ObjectTransferRefusal),
+    Cancelled,
+}
+
+impl From<git::integration::ObjectTransferError> for ServiceError {
+    fn from(error: git::integration::ObjectTransferError) -> Self {
+        match error {
+            git::integration::ObjectTransferError::Git(error) => error.into(),
+            other => ServiceError::invalid_operation(other.to_string()),
+        }
+    }
+}
+
+fn transfer_refusal(
+    error: git::integration::ObjectTransferError,
+) -> Result<api_types::ObjectTransferRefusal> {
+    use api_types::ObjectTransferRefusal as R;
+    use git::integration::ObjectTransferError as E;
+    Ok(match error {
+        E::TooLarge { bytes, max_bytes } => R::TooLarge { bytes, max_bytes },
+        E::Invalid { reason } => R::Invalid { reason },
+        E::MissingObject { sha } => R::MissingObject { sha },
+        E::KeyConflict { existing_sha } => R::KeyConflict { existing_sha },
+        E::Git(error) => return Err(error.into()),
+    })
+}
+
+/// Export from a server-owned checkout: the same operation a daemon serves as
+/// `integration.export_objects`.
+pub struct ServerObjectExport<'a> {
+    pub fence: &'a IntegrationOwnerFence,
+    /// `api_types::object_transfer_key(attempt, generation, direction)`.
+    pub key: &'a str,
+    pub repo_location_id: &'a str,
+    pub have: &'a [String],
+    pub want: &'a str,
+    /// Where the bundle is written; removed unless the export succeeds.
+    pub dest: &'a Path,
+    pub cancel: &'a CancellationToken,
+}
+
+/// Import into a server-owned checkout under `refs/forge/integration/<key>`.
+pub struct ServerObjectImport<'a> {
+    pub fence: &'a IntegrationOwnerFence,
+    pub export: &'a api_types::ObjectExportReceipt,
+    pub repo_location_id: &'a str,
+    /// Not read for an export of zero bytes.
+    pub bundle: &'a Path,
+    pub cancel: &'a CancellationToken,
+}
+
+pub(crate) fn transfer_io(error: std::io::Error) -> ServiceError {
+    git::GitError::Io(error).into()
+}
+
+async fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::Digest;
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await.map_err(transfer_io)?;
+    let mut digest = sha2::Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await.map_err(transfer_io)?;
+        if read == 0 {
+            return Ok(hex::encode(digest.finalize()));
+        }
+        digest.update(&buffer[..read]);
+    }
+}
+
+impl ServerIntegrationOwner {
+    /// The claim that asks must still be the attempt's current fence, and the
+    /// checkout must be one this server owns.
+    async fn admit_transfer(
+        &self,
+        fence: &IntegrationOwnerFence,
+        repo_location_id: &str,
+    ) -> Result<std::result::Result<std::path::PathBuf, api_types::ObjectTransferRefusal>> {
+        if self.db.integration_owner_fence(&fence.attempt_id).await? != Some(fence.clone()) {
+            return Ok(Err(api_types::ObjectTransferRefusal::StaleFence));
+        }
+        let path: Option<String> = sqlx::query_scalar(
+            "SELECT path FROM repo_location WHERE id=? AND owner_kind='server' AND status='ready'",
+        )
+        .bind(repo_location_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+        Ok(path.map(std::path::PathBuf::from).ok_or_else(|| {
+            api_types::ObjectTransferRefusal::Invalid {
+                reason: "checkout is not a ready server-owned repo location".into(),
+            }
+        }))
+    }
+
+    /// The receipt of an import this key already completed here, if any.
+    pub async fn imported_objects(
+        &self,
+        fence: &IntegrationOwnerFence,
+        repo_location_id: &str,
+        key: &str,
+        expected_tip_sha: &str,
+    ) -> Result<ObjectTransferOutcome<Option<api_types::ObjectImportReceipt>>> {
+        let repo = match self.admit_transfer(fence, repo_location_id).await? {
+            Ok(repo) => repo,
+            Err(refusal) => return Ok(ObjectTransferOutcome::Refused(refusal)),
+        };
+        match git::integration::imported_objects(&repo, key, expected_tip_sha).await {
+            Ok(found) => Ok(ObjectTransferOutcome::Done(found.map(|found| {
+                api_types::ObjectImportReceipt {
+                    key: key.into(),
+                    tip_sha: found.tip_sha,
+                    ref_name: found.ref_name,
+                    replayed: true,
+                }
+            }))),
+            Err(error) => Ok(ObjectTransferOutcome::Refused(transfer_refusal(error)?)),
+        }
+    }
+
+    /// Write the commits of `want` the receiver lacks to `dest`. Capped at
+    /// `MAX_OBJECT_TRANSFER_BYTES`; nothing in the checkout changes.
+    pub async fn export_objects(
+        &self,
+        input: ServerObjectExport<'_>,
+    ) -> Result<ObjectTransferOutcome<api_types::ObjectExportReceipt>> {
+        let repo = match self
+            .admit_transfer(input.fence, input.repo_location_id)
+            .await?
+        {
+            Ok(repo) => repo,
+            Err(refusal) => return Ok(ObjectTransferOutcome::Refused(refusal)),
+        };
+        let export = async {
+            let export = git::integration::export_objects(
+                &repo,
+                input.key,
+                input.have,
+                input.want,
+                input.dest,
+                api_types::MAX_OBJECT_TRANSFER_BYTES,
+            )
+            .await;
+            let export = match export {
+                Ok(export) => export,
+                Err(error) => return Ok(ObjectTransferOutcome::Refused(transfer_refusal(error)?)),
+            };
+            let sha256 = if export.total_bytes == 0 {
+                use sha2::Digest;
+                hex::encode(sha2::Sha256::digest([]))
+            } else {
+                sha256_file(input.dest).await?
+            };
+            Ok::<_, ServiceError>(ObjectTransferOutcome::Done(
+                api_types::ObjectExportReceipt {
+                    key: input.key.into(),
+                    tip_sha: export.tip_sha,
+                    total_bytes: export.total_bytes,
+                    sha256,
+                },
+            ))
+        };
+        let outcome = tokio::select! {
+            biased;
+            _ = input.cancel.cancelled() => Ok(ObjectTransferOutcome::Cancelled),
+            outcome = export => outcome,
+        };
+        if !matches!(outcome, Ok(ObjectTransferOutcome::Done(_))) {
+            let _ = tokio::fs::remove_file(input.dest).await;
+        }
+        outcome
+    }
+
+    /// Verify the bundle against its receipt and import it. The checkout's
+    /// branches, HEAD and work tree do not change.
+    pub async fn import_objects(
+        &self,
+        input: ServerObjectImport<'_>,
+    ) -> Result<ObjectTransferOutcome<api_types::ObjectImportReceipt>> {
+        use api_types::ObjectTransferRefusal as R;
+        let repo = match self
+            .admit_transfer(input.fence, input.repo_location_id)
+            .await?
+        {
+            Ok(repo) => repo,
+            Err(refusal) => return Ok(ObjectTransferOutcome::Refused(refusal)),
+        };
+        let export = input.export;
+        let import = async {
+            match git::integration::imported_objects(&repo, &export.key, &export.tip_sha).await {
+                Ok(Some(found)) => return Ok(Ok(found)),
+                Ok(None) => {}
+                Err(error) => return Ok(Err(transfer_refusal(error)?)),
+            }
+            if export.total_bytes > api_types::MAX_OBJECT_TRANSFER_BYTES {
+                return Ok(Err(R::TooLarge {
+                    bytes: export.total_bytes,
+                    max_bytes: api_types::MAX_OBJECT_TRANSFER_BYTES,
+                }));
+            }
+            if export.total_bytes > 0 {
+                let stored = tokio::fs::metadata(input.bundle).await.map(|m| m.len());
+                if stored.ok() != Some(export.total_bytes)
+                    || sha256_file(input.bundle).await? != export.sha256
+                {
+                    return Ok(Err(R::Invalid {
+                        reason: "bundle does not match its export receipt".into(),
+                    }));
+                }
+            }
+            // Publishing objects and the ref is serialized with the merge on
+            // this checkout by the caller's queue slot.
+            match git::integration::import_objects(
+                &repo,
+                &export.key,
+                (export.total_bytes > 0).then_some(input.bundle),
+                &export.tip_sha,
+                api_types::MAX_OBJECT_TRANSFER_BYTES,
+            )
+            .await
+            {
+                Ok(done) => Ok::<_, ServiceError>(Ok(done)),
+                Err(error) => Ok(Err(transfer_refusal(error)?)),
+            }
+        };
+        let outcome = tokio::select! {
+            biased;
+            _ = input.cancel.cancelled() => return Ok(ObjectTransferOutcome::Cancelled),
+            outcome = import => outcome?,
+        };
+        Ok(match outcome {
+            Ok(done) => ObjectTransferOutcome::Done(api_types::ObjectImportReceipt {
+                key: export.key.clone(),
+                tip_sha: done.tip_sha,
+                ref_name: done.ref_name,
+                replayed: done.replayed,
+            }),
+            Err(refusal) => ObjectTransferOutcome::Refused(refusal),
+        })
+    }
+}
+
 /// Validate owner facts before persistence or journal acknowledgement.
 pub(crate) fn validate_attempt_receipt(receipt: &db::IntegrationEffectReceipt) -> Result<()> {
     let invalid = || {
@@ -776,6 +1023,201 @@ mod tests {
             }),
         }
     }
+    /// A second server-owned clone of the fixture repository, one commit
+    /// (the candidate) behind the Task's checkout.
+    async fn second_location(f: &Fixture) -> std::path::PathBuf {
+        let clone = f._temp.path().join("clone");
+        git_at(
+            f._temp.path(),
+            &[
+                "clone",
+                "-q",
+                "--branch",
+                "main",
+                f.repo.to_str().unwrap(),
+                "clone",
+            ],
+        )
+        .await;
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('l2','r','server',?,'managed_clone',0,'ready',?,?)").bind(clone.to_str()).bind(&now).bind(&now).execute(f.db.pool()).await.unwrap();
+        clone
+    }
+    async fn untouched(path: &Path) -> String {
+        format!(
+            "{}\n{}\n{}\n{}",
+            git_at(path, &["for-each-ref"]).await,
+            git_at(path, &["rev-parse", "HEAD"]).await,
+            git_at(path, &["status", "--porcelain"]).await,
+            git_at(path, &["count-objects", "-v"]).await
+        )
+    }
+    #[tokio::test]
+    async fn server_owner_moves_exact_objects_between_checkouts_once_per_key() {
+        let f = fixture().await;
+        let clone = second_location(&f).await;
+        let key = api_types::object_transfer_key(
+            &f.fence.attempt_id,
+            f.fence.generation,
+            api_types::ObjectTransferDirection::Outbound,
+        );
+        let bundle = f._temp.path().join("out.bundle");
+        let have = vec![f.target.clone()];
+        let export_input = || ServerObjectExport {
+            fence: &f.fence,
+            key: &key,
+            repo_location_id: "l",
+            have: &have,
+            want: &f.head,
+            dest: &bundle,
+            cancel: &f.cancel,
+        };
+        let before = untouched(&clone).await;
+        assert_eq!(
+            f.owner
+                .imported_objects(&f.fence, "l2", &key, &f.head)
+                .await
+                .unwrap(),
+            ObjectTransferOutcome::Done(None)
+        );
+        let ObjectTransferOutcome::Done(export) =
+            f.owner.export_objects(export_input()).await.unwrap()
+        else {
+            panic!("export refused")
+        };
+        assert_eq!(export.tip_sha, f.head);
+        assert!(export.total_bytes > 0);
+        let import_input = |export, bundle| ServerObjectImport {
+            fence: &f.fence,
+            export,
+            repo_location_id: "l2",
+            bundle,
+            cancel: &f.cancel,
+        };
+        // A bundle that does not match its receipt, an oversized receipt and a
+        // corrupt bundle are refused with the target untouched.
+        let mut wrong = export.clone();
+        wrong.sha256 = "0".repeat(64);
+        let mut huge = export.clone();
+        huge.total_bytes = api_types::MAX_OBJECT_TRANSFER_BYTES + 1;
+        let corrupt = f._temp.path().join("corrupt.bundle");
+        let mut bytes = std::fs::read(&bundle).unwrap();
+        let at = bytes.len() - 30;
+        bytes[at] ^= 0xff;
+        std::fs::write(&corrupt, &bytes).unwrap();
+        let mut relabelled = export.clone();
+        relabelled.sha256 = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&bytes))
+        };
+        let missing = f._temp.path().join("missing.bundle");
+        for (name, receipt, path) in [
+            ("digest", &wrong, &bundle),
+            ("size", &huge, &missing),
+            ("corrupt", &relabelled, &corrupt),
+        ] {
+            let outcome = f
+                .owner
+                .import_objects(import_input(receipt, path))
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, ObjectTransferOutcome::Refused(_)),
+                "{name}: {outcome:?}"
+            );
+            assert_eq!(untouched(&clone).await, before, "{name}");
+        }
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            f.owner
+                .import_objects(ServerObjectImport {
+                    cancel: &cancelled,
+                    ..import_input(&export, &bundle)
+                })
+                .await
+                .unwrap(),
+            ObjectTransferOutcome::Cancelled
+        );
+        assert_eq!(untouched(&clone).await, before);
+        // The sound transfer binds the Forge ref only.
+        let head = git_at(&clone, &["rev-parse", "HEAD"]).await;
+        let imported = f
+            .owner
+            .import_objects(import_input(&export, &bundle))
+            .await
+            .unwrap();
+        let reference = format!("refs/forge/integration/{key}");
+        assert_eq!(
+            imported,
+            ObjectTransferOutcome::Done(api_types::ObjectImportReceipt {
+                key: key.clone(),
+                tip_sha: f.head.clone(),
+                ref_name: reference.clone(),
+                replayed: false,
+            })
+        );
+        assert_eq!(git_at(&clone, &["rev-parse", &reference]).await, f.head);
+        assert_eq!(git_at(&clone, &["rev-parse", "HEAD"]).await, head);
+        assert_eq!(
+            git_at(&clone, &["rev-parse", "refs/heads/main"]).await,
+            head
+        );
+        assert!(!clone.join("candidate").exists());
+        // The duplicate key replays the receipt without the bundle.
+        std::fs::remove_file(&bundle).unwrap();
+        let after = untouched(&clone).await;
+        let replay = f
+            .owner
+            .import_objects(import_input(&export, &bundle))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&replay, ObjectTransferOutcome::Done(receipt) if receipt.replayed && receipt.tip_sha == f.head)
+        );
+        assert!(matches!(
+            f.owner.imported_objects(&f.fence, "l2", &key, &f.head).await.unwrap(),
+            ObjectTransferOutcome::Done(Some(receipt)) if receipt.replayed
+        ));
+        assert_eq!(untouched(&clone).await, after);
+        // A cancelled export keeps no file; an old claim and a checkout this
+        // server does not own are refused before Git.
+        assert_eq!(
+            f.owner
+                .export_objects(ServerObjectExport {
+                    cancel: &cancelled,
+                    ..export_input()
+                })
+                .await
+                .unwrap(),
+            ObjectTransferOutcome::Cancelled
+        );
+        assert!(!bundle.exists());
+        let mut stale = f.fence.clone();
+        stale.generation += 1;
+        assert_eq!(
+            f.owner
+                .export_objects(ServerObjectExport {
+                    fence: &stale,
+                    ..export_input()
+                })
+                .await
+                .unwrap(),
+            ObjectTransferOutcome::Refused(api_types::ObjectTransferRefusal::StaleFence)
+        );
+        assert!(matches!(
+            f.owner
+                .export_objects(ServerObjectExport {
+                    repo_location_id: "elsewhere",
+                    ..export_input()
+                })
+                .await
+                .unwrap(),
+            ObjectTransferOutcome::Refused(api_types::ObjectTransferRefusal::Invalid { .. })
+        ));
+        assert!(!bundle.exists());
+    }
+
     #[test]
     fn owner_receipt_validation_refuses_wrong_object_and_false_success() {
         let request = IntegrationEffectRequest {

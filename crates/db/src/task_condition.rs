@@ -202,13 +202,33 @@ pub enum ParkReason {
     RemoteCancelPending {
         source: ConditionSource,
     },
+    /// `dependency_ids` names the dependencies waited for: the cancelled
+    /// ones of a `dependency_cancelled` blocker, or the unfinished ones an
+    /// accepted action waits behind.
     Dependencies {
         cancelled: bool,
+        #[serde(default)]
+        dependency_ids: Vec<String>,
         source: ConditionSource,
     },
     Children {
         root_id: String,
         remaining: Vec<String>,
+    },
+    /// A subtask its parent does not let run yet. `cause` is `held` (the
+    /// owner holds the parent), `blocked` (the parent is parked on a
+    /// failure or a blocked entry) or `not_coordinating` (the parent is in
+    /// a state that runs no subtasks). The exit is on the parent.
+    Parent {
+        parent_id: String,
+        cause: String,
+    },
+    /// The Agent that would run the Task cannot take work. `status` is the
+    /// Agent's effective status (`paused`, `daemon_offline`, ...). The exit
+    /// is on the Agent.
+    Agent {
+        agent_id: String,
+        status: String,
     },
     PlanSettlementWait {
         execution_id: Option<String>,
@@ -529,6 +549,17 @@ fn text(fields: &Fields<'_>, key: &str) -> Option<String> {
     }
     serde_json::from_str(raw).ok()
 }
+/// A bounded list of identifiers; anything else reads as none.
+fn ids(fields: &Fields<'_>, key: &str) -> Vec<String> {
+    fields
+        .get(key)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw.get()).ok())
+        .map(|mut ids| {
+            ids.truncate(16);
+            ids
+        })
+        .unwrap_or_default()
+}
 fn is(fields: &Fields<'_>, key: &str, expected: &str) -> bool {
     text(fields, key).as_deref() == Some(expected)
 }
@@ -824,6 +855,9 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
                     48,
                     ParkReason::Dependencies {
                         cancelled: true,
+                        dependency_ids: object(fields, "hook")
+                            .map(|hook| ids(&hook, "cancelled_dependency_ids"))
+                            .unwrap_or_default(),
                         source: from_annotation(),
                     },
                 ));
@@ -1004,6 +1038,14 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
                 160,
                 ParkReason::Capacity {
                     scope: ConditionCapacityScope::Project,
+                },
+            ),
+            Some("dependency_wait") => (
+                161,
+                ParkReason::Dependencies {
+                    cancelled: false,
+                    dependency_ids: ids(&disposition, "dependency_ids"),
+                    source: in_metadata("dispatch_disposition"),
                 },
             ),
             _ => (

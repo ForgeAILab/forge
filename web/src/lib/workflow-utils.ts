@@ -118,6 +118,61 @@ export function checkWaitNotice(
   }
 }
 
+const PARENT_WAIT_CAUSES: Record<string, string> = {
+  held: 'is on hold',
+  blocked: 'is blocked',
+  not_coordinating: 'is not running subtasks yet',
+}
+
+const AGENT_WAIT_STATUSES: Record<string, string> = {
+  paused: 'is paused',
+  daemon_offline: 'is offline',
+}
+
+/**
+ * What a parked Task waits for when the wait is on something other than the
+ * Task itself: its parent Task, its Agent, or unfinished dependencies. These
+ * are waits, not failures, so they carry no blocked or failed record.
+ */
+export function getTaskWaitNotice(
+  task: Pick<TaskResponse, 'condition'>,
+): { title: string; message: string } | null {
+  const condition = task.condition
+  if (condition.kind !== 'parked') return null
+  const reason = [condition.primary, ...condition.additional].find(
+    (candidate) =>
+      candidate.kind === 'parent' ||
+      candidate.kind === 'agent' ||
+      (candidate.kind === 'dependencies' && !candidate.cancelled),
+  )
+  if (!reason) return null
+  if (reason.kind === 'parent') {
+    const cause = PARENT_WAIT_CAUSES[reason.cause] ?? 'does not let it run yet'
+    return {
+      title: 'Waiting for parent task',
+      message: `The parent task ${cause}. This subtask runs when the parent lets its subtasks run.`,
+    }
+  }
+  if (reason.kind === 'agent') {
+    const status = AGENT_WAIT_STATUSES[reason.status] ?? `is ${reason.status.replace(/_/g, ' ')}`
+    return {
+      title: 'Waiting for agent',
+      message: `The assigned agent ${status}. This task runs when the agent can take work.`,
+    }
+  }
+  if (reason.kind === 'dependencies') {
+    const count = reason.dependency_ids.length
+    return {
+      title: 'Waiting for dependencies',
+      message:
+        count === 1
+          ? 'One dependency is unfinished. This task runs when it finishes or the dependency is removed.'
+          : `${count > 1 ? count : 'Some'} dependencies are unfinished. This task runs when they finish or are removed.`,
+    }
+  }
+  return null
+}
+
 /** The Task's blocked record. A failure record alone is not a block. */
 export function blockedInterruption(task: TaskAnnotationSummary) {
   return task.condition.details.blocked ? task.condition.details.interruption : null

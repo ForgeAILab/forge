@@ -220,6 +220,31 @@ impl TaskService {
             .await
     }
 
+    /// Hold a Task that carries a cancelled-dependency blocker: the blocker
+    /// stays (it names the dependency and is the Task's first exit) and the
+    /// hold takes the place of whatever the blocker had displaced, so
+    /// removing the dependency leaves the Task held, with its release on
+    /// offer. `None` when the Task carries no such blocker.
+    pub(super) async fn hold_under_dependency_block(
+        &self,
+        task: &Task,
+        hold_annotation: String,
+        hold_blocked: String,
+    ) -> Result<Option<Task>> {
+        let Some(block) = dependency_block(task) else {
+            return Ok(None);
+        };
+        let superseded = json!({
+            "status": task.status,
+            "error_annotation": hold_annotation,
+            "blocked_json": hold_blocked,
+            "failed_json": Value::Null,
+        });
+        self.write_dependency_block(task, &block.cancelled_dependency_ids, Some(superseded))
+            .await
+            .map(Some)
+    }
+
     async fn write_dependency_block(
         &self,
         task: &Task,

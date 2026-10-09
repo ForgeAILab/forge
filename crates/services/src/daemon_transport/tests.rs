@@ -1272,7 +1272,10 @@ async fn former_revision_three_handshake_requires_daemon_upgrade() {
     };
     assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
     assert!(error.message.contains("upgrade the daemon"));
-    assert!(error.message.contains("revision 5"));
+    assert!(error.message.contains(&format!(
+        "revision {}",
+        api_types::DAEMON_MIN_PROTOCOL_REVISION
+    )));
     assert!(registry.get("revision-three").unwrap().needs_upgrade());
     assert!(!registry
         .get("revision-three")
@@ -1305,4 +1308,99 @@ async fn revision_four_check_owner_is_refused_before_any_check_rpc() {
         ));
     }
     assert!(outbound.try_recv().is_err());
+}
+
+/// A daemon one revision behind is refused before any integration owner
+/// frame is written: no announcement, no export, no import, no release.
+#[tokio::test]
+async fn previous_revision_daemon_gets_upgrade_required_for_the_integration_owner_wire() {
+    use super::workspace_client;
+    use tokio_util::sync::CancellationToken;
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("revision-behind".into());
+    let id = connection.id();
+    registry.register("revision-behind".into(), connection);
+    assert!(registry.dispatch_incoming_for_connection("revision-behind", id, api_types::DaemonFrame::Notification {
+        method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params: json!({"protocol_revision":api_types::DAEMON_MIN_PROTOCOL_REVISION - 1,"capabilities":api_types::DAEMON_REQUIRED_CAPABILITIES}),
+    }));
+    let api_types::DaemonFrame::Error { error, .. } = outbound.recv().await.unwrap() else {
+        panic!("old daemon accepted");
+    };
+    assert_eq!(error.code, api_types::DAEMON_UPGRADE_REQUIRED);
+    let client = workspace_client::DaemonWorkspaceClient::new(registry.clone());
+    let fence = api_types::IntegrationOwnerFence {
+        queue_id: "queue".into(),
+        attempt_id: "attempt".into(),
+        generation: 1,
+        lease_owner: "worker".into(),
+        target_owner: json!({}),
+    };
+    let endpoint = workspace_client::DaemonObjectEndpoint {
+        daemon_id: "revision-behind",
+        runtime_id: "runtime",
+        repo_location_id: "location",
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let bundle = directory.path().join("bundle");
+    std::fs::write(&bundle, b"bundle").unwrap();
+    let dest = directory.path().join("dest");
+    let cancel = CancellationToken::new();
+    let upgrade = |error: workspace_client::WorkspaceClientError| {
+        assert!(
+            matches!(
+                error,
+                workspace_client::WorkspaceClientError::Transport(
+                    ServiceError::DaemonUpgradeRequired { .. }
+                )
+            ),
+            "{error:?}"
+        );
+    };
+    upgrade(
+        client
+            .announce_integration_fence("revision-behind", "runtime", &fence, None)
+            .await
+            .unwrap_err(),
+    );
+    upgrade(
+        client
+            .imported_objects(endpoint, &fence, "key", &"a".repeat(40))
+            .await
+            .unwrap_err(),
+    );
+    upgrade(
+        client
+            .export_objects(
+                endpoint,
+                &fence,
+                "key",
+                &[],
+                &"a".repeat(40),
+                &dest,
+                &cancel,
+            )
+            .await
+            .unwrap_err(),
+    );
+    let export = api_types::ObjectExportReceipt {
+        key: "key".into(),
+        tip_sha: "a".repeat(40),
+        total_bytes: 6,
+        sha256: "0".repeat(64),
+    };
+    upgrade(
+        client
+            .import_objects(endpoint, &fence, &export, &bundle, &cancel)
+            .await
+            .unwrap_err(),
+    );
+    client
+        .release_objects("revision-behind", "runtime", "key")
+        .await;
+    assert!(!dest.exists());
+    assert!(
+        outbound.try_recv().is_err(),
+        "no frame reached the old daemon"
+    );
 }

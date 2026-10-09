@@ -61,7 +61,7 @@ async fn inspect(
         .and_then(decode)
 }
 
-fn merge_params(
+pub(super) fn merge_params(
     fixture: &Fixture,
     id: &str,
     candidate: &str,
@@ -81,7 +81,7 @@ fn merge_params(
     }
 }
 
-fn retain_intent(fixture: &Fixture, method: &str, request: Value) {
+pub(super) fn retain_intent(fixture: &Fixture, method: &str, request: Value) {
     let fence: WorkspaceMutationFence = decode(request.clone()).unwrap();
     fixture
         .journal
@@ -1445,7 +1445,7 @@ async fn late_reset_ack_prunes_only_the_review_handles_it_retired() {
     assert!(!backend.state.lock().unwrap().handles.contains_key(main));
 }
 
-fn attempt_request(
+pub(super) fn attempt_request(
     fixture: &Fixture,
     head: &str,
     target: &str,
@@ -1466,7 +1466,7 @@ fn attempt_request(
     }
 }
 
-fn attempt_merge_params(
+pub(super) fn attempt_merge_params(
     fixture: &Fixture,
     request: WorkspaceIntegrationRequest,
 ) -> WorkspaceReviewedMergeParams {

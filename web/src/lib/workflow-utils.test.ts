@@ -7,6 +7,7 @@ import {
   deriveColumns,
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
+  getTaskWaitNotice,
   getTaskWorkflowWarning,
   isTaskBlocked,
   matchesFilters,
@@ -339,5 +340,27 @@ describe('integration conditions', () => {
     task.condition.details.interruption = { kind: 'target_repo_dirty', reason: 'target dirty', created_at: '' }
     expect(blockedInterruption(task)?.reason).toBe('target dirty')
     expect(isTaskBlocked(task)).toBe(true)
+  })
+  it('labels the waits on a parent task, an agent and unfinished dependencies', () => {
+    const details = { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false }
+    const parked = (primary: Record<string, unknown>) =>
+      taskListItem({
+        condition: { kind: 'parked', primary, additional: [], resume: { kind: 'reconcile' }, since: null, details },
+      } as never)
+    expect(getTaskWaitNotice(parked({ kind: 'parent', parent_id: 'root', cause: 'held' }))).toEqual({
+      title: 'Waiting for parent task',
+      message: 'The parent task is on hold. This subtask runs when the parent lets its subtasks run.',
+    })
+    expect(getTaskWaitNotice(parked({ kind: 'agent', agent_id: 'coder', status: 'paused' }))?.message).toBe(
+      'The assigned agent is paused. This task runs when the agent can take work.',
+    )
+    expect(getTaskWaitNotice(parked({ kind: 'agent', agent_id: 'coder', status: 'some_new_status' }))?.message).toContain(
+      'is some new status',
+    )
+    expect(
+      getTaskWaitNotice(parked({ kind: 'dependencies', cancelled: false, dependency_ids: ['a'] }))?.title,
+    ).toBe('Waiting for dependencies')
+    expect(getTaskWaitNotice(parked({ kind: 'dependencies', cancelled: true, dependency_ids: ['a'] }))).toBeNull()
+    expect(getTaskWaitNotice(parked({ kind: 'held', actor: 'user' }))).toBeNull()
   })
 })

@@ -1885,14 +1885,15 @@ async fn exhausted_retries_park_the_task_and_the_owners_retry_asks_again_with_a_
             .unwrap(),
         consumer::CheckApplyOutcome::Applied
     );
-    let applied = family.applied.lock().unwrap();
-    assert_eq!(applied.len(), 2);
-    assert!(matches!(
-        &applied[1].verdict,
-        consumer::CheckVerdict::Result(result) if result.outcome == CheckResultOutcome::Pass
-    ));
-    assert_eq!(applied[1].consumer_id, consumer_id);
-    drop(applied);
+    {
+        let applied = family.applied.lock().unwrap();
+        assert_eq!(applied.len(), 2);
+        assert!(matches!(
+            &applied[1].verdict,
+            consumer::CheckVerdict::Result(result) if result.outcome == CheckResultOutcome::Pass
+        ));
+        assert_eq!(applied[1].consumer_id, consumer_id);
+    }
     assert!(condition(&store).await.check_witness().is_none());
     assert!(!in_step(&store, async {
         consumers.retry_exhausted(&task().await).await

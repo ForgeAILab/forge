@@ -608,8 +608,16 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         append_owner_advance(snapshot, &mut offers);
         return offers;
     }
+    // A coordination root runs only its aggregate review role. Held in any
+    // other state, its release launches nothing: it lets its subtasks run.
+    let root_role_refused = snapshot.coordination_root
+        && role.is_some_and(|role| {
+            !crate::task_hierarchy::RootRolePolicy::for_workflow(workflow)
+                .allows_execution(&task.status, role)
+        });
     if held {
-        if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() {
+        if (snapshot.has_agent && !snapshot.project_paused) && role.is_some() && !root_role_refused
+        {
             offer(
                 TaskAction::Release { reason: None },
                 &[],
@@ -761,6 +769,24 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 &[Owner],
                 "failed_review_override",
                 "Override Failed Review",
+            );
+        }
+        // A parent Task whose aggregate review cannot pass needs corrective
+        // work, and a parent in review accepts no new subtask. Sending it
+        // back reopens it, held, so a corrective subtask can be added; its
+        // release runs that subtask and the aggregate review after it.
+        if task.status == "review"
+            && snapshot.coordination_root
+            && target(WorkflowTrigger::Reject).is_some()
+        {
+            offer(
+                TaskAction::SendBack {
+                    guidance: String::new(),
+                },
+                &["guidance"],
+                &[Owner],
+                "root_review_reopen",
+                "Reopen for a Corrective Subtask",
             );
         }
         if !(task.status == "review"
@@ -1039,6 +1065,12 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
         && !snapshot.coordination_root
         && (snapshot.has_agent && !snapshot.project_paused)
         && snapshot.dependencies_satisfied
+        // A subtask its parent does not let run cannot be started: the
+        // exit is on the parent, which the condition names.
+        && !task
+            .condition
+            .reasons()
+            .any(|reason| matches!(reason, db::ParkReason::Parent { .. }))
         && workflow
             .outgoing_trigger_targets(&task.status)
             .any(|(_, target)| {

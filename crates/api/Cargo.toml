@@ -54,6 +54,7 @@ forge-client = { path = "../forge-client" }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tokio-tungstenite = "0.28"
+tokio-util = "0.7"
 tower = "0.5"
 
 [lints]

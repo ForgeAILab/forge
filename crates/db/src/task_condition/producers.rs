@@ -196,15 +196,14 @@ pub(crate) async fn derive(
                 }
                 facts.check = Some((wait.clone(), *epoch));
             }
-            ConditionStatement::CheckCleared { consumer_id } => {
-                // A stale consumer never clears its successor's wait.
+            // A stale consumer never clears its successor's wait.
+            ConditionStatement::CheckCleared { consumer_id }
                 if facts
                     .check
                     .as_ref()
-                    .is_some_and(|(wait, _)| wait.consumer_id == *consumer_id)
-                {
-                    facts.check = None;
-                }
+                    .is_some_and(|(wait, _)| wait.consumer_id == *consumer_id) =>
+            {
+                facts.check = None;
             }
             _ => {}
         }
