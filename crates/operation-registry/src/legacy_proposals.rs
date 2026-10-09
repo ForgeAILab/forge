@@ -3,9 +3,9 @@ use crate::*;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-// Intent values stay opaque: the old enqueuer did not interpret them. Fresh
-// calls have a closed field contract, while exact stored preparations keep
-// their recorded fields, just as Project-create preparations do.
+// Intent values stay opaque: the old enqueuer did not interpret them. The
+// payload was always an open, size-capped object stored verbatim, so the
+// declared fields are hints and every other field is kept as recorded.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct Message {
     pub body: Option<Value>,
@@ -111,10 +111,7 @@ pub const IDS: &[&str] = &[
     "session.action",
 ];
 pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
-    let closed = &[
-        StructuralConstraint::ClosedObject,
-        StructuralConstraint::MaxSerializedBytes(65536),
-    ];
+    let open = &[StructuralConstraint::MaxSerializedBytes(65536)];
     vec![
         OperationSpec::typed(
             "message.send",
@@ -124,7 +121,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             SURFACES,
             "PENDING message proposal; no message is sent.",
             "",
-            closed,
+            open,
             |context, input| Box::pin(context.pending_message(input)),
         ),
         OperationSpec::typed(
@@ -135,7 +132,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             SURFACES,
             "PENDING commitment proposal; no commitment is changed.",
             "",
-            closed,
+            open,
             |context, input| Box::pin(context.pending_commitment(input)),
         ),
         OperationSpec::typed(
@@ -146,7 +143,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             SURFACES,
             "PENDING memory proposal; no memory is published.",
             "",
-            closed,
+            open,
             |context, input| Box::pin(context.pending_memory_publish(input)),
         ),
         OperationSpec::typed(
@@ -157,7 +154,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             SURFACES,
             "PENDING memory proposal; no memory is superseded.",
             "",
-            closed,
+            open,
             |context, input| Box::pin(context.pending_memory_supersede(input)),
         ),
         OperationSpec::typed(
@@ -168,7 +165,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             SURFACES,
             "PENDING review proposal; no review is dispatched.",
             "",
-            closed,
+            open,
             |context, input| Box::pin(context.pending_review(input)),
         ),
         OperationSpec::typed(
@@ -179,7 +176,7 @@ pub fn specs<E: Send + 'static>() -> Vec<OperationSpec<E>> {
             SURFACES,
             "PENDING session proposal; no session is cancelled or steered.",
             "",
-            closed,
+            open,
             |context, input| Box::pin(context.pending_session(input)),
         ),
     ]

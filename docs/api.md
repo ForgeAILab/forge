@@ -5481,7 +5481,9 @@ error after the authority check.
 
 Project review configuration, Documents, Decisions, milestones, validation,
 release-candidate proposals and escalation now use typed registry contracts.
-Document and milestone fields are specific to the selected action. Fresh calls
+Document fields are specific to the selected action; milestone actions accept
+the operation's `milestone_id`, `display_label`, `primary_milestone_id` and
+`content` whichever action is named, as they always did. Fresh calls
 reject undeclared payload/envelope fields and forged server-derived authority or
 scope names. Omitted optional fields stay omitted, preserving receipt inputs;
 prepared calls retain their stored arguments. Proposal payloads are limited to
@@ -5490,13 +5492,15 @@ and non-null idempotency/correlation strings, matching preparation acceptance.
 A `null` or omitted payload on a registered proposal is read as `{}`, so the
 call is judged by the operation's own contract. A refused field is answered
 with one correction that names the operation, the field and the expected
-contract line. Document `approve` no longer takes `kind`, `title` or
-`envelope_digest`: the approval never read them.
+contract line. Document `approve` still accepts `kind`, `title` and
+`envelope_digest`, and `project.validation` still accepts
+`governing_revision_ids`; these were advertised before and are not read.
 
 The six legacy message, commitment, memory, review and session operations return
 pending proposals only. Their generated descriptions explicitly say no domain
-effect occurred. Their intent values remain opaque; fresh payloads admit only
-the operation's declared fields. No executor was added. A replay cannot report a
+effect occurred. Their intent values remain opaque and their payload stays an
+open object of at most 65,536 serialized bytes, stored as sent: the declared
+fields are hints, and other fields are kept, not refused. No executor was added. A replay cannot report a
 receipt-less legacy row marked `executed` as a materialized effect.
 
 Ready Project Agents see the existing Charter amendment draft capability.
