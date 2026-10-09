@@ -149,7 +149,8 @@ impl CoordinationToolProvider {
                 .find(|field| !FIELDS.contains(&field.as_str()))
             {
                 return Err(invalid_arguments(format!(
-                    "{operation}: envelope field `{field}` is not admitted"
+                    "{operation}: envelope field `{field}` is not admitted; expected {}",
+                    spec.contract_line()
                 )));
             }
             for field in ["dedupe_key", "correlation_id"] {
@@ -274,6 +275,40 @@ impl MainProposalContext<AgentHostError> for super::registered_reads::Context<'_
                 "propose_project",
                 Some("account".into()),
                 Some(account),
+            )
+            .await
+    }
+}
+
+#[async_trait]
+impl operation_registry::hand_proposals::HandProposalContext<AgentHostError>
+    for super::registered_reads::Context<'_>
+{
+    async fn genesis_start(
+        &self,
+        _: operation_registry::hand_proposals::GenesisStart,
+    ) -> Result<Value, AgentHostError> {
+        let arguments = self.proposal_arguments.expect("proposal envelope");
+        self.provider
+            .execute_main_genesis_start(
+                self.actor_identity_id,
+                self.scope,
+                arguments.clone(),
+                arguments["payload"].clone(),
+            )
+            .await
+    }
+    async fn charter_draft(
+        &self,
+        _: operation_registry::hand_proposals::CharterDraft,
+    ) -> Result<Value, AgentHostError> {
+        let arguments = self.proposal_arguments.expect("proposal envelope");
+        self.provider
+            .execute_main_genesis_charter_draft(
+                self.actor_identity_id,
+                self.scope,
+                arguments.clone(),
+                arguments["payload"].clone(),
             )
             .await
     }

@@ -1830,24 +1830,34 @@ fn null_registered_payload_is_empty(arguments: &mut Value) {
 }
 
 /// Canonicalize provider-friendly flat coordination fields into `payload`.
-/// The runtime schema exposes both forms because several function-calling
-/// providers lose the nested object while still producing its fields. The
-/// server receives only the canonical envelope.
+/// Hand Task schemas expose both forms. Registered operations derive their
+/// field names from the registry, so normalization does not need a second
+/// declaration in the advertised schema. The server receives the envelope.
 fn lift_coordination_payload(
     arguments: &mut Value,
     operations: &BTreeSet<String>,
 ) -> Result<(), RuntimeError> {
-    let Some(payload_properties) = coordination_payload_properties(operations) else {
-        return Ok(());
-    };
-    let Some(payload_properties) = payload_properties.as_object() else {
-        return Ok(());
-    };
+    // Canonical field names, not advertised aliases, drive normalization.
+    let mut payload_fields = BTreeSet::new();
+    if let Some(Value::Object(properties)) = coordination_payload_properties(operations) {
+        payload_fields.extend(properties.into_iter().map(|(name, _)| name));
+    }
+    for operation in operations {
+        if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
+            payload_fields.extend(
+                spec.input.schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned(),
+            );
+        }
+    }
     let Some(object) = arguments.as_object_mut() else {
         return Ok(());
     };
     let mut flat_payload = Map::new();
-    for field in payload_properties.keys() {
+    for field in &payload_fields {
         if let Some(value) = object.remove(field) {
             // Provider schemas declare aliases nullable so an explicit null
             // is normalized; null means omitted and must not become an
@@ -1927,7 +1937,7 @@ impl ForgeScopeReadTool {
     fn spec_with_operations(&self) -> ToolSpec {
         let description = if self.reject_authority_overrides {
             format!(
-                "Read one bounded Forge orchestration resource from {}. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+                "Read one Forge orchestration resource from {}.",
                 self.scope_label
             )
         } else {
@@ -2236,7 +2246,7 @@ impl ForgeScopeProposeTool {
     fn spec_with_operations(&self) -> ToolSpec {
         let description = if self.reject_authority_overrides {
             format!(
-                "Submit a typed Forge orchestration proposal in {}. The server derives the identity, scope, authority, and target; caller-supplied replacements are not accepted.",
+                "Submit one typed Forge orchestration proposal in {}.",
                 self.scope_label
             )
         } else {
@@ -4597,7 +4607,6 @@ mod tests {
             );
         }
         for field in [
-            "action",
             "charter_id",
             "project_mode",
             "maturity",
@@ -4614,7 +4623,7 @@ mod tests {
             );
         }
         assert_eq!(payload["additionalProperties"], false);
-        assert_eq!(payload["properties"]["action"]["const"], "save_revision");
+        assert!(payload["properties"].get("action").is_none());
         assert_eq!(
             payload["properties"]["content"]["additionalProperties"],
             false

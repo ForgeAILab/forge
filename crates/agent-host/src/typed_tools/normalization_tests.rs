@@ -144,25 +144,14 @@ fn serialized_tool_definitions() {
 /// A surface may shrink freely. Raise a ceiling only deliberately, in the
 /// change that explains why the prefix has to grow.
 const SURFACE_BYTE_CEILINGS: &[(&str, usize)] = &[
-    // 8,860 and 4,127 at 8bc736f5, less 46 and 38: the Main read lines state
-    // which fields are required instead of `optional {...}` for all of them.
-    // Main less 256 more: generated proposal contract lines replace the hand
-    // summaries of `genesis.project_agent.select` and `project.create`.
-    ("main", 8_558),
-    ("inquiry", 4_089),
-    // 24,048 and 25,297 at 172338b3, plus 56 each: the `skill.section`
-    // argument line states the required enum instead of `optional {section}`.
-    // Less 12 each: generated contract lines for the registered Project
-    // operations (-1,007) outweigh the pending legacy proposals' contract
-    // lines and flat aliases (+995). Hand Task operations keep their payload
-    // fields declared; that duplication is theirs to remove.
-    ("project", 24_092),
-    ("project_verify_solo", 25_341),
-    // Setup gains 194 bytes: the required truthful PENDING message contract
-    // and its body/content aliases add 200; the amendment wording adds 2; the new
-    // current-state line saves 8. The unchanged hand Charter dominates
-    // (12,526 bytes); no unrelated Task fields are added.
-    ("project_setup", 15_766),
+    // E2: Main command contracts are one generated line; registered pending
+    // fields need no root aliases. Named tools state their purpose once.
+    // Hand Task declarations are unchanged, including their existing ceiling.
+    ("main", 5_386),
+    ("inquiry", 3_971),
+    ("project", 23_710),
+    ("project_verify_solo", 24_959),
+    ("project_setup", 15_517),
     ("worker", 6_062),
     ("reviewer", 4_829),
     ("planner", 5_437),

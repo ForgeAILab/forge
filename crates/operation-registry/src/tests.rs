@@ -12,6 +12,7 @@ fn catalog_is_complete_unique_and_deterministic() {
             + main_proposals::IDS.len()
             + project_proposals::IDS.len()
             + legacy_proposals::IDS.len()
+            + hand_proposals::IDS.len()
     );
     assert_eq!(
         ids.len(),
@@ -927,4 +928,71 @@ fn project_variants_refuse_fields_from_other_actions_and_enforce_limits() {
     pending
         .validate_arguments(&json!({"content":"é".repeat(32750)}))
         .unwrap();
+}
+
+#[async_trait::async_trait]
+impl hand_proposals::HandProposalContext<&'static str> for RecordingContext {
+    async fn genesis_start(&self, _: hand_proposals::GenesisStart) -> Result<Value, &'static str> {
+        self.record("genesis.start")
+    }
+    async fn charter_draft(&self, _: hand_proposals::CharterDraft) -> Result<Value, &'static str> {
+        self.record("charter.draft")
+    }
+}
+#[tokio::test]
+async fn hand_contracts_decode_close_fields_and_preserve_receipt_inputs() {
+    let inputs: Value = serde_json::from_str(include_str!("../tests/hand_inputs.json")).unwrap();
+    let context = RecordingContext(std::sync::Mutex::new(Vec::new()));
+    let catalog = proposal_catalog();
+    for id in hand_proposals::IDS {
+        let spec = catalog.lookup(id).unwrap();
+        let mut input = inputs[*id].clone();
+        input.as_object_mut().unwrap().remove("action");
+        assert_eq!(spec.normalize_arguments(&input).unwrap(), input);
+        assert_eq!(
+            spec.dispatch(&context, input.clone()).await.unwrap()["handler"],
+            *id
+        );
+        let mut unknown = input.clone();
+        unknown["unexpected"] = json!(true);
+        let error = spec.normalize_arguments(&unknown).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "{id}: argument `unexpected` is not admitted; expected {}",
+                spec.contract_line()
+            )
+        );
+        assert!(spec.dispatch_prepared(&context, unknown).await.is_ok());
+    }
+}
+
+#[test]
+fn hand_main_payload_byte_limits_and_ignored_actions_are_explicit() {
+    let inputs: Value = serde_json::from_str(include_str!("../tests/hand_inputs.json")).unwrap();
+    for id in hand_proposals::IDS {
+        let catalog = proposal_catalog::<std::convert::Infallible>();
+        let spec = catalog.lookup(id).unwrap();
+        let mut input = inputs[*id].clone();
+        input.as_object_mut().unwrap().remove("action");
+        let plain = spec.normalize_arguments(&input).unwrap();
+        for action in [
+            json!(null),
+            json!(false),
+            json!("other"),
+            json!({"ignored":true}),
+        ] {
+            input["action"] = action;
+            assert_eq!(spec.normalize_arguments(&input).unwrap(), plain);
+        }
+        if *id == "charter.draft" {
+            input["content"]["identity"]["working_name"] = json!("é".repeat(32768));
+        } else {
+            input["preferred_project_agent_identity_id"] = json!("é".repeat(32768));
+        }
+        assert!(spec
+            .normalize_arguments(&input)
+            .unwrap_err()
+            .contains("serialized UTF-8 bytes"));
+    }
 }

@@ -5515,3 +5515,35 @@ setup completes name `charter_adoption_not_applicable`.
 These changes affect native tool contracts and agent-action admission; REST
 resource shapes and MCP projections are unchanged. Charter adoption, evidence
 and readiness retain their hand paths in this slice.
+
+
+### Native Main command contracts (3.8 E2)
+
+`charter.draft` and `genesis.start` use registry-generated contracts on the same
+native Main proposal tool. The public REST request/response types and MCP
+projections are unchanged. Main binding and domain authorization retain the base
+behavior: `project.create` and Project-Agent selection keep `main_account_id`,
+and the two direct commands keep `authorize_current_principal` for fresh effects.
+An owned former Main identity can replay its exact receipt but cannot issue a
+fresh command.
+
+The transport-only `action` is ignored and no longer required or advertised.
+Genesis accepts optional nullable `maturity` and
+`preferred_project_agent_identity_id`; its user idea and source message/turn are
+server-derived. Main draft declares the actual command fields, including the
+previously unadvertised `genesis_session_id`, `expected_charter_version`,
+`change_summary`, `source_refs`, `content_digest` and `render_digest`. Its full
+nested Charter and provenance types are checked at registry decode. A field or
+envelope violation produces one correction naming the operation, field and
+contract line, after current authority and forged-scope checks. Integer spellings
+normalize as for other registered operations; `payload: null` is read as `{}`.
+Payloads retain the 65,536 serialized UTF-8 byte ceiling. Native preparation still
+drops caller renderer fields, while direct command adapters retain their existing
+round-trip validation.
+
+Pending proposals advertise their contract once, without registered root field
+aliases. Existing flat inputs still normalize from canonical registry field
+names. Task payload declarations and legacy pending materialization are unchanged.
+Charter adoption and evidence remain on their hand paths because their historical
+receipt retrieval after pause/ceiling changes would be narrowed by registry
+admission. Readiness also remains on its hand path.

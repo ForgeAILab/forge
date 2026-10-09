@@ -2,6 +2,7 @@
 //! handlers; consumers use the same catalog for schemas, decoding and dispatch.
 
 pub mod authority;
+pub mod hand_proposals;
 mod input_check;
 pub mod legacy_proposals;
 pub mod main_proposals;
@@ -38,6 +39,7 @@ pub trait OperationContext<E>:
     + main_proposals::MainProposalContext<E>
     + project_proposals::ProjectProposalContext<E>
     + legacy_proposals::LegacyProposalContext<E>
+    + hand_proposals::HandProposalContext<E>
 {
 }
 impl<
@@ -47,7 +49,8 @@ impl<
             + main_reads::MainReadContext<E>
             + main_proposals::MainProposalContext<E>
             + project_proposals::ProjectProposalContext<E>
-            + legacy_proposals::LegacyProposalContext<E>,
+            + legacy_proposals::LegacyProposalContext<E>
+            + hand_proposals::HandProposalContext<E>,
     > OperationContext<E> for T
 {
 }
@@ -431,6 +434,7 @@ pub fn registered_operations() -> Vec<&'static str> {
         main_proposals::IDS.to_vec(),
         project_proposals::IDS.to_vec(),
         legacy_proposals::IDS.to_vec(),
+        hand_proposals::IDS.to_vec(),
     ]
     .concat();
     ids.sort_unstable();
@@ -455,13 +459,15 @@ pub fn proposal_catalog<E: Send + 'static>() -> OperationCatalog<E> {
         main_proposals::IDS,
         project_proposals::IDS,
         legacy_proposals::IDS,
+        hand_proposals::IDS,
     ]
     .concat();
     OperationCatalog::new(
         main_proposals::specs()
             .into_iter()
             .chain(project_proposals::specs())
-            .chain(legacy_proposals::specs()),
+            .chain(legacy_proposals::specs())
+            .chain(hand_proposals::specs()),
         &ids,
     )
     .expect("complete proposal catalog")

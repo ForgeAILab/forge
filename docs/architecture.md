@@ -58,7 +58,7 @@ forge-solo → services → db / events / agent-host / executors / workspace →
 which the workspace already resolved. `agent-host`, `services`, `db` and
 `mcp-server` depend on it; it imports neither, so typed service handler registration does not
 create a dependency cycle. Specifications live in domain modules of that crate
-(`scope_reads`, `project_reads`, `main_reads`, `main_proposals`), below `agent-host`, because `agent-host`
+(`scope_reads`, `project_reads`, `main_reads`, `main_proposals`, `hand_proposals`), below `agent-host`, because `agent-host`
 builds the advertised schema and cannot depend on `services`. Each module owns
 its specs, its id list and the small context trait its handlers need;
 `services` implements the traits. `lib.rs` only concatenates the modules,
@@ -162,10 +162,17 @@ atomically records the Project/handoff/receipt. It cannot execute by proposing
 or by an agent executor. Dedupe keys, correlation/causation, immutable receipts,
 protected checkpoint encryption and approval storage are unchanged.
 
-`genesis.start` and `charter.draft` remain on their hand paths: this checkpoint
-has not proved their leased-source control-transfer and nested Charter edited
-preparation continuation, respectively. All other operations keep their hand paths; an operation never
-has both. Existing permission/binding checks enforce
+`genesis.start` and `charter.draft` use typed specs in `hand_proposals` and
+registered dispatch. Their existing command adapters and domain authorizers are
+unchanged: Genesis still derives its creation intent from the leased user
+message, and neither command grants a fresh effect to an owned unbound identity.
+An owned former Main identity may retrieve its exact committed receipt as at
+base. The native `main_account_id` gate remains on `project.create` and
+`genesis.project_agent.select`; extending it to these direct commands would
+narrow that receipt retrieval. Stored preparations retain their exact arguments;
+the transport-only `action` is omitted from the advertised contracts and ignored
+before decoding, as the domain adapters already did. All other operations keep
+their hand paths; an operation never has both. Existing permission/binding checks enforce
 authority; spec/check parity is tested pending EffectiveAuthority. Domain
 semantic validation, transactions, workspace preparation, MCP projections and
 doctrine remain hand-written.
@@ -195,16 +202,21 @@ Charter amendment draft capability; no approval authority is added.
 `message.send`, `commitment.update`, `memory.publish`, `memory.supersede`,
 `review.request` and `session.action` are closed pending-intent specs. Their
 results remain pending proposals, never success for a message, memory, commitment,
-review or session effect. No materializer was added. The same operation schema
-produces field aliases and the contract line. On a tool that mixes them with
-hand operations, registered fields are not repeated inside `payload`; the hand
-operations' payload fields stay declared there, because some providers drop
-undeclared nested fields. A `null` payload on a registered proposal is read as
+review or session effect. No materializer was added. The operation schema produces the contract line and the canonical field names
+used by normalization. Registered pending fields are no longer duplicated as
+root-level aliases in `forge_scope_propose`. Flat calls still canonicalize from
+the registry's field names, so handlers and prepared calls keep their inputs.
+Hand Task operations retain their existing root and payload field declarations.
+Named orchestration descriptions state the action once; the canonical scope and
+authority rules are enforced by the same server checks. A `null` payload on a registered proposal is read as
 `{}`.
 
 `project.charter.adoption`, `project.evidence` and `project.readiness` retain their
-hand paths because their base receipt capture could not be proven exact in this
-slice. Project verification remains a disposable checkout with observed commands:
+hand paths. Literal fixtures from the real approved Charter/create and milestone
+command setup show that adoption and evidence return committed receipts after
+an identity pause or ceiling reduction. Registry admission would narrow those
+replays, so no partial move is retained. Readiness's base capture reached its
+bounded fixture-attempt limit; its dispatch and schema are unchanged. Project verification remains a disposable checkout with observed commands:
 `project.validation` still requires the command observations for pass/fail and
 refuses manual attestation through the Project-Agent path. Setup-only availability
 now reports `charter_adoption_not_applicable` after setup completes, rather than

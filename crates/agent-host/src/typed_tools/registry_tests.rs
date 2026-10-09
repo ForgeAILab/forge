@@ -22,6 +22,8 @@ fn spec_authority_agrees_with_existing_permission_check_on_every_surface() {
         ("project.observations", "PC", true),
         ("skill.section", "PC", true),
         ("genesis.project_agent.select", "AM", false),
+        ("charter.draft", "AM", false),
+        ("genesis.start", "AM", false),
         ("project.create", "AM", false),
         ("project.review_config", "PC", true),
         ("project.document", "PC", true),
@@ -393,7 +395,8 @@ fn main_registered_reads_have_no_hand_schema_validator_or_dispatch_arm() {
         .split("pub(crate) fn portable_const_schema")
         .next()
         .unwrap();
-    assert!(payloads.contains("MAIN_CHARTER_DRAFT_OPERATION =>"));
+    assert!(payloads.contains("PROJECT_CHARTER_ADOPTION_OPERATION =>"));
+    assert!(!payloads.contains("MAIN_CHARTER_DRAFT_OPERATION =>"));
     let validators = include_str!("../typed_tools.rs")
         .split("fn validate_orchestration_read_arguments")
         .nth(1)
@@ -577,15 +580,9 @@ async fn integer_spellings_are_admitted_at_preparation() {
 fn each_registered_proposal_projects_only_its_own_fields() {
     for spec in operation_registry::PROPOSAL_CATALOG.iter() {
         let one = BTreeSet::from([spec.id.to_owned()]);
-        let fields = coordination_payload_properties(&one).unwrap();
-        assert_eq!(
-            fields.as_object().unwrap().keys().collect::<Vec<_>>(),
-            spec.input.schema["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .collect::<Vec<_>>(),
-            "{}",
+        assert!(
+            coordination_payload_properties(&one).is_none(),
+            "registered contracts need no advertised root aliases: {}",
             spec.id
         );
         let tool = ForgeScopeProposeTool::new(
@@ -599,6 +596,22 @@ fn each_registered_proposal_projects_only_its_own_fields() {
             assert_eq!(schema["properties"][field]["type"], "string");
         }
         assert_eq!(schema["properties"]["payload"]["type"], "object");
+        assert_eq!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "causation_depth",
+                "causation_id",
+                "correlation_id",
+                "dedupe_key",
+                "operation",
+                "payload"
+            ]
+        );
     }
 }
 
@@ -659,5 +672,28 @@ async fn moved_proposals_refuse_unknown_and_forged_envelope_fields_before_dispat
             .unwrap_err()
             .to_string();
         assert!(error.contains("server-derived") && !error.contains("expected"));
+    }
+}
+
+#[test]
+fn registry_field_canonicalization_does_not_depend_on_root_aliases() {
+    let inputs: Value = serde_json::from_str(include_str!(
+        "../../../operation-registry/tests/project_inputs.json"
+    ))
+    .unwrap();
+    for id in operation_registry::legacy_proposals::IDS {
+        let tool = ForgeScopeProposeTool::new(
+            "actor".into(),
+            scope(CanonicalScopeType::Project, WorkspaceAccess::Deny),
+            vec![(*id).into()],
+            Arc::new(RecordingProvider::default()),
+        );
+        let mut flat = inputs[*id].as_object().unwrap().clone();
+        flat.insert("operation".into(), json!(id));
+        flat.insert("dedupe_key".into(), json!("key"));
+        flat.insert("correlation_id".into(), json!("correlation"));
+        let normalized = tool.normalize_arguments(Value::Object(flat)).unwrap();
+        assert_eq!(normalized["payload"], inputs[*id]);
+        assert_eq!(normalized.as_object().unwrap().len(), 4);
     }
 }

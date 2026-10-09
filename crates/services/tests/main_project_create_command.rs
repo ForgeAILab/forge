@@ -194,6 +194,21 @@ async fn fixture_with_policies(
     project_backend_kind: &str,
     main_policy: &str,
 ) -> Fixture {
+    fixture_with_agent_policies(
+        db,
+        project_backend_kind,
+        main_policy,
+        r#"{"permissions":["read_project","handoff"]}"#,
+    )
+    .await
+}
+
+async fn fixture_with_agent_policies(
+    db: Arc<SqliteDb>,
+    project_backend_kind: &str,
+    main_policy: &str,
+    project_tool_policy: &str,
+) -> Fixture {
     let authorization_now = now_rfc3339();
     UserRepo::create_user(
         &*db,
@@ -219,7 +234,6 @@ async fn fixture_with_policies(
         "native",
     )
     .await;
-    let project_tool_policy = r#"{"permissions":["read_project","handoff"]}"#;
     create_identity(
         &db,
         PROJECT_IDENTITY_ID,
@@ -1789,3 +1803,6 @@ async fn main_create_literal_checkpoints_resume_real_provider_then_approve_execu
         assert_eq!(count, 1);
     }
 }
+
+#[path = "main_project_create_command/hand_registry.rs"]
+mod hand_registry;
