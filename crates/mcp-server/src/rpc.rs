@@ -75,8 +75,11 @@ pub(crate) async fn dispatch_with_context(
             if operation_registry::mcp::lookup(&params.name).is_some()
                 && context.project_id.is_some()
             {
-                let authority = super::tools::registry::authority(state, context).await?;
-                super::tools::registry::authorize(&authority, &params.name).map_err(|error| {
+                let admission = async {
+                    let authority = super::tools::registry::authority(state, context).await?;
+                    super::tools::registry::authorize(&authority, &params.name)
+                };
+                admission.await.map_err(|error| {
                     error.with_call_context(
                         &params.name,
                         context.project_id.as_deref(),

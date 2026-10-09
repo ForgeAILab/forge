@@ -235,3 +235,168 @@ fn registry_contract_correction_survives_the_in_band_error_projection() {
             .contains("expected no arguments"));
     });
 }
+
+#[test]
+fn handlers_recheck_identity_ownership_and_daemon_pinning_at_the_effect() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (foreign_identity, _, _) = seed_chat_account(&state).await;
+        let context = McpContext {
+            project_id: None,
+            user_id: Some("mcp-test-user".into()),
+        };
+        let error = crate::tools::dispatch_handler_only(
+            &state,
+            "forge_set_main_agent",
+            json!({"identity_id": foreign_identity, "expected_version": 0}),
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, -32004);
+        let bound: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM account_main_agent_binding WHERE account_id = 'mcp-test-user'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(bound, 0, "a foreign identity is never bound");
+
+        let (executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
+        let error = crate::tools::dispatch_handler_only(
+            &state,
+            "forge_register_agent",
+            json!({"name": "pinned", "executor_type": executor_type, "daemon_id": daemon_id}),
+            &context,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, -32003);
+        let registered: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_identity WHERE owner_id = 'mcp-test-user'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(registered, 0, "a refused pin registers nothing");
+    });
+}
+
+#[test]
+fn a_foreign_identity_answers_exactly_like_a_missing_one() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (foreign_identity, _, _) = seed_chat_account(&state).await;
+        for (name, extra) in [
+            ("forge_list_agent_profiles", json!({})),
+            ("forge_list_agent_sessions", json!({})),
+            ("forge_set_main_agent", json!({"expected_version": 0})),
+        ] {
+            let mut answers = Vec::new();
+            for id in [foreign_identity.as_str(), "missing-identity"] {
+                let mut arguments = extra.clone();
+                arguments["identity_id"] = json!(id);
+                let error = call_tool_error(&state, name, arguments).await;
+                answers.push((error.code, error.message.replace(id, "<id>"), error.data));
+            }
+            assert_eq!(answers[0], answers[1], "{name}");
+            assert_eq!(answers[0].0, -32004, "{name}");
+        }
+    });
+}
+
+#[test]
+fn an_account_grant_reaches_project_tools_only_with_the_project_role() {
+    run_async(async {
+        let state = sqlite_state().await;
+        // Ownerless Project: visible to the user, who holds no role in it.
+        let (project_id, _) = seed_project_repo(&state).await;
+        let calls = |project_id: &str| {
+            [
+                ("forge_get_project_agent", json!({"project_id": project_id})),
+                (
+                    "forge_set_project_agent",
+                    json!({"project_id": project_id, "identity_id": "i", "expected_version": 0}),
+                ),
+                (
+                    "forge_list_agent_handoffs",
+                    json!({"project_id": project_id}),
+                ),
+                (
+                    "forge_get_agent_handoff",
+                    json!({"project_id": project_id, "handoff_id": "missing"}),
+                ),
+                (
+                    "forge_create_agent_handoff",
+                    json!({"project_id": project_id, "content": "c", "dedupe_key": "k"}),
+                ),
+            ]
+        };
+        for (name, arguments) in calls(&project_id) {
+            let error = call_tool_error(&state, name, arguments).await;
+            assert_eq!(error.code, -32001, "{name}");
+            assert_eq!(error.data.unwrap()["code"], "mcp_scope_denied", "{name}");
+        }
+        let now = now_rfc3339();
+        ProjectMemberRepo::add_member(
+            &*state.db,
+            CreateProjectMember {
+                id: new_uuid_v4(),
+                project_id: project_id.clone(),
+                user_id: "mcp-test-user".into(),
+                role: "member".into(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap();
+        for (name, arguments) in calls(&project_id) {
+            let denied = dispatch(
+                &state,
+                "tools/call",
+                json!({"name": name, "arguments": arguments}),
+            )
+            .await
+            .err()
+            .and_then(|error| error.into_response(Value::Null).error.unwrap().data)
+            .is_some_and(|data| data["code"] == "mcp_scope_denied");
+            assert_eq!(
+                denied,
+                name == "forge_set_project_agent",
+                "an ordinary member passes every role check but the binding setter: {name}"
+            );
+        }
+    });
+}
+
+#[test]
+fn contract_corrections_do_not_echo_argument_values_and_need_an_object() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let error = call_tool_error(
+            &state,
+            "forge_list_agents",
+            json!({"limit": "s3cret-value"}),
+        )
+        .await;
+        assert_eq!(error.code, -32602);
+        let data = error.data.unwrap();
+        assert_eq!(data["code"], "mcp_contract_invalid");
+        let details = data["details"].as_str().unwrap();
+        assert!(!details.contains("s3cret"), "{details}");
+        assert!(
+            details.contains("invalid type: string, expected"),
+            "{details}"
+        );
+
+        let (foreign_identity, _, _) = seed_chat_account(&state).await;
+        let error = call_tool_error(
+            &state,
+            "forge_list_agent_profiles",
+            json!([foreign_identity]),
+        )
+        .await;
+        assert_eq!(error.code, -32602);
+    });
+}

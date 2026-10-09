@@ -1797,7 +1797,11 @@ direct APIs remain separate contracts with unchanged effects and result shapes.
 contracts, their required roles and resource classifications. Schemas and typed
 decoders derive from the same Serde/JsonSchema input structs. The MCP handlers
 accept those concrete types; they no longer duplicate parameter declarations or
-role predicates. Task/Project MCP tools, including owner escalation, retain
+role predicates. Two effect-time re-checks stay in handlers, next to the write:
+identity ownership in `forge_set_main_agent` and the administrator flag for
+daemon pinning in `forge_register_agent`. Referenced-resource authorization
+reads named fields of a JSON object, so the decoder refuses any other argument
+shape. Task/Project MCP tools, including owner escalation, retain
 their existing descriptor/handler paths pending their separate migration.
 
 All 42 MCP names have one scope classification in the registry. A Project grant

@@ -259,3 +259,21 @@ fn opaque_policies_and_executor_extensions_preserve_base_acceptance() {
         .decode(json!({"name":"n","executor_type":"custom-executor"}))
         .is_ok());
 }
+
+/// Serde decodes a struct from a positional array too. The named fields are
+/// what authority is checked against, so only an object is a contract input.
+#[test]
+fn positional_arguments_are_refused_for_every_operation() {
+    for spec in CATALOG.iter() {
+        for arguments in [
+            json!(["a", "b", "c", "d", "e", "f", "g"]),
+            json!(["a"]),
+            json!([]),
+            json!("a"),
+            json!(null),
+        ] {
+            let error = spec.decode(arguments).unwrap_err();
+            assert_eq!(error.detail, "arguments must be an object", "{}", spec.name);
+        }
+    }
+}

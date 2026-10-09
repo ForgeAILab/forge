@@ -216,6 +216,11 @@ impl McpOperation {
     /// contract checker then enforces the portable schema and closed fields.
     pub fn decode(&self, arguments: Value) -> Result<McpInput, McpInputError> {
         let decode = || {
+            // Serde would also decode a struct from a positional array, which
+            // bypasses the named fields that authority was checked against.
+            if !arguments.is_object() {
+                return Err("arguments must be an object".to_owned());
+            }
             let input = (self.decode)(arguments.clone())?;
             self.input.normalize(&arguments)?;
             Ok(input)

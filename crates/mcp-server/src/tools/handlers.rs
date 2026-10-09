@@ -810,6 +810,14 @@ pub(super) async fn forge_register_agent(
 ) -> Result<Value, McpToolError> {
     let user = authenticated_user_record(state, context).await?;
     let is_admin = user.is_admin;
+    // Effect-time re-check of the registry's conditional field authority:
+    // the administrator flag is read again here, next to the write.
+    if !is_admin && params.daemon_id.is_some() {
+        return Err(
+            McpToolError::new(-32003, "Admin access required to pin an agent to a daemon")
+                .with_data(json!({ "code": "admin_required" })),
+        );
+    }
     let agent = state
         .agent_service
         .register(
@@ -823,7 +831,7 @@ pub(super) async fn forge_register_agent(
             "[]".to_owned(),
             "{}".to_owned(),
             None,
-            params.daemon_id.filter(|_| is_admin),
+            params.daemon_id,
             None,
             None,
             None,
@@ -1385,8 +1393,11 @@ pub(super) async fn forge_set_main_agent(
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let user_id = authenticated_user(context)?;
+    // Effect-time ownership re-check on the decoded identity. A missing and
+    // a foreign identity are the same answer.
     let identity = AgentRepo::get_by_id(&*state.db, &params.identity_id)
         .await?
+        .filter(|identity| identity.owner_id.as_deref() == Some(user_id))
         .ok_or_else(|| McpToolError::not_found("agent_identity", params.identity_id.clone()))?;
     let now = now_rfc3339();
     let replacement = CreateAccountMainAgentBinding {

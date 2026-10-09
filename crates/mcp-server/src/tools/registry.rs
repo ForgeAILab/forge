@@ -15,8 +15,30 @@ use operation_registry::{
 };
 use serde_json::{json, Value};
 
+/// Serde reports a mistyped value by quoting it (`invalid type: string
+/// "...", expected i64`). The correction keeps the kind and the expectation
+/// and drops the caller's literal, so no argument value is echoed.
+fn without_echoed_value(detail: &str) -> String {
+    for prefix in ["invalid type: ", "invalid value: "] {
+        if let Some(rest) = detail.strip_prefix(prefix) {
+            let kind = rest
+                .split(|c: char| !c.is_ascii_alphabetic())
+                .next()
+                .unwrap_or_default();
+            let expected = rest
+                .rfind(", expected ")
+                .map_or("", |position| &rest[position..]);
+            return format!("{prefix}{kind}{expected}");
+        }
+    }
+    detail.to_owned()
+}
+
 pub(crate) fn input_error(error: McpInputError) -> McpToolError {
-    let detail = error.detail.chars().take(512).collect::<String>();
+    let detail = without_echoed_value(&error.detail)
+        .chars()
+        .take(512)
+        .collect::<String>();
     let correction = format!(
         "{}: {}; expected {}",
         error.operation, detail, error.expected
@@ -108,6 +130,14 @@ pub(crate) async fn authorize_resource(
     arguments: &Value,
     context: &McpContext,
 ) -> Result<(), McpToolError> {
+    // References are read from named fields. Anything but an object carries
+    // none, and is refused here so that it cannot reach the typed decode.
+    if !arguments.is_object() {
+        return Err(McpToolError::new(
+            -32602,
+            "tool arguments must be an object",
+        ));
+    }
     let user_id = context.user_id.as_deref().unwrap_or_default();
     let mut authority = mcp_authority(user_id, context.project_id.as_deref());
     if let Some(rule) = &spec.field_authority {
@@ -130,19 +160,26 @@ pub(crate) async fn authorize_resource(
     let get = |field: &str| arguments.get(field).and_then(Value::as_str);
     match spec.resource {
         ResourceRule::OwnedIdentity | ResourceRule::OwnedSession => {
-            let identity_id = if spec.resource == ResourceRule::OwnedSession {
+            // The denial names only what the caller sent: a session owned by
+            // another account answers exactly like a missing one, and never
+            // names that account's identity.
+            let (identity_id, hidden) = if spec.resource == ResourceRule::OwnedSession {
                 let Some(id) = get("session_id") else {
                     return Ok(());
                 };
-                AgentSessionRepo::get_agent_session(&*state.db, id)
+                let hidden = || McpToolError::not_found("agent_session", id.to_owned());
+                let session = AgentSessionRepo::get_agent_session(&*state.db, id)
                     .await?
-                    .ok_or_else(|| McpToolError::not_found("agent_session", id.to_owned()))?
-                    .identity_id
+                    .ok_or_else(hidden)?;
+                (session.identity_id, hidden())
             } else {
                 let Some(id) = get("identity_id") else {
                     return Ok(());
                 };
-                id.to_owned()
+                (
+                    id.to_owned(),
+                    McpToolError::not_found("agent_identity", id.to_owned()),
+                )
             };
             if AgentRepo::get_by_id(&*state.db, &identity_id)
                 .await?
@@ -150,8 +187,7 @@ pub(crate) async fn authorize_resource(
             {
                 authority.ceiling.insert("mcp_owned_identity".into());
             }
-            evaluate_resource(&authority, "mcp_owned_identity")
-                .map_err(|_| McpToolError::not_found("agent_identity", identity_id))?;
+            evaluate_resource(&authority, "mcp_owned_identity").map_err(|_| hidden)?;
         }
         ResourceRule::Project | ResourceRule::Handoff => {
             let Some(project_id) = get("project_id") else {

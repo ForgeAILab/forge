@@ -4855,7 +4855,9 @@ in `operation-registry::mcp`. Each description is one generated summary line
 with the admitted fields. Names and result shapes are unchanged. Unknown fields
 on these 18 tools map to one `-32602` contract error. The in-band result has
 `structuredContent.code = "validation_error"` and bounded `details` carrying
-`code = "mcp_contract_invalid"`, the operation name and the expected contract. The
+`code = "mcp_contract_invalid"`, the operation name and the expected contract. A
+mistyped value is described by its JSON type and never quoted back. Arguments
+must be a JSON object. The
 registry checks delegated authority before reporting contract details. Required
 integer arguments retain MCP's strict JSON integer spelling; native integer
 coercions do not apply.
@@ -4883,6 +4885,24 @@ contract decoding; a non-null value from a non-admin still returns `-32003`
 `admin_required`. A null or omitted daemon field retains its former meaning.
 The 24 unmoved Task/Project descriptors and their grant filtering retain the
 base behavior, including `forge_project_escalate`'s separate owner check.
+
+A role denial on a moved tool is `-32001` with `data.code = "mcp_scope_denied"`
+for both grant kinds. A reference the user may not use answers exactly like a
+missing one: an identity or session of another account is `-32004`
+(`agent_identity not found` / `agent_session not found`, naming only the id
+that was sent), and a handoff of another Project is `-32004`
+`agent_handoff not found`. `forge_set_main_agent` re-reads identity ownership
+and `forge_register_agent` re-reads the administrator flag in the handler,
+next to the write; the Chat service re-checks Project role for
+`forge_set_project_agent` and Chat access for `forge_send_agent_chat_message`.
+
+Fields that were silently ignored before and are now refused as undeclared:
+`project_id` on `forge_list_projects`, `forge_list_agent_chats`,
+`forge_get_agent_chat`, `forge_list_agent_chat_messages`,
+`forge_send_agent_chat_message` and the eight account-wide tools; `cursor` /
+`limit` on `forge_list_agent_profiles`, `forge_list_agent_sessions` and
+`forge_get_agent_session`; `executor_type` / `capabilities` on
+`forge_list_agents`; any argument on `forge_get_main_agent`.
 
 The generated schemas now describe accepted nullable optional strings/integers,
 opaque JSON `autonomy_policy` and `permission_ceiling` values, and registration's
