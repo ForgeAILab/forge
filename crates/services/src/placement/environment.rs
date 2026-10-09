@@ -1438,7 +1438,7 @@ mod tests {
             crate::daemon_transport::DaemonConnection::new("probe-daemon".into());
         registry.register("probe-daemon".into(), connection.clone());
         let handshake = api_types::DaemonHandshakeNotification {
-            protocol_revision: 3,
+            protocol_revision: api_types::DAEMON_PROTOCOL_REVISION,
             capabilities: api_types::DAEMON_REQUIRED_CAPABILITIES
                 .iter()
                 .map(|fact| (*fact).to_owned())
