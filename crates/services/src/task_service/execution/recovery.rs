@@ -587,25 +587,9 @@ impl TaskService {
             queued.request.offer.reason.as_str(),
             "ready_to_start" | "initial_retry" | "role_retry" | "manually_held" | "merge_fix_retry"
         ) {
-            let role = workflow
-                .states
-                .iter()
-                .find(|state| state.name == task.status)
-                .and_then(crate::workflow::effective_role)
-                .or_else(|| {
-                    workflow
-                        .outgoing_trigger_targets(&task.status)
-                        .find_map(|(_, target)| {
-                            workflow
-                                .states
-                                .iter()
-                                .find(|state| state.name == target)
-                                .and_then(crate::workflow::effective_role)
-                        })
-                })
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation("queued action lost its workflow role")
-                })?;
+            let role = crate::workflow::action_role(&workflow, &task.status).ok_or_else(|| {
+                ServiceError::invalid_operation("queued action lost its workflow role")
+            })?;
             if queued
                 .request
                 .role_name
