@@ -7,6 +7,7 @@ mod input_check;
 pub mod legacy_proposals;
 pub mod main_proposals;
 pub mod main_reads;
+pub mod mcp;
 pub mod project_proposals;
 pub mod project_reads;
 pub mod scope_reads;

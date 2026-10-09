@@ -1,0 +1,300 @@
+{
+  "base": "33e2a974",
+  "oracle": "Scope admission for H; base handler role acceptance for G. IDs and mutable domain state are separately authorized.",
+  "rows": {
+    "forge_project_escalate": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_create_task": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_list_tasks": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_get_task": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_preview_prompt": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_memory_search": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_memory_get": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_assign_agent": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_task_action": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_get_task_diff": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_list_executions": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_update_task": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_transition_task": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_register_agent": {
+      "account": true,
+      "project_public": false,
+      "project_member": false,
+      "project_admin": false,
+      "project_owner": false
+    },
+    "forge_list_agents": {
+      "account": true,
+      "project_public": false,
+      "project_member": false,
+      "project_admin": false,
+      "project_owner": false
+    },
+    "forge_list_projects": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_create_project": {
+      "account": true,
+      "project_public": false,
+      "project_member": false,
+      "project_admin": false,
+      "project_owner": false
+    },
+    "forge_get_project": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_update_project": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_update_project_lifecycle_hooks": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_follow_up_execution": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_add_task_dependency": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_remove_task_dependency": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_list_task_dependencies": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_list_task_dependents": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_create_sub_tasks": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_list_sub_tasks": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_reorder_sub_tasks": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_list_agent_profiles": {
+      "account": true,
+      "project_public": false,
+      "project_member": false,
+      "project_admin": false,
+      "project_owner": false
+    },
+    "forge_list_agent_sessions": {
+      "account": true,
+      "project_public": false,
+      "project_member": false,
+      "project_admin": false,
+      "project_owner": false
+    },
+    "forge_get_agent_session": {
+      "account": true,
+      "project_public": false,
+      "project_member": false,
+      "project_admin": false,
+      "project_owner": false
+    },
+    "forge_get_main_agent": {
+      "account": true,
+      "project_public": false,
+      "project_member": false,
+      "project_admin": false,
+      "project_owner": false
+    },
+    "forge_set_main_agent": {
+      "account": true,
+      "project_public": false,
+      "project_member": false,
+      "project_admin": false,
+      "project_owner": false
+    },
+    "forge_get_project_agent": {
+      "account": true,
+      "project_public": false,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_set_project_agent": {
+      "account": true,
+      "project_public": false,
+      "project_member": false,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_list_agent_chats": {
+      "account": true,
+      "project_public": true,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_get_agent_chat": {
+      "account": true,
+      "project_public": false,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_list_agent_chat_messages": {
+      "account": true,
+      "project_public": false,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_send_agent_chat_message": {
+      "account": true,
+      "project_public": false,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_list_agent_handoffs": {
+      "account": true,
+      "project_public": false,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_get_agent_handoff": {
+      "account": true,
+      "project_public": false,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    },
+    "forge_create_agent_handoff": {
+      "account": true,
+      "project_public": false,
+      "project_member": true,
+      "project_admin": true,
+      "project_owner": true
+    }
+  }
+}

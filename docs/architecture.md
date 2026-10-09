@@ -1825,11 +1825,42 @@ supported canonical scopes, command classification, scope-aware permission,
 input-contract family, and the shared output envelope. Provider JSON schemas
 and preparation-time structural checks are derived from that contract; service
 adapters look up the same operation and permission metadata and retain only
-domain/lifecycle validation in the command service. The current MCP registry
-contains no migrated dotted orchestration operation IDs, so its existing
-`forge_*` direct APIs remain explicitly separate. An invariant test prevents a
-migrated operation from entering MCP through a second manual descriptor; a
-future MCP projection must consume the canonical contract.
+domain/lifecycle validation in the command service. The MCP registry
+contains no migrated dotted orchestration operation IDs. Its existing `forge_*`
+direct APIs remain separate contracts with unchanged effects and result shapes.
+`operation-registry::mcp` owns 18 account, identity, binding, Chat and handoff
+contracts, their required roles and resource classifications. Schemas and typed
+decoders derive from the same Serde/JsonSchema input structs. The MCP handlers
+accept those concrete types; they no longer duplicate parameter declarations or
+role predicates. Two effect-time re-checks stay in handlers, next to the write:
+identity ownership in `forge_set_main_agent` and the administrator flag for
+daemon pinning in `forge_register_agent`. Referenced-resource authorization
+reads named fields of a JSON object, so the decoder refuses any other argument
+shape. Task/Project MCP tools, including owner escalation, retain
+their existing descriptor/handler paths pending their separate migration.
+
+All 42 MCP names have one scope classification in the registry. A Project grant
+omits/refuses the same eight account-wide tools. MCP always resolves a
+`Principal::DelegatedUser`; Project binding never implies an Agent principal.
+RPC generates the moved part of `tools/list` for each connection using the same
+`EffectiveAuthority::evaluate` requirements as call admission. Project grants
+resolve visibility and member/admin facts for the bound Project; account grants
+retain all names and resolve role/ownership against each supplied reference.
+Conditional daemon pinning is declared on the registration contract and passed
+through that evaluator for both field advertisement and admission. Unmoved
+Task calls retain the original database admission path.
+
+Call order is known-name lookup, delegated scope/role admission, Project scope
+binding, referenced-resource authorization, then strict typed contract decode
+and the original handler effect. Denial precedes contract diagnostics and
+owned-identity failures preserve missing/inaccessible equivalence. Each moved
+input is closed; a contract violation maps to MCP `-32602` with
+`mcp_contract_invalid`, operation and expected fields. The projection emits only
+portable base schema keywords and one description line. Optional nulls,
+opaque JSON policies, reserved ignored pagination, and strict integer spelling
+preserve handler acceptance. Domain services retain their transaction-time
+rechecks, CAS, content guards and permission-document validation. No native
+orchestration, Task effect, Agent credential or workflow policy is introduced.
 
 Native and MCP orchestration adapters expose those command results through one
 typed `OrchestrationOutcome` envelope. It carries `code`, `status`,

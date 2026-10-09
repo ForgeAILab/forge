@@ -160,8 +160,9 @@ impl McpToolError {
     }
 
     /// Render a known-tool failure as an MCP in-band tool result. The error's
-    /// raw message and data are deliberately not forwarded: model-facing
-    /// clients receive only stable codes and safe, bounded guidance.
+    /// raw message and data are deliberately not forwarded. Registry contract
+    /// corrections alone carry bounded caller-input detail; other failures
+    /// expose only stable codes and safe guidance.
     pub(crate) fn into_tool_response(self, id: Value) -> McpResponse {
         let outcome = self.into_outcome();
         let text = serde_json::to_string(&outcome).unwrap_or_else(|_| {
@@ -183,6 +184,27 @@ impl McpToolError {
     }
 
     fn into_outcome(self) -> Value {
+        // Only registry-generated contract corrections may carry input detail.
+        // Other failures retain their existing protected-data redaction.
+        let contract_details = self
+            .details
+            .data
+            .as_ref()
+            .filter(|data| {
+                data["code"] == "mcp_contract_invalid"
+                    && data["operation"]
+                        .as_str()
+                        .is_some_and(|name| operation_registry::mcp::lookup(name).is_some())
+                    && self.details.operation.as_deref() == data["operation"].as_str()
+            })
+            .and_then(|data| {
+                data["details"].as_str().map(|detail| {
+                    json!({
+                        "code":"mcp_contract_invalid", "operation":data["operation"],
+                        "details": detail.chars().take(4096).collect::<String>()
+                    })
+                })
+            });
         let execution_already_running_details = self
             .details
             .data
@@ -259,7 +281,8 @@ impl McpToolError {
         }
         outcome.details = action_unavailable_offers
             .map(|offers| json!({"available_actions": offers}))
-            .or(execution_already_running_details);
+            .or(execution_already_running_details)
+            .or(contract_details);
         serde_json::to_value(outcome).unwrap_or_else(|_| {
             json!({
                 "code": "internal_failure",
