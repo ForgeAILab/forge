@@ -56,11 +56,15 @@ pub(super) async fn task_execution_is_read_only(
     ctx: &HookContext,
     task: &db::Task,
 ) -> Result<bool, String> {
+    task_is_read_only(&ctx.db, task).await
+}
+
+pub(crate) async fn task_is_read_only(db: &db::SqliteDb, task: &db::Task) -> Result<bool, String> {
     let capability_class = sqlx::query_scalar::<_, Option<String>>(
         "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
     )
     .bind(&task.id)
-    .fetch_optional(ctx.db.pool())
+    .fetch_optional(db.pool())
     .await
     .map_err(|error| error.to_string())?
     .flatten();
@@ -287,40 +291,76 @@ pub(super) fn follow_up_trigger(ctx: &HookContext) -> &'static str {
     }
 }
 
+tokio::task_local! { static COMMENT_KEY: String; }
+
+/// Run `work` with every system comment it writes through a hook context
+/// keyed by `key` and the comment's text, so a redelivered Task step writes
+/// each comment once. A hook step keeps its own key; nothing else sets one.
+pub(crate) async fn with_comment_key<F: std::future::Future>(key: String, work: F) -> F::Output {
+    COMMENT_KEY.scope(key, work).await
+}
+
 pub(super) async fn create_system_comment(ctx: &HookContext, content: String) -> db::Result<()> {
+    let idempotency_key = crate::workflow::engine::durable::current_hook(&ctx.task_id)
+        .map(|a| format!("hook-comment:{}:{}:{}", a.step.id, a.index, content))
+        .or_else(|| {
+            COMMENT_KEY
+                .try_with(|key| format!("step-comment:{key}:{content}"))
+                .ok()
+        });
+    system_comment(
+        &ctx.db,
+        &ctx.event_bus,
+        &ctx.project_id,
+        &ctx.task_id,
+        content,
+        idempotency_key,
+    )
+    .await
+}
+
+/// A "Forge" comment on the Task, indexed and announced as every system
+/// comment is. `idempotency_key` makes a redelivered step write it once.
+pub(crate) async fn system_comment(
+    db: &Arc<db::SqliteDb>,
+    event_bus: &Arc<events::EventBus>,
+    project_id: &str,
+    task_id: &str,
+    content: String,
+    idempotency_key: Option<String>,
+) -> db::Result<()> {
     let now = now_rfc3339();
     let comment = TaskCommentRepo::create_comment(
-        &*ctx.db,
+        &**db,
         CreateTaskComment {
             id: new_uuid_v4(),
-            task_id: ctx.task_id.clone(),
+            task_id: task_id.to_owned(),
             author_type: CommentAuthorType::System,
             author_id: None,
             author_name: "Forge".to_string(),
-            content: content.clone(),
+            content,
             execution_id: None,
             role: None,
             worklog_kind: None,
-            idempotency_key: crate::workflow::engine::durable::current_hook(&ctx.task_id)
-                .map(|a| format!("hook-comment:{}:{}:{}", a.step.id, a.index, content)),
+            idempotency_key,
             created_at: now.clone(),
             updated_at: now,
         },
     )
     .await?;
-    let memory_service = crate::MemoryService::new(Arc::clone(&ctx.db));
+    let memory_service = crate::MemoryService::new(Arc::clone(db));
     if let Err(error) = memory_service
-        .record_task_comment(&ctx.project_id, &comment)
+        .record_task_comment(project_id, &comment)
         .await
     {
         tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
     }
-    ctx.event_bus.publish(ForgeEvent {
+    event_bus.publish(ForgeEvent {
         event_type: "comment.created".to_string(),
         entity_id: comment.id.clone(),
         timestamp: event_timestamp(),
         context: EventContext::CommentCreated {
-            task_id: ctx.task_id.clone(),
+            task_id: task_id.to_owned(),
             comment_id: comment.id,
             author_type: "system".to_string(),
             author_name: "Forge".to_string(),

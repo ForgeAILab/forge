@@ -8,6 +8,34 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **The managed Codex home and Task hook logs moved (3.4 stage C part 1).**
+  The Forge-owned Codex home of a Task is now
+  `<task root>/.forge-task/home/codex` instead of
+  `<workspace root>/.forge/logs/<project>/<task>/.codex-managed-home` (server)
+  or `<root>/.forge-daemon/execution-logs/.codex-managed-home` (daemon, one
+  home shared by every execution). The server-side home is moved into the
+  Task root on the Task's next Codex execution, so resumed Tasks keep their
+  sessions; the old daemon home is no longer used and can be deleted. Hook
+  logs written outside an execution moved from
+  `<system temp>/forge/logs/<task_id>/hooks/` to
+  `<workspace root>/.forge/logs/<project_id>/<task_id>/hooks/`; old files are
+  not migrated. The Gemini API-key home moved from
+  `<system temp>/forge-gemini-api-key-home` to
+  `<task root>/.forge-task/home/gemini`.
+- **A repository named `.forge-task` cannot have a Task workspace.** Creating
+  its worktree fails with `repository name ".forge-task" is reserved by
+  Forge; rename the repository`. A Task root that already holds `.forge-task`
+  as a link or a file is refused as well.
+- **Rust build output of a Task moved out of the worktree (3.4 stage C part
+  1).** Runs in a Task worktree get
+  `CARGO_TARGET_DIR=<task root>/.forge-task/build/cargo`, so `target/` no
+  longer appears in the worktree and scripts that read `./target/...` must
+  use `$CARGO_TARGET_DIR`. A value from the Project environment, the Agent
+  profile or the server's own environment still wins; an empty Project value
+  keeps building in the worktree. Runs whose own sandbox cannot write the
+  directory (a Codex execution that is not a managed Task, Gemini with
+  `--sandbox`) are unchanged.
+
 - **Daemon protocol revision 6 (3.2 stage D1c).** The minimum revision is 6:
   a revision-5 or older daemon is refused at the handshake with
   `daemon_upgrade_required` and cannot use any command RPC. Upgrade the
@@ -829,6 +857,33 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   unchanged commit run no CI) is the next step and is not in this change. No
   stored check result is migrated or reinterpreted.
 
+- **Merge queue Task steps, not produced yet (3.2 stage D, part 1b).** The
+  server can now apply what the merge queue decides to a Task (ask for the
+  check of a rebased commit, authorize the fast-forward, mark the Task done,
+  hand a conflict or a failed check back, say why a Task is waiting), but
+  nothing asks it to: merging works exactly as before. Upgrading rebuilds the
+  internal `task_step` table once to add the new step kind; no row is
+  changed. One thing is live today: cancelling a Task, by action or by
+  dragging it to the cancelled column, also marks its merge-queue record as
+  cancel-requested in the same write.
+- **Every run gets its temp directory and build output from its Task root
+  (3.4 stage C part 1).** Forge reserves `.forge-task/` beside each Task
+  worktree (`tmp/<run>/`, `home/<family>/`, `build/`). Agent executions of
+  every executor family, native tool commands, lifecycle script hooks and
+  check commands now run with `TMPDIR`, `TMP` and `TEMP` pointing at a
+  per-run directory that is removed when the run ends, after a crash, and
+  with the Task; before, temp files went to the system temp directory and
+  were never reclaimed. When the in-root path would be too long for a Unix
+  socket the run uses `<workspace root>/.forge-tmp/<run>/` instead. Rust
+  builds get `CARGO_TARGET_DIR=<task root>/.forge-task/build/cargo`, so
+  build output no longer sits inside the worktree; set `CARGO_TARGET_DIR` in
+  the Project environment to choose another directory, or to an empty value
+  to keep building in the worktree. `HOME` and shared toolchain caches are
+  unchanged. Workspaces whose recorded path is not
+  `<workspace root>/<task_id>/<name>` keep the previous behaviour. Leftovers
+  of a crashed process are removed at the next start, never the directory of
+  a run that is still going. A run is never given a directory it cannot
+  write or one that is a link: it keeps the inherited one instead.
 - **Integration queue worker, not started yet (3.2 stage D, part 1d).** The
   server has the worker that will drive the per-branch merge queue (rebase,
   check, fast-forward, takeover after a crash), but nothing starts it:

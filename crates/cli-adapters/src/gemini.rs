@@ -90,14 +90,6 @@ impl GeminiAdapter {
             // opened interactively; without this the CLI refuses headless
             // runs with an untrusted-directory error.
             .env("GEMINI_CLI_TRUST_WORKSPACE", "true");
-        let key_injected = config
-            .command_overrides
-            .env
-            .as_ref()
-            .is_some_and(|env| env.contains_key("GEMINI_API_KEY"));
-        if key_injected && let Some(home) = ensure_api_key_home() {
-            cmd.env("GEMINI_CLI_HOME", home);
-        }
         cmd
     }
 
@@ -130,11 +122,34 @@ impl Default for GeminiAdapter {
 
 /// The user-level `~/.gemini/settings.json` may pin OAuth auth, which the
 /// CLI prefers over an injected `GEMINI_API_KEY` and which fails headless.
+/// Whether this launch runs the Gemini CLI's own sandbox: `--sandbox` from
+/// the Agent config (dropped under yolo, as in [`GeminiAdapter::build_command`])
+/// or a `GEMINI_SANDBOX` the command carries that is not an explicit "off".
+fn gemini_sandbox_enabled(
+    config: &GeminiConfig,
+    command_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    let policy_is_yolo = matches!(
+        config.permission_policy.as_ref(),
+        Some(PermissionPolicy::Yolo)
+    );
+    (!policy_is_yolo && config.sandbox.is_some())
+        || command_env("GEMINI_SANDBOX")
+            .is_some_and(|value| !matches!(value.to_str(), Some("" | "false" | "0" | "none")))
+}
+
 /// When Forge injects a provider API key, point the CLI at a Forge-owned
 /// home whose settings select API-key auth so the key actually drives the
 /// run.
-fn ensure_api_key_home() -> Option<PathBuf> {
-    let home = std::env::temp_dir().join("forge-gemini-api-key-home");
+///
+/// The home belongs to the Task: `<task root>/.forge-task/home/gemini`,
+/// removed with the Task root. A worktree whose Task root Forge did not
+/// reserve keeps the shared directory in the system temp dir.
+fn ensure_api_key_home(worktree: &Path) -> Option<PathBuf> {
+    // `prepare_home` refuses a `home` that is a link or a file.
+    let home = executors::sandbox::TaskRoot::of_worktree(worktree)
+        .and_then(|task_root| task_root.prepare_home("gemini"))
+        .unwrap_or_else(|| std::env::temp_dir().join("forge-gemini-api-key-home"));
     let settings_dir = home.join(".gemini");
     std::fs::create_dir_all(&settings_dir).ok()?;
     std::fs::write(
@@ -189,7 +204,31 @@ impl CodingExecutorAdapter for GeminiAdapter {
             ctx.description.clone()
         };
         let mut cmd = Self::build_command(&config, &prompt);
-        crate::command::run_in_task_worktree(&mut cmd, &ctx);
+        let key_injected = config
+            .command_overrides
+            .env
+            .as_ref()
+            .is_some_and(|env| env.contains_key("GEMINI_API_KEY"));
+        if key_injected && let Some(home) = ensure_api_key_home(Path::new(&ctx.worktree_path)) {
+            cmd.env("GEMINI_CLI_HOME", home);
+        }
+        // Owns the execution's temp directory until this execution returns.
+        // A sandboxed Gemini (container or seatbelt) writes only the worktree
+        // and what the CLI itself mounts, so it keeps the inherited temp and
+        // build directories rather than ones under `.forge-task`.
+        let sandboxed = gemini_sandbox_enabled(&config, |key| {
+            cmd.as_std()
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        });
+        let _run_scope = crate::command::run_in_task_worktree_with(&mut cmd, &ctx, |sandbox| {
+            if sandboxed {
+                executors::sandbox::SandboxEnv::none()
+            } else {
+                sandbox
+            }
+        });
 
         let mut child = cmd.spawn()?;
 

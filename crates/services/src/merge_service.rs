@@ -702,7 +702,7 @@ impl MergeService {
 
     /// Today's Task-step projection, including the original repository
     /// transaction and its Project/usage trigger effects.
-    async fn record_merge_execution_evidence(
+    pub(crate) async fn record_merge_execution_evidence(
         &self,
         execution_id: &str,
         evidence: crate::integration_effects::MergeExecutionEvidence,

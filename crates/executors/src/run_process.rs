@@ -1,5 +1,6 @@
 //! Machine-local policy, installed by the process entrypoint. Never sent over
 //! the daemon protocol: remote commands use the receiving machine's policy.
+use crate::sandbox::SandboxEnv;
 use config::RunBudget;
 use std::{
     collections::BTreeMap,
@@ -82,9 +83,21 @@ pub fn build_environment(
     env
 }
 
-pub fn apply(command: &mut Command, project: &BTreeMap<String, String>) {
+/// The one seam every run goes through: the machine build budget and
+/// niceness, plus what the run's Task root adds ([`SandboxEnv`]: per-run
+/// `TMPDIR`/`TMP`/`TEMP` and the per-Task build directory).
+///
+/// Call it after the command's own environment is set, so a value the command
+/// or the Project environment already carries wins where the rules say so.
+pub fn apply_sandboxed(
+    command: &mut Command,
+    project: &BTreeMap<String, String>,
+    sandbox: &SandboxEnv,
+) {
     apply_budget(command, machine_policy().get(), project);
+    sandbox.apply_to(command, project);
 }
+
 pub fn apply_budget(command: &mut Command, budget: RunBudget, project: &BTreeMap<String, String>) {
     // A non-empty value already set on the command (an Agent profile's env,
     // a shell plan, or the inherited environment) wins over the budget.

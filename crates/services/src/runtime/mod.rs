@@ -806,6 +806,14 @@ impl ForgeRuntimeBuilder {
             check_runner.clone(),
         ));
         let _ = task_service.check_consumers.set(check_consumers.clone());
+        // The merge-path consumer family. Passive until the integration
+        // queue is activated: nothing asks for an `integration` check yet.
+        crate::integration_steps::IntegrationCheckFamily::register(
+            &check_consumers,
+            Arc::new(crate::integration_steps::IntegrationSteps::new(
+                (*task_service).clone(),
+            )),
+        );
         let check_owners = Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
             self.db.clone(),
             daemon_connections.clone(),

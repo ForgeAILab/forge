@@ -3207,6 +3207,50 @@ pub(crate) mod tests {
         );
     }
 
+    /// The claim is where a server-owned Task root becomes Forge-shaped:
+    /// `.forge-task` is reserved beside the worktree, outside Git's view. A
+    /// recorded path that is not `<root>/<task_id>/<name>` is never reserved.
+    #[tokio::test]
+    async fn placement_claim_reserves_the_task_root_and_leaves_a_legacy_path_alone() {
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf());
+        let admission = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .unwrap();
+        let prepared = service.prepare_claim_workspace(admission).await.unwrap();
+        let worktree = PathBuf::from(prepared.placement.workspace_handle.as_deref().unwrap());
+        let task_root = root.path().join(&task.id);
+        assert_eq!(worktree.parent(), Some(task_root.as_path()));
+        assert!(task_root.join(".forge-task").is_dir());
+        assert!(executors::sandbox::TaskRoot::of_worktree(&worktree).is_some());
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--ignored"])
+            .current_dir(&worktree)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .unwrap();
+        assert!(status.status.success() && status.stdout.is_empty());
+
+        let legacy_project = seed_project_repo(&db).await.0;
+        let legacy_task = seed_task(&db, &legacy_project, None).await;
+        let legacy = TempDir::new().unwrap();
+        let legacy_worktree = legacy.path().join("projects").join("repo");
+        std::fs::create_dir_all(&legacy_worktree).unwrap();
+        seed_workspace(&db, &legacy_task, WorkspaceStatus::Ready, &legacy_worktree).await;
+        let _ =
+            prepare_workspace_for_test(&db, root.path(), &legacy_task, &legacy_task.id, None).await;
+        assert!(!legacy.path().join("projects/.forge-task").exists());
+        assert!(executors::sandbox::TaskRoot::of_worktree(&legacy_worktree).is_none());
+    }
+
     /// The claim is the launch guard every executor family shares (a CLI
     /// executor has no later check of its own): a worktree left off the
     /// Task branch is put back on it before anything is started there, and

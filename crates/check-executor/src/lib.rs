@@ -302,6 +302,27 @@ pub fn command(
     environment: &BTreeMap<String, String>,
     policy: &str,
 ) -> Result<(Command, BTreeMap<String, String>), String> {
+    // No run scope: the Task-level environment of the directory only.
+    sandboxed_command(
+        path,
+        spec,
+        environment,
+        policy,
+        &executors::sandbox::SandboxEnv::for_task(path),
+    )
+}
+
+/// [`command`] with the environment of the run it belongs to. A check that
+/// runs in a Task worktree gets that Task root's per-run temp directory and
+/// build directory; an exact-commit checkout is not a Task root and gets
+/// nothing.
+fn sandboxed_command(
+    path: &Path,
+    spec: &CheckCommandSpec,
+    environment: &BTreeMap<String, String>,
+    policy: &str,
+    sandbox: &executors::sandbox::SandboxEnv,
+) -> Result<(Command, BTreeMap<String, String>), String> {
     if spec.shell != "bash -lc" {
         return Err("unsupported check shell".into());
     }
@@ -330,7 +351,7 @@ pub fn command(
         .arg(&spec.shell_text)
         .current_dir(path)
         .envs(&env);
-    executors::run_process::apply(&mut command, &env);
+    executors::run_process::apply_sandboxed(&mut command, &env, sandbox);
     // Legacy unbounded server CI inherited these; bounded CI and daemon did not.
     if policy != LEGACY_SERVER || spec.timeout_seconds.is_some() {
         command
@@ -369,7 +390,10 @@ async fn run_command_group(
 ) -> Result<(CheckCommandReceipt, Option<u32>), String> {
     let started_at = now();
     let start = Instant::now();
-    let (mut command, env) = command(path, spec, environment, policy)?;
+    // Removed when this command returns: pass, fail, timeout or cancel.
+    let run_scope =
+        executors::sandbox::SandboxEnv::for_command(path, executors::sandbox::RunPurpose::Check);
+    let (mut command, env) = sandboxed_command(path, spec, environment, policy, run_scope.env())?;
     let per_command = spec
         .timeout_seconds
         .and_then(|s| start.checked_add(Duration::from_secs(s)));

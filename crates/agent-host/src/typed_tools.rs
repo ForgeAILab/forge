@@ -2935,7 +2935,12 @@ async fn execute_workspace_command(
         .current_dir(&current_dir)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default());
-    executors::run_process::apply(&mut command, environment);
+    // One temp directory per command, inside the Task root, removed when
+    // the command returns. The environment is cleared above, so without it a
+    // child falls back to the shared platform temp directory.
+    let run_scope =
+        executors::sandbox::SandboxEnv::for_command(root, executors::sandbox::RunPurpose::Command);
+    executors::run_process::apply_sandboxed(&mut command, environment, run_scope.env());
     let output = run_bounded_command(command, TASK_COMMAND_TIMEOUT)
         .await
         .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?;
@@ -3645,6 +3650,72 @@ mod tests {
             )
         });
         assert_eq!(lines[1], expected);
+    }
+
+    /// The native command tool clears the child's environment, so without the
+    /// Task root's per-run directory a command falls back to the shared
+    /// platform temp directory. Each command gets its own, removed when the
+    /// command returns (pass or fail); a workspace whose parent Forge did not
+    /// reserve gets nothing and nothing is created beside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_command_gets_a_task_root_tmpdir_removed_when_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("t").join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let tmp_root = worktree.parent().unwrap().join(".forge-task/tmp");
+        let env = std::collections::BTreeMap::new();
+        let run = |root: &Path, script: &'static str| {
+            let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+                root: root.to_string_lossy().into_owned(),
+            });
+            let env = env.clone();
+            async move {
+                let ctx = command_invocation_context(workspace);
+                super::execute_workspace_command(
+                    "sh",
+                    &["-c".into(), script.into()],
+                    None,
+                    &env,
+                    &ctx,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let mut seen = Vec::new();
+        for (script, success) in [
+            (
+                "touch \"$TMPDIR/made\" && printf '%s|%s|%s' \"$TMPDIR\" \"$TMP\" \"$TEMP\"",
+                true,
+            ),
+            (
+                "touch \"$TMPDIR/made\" && printf '%s|%s|%s' \"$TMPDIR\" \"$TMP\" \"$TEMP\"; exit 4",
+                false,
+            ),
+        ] {
+            let output = run(&worktree, script).await;
+            assert_eq!(output.success, success);
+            let text = String::from_utf8(output.stdout).unwrap();
+            let parts: Vec<_> = text.split('|').collect();
+            assert!(parts[0] == parts[1] && parts[1] == parts[2], "{text}");
+            let tmp = std::path::PathBuf::from(parts[0]);
+            assert_eq!(tmp.parent(), Some(tmp_root.as_path()));
+            assert!(!tmp.exists(), "removed when the command returns");
+            seen.push(tmp);
+        }
+        assert_ne!(seen[0], seen[1], "one directory per command");
+        assert_eq!(std::fs::read_dir(&tmp_root).unwrap().count(), 0);
+
+        let plain = dir.path().join("user").join("repo");
+        std::fs::create_dir_all(&plain).unwrap();
+        let output = run(&plain, "printf '%s' \"${TMPDIR-unset}\"").await;
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "unset");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("user")).unwrap().count(),
+            1
+        );
     }
 
     #[tokio::test]

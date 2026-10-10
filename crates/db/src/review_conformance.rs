@@ -403,6 +403,85 @@ async fn verified_passed_contract(
     Ok(contract)
 }
 
+/// The review authority integration must find for `task_id`, read in the
+/// caller's transaction: the passed contract (none for a Task with no agent
+/// reviewer or an owner's manual pass) and the exact commit and target tip it
+/// covers, a later carry superseding the contract's own. `DbError::Check`
+/// names why a fresh review is required. Shared by the merge hook's lock and
+/// the integration queue's `settle` step.
+pub async fn review_integration_authority_in_tx(
+    conn: &mut SqliteConnection,
+    task_id: &str,
+) -> Result<(Option<ReviewContract>, Option<ReviewCandidate>)> {
+    let source = review_source_in_tx(&mut *conn, task_id, None).await?;
+    let assigned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_role_assignment WHERE task_id = ? AND role_name = 'reviewer' AND assignee_type = 'agent' AND assignee_id IS NOT NULL)")
+        .bind(task_id).fetch_one(&mut *conn).await?;
+    let has_review_role = source
+        .pointer("/workflow/states")
+        .and_then(Value::as_array)
+        .map(|states| states.iter().any(|s| s["role"] == "reviewer"))
+        .unwrap_or(true);
+    let contract = if assigned && has_review_role {
+        let review_passed_at: Option<String> = sqlx::query_scalar(
+            "SELECT review_passed_at
+             FROM task
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if review_passed_at
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(DbError::Check(
+                "current review authority required before integration".into(),
+            ));
+        }
+        let raw: Option<String> = sqlx::query_scalar("SELECT CASE WHEN status = 'passed' THEN step_results_json ELSE '{}' END FROM review WHERE task_id = ? ORDER BY attempt_number DESC, id DESC LIMIT 1")
+            .bind(task_id).fetch_optional(&mut *conn).await?;
+        if owner_passed_review_manually(raw.as_deref()) {
+            // The owner passed the failed review by hand
+            // (`create_manual_pass_with_task_authority`). That decision
+            // is the review authority: there is no reviewer conformance
+            // to verify and no reviewed object to pin, exactly as for a
+            // Task with no reviewer. The pass still has to be current
+            // (`review_passed_at`, checked above, is cleared whenever
+            // the Task leaves the accepted state).
+            None
+        } else {
+            Some(verified_passed_contract(&mut *conn, task_id, raw.as_deref()).await?)
+        }
+    } else {
+        None
+    };
+    let candidate = match &contract {
+        Some(contract) => {
+            let carried = sqlx::query(
+                "SELECT commit_sha, base_sha FROM review_authority_carry
+                 WHERE task_id = ? AND contract_execution_id = ?
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            )
+            .bind(task_id)
+            .bind(&contract.execution_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            Some(match carried {
+                Some(row) => ReviewCandidate {
+                    commit_sha: row.try_get("commit_sha")?,
+                    base_sha: row.try_get("base_sha")?,
+                },
+                None => ReviewCandidate {
+                    commit_sha: contract.commit_sha.clone(),
+                    base_sha: contract.base_sha.clone(),
+                },
+            })
+        }
+        None => None,
+    };
+    Ok((contract, candidate))
+}
+
 #[async_trait]
 impl ReviewConformanceRepo for SqliteDb {
     async fn lock_review_integration(&self, task_id: &str) -> Result<ReviewIntegrationGuard> {
@@ -419,72 +498,7 @@ impl ReviewConformanceRepo for SqliteDb {
         if let Some(project_id) = paused_project_id {
             return Err(DbError::ProjectPaused { project_id });
         }
-        let source = review_source_in_tx(&mut tx, task_id, None).await?;
-        let assigned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_role_assignment WHERE task_id = ? AND role_name = 'reviewer' AND assignee_type = 'agent' AND assignee_id IS NOT NULL)")
-            .bind(task_id).fetch_one(&mut *tx).await?;
-        let has_review_role = source
-            .pointer("/workflow/states")
-            .and_then(Value::as_array)
-            .map(|states| states.iter().any(|s| s["role"] == "reviewer"))
-            .unwrap_or(true);
-        let contract = if assigned && has_review_role {
-            let review_passed_at: Option<String> = sqlx::query_scalar(
-                "SELECT review_passed_at
-                 FROM task
-                 WHERE id = ? AND deleted_at IS NULL",
-            )
-            .bind(task_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if review_passed_at
-                .as_deref()
-                .is_none_or(|value| value.trim().is_empty())
-            {
-                return Err(DbError::Check(
-                    "current review authority required before integration".into(),
-                ));
-            }
-            let raw: Option<String> = sqlx::query_scalar("SELECT CASE WHEN status = 'passed' THEN step_results_json ELSE '{}' END FROM review WHERE task_id = ? ORDER BY attempt_number DESC, id DESC LIMIT 1")
-                .bind(task_id).fetch_optional(&mut *tx).await?;
-            if owner_passed_review_manually(raw.as_deref()) {
-                // The owner passed the failed review by hand
-                // (`create_manual_pass_with_task_authority`). That decision
-                // is the review authority: there is no reviewer conformance
-                // to verify and no reviewed object to pin, exactly as for a
-                // Task with no reviewer. The pass still has to be current
-                // (`review_passed_at`, checked above, is cleared whenever
-                // the Task leaves the accepted state).
-                None
-            } else {
-                Some(verified_passed_contract(&mut tx, task_id, raw.as_deref()).await?)
-            }
-        } else {
-            None
-        };
-        let candidate = match &contract {
-            Some(contract) => {
-                let carried = sqlx::query(
-                    "SELECT commit_sha, base_sha FROM review_authority_carry
-                     WHERE task_id = ? AND contract_execution_id = ?
-                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                )
-                .bind(task_id)
-                .bind(&contract.execution_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-                Some(match carried {
-                    Some(row) => ReviewCandidate {
-                        commit_sha: row.try_get("commit_sha")?,
-                        base_sha: row.try_get("base_sha")?,
-                    },
-                    None => ReviewCandidate {
-                        commit_sha: contract.commit_sha.clone(),
-                        base_sha: contract.base_sha.clone(),
-                    },
-                })
-            }
-            None => None,
-        };
+        let (contract, candidate) = review_integration_authority_in_tx(&mut tx, task_id).await?;
         Ok(ReviewIntegrationGuard {
             contract,
             candidate,

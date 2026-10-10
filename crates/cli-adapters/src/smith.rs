@@ -219,7 +219,8 @@ impl CodingExecutorAdapter for SmithAdapter {
         };
 
         let mut cmd = Self::build_command(&config, &prompt);
-        crate::command::run_in_task_worktree(&mut cmd, &ctx);
+        // Owns the execution's temp directory until this execution returns.
+        let _run_scope = crate::command::run_in_task_worktree(&mut cmd, &ctx);
 
         let mut child = cmd.spawn()?;
 

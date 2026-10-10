@@ -825,8 +825,11 @@ checkout/branch context or integrating/publishing Git history. Every managed
 role, including a read-only reviewer, runs in the workspace-write sandbox with
 network access so it can install dependencies, build, and run tests. The
 sandbox excludes both `/tmp` and the inherited `TMPDIR`; beyond the worktree
-its only writable roots are one freshly reset Forge-owned `task-scratch`
-directory, the execution outbox, and the host's package-manager caches
+its only writable roots are the execution's own temp directory (see
+[Task-root layout and run environment](#task-root-layout-and-run-environment);
+a Task root Forge did not reserve keeps a freshly reset `task-scratch` inside
+the managed home), the Task's build directory `.forge-task/build`, the
+execution outbox, and the host's package-manager caches
 (`~/.npm`, Cargo `registry`/`git`, the Go module cache, the XDG cache, pnpm's
 store, and `~/Library/Caches` on macOS, each honoring its relocation
 variable). The Task directory that contains the worktree is not writable by
@@ -3252,6 +3255,118 @@ review-ready and active work, embedded-agent health/current scope/focus,
 commitments, recent outcomes, and capacity; they do not introduce a second
 mutable Task or Agent truth.
 
+### Task-root layout and run environment
+
+The directory that contains a Task's worktree is its **Task root**:
+`<workspace root>/<task_id>/` on the server, `<root>/.forge/workspaces/<handle>/`
+on a daemon. The worktree stays where it was; Forge keeps one reserved
+directory beside it:
+
+```
+<task root>/
+  <repo name>/              the Git worktree (daemon: repo/)
+  .forge-outbox/<exec>/     execution outbox
+  .forge-task/              reserved
+    tmp/<run key>/          TMPDIR, TMP, TEMP of one run
+    home/codex/             managed Codex home
+    home/gemini/            Gemini API-key home
+    build/cargo/            CARGO_TARGET_DIR of the Task
+<task roots dir>/.forge-tmp/<run key>/   run temp dir when the path above is too long
+```
+
+`.forge-task` is outside the worktree, so `git status`, `git clean`, review
+dirt checks and worktree removal never see it, and it is removed with the Task
+root (read-only build output included). A repository named `.forge-task` is
+refused at worktree creation (`WorkspaceError::ReservedName`).
+
+A Task root is **reserved** when `.forge-task` exists in it as a real
+directory. Only the workspace owner creates it: the `workspace` crate when it
+creates or recovers a Task worktree, the services `WorkspaceManager` when it
+validates a workspace of the managed shape `<root>/<task_id>/<name>` for any
+purpose but inspection, and the daemon in `workspace.prepare`. A recorded
+path of any other shape, an exact-commit check checkout, a Project
+verification checkout and a chat sandbox are not reserved: runs there keep
+the environment they had before, and nothing is created beside them.
+
+`executors::sandbox::SandboxEnv` is the environment a run gets from its Task
+root, and `executors::run_process::apply_sandboxed(command, project_env,
+&sandbox)` is the one place it is applied, together with the build budget and
+niceness. Every path is a pure function of the worktree path and the run id,
+so the server and a daemon derive the same directories without a protocol
+field.
+
+| Run | Run id | Temp directory lives |
+|---|---|---|
+| CLI adapter execution (Codex, Claude, Cursor, Gemini, OpenCode, Smith), shell executor | execution id | until the adapter's `execute` returns (success, failure, cancel) |
+| Native command tool | fresh per command | until the command returns |
+| Lifecycle script hook | fresh per hook | until the hook returns or times out |
+| Check / CI command in the Task worktree, daemon `workspace.run` | fresh per command | until the command returns |
+| Environment check, daemon probe | fresh per command | until the command returns (only when it runs in a reserved Task root) |
+
+- `TMPDIR`, `TMP` and `TEMP` are set to the per-run directory over anything
+  inherited. A key the Project environment declares is left to the Project.
+  `HOME`, `XDG_CACHE_HOME`, `GOCACHE` and `npm_config_cache` are never
+  redirected: CLI logins and shared toolchain caches live there.
+- A Unix socket path is limited to 104 bytes on macOS, and tools create
+  sockets under `TMPDIR`. Forge never hands out a `TMPDIR` longer than 72
+  bytes: when `<task root>/.forge-task/tmp/<key>` is longer, the run uses
+  `<task roots dir>/.forge-tmp/<key>`; when that is too long as well, the run
+  keeps the inherited temp directory. With UUID Task ids the short directory
+  is the usual place.
+- A run that died with its process leaves its directory behind. Crash
+  recovery removes the directory of every execution it settles; at startup
+  the server (in crash recovery, for every ready server placement of the
+  managed shape) and the daemon sweep the rest
+  (`executors::sandbox::sweep_dead_runs`). Hooks, checks, tool commands and
+  probes are in no table, so the sweep is safe by construction, not by
+  ordering: it removes a directory only when this process did not create it
+  (an in-process registry of unsettled runs), it was last modified before
+  this process started, and its key belongs to no execution still recorded
+  as running. A sweep failure is logged and never stops recovery. Nothing
+  Forge reads after a run (outbox, plan, evidence, logs) lives in the
+  per-run directory.
+- Links are never followed. `.forge-task` that exists as a link or a file
+  makes worktree creation fail and is never a reserved root; a linked or
+  non-directory `.forge-task/tmp`, `.forge-tmp`, `.forge-task/home` or
+  `.forge-task/build` is not created through, removed through or handed to a
+  run (the run keeps the inherited temp directory, the previous home
+  location, and builds in the worktree); a linked Task-root entry is skipped
+  by the sweep.
+- A CLI that confines its own writes is handed only what it can write
+  (`cli_adapters::command::run_in_task_worktree_with`). A managed Codex Task
+  (workspace-write) gets the per-run directory and `.forge-task/build` as
+  writable roots, each only when it resolves where the Task root says, and
+  the build root only when the child really uses that `CARGO_TARGET_DIR`;
+  a Codex execution under `yolo` has no sandbox and gets everything; a Codex
+  execution that is not a managed Task uses the operator's own sandbox
+  configuration and gets nothing. Gemini launched with `--sandbox` (or
+  `GEMINI_SANDBOX`) gets nothing. Claude, Cursor, OpenCode, Smith, the shell
+  executor, the native command tool, hooks and checks run unsandboxed.
+- One build directory per Task root is shared by the coder, hooks and
+  in-worktree checks. Cargo serialises concurrent users with its own
+  build-directory lock, and its fingerprints (source content and mtime,
+  profile, flags, package path) decide what is rebuilt, so output left by
+  another commit can make a check slower or faster but cannot change its
+  result.
+- `CARGO_TARGET_DIR` is set to `<task root>/.forge-task/build/cargo` from
+  `executors::sandbox::BUILD_DIR_TABLE` (Rust only). Precedence: Project
+  environment, then a value the command already carries, then the operator's
+  process environment, then Forge. A Project environment value of `""`
+  disables it. Subtasks share their root's worktree and therefore its build
+  directory; review and CI commands in the Task worktree use the same one.
+  Checks in exact-commit checkouts get none.
+- The managed Codex home is `<task root>/.forge-task/home/codex`, so two
+  executions of different Tasks never share or reset one home (before, a
+  daemon derived one home for all executions from its flat log directory).
+  On first use after an upgrade the server-side per-Task home is moved from
+  `<root>/.forge/logs/<project>/<task>/.codex-managed-home` into the Task
+  root, so a resumed Task keeps its Codex sessions; the old shared daemon
+  home is left where it is and a fresh home is created. The move is one
+  rename and deletes nothing: a stray Codex process still holding the old
+  home keeps writing the files it has open, which are now in the new home.
+- Lifecycle hooks that run outside an execution log to
+  `<workspace root>/.forge/logs/<project_id>/<task_id>/hooks/`.
+
 ### Workspace placement
 
 A repository's logical identity is separate from its machine-local checkouts.
@@ -5592,6 +5707,101 @@ Known limits: the first rebase of a head is always counted as a
 `queue_member` lost race (the queue does not store the commit it last
 integrated, so a push from outside before the claim cannot be told apart);
 an `applied` head waits for its `result` step without a timer.
+
+### Integration Task steps (3.2 stage D, part 1b; not produced until D2)
+
+`services::integration_steps` is the Task-step side of the integration queue.
+Nothing enqueues one of its steps yet: `merging` still runs today's merge
+hooks, and the queue worker that would ask is not started until D2. The only
+live additions are a registered check consumer family that nobody requests
+from, and one write in the cancel transition (below).
+
+The worker never writes Task state. Each request is one Task step of kind
+`integration` with the payload `{task_id, queue_id, attempt_id,
+expected_epoch, generation, effect_seq, action}` and the causation key
+`integration:<attempt>:<effect_seq>:<action>`; `(task_id, causation_key)`
+makes the enqueue idempotent. The step answers by writing the attempt's
+`effect_ack_json` / `acknowledged_at` (and `permit_json` for a permit) in the
+same transaction as its Task write (`acknowledge_integration_step_in_tx`: a
+compare-and-set on the attempt's revision, `effect_seq` and, except for
+`result`, its slot generation).
+
+A step is enqueued before the attempt transition it belongs to. So every
+action first places itself: attempt not yet in the state it answers → retry
+with back-off (no write); attempt past its `effect_seq` or generation, or no
+longer current → finish without a write; same `(effect_seq, action)` already
+answered → finish without a write.
+
+| Action | Attempt state | Task effect | Answer |
+|---|---|---|---|
+| `request_check` | `checking` | Asks the check runner (origin `integration`, purpose queue-head CI: the review state's effective `ci_steps`) for the rebased commit; states `integration/owned/checking`. With nothing configured to run it settles at once. | None. The check's own delivery step (`apply_check_result`) writes the `settle` answer: verdict, check timing and, on a pass, the permit. |
+| `settle` | `awaiting_task_step` | Reads review authority; when the queue rebased the commit, carries the review by attempt lineage; pre-enqueues the protected `result` step; states `integration/owned/fast_forwarding`. | `settle`: `permit` + `permit_json`, or `needs_review`, `candidate_check_failed`, `infrastructure`, `task_left`. |
+| `result` | `applied` | Execution evidence, the "Changes merged to …" comment, `integration/applied`, the `paused_integration` marker cleared, and the `merging → done` cascade enqueued at priority 2: the writes today's merge success performs. | `result`: `done` (or `task_left`). |
+| `send_back` | `ejected`, `needs_review` | Conflict: today's conflict handoff to the Worker (annotation, comment, `merge.failed`, `conflict_handoff` bridge and budget). Red check: a merge failure under the merge-fix budget. Lost review: `review_refresh` through `merge_failed`. States the typed reason and the handoff. | `send_back`: `done`. |
+| `park` | `parked`, `quarantined`, `queued` | Level-triggered: states `integration/deferred` with the cause read from the attempt (or the suspended queue); `integration/waiting` again once the member is queued behind an open queue; nothing for a paused Project. An intervention cause appends `task.interruption_changed` in the same transaction. | `park`: `done`. |
+| `clear` | `cancelled` | Clears this attempt's integration statement. | None (the attempt is terminal). |
+
+The permit binds `candidate_sha`, `target_tip_sha`, `task_ref`,
+`expected_epoch` and `slot_generation`; storage refuses any other.
+
+**Protection and Cancel.** In the transaction that writes a permit, `settle`
+enqueues the `result` step identity-fenced and marked as started integration
+(`enqueue_protected_integration_step_in_tx`), due at its own deadline. From
+that commit a later Cancel, Hold or move can neither be claimed ahead of it
+nor supersede it. The other way round, `settle` writes no permit while an
+owner command is already queued for the Task: it yields, the command runs,
+and the Task leaves `merging`. Exactly one of the two wins. Kind
+`integration` is in the supersede list, so a pending unprotected step is
+dropped the moment a Cancel is enqueued; the protected `result` step never
+is. The Task's cancel transition calls
+`request_task_integration_cancel_in_tx` in its own transaction: a
+cancellable attempt gets `cancel_requested_at` with the Task write; in
+`ff_inflight`, `reconciling`, `applied` or `quarantined` the Cancel is
+refused as busy while the protected step is alive (it then runs after the
+result) and is not held back by an attempt nothing drives. A board move into
+the cancellation state does the same through the same function
+(`CompareAndMoveTask.integration_cancel`, inside the move's transaction), so
+the flag has one writer. The call never fails a Cancel for a reason of its
+own: an attempt row or request time storage refuses counts as an attempt
+nothing drives. Storage refuses a permit for an attempt that carries the
+flag, and `settle` answers `task_left` instead of asking for one.
+
+**Redelivery.** Every action is safe to deliver twice. `settle`, `result`,
+`park` and `clear` write only in their final transaction. `send_back` writes
+its comment, annotation, block and `merge.failed` event before that
+transaction, as today's merge hook does; the comments are keyed by the step
+(`with_comment_key`), the annotation, block and cleared approval are the same
+values again, and the budget is charged by the cascade enqueued in the
+transaction, so a step that stops before its commit and runs again leaves one
+comment, one charge and one transition. The `merge.failed` and `task.blocked`
+bus events are not durable and can repeat. `request_check` asked again for a
+commit whose verdict already exists (applied for an earlier `effect_seq`, or a
+delivery whose application failed part-way and is not run again) applies the
+stored verdict itself.
+
+**`result` cannot dead-letter.** It never settles `failed` or `parked`. If it
+cannot apply, the Task states `integration/deferred/unresolved_result`, the
+step stays pending far in the future, and the worker's `ready_result_step`
+re-arms it. Woken by its own deadline with the permit unused, it takes the
+permit back (`revoke_integration_permit_in_tx`, a compare-and-set against
+the worker's commit to `ff_inflight`) and finishes, which lets a waiting
+owner command run.
+
+**Carry by attempt lineage.** One rule decides whether a passed review may
+cover a mechanically changed commit, for a Task entering `review` on a
+mechanical bridge and for an attempt the queue rebased in `merging`:
+`gate_refuses_carry`, `task_carry_checks`, `carry_budget_refusal` and
+`carry_path_refusal` in `workflow::actions::carry`. The queue's carry is
+recorded by `settle_attempt_review_carry_in_tx` (a `review_authority_carry`
+row and one `review_carry` charge, with the permit); no Review row is opened
+because the Task never left `merging`.
+
+Storage: migration `V202610100137__integration_task_step.sql` adds the step
+kind (a data-preserving `task_step` rebuild; SQLite cannot alter a CHECK).
+
+Not here yet: the head's check result is not copied onto a Review row; after
+a queue reopens nothing asks for the `park` step that restores `waiting`.
+
 
 ### Task condition actions
 

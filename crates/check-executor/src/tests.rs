@@ -800,3 +800,71 @@ async fn a_canonical_service_survives_to_the_next_step_and_is_stopped_at_run_end
         assert!(!alive(service.trim()));
     }
 }
+#[tokio::test]
+async fn check_in_a_task_worktree_gets_a_task_root_tmpdir_removed_after_pass_fail_and_cancel() {
+    let temp = tempfile::tempdir().unwrap();
+    let worktree = temp.path().join("t").join("repo");
+    std::fs::create_dir_all(&worktree).unwrap();
+    executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+    let tmp_root = worktree.parent().unwrap().join(".forge-task/tmp");
+    let seen_file = temp.path().join("seen");
+    let leftovers = || std::fs::read_dir(&tmp_root).map_or(0, Iterator::count);
+    for (tail, outcome) in [
+        ("exit 0", CheckExecutionOutcome::Passed),
+        ("exit 9", CheckExecutionOutcome::Failed),
+    ] {
+        let bundle = spec(&format!(
+            "touch \"$TMPDIR/made\" && printf '%s' \"$TMPDIR\" > {}; {tail}",
+            seen_file.display()
+        ));
+        let receipt = run_command(
+            &worktree,
+            &bundle.commands[0],
+            &BTreeMap::new(),
+            &bundle.execution_policy,
+            Some(Instant::now() + Duration::from_secs(10)),
+            &CancellationToken::new(),
+            512,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.outcome, outcome);
+        let seen = std::path::PathBuf::from(std::fs::read_to_string(&seen_file).unwrap());
+        assert_eq!(seen.parent(), Some(tmp_root.as_path()));
+        assert_eq!(leftovers(), 0);
+    }
+    let cancel = CancellationToken::new();
+    let bundle = spec("touch \"$TMPDIR/made\"; sleep 30");
+    let stop = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop.cancel();
+    });
+    let receipt = run_command(
+        &worktree,
+        &bundle.commands[0],
+        &BTreeMap::new(),
+        &bundle.execution_policy,
+        Some(Instant::now() + Duration::from_secs(20)),
+        &cancel,
+        512,
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Cancelled);
+    assert_eq!(leftovers(), 0);
+
+    // A checkout that is not a Task root gets nothing and nothing beside it.
+    let plain = tempfile::tempdir().unwrap();
+    let (command, _) = command(
+        plain.path(),
+        &spec("true").commands[0],
+        &BTreeMap::new(),
+        &spec("true").execution_policy,
+    )
+    .unwrap();
+    assert!(!command
+        .as_std()
+        .get_envs()
+        .any(|(key, _)| key == "TMPDIR" || key == "CARGO_TARGET_DIR"));
+}

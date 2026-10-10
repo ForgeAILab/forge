@@ -423,7 +423,12 @@ impl LifecycleEventEmitter {
                 None,
             ),
         };
-        let log_dir = resolve_log_dir(execution.as_ref(), resolved_execution_id.as_deref());
+        let log_dir = resolve_log_dir(
+            execution.as_ref(),
+            resolved_execution_id.as_deref(),
+            &project.id,
+            &task.id,
+        );
         let recorded_execution_id = resolved_execution_id.clone();
 
         let ctx = LifecycleHookContext {
@@ -726,20 +731,23 @@ fn resolve_workflow(workflow_definition: &str) -> WorkflowDefinition {
     WorkflowEngine::resolve_workflow(workflow_definition)
 }
 
-fn resolve_log_dir(execution: Option<&Execution>, execution_id: Option<&str>) -> Option<PathBuf> {
+fn resolve_log_dir(
+    execution: Option<&Execution>,
+    execution_id: Option<&str>,
+    project_id: &str,
+    task_id: &str,
+) -> Option<PathBuf> {
     if let Some(logs_path) = execution.and_then(|execution| execution.logs_path.as_deref()) {
         return Path::new(logs_path).parent().map(Path::to_path_buf);
     }
-
-    execution_id
-        .map(|execution_id| {
-            std::env::temp_dir()
-                .join("forge")
-                .join("logs")
-                .join(execution_id)
-                .with_extension("jsonl")
-        })
-        .and_then(|path| path.parent().map(Path::to_path_buf))
+    // An execution with no log to sit beside: the Task's own log directory.
+    execution_id.map(|_| {
+        crate::task_service::logs::task_hook_logs_dir(
+            &crate::task_service::workspace::default_workspace_root(),
+            project_id,
+            task_id,
+        )
+    })
 }
 
 #[cfg(test)]

@@ -34,11 +34,11 @@ impl TaskService {
         let resolved = self.resolve_task_workspace(workspace).await?;
         let (repo_path, worktree_path) =
             crate::lifecycle::context::workspace_context_paths(&self.db, &resolved).await?;
-        let log_dir = std::env::temp_dir()
-            .join("forge")
-            .join("logs")
-            .join(&task.id)
-            .join("hooks");
+        let log_dir = crate::task_service::logs::task_hook_logs_dir(
+            &self.workspace_root,
+            &task.project_id,
+            &task.id,
+        );
         let ctx = LifecycleHookContext {
             env: settings.environment.env.clone(),
             event: api_types::LifecycleEvent::BeforeWork,
