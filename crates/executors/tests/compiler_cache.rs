@@ -192,23 +192,9 @@ fn rust_hits(sccache: &Path, socket: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// The real thing, when sccache and cargo are installed: the second Task's
-/// build of a dependency both Tasks share is a cache hit although each Task
-/// has its own `CARGO_TARGET_DIR`; a run's removed temp directory does not
-/// break the next run; and evicting every entry under the live server costs
-/// a recompile, never a failed build.
-#[test]
-fn sccache_shares_a_dependency_between_two_task_worktrees() {
-    let (Some(sccache), Some(_cargo)) = (on_path("sccache"), on_path("cargo")) else {
-        eprintln!("skipped: sccache or cargo is not installed");
-        return;
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().canonicalize().unwrap();
-    let root = base.join("root");
-    // A dependency at one absolute path for every Task, like a registry
-    // crate: sccache keys an entry on the directory the compiler runs in,
-    // so a crate inside a worktree is never shared between worktrees.
+/// A crate `app` in a repository, depending on a crate at one absolute path
+/// outside every worktree (like a registry crate). Returns the repository.
+fn app_with_a_shared_dependency(base: &Path, root: &Path) -> PathBuf {
     let dep = base.join("shared").join("dep");
     fs::create_dir_all(dep.join("src")).unwrap();
     fs::write(
@@ -217,8 +203,8 @@ fn sccache_shares_a_dependency_between_two_task_worktrees() {
     )
     .unwrap();
     fs::write(dep.join("src/lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
-    let repo = repository(
-        &root,
+    repository(
+        root,
         "repo-1",
         &[
             (
@@ -233,7 +219,54 @@ fn sccache_shares_a_dependency_between_two_task_worktrees() {
                 "pub fn answer() -> u32 { dep::answer() }\n".to_owned(),
             ),
         ],
+    )
+}
+
+/// `cargo build` in a new Task worktree of `repo`, with what its Task root
+/// gives the run. The run's temp directory is removed when this returns.
+fn cargo_build(root: &Path, repo: &Path, task: &str, store: &Path) {
+    let worktree = task_worktree(root, repo, task);
+    let scope = SandboxEnv::for_run(&worktree, task, RunPurpose::Execution).scoped();
+    assert_eq!(
+        scope.env().compiler_cache().and_then(|cache| cache.dir()),
+        Some(store),
+        "the cache is usable for {task}"
     );
+    let mut command = Command::new("cargo");
+    command
+        .args(["build", "--offline", "--quiet"])
+        .current_dir(&worktree)
+        .env("CARGO_INCREMENTAL", "0");
+    apply(&mut command, scope.env());
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{task}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let target = root.join(task).join(".forge-task/build/cargo");
+    assert!(target.join("debug").is_dir(), "{task} built into its own directory");
+}
+
+/// The real thing, when sccache and cargo are installed: the second Task's
+/// build of a dependency both Tasks share is a cache hit although each Task
+/// has its own `CARGO_TARGET_DIR`; a run's removed temp directory does not
+/// break the next run; and evicting every entry under the live server costs
+/// a recompile, never a failed build.
+#[test]
+fn sccache_shares_a_dependency_between_two_task_worktrees() {
+    let (Some(sccache), Some(_cargo)) = (on_path("sccache"), on_path("cargo")) else {
+        eprintln!("skipped: sccache or cargo is not installed");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let root = base.join("root");
+    // The dependency sits at one absolute path for every Task, like a
+    // registry crate: sccache keys an entry on the directory the compiler
+    // runs in, so a crate inside a worktree is never shared between
+    // worktrees.
+    let repo = app_with_a_shared_dependency(&base, &root);
     let cache_dir = base.join("c");
     compiler_cache::install(
         &root,
@@ -251,30 +284,7 @@ fn sccache_shares_a_dependency_between_two_task_worktrees() {
         socket: socket.clone(),
     };
 
-    let build = |task: &str| {
-        let worktree = task_worktree(&root, &repo, task);
-        let scope = SandboxEnv::for_run(&worktree, task, RunPurpose::Execution).scoped();
-        assert_eq!(
-            scope.env().compiler_cache().and_then(|cache| cache.dir()),
-            Some(store.as_path()),
-            "the cache is usable for {task}"
-        );
-        let mut command = Command::new("cargo");
-        command
-            .args(["build", "--offline", "--quiet"])
-            .current_dir(&worktree)
-            .env("CARGO_INCREMENTAL", "0");
-        apply(&mut command, scope.env());
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{task}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let target = root.join(task).join(".forge-task/build/cargo");
-        assert!(target.join("debug").is_dir(), "{task} built into its own directory");
-        // The scope drops here: the run's temp directory is removed.
-    };
+    let build = |task: &str| cargo_build(&root, &repo, task, &store);
 
     build("task-a");
     assert_eq!(rust_hits(&sccache, &socket), 0);
@@ -298,5 +308,65 @@ fn sccache_shares_a_dependency_between_two_task_worktrees() {
     assert_eq!(rust_hits(&sccache, &socket), hits, "nothing left to hit");
     build("task-d");
     assert!(rust_hits(&sccache, &socket) > hits, "the entry was stored again");
+    compiler_cache::install(&root, None);
+}
+
+/// Stops the daemon kache started for one store, whatever the test did.
+struct StopDaemon {
+    kache: PathBuf,
+    store: PathBuf,
+}
+
+impl Drop for StopDaemon {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.kache)
+            .args(["daemon", "stop"])
+            .env("KACHE_CACHE_DIR", &self.store)
+            .output();
+    }
+}
+
+/// The same with kache, when it is installed: the second Task's build is
+/// served from the first Task's entries although each Task has its own
+/// worktree, `CARGO_TARGET_DIR` and (removed) temp directory.
+#[test]
+fn kache_shares_a_build_between_two_task_worktrees() {
+    let (Some(kache), Some(_cargo)) = (on_path("kache"), on_path("cargo")) else {
+        eprintln!("skipped: kache or cargo is not installed");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let root = base.join("root");
+    let repo = app_with_a_shared_dependency(&base, &root);
+    let cache_dir = base.join("c");
+    compiler_cache::install(
+        &root,
+        Some(CompilerCache {
+            kind: WrapperKind::of(&kache),
+            wrapper: kache.clone(),
+            dir: cache_dir.clone(),
+            max_bytes: 1 << 30,
+        }),
+    );
+    let store = cache_dir.join("repo-1");
+    let _stop = StopDaemon {
+        kache: kache.clone(),
+        store: store.clone(),
+    };
+    let local_hits = || {
+        let output = Command::new(&kache)
+            .args(["stats", "--json"])
+            .env("KACHE_CACHE_DIR", &store)
+            .output()
+            .unwrap();
+        let stats: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        stats["local_hits"].as_u64().unwrap_or(0)
+    };
+
+    cargo_build(&root, &repo, "task-a", &store);
+    assert_eq!(local_hits(), 0);
+    cargo_build(&root, &repo, "task-b", &store);
+    assert!(local_hits() >= 1, "the second Task hit the first Task's entries");
     compiler_cache::install(&root, None);
 }
