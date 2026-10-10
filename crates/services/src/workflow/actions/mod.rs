@@ -25,7 +25,8 @@ pub use merge::{
     AutoCascadeOnMergeResult, CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge,
 };
 pub use review::{
-    run_ci_steps_in_step, AutoCascadeOnReviewPass, AutoCascadeOnUnconfiguredReview, RunCiSteps,
+    run_ci_steps_in_step, set_entry_check_wall_seconds_for_test, AutoCascadeOnReviewPass,
+    AutoCascadeOnUnconfiguredReview, RunCiSteps,
 };
 pub use subtasks::{
     CancelPendingSubtasks, PropagateDoneToSubtasks, SatisfyDependents, SubtaskSequenceComplete,

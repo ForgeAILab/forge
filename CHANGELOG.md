@@ -35,8 +35,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     environment.
   - **A re-review of an unchanged commit in the same worktree runs no CI.**
     The earlier passing result is reused. Reuse is per worktree, per Forge
-    version and per server environment: a changed commit, a dirty tree, a
-    changed command, a changed Project environment value or a changed
+    version and per server environment: a changed commit, a dirty tree
+    (uncommitted or untracked files when the Task enters review), a changed
+    command, a changed Project environment value or a changed
     inherited variable always runs. Limits: Forge cannot see a tool upgraded
     in place under the same path, files ignored by Git, the passage of time,
     or anything a step reads from the network, so a check that depends on
@@ -45,11 +46,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - While the checks run the Task shows the typed check wait
     (`condition.primary.kind = "check"`) and its hooks step has the new step
     status `suspended` (not `pending`): Cancel and Hold no longer wait for
-    the running command, they supersede the suspended step, the review
-    attempt is cancelled and the run is stopped once the Task has left the
-    status entry. A run that produces no verdict after its automatic
-    infrastructure retries parks the Task on the check condition, which
-    offers `retry` and `cancel`.
+    the running command. They supersede the suspended step, the review
+    attempt is cancelled, the Task stops showing the check wait and the run
+    is stopped within about a second. For a daemon-placed Task the command
+    is cancelled on its machine; when that machine is unreachable the
+    workspace stays fenced (`pending_remote_cancel`, as for any other remote
+    command) until the machine reconnects and confirms. A run that produces
+    no verdict after its automatic infrastructure retries parks the Task on
+    the check condition, which offers `retry` and `cancel`.
+  - A daemon that drops off while the checks run there is not a failure:
+    the Task keeps its check wait and, when the daemon reconnects, the
+    result it kept is read and the same review attempt settles; the commands
+    are not run again.
+  - A Task version change or a change to the Review row while the checks
+    run still cancels that review attempt, as it did when the commands ran
+    inline.
+  - A review check that can no longer be answered (its run was lost) fails
+    the entry with `review check was lost before it produced a result`
+    instead of waiting.
 - **The managed Codex home and Task hook logs moved (3.4 stage C part 1).**
   The Forge-owned Codex home of a Task is now
   `<task root>/.forge-task/home/codex` instead of

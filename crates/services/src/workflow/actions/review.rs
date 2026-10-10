@@ -218,7 +218,7 @@ impl HookAction for RunCiSteps {
                 // is the re-arm for a delivery that never arrives.
                 Ok(CheckWaitState::Pending | CheckWaitState::Exhausted) => {
                     let until = (chrono::Utc::now()
-                        + chrono::Duration::seconds(entry_check_wake_seconds()))
+                        + chrono::Duration::seconds(entry_check_wake_seconds(&ctx.task_id)))
                     .to_rfc3339();
                     if !crate::workflow::engine::durable::suspend_hook(
                         &ctx.task_id,
@@ -466,24 +466,29 @@ const CI_REVIEW: &str = "ci_review";
 const CI_CONSUMER: &str = "ci_consumer";
 /// The wall limit of one review-entry CI run.
 pub const ENTRY_CHECK_WALL_SECONDS: u64 = 3600;
-static ENTRY_CHECK_WALL_OVERRIDE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// The wall limit in force. Tests shorten it to drive a timeout through the
-/// runner; production never sets the override.
-fn entry_check_wall_seconds() -> u64 {
-    match ENTRY_CHECK_WALL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => ENTRY_CHECK_WALL_SECONDS,
-        seconds => seconds,
-    }
+static ENTRY_CHECK_WALL_OVERRIDE: std::sync::Mutex<Vec<(String, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+/// The wall limit in force for this Task's entry. A test shortens it for its
+/// own Task to drive a timeout through the runner; production never does.
+fn entry_check_wall_seconds(task_id: &str) -> u64 {
+    ENTRY_CHECK_WALL_OVERRIDE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(id, _)| id == task_id)
+        .map_or(ENTRY_CHECK_WALL_SECONDS, |(_, seconds)| *seconds)
 }
 #[doc(hidden)]
-pub fn set_entry_check_wall_seconds_for_test(seconds: u64) {
-    ENTRY_CHECK_WALL_OVERRIDE.store(seconds, std::sync::atomic::Ordering::Relaxed);
+pub fn set_entry_check_wall_seconds_for_test(task_id: &str, seconds: u64) {
+    ENTRY_CHECK_WALL_OVERRIDE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((task_id.to_owned(), seconds));
 }
 /// When a suspended step looks again on its own: past the run's wall limit
 /// and the worker's settlement grace.
-fn entry_check_wake_seconds() -> i64 {
-    entry_check_wall_seconds() as i64 + 120
+fn entry_check_wake_seconds(task_id: &str) -> i64 {
+    entry_check_wall_seconds(task_id) as i64 + 120
 }
 
 /// The authority `run_ci_steps` asked under, carried across the suspension:
@@ -591,6 +596,9 @@ async fn request_entry_check(
             return Err(failed(error.to_string()));
         }
     };
+    // A tree with uncommitted or untracked files is not what `commit_sha`
+    // names: the entry runs and neither reuses a result nor leaves one.
+    let dirty = state.dirty;
     let commit_sha = state
         .head_sha
         .ok_or_else(|| failed("review workspace has no HEAD".to_owned()))?;
@@ -624,9 +632,12 @@ async fn request_entry_check(
     if spec.commands.is_empty() {
         return Ok(EntryCheck::NothingToRun);
     }
-    let inputs = crate::check_runner::policy::digest_input(&ctx.db, spec, &environment.env)
+    let mut inputs = crate::check_runner::policy::digest_input(&ctx.db, spec, &environment.env)
         .await
         .map_err(|error| failed(error.to_string()))?;
+    if dirty {
+        inputs.environment_identity = api_types::CheckEnvironmentIdentity::NotAttested;
+    }
     let status_epoch = db::CheckDeliveryRepo::live_task_epoch(&*ctx.db, &task.id)
         .await
         .map_err(|error| failed(error.to_string()))?
@@ -646,7 +657,7 @@ async fn request_entry_check(
             },
             workspace_id: Some(workspace.id.clone()),
             machine_id: resolved.placement.daemon_id.clone().filter(|_| daemon),
-            wall_timeout_seconds: entry_check_wall_seconds(),
+            wall_timeout_seconds: entry_check_wall_seconds(&task.id),
         })
         .await
         .map_err(|error| failed(error.to_string()))?;
