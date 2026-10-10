@@ -6730,6 +6730,11 @@ async fn cross_owner_task_daemon_disconnect_in_rebasing_is_settled_by_that_daemo
     queue_eventually!(&fixture, &head, "the rebase receipt after the reconnect", {
         succeeded(&queue_attempt(&fixture, &head).await, Kind::Rebase).len() == 1
     });
+    // Bounded by progress, not by a fixed sleep: the head reconciles the
+    // receipt and goes back to `rebasing`, where it waits for the placement.
+    queue_eventually!(&fixture, &head, "the head to wait in rebasing", {
+        queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Rebasing
+    });
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         queue_attempt(&fixture, &head).await.state,
@@ -6995,7 +7000,26 @@ async fn cross_owner_ports_write_only_queue_attempt_and_task_step() {
         digests.insert("daemon::stable".into(), daemons.join("\n"));
         digests
     }
-    let before = foreign(&database).await;
+    // The harness's own background consumers (event cursors, projections)
+    // may still be working through the fixture's setup when the machine is
+    // busy. Wait until the foreign tables stand still, so that only a port's
+    // write can make them differ below.
+    let mut before = foreign(&database).await;
+    let mut still = 0;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let now = foreign(&database).await;
+        if now == before {
+            still += 1;
+            if still >= 10 {
+                break;
+            }
+        } else {
+            still = 0;
+            before = now;
+        }
+    }
+    assert!(still >= 10, "the fixture's background writers settle");
 
     let facts = facts_port.head_facts(&attempt, &queue).await.unwrap();
     assert_eq!(facts.candidate_head, candidate);
