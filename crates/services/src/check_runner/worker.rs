@@ -21,6 +21,8 @@ const OWNER_RPC_BOUND: Duration = Duration::from_secs(30);
 /// admission back by at most this long per `CHECK_ACK_RETRY_SECONDS`.
 const OWNER_ACK_BOUND: Duration = Duration::from_secs(5);
 const SETTLEMENT_GRACE_SECONDS: i64 = 65;
+/// How often a running dispatch looks whether anybody still waits for it.
+const CONSUMER_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 /// How long past its settlement deadline an owner may keep answering
 /// "still running" (or refusing to answer) to lookup and cancel before the
 /// run is settled without it.
@@ -256,12 +258,19 @@ impl CheckRunWorker {
             tokio::pin!(operation);
             let mut renew = tokio::time::interval(Duration::from_secs(15));
             renew.tick().await;
+            // A run nobody waits for any more is stopped within about a
+            // second, not at the next lease renewal: it holds a machine slot.
+            let mut liveness = tokio::time::interval(CONSUMER_LIVENESS_INTERVAL);
+            liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            liveness.tick().await;
             loop {
                 tokio::select! {
                     result=&mut operation=>break result,
                     _=tokio::time::sleep_until(deadline)=>break Err(ServiceError::invalid_operation("check dispatch reply uncertain")),
                     _=renew.tick()=> {
                         run=self.store.renew_check_run(&fence(&run),&db::now_rfc3339(),&lease_until()).await?;
+                    }
+                    _=liveness.tick()=> {
                         if self.store.active_check_consumers(&run.id,&db::now_rfc3339()).await?.is_empty() {
                             // Nobody waits for this result any more. The run
                             // is `cancelling` for the length of the bounded

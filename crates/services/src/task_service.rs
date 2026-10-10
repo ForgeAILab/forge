@@ -411,6 +411,14 @@ pub(super) fn is_transient_error_annotation(raw_annotation: &str) -> bool {
     )
 }
 
+/// The check runtime of one Task service, as [`TaskService::compose_checks`]
+/// builds it.
+pub struct ComposedChecks {
+    pub runner: Arc<crate::check_runner::CheckRunner>,
+    pub consumers: Arc<crate::check_runner::consumer::TaskCheckConsumers>,
+    pub worker: Arc<crate::check_runner::worker::CheckRunWorker>,
+}
+
 #[derive(Clone)]
 pub struct TaskService {
     workflow_engine: Arc<WorkflowEngine>,
@@ -428,6 +436,7 @@ pub struct TaskService {
     /// this one with it, or no check a step asks for is ever answered.
     pub(crate) check_worker:
         Arc<std::sync::OnceLock<Arc<crate::check_runner::worker::CheckRunWorker>>>,
+    pub(crate) check_runner: Arc<std::sync::OnceLock<Arc<crate::check_runner::CheckRunner>>>,
     pub(crate) db: Arc<SqliteDb>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) merge_service: Option<Arc<MergeService>>,
@@ -524,42 +533,77 @@ impl TaskService {
     pub fn check_worker(&self) -> Option<Arc<crate::check_runner::worker::CheckRunWorker>> {
         self.check_worker.get().cloned()
     }
-    /// The check worker `drain` drives. The runtime composes the real one
-    /// (with its daemon owners) before any step runs; a service built
-    /// without a runtime gets a server-only check runtime here, so a
-    /// drained Task's review-entry CI still runs in its embedded worktree.
-    pub fn check_worker_or_embedded(&self) -> Arc<crate::check_runner::worker::CheckRunWorker> {
-        if let Some(worker) = self.check_worker() {
-            return worker;
-        }
-        let consumers = self.check_consumers.get_or_init(|| {
-            let consumers = Arc::new(crate::check_runner::consumer::TaskCheckConsumers::new(
-                self.db.clone(),
-                Arc::new(crate::check_runner::CheckRunner::new(self.db.clone())),
-            ));
-            consumers.register(
-                db::CheckConsumerOrigin::Entry,
-                Arc::new(crate::check_runner::review_entry::ReviewEntryChecks::new(
+    /// The one place the check runtime of a Task service is composed: the
+    /// runner, the consumer contract with EVERY consumer family (review
+    /// entry and integration), and the worker with its workspace owners.
+    /// The production runtime and every test build it here, so no caller
+    /// can end up with a subset of the families. Idempotent: the first
+    /// composition wins and later calls return it.
+    pub fn compose_checks(
+        &self,
+        daemon_connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+        disconnect_bound: std::time::Duration,
+    ) -> ComposedChecks {
+        let runner = self
+            .check_runner
+            .get_or_init(|| Arc::new(crate::check_runner::CheckRunner::new(self.db.clone())))
+            .clone();
+        let consumers = self
+            .check_consumers
+            .get_or_init(|| {
+                let consumers = Arc::new(crate::check_runner::consumer::TaskCheckConsumers::new(
                     self.db.clone(),
-                )),
-            );
-            consumers
-        });
-        let _ = consumers;
-        self.check_worker
+                    runner.clone(),
+                ));
+                crate::integration_steps::IntegrationCheckFamily::register(
+                    &consumers,
+                    Arc::new(crate::integration_steps::IntegrationSteps::new(
+                        self.clone(),
+                    )),
+                );
+                consumers.register(
+                    db::CheckConsumerOrigin::Entry,
+                    Arc::new(crate::check_runner::review_entry::ReviewEntryChecks::new(
+                        self.db.clone(),
+                    )),
+                );
+                consumers
+            })
+            .clone();
+        let worker = self
+            .check_worker
             .get_or_init(|| {
                 Arc::new(crate::check_runner::worker::CheckRunWorker::new(
                     self.db.clone(),
                     Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
                         self.db.clone(),
-                        Arc::new(
-                            crate::daemon_transport::DaemonConnectionRegistry::without_handlers(),
-                        ),
-                        std::time::Duration::from_secs(60),
+                        daemon_connections,
+                        disconnect_bound,
                     )),
                 ))
             })
-            .clone()
+            .clone();
+        ComposedChecks {
+            runner,
+            consumers,
+            worker,
+        }
+    }
+    /// The check worker `drain` drives. The runtime composes it before any
+    /// step runs; a service built without a runtime (tests) composes the
+    /// same runtime here, through [`Self::compose_checks`], with the daemon
+    /// registry the service was given (or one with no daemon connected).
+    pub fn check_worker_or_embedded(&self) -> Arc<crate::check_runner::worker::CheckRunWorker> {
+        if let Some(worker) = self.check_worker() {
+            return worker;
+        }
+        self.compose_checks(
+            self.daemon_connections.clone().unwrap_or_else(|| {
+                Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers())
+            }),
+            std::time::Duration::from_secs(60),
+        )
+        .worker
     }
     pub fn check_consumers(
         &self,
@@ -585,6 +629,7 @@ impl TaskService {
             task_step_driver: Arc::default(),
             task_step_replies: Arc::default(),
             check_consumers: Arc::default(),
+            check_runner: Arc::default(),
             check_worker: Arc::default(),
             event_bus,
             merge_service: None,

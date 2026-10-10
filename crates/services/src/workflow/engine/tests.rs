@@ -4185,96 +4185,30 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
     );
 }
 
+// The Review row changes while review-entry CI runs on the check runner and
+// its hooks step is suspended. The woken step settles under the authority it
+// asked with (carried in the suspension record), so the write is refused
+// where the inline run refused it and the attempt is cancelled.
 #[tokio::test]
 async fn system_review_ci_authority_loss_keeps_base_cancellation_routing() {
-    use crate::workspace_backend as ws;
-    struct ReviewCiFault {
-        db: Arc<db::SqliteDb>,
-        task_id: String,
-        authority_loss: bool,
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-    #[async_trait::async_trait]
-    impl ws::WorkspaceBackend for ReviewCiFault {
-        async fn prepare(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::PrepareSpec,
-        ) -> ws::Result<ws::PreparedWorkspace> {
-            unreachable!()
-        }
-        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
-            unreachable!()
-        }
-        async fn run(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::RunSpec,
-        ) -> ws::Result<ws::RunResult> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if self.authority_loss {
-                sqlx::query("UPDATE review SET updated_at='2099-01-01T00:00:00Z' WHERE task_id=? AND status='running'")
-                    .bind(&self.task_id)
-                    .execute(self.db.pool())
-                    .await
-                    .unwrap();
-                Ok(ws::RunResult {
-                    exit_code: 0,
-                    stdout_tail: String::new(),
-                    stderr_tail: String::new(),
-                    duration_ms: 1,
-                })
-            } else {
-                Err(ws::WorkspaceBackendError::OwnerUnreachable {
-                    daemon_id: "review-owner".into(),
-                })
-            }
-        }
-
-        async fn diff(&self, _: &db::WorkspacePlacement, _: &ws::DiffSpec) -> ws::Result<ws::Diff> {
-            unreachable!()
-        }
-        async fn read(&self, _: &db::WorkspacePlacement, _: &str, _: u64) -> ws::Result<Vec<u8>> {
-            unreachable!()
-        }
-        async fn merge(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::MergeSpec,
-        ) -> ws::Result<ws::MergeOutcome> {
-            unreachable!()
-        }
-        async fn reset(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::ResetSpec,
-        ) -> ws::Result<ws::PreparedWorkspace> {
-            unreachable!()
-        }
-        async fn cleanup(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::CleanupAck> {
-            unreachable!()
-        }
-        async fn harvest_outbox(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &str,
-        ) -> ws::Result<ws::OutboxHarvest> {
-            unreachable!()
-        }
-        async fn consume_outbox(&self, _: &db::WorkspacePlacement, _: &str) -> ws::Result<()> {
-            unreachable!()
-        }
-    }
-
-    let mut fixture = failed_ci_fixture(1, FailurePolicy::Block).await;
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    fixture.engine.workspace_backend_router =
-        Arc::new(ws::WorkspaceBackendRouter::new(Arc::new(ReviewCiFault {
-            db: fixture.db.clone(),
-            task_id: fixture.task.id.clone(),
-            authority_loss: true,
-            calls: calls.clone(),
-        })));
+    let fixture = failed_ci_fixture(1, FailurePolicy::Block).await;
+    let gate = TempDir::new().unwrap();
+    let started = gate.path().join("started");
+    let release = gate.path().join("release");
+    let quote = |p: &std::path::Path| format!("\"{}\"", p.to_str().unwrap());
+    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+        .bind(
+            json!({"retry_budgets":{"review":1},"review":{"ci_steps":[format!(
+                "touch {}; while [ ! -f {} ]; do sleep 0.02; done",
+                quote(&started),
+                quote(&release)
+            )]}})
+            .to_string(),
+        )
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
     let result = fixture
         .engine
         .workflow_execution()
@@ -4290,12 +4224,36 @@ async fn system_review_ci_authority_loss_keeps_base_cancellation_routing() {
         )
         .await;
     let result = result.unwrap();
-    let result = drain_result(fixture.engine.clone(), result).await;
+    let draining = tokio::spawn(drain_result(fixture.engine.clone(), result));
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("review-entry CI runs on the check runner");
     assert_eq!(
-        calls.load(std::sync::atomic::Ordering::SeqCst),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task_step WHERE task_id=? AND kind='hooks' AND status='suspended'"
+        )
+        .bind(&fixture.task.id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap(),
         1,
-        "injected CI backend runs"
+        "the asking step waits suspended"
     );
+    let changed = sqlx::query(
+        "UPDATE review SET updated_at='2099-01-01T00:00:00Z' WHERE task_id=? AND status='running'",
+    )
+    .bind(&fixture.task.id)
+    .execute(fixture.db.pool())
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(changed, 1, "the Review row changes while CI runs");
+    std::fs::write(&release, "release").unwrap();
+    let result = draining.await.unwrap();
     assert_eq!(result.task.status, "in_progress");
     assert!(result.task.entry_barrier_json.is_none());
     let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)

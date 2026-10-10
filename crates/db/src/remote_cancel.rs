@@ -93,6 +93,39 @@ impl SqliteDb {
         Ok(())
     }
 
+    /// The daemon operation of a check run whose asking hooks step was
+    /// superseded while it waited (Cancel or Hold during review-entry CI).
+    /// Registered as that step's running remote operation so the ordinary
+    /// cancellation fence covers it: cancelled on the daemon when reachable,
+    /// a `pending_remote_cancel` marker on the workspace when not. `None`
+    /// when the machine was removed or the operation is already settled.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_abandoned_check_operation(
+        &self,
+        step_id: &str,
+        expected_epoch: i64,
+        operation_id: &str,
+        workspace_id: &str,
+        placement_id: &str,
+        daemon_id: &str,
+        runtime_id: &str,
+        generation: i64,
+    ) -> Result<Option<RemoteTaskOperation>> {
+        let mut tx = begin_immediate(self.pool()).await?;
+        sqlx::query("INSERT INTO task_remote_operation(operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,state,created_at) SELECT ?,?,?,?,?,?,?,?,'running',? WHERE NOT EXISTS(SELECT 1 FROM daemon WHERE id=? AND removed_at IS NOT NULL) ON CONFLICT(operation_id) DO NOTHING")
+            .bind(operation_id).bind(step_id).bind(workspace_id).bind(placement_id)
+            .bind(daemon_id).bind(runtime_id).bind(generation).bind(expected_epoch)
+            .bind(now_rfc3339()).bind(daemon_id).execute(&mut *tx).await?;
+        let row = sqlx::query(
+            "SELECT * FROM task_remote_operation WHERE operation_id=? AND state='running'",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.map(row_operation))
+    }
+
     pub async fn running_remote_task_operations(
         &self,
         step_id: &str,

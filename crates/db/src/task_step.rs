@@ -508,6 +508,18 @@ impl SqliteDb {
             .fetch_all(self.pool())
             .await?)
     }
+    /// The step that asked for this check will never read its result: the
+    /// consumer is cancelled, so its delivery is stale and its run, when it
+    /// has no other consumer, is stopped by the check worker's next look.
+    pub async fn cancel_abandoned_check_consumer(&self, consumer_id: &str) -> Result<bool> {
+        Ok(sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE id=? AND cancelled_at IS NULL AND applied_at IS NULL")
+            .bind(now_rfc3339())
+            .bind(consumer_id)
+            .execute(self.pool())
+            .await?
+            .rows_affected()
+            == 1)
+    }
     /// The abandoned wait of `step_id` was cleaned up.
     pub async fn forget_check_wait(&self, step_id: &str) -> Result<()> {
         sqlx::query("UPDATE task_step SET awaited_consumer_id=NULL WHERE id=? AND status NOT IN ('suspended','pending','claimed')")

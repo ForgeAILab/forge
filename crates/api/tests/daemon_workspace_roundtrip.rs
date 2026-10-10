@@ -1775,6 +1775,30 @@ async fn remote_ci_pass_and_failure_record_reviews_and_events() {
             }
             _ => unreachable!(),
         }
+        // The whole entry is ONE `check.run` on the owning daemon under the
+        // daemon's frozen policy (always runs, never reused), bounded by an
+        // absolute deadline; no command travels as `workspace.run` any more.
+        let link = fixture.link.as_ref().unwrap();
+        let runs = link.requests(api_types::METHOD_CHECK_RUN);
+        assert_eq!(runs.len(), 1, "{case}: one check.run per entry");
+        assert_eq!(
+            runs[0]["purpose"],
+            serde_json::to_value(api_types::WorkspaceRunPurpose::CiStep).unwrap()
+        );
+        assert_eq!(runs[0]["spec"]["execution_policy"], "legacy-daemon/1");
+        assert_eq!(
+            runs[0]["spec"]["commands"].as_array().unwrap().len(),
+            2,
+            "{case}: every configured step is in the spec"
+        );
+        assert!(runs[0]["deadline"].is_string());
+        assert!(
+            runs[0]["target"]
+                .to_string()
+                .contains(&fixture.resolved.placement.id),
+            "{case}: the run targets the Task's own placement"
+        );
+        assert!(link.requests(api_types::METHOD_WORKSPACE_RUN).is_empty());
         let comments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_comment WHERE task_id=?")
             .bind(task_id)
             .fetch_one(state.db.pool())
@@ -2861,6 +2885,52 @@ async fn remote_plan_operations_wait_for_workspace_run_and_discard_cleaned_state
     ));
 }
 
+/// What a Cancel or Hold during remote review-entry CI must leave behind:
+/// no consumer still waits (a late result is stale), the review attempt the
+/// superseded step opened is closed, and the run is settled so it holds no
+/// machine slot.
+async fn assert_remote_ci_abandoned(db: &db::SqliteDb, task_id: &str) {
+    let waiting: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM check_consumer WHERE task_id=? AND cancelled_at IS NULL",
+    )
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(waiting, 0, "no consumer waits for the abandoned run");
+    let review: String = sqlx::query_scalar(
+        "SELECT status FROM review WHERE task_id=? ORDER BY attempt_number DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(review, "cancelled");
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run r WHERE r.id IN (SELECT run_id FROM check_consumer WHERE task_id=?) AND r.state NOT IN ('succeeded','failed','cancelled')")
+                .bind(task_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            if live == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the abandoned remote run settles and frees its slot");
+    let applied: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM check_consumer WHERE task_id=? AND applied_at IS NOT NULL",
+    )
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(applied, 0, "the late result is applied to nothing");
+}
+
 #[tokio::test]
 async fn connected_cancel_kills_remote_ci_and_supersedes_its_hook_step() {
     use db::TaskStepRepo;
@@ -2940,6 +3010,16 @@ async fn connected_cancel_kills_remote_ci_and_supersedes_its_hook_step() {
         1
     );
     running.await.unwrap().unwrap();
+    assert_remote_ci_abandoned(db, &task_id).await;
+    assert!(!completed.exists());
+    assert_eq!(
+        TaskRepo::get_by_id(&**db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
 }
 
 #[tokio::test]
@@ -3052,6 +3132,19 @@ async fn disconnected_cancel_fences_workspace_until_real_owner_reconnect_cleanup
         .await
         .unwrap()
         .is_empty());
+    // The fence held while the owner was away; once it confirms, nothing of
+    // the abandoned run is left: no waiting consumer, no open review
+    // attempt, no run holding a slot, and the Task did not move.
+    assert_remote_ci_abandoned(&db, &task_id).await;
+    assert!(!completed.exists());
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
 }
 
 /// Hold with the owner disconnected parks the follow-up action on the
@@ -3208,6 +3301,120 @@ async fn disconnected_hold_parks_follow_up_on_the_named_machine_until_reconnect(
         .as_deref()
         .unwrap_or_default()
         .contains("pending_remote_cancel"));
+    assert!(!completed.exists());
+}
+
+/// The owning daemon drops off while review-entry CI runs there. That is no
+/// verdict: the Task stays in `review` on its typed check wait with the
+/// asking step suspended, and when the daemon is back the result it kept is
+/// read once and the same review attempt settles.
+#[tokio::test]
+async fn disconnected_remote_ci_waits_on_the_typed_check_and_resumes_on_reconnect() {
+    let mut fixture = Fixture::new("forge-disconnected-ci-resume").await;
+    let db = fixture.harness.state.db.clone();
+    let task_id = fixture.resolved.placement.task_id.clone();
+    let started = fixture._daemon_root.path().join("resume-ci-started");
+    let completed = fixture._daemon_root.path().join("resume-ci-completed");
+    sqlx::query("UPDATE task SET task_state_config=?,status='merge_failed' WHERE id=?").bind(json!({"review":{"ci_steps":[format!("touch {}; sleep 2; touch {}; printf resumed",quote(&started.to_string_lossy()),quote(&completed.to_string_lossy()))]}}).to_string()).bind(&task_id).execute(db.pool()).await.unwrap();
+    let service = fixture.harness.state.task_service.clone();
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    service
+        .transition(
+            &task_id,
+            "review".to_owned(),
+            services::task_service::TransitionOptions {
+                bridge: Default::default(),
+                version: task.version,
+                triggered_by: Actor::system(SystemComponent::Workflow),
+                reason: Some("remote CI".into()),
+                rejection: false,
+                defer_dispatch_seconds: None,
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.link.take();
+    fixture
+        .harness
+        .state
+        .daemon_connections
+        .unregister(&fixture.daemon_id);
+    // The command finishes on the daemon while the server cannot hear it.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !completed.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let waiting = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.status, "review");
+    assert!(
+        waiting.condition.check_witness().is_some(),
+        "the wait is a typed check condition: {:?}",
+        waiting.condition
+    );
+    let suspended: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_step WHERE task_id=? AND kind='hooks' AND status='suspended'",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(suspended, 1);
+    assert!(!db.task_has_pending_remote_cancel(&task_id).await.unwrap());
+    fixture.link = Some(
+        DaemonLink::connect(
+            &fixture.server,
+            &fixture.daemon_id,
+            &fixture.token,
+            fixture.runtime.clone(),
+        )
+        .await,
+    );
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let reviews = ReviewRepo::list_by_task(&*db, &task_id).await.unwrap();
+            let details: Value =
+                serde_json::from_str(&reviews[0].step_results_json).unwrap_or(Value::Null);
+            if details["ci_steps"]
+                .as_array()
+                .is_some_and(|s| !s.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the reconnected daemon's result settles the review attempt");
+    let reviews = ReviewRepo::list_by_task(&*db, &task_id).await.unwrap();
+    assert_eq!(reviews.len(), 1, "the same attempt resumes");
+    let details: Value = serde_json::from_str(&reviews[0].step_results_json).unwrap();
+    assert_eq!(details["ci_steps"].as_array().unwrap().len(), 1);
+    assert_eq!(details["ci_steps"][0]["exit_code"], 0);
+    assert_eq!(details["ci_steps"][0]["output_tail"], "resumed");
+    // The command ran once: the reconnected link is only asked what happened.
+    assert!(fixture
+        .link
+        .as_ref()
+        .unwrap()
+        .requests(api_types::METHOD_CHECK_RUN)
+        .is_empty());
 }
 
 #[cfg(unix)]

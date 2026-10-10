@@ -58,6 +58,32 @@ pub fn is_dispatch_action(name: &str) -> bool {
     )
 }
 
+/// Test-only workload that keeps a hooks step running for as long as the
+/// test wants: it touches `started` in the gate directory named by the
+/// state's `test_hold_gate` and returns once `release` exists there (or the
+/// directory is gone).
+#[cfg(test)]
+pub(crate) struct TestHoldStep;
+#[cfg(test)]
+#[async_trait::async_trait]
+impl HookAction for TestHoldStep {
+    async fn execute(&self, ctx: &crate::workflow::HookContext) -> crate::workflow::HookResult {
+        let Some(gate) = ctx.state_config["test_hold_gate"]
+            .as_str()
+            .map(std::path::PathBuf::from)
+        else {
+            return crate::workflow::HookResult::Skipped {
+                reason: "no gate".to_owned(),
+            };
+        };
+        let _ = std::fs::write(gate.join("started"), "");
+        while !gate.join("release").exists() && gate.is_dir() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        crate::workflow::HookResult::Ok
+    }
+}
+
 pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
     let action: Box<dyn HookAction> = match name {
         "run_ci_steps" => Box::new(RunCiSteps),
@@ -86,6 +112,8 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "subtask_sequence_complete" => Box::new(SubtaskSequenceComplete),
         "propagate_done_to_subtasks" => Box::new(PropagateDoneToSubtasks),
         "cancel_pending_subtasks" => Box::new(CancelPendingSubtasks),
+        #[cfg(test)]
+        "test_hold_step" => Box::new(TestHoldStep),
         _ => {
             return Err(ServiceError::InvalidOperation {
                 message: format!("unknown action: {name}"),

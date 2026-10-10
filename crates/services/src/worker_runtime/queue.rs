@@ -248,9 +248,6 @@ impl TaskStepWorker {
         }
         if command.preempt {
             self.db.request_task_preemption(task_id).await?;
-            // A hooks step superseded while it waited for review-entry CI
-            // leaves its review attempt open: close it.
-            crate::check_runner::review_entry::abandon_superseded_waits(&self.db, task_id).await?;
         }
         let notify = self.db.domain_event_notify();
         let deadline = tokio::time::Instant::now()
@@ -710,6 +707,16 @@ impl TaskStepWorker {
                 return Ok(());
             }
             if command.preempt {
+                // A hooks step superseded while it waited for review-entry
+                // CI: its remote run is cancelled or fenced, its consumer
+                // cancelled and its review attempt closed, here in the
+                // preempting command's own step, before the command acts.
+                crate::check_runner::review_entry::abandon_superseded_waits(
+                    &self.db,
+                    self.task_service.daemon_connections.clone(),
+                    &step.task_id,
+                )
+                .await?;
                 // A disconnect may have failed the server-side hook before
                 // Cancel arrived, although its owner command is still alive.
                 let marked = self.db.pending_remote_cancels(None, None).await?;
@@ -840,6 +847,7 @@ impl TaskStepWorker {
             // reads the result: close the review attempt it opened.
             return crate::check_runner::review_entry::abandon_superseded_waits(
                 &self.db,
+                self.task_service.daemon_connections.clone(),
                 &step.task_id,
             )
             .await;

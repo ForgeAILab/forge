@@ -91,7 +91,7 @@ impl HookAction for RunCiSteps {
         let asked =
             match crate::workflow::engine::durable::hook_effect(&ctx.task_id, CI_REVIEW).await {
                 // An effect is stored as JSON text.
-                Ok(asked) => asked.and_then(|id| serde_json::from_str::<String>(&id).ok()),
+                Ok(asked) => asked.and_then(|raw| serde_json::from_str::<AskedReview>(&raw).ok()),
                 Err(error) => {
                     return HookResult::Failed {
                         reason: error.to_string(),
@@ -107,9 +107,9 @@ impl HookAction for RunCiSteps {
         let reviewer_assigned = reviewer_assignment
             .as_ref()
             .is_some_and(|assignment| assignment.assignee_id.is_some());
-        let review = match asked {
-            Some(review_id) => match ReviewRepo::get_by_id(&*ctx.db, &review_id).await {
-                Ok(Some(review)) => review,
+        let (review, asked) = match asked {
+            Some(asked) => match ReviewRepo::get_by_id(&*ctx.db, &asked.review_id).await {
+                Ok(Some(review)) => (review, asked),
                 Ok(None) => {
                     return HookResult::Failed {
                         reason: "the review attempt of this check no longer exists".to_owned(),
@@ -133,10 +133,16 @@ impl HookAction for RunCiSteps {
                     Ok(review) => review,
                     Err(reason) => return HookResult::Failed { reason },
                 };
+                let asked = AskedReview {
+                    review_id: review.id.clone(),
+                    task_version: task.version,
+                    review_status: review.status.to_string(),
+                    review_updated_at: review.updated_at.clone(),
+                };
                 if let Err(error) = crate::workflow::engine::durable::record_hook_effect(
                     &ctx.task_id,
                     CI_REVIEW,
-                    &json!(review.id),
+                    &serde_json::to_value(&asked).expect("asking-time authority serializes"),
                 )
                 .await
                 {
@@ -144,13 +150,31 @@ impl HookAction for RunCiSteps {
                         reason: error.to_string(),
                     };
                 }
-                review
+                (review, asked)
             }
         };
         // An earlier delivery of this step already wrote the CI result.
         if let Some(settled) = settled_ci_result(&review) {
             return settled;
         }
+        // The settlement below is fenced on the authority this hook asked
+        // under, not on what the woken step re-reads: a Task version bump or
+        // a Review row change while the check ran refuses the write exactly
+        // where the inline run refused it, and cancels the attempt.
+        let authority_version = asked.task_version;
+        let asked_status = match asked.review_status.parse::<ReviewStatus>() {
+            Ok(status) => status,
+            Err(_) => {
+                return HookResult::Failed {
+                    reason: "the review attempt's asking-time authority is unreadable".to_owned(),
+                }
+            }
+        };
+        let review = db::Review {
+            status: asked_status,
+            updated_at: asked.review_updated_at.clone(),
+            ..review
+        };
         let consumer_id =
             match crate::workflow::engine::durable::hook_effect(&ctx.task_id, CI_CONSUMER).await {
                 Ok(Some(consumer_id)) => {
@@ -185,17 +209,16 @@ impl HookAction for RunCiSteps {
         let result = if consumer_id.is_empty() {
             None
         } else {
-            match consumers.verdict(&consumer_id).await {
-                Ok(Some(crate::check_runner::consumer::CheckVerdict::Result(result))) => {
-                    Some(result)
-                }
+            use crate::check_runner::consumer::CheckWaitState;
+            match consumers.wait_state(&consumer_id).await {
+                Ok(CheckWaitState::Result(result)) => Some(result),
                 // No result yet, or no verdict after the automatic retries
                 // (the Task is parked on the typed check condition and the
                 // owner's `retry` asks again): the step waits. The deadline
                 // is the re-arm for a delivery that never arrives.
-                Ok(_) => {
+                Ok(CheckWaitState::Pending | CheckWaitState::Exhausted) => {
                     let until = (chrono::Utc::now()
-                        + chrono::Duration::seconds(ENTRY_CHECK_WAKE_SECONDS))
+                        + chrono::Duration::seconds(entry_check_wake_seconds()))
                     .to_rfc3339();
                     if !crate::workflow::engine::durable::suspend_hook(
                         &ctx.task_id,
@@ -207,6 +230,17 @@ impl HookAction for RunCiSteps {
                         };
                     }
                     return HookResult::Ok;
+                }
+                // Nothing will ever answer: the consumer was cancelled or its
+                // run row is gone. Waiting again would wait forever, so the
+                // attempt is cancelled and the hook fails as an unfinished
+                // check does.
+                Ok(CheckWaitState::Lost) => {
+                    let reason = "review check was lost before it produced a result";
+                    cancel_review_after_authority_loss(ctx, &review, reason).await;
+                    return HookResult::Failed {
+                        reason: reason.to_owned(),
+                    };
                 }
                 Err(error) => {
                     return HookResult::Failed {
@@ -275,7 +309,7 @@ impl HookAction for RunCiSteps {
                 review_details.to_string(),
                 Some(now.clone()),
                 &now,
-                task.version,
+                authority_version,
                 &ctx.to_state,
                 ctx.project_version,
                 ctx.project_workflow_definition.as_deref(),
@@ -369,7 +403,7 @@ impl HookAction for RunCiSteps {
                 review_details.to_string(),
                 finished_at.clone(),
                 &now,
-                task.version,
+                authority_version,
                 &ctx.to_state,
                 ctx.project_version,
                 ctx.project_workflow_definition.as_deref(),
@@ -396,7 +430,7 @@ impl HookAction for RunCiSteps {
                 review_details.to_string(),
                 finished_at.clone(),
                 &now,
-                task.version,
+                authority_version,
                 &execution_id,
             )
             .await
@@ -431,10 +465,36 @@ impl HookAction for RunCiSteps {
 const CI_REVIEW: &str = "ci_review";
 const CI_CONSUMER: &str = "ci_consumer";
 /// The wall limit of one review-entry CI run.
-const ENTRY_CHECK_WALL_SECONDS: u64 = 3600;
+pub const ENTRY_CHECK_WALL_SECONDS: u64 = 3600;
+static ENTRY_CHECK_WALL_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// The wall limit in force. Tests shorten it to drive a timeout through the
+/// runner; production never sets the override.
+fn entry_check_wall_seconds() -> u64 {
+    match ENTRY_CHECK_WALL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => ENTRY_CHECK_WALL_SECONDS,
+        seconds => seconds,
+    }
+}
+#[doc(hidden)]
+pub fn set_entry_check_wall_seconds_for_test(seconds: u64) {
+    ENTRY_CHECK_WALL_OVERRIDE.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
 /// When a suspended step looks again on its own: past the run's wall limit
 /// and the worker's settlement grace.
-const ENTRY_CHECK_WAKE_SECONDS: i64 = ENTRY_CHECK_WALL_SECONDS as i64 + 120;
+fn entry_check_wake_seconds() -> i64 {
+    entry_check_wall_seconds() as i64 + 120
+}
+
+/// The authority `run_ci_steps` asked under, carried across the suspension:
+/// the review attempt it opened and the versions the settlement is fenced on.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AskedReview {
+    review_id: String,
+    task_version: i64,
+    review_status: String,
+    review_updated_at: String,
+}
 
 enum EntryCheck {
     /// Every configured step is blank: nothing runs and the entry passes.
@@ -586,7 +646,7 @@ async fn request_entry_check(
             },
             workspace_id: Some(workspace.id.clone()),
             machine_id: resolved.placement.daemon_id.clone().filter(|_| daemon),
-            wall_timeout_seconds: ENTRY_CHECK_WALL_SECONDS,
+            wall_timeout_seconds: entry_check_wall_seconds(),
         })
         .await
         .map_err(|error| failed(error.to_string()))?;

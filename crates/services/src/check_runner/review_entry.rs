@@ -60,23 +60,50 @@ fn awaits_ci(review: &db::Review) -> bool {
 
 /// Hooks steps of this Task that were superseded while they waited for
 /// review-entry CI (the Task was cancelled, held or left `review`) never read
-/// the result. Cancel the review attempt each one opened, so no attempt
-/// stays `running`; the consumer itself is fenced by its authority (and
-/// cancelled by the check worker once the Task's status entry has moved).
+/// the result. For each one:
+/// - a run still executing on a daemon is cancelled there when the daemon is
+///   reachable, and otherwise fences the workspace with a
+///   `pending_remote_cancel` marker until the daemon confirms, exactly as a
+///   preempted remote command does;
+/// - the consumer is cancelled, so a late delivery is stale and the check
+///   worker stops a run nobody waits for and frees its slot;
+/// - the review attempt the step opened is cancelled, so no attempt stays
+///   `running`.
+///
 /// Idempotent: a cleaned wait is forgotten.
-pub async fn abandon_superseded_waits(db: &Arc<SqliteDb>, task_id: &str) -> Result<()> {
+pub async fn abandon_superseded_waits(
+    db: &Arc<SqliteDb>,
+    daemons: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
+    task_id: &str,
+) -> Result<()> {
     for (step_id, consumer_id) in db.abandoned_check_waits(task_id).await? {
-        let review_id = CheckDeliveryRepo::check_consumer_delivery(&**db, &consumer_id)
+        let state = CheckDeliveryRepo::check_consumer_delivery(&**db, &consumer_id)
             .await?
-            .filter(|state| state.consumer.origin == db::CheckConsumerOrigin::Entry)
-            .and_then(|state| {
-                state
-                    .consumer
-                    .request_key
-                    .rsplit('|')
-                    .next()
-                    .map(str::to_owned)
-            });
+            .filter(|state| state.consumer.origin == db::CheckConsumerOrigin::Entry);
+        if let Some(state) = &state {
+            fence_remote_run(db, daemons.clone(), &step_id, &state.consumer).await?;
+            db.cancel_abandoned_check_consumer(&consumer_id).await?;
+            // The wait is over: the Task no longer states that it waits for
+            // this check. Only the Task's own step may write its condition.
+            if db::task_writer::owns_task(task_id) {
+                CheckDeliveryRepo::state_check_condition(
+                    &**db,
+                    task_id,
+                    &db::ConditionStatement::CheckCleared {
+                        consumer_id: consumer_id.clone(),
+                    },
+                )
+                .await?;
+            }
+        }
+        let review_id = state.and_then(|state| {
+            state
+                .consumer
+                .request_key
+                .rsplit('|')
+                .next()
+                .map(str::to_owned)
+        });
         let review = match review_id {
             Some(id) => ReviewRepo::get_by_id(&**db, &id).await?,
             None => None,
@@ -103,5 +130,70 @@ pub async fn abandon_superseded_waits(db: &Arc<SqliteDb>, task_id: &str) -> Resu
         }
         db.forget_check_wait(&step_id).await?;
     }
+    Ok(())
+}
+
+/// The run `consumer` waits for may still execute on a daemon. When this
+/// consumer is the only one waiting, its operation is put under the remote
+/// cancellation fence: stopped now if the daemon answers, or marked so the
+/// workspace stays excluded until the daemon reconnects and confirms.
+async fn fence_remote_run(
+    db: &Arc<SqliteDb>,
+    daemons: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
+    step_id: &str,
+    consumer: &db::CheckConsumer,
+) -> Result<()> {
+    use db::{CheckDispatchTarget, CheckWorkerRepo};
+    let Some(run_id) = consumer.run_id.as_deref() else {
+        return Ok(());
+    };
+    if consumer.result_id.is_some() {
+        return Ok(());
+    }
+    let record = match CheckWorkerRepo::check_worker_record(&**db, run_id).await {
+        Ok(record) => record,
+        Err(db::DbError::NotFound) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if record.run.state.terminal() || record.receipt.is_some() {
+        return Ok(());
+    }
+    let Some(db::CheckDispatchIntent {
+        target: CheckDispatchTarget::Daemon { workspace },
+        ..
+    }) = &record.dispatch
+    else {
+        return Ok(());
+    };
+    let Some(workspace_id) = record.run.workspace_id.as_deref() else {
+        return Ok(());
+    };
+    // A run other consumers still wait for keeps running for them.
+    let others = CheckWorkerRepo::active_check_consumers(&**db, run_id, &db::now_rfc3339())
+        .await?
+        .into_iter()
+        .any(|other| other.id != consumer.id);
+    if others {
+        return Ok(());
+    }
+    let Ok(generation) = i64::try_from(workspace.generation) else {
+        return Ok(());
+    };
+    let Some(operation) = db
+        .register_abandoned_check_operation(
+            step_id,
+            consumer.status_epoch,
+            &record.run.operation_id,
+            workspace_id,
+            &workspace.placement_id,
+            &workspace.daemon_id,
+            &workspace.runtime_id,
+            generation,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    crate::remote_cancel::cancel_operations(db, daemons, &[operation]).await?;
     Ok(())
 }
