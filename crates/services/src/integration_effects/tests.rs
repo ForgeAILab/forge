@@ -268,6 +268,7 @@ fn canonical_ci_spec_matches_the_existing_check_run_input_and_sequence() {
             event: api_types::LifecycleEvent::BeforeWork,
             role: "coder",
             owner_is_daemon: false,
+            canonical_policy: false,
             workspace: Some(review::check_spec::CheckWorkspaceIdentity {
                 workspace_id: "workspace",
                 generation: 1,
@@ -336,6 +337,7 @@ fn canonical_ci_spec_matches_the_existing_check_run_input_and_sequence() {
         commands: outcome.commands,
         output_truncated: false,
         redaction_values: vec![],
+        reusable: true,
     };
     assert_eq!(evidence.commands.len(), spec.commands.len());
 }

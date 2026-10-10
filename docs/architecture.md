@@ -7632,7 +7632,8 @@ its retained intent reports `interrupted`, never a pass or permission to rerun.
 
 New execution policies clear ambient environment, disable login-profile loading
 and pass only declared keys plus the receiving machine's existing five build
-budget variables and niceness. The explicit frozen `legacy-server/1` and
+budget variables and niceness. The canonical CI policy additionally passes the
+owner's canonical environment (see "Reusable results" below). The explicit frozen `legacy-server/1` and
 `legacy-daemon/1` policies preserve existing login-shell/environment/Git-variable
 behavior during caller migration: the child inherits the owner process
 environment (PATH, HOME, toolchain variables), then the Project environment and
@@ -7895,13 +7896,107 @@ the runner.** Merge-path and review-entry CI, manual `ReviewRunner`,
 conformance, before-work and other checks retain their current inline
 orchestration, limits and verdicts; the conditions above are therefore
 produced only by tests until a family moves. The 3.2 integration queue stays
-inactive. Still pending: the review-entry cutover (3.3 stage D part 1, scope
-2), the merge-path cutover (3.2 D1b), canonical PATH/HOME declaration and
-managed-checkout/canonical-policy activation. Current owner dispatch uses the
-frozen legacy workspace policy and supplies no new server input attestation;
-configured checks remain uncacheable. A reusable result has no expiry: reuse
-ends only when the commit, spec digest or audited execution revision differs.
-No historical review or legacy CI row is promoted to cache.
+inactive. Still pending: the review-entry cutover (3.3 stage D part 2, scope
+2), the merge-path cutover (3.2 D1b) and managed-checkout activation. The
+owners execute the frozen legacy policies and the canonical CI policy below;
+only the canonical one attests its inputs and may be reused. A reusable result
+has no expiry: reuse ends only when the commit, spec digest, owner environment
+identity or audited execution revision differs. No historical review or legacy
+CI row is promoted to cache.
+
+#### Reusable results: the canonical CI policy (3.3 stage D part 2, scope 1)
+
+`canonical-ci/1` (`api_types::CANONICAL_CI_POLICY`) is the execution policy
+under which a CI bundle's result may stand for a later request. It is built by
+`build_check_spec` only when the caller sets `canonical_policy`, only for the
+entry-CI bundle and only for a server-owned checkout; every other combination
+is refused. **No production family requests it yet**: review-entry CI still
+runs inline under `legacy-server/1` / `legacy-daemon/1` until the review-entry
+cutover, so no Project's behaviour changes with this stage. What exists is the
+policy, its witness, its identity and its certification, proven through the
+real server owner.
+
+What a canonical command runs with:
+
+| Input | Source | Where it is identified |
+|---|---|---|
+| Commit | the Task worktree at the requested commit (the owner re-reads HEAD before it starts) | `check_run.commit_sha`, the scope identity |
+| Commands, order, cwd, stop policy, policy revision | the spec | the digest |
+| `PATH`, `HOME` | declared by every canonical spec (`CANONICAL_ENVIRONMENT_KEYS`); the owner's value unless the Project sets the key | the digest, as a controlled value |
+| Project environment values | declared key by key | the digest, as an opaque revision: a digest keyed with a random salt the server creates once and keeps in `system_setting` (`check_value_revision_salt`, hidden from and not writable through the admin settings API), so neither the value nor a public hash of it is in the identity. The salt is durable: a request stated before a restart is verified with the same revision after it |
+| `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `GOPATH`, `GOROOT`, `JAVA_HOME` | passed through from the owner when it sets them (`CANONICAL_PASSTHROUGH_KEYS`); fixed by the policy revision | the owner's environment identity (names and values, hashed) |
+| Shell, runner, OS, architecture | the owner | the owner's environment identity |
+| Machine build budget (five variables, niceness) | the owner, as for every run | not identified: it bounds how fast a step runs, not what it produces |
+
+Everything else is cleared: `env_clear`, `bash --noprofile -lc`. The owner's
+values are read once per process from a login shell (`check_executor::
+canonical_environment`), so `PATH` is the one a legacy `bash -lc` step saw and
+tools a profile puts on `PATH` are still found. A variable that only the
+profile or the server's own environment exported, and that is not in the
+table, is no longer visible: a Project that needs one declares it in its
+Project environment. That set is deliberately small. `PATH` and `HOME` locate
+every toolchain installed in its default place; the pass-through keys are who
+runs, the locale (it changes sort order and test output), the scratch
+directory, and the toolchain roots that cannot be derived from `HOME` once an
+install is relocated.
+
+The minimal set differs per machine, so none of it is left out of the
+identity: the values are in the digest (`PATH`, `HOME`) or in the environment
+identity (`ServerCheckExecutionInputs`: `environment_revision` is the digest
+of the canonical names and values, `shell_revision` the shell's version,
+`runner_revision` the policy and the Forge version). The requester computes
+that identity with the same function the owner uses, the owner recomputes it
+before it starts, and `validate_receipt` refuses a receipt whose attestation
+is not the identity's. Before it starts the owner also compares every declared
+value with the identity (`owners.rs` `environment`): a `PATH`, `HOME` or
+Project value that moved since the request refuses the run instead of filing
+a result under an identity that does not describe it. Tool versions are not
+probed: an upgrade in place behind an unchanged `PATH` is not seen (a Forge
+upgrade is: it changes `runner_revision`).
+
+The witness, taken by the executor beside the commands:
+
+- `prepared_head`: HEAD before the first command;
+- clean start: `git status --porcelain` is empty before the first command
+  (nothing modified, staged or untracked; ignored files such as build output
+  do not count), within 20 seconds;
+- `finished_head` and tracked changes (`git diff --quiet HEAD`) after the last;
+- `tracked_changes` on the receipt is the single answer: `false` only for a
+  clean start and no tracked change after; `true` for a start that was not
+  clean; absent when the start could not be witnessed;
+- `process_tree_stopped` per command: the canonical policy stops each
+  command's process group when it exits, so a step can no longer leave a
+  service running for a later step.
+
+A daemon owner would return the same witness (the executor is shared), but no
+daemon runs the policy: a daemon attests no inputs yet, `prepare` refuses the
+canonical policy for a daemon placement and the builder refuses to build it.
+Daemon-placed checks therefore stay on `legacy-daemon/1`, uncacheable.
+
+**Verdict and reuse are separate.** The canonical policy runs in the Task
+worktree, as CI steps always did, so a step that rewrites a tracked file
+(a lockfile, generated code), commits, starts on a worktree that is not
+clean, or whose process tree was not confirmed stopped still produces that
+Task's verdict, exactly as before. It is only never reused:
+`CheckResultEvidence.reusable` is set by `validate_receipt` for a pass with
+the complete witness, and `finish_check_run` stores `check_result.cacheable`
+as "run cacheable, certified and reusable" instead of copying the run's flag.
+A consumer repeating its own request for such a run is `Joined` to it, never
+`Hit`. Timed-out, cancelled, failed and infrastructure results are never
+certified, hence never reusable. Every other non-legacy policy keeps the
+strict rule (no witness, no pass).
+
+| Request for commit + spec + environment | Outcome |
+|---|---|
+| unchanged, earlier reusable pass | `Hit`: no run row, no slot, no process |
+| unchanged, a run is in flight (any Task) | `Joined`: one run, one result per consumer |
+| another commit, command, Project value, owner environment identity or policy | `Scheduled`: its own run |
+| earlier pass left a tracked change, started dirty, moved HEAD | `Scheduled` |
+| earlier run failed, timed out, was cancelled or failed infrastructure | `Scheduled` |
+
+Neither the spec revision nor the digest schema changes: the policy string is
+already a digest input, so no stored result of a legacy policy can satisfy a
+canonical request, and the digest's shape is the same.
 
 The owner supervision guarantees tested here cover normal cancellation, dropped
 futures, retained receipts and restart reconciliation. Abrupt process death

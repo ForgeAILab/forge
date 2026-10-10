@@ -16,11 +16,113 @@ pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// with the same few bytes as some environment value.
 const SECRET_FRAGMENT_BYTES: usize = 4;
 const WITNESS_TIMEOUT: Duration = Duration::from_secs(2);
+/// `git status` walks the worktree; a large one needs longer than a HEAD read.
+const CLEAN_WITNESS_TIMEOUT: Duration = Duration::from_secs(20);
 const LEGACY_SERVER: &str = "legacy-server/1";
 const LEGACY_DAEMON: &str = "legacy-daemon/1";
 fn legacy(policy: &str) -> bool {
     matches!(policy, LEGACY_SERVER | LEGACY_DAEMON)
 }
+fn canonical(policy: &str) -> bool {
+    policy == CANONICAL_CI_POLICY
+}
+
+/// The owner's canonical environment: what a login shell on this machine
+/// resolves for the canonical keys, read once per process. This is the PATH
+/// and HOME a legacy `bash -lc` step saw, so moving a step to the canonical
+/// policy does not lose the tools its profile put on PATH.
+pub struct CanonicalEnvironment {
+    pub values: BTreeMap<String, String>,
+    pub shell_revision: String,
+}
+static CANONICAL_ENVIRONMENT: tokio::sync::OnceCell<CanonicalEnvironment> =
+    tokio::sync::OnceCell::const_new();
+const CANONICAL_PROBE_MARK: &str = "forge-canonical-environment";
+pub async fn canonical_environment() -> &'static CanonicalEnvironment {
+    CANONICAL_ENVIRONMENT
+        .get_or_init(|| async {
+            let names = CANONICAL_ENVIRONMENT_KEYS
+                .iter()
+                .chain(CANONICAL_PASSTHROUGH_KEYS.iter())
+                .copied()
+                .collect::<Vec<_>>();
+            let script = format!(
+                "printf '%s\\0' {CANONICAL_PROBE_MARK} \"$BASH_VERSION\"; for k in {}; do if [ -n \"${{!k+x}}\" ]; then printf '%s=%s\\0' \"$k\" \"${{!k}}\"; fi; done",
+                names.join(" ")
+            );
+            let mut probe = Command::new("bash");
+            probe
+                .arg("-lc")
+                .arg(script)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(10), probe.output())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .filter(|output| output.status.success());
+            let mut values = BTreeMap::new();
+            let mut shell_revision = String::new();
+            if let Some(output) = output {
+                // A profile may print before the probe does: read after the mark.
+                let mut fields = output
+                    .stdout
+                    .split(|byte| *byte == 0)
+                    .map(|field| String::from_utf8_lossy(field).into_owned())
+                    .skip_while(|field| !field.ends_with(CANONICAL_PROBE_MARK));
+                if fields.next().is_some() {
+                    shell_revision = fields.next().unwrap_or_default();
+                    for field in fields {
+                        if let Some((key, value)) = field.split_once('=') {
+                            if names.contains(&key) {
+                                values.insert(key.to_owned(), value.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            // No login shell answered: the owner process's own values.
+            for key in names {
+                if !values.contains_key(key) {
+                    if let Ok(value) = std::env::var(key) {
+                        values.insert(key.to_owned(), value);
+                    }
+                }
+            }
+            values
+                .entry("PATH".into())
+                .or_insert_with(|| "/usr/local/bin:/usr/bin:/bin".into());
+            values.entry("HOME".into()).or_insert_with(|| "/".into());
+            if shell_revision.is_empty() {
+                shell_revision = "bash".into();
+            }
+            CanonicalEnvironment {
+                values,
+                shell_revision,
+            }
+        })
+        .await
+}
+/// What this owner attests for a canonical run: its canonical environment
+/// (names and values, hashed), its shell and this runner. Tool versions are
+/// not probed: an in-place upgrade behind an unchanged PATH is not seen.
+pub async fn canonical_inputs() -> Result<ServerCheckExecutionInputs, String> {
+    let environment = canonical_environment().await;
+    Ok(ServerCheckExecutionInputs {
+        toolchain_revision: "path-not-probed".into(),
+        environment_revision: api_types::canonical_digest_with_schema(
+            "forge.check-canonical-environment/1",
+            &serde_json::json!(environment.values),
+        )
+        .map_err(|e| e.to_string())?,
+        asset_revisions: BTreeMap::new(),
+        secret_revisions: BTreeMap::new(),
+        shell_revision: environment.shell_revision.clone(),
+        runner_revision: format!("{CANONICAL_CI_POLICY}@{}", env!("CARGO_PKG_VERSION")),
+    })
+}
+
 /// What happens to a command's descendants once it exits normally.
 ///
 /// Neither the server nor the daemon ever stopped a CI step's descendants: a
@@ -148,6 +250,19 @@ pub fn command(
     environment: &BTreeMap<String, String>,
     policy: &str,
 ) -> Result<(Command, BTreeMap<String, String>), String> {
+    command_in(path, spec, environment, policy, None)
+}
+/// `owner` is the owner's canonical environment under the canonical policy.
+/// Its values reach the command but are not returned: the returned map is
+/// what output is redacted with, and a home directory or a PATH entry in a
+/// compiler message is not a secret.
+fn command_in(
+    path: &Path,
+    spec: &CheckCommandSpec,
+    environment: &BTreeMap<String, String>,
+    policy: &str,
+    owner: Option<&BTreeMap<String, String>>,
+) -> Result<(Command, BTreeMap<String, String>), String> {
     if spec.shell != "bash -lc" {
         return Err("unsupported check shell".into());
     }
@@ -159,13 +274,16 @@ pub fn command(
     if spec
         .environment_keys
         .iter()
-        .any(|key| !env.contains_key(key))
+        .any(|key| !env.contains_key(key) && !owner.is_some_and(|owner| owner.contains_key(key)))
     {
         return Err("missing declared check environment key".into());
     }
     let mut command = Command::new("bash");
     if !legacy(policy) {
         command.env_clear().arg("--noprofile");
+    }
+    if let Some(owner) = owner {
+        command.envs(owner);
     }
     command
         .arg("-lc")
@@ -197,7 +315,12 @@ pub async fn run_command(
 ) -> Result<CheckCommandReceipt, String> {
     let started_at = now();
     let start = Instant::now();
-    let (mut command, env) = command(path, spec, environment, policy)?;
+    let owner = if canonical(policy) {
+        Some(&canonical_environment().await.values)
+    } else {
+        None
+    };
+    let (mut command, env) = command_in(path, spec, environment, policy, owner)?;
     let per_command = spec
         .timeout_seconds
         .and_then(|s| start.checked_add(Duration::from_secs(s)));
@@ -423,6 +546,10 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
         receipt.outcome = CheckExecutionOutcome::Infrastructure;
         receipt.infrastructure_message = Some(error);
     }
+    // The canonical policy runs in the Task worktree, which is only a clean
+    // checkout of the commit when nothing is modified, staged or untracked
+    // there before the first command. `None`: the witness could not be taken.
+    let mut clean_before = None;
     if receipt.outcome == CheckExecutionOutcome::Passed {
         if let Some(path) = path.as_ref() {
             if witnessed {
@@ -431,6 +558,17 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
                         .await
                         .ok()
                         .and_then(Result::ok);
+            }
+            if canonical(&input.spec.execution_policy) {
+                clean_before = tokio::time::timeout(
+                    CLEAN_WITNESS_TIMEOUT,
+                    git::command_output(path, &["status", "--porcelain"]),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .filter(|output| output.status.success())
+                .map(|output| output.stdout.is_empty());
             }
             let mut sequence = CheckSequence::new(input.spec.clone());
             while let Some((_, spec)) = sequence.next_command() {
@@ -476,6 +614,17 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
         if let Ok((head, tracked)) = evidence {
             receipt.finished_head = head;
             receipt.tracked_changes = tracked;
+        }
+        if canonical(&input.spec.execution_policy) {
+            // One witness for the consumer: the commands ran on a clean
+            // checkout and left no tracked change. A checkout that was not
+            // clean before is reported as changed, and an unknown start as
+            // unknown, so neither can certify a reusable result.
+            receipt.tracked_changes = match (clean_before, receipt.tracked_changes) {
+                (Some(true), after) => after,
+                (Some(false), _) => Some(true),
+                (None, _) => None,
+            };
         }
     }
     if let Some(path) = path.as_ref() {

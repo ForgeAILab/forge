@@ -77,13 +77,35 @@ impl WorkspaceCheckOwners {
         .map_err(ServiceError::invalid_operation)?;
         // Secret bytes never enter check storage. Controlled values must still
         // equal the declared snapshot; volatile values make the key uncacheable.
+        // Under the canonical policy a key the Project does not set is the
+        // owner's own value, and a Project value is compared by its revision:
+        // a run never executes with an environment its identity does not name.
+        let owner = if record.run.identity.inputs.spec.execution_policy == CANONICAL_CI_POLICY {
+            Some(check_executor::canonical_environment().await)
+        } else {
+            None
+        };
         for (key, value) in &record.run.identity.inputs.environment {
-            if let CheckEnvironmentValue::ControlledValue(expected) = value {
-                if environment.env.get(key) != Some(expected) {
-                    return Err(ServiceError::invalid_operation(
-                        "check environment revision changed",
-                    ));
+            let actual = environment.env.get(key);
+            let unchanged = match value {
+                CheckEnvironmentValue::ControlledValue(expected) => {
+                    actual.or_else(|| owner.and_then(|owner| owner.values.get(key)))
+                        == Some(expected)
                 }
+                CheckEnvironmentValue::SecretRevision(expected) if owner.is_some() => {
+                    match actual {
+                        Some(actual) => {
+                            super::policy::value_revision(&self.db, key, actual).await? == *expected
+                        }
+                        None => false,
+                    }
+                }
+                _ => true,
+            };
+            if !unchanged {
+                return Err(ServiceError::invalid_operation(
+                    "check environment revision changed",
+                ));
             }
         }
         Ok(environment.env)
@@ -155,8 +177,11 @@ impl WorkspaceCheckOwners {
             let actual=tokio::time::timeout(Duration::from_secs(2),git::get_current_sha(Path::new(path))).await.map_err(|_| ServiceError::invalid_operation("check candidate witness timed out"))??;
             if actual!=record.run.identity.commit_sha { return Err(ServiceError::invalid_operation("check candidate changed")); }
             let environment=self.environment(record).await?;
+            // The canonical policy is attested by this owner, now: a receipt
+            // whose attestation differs from the identity certifies nothing.
+            let inputs=if record.run.identity.inputs.spec.execution_policy==CANONICAL_CI_POLICY { Some(check_executor::canonical_inputs().await.map_err(ServiceError::invalid_operation)?) } else { None };
             crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
-                operation_id:&id,spec:&record.run.identity.inputs.spec,target:check_executor::CheckoutTarget::Workspace(Path::new(path)),owner:intent.owner.clone(),input_revisions:None,environment:&environment,deadline:Some(deadline),cancel:&token,permit:&check_executor::CheckPermit::already_admitted(),cleanup:check_executor::CleanupPlan { commands:&[],timeout:check_executor::CLEANUP_TIMEOUT },output_limit:check_executor::OUTPUT_TAIL_BYTES,
+                operation_id:&id,spec:&record.run.identity.inputs.spec,target:check_executor::CheckoutTarget::Workspace(Path::new(path)),owner:intent.owner.clone(),input_revisions:inputs.as_ref(),environment:&environment,deadline:Some(deadline),cancel:&token,permit:&check_executor::CheckPermit::already_admitted(),cleanup:check_executor::CleanupPlan { commands:&[],timeout:check_executor::CLEANUP_TIMEOUT },output_limit:check_executor::OUTPUT_TAIL_BYTES,
             }).await
         }.await.unwrap_or_else(|_| check_executor::unstarted_receipt(&id,intent.owner.clone(),CheckExecutionOutcome::Infrastructure,Some("check checkout or execution inputs unavailable".into())));
         let result = DaemonCheckResult::Completed {
@@ -191,11 +216,16 @@ impl CheckOwnerPort for WorkspaceCheckOwners {
                 "check placement is not ready",
             ));
         }
-        let expected_policy = match placement.owner_kind {
-            PlacementOwnerKind::Server => "legacy-server/1",
-            PlacementOwnerKind::Daemon => "legacy-daemon/1",
+        // A daemon attests no inputs yet, so only the server owner executes
+        // the canonical policy.
+        let policy = run.identity.inputs.spec.execution_policy.as_str();
+        let configured = match placement.owner_kind {
+            PlacementOwnerKind::Server => {
+                matches!(policy, "legacy-server/1" | CANONICAL_CI_POLICY)
+            }
+            PlacementOwnerKind::Daemon => policy == "legacy-daemon/1",
         };
-        if run.identity.inputs.spec.execution_policy != expected_policy {
+        if !configured {
             return Err(ServiceError::invalid_operation(
                 "check owner policy is not configured",
             ));

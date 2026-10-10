@@ -190,6 +190,12 @@ pub struct CheckResultEvidence {
     /// Actual environment secret values, used transiently for redaction only.
     /// Never serialized, stored, or included in an identity.
     pub redaction_values: Vec<String>,
+    /// The owner's evidence that this run may stand for a later request of
+    /// the same identity: a clean checkout at the commit before, the same
+    /// HEAD and no tracked change after, every process tree stopped. A run
+    /// that is a valid verdict for its own consumers but lacks this is
+    /// stored and delivered, and never reused.
+    pub reusable: bool,
 }
 /// The caller's last read of a run. `lease_owner` is None only for a queued
 /// run nobody has claimed; that fence is version-only and can do nothing but
@@ -685,7 +691,7 @@ impl CheckRunRepo for SqliteDb {
         let id = new_uuid_v4();
         sqlx::query("INSERT INTO check_result(id,run_id,identity_key,outcome,cleanup,certified,cacheable,steps_json,output_truncated,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
             .bind(&id).bind(&run.id).bind(&run.identity_key).bind(evidence.outcome.to_string()).bind(evidence.cleanup.to_string())
-            .bind(certified).bind(run.cacheable).bind(steps).bind(evidence.output_truncated).bind(now).execute(&mut *tx).await?;
+            .bind(certified).bind(run.cacheable && certified && evidence.reusable).bind(steps).bind(evidence.output_truncated).bind(now).execute(&mut *tx).await?;
         sqlx::query("UPDATE check_consumer SET result_id=? WHERE run_id=?")
             .bind(&id)
             .bind(&run.id)

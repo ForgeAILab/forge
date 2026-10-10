@@ -1,4 +1,6 @@
-//! Characterization of today's execution families; no caller executes this spec.
+//! The check spec of every execution family. With `canonical_policy`, entry
+//! CI on a server-owned checkout is built for the durable runner's reusable
+//! policy; every other spec characterizes a path that executes outside it.
 use crate::contract::DEFAULT_CHECK_TIMEOUT_SECONDS;
 use api_types::*;
 use serde_json::Value;
@@ -28,6 +30,10 @@ pub struct CheckSpecConfiguration<'a> {
     pub event: LifecycleEvent,
     pub role: &'a str,
     pub owner_is_daemon: bool,
+    /// Build the bundle for the durable runner's canonical, reusable policy
+    /// instead of the frozen policy of the inline path. Entry CI on a
+    /// server-owned checkout only.
+    pub canonical_policy: bool,
     /// The Task worktree the bundle would run in, when one exists: workspace
     /// id and placement generation. Families that act on the worktree put it
     /// in the run identity; families that only read a commit never do.
@@ -104,6 +110,14 @@ pub fn build_check_spec(
     } else {
         purpose
     };
+    // The canonical policy is defined for the CI bundle on a server-owned
+    // checkout. A daemon owner attests no inputs yet, and the manual
+    // ReviewRunner, conformance and every other family keep the frozen policy
+    // of their own execution path.
+    let canonical = config.canonical_policy;
+    if canonical && (family != CheckPurpose::EntryCi || config.owner_is_daemon) {
+        return Err("the canonical policy runs entry CI on a server-owned checkout only".into());
+    }
     let mut has_setup = false;
     let mut spec = CheckSpec {
         schema_revision: CHECK_SPEC_REVISION,
@@ -115,12 +129,19 @@ pub fn build_check_spec(
         blank_commands: Vec::new(),
         execution_policy: if config.owner_is_daemon {
             "legacy-daemon/1"
+        } else if canonical {
+            CANONICAL_CI_POLICY
         } else {
             "legacy-server/1"
         }
         .into(),
     };
-    let keys: BTreeSet<_> = config.environment.env.keys().cloned().collect();
+    let mut keys: BTreeSet<_> = config.environment.env.keys().cloned().collect();
+    if canonical {
+        // The canonical policy clears the ambient environment, so the spec
+        // names what replaces it and the digest covers it.
+        keys.extend(CANONICAL_ENVIRONMENT_KEYS.map(str::to_owned));
+    }
     let mut add = |id: String,
                    command: String,
                    cwd,
@@ -145,7 +166,11 @@ pub fn build_check_spec(
             environment_keys: keys.clone(),
             timeout_seconds: timeout,
             failure_policy,
-            cacheability: CheckCacheability::Uncacheable,
+            cacheability: if canonical {
+                CheckCacheability::DeclaredControlledInputs
+            } else {
+                CheckCacheability::Uncacheable
+            },
             requirement_ids: requirements,
         });
         true

@@ -34,10 +34,17 @@ pub(super) fn validate_receipt(
     {
         return Err(refuse());
     }
-    let legacy = matches!(
-        run.identity.inputs.spec.execution_policy.as_str(),
-        "legacy-server/1" | "legacy-daemon/1"
-    );
+    let policy = run.identity.inputs.spec.execution_policy.as_str();
+    let legacy = matches!(policy, "legacy-server/1" | "legacy-daemon/1");
+    // The canonical CI policy runs in the Task worktree, as the steps always
+    // did. A step that leaves a tracked change, a worktree that was not clean
+    // or a process tree that was not confirmed stopped is still that Task's
+    // verdict, exactly as before; it is only never reused. Every other
+    // non-legacy policy keeps the strict rule: no witness, no pass.
+    let canonical = policy == CANONICAL_CI_POLICY;
+    let witnessed = receipt.prepared_head.as_deref() == Some(&run.identity.commit_sha)
+        && receipt.finished_head == receipt.prepared_head
+        && receipt.tracked_changes == Some(false);
     let mut previous = started;
     let mut commands = Vec::new();
     for (index, command) in receipt.commands.iter().enumerate() {
@@ -51,7 +58,7 @@ pub(super) fn validate_receipt(
             || from < previous
             || to < from
             || to > finished
-            || (!legacy && !command.process_tree_stopped)
+            || (!legacy && !canonical && !command.process_tree_stopped)
         {
             return Err(refuse());
         }
@@ -89,14 +96,17 @@ pub(super) fn validate_receipt(
         }
         // Legacy policies deliberately take no adjacent Git witness. They can
         // produce uncached mechanical evidence, never an unwitnessed cache pass.
-        if (!legacy || run.cacheable)
-            && (receipt.prepared_head.as_deref() != Some(&run.identity.commit_sha)
-                || receipt.finished_head != receipt.prepared_head
-                || receipt.tracked_changes != Some(false))
-        {
+        if !canonical && (!legacy || run.cacheable) && !witnessed {
             return Err(refuse());
         }
     }
+    let reusable = receipt.outcome == CheckExecutionOutcome::Passed
+        && witnessed
+        && receipt.commands.iter().all(|c| c.process_tree_stopped)
+        && matches!(
+            receipt.cleanup.outcome,
+            CheckCleanupOutcome::NotPerformed | CheckCleanupOutcome::Success
+        );
     let cleanup = match receipt.cleanup.outcome {
         CheckCleanupOutcome::NotPerformed => CheckCleanup::NotPerformed,
         CheckCleanupOutcome::Success => CheckCleanup::Success,
@@ -137,5 +147,6 @@ pub(super) fn validate_receipt(
                     || c.stderr_drain_incomplete
             }),
         redaction_values: vec![],
+        reusable,
     })
 }

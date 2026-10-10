@@ -798,6 +798,28 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Check results can now be reused, for the canonical CI policy (plan 3.3
+  stage D part 2, scope 1). Nothing runs under it yet.** A new execution
+  policy, `canonical-ci/1`, defines when the stored result of a CI bundle may
+  answer a later request for the same commit, commands and environment without
+  running anything: the ambient environment is cleared and replaced by a
+  declared set (`PATH` and `HOME` in the check's identity by value, each
+  Project environment value by an opaque revision, and the owner's `USER`,
+  `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`,
+  `GOPATH`, `GOROOT`, `JAVA_HOME` in the owner's attested environment
+  identity); the executor witnesses a clean checkout at the commit before the
+  first command and the same HEAD with no tracked change after the last; every
+  command's process group is stopped when it exits. A pass with that complete
+  witness is reusable. A pass that left a tracked change, started on a
+  worktree that was not clean or moved HEAD is still the verdict for the Task
+  that asked and is never reused; failed, timed-out, cancelled and
+  infrastructure results are never reused. Only the server owner attests its
+  environment, so daemon-placed checks stay on the frozen policy and always
+  run. Review-entry CI still runs inline exactly as before: moving it onto the
+  durable runner (which is what makes a re-review of an unchanged commit run
+  no CI) is the next step and is not in this change. No stored check result
+  is migrated or reinterpreted.
+
 - **Task conditions can say a Task is waiting on its checks (3.3 stage D
   part 1).** The public Task condition gains the reason
   `{ "kind": "check", "wait": { "phase", "consumer_id", "origin" } }` with

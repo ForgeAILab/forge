@@ -105,6 +105,7 @@ async fn settle(
                 }],
                 output_truncated: false,
                 redaction_values: vec![],
+                reusable: true,
             },
             &now,
         )
@@ -2066,4 +2067,335 @@ async fn an_owners_retry_is_idempotent_and_never_reruns_a_stale_identity() {
     assert!(lifted.check_witness().is_none() && !lifted.is_blocked());
     assert!(store.retryable_check_runs(10).await.unwrap().is_empty());
     assert_eq!(store.enqueue_check_result_steps(10).await.unwrap(), 0);
+}
+
+// ---- canonical CI policy: reuse through the real server owner ----
+
+struct Canonical {
+    temp: tempfile::TempDir,
+    store: Arc<SqliteDb>,
+    runner: Arc<CheckRunner>,
+    worker: CheckRunWorker,
+    checkout: std::path::PathBuf,
+    head: String,
+}
+async fn fixture_git(path: &std::path::Path, args: &[&str]) {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "fixture Git command failed");
+}
+async fn canonical_fixture() -> Canonical {
+    let (temp, store, runner) = fixture().await;
+    let checkout = temp.path().join("repo");
+    std::fs::create_dir(&checkout).unwrap();
+    fixture_git(&checkout, &["init", "-q"]).await;
+    fixture_git(&checkout, &["config", "user.name", "Check test"]).await;
+    fixture_git(
+        &checkout,
+        &["config", "user.email", "check@example.invalid"],
+    )
+    .await;
+    std::fs::write(checkout.join("tracked"), "one\n").unwrap();
+    fixture_git(&checkout, &["add", "."]).await;
+    fixture_git(&checkout, &["commit", "-q", "-m", "candidate"]).await;
+    let head = git::get_current_sha(&checkout).await.unwrap();
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('t2','p','second','review',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES('w','t','r',?,'task/branch','ready',?,?)").bind(checkout.to_str()).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('l','r','server',?,'primary_checkout',1,'ready',?,?)").bind(checkout.to_str()).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES('pl','w','t','server','l',?,1,'ready','scheduler','{}',?,?)").bind(checkout.to_str()).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    let owners = Arc::new(super::owners::WorkspaceCheckOwners::new(
+        store.clone(),
+        Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers()),
+        std::time::Duration::from_secs(60),
+    ));
+    let worker = CheckRunWorker::new(store.clone(), owners);
+    Canonical {
+        temp,
+        store,
+        runner,
+        worker,
+        checkout,
+        head,
+    }
+}
+impl Canonical {
+    /// The step appends one line per execution, outside the checkout: the
+    /// number of lines is the number of times the executor ran it.
+    fn counting_step(&self) -> String {
+        format!(
+            "echo run >> '{}'",
+            self.temp.path().join("executions").display()
+        )
+    }
+    fn executions(&self) -> usize {
+        std::fs::read_to_string(self.temp.path().join("executions"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+    async fn project_environment(&self) -> std::collections::BTreeMap<String, String> {
+        review::contract::project_environment(&self.store, "t")
+            .await
+            .unwrap()
+            .env
+    }
+    async fn set_project_value(&self, value: &str) {
+        sqlx::query("UPDATE project SET settings=? WHERE id='p'")
+            .bind(serde_json::json!({"environment":{"env":{"FLAVOR":value}}}).to_string())
+            .execute(self.store.pool())
+            .await
+            .unwrap();
+    }
+    async fn request(&self, key: &str, task: &str, step: &str) -> CheckRunRequest {
+        let project = self.project_environment().await;
+        let mut spec = check_executor::legacy_ci_spec(step, &project, 0, false);
+        spec.execution_policy = CANONICAL_CI_POLICY.into();
+        spec.commands[0].cacheability = CheckCacheability::DeclaredControlledInputs;
+        spec.commands[0]
+            .environment_keys
+            .extend(CANONICAL_ENVIRONMENT_KEYS.map(str::to_owned));
+        let mut req = request(key);
+        req.task_id = Some(task.into());
+        req.workspace_id = Some("w".into());
+        req.identity.commit_sha = self.head.clone();
+        req.identity.inputs = super::policy::digest_input(&self.store, spec, &project)
+            .await
+            .unwrap();
+        req
+    }
+    async fn ask(&self, req: CheckRunRequest) -> RequestedCheck {
+        self.runner.request(req).await.unwrap()
+    }
+    async fn drive(&self, run: &StoredCheckRun) -> StoredCheckResult {
+        self.worker
+            .drive(admit(&self.store, run).await)
+            .await
+            .unwrap();
+        let id: String = sqlx::query_scalar(
+            "SELECT id FROM check_result WHERE run_id=? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&run.id)
+        .fetch_one(self.store.pool())
+        .await
+        .unwrap();
+        self.store.check_result(&id).await.unwrap().unwrap()
+    }
+    async fn runs(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM check_run")
+            .fetch_one(self.store.pool())
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_second_request_for_an_unchanged_commit_and_spec_runs_nothing() {
+    let f = canonical_fixture().await;
+    let step = f.counting_step();
+    let first = f.ask(f.request("review-1", "t", &step).await).await;
+    assert!(first.consumer.result_id.is_none());
+    let run = scheduled(first);
+    assert!(run.cacheable);
+    let result = f.drive(&run).await;
+    assert_eq!(result.outcome, CheckResultOutcome::Pass);
+    assert!(result.certified && result.cacheable);
+    assert_eq!(f.executions(), 1);
+
+    // The re-review: same commit, same spec, same environment.
+    let again = f.ask(f.request("review-2", "t", &step).await).await;
+    assert!(
+        matches!(&again.outcome, CheckRequestOutcome::Hit(hit) if hit.id == result.id),
+        "an unchanged commit and spec must reuse the stored result"
+    );
+    assert_eq!(
+        again.consumer.result_id.as_deref(),
+        Some(result.id.as_str())
+    );
+    // Measured: zero executor invocations and no second run row.
+    assert_eq!(f.executions(), 1);
+    assert_eq!(f.runs().await, 1);
+    // Another Task at that commit reuses it too, and takes no slot.
+    let other = f.ask(f.request("review-other", "t2", &step).await).await;
+    assert!(matches!(other.outcome, CheckRequestOutcome::Hit(_)));
+    assert_eq!((f.executions(), f.runs().await), (1, 1));
+    assert_eq!(f.store.check_run_counts().await.unwrap().admitted_runs, 0);
+}
+
+#[tokio::test]
+async fn two_tasks_on_one_commit_and_spec_share_one_run() {
+    let f = canonical_fixture().await;
+    let step = f.counting_step();
+    let run = scheduled(f.ask(f.request("first-task", "t", &step).await).await);
+    let joined = f.ask(f.request("second-task", "t2", &step).await).await;
+    assert!(matches!(&joined.outcome, CheckRequestOutcome::Joined(same) if same.id == run.id));
+    let result = f.drive(&run).await;
+    assert_eq!(f.executions(), 1);
+    let attached: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT result_id FROM check_consumer ORDER BY created_at")
+            .fetch_all(f.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(attached, [Some(result.id.clone()), Some(result.id)]);
+}
+
+#[tokio::test]
+async fn nothing_is_reused_when_the_commit_spec_environment_or_policy_differs() {
+    let f = canonical_fixture().await;
+    let step = f.counting_step();
+    f.set_project_value("vanilla").await;
+    let base = f.request("base", "t", &step).await;
+    let base_key = base.identity.key().unwrap();
+    let result = f.drive(&scheduled(f.ask(base.clone()).await)).await;
+    assert!(result.cacheable);
+    assert_eq!(f.executions(), 1);
+    let scheduled_fresh = |reply: RequestedCheck| {
+        assert!(
+            matches!(reply.outcome, CheckRequestOutcome::Scheduled(_)),
+            "a different identity must run its own check"
+        );
+        scheduled(reply)
+    };
+
+    // Another spec: one more command character.
+    let spec = f.request("spec", "t", &format!("{step}; true")).await;
+    assert_ne!(spec.identity.key().unwrap(), base_key);
+    let run = scheduled_fresh(f.ask(spec).await);
+    assert!(f.drive(&run).await.cacheable);
+    assert_eq!(f.executions(), 2);
+
+    // Another Project value for a declared key.
+    f.set_project_value("chocolate").await;
+    let value = f.request("value", "t", &step).await;
+    assert_ne!(value.identity.key().unwrap(), base_key);
+    let run = scheduled_fresh(f.ask(value).await);
+    assert_eq!(f.drive(&run).await.outcome, CheckResultOutcome::Pass);
+    assert_eq!(f.executions(), 3);
+    f.set_project_value("vanilla").await;
+
+    // Another owner environment identity. Its run cannot even certify here:
+    // this owner attests its own environment, not the one the request names.
+    let mut env = base.clone();
+    env.request_key = "environment".into();
+    env.identity.inputs.environment_identity = CheckEnvironmentIdentity::Attested {
+        input_digest: "b".repeat(64),
+    };
+    assert_ne!(env.identity.key().unwrap(), base_key);
+    let run = scheduled_fresh(f.ask(env).await);
+    let foreign = f.drive(&run).await;
+    assert_eq!(foreign.outcome, CheckResultOutcome::InfrastructureFailed);
+    assert!(!foreign.certified && !foreign.cacheable);
+
+    // The frozen policy: never reusable, and never served by a canonical pass.
+    let mut frozen = base.clone();
+    frozen.request_key = "frozen".into();
+    frozen.identity.inputs.spec.execution_policy = "legacy-server/1".into();
+    frozen.identity.inputs.spec.commands[0].cacheability = CheckCacheability::Uncacheable;
+    assert_ne!(frozen.identity.key().unwrap(), base_key);
+    assert!(!scheduled_fresh(f.ask(frozen).await).cacheable);
+
+    // Another commit.
+    fixture_git(
+        &f.checkout,
+        &["commit", "-q", "--allow-empty", "-m", "next"],
+    )
+    .await;
+    let mut commit = f.request("commit", "t", &step).await;
+    commit.identity.commit_sha = git::get_current_sha(&f.checkout).await.unwrap();
+    assert_ne!(commit.identity.key().unwrap(), base_key);
+    scheduled_fresh(f.ask(commit).await);
+
+    // And the unchanged request is still a hit.
+    let mut same = base;
+    same.request_key = "same".into();
+    assert!(matches!(
+        f.ask(same).await.outcome,
+        CheckRequestOutcome::Hit(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_run_that_dirtied_the_tree_or_timed_out_is_a_verdict_but_never_reused() {
+    // A step that rewrites a tracked file: today's verdict, not reusable.
+    let f = canonical_fixture().await;
+    let step = format!("{}; echo two >> tracked", f.counting_step());
+    let run = scheduled(f.ask(f.request("dirty-1", "t", &step).await).await);
+    assert!(run.cacheable);
+    let result = f.drive(&run).await;
+    assert_eq!(result.outcome, CheckResultOutcome::Pass);
+    assert!(result.certified && !result.cacheable);
+    assert_eq!(
+        f.store.check_run(&run.id).await.unwrap().unwrap().state,
+        CheckRunState::Succeeded
+    );
+    // The consumer that asked is answered by its own run, never as a hit.
+    let repeat = f.ask(f.request("dirty-1", "t", &step).await).await;
+    assert!(matches!(&repeat.outcome, CheckRequestOutcome::Joined(same) if same.id == run.id));
+    assert_eq!(
+        repeat.consumer.result_id.as_deref(),
+        Some(result.id.as_str())
+    );
+    // A new consumer runs it again (the worktree is still dirty: nor is
+    // that one reusable).
+    let next = f.ask(f.request("dirty-2", "t", &step).await).await;
+    let next = scheduled(next);
+    assert!(!f.drive(&next).await.cacheable);
+    assert_eq!(f.executions(), 2);
+    assert_eq!(
+        f.store.check_run_counts().await.unwrap().reusable_results,
+        0
+    );
+
+    // A run stopped by its wall limit.
+    let f = canonical_fixture().await;
+    let step = format!("{}; sleep 30", f.counting_step());
+    let mut slow = f.request("slow-1", "t", &step).await;
+    slow.wall_timeout_seconds = 1;
+    let result = f.drive(&scheduled(f.ask(slow).await)).await;
+    assert_eq!(result.outcome, CheckResultOutcome::TimedOut);
+    assert!(!result.certified && !result.cacheable);
+    let again = f.ask(f.request("slow-2", "t", &step).await).await;
+    assert!(matches!(again.outcome, CheckRequestOutcome::Scheduled(_)));
+}
+
+#[tokio::test]
+async fn a_project_value_revision_survives_a_restart_and_never_holds_the_value() {
+    let f = canonical_fixture().await;
+    f.set_project_value("s3cret-value").await;
+    let req = f.request("before-restart", "t", "true").await;
+    let stored = serde_json::to_string(&req.identity.inputs).unwrap();
+    assert!(!stored.contains("s3cret-value"));
+    let revision = super::policy::value_revision(&f.store, "FLAVOR", "s3cret-value")
+        .await
+        .unwrap();
+    assert!(matches!(
+        &req.identity.inputs.environment["FLAVOR"],
+        CheckEnvironmentValue::SecretRevision(stated) if *stated == revision
+    ));
+    assert_ne!(
+        revision,
+        super::policy::value_revision(&f.store, "FLAVOR", "other")
+            .await
+            .unwrap()
+    );
+    // A request stated before a restart is verified by the owner after it:
+    // the reopened server computes the same revision and the same identity.
+    f.store.pool().close().await;
+    let reopened = SqliteDb::new(
+        db::create_sqlite_pool(&format!(
+            "sqlite://{}",
+            f.temp.path().join("checks.sqlite").display()
+        ))
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        super::policy::value_revision(&reopened, "FLAVOR", "s3cret-value")
+            .await
+            .unwrap(),
+        revision
+    );
 }

@@ -566,3 +566,166 @@ fn redaction_leaves_short_edge_matches_alone_and_masks_cut_secrets() {
         "[REDACTED] failed [REDACTED]"
     );
 }
+
+async fn git(path: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "fixture Git command failed");
+}
+async fn candidate() -> (tempfile::TempDir, String) {
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init", "-q"]).await;
+    git(temp.path(), &["config", "user.name", "Check test"]).await;
+    git(
+        temp.path(),
+        &["config", "user.email", "check@example.invalid"],
+    )
+    .await;
+    std::fs::write(temp.path().join("tracked"), "one\n").unwrap();
+    std::fs::write(temp.path().join(".gitignore"), "ignored\n").unwrap();
+    git(temp.path(), &["add", "."]).await;
+    git(temp.path(), &["commit", "-q", "-m", "candidate"]).await;
+    let head = git::get_current_sha(temp.path()).await.unwrap();
+    (temp, head)
+}
+fn canonical_spec(text: &str, keys: &[&str]) -> CheckSpec {
+    let mut spec = spec(text);
+    spec.execution_policy = CANONICAL_CI_POLICY.into();
+    spec.commands[0].cacheability = CheckCacheability::DeclaredControlledInputs;
+    spec.commands[0].environment_keys = CANONICAL_ENVIRONMENT_KEYS
+        .iter()
+        .chain(keys)
+        .map(|key| (*key).to_owned())
+        .collect();
+    spec
+}
+async fn canonical_run(
+    path: &Path,
+    spec: &CheckSpec,
+    env: &BTreeMap<String, String>,
+) -> CheckReceipt {
+    let inputs = canonical_inputs().await.unwrap();
+    execute(CheckExecution {
+        operation_id: "canonical",
+        spec,
+        target: CheckoutTarget::Workspace(path),
+        owner: owner(),
+        input_revisions: Some(&inputs),
+        environment: env,
+        deadline: Some(Instant::now() + Duration::from_secs(30)),
+        cancel: &CancellationToken::new(),
+        permit: &CheckPermit::already_admitted(),
+        cleanup: CleanupPlan {
+            commands: &[],
+            timeout: Duration::from_millis(250),
+        },
+        output_limit: 4096,
+    })
+    .await
+}
+#[tokio::test]
+async fn a_canonical_run_on_a_clean_checkout_returns_the_full_witness_and_attestation() {
+    let (temp, head) = candidate().await;
+    // An ignored build product is not a change to the checkout.
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec("echo built > ignored", &[]),
+        &BTreeMap::new(),
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(receipt.prepared_head.as_deref(), Some(head.as_str()));
+    assert_eq!(receipt.finished_head, receipt.prepared_head);
+    assert_eq!(receipt.tracked_changes, Some(false));
+    assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
+    assert_eq!(
+        receipt.execution_inputs,
+        canonical_inputs().await.unwrap().identity().unwrap()
+    );
+    assert!(matches!(
+        receipt.execution_inputs,
+        CheckEnvironmentIdentity::Attested { .. }
+    ));
+}
+#[tokio::test]
+async fn a_canonical_command_sees_the_declared_environment_and_nothing_ambient() {
+    let (temp, _) = candidate().await;
+    // Present in this process, declared by nobody: the command must not see it.
+    assert!(std::env::var_os("CARGO_TARGET_DIR").is_some() || std::env::var_os("CARGO").is_some());
+    let env = BTreeMap::from([("DECLARED".to_owned(), "project-value".to_owned())]);
+    let script = "test -n \"$PATH\" && test -n \"$HOME\" && test \"$DECLARED\" = project-value \
+        && test -z \"${CARGO+x}\" && test -z \"${CARGO_TARGET_DIR+x}\" && test -z \"${CARGO_MANIFEST_DIR+x}\" \
+        && command -v git >/dev/null && printf 'home=%s' \"$HOME\"";
+    let receipt = canonical_run(temp.path(), &canonical_spec(script, &["DECLARED"]), &env).await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    // The owner's own values are not secrets: output naming them is kept.
+    let home = &canonical_environment().await.values["HOME"];
+    // Compared without printing either: a failure must not show the path.
+    assert!(receipt.commands[0].stdout_tail.strip_prefix("home=") == Some(home.as_str()));
+    // A Project value for a canonical key wins over the owner's.
+    let env = BTreeMap::from([("HOME".to_owned(), "/project-home".to_owned())]);
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec("test \"$HOME\" = /project-home", &[]),
+        &env,
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    // A declared key nobody provides refuses before anything runs.
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec("true", &["ABSENT"]),
+        &BTreeMap::new(),
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Infrastructure);
+}
+#[tokio::test]
+async fn a_canonical_witness_reports_a_dirty_start_a_tracked_change_and_a_moved_head() {
+    // Untracked work the commit does not contain: not a clean checkout.
+    let (temp, _) = candidate().await;
+    std::fs::write(temp.path().join("uncommitted"), "x").unwrap();
+    let receipt = canonical_run(temp.path(), &canonical_spec("true", &[]), &BTreeMap::new()).await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(receipt.tracked_changes, Some(true));
+    // A step that rewrites a tracked file still passes; the witness says so.
+    let (temp, _) = candidate().await;
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec("echo two >> tracked", &[]),
+        &BTreeMap::new(),
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(receipt.tracked_changes, Some(true));
+    // A step that commits moves HEAD.
+    let (temp, head) = candidate().await;
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec("git commit -q --allow-empty -m moved", &[]),
+        &BTreeMap::new(),
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(receipt.prepared_head.as_deref(), Some(head.as_str()));
+    assert_ne!(receipt.finished_head, receipt.prepared_head);
+}
+#[tokio::test]
+async fn a_canonical_step_does_not_leave_its_process_tree_running() {
+    let (temp, _) = candidate().await;
+    let marker = temp.path().join("ignored");
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec("(sleep 1; echo late > ignored) & true", &[]),
+        &BTreeMap::new(),
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert!(receipt.commands[0].process_tree_stopped);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!marker.exists());
+}

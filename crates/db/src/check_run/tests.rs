@@ -101,6 +101,7 @@ fn evidence(outcome: CheckResultOutcome, cleanup: CheckCleanup) -> CheckResultEv
         }],
         output_truncated: false,
         redaction_values: vec![],
+        reusable: true,
     }
 }
 async fn cleaning(db: &SqliteDb, req: CheckRunRequest) -> StoredCheckRun {
