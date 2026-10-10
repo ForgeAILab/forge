@@ -8,6 +8,45 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A manual review re-run goes through the ordinary review entry; the
+  separate review runner is gone (3.3 stage E).** The review `retry` Task
+  action ("Re-run Review" / "Recheck Review") keeps its verb and payload, but
+  it no longer runs CI and an auditor inline:
+  - **It is asynchronous and durable.** The action only re-enters `review`;
+    the checks and the review run afterwards in the Task's own steps and
+    survive a restart. Read the Task and its Reviews for the outcome.
+  - **Its CI is bounded.** The checks run on the durable check runner: each
+    command under `check_timeout_seconds` and the whole run under the
+    3,600-second wall limit of a review-entry check run (they ran unbounded
+    before). The run is admitted against the machine's run cap. An unchanged
+    commit, worktree and environment reuse a certified green result instead of
+    running again; the review itself is always asked for again.
+  - **No synthetic reviewer executions.** A re-run no longer creates a
+    `reviewer` execution that no Agent ran (nor an `auditor` child), so these
+    stop appearing in execution history and in Agent and machine occupancy.
+    Existing rows stay readable. One found still `running` after the upgrade
+    is stopped by recovery with an error naming it, and the Task's review
+    entry runs again.
+  - **The reviewer is an ordinary reviewer.** It is dispatched as on any
+    review entry, under the ordinary read-only policy: a reviewer that changes
+    the worktree fails. The re-run no longer restores the worktree to the
+    pre-auditor commit and carries on.
+  - **A failed re-run spends review retry budget** like an automatic entry
+    (the inline re-run was budget-exempt as an owner action).
+  - **One attempt per entry.** The open attempt a re-run replaces is closed as
+    `cancelled` (`execution_retry.status = "superseded_by_rerun"`). A Task
+    with neither checks nor a reviewer leaves review without a Review attempt
+    (the inline re-run recorded an empty passed one).
+  - **Busy Tasks are refused.** While a review entry or a reviewer is still
+    running no review `retry` is offered (`409 action_unavailable`); the
+    internal `rerun_review` command answers `409 task_busy`.
+  - Review details of a re-run without a reviewer are now the object every
+    entry writes (`{"ci_steps": [...]}`), not a bare step array.
+  - Rust API: `review::ReviewRunner`, `review::ReviewRequest`,
+    `TaskService::with_review_runner`, `ForgeRuntimeBuilder::with_review_runner`
+    and the `review_runner` fields of `AppState`, `ForgeRuntime` and
+    `HookContext` are removed; `TaskService::rerun_review` returns the
+    re-entered `Task`.
 - **A machine under its free-space floor starts no new work (3.4 stage E).**
   With the default floor (10 GiB or 5 % of the workspace filesystem,
   whichever is larger, or 5 % of its inodes; on a filesystem under 20 GiB
