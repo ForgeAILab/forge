@@ -21,10 +21,12 @@
 //! and a run can be settled by a caller that never saw its [`SandboxEnv`].
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
+    time::SystemTime,
 };
 use tokio::process::Command;
 
@@ -61,6 +63,20 @@ pub enum RunPurpose {
 /// their output where they put it today, and shared caches (`GOCACHE`,
 /// `npm_config_cache`, `XDG_CACHE_HOME`) are never redirected.
 pub const BUILD_DIR_TABLE: [(&str, &str); 1] = [("CARGO_TARGET_DIR", "cargo")];
+
+/// Per-run temp directories this process created and has not yet removed.
+/// [`sweep_dead_runs`] never touches one: a hook, check, tool command or
+/// execution running in this process is live whatever any table says.
+static LIVE_RUN_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+/// First use of this module by the process. A directory modified after it was
+/// not left by a previous process, so the sweep leaves it alone.
+static PROCESS_START: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
+
+fn live_run_dirs() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+    LIVE_RUN_DIRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// A Task root the workspace owner reserved for Forge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,9 +120,30 @@ impl TaskRoot {
         self.0.join(TASK_DIR_NAME).join("home").join(family)
     }
 
+    /// [`Self::home`], created one level at a time and never through a
+    /// link or a file: `None` when `home` or `home/<family>` exists as
+    /// anything but a real directory, so the caller keeps its fallback.
+    pub fn prepare_home(&self, family: &str) -> Option<PathBuf> {
+        let homes = self.0.join(TASK_DIR_NAME).join("home");
+        let home = homes.join(family);
+        for dir in [&homes, &home] {
+            create_private_dir(dir).ok()?;
+            is_real_dir(dir).then_some(())?;
+        }
+        Some(home)
+    }
+
     /// `<task root>/.forge-task/build`.
     pub fn build_dir(&self) -> PathBuf {
         self.0.join(TASK_DIR_NAME).join("build")
+    }
+
+    /// Whether `.forge-task/build` is a real directory Forge can point a
+    /// toolchain at (created here when missing). A link or a file planted
+    /// there is never followed: the run builds where it did before.
+    fn build_dir_is_usable(&self) -> bool {
+        let build = self.build_dir();
+        create_private_dir(&build).is_ok() && is_real_dir(&build)
     }
 
     /// The temp directory of run `run_id`.
@@ -177,6 +214,9 @@ impl SandboxEnv {
     }
 
     fn build_dirs(task_root: &TaskRoot) -> Vec<(&'static str, PathBuf)> {
+        if !task_root.build_dir_is_usable() {
+            return Vec::new();
+        }
         BUILD_DIR_TABLE
             .iter()
             .map(|(key, dir)| (*key, task_root.build_dir().join(dir)))
@@ -196,12 +236,32 @@ impl SandboxEnv {
             .map(|(_, path)| path.as_path())
     }
 
+    /// This environment without the per-run temp directory: for a run whose
+    /// own sandbox could not write it. The run keeps the inherited one.
+    #[must_use]
+    pub fn without_tmp(mut self) -> Self {
+        self.tmp = None;
+        self
+    }
+
+    /// This environment without the build directories: for a run whose own
+    /// sandbox could not write them. The run builds where it did before.
+    #[must_use]
+    pub fn without_build(mut self) -> Self {
+        self.build.clear();
+        self
+    }
+
     /// Create the per-run temp directory. A run whose directory cannot be
     /// created keeps today's temp directory instead of failing.
     #[must_use = "the returned environment is the one to apply"]
     pub fn prepared(mut self) -> Self {
         if let Some(tmp) = &self.tmp {
+            LazyLock::force(&PROCESS_START);
+            // Live before it exists, so a concurrent sweep cannot take it.
+            live_run_dirs().insert(tmp.clone());
             if let Err(error) = prepare_run_tmp(tmp) {
+                live_run_dirs().remove(tmp);
                 tracing::warn!(path = %tmp.display(), %error, "per-run temp directory could not be created; run keeps the inherited one");
                 self.tmp = None;
             }
@@ -212,7 +272,8 @@ impl SandboxEnv {
     /// Remove the per-run temp directory. Idempotent.
     pub fn settle(&self) {
         if let Some(tmp) = &self.tmp {
-            remove_tree(tmp);
+            remove_run_tmp(tmp);
+            live_run_dirs().remove(tmp);
         }
     }
 
@@ -311,24 +372,54 @@ pub fn settle_run(worktree: &Path, run_id: &str) {
         return;
     };
     if let Some(tmp) = task_root.run_tmp(run_id) {
-        remove_tree(&tmp);
+        if !live_run_dirs().contains(&tmp) {
+            remove_run_tmp(&tmp);
+        }
     }
 }
 
-/// Remove the temp directories of runs that are no longer alive.
+/// Remove one per-run directory, but only out of a real directory: a
+/// `.forge-task/tmp` or `.forge-tmp` that is a link (or a file) is never
+/// removed through.
+fn remove_run_tmp(tmp: &Path) {
+    if tmp.parent().is_some_and(is_real_dir) {
+        remove_tree(tmp);
+    }
+}
+
+/// Remove the temp directories runs of a previous process left behind.
 ///
 /// `task_roots` is the directory whose children are Task roots (the server
-/// workspace root; `<root>/.forge/workspaces` on a daemon). Every per-run
-/// directory under a reserved Task root and under the short directory is
-/// removed unless its key belongs to a run id in `live`. Returns the number
-/// of directories removed.
+/// workspace root; `<root>/.forge/workspaces` on a daemon). A per-run
+/// directory under a reserved Task root or under the short directory is
+/// removed only when all of these hold:
+///
+/// - this process did not create it (a hook, check, tool command, probe or
+///   execution running here is never touched, whenever the sweep runs and
+///   however often);
+/// - it was last modified before this process first used this module (so a
+///   directory another live owner made since is left alone);
+/// - its key belongs to no run id in `live`.
+///
+/// Links are never followed: not a linked Task root, not a linked
+/// `.forge-task`, `tmp` or `.forge-tmp`. Returns the number removed.
 pub fn sweep_dead_runs<'a>(task_roots: &Path, live: impl IntoIterator<Item = &'a str>) -> usize {
+    sweep_dead_runs_older_than(task_roots, live, *PROCESS_START)
+}
+
+fn sweep_dead_runs_older_than<'a>(
+    task_roots: &Path,
+    live: impl IntoIterator<Item = &'a str>,
+    cutoff: SystemTime,
+) -> usize {
     let live: Vec<String> = live.into_iter().filter_map(run_key).collect();
     let mut parents = vec![task_roots.join(SHORT_TMP_DIR_NAME)];
     if let Ok(entries) = fs::read_dir(task_roots) {
         parents.extend(
             entries
                 .flatten()
+                // `file_type` does not follow a link.
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
                 .filter_map(|entry| TaskRoot::at(&entry.path()))
                 .map(|root| root.0.join(TASK_DIR_NAME).join("tmp")),
         );
@@ -343,10 +434,17 @@ pub fn sweep_dead_runs<'a>(task_roots: &Path, live: impl IntoIterator<Item = &'a
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            if live.iter().any(|key| OsStr::new(key) == name) {
+            let path = entry.path();
+            let old = fs::symlink_metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified < cutoff);
+            if !old
+                || live.iter().any(|key| OsStr::new(key) == name)
+                || live_run_dirs().contains(&path)
+            {
                 continue;
             }
-            remove_tree(&entry.path());
+            remove_tree(&path);
             removed += 1;
         }
     }
@@ -588,9 +686,15 @@ mod tests {
         let sandbox =
             SandboxEnv::for_task_root(&root, "7b0c9f6e-1234", RunPurpose::Execution).prepared();
         assert!(tmp.is_dir());
+        // A run this process still holds is not settled from elsewhere.
+        settle_run(&worktree, "7b0c9f6e-1234");
+        assert!(tmp.is_dir());
+        sandbox.settle();
+        assert!(!tmp.exists());
+        // A leftover of a dead process is.
+        fs::create_dir(&tmp).unwrap();
         settle_run(&worktree, "7b0c9f6e-1234");
         assert!(!tmp.exists());
-        drop(sandbox);
 
         // A socket in the fallback directory binds; that is the point of it.
         #[cfg(unix)]
@@ -681,6 +785,10 @@ mod tests {
         assert_eq!(run(off).await, "unset");
     }
 
+    fn later() -> SystemTime {
+        SystemTime::now() + std::time::Duration::from_secs(60)
+    }
+
     #[test]
     fn sweep_removes_dead_runs_and_keeps_live_ones() {
         let dir = tempfile::tempdir().unwrap();
@@ -694,6 +802,7 @@ mod tests {
         }
         let short_root = TaskRoot::reserve(&short).unwrap();
         let long_root = TaskRoot::reserve(&long).unwrap();
+        // What a dead process left: directories this process never prepared.
         let mut dirs = Vec::new();
         for (root, run) in [
             (&short_root, "dead-run"),
@@ -701,14 +810,117 @@ mod tests {
             (&long_root, "dead-long"),
             (&long_root, "live-long"),
         ] {
-            let sandbox = SandboxEnv::for_task_root(root, run, RunPurpose::Execution).prepared();
-            dirs.push(sandbox.tmp_dir().unwrap().to_path_buf());
+            let tmp = root.run_tmp(run).unwrap();
+            fs::create_dir_all(&tmp).unwrap();
+            dirs.push(tmp);
         }
         assert!(dirs[2].starts_with(dir.path().join(SHORT_TMP_DIR_NAME)));
         fs::create_dir_all(unreserved.join("tmp/kept")).unwrap();
-        assert_eq!(sweep_dead_runs(dir.path(), ["live-run", "live-long"]), 2);
+        // Nothing is old enough for the real cutoff: all four were made
+        // after this process started.
+        assert_eq!(sweep_dead_runs(dir.path(), []), 0);
+        assert_eq!(
+            sweep_dead_runs_older_than(dir.path(), ["live-run", "live-long"], later()),
+            2
+        );
         assert!(!dirs[0].exists() && dirs[1].exists());
         assert!(!dirs[2].exists() && dirs[3].exists());
         assert!(unreserved.join("tmp/kept").exists());
+    }
+
+    /// Hooks, checks, tool commands and probes are in no table. The sweep
+    /// must not take the directory of one that is running in this process,
+    /// even with an empty live list and no age limit.
+    #[test]
+    fn sweep_never_removes_a_run_this_process_is_still_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("t").join("repo");
+        fs::create_dir_all(&worktree).unwrap();
+        TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let scope = SandboxEnv::for_command(&worktree, RunPurpose::Hook);
+        let tmp = scope.env().tmp_dir().unwrap().to_path_buf();
+        assert_eq!(sweep_dead_runs_older_than(dir.path(), [], later()), 0);
+        assert!(tmp.is_dir());
+        // Settling it by id from elsewhere is refused too.
+        settle_run(&worktree, tmp.file_name().unwrap().to_str().unwrap());
+        assert!(tmp.is_dir());
+        drop(scope);
+        assert!(!tmp.exists());
+        // Once settled it is an ordinary leftover again.
+        fs::create_dir(&tmp).unwrap();
+        assert_eq!(sweep_dead_runs_older_than(dir.path(), [], later()), 1);
+    }
+
+    /// `.forge-task`, its `tmp`, `home` and `build`, the short directory and
+    /// a Task-root entry that already exist as links (or files) are never
+    /// written through, removed through or handed to a run.
+    #[cfg(unix)]
+    #[test]
+    fn planted_links_and_files_are_never_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let victim = |name: &str| {
+            let path = outside.join(name);
+            fs::create_dir_all(path.join("runabc")).unwrap();
+            fs::write(path.join("runabc/keep"), "keep").unwrap();
+            path
+        };
+        let tasks = dir.path().join("w");
+
+        // `.forge-task` is a file: not a Task root, nothing set, nothing written.
+        let file_root = tasks.join("file");
+        fs::create_dir_all(file_root.join("repo")).unwrap();
+        fs::write(file_root.join(TASK_DIR_NAME), "not a directory").unwrap();
+        assert!(TaskRoot::reserve(&file_root).is_err());
+        let sandbox = SandboxEnv::for_run(&file_root.join("repo"), "runabc", RunPurpose::Execution)
+            .prepared();
+        assert_eq!(sandbox, SandboxEnv::none());
+        assert_eq!(
+            fs::read_to_string(file_root.join(TASK_DIR_NAME)).unwrap(),
+            "not a directory"
+        );
+
+        // `.forge-task/tmp`, `home` and `build` are links out of the root.
+        let linked = tasks.join("linked");
+        fs::create_dir_all(linked.join("repo")).unwrap();
+        let root = TaskRoot::reserve(&linked).unwrap();
+        for name in ["tmp", "home", "build"] {
+            symlink(victim(name), linked.join(TASK_DIR_NAME).join(name)).unwrap();
+        }
+        let sandbox =
+            SandboxEnv::for_run(&linked.join("repo"), "runabc", RunPurpose::Execution).prepared();
+        assert_eq!(sandbox.tmp_dir(), None, "a linked tmp is not handed out");
+        assert_eq!(sandbox.build_dir("CARGO_TARGET_DIR"), None);
+        assert_eq!(root.prepare_home("codex"), None);
+        settle_run(&linked.join("repo"), "runabc");
+        SandboxEnv::for_run(&linked.join("repo"), "runabc", RunPurpose::Hook).settle();
+
+        // A Task-root entry that is itself a link, and a linked short directory.
+        let real_root = outside.join("real-root");
+        fs::create_dir_all(real_root.join(".forge-task/tmp/runabc")).unwrap();
+        symlink(&real_root, tasks.join("alias")).unwrap();
+        symlink(victim("short"), tasks.join(SHORT_TMP_DIR_NAME)).unwrap();
+        let long = tasks.join("0d9d6a3e-5f0b-4c57-9d4e-1f2a3b4c5d6e-long-enough-name-for-fallback");
+        fs::create_dir_all(long.join("repo")).unwrap();
+        let long_root = TaskRoot::reserve(&long).unwrap();
+        if let Some(tmp) = long_root.run_tmp("runabc") {
+            assert!(tmp.starts_with(tasks.join(SHORT_TMP_DIR_NAME)));
+            let sandbox =
+                SandboxEnv::for_task_root(&long_root, "runabc", RunPurpose::Check).prepared();
+            assert_eq!(sandbox.tmp_dir(), None);
+            settle_run(&long.join("repo"), "runabc");
+        }
+
+        assert_eq!(sweep_dead_runs_older_than(&tasks, [], later()), 0);
+        for name in ["tmp", "home", "build", "short"] {
+            assert!(outside.join(name).join("runabc/keep").exists(), "{name}");
+            assert_eq!(
+                fs::read_dir(outside.join(name)).unwrap().count(),
+                1,
+                "{name}"
+            );
+        }
+        assert!(real_root.join(".forge-task/tmp/runabc").exists());
     }
 }

@@ -88,9 +88,11 @@ impl CrashRecovery {
     }
 
     /// Remove the per-run temp directories the previous process left in
-    /// server-owned Task roots. Hooks, checks and tool commands die with the
-    /// process; an execution still recorded as running keeps its directory
-    /// (an owner may still be running it) and loses it when it is settled.
+    /// server-owned Task roots of the managed shape. Hooks, checks and tool
+    /// commands are in no table, so the sweep itself
+    /// ([`executors::sandbox::sweep_dead_runs`]) refuses every directory this
+    /// process created or that changed since it started; an execution still
+    /// recorded as running keeps its directory and loses it when it settles.
     async fn sweep_dead_run_temp_dirs(&self) -> Result<()> {
         let live: Vec<String> =
             sqlx::query_scalar("SELECT id FROM execution WHERE status = 'running'")
@@ -100,9 +102,15 @@ impl CrashRecovery {
         for placement in
             WorkspacePlacementRepo::list_by_state(&*self.db, PlacementState::Ready).await?
         {
+            // Only the managed shape `<root>/<task_id>/<name>`: nothing is
+            // ever swept beside a directory Forge does not own.
             if let Some(dir) = crate::workspace_manager::task_root_anchor_of(&placement)
                 .ok()
-                .and_then(|worktree| Some(worktree.parent()?.parent()?.to_path_buf()))
+                .and_then(|worktree| {
+                    let task_root = worktree.parent()?;
+                    (task_root.file_name()?.to_str()? == placement.task_id)
+                        .then(|| task_root.parent().map(std::path::Path::to_path_buf))?
+                })
             {
                 task_root_dirs.insert(dir);
             }
@@ -157,7 +165,10 @@ impl CrashRecovery {
                 }
             }
         }
-        self.sweep_dead_run_temp_dirs().await?;
+        // Housekeeping only: a failure here must not stop recovery.
+        if let Err(error) = self.sweep_dead_run_temp_dirs().await {
+            tracing::warn!(%error, "could not sweep temp directories of dead runs");
+        }
         // Expire stale grants before recovering active Tasks. The recovery
         // pass below then sees the still-running attempt and requeues/blocks
         // it through the normal crash-recovery state machine.
@@ -4606,6 +4617,138 @@ pub(crate) mod tests {
         monitor.stop();
         handle.await.expect("monitor task joins");
         assert!(monitor.is_stopped());
+    }
+
+    /// The start-up sweep removes what a dead process left in a server-owned
+    /// Task root and nothing else: not the directory of a hook, check or tool
+    /// command running in this process (they are in no table), not one made
+    /// since this process started, and nothing beside a legacy-shaped path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_sweeps_temp_dirs_of_dead_runs_and_never_one_of_a_live_run() {
+        let db = Arc::new(sqlite_db().await);
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let root = tempfile::tempdir().expect("workspace root");
+        let legacy = tempfile::tempdir().expect("user directory");
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let backdate = |dir: &std::path::Path| {
+            std::fs::File::open(dir)
+                .and_then(|file| file.set_modified(old))
+                .expect("directory is back-dated");
+        };
+        let mut worktrees = Vec::new();
+        for shape in ["managed", "legacy"] {
+            let task = seed_task(&db, project_id.clone(), "todo".to_owned(), None).await;
+            let worktree = if shape == "managed" {
+                root.path().join(&task.id).join("repo")
+            } else {
+                legacy.path().join("projects").join("repo")
+            };
+            std::fs::create_dir_all(&worktree).expect("worktree creates");
+            let now = now_rfc3339();
+            let workspace = db::WorkspaceRepo::create(
+                &*db,
+                db::CreateWorkspace {
+                    id: new_uuid_v4(),
+                    task_id: task.id.clone(),
+                    repo_id: repo_id.clone(),
+                    worktree_path: worktree.to_string_lossy().into_owned(),
+                    branch: format!("task/{shape}"),
+                    status: db::WorkspaceStatus::Ready,
+                    before_sha: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("workspace creates");
+            let location = db::RepoLocationRepo::create(
+                &*db,
+                db::CreateRepoLocation {
+                    id: new_uuid_v4(),
+                    repo_id: repo_id.clone(),
+                    owner_kind: db::RepoLocationOwnerKind::Server,
+                    daemon_id: None,
+                    runtime_id: None,
+                    path: format!("checkout-{shape}"),
+                    kind: db::RepoLocationKind::SharedMount,
+                    is_default: shape == "managed",
+                    status: db::RepoLocationStatus::Ready,
+                    last_verified_at: Some(now.clone()),
+                    last_error: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("location creates");
+            WorkspacePlacementRepo::create(
+                &*db,
+                db::CreateWorkspacePlacement {
+                    id: new_uuid_v4(),
+                    workspace_id: workspace.id,
+                    task_id: task.id,
+                    agent_id: None,
+                    owner_kind: PlacementOwnerKind::Server,
+                    daemon_id: None,
+                    runtime_id: None,
+                    repo_location_id: location.id,
+                    execution_daemon_id: None,
+                    workspace_handle: Some(worktree.to_string_lossy().into_owned()),
+                    generation: 1,
+                    state: PlacementState::Ready,
+                    selected_by: db::PlacementSelectedBy::Scheduler,
+                    selection_reason: "{}".to_owned(),
+                    reserved_until: None,
+                    disconnected_at: None,
+                    failure_cause: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            )
+            .await
+            .expect("placement creates");
+            worktrees.push(worktree);
+        }
+        let task_root = worktrees[0].parent().unwrap();
+        executors::sandbox::TaskRoot::reserve(task_root).expect("Task root reserves");
+        let tmp = task_root.join(".forge-task/tmp");
+        // A hook running right now, in this process, however old its directory looks.
+        let hook = executors::sandbox::SandboxEnv::for_command(
+            &worktrees[0],
+            executors::sandbox::RunPurpose::Hook,
+        );
+        let hook_tmp = hook
+            .env()
+            .tmp_dir()
+            .expect("hook has a temp dir")
+            .to_path_buf();
+        assert_eq!(hook_tmp.parent(), Some(tmp.as_path()));
+        backdate(&hook_tmp);
+        // What the previous process left, and what something made since.
+        let (dead, recent) = (tmp.join("deadrun"), tmp.join("recentrun"));
+        std::fs::create_dir_all(dead.join("leftover")).unwrap();
+        std::fs::create_dir(&recent).unwrap();
+        backdate(&dead);
+        // Beside the legacy path: a user's directories, old or not.
+        let user_short = legacy.path().join(".forge-tmp/olduser");
+        let user_task = legacy.path().join("projects/.forge-task/tmp/olduser");
+        for dir in [&user_short, &user_task] {
+            std::fs::create_dir_all(dir).unwrap();
+            backdate(dir);
+        }
+
+        CrashRecovery::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
+            .run_recovery()
+            .await
+            .expect("recovery runs");
+
+        assert!(!dead.exists(), "the dead run's directory is removed");
+        assert!(hook_tmp.is_dir(), "a live hook keeps its directory");
+        assert!(recent.is_dir(), "a directory made since start is kept");
+        assert!(user_short.is_dir() && user_task.is_dir());
+        drop(hook);
+        assert!(!hook_tmp.exists());
     }
 
     #[tokio::test]

@@ -380,15 +380,24 @@ impl CodexAdapter {
         let managed_home =
             match executors::sandbox::TaskRoot::of_worktree(Path::new(&ctx.worktree_path)) {
                 Some(task_root) => {
-                    let home = task_root.home("codex");
-                    adopt_legacy_managed_home(legacy_home.as_deref(), &home, &ctx.task_id);
-                    home
+                    adopt_legacy_managed_home(
+                        legacy_home.as_deref(),
+                        &task_root.home("codex"),
+                        &ctx.task_id,
+                    );
+                    // Refuses a `home` that is a link or a file.
+                    task_root.prepare_home("codex")
                 }
-                // A Task root Forge did not reserve keeps the home beside its logs.
-                None => legacy_home.ok_or_else(|| {
-                    ExecutorError::Other("managed Codex execution has no log directory".to_owned())
-                })?,
+                None => None,
             };
+        let managed_home = match managed_home {
+            Some(home) => home,
+            // A Task root Forge did not reserve (or cannot use) keeps the
+            // home beside its logs.
+            None => legacy_home.ok_or_else(|| {
+                ExecutorError::Other("managed Codex execution has no log directory".to_owned())
+            })?,
+        };
         prepare_managed_codex_home(&managed_home, &ambient_codex_home())?;
         Ok(Some(managed_home))
     }
@@ -568,7 +577,32 @@ impl CodingExecutorAdapter for CodexAdapter {
         let managed_codex_home = Self::managed_codex_home(&ctx)?;
         let mut command = Self::build_command(&config, managed_codex_home.as_deref());
         // Owns the execution's temp directory until this execution returns.
-        let run_scope = crate::command::run_in_task_worktree(&mut command, &ctx);
+        // Only what this execution's Codex sandbox will be able to write is
+        // kept; the rest stays as `build_command` and the server left it.
+        let is_yolo = matches!(
+            config.permission_policy.clone().unwrap_or_default(),
+            PermissionPolicy::Yolo
+        );
+        let managed_task = managed_codex_home.is_some();
+        let run_scope = crate::command::run_in_task_worktree_with(&mut command, &ctx, |sandbox| {
+            codex_admitted_sandbox(
+                sandbox,
+                Path::new(&ctx.worktree_path),
+                managed_task,
+                is_yolo,
+            )
+        });
+        // The build directory is a writable root only when it is the one the
+        // child will really use (the Project, the profile or the operator may
+        // have chosen another).
+        let build_in_use = run_scope
+            .env()
+            .build_dir("CARGO_TARGET_DIR")
+            .filter(|build| {
+                command.as_std().get_envs().any(|(key, value)| {
+                    key == "CARGO_TARGET_DIR" && value == Some(build.as_os_str())
+                })
+            });
         // The Worker's TMPDIR: the per-run directory of the Task root, or the
         // home's own scratch when the Task root is not Forge's.
         let managed = ManagedRoots {
@@ -580,7 +614,7 @@ impl CodingExecutorAdapter for CodexAdapter {
             }),
             build: managed_codex_home
                 .as_ref()
-                .and_then(|_| run_scope.env().build_dir("CARGO_TARGET_DIR"))
+                .and_then(|_| build_in_use)
                 .and_then(Path::parent)
                 .map(Path::to_path_buf),
             home: managed_codex_home,
@@ -1317,6 +1351,51 @@ struct ManagedRoots {
     build: Option<PathBuf>,
 }
 
+/// The part of the Task root's environment a Codex execution can write.
+///
+/// - `yolo` runs without a sandbox: everything.
+/// - A managed Task runs under workspace-write with only the roots Forge
+///   grants. The per-run temp directory and the build directory are granted
+///   (see `managed_writable_roots`) when they really are where the Task root
+///   says: a path that resolves anywhere else (a planted link) is dropped, so
+///   the run keeps the scratch directory of its managed home and builds in
+///   the worktree.
+/// - Any other execution uses the sandbox of the operator's own Codex
+///   configuration, which Forge does not control: nothing is redirected.
+fn codex_admitted_sandbox(
+    sandbox: executors::sandbox::SandboxEnv,
+    worktree: &Path,
+    managed_task: bool,
+    is_yolo: bool,
+) -> executors::sandbox::SandboxEnv {
+    if is_yolo {
+        return sandbox;
+    }
+    let Some(task_roots) = worktree
+        .parent()
+        .and_then(Path::parent)
+        .filter(|_| managed_task)
+    else {
+        return executors::sandbox::SandboxEnv::none();
+    };
+    let in_place = |path: &Path| {
+        path.strip_prefix(task_roots).is_ok_and(|suffix| {
+            resolve_path_for_overlap(path) == resolve_path_for_overlap(task_roots).join(suffix)
+        })
+    };
+    let mut sandbox = sandbox;
+    if sandbox.tmp_dir().is_some_and(|tmp| !in_place(tmp)) {
+        sandbox = sandbox.without_tmp();
+    }
+    if sandbox
+        .build_dir("CARGO_TARGET_DIR")
+        .is_some_and(|build| !in_place(build))
+    {
+        sandbox = sandbox.without_build();
+    }
+    sandbox
+}
+
 /// Move a Task's managed home from its pre-0.14 place beside the logs into
 /// the Task root, so a Task that resumes after the upgrade keeps its Codex
 /// sessions. Only the server layout (`logs/<project>/<task>/`) is per Task;
@@ -1336,7 +1415,9 @@ fn adopt_legacy_managed_home(legacy: Option<&Path>, home: &Path, task_id: &str) 
         return;
     }
     let Some(parent) = home.parent() else { return };
-    if std::fs::create_dir_all(parent).is_ok()
+    // One level, never through a link: `.forge-task` exists and is Forge's.
+    let _ = std::fs::create_dir(parent);
+    if is_dir(parent)
         && let Err(error) = std::fs::rename(legacy, home)
     {
         tracing::warn!(from = %legacy.display(), to = %home.display(), %error, "could not move the managed Codex home into the Task root; a fresh one is created");
@@ -2594,6 +2675,85 @@ mod tests {
         .expect("managed home");
         assert_eq!(home, logs.join(".codex-managed-home"));
         assert!(!dir.path().join("user/.forge-task").exists());
+    }
+
+    /// An execution that outlived the upgrade (an orphaned child of the old
+    /// server) may still hold its old home. Moving the home keeps every file
+    /// it has open: nothing it writes is lost, and nothing is deleted.
+    #[cfg(unix)]
+    #[test]
+    fn adopting_the_legacy_home_under_a_live_execution_loses_nothing() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let logs = dir.path().join("logs/project/task-a");
+        let legacy = logs.join(".codex-managed-home");
+        fs::create_dir_all(legacy.join("sessions")).expect("legacy home creates");
+        let mut live = fs::File::create(legacy.join("sessions/rollout.jsonl")).expect("opens");
+        live.write_all(b"before\n").expect("writes");
+        let worktree = dir.path().join("task-a/repo");
+        fs::create_dir_all(&worktree).expect("worktree creates");
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
+        let ctx = managed_ctx(&worktree, "task-a", &logs.join("exec.jsonl"));
+        let home = CodexAdapter::managed_codex_home(&ctx)
+            .expect("home prepares")
+            .expect("managed home");
+        live.write_all(b"after\n")
+            .expect("the live execution still writes");
+        live.sync_all().expect("syncs");
+        assert_eq!(
+            fs::read_to_string(home.join("sessions/rollout.jsonl")).unwrap(),
+            "before\nafter\n"
+        );
+        // A second execution adopts nothing and resets nothing of the first's sessions.
+        CodexAdapter::managed_codex_home(&ctx).expect("home prepares again");
+        assert_eq!(
+            fs::read_to_string(home.join("sessions/rollout.jsonl")).unwrap(),
+            "before\nafter\n"
+        );
+    }
+
+    /// A managed Codex run is handed only directories its sandbox can write.
+    #[cfg(unix)]
+    #[test]
+    fn codex_sandbox_keeps_only_what_the_execution_can_write() {
+        use executors::sandbox::{RunPurpose, SandboxEnv, TaskRoot};
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let worktree = dir.path().join("t/repo");
+        fs::create_dir_all(&worktree).expect("worktree creates");
+        TaskRoot::reserve(worktree.parent().unwrap()).expect("reserved");
+        let offered = || SandboxEnv::for_run(&worktree, "run-1", RunPurpose::Execution);
+        let reserved = dir.path().join("t/.forge-task");
+        assert_eq!(
+            offered().tmp_dir(),
+            Some(reserved.join("tmp/run1").as_path())
+        );
+
+        // Managed: both are granted as writable roots, so both are kept.
+        assert_eq!(
+            codex_admitted_sandbox(offered(), &worktree, true, false),
+            offered()
+        );
+        // Yolo has no sandbox.
+        assert_eq!(
+            codex_admitted_sandbox(offered(), &worktree, false, true),
+            offered()
+        );
+        // The operator's own sandbox: Forge cannot know what it can write.
+        assert_eq!(
+            codex_admitted_sandbox(offered(), &worktree, false, false),
+            SandboxEnv::none()
+        );
+
+        // A temp directory that resolves outside the Task root is not handed out.
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside creates");
+        std::os::unix::fs::symlink(&outside, reserved.join("tmp")).expect("link plants");
+        let admitted = codex_admitted_sandbox(offered(), &worktree, true, false);
+        assert_eq!(admitted.tmp_dir(), None);
+        assert_eq!(
+            admitted.build_dir("CARGO_TARGET_DIR"),
+            Some(reserved.join("build/cargo").as_path())
+        );
     }
 
     #[test]

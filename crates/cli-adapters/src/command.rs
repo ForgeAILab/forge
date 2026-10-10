@@ -122,15 +122,28 @@ pub fn run_in_task_worktree(
     command: &mut Command,
     ctx: &executors::ExecutionContext,
 ) -> executors::sandbox::RunScope {
+    run_in_task_worktree_with(command, ctx, |sandbox| sandbox)
+}
+
+/// [`run_in_task_worktree`] for an adapter whose CLI confines its own writes.
+/// `admit` sees the environment the Task root offers and returns the part the
+/// CLI's sandbox can write; what it drops the run keeps as inherited, so a run
+/// is never handed a temp or build directory it cannot write.
+#[must_use = "dropping the scope removes the execution's temp directory"]
+pub fn run_in_task_worktree_with(
+    command: &mut Command,
+    ctx: &executors::ExecutionContext,
+    admit: impl FnOnce(executors::sandbox::SandboxEnv) -> executors::sandbox::SandboxEnv,
+) -> executors::sandbox::RunScope {
     // The Project environment goes first so Forge's own variables below
     // always win.
     let environment = executors::environment::task_environment(&ctx.agent_config);
     command.envs(&environment);
-    let run_scope = executors::sandbox::SandboxEnv::for_run(
+    let run_scope = admit(executors::sandbox::SandboxEnv::for_run(
         std::path::Path::new(&ctx.worktree_path),
         &ctx.execution_id,
         executors::sandbox::RunPurpose::Execution,
-    )
+    ))
     .scoped();
     executors::run_process::apply_sandboxed(command, &environment, run_scope.env());
     command

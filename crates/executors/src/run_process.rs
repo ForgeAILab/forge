@@ -98,20 +98,6 @@ pub fn apply_sandboxed(
     sandbox.apply_to(command, project);
 }
 
-/// [`apply_sandboxed`] for a command whose caller owns no run scope: it gets
-/// the Task-level part (build directory) of the Task root its working
-/// directory is in, and no per-run temp directory.
-///
-/// Only review commands still come through here; a caller that knows its run
-/// uses [`apply_sandboxed`].
-pub fn apply(command: &mut Command, project: &BTreeMap<String, String>) {
-    let sandbox = command
-        .as_std()
-        .get_current_dir()
-        .map(SandboxEnv::for_task)
-        .unwrap_or_default();
-    apply_sandboxed(command, project, &sandbox);
-}
 pub fn apply_budget(command: &mut Command, budget: RunBudget, project: &BTreeMap<String, String>) {
     // A non-empty value already set on the command (an Agent profile's env,
     // a shell plan, or the inherited environment) wins over the budget.

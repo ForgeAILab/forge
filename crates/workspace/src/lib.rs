@@ -43,9 +43,22 @@ pub const RESERVED_TASK_DIR_NAME: &str = ".forge-task";
 /// Mark a Task root this manager just created as Forge's, so the runs in its
 /// worktree get their temp directory, managed homes and build directory there.
 async fn reserve_task_dir(task_root: &Path) -> Result<()> {
-    match fs::create_dir(task_root.join(RESERVED_TASK_DIR_NAME)).await {
+    let reserved = task_root.join(RESERVED_TASK_DIR_NAME);
+    match fs::create_dir(&reserved).await {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        // Something is already there. Only a real directory is Forge's: a
+        // link or a file is never adopted, followed or written through.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::symlink_metadata(&reserved).await?.file_type().is_dir() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} is not a directory", reserved.display()),
+                )
+                .into())
+            }
+        }
         Err(error) => Err(error.into()),
     }
 }
