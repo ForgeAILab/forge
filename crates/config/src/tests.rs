@@ -679,6 +679,9 @@ fn clear_forge_env() {
         "FORGE_WORKSPACE_ROOT",
         "FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS",
         "FORGE_MAX_DISCONNECT_SECONDS",
+        "FORGE_WORKSPACE_LOG_RETENTION_DAYS",
+        "FORGE_WORKSPACE_MIN_FREE_BYTES",
+        "FORGE_WORKSPACE_MIN_FREE_PERCENT",
         "FORGE_AGENT_MAX_CONCURRENT_TASKS",
         "FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS",
         "FORGE_AGENT_MAX_MISSED_HEARTBEATS",
@@ -719,6 +722,52 @@ fn max_disconnect_defaults_and_obeys_file_env_override_precedence() {
     )
     .expect("override loads");
     assert_eq!(loaded.workspace.max_disconnect_seconds, 1200);
+    clear_forge_env();
+}
+
+#[test]
+fn workspace_gc_keys_default_and_obey_file_then_env() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("forge.yaml");
+    let defaults = ForgeConfig::with_data_dir(dir.path().to_path_buf()).workspace;
+    assert_eq!(
+        (
+            defaults.log_retention_days,
+            defaults.min_free_bytes,
+            defaults.min_free_percent
+        ),
+        (30, 10 * 1024 * 1024 * 1024, 5)
+    );
+    fs::write(
+        &path,
+        "workspace:\n  log_retention_days: 7\n  min_free_bytes: 1000\n  min_free_percent: 9\n",
+    )
+    .expect("config writes");
+    let loaded = ForgeConfig::load(Some(&path), test_overrides(dir.path())).expect("file loads");
+    assert_eq!(
+        (
+            loaded.workspace.log_retention_days,
+            loaded.workspace.min_free_bytes,
+            loaded.workspace.min_free_percent
+        ),
+        (7, 1000, 9)
+    );
+    env::set_var("FORGE_WORKSPACE_LOG_RETENTION_DAYS", "0");
+    env::set_var("FORGE_WORKSPACE_MIN_FREE_BYTES", "2000");
+    env::set_var("FORGE_WORKSPACE_MIN_FREE_PERCENT", "12");
+    let loaded = ForgeConfig::load(Some(&path), test_overrides(dir.path())).expect("env loads");
+    assert_eq!(
+        (
+            loaded.workspace.log_retention_days,
+            loaded.workspace.min_free_bytes,
+            loaded.workspace.min_free_percent
+        ),
+        (0, 2000, 12)
+    );
+    env::set_var("FORGE_WORKSPACE_MIN_FREE_PERCENT", "300");
+    assert!(ForgeConfig::load(Some(&path), test_overrides(dir.path())).is_err());
     clear_forge_env();
 }
 

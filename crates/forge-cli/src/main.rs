@@ -51,6 +51,14 @@ struct Cli {
     /// Cursor inactivity threshold for stalled event consumers, in seconds.
     #[arg(long)]
     event_consumer_stall_seconds: Option<u32>,
+    /// Take the workspace root over for this database, then start as usual.
+    /// Garbage collection only runs on a root this database owns; after a
+    /// database reset the root still names the old one and nothing is
+    /// reclaimed. Use this once, with no other Forge server on the root:
+    /// directories the old database knew and this one does not are
+    /// quarantined and deleted a day later.
+    #[arg(long = "reclaim-workspace-gc")]
+    reclaim_workspace_gc: bool,
     /// Convert an existing database to incremental auto-vacuum, then exit.
     /// Stop Forge first. Full VACUUM locks the database and needs extra disk space.
     #[arg(long, conflicts_with_all = ["demo", "no_mcp", "no_embedded_daemon"])]
@@ -227,10 +235,24 @@ async fn run() {
             .with_bcrypt_cost(effective_config.server.bcrypt_cost)
             .build(),
     );
-    // Only the running server garbage-collects its workspace root and the
-    // locations older versions left in the system temp directory; nothing
-    // built for a test ever does.
-    runtime.cleanup_scheduler.enable_gc();
+    // Only a running server adopts its workspace root, and only an adopted
+    // root is ever garbage-collected: nothing built for a test does this.
+    // The same goes for the locations older versions left in the system
+    // temp directory.
+    let ownership = if cli.reclaim_workspace_gc {
+        runtime.cleanup_scheduler.reclaim_workspace_root().await
+    } else {
+        runtime.cleanup_scheduler.adopt_workspace_root().await
+    };
+    match ownership {
+        Ok(executors::gc::Ownership::Mine) => {}
+        Ok(ownership) => tracing::warn!(
+            root = %workspace_root.display(),
+            state = ownership.as_str(),
+            "workspace garbage collection is OFF: the workspace root is owned by another Forge database or cannot be a workspace root, so nothing is reclaimed and the disk can fill. If the root belongs to this server, restart once with --reclaim-workspace-gc"
+        ),
+        Err(error) => tracing::warn!(%error, "workspace root ownership could not be settled; garbage collection is off"),
+    }
     runtime
         .cleanup_scheduler
         .set_legacy_temp_dir(std::env::temp_dir());

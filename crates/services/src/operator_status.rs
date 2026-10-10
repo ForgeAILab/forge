@@ -381,6 +381,34 @@ impl OperatorStatusService {
                 occurred_at: pass.completed_at,
             });
         }
+        // A workspace root this database does not own is never garbage
+        // collected: say so for as long as it lasts, the disk fills silently
+        // otherwise.
+        let gc_status = sqlx::query_as::<_, (String, String)>(
+            "SELECT value, updated_at FROM system_setting WHERE key = ?",
+        )
+        .bind(crate::workspace_cleanup::GC_STATUS_KEY)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if let Some((value, since)) = gc_status {
+            let status: Value = serde_json::from_str(&value).unwrap_or_default();
+            let state = status["state"].as_str().unwrap_or("unknown");
+            if state != "owned" {
+                recent_errors.push(RecentErrorSummary {
+                    severity: api_types::OperatorSeverity::Attention,
+                    entity_type: "workspace_gc".into(),
+                    entity_id: status["root"].as_str().unwrap_or_default().to_owned(),
+                    error: format!(
+                        "Workspace garbage collection is off ({state}{}): nothing under the workspace root is reclaimed and the disk can fill. The root is owned by another Forge database or cannot be a workspace root. If it belongs to this server (its database was reset), stop Forge and start it once with --reclaim-workspace-gc",
+                        status["reason"]
+                            .as_str()
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default(),
+                    ),
+                    occurred_at: since,
+                });
+            }
+        }
         for issue in &recent_errors {
             raise_severity(&mut overall_severity, issue.severity.clone());
         }
@@ -2337,6 +2365,43 @@ mod condition_check_tests {
             status.overall_severity,
             api_types::OperatorSeverity::Healthy
         );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_root_this_database_does_not_own_is_reported_until_it_does() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = std::sync::Arc::new(db::SqliteDb::new(pool));
+        let record = |state: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO system_setting (key, value, updated_at) VALUES (?, ?, ?)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                )
+                .bind(crate::workspace_cleanup::GC_STATUS_KEY)
+                .bind(format!(r#"{{"state":"{state}","root":"/srv/forge","reason":null}}"#))
+                .bind(db::now_rfc3339())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+        };
+        record("claimed_by_other").await;
+        let reported = status(&db).await;
+        assert_eq!(reported.recent_errors.len(), 1);
+        let issue = &reported.recent_errors[0];
+        assert_eq!(
+            (issue.entity_type.as_str(), issue.entity_id.as_str()),
+            ("workspace_gc", "/srv/forge")
+        );
+        assert!(issue.error.contains("--reclaim-workspace-gc"));
+        assert_ne!(
+            reported.overall_severity,
+            api_types::OperatorSeverity::Healthy
+        );
+        record("owned").await;
+        assert!(status(&db).await.recent_errors.is_empty());
     }
 
     /// Only a completed pass that repaired a row is reported, and the row

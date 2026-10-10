@@ -302,6 +302,20 @@ impl ForgeConfig {
             self.workspace.max_disconnect_seconds =
                 parse_env_u64("FORGE_MAX_DISCONNECT_SECONDS", &value)?;
         }
+        if let Some(value) = env_value("FORGE_WORKSPACE_LOG_RETENTION_DAYS") {
+            self.workspace.log_retention_days =
+                parse_env_u32("FORGE_WORKSPACE_LOG_RETENTION_DAYS", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_MIN_FREE_BYTES") {
+            self.workspace.min_free_bytes =
+                parse_env_u64("FORGE_WORKSPACE_MIN_FREE_BYTES", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_MIN_FREE_PERCENT") {
+            // Anything over 100 is refused by validation, whatever its size.
+            self.workspace.min_free_percent =
+                u8::try_from(parse_env_u32("FORGE_WORKSPACE_MIN_FREE_PERCENT", &value)?)
+                    .unwrap_or(u8::MAX);
+        }
         if let Some(value) = env_value("FORGE_AGENT_MAX_CONCURRENT_TASKS") {
             self.agent.max_concurrent_tasks =
                 parse_env_u32("FORGE_AGENT_MAX_CONCURRENT_TASKS", &value)?;

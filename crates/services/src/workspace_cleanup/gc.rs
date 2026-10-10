@@ -1,7 +1,11 @@
 //! The server's garbage-collection pass over its workspace root.
 //!
 //! It runs at the end of every terminal-Task sweep, inside the same time
-//! budget, and resumes from a cursor. The filesystem mechanics (and their
+//! budget, and resumes from a cursor. It runs only on a root this database
+//! owns: `<root>/.forge/gc/owner`, written once by a running server at
+//! start-up ([`WorkspaceCleanupScheduler::adopt_workspace_root`]), names it.
+//! A scheduler nobody adopted a root for (every test, every tool) sweeps
+//! nothing and writes nothing. The filesystem mechanics (and their
 //! link, confinement and budget guarantees) are `executors::gc`; this module
 //! decides, from the database, what each directory is.
 //!
@@ -13,7 +17,7 @@
 use super::{SweepCursor, WorkspaceCleanupScheduler, SWEEP_LIMIT};
 use crate::{workflow::engine::WorkflowEngine, Result};
 use db::{now_rfc3339, ProjectRepo, TaskRepo};
-use executors::gc::{self, FreeFloor, GcReport, RootState, Sweep};
+use executors::gc::{self, FreeFloor, GcReport, Ownership, RootState, Sweep};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -26,18 +30,25 @@ const MEASURE_LIMIT: i64 = 32;
 /// Live workspaces considered for build eviction per pass.
 const EVICTION_CANDIDATES: i64 = 256;
 
+/// Legacy hook-log directories looked at per pass.
+const LEGACY_LOG_DIRS: usize = 256;
+const OWNER_KEY: &str = "workspace_gc_owner_id";
+/// What the last ownership check found, for operator status.
+pub const STATUS_KEY: &str = "workspace_gc_status";
+
 pub type LiveCheckCounter = Arc<dyn Fn() -> usize + Send + Sync>;
 
-/// Operator settings and wiring of the garbage-collection pass.
+/// Operator settings and wiring of the garbage-collection pass. Nothing here
+/// turns the pass on or off: it runs exactly when this database owns the
+/// root.
 #[derive(Clone)]
 pub struct GcSettings {
-    /// Off by default: a scheduler built for a test (often on the shared
-    /// default workspace root) sweeps and claims nothing. The running
-    /// server turns it on.
-    pub enabled: bool,
     /// Days the logs of a terminal Task are kept; `0` keeps them forever.
     pub log_retention_days: u32,
     pub free_floor: FreeFloor,
+    /// Age after which a check checkout nobody holds is dead, from the
+    /// configured check wall limit.
+    pub check_checkout_age: Duration,
     /// The system temp directory Forge used before the Task-root layout.
     /// Only the running server sets it: without it the pass removes nothing
     /// outside the workspace root.
@@ -49,9 +60,9 @@ pub struct GcSettings {
 impl Default for GcSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
             log_retention_days: config::DEFAULT_LOG_RETENTION_DAYS,
             free_floor: FreeFloor::default(),
+            check_checkout_age: gc::CHECK_CHECKOUT_AGE,
             legacy_temp_dir: None,
             live_check_operations: None,
         }
@@ -83,9 +94,105 @@ impl WorkspaceCleanupScheduler {
         });
     }
 
-    /// Turn the garbage-collection pass on for this workspace root.
-    pub fn enable_gc(&self) {
-        self.update_gc_settings(|settings| settings.enabled = true);
+    /// The configured wall limit of one check run, in seconds.
+    pub fn set_check_timeout(&self, seconds: u64) {
+        self.update_gc_settings(|settings| {
+            settings.check_checkout_age = gc::check_checkout_age(seconds);
+        });
+    }
+
+    /// Adopt the workspace root for this database when nobody owns it yet:
+    /// the one step that writes Forge's marker, and so the one step that
+    /// lets the garbage collector run. Called once by a running server at
+    /// start-up, never by a test builder, never by the sweep. A root owned
+    /// by another database stays theirs.
+    pub async fn adopt_workspace_root(&self) -> Result<Ownership> {
+        self.settle_ownership(|sweep, owner| sweep.adopt(owner))
+            .await
+    }
+
+    /// Take the workspace root over from whoever owns it. Only on an
+    /// operator's explicit request (`forge --reclaim-workspace-gc`).
+    pub async fn reclaim_workspace_root(&self) -> Result<Ownership> {
+        self.settle_ownership(|sweep, owner| sweep.reclaim(owner))
+            .await
+    }
+
+    async fn settle_ownership(
+        &self,
+        settle: impl FnOnce(&Sweep, &str) -> Ownership + Send + 'static,
+    ) -> Result<Ownership> {
+        let owner_id = self.gc_owner_id().await?;
+        let configured = self.workspace_root.clone();
+        let (root, ownership) = blocking(move || {
+            // The configured root of a running server may not exist yet.
+            let _ = std::fs::create_dir_all(&configured);
+            let root = std::fs::canonicalize(&configured).unwrap_or(configured);
+            let sweep = Sweep::new(&root, &root, is_task_id, Duration::ZERO);
+            let ownership = settle(&sweep, &owner_id);
+            (root, ownership)
+        })
+        .await
+        .ok_or_else(|| crate::ServiceError::invalid_operation("workspace gc ownership check"))?;
+        self.record_gc_status(&root, ownership).await;
+        Ok(ownership)
+    }
+
+    /// This database's identity as a workspace-root owner: created once and
+    /// kept with the data, so a reset database is a different owner.
+    async fn gc_owner_id(&self) -> Result<String> {
+        sqlx::query(
+            "INSERT INTO system_setting (key, value, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(OWNER_KEY)
+        .bind(db::new_uuid_v4())
+        .bind(now_rfc3339())
+        .execute(self.db.pool())
+        .await?;
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key = ?")
+                .bind(OWNER_KEY)
+                .fetch_one(self.db.pool())
+                .await?,
+        )
+    }
+
+    /// Whether this database owns `root` right now. Read-only on disk.
+    async fn gc_ownership(&self, root: &Path) -> Result<Ownership> {
+        let owner_id = self.gc_owner_id().await?;
+        let sweep = Sweep::new(root, root, is_task_id, Duration::ZERO);
+        Ok(blocking(move || sweep.ownership(&owner_id))
+            .await
+            .unwrap_or(Ownership::Other))
+    }
+
+    /// Keep what the last check found where operator status reads it.
+    /// Written only when it changes.
+    async fn record_gc_status(&self, root: &Path, ownership: Ownership) {
+        let reason = match ownership {
+            Ownership::Refused(reason) => Some(reason),
+            _ => None,
+        };
+        let value = serde_json::json!({
+            "state": ownership.as_str(),
+            "root": root.display().to_string(),
+            "reason": reason,
+        })
+        .to_string();
+        let written = sqlx::query(
+            "INSERT INTO system_setting (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+             WHERE system_setting.value != excluded.value",
+        )
+        .bind(STATUS_KEY)
+        .bind(value)
+        .bind(now_rfc3339())
+        .execute(self.db.pool())
+        .await;
+        if let Err(error) = written {
+            tracing::warn!(%error, "workspace gc status not recorded");
+        }
     }
 
     /// Let the pass remove the legacy locations under the system temp
@@ -112,15 +219,6 @@ impl WorkspaceCleanupScheduler {
             .unwrap_or_default()
     }
 
-    /// The directory a Task's logs live in.
-    pub(super) fn task_logs_dir(&self, project_id: &str, task_id: &str) -> PathBuf {
-        self.workspace_root
-            .join(".forge")
-            .join("logs")
-            .join(project_id)
-            .join(task_id)
-    }
-
     /// Remove the logs of a terminal Task once they are older than the
     /// retention. The caller has proven the Task terminal and idle.
     pub(super) async fn expire_task_logs(&self, task: &db::Task) {
@@ -134,16 +232,28 @@ impl WorkspaceCleanupScheduler {
         if terminal_since + chrono::Duration::days(i64::from(days)) > chrono::Utc::now() {
             return;
         }
-        let logs = self.task_logs_dir(&task.project_id, &task.id);
-        let sweep = Sweep::new(
-            &self.workspace_root,
-            &self.workspace_root,
-            is_task_id,
-            Duration::ZERO,
-        );
+        let Ok(root) = std::fs::canonicalize(&self.workspace_root) else {
+            return;
+        };
+        // Like every other deletion of the pass: only on a root this
+        // database owns.
+        if !matches!(self.gc_ownership(&root).await, Ok(Ownership::Mine)) {
+            return;
+        }
+        let logs = root
+            .join(".forge")
+            .join("logs")
+            .join(&task.project_id)
+            .join(&task.id);
+        let sweep = Sweep::new(&root, &root, is_task_id, Duration::ZERO);
+        let quiet = Duration::from_secs(u64::from(days) * 24 * 60 * 60);
         let report = blocking(move || {
             let mut report = GcReport::default();
-            sweep.remove(&logs, &mut report);
+            // A Task imported, restored or finished again with an old
+            // timestamp keeps logs that were written inside the retention.
+            if gc::untouched_for(&logs, SystemTime::now(), quiet) {
+                sweep.remove(&logs, &mut report);
+            }
             report
         })
         .await
@@ -166,32 +276,29 @@ impl WorkspaceCleanupScheduler {
         budget: Duration,
         now: SystemTime,
     ) -> GcReport {
-        let mut sweep = Sweep::new(
-            &self.workspace_root,
-            &self.workspace_root,
-            is_task_id,
-            budget,
-        );
-        sweep.now = now;
         let settings = self.gc_settings();
         let mut report = GcReport::default();
-        if !settings.enabled {
+        // The root as it resolves now: every path of the pass is built on
+        // it, and the marker must be inside it.
+        let Ok(root) = std::fs::canonicalize(&self.workspace_root) else {
             return report;
-        }
+        };
+        let mut sweep = Sweep::new(&root, &root, is_task_id, budget);
+        sweep.now = now;
+        sweep.creating = workspace::is_creating;
+        sweep.check_checkout_age = settings.check_checkout_age;
         let out_of_time = |sweep: &Sweep| std::time::Instant::now() >= sweep.deadline;
-        match self.owns_root(&sweep).await {
-            Ok(true) => {}
-            Ok(false) => {
-                if std::fs::symlink_metadata(
-                    self.workspace_root.join(gc::GC_DIR).join(gc::OWNER_FILE),
-                )
-                .is_ok()
-                {
-                    tracing::warn!(
-                        root = %self.workspace_root.display(),
-                        "workspace root is claimed by another Forge database; garbage collection is off for it. Give each server its own workspace root, or delete .forge/gc/owner under the root if it belongs to this server"
-                    );
-                }
+        match self.gc_ownership(&root).await {
+            Ok(Ownership::Mine) => {}
+            // Never adopted: a test, a tool, a server that has not started.
+            Ok(Ownership::Unclaimed) => return report,
+            Ok(ownership) => {
+                self.record_gc_status(&root, ownership).await;
+                tracing::warn!(
+                    root = %root.display(),
+                    state = ownership.as_str(),
+                    "workspace garbage collection is off for this root: it is owned by another Forge database or cannot be a workspace root. Nothing is reclaimed and the disk can fill. Give each server its own workspace root; if this root belongs to this server (its database was reset), stop Forge and start it once with --reclaim-workspace-gc"
+                );
                 return report;
             }
             Err(error) => {
@@ -199,10 +306,22 @@ impl WorkspaceCleanupScheduler {
                 return report;
             }
         }
+        self.record_gc_status(&root, Ownership::Mine).await;
 
         if let Err(error) = self.gc_task_roots(&sweep, cursor, &mut report).await {
             tracing::warn!(%error, "workspace gc: Task-root pass failed");
         }
+        // What was condemned under a Task's lock (in this pass or one that
+        // was interrupted) is deleted here, outside every lock.
+        let pass = sweep.clone();
+        let emptied = blocking(move || {
+            let mut report = GcReport::default();
+            pass.empty_trash(&mut report);
+            report
+        })
+        .await
+        .unwrap_or_default();
+        report.merge(&emptied);
         if !out_of_time(&sweep) {
             if let Err(error) = self.gc_quarantine(&sweep, &mut report).await {
                 tracing::warn!(%error, "workspace gc: quarantine pass failed");
@@ -221,6 +340,10 @@ impl WorkspaceCleanupScheduler {
             .map_or(0, |counter| counter());
         if let Some(running) = running.filter(|_| !out_of_time(&sweep)) {
             let legacy = settings.legacy_temp_dir.clone();
+            let known_tasks = match &legacy {
+                Some(temp) if running.is_empty() => self.legacy_log_tasks(temp).await,
+                _ => HashSet::new(),
+            };
             let pass = sweep.clone();
             let swept = blocking(move || {
                 let mut report = GcReport::default();
@@ -229,7 +352,7 @@ impl WorkspaceCleanupScheduler {
                 // The legacy homes are shared by every run that still falls
                 // back to them, so they go only while nothing runs at all.
                 if let (Some(temp), true) = (legacy, running.is_empty()) {
-                    legacy_temp_locations(&temp, &mut report);
+                    legacy_temp_locations(&temp, &known_tasks, pass.now, &mut report);
                 }
                 report
             })
@@ -257,28 +380,37 @@ impl WorkspaceCleanupScheduler {
         report
     }
 
-    /// Whether this database is the one that sweeps the workspace root; see
-    /// [`Sweep::claim`]. The identity is created once and kept with the data.
-    async fn owns_root(&self, sweep: &Sweep) -> Result<bool> {
-        const KEY: &str = "workspace_gc_owner_id";
-        sqlx::query(
-            "INSERT INTO system_setting (key, value, updated_at) VALUES (?, ?, ?)
-             ON CONFLICT(key) DO NOTHING",
-        )
-        .bind(KEY)
-        .bind(db::new_uuid_v4())
-        .bind(now_rfc3339())
-        .execute(self.db.pool())
-        .await?;
-        let owner_id =
-            sqlx::query_scalar::<_, String>("SELECT value FROM system_setting WHERE key = ?")
-                .bind(KEY)
-                .fetch_one(self.db.pool())
-                .await?;
-        let pass = sweep.clone();
-        Ok(blocking(move || pass.claim(&owner_id))
-            .await
-            .unwrap_or(false))
+    /// The Task ids among the legacy hook-log directories that are Tasks of
+    /// this database. The system temp directory is shared by every Forge on
+    /// the machine; only a directory named after one of our own Tasks is
+    /// provably ours.
+    async fn legacy_log_tasks(&self, temp: &Path) -> HashSet<String> {
+        let logs = temp.join("forge").join("logs");
+        let names = blocking(move || {
+            let Ok(entries) = std::fs::read_dir(&logs) else {
+                return Vec::new();
+            };
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| is_task_id(name))
+                .take(LEGACY_LOG_DIRS)
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        let mut known = HashSet::new();
+        for name in names {
+            let exists =
+                sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM task WHERE id = ?)")
+                    .bind(&name)
+                    .fetch_one(self.db.pool())
+                    .await;
+            if matches!(exists, Ok(found) if found != 0) {
+                known.insert(name);
+            }
+        }
+        known
     }
 
     async fn gc_task_roots(
@@ -292,12 +424,15 @@ impl WorkspaceCleanupScheduler {
             .await
             .unwrap_or_default();
         let mut states = HashMap::new();
+        // The deadline is checked after each name, so every pass classifies
+        // at least one and the cursor always moves.
+        let mut classified = 0;
         for name in &names {
             match self.classify_root(name).await {
                 Ok(RootClass::Unknown) => {
                     states.insert(name.clone(), RootState::Unknown);
                 }
-                // Removed below under the Task's lifecycle lock.
+                // Moved aside below under the Task's lifecycle lock.
                 Ok(RootClass::Cleaned) => {
                     if let Err(error) = self.remove_cleaned_root(sweep, name, report).await {
                         tracing::warn!(task_id = %name, %error, "workspace gc: cleaned Task root not removed");
@@ -312,26 +447,36 @@ impl WorkspaceCleanupScheduler {
                     report.errors += 1;
                 }
             }
+            classified += 1;
             if std::time::Instant::now() >= sweep.deadline {
                 break;
             }
         }
         let pass = sweep.clone();
-        let done = blocking(move || {
+        let (done, finished) = blocking(move || {
             let mut report = GcReport::default();
-            pass.task_roots(&states, &mut report);
-            report
+            let finished = pass.task_roots(&states, &mut report);
+            (report, finished)
         })
         .await
         .unwrap_or_default();
         report.merge(&done);
-        if done.out_of_time || std::time::Instant::now() >= sweep.deadline {
-            // Resume at the same page: nothing in it is skipped.
-            return Ok(());
-        }
-        match names.last() {
-            Some(last) if names.len() >= SWEEP_LIMIT as usize => cursor.root_name = last.clone(),
-            _ => cursor.root_name.clear(),
+        // Resume after the last name this pass finished. A page that ran out
+        // of time is not started over: the entry that took the time is done
+        // or will be skipped past, and the names after it get their turn.
+        if done.out_of_time {
+            if let Some(finished) = finished {
+                cursor.root_name = finished;
+            }
+        } else if classified < names.len() {
+            cursor.root_name = names[classified - 1].clone();
+        } else {
+            match names.last() {
+                Some(last) if names.len() >= SWEEP_LIMIT as usize => {
+                    cursor.root_name = last.clone();
+                }
+                _ => cursor.root_name.clear(),
+            }
         }
         Ok(())
     }
@@ -429,9 +574,11 @@ impl WorkspaceCleanupScheduler {
         Ok(active != 0)
     }
 
-    /// Leftovers of a workspace that was reclaimed: removed under the Task's
-    /// lifecycle lock, and only while the Task is terminal and idle, so a
-    /// reopened Task never loses a root it is about to use.
+    /// Leftovers of a workspace that was reclaimed: moved out of their place
+    /// under the Task's lifecycle lock, and only while the Task is terminal
+    /// and idle, so a reopened Task never loses a root it is about to use.
+    /// The move is one rename; the delete, however long, happens after the
+    /// lock is released ([`Sweep::empty_trash`]).
     async fn remove_cleaned_root(
         &self,
         sweep: &Sweep,
@@ -451,13 +598,13 @@ impl WorkspaceCleanupScheduler {
         {
             return Ok(());
         }
-        let (pass, path) = (sweep.clone(), self.workspace_root.join(name));
+        let (pass, path) = (sweep.clone(), sweep.root.join(name));
         let done = blocking(move || {
             let mut report = GcReport::default();
-            if executors::sandbox::has_live_run_in(&path) {
+            if executors::sandbox::has_live_run_in(&path) || workspace::is_creating(&path) {
                 return report;
             }
-            pass.remove(&path, &mut report);
+            pass.trash(&path, &mut report);
             report
         })
         .await
@@ -519,9 +666,9 @@ impl WorkspaceCleanupScheduler {
         floor: &FreeFloor,
         report: &mut GcReport,
     ) -> Result<()> {
-        let (root, floor) = (self.workspace_root.clone(), *floor);
+        let (root, floor, disk_space) = (sweep.root.clone(), *floor, sweep.disk_space);
         let under_floor = blocking(move || {
-            gc::disk_space(&root).is_some_and(|space| space.free < floor.bytes(space.total))
+            disk_space(&root).is_some_and(|space| space.free < floor.bytes(space.total))
         })
         .await
         .unwrap_or(false);
@@ -623,25 +770,38 @@ fn real_dir(path: &Path) -> bool {
 ///
 /// - `<temp>/forge-gemini-api-key-home`
 /// - `<temp>/forge/logs/<task id>/hooks` (and the `<task id>` directory when
-///   that leaves it empty)
+///   that leaves it empty), for a `<task id>` in `known_tasks` only
 ///
-/// Nothing else under the temp directory is read or removed, and no link on
-/// the way is followed.
-pub(super) fn legacy_temp_locations(temp: &Path, report: &mut GcReport) {
-    gc::remove_exact(&temp.join("forge-gemini-api-key-home"), report);
+/// The system temp directory is shared by every Forge on the machine (a dev
+/// server beside a real one, an older version still running), and nobody can
+/// know what they run. So a location goes only after nothing touched it for
+/// [`gc::LEGACY_UNTOUCHED`], and a hook-log directory only when it is named
+/// after a Task of this database. Nothing else under the temp directory is
+/// read or removed, and no link on the way is followed.
+pub(super) fn legacy_temp_locations(
+    temp: &Path,
+    known_tasks: &HashSet<String>,
+    now: SystemTime,
+    report: &mut GcReport,
+) {
+    let home = temp.join("forge-gemini-api-key-home");
+    if gc::untouched_for(&home, now, gc::LEGACY_UNTOUCHED) {
+        gc::remove_exact(&home, report);
+    }
     let logs = temp.join("forge").join("logs");
     if !real_dir(&temp.join("forge")) || !real_dir(&logs) {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(&logs) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let task_dir = entry.path();
-        if !entry.file_name().to_str().is_some_and(is_task_id) || !real_dir(&task_dir) {
+    for task_id in known_tasks {
+        let task_dir = logs.join(task_id);
+        let hooks = task_dir.join("hooks");
+        if !is_task_id(task_id)
+            || !real_dir(&task_dir)
+            || !gc::untouched_for(&hooks, now, gc::LEGACY_UNTOUCHED)
+        {
             continue;
         }
-        gc::remove_exact(&task_dir.join("hooks"), report);
+        gc::remove_exact(&hooks, report);
         // Only when empty: anything else in it is not ours to judge.
         let _ = std::fs::remove_dir(&task_dir);
     }

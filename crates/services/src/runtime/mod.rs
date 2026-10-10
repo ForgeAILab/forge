@@ -820,6 +820,9 @@ impl ForgeRuntimeBuilder {
             Duration::from_secs(effective_config.workspace.max_disconnect_seconds),
         ));
         cleanup_scheduler.set_live_check_counter(check_owners.live_operation_counter());
+        cleanup_scheduler.set_check_timeout(u64::from(
+            effective_config.server.check_run_timeout_seconds,
+        ));
         cleanup_scheduler.set_gc_limits(
             effective_config.workspace.log_retention_days,
             executors::gc::FreeFloor {

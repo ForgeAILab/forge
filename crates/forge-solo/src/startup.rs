@@ -218,6 +218,20 @@ impl SoloStartup {
             .with_config_path(config_path)
             .build(),
         );
+        // Solo is a running server too: it adopts its workspace root, and
+        // only then does the garbage collector reclaim anything in it.
+        match runtime.cleanup_scheduler.adopt_workspace_root().await {
+            Ok(executors::gc::Ownership::Mine) => {}
+            Ok(ownership) => tracing::warn!(
+                root = %paths.worktrees.display(),
+                state = ownership.as_str(),
+                "workspace garbage collection is off: the workspace root is owned by another Forge database or cannot be a workspace root"
+            ),
+            Err(error) => tracing::warn!(%error, "workspace root ownership could not be settled; garbage collection is off"),
+        }
+        runtime
+            .cleanup_scheduler
+            .set_legacy_temp_dir(std::env::temp_dir());
 
         let daemon = Arc::new(
             EmbeddedDaemon::new(
