@@ -3007,6 +3007,7 @@ pub(crate) mod tests {
                         | 202610070507
                         | 202610100137
                         | 202610100820
+                        | 202610101906
                 ))
                 .then_some((version, path))
             })
@@ -3030,6 +3031,13 @@ pub(crate) mod tests {
         // in version order.
         sqlx::raw_sql(include_str!(
             "../../../db/migrations/V202610070507__task_condition_readers.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The check slot-release triggers write the scheduler's tables.
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610101906__check_slot_release.sql"
         ))
         .execute(&pool)
         .await
