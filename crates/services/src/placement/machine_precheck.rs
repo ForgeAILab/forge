@@ -41,6 +41,13 @@ pub(crate) async fn task_blocked(
     {
         return Ok(false);
     }
+    // A Task never waits for the slot it holds itself. The dispatcher asks
+    // this for Tasks in flight too (so a stale wait is retired); the Task's
+    // own running execution is what filled the machine, and its follow-up
+    // (retry, review entry, reviewer) asks again after that execution ended.
+    if task_holds_run_slot(db, &task.id).await? {
+        return Ok(false);
+    }
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
@@ -111,6 +118,18 @@ pub(crate) async fn task_blocked(
         matches!(select_placement(&context), SelectionOutcome::Unavailable(refusal)
         if capacity_only_wait(&refusal)),
     )
+}
+
+/// Whether one of the Task's own executions is running. A live reservation
+/// needs no clause: a placement that is not `ready` or `cleaned` already ends
+/// the precheck above the selection.
+async fn task_holds_run_slot(db: &db::SqliteDb, task_id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND status = 'running')",
+    )
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await?)
 }
 
 /// A known environment-failed machine is not an alternative to a full,

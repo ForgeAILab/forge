@@ -31,6 +31,10 @@
 //! instead of derived from the host's cores, so a 4-core CI runner and a
 //! workstation walk the same histories. It is the automatic cap of a small
 //! machine: runs, and review checks, do wait for a slot in these sequences.
+//! `sequences_stay_live_at_run_cap_1` and `sequences_stay_live_without_a_pinned_run_cap`
+//! walk a few of the same sequences with one slot and with the host's own cap:
+//! a machine limited to one run is a supported setting, and with it a Task's
+//! whole life (run, review check, reviewer, merge) happens in that one slot.
 #![allow(dead_code)]
 mod common;
 
@@ -462,6 +466,19 @@ const QUIESCENCE_FLOOR: Duration = Duration::from_millis(250);
 /// The server's run cap in every model stack: what a 4-core machine resolves
 /// on its own (`config::automatic_run_cap_for_cores`).
 const MODEL_RUN_CAP: u32 = 2;
+tokio::task_local! {
+    /// The cap a test pins for the stacks it boots; `None` leaves the cap to
+    /// the host (`max_concurrent_runs` unset).
+    static PINNED_RUN_CAP: Option<u32>;
+}
+
+/// A test's own pin first, then `FORGE_MODEL_RUN_CAP`, then `MODEL_RUN_CAP`.
+fn run_cap() -> Option<u32> {
+    PINNED_RUN_CAP.try_with(|cap| *cap).unwrap_or_else(|_| {
+        Some(env_number("FORGE_MODEL_RUN_CAP").map_or(MODEL_RUN_CAP, |cap| cap as u32))
+    })
+}
+
 const BUSY_RETRIES: usize = 8;
 const SETTLE_ROUNDS: usize = 20;
 const INITIAL: [&str; 2] = ["backlog", "todo"];
@@ -490,8 +507,7 @@ impl World {
         let workspaces = dir.join("workspaces");
         let mut config = config::ForgeConfig::with_data_dir(dir.join("data"));
         config.workspace.root = workspaces.clone();
-        config.server.max_concurrent_runs =
-            Some(env_number("FORGE_MODEL_RUN_CAP").map_or(MODEL_RUN_CAP, |cap| cap as u32));
+        config.server.max_concurrent_runs = run_cap();
         let runtime = Arc::new(
             services::ForgeRuntimeBuilder::from_config(
                 Arc::clone(&db),
@@ -1959,6 +1975,127 @@ async fn random_sequences_keep_every_task_live() {
     .await;
 }
 
+/// The sequences the extra caps walk: every Task lifecycle shape (plain
+/// success, a failed run retried, a review sent back, two Tasks for one slot,
+/// a crash in flight) and two generated seeds. Fewer than the default cap's
+/// set, to keep the target's runtime in bounds.
+fn cap_matrix_cases() -> Vec<(String, Vec<Step>)> {
+    use Action::{Claim, Create, Finish, Verdict};
+    let mut cases = vec![
+        (
+            "one Task runs, is checked, reviewed and merged".to_owned(),
+            vec![step(Create), step(Finish(0, Outcome::Success))],
+        ),
+        (
+            "a failed run is retried".to_owned(),
+            vec![step(Create), step(Finish(0, Outcome::Fail))],
+        ),
+        (
+            "a usage limit is waited out".to_owned(),
+            vec![
+                step(Create),
+                step(Claim(0)),
+                step(Finish(0, Outcome::UsageLimit)),
+            ],
+        ),
+        (
+            "review sends the Task back".to_owned(),
+            vec![
+                step(Create),
+                step(Verdict(0, false)),
+                step(Finish(0, Outcome::Success)),
+            ],
+        ),
+        (
+            "three Tasks share the slots".to_owned(),
+            vec![
+                step(Create),
+                step(Create),
+                step(Create),
+                step(Finish(0, Outcome::Success)),
+                step(Finish(1, Outcome::Fail)),
+            ],
+        ),
+        (
+            "crash with a run in flight".to_owned(),
+            vec![step(Create), crash_after(Create)],
+        ),
+    ];
+    cases.extend([3, 5].map(|seed| (format!("FORGE_MODEL_SEED={seed}"), generate(seed, 16))));
+    cases
+}
+
+/// A machine with `max_concurrent_runs: 1`. Before the fix a single Task
+/// parked on a machine slot that its own running execution held
+/// (`placement::machine_precheck::task_blocked` counted it), and nothing but
+/// another Task's dispatch retired that wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequences_stay_live_at_run_cap_1() {
+    PINNED_RUN_CAP
+        .scope(Some(1), run_cases(cap_matrix_cases()))
+        .await;
+}
+
+/// With one slot the whole lifecycle still happens, each stage in that slot:
+/// the coder run, the review-entry check, the reviewer run and the merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_slot_carries_a_task_from_run_to_merge() {
+    PINNED_RUN_CAP
+        .scope(Some(1), async {
+            let mut world = World::new().await;
+            let outcome: Result<(), String> = async {
+                for action in [Action::Create, Action::Finish(0, Outcome::Success)] {
+                    let applied = world.apply(&action).await?;
+                    world.quiesce().await?;
+                    let state = world.check_quiescent().await?;
+                    world
+                        .trace
+                        .push(format!("{action:?} -> {applied}: {state}"));
+                }
+                world.drive_to_settlement().await?;
+                let task = world.task(0).await?;
+                if task["status"] != "done" {
+                    return Err(format!("the Task ended in {}", task["status"]));
+                }
+                let pool = &world.live.as_ref().expect("the stack is up").pool;
+                let checks: Vec<(String,)> = sqlx::query_as("SELECT state FROM check_run")
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if checks.is_empty() || checks.iter().any(|(state,)| state != "succeeded") {
+                    return Err(format!("review-entry check runs: {checks:?}"));
+                }
+                let runs: Vec<(String, String)> =
+                    sqlx::query_as("SELECT role, status FROM execution ORDER BY created_at, rowid")
+                        .fetch_all(pool)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                for role in ["coder", "reviewer"] {
+                    if !runs
+                        .iter()
+                        .any(|(ran, status)| ran == role && status == "completed")
+                    {
+                        return Err(format!("no completed {role} run in {runs:?}"));
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(violation) = outcome {
+                panic!("{violation}\ntrace:\n{}", world.trace.join("\n"));
+            }
+        })
+        .await;
+}
+
+/// No pinned cap: the server resolves its own from the host's cores.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequences_stay_live_without_a_pinned_run_cap() {
+    PINNED_RUN_CAP
+        .scope(None, run_cases(cap_matrix_cases()))
+        .await;
+}
+
 /// Sequences for wedges this project has shipped, as far as the action set
 /// can express them. Each must end with every Task settled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2112,6 +2249,14 @@ async fn a_held_task_always_offers_its_release() {
 /// Agent is that Task's exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn start_on_a_queued_task_does_not_park_it_as_failed() {
+    // Pinned: the third Task must queue behind the Agent's two runs. With one
+    // machine slot it waits for the machine instead and `start` is not offered.
+    PINNED_RUN_CAP
+        .scope(Some(MODEL_RUN_CAP), start_on_a_queued_task())
+        .await;
+}
+
+async fn start_on_a_queued_task() {
     use Action::{Create, PauseAgent, Take};
     for (sequence, expected) in [
         (vec![Create, Create, Create, Take(2, "start")], "start"),

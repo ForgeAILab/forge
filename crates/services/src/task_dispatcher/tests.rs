@@ -8035,6 +8035,64 @@ async fn machine_capacity_waits_in_initial_state_then_starts_after_run_ends() {
     assert!(deferred_dispatch::current_dispatch_disposition(&admitted).is_none());
 }
 
+/// One slot, one Task, and that Task's own run holds the slot: it waits for
+/// nothing. The precheck used to count the Task's execution against the Task,
+/// so a machine capped at one run showed every running Task as waiting for a
+/// slot, and the wait outlived the run.
+#[tokio::test]
+async fn machine_capacity_task_does_not_wait_for_its_own_slot() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let agent_id = seed_agent(&db, 4, DaemonStatus::Online, AgentStatus::Idle).await;
+    let running = seed_task(&db, &project_id, "RUN", "in_progress", 0).await;
+    assign_role(&db, &running.id, "coder", &agent_id).await;
+    seed_running_execution(&db, &running.id, &agent_id, "coder").await;
+    db.server_run_cap.set(
+        Some(1),
+        config::resolved_run_cap(Some(1)),
+        &config::embedded_machine_id(),
+    );
+    let (dispatcher, _rx) = build_dispatcher(db.clone(), workspaces.path()).await;
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let task = machine_capacity_task(&db, &running.id).await;
+    assert!(!dispatcher
+        .task_service
+        .machine_capacity_blocked(&task, &agent, Some("coder"))
+        .await
+        .unwrap());
+    dispatcher.check_once_and_drain().await.unwrap();
+    let task = machine_capacity_task(&db, &running.id).await;
+    assert!(deferred_dispatch::dispatch_disposition(&task).is_none());
+
+    // A wait left on a Task that then got the slot is retired by the same
+    // observation, not kept until some other Task is dispatched.
+    deferred_dispatch::record_dispatch_disposition(
+        &db,
+        &task,
+        "machine_capacity",
+        "machine_capacity: waiting for a machine run slot",
+    )
+    .await
+    .unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
+    let task = machine_capacity_task(&db, &running.id).await;
+    assert!(deferred_dispatch::dispatch_disposition(&task).is_none());
+
+    // Another Task on the same machine does wait for it.
+    let queued = seed_task(&db, &project_id, "WAIT", "todo", 0).await;
+    assign_role(&db, &queued.id, "coder", &agent_id).await;
+    assert!(dispatcher
+        .task_service
+        .machine_capacity_blocked(&queued, &agent, Some("coder"))
+        .await
+        .unwrap());
+}
+
 #[tokio::test]
 async fn machine_capacity_active_waiter_is_parked_at_final_version() {
     let db = Arc::new(sqlite_db().await);

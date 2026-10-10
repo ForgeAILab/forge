@@ -2199,6 +2199,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- **A machine limited to one run no longer parks its own running Task.**
+  With `max_concurrent_runs: 1` (server setting, or a daemon's cap or admin
+  run limit) the dispatcher's capacity precheck counted a Task's own running
+  execution against that Task: every running Task was shown as `Waiting for a
+  Slot` on the machine it was running on, and after a failed run the wait
+  could stay although nothing held the slot. A Task that holds the slot is no
+  longer a capacity waiter and a stale wait is retired when the Task is next
+  observed. The cause predates the review-entry check cutover.
+
 - **Three waits that showed nothing, or lost what they waited for, are now
   typed and visible.** (1) A Task whose Agent is paused or unreachable kept a
   clear condition while `start` and `retry` were hidden; its condition is now

@@ -3698,6 +3698,12 @@ examines all potentially usable locations, including unverified clones; unknown
 facts, a possibly free machine or another placement refusal delegate to reserve.
 It uses the placement filters and server executor availability, without clone
 verification, persisted location writes, a sweep or a writer lock.
+A Task never waits for a slot it holds: when one of the Task's own executions
+is running the precheck answers "not waiting" before it counts the machine, so
+a machine capped at one run (`max_concurrent_runs: 1`, a supported setting)
+does not show its only running Task as a capacity waiter, and a wait recorded
+earlier is retired at that same observation. The run's follow-up (retry, review
+entry check, reviewer) asks for a slot only after that execution has ended.
 The durable reserve/start transactions still fence races. A machine or Project capacity waiter in an active/gate state
 counts as parked until dispatch observes a different outcome; a plain edit does
 not un-park it, and its metadata change moves the Project list revision used by
