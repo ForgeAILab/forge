@@ -2282,6 +2282,216 @@ async fn a_task_waiting_for_its_pending_entry_check_offers_cancel_and_no_hold() 
     }
 }
 
+/// Where the server dies while a Task's hooks step waits for its review-entry
+/// check. The process is dropped and a new one is built on the same database.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RestartPoint {
+    /// The check was requested; the step had not yet been suspended.
+    AfterRequestBeforeSuspend,
+    /// The result's delivery step is enqueued and has not run.
+    AfterDeliveryBeforeWake,
+    /// The delivery woke the hooks step, which has not run yet.
+    AfterWakeBeforeSettle,
+    /// The delivery step is dead-lettered: nothing wakes the hooks step but
+    /// its own deadline.
+    DeliveryDeadLettered,
+}
+
+async fn restart_while_the_entry_check_is_awaited(point: RestartPoint) {
+    let mut world = World::new().await;
+    let outcome: Result<(), String> = async {
+        // As in the pause tests: the first Task's check waits for the one
+        // slot, which the second Task's run holds.
+        for action in [Action::Create, Action::Create] {
+            world.apply(&action).await?;
+            world.quiesce().await?;
+        }
+        let cap = &world.live().state.db.server_run_cap;
+        cap.set(Some(1), 1, &cap.embedded_machine_id());
+        world.apply(&Action::Finish(0, Outcome::Success)).await?;
+        world.quiesce().await?;
+        if world.check_runs(0).await? != ["queued"] {
+            return Err(format!("expected one queued check: {:?}", world.check_runs(0).await?));
+        }
+        let task_id = world.tasks[0].clone();
+        let pool = world.live().pool.clone();
+        let sql = |error: sqlx::Error| error.to_string();
+        if point == RestartPoint::AfterRequestBeforeSuspend {
+            // The consumer and its run are stored; the step still holds the
+            // claim of a process that is gone.
+            let changed = sqlx::query(
+                "UPDATE task_step SET status='claimed', claimed_by='dead-process',
+                        lease_until='2000-01-01T00:00:00+00:00', attempts=attempts+1,
+                        suspended_until=NULL, awaited_consumer_id=NULL
+                 WHERE task_id = ? AND status = 'suspended'",
+            )
+            .bind(&task_id)
+            .execute(&pool)
+            .await
+            .map_err(sql)?
+            .rows_affected();
+            if changed != 1 {
+                return Err("no suspended hooks step to rewind".to_owned());
+            }
+        } else {
+            // The slot frees; the check worker runs the check and enqueues
+            // its delivery. No Task step runs: the model has no step worker.
+            world.apply(&Action::Finish(1, Outcome::Success)).await?;
+            let delivery: String = tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let step: Option<String> = sqlx::query_scalar(
+                        "SELECT c.delivery_step_id FROM check_consumer c JOIN check_run r ON r.id = c.run_id
+                         WHERE c.task_id = ? AND r.state = 'succeeded' AND c.delivery_step_id IS NOT NULL",
+                    )
+                    .bind(&task_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(sql)?;
+                    if let Some(step) = step {
+                        return Ok::<_, String>(step);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .map_err(|_| "the check result was not delivered".to_owned())??;
+            let pending: Option<String> =
+                sqlx::query_scalar("SELECT status FROM task_step WHERE id = ?")
+                    .bind(&delivery)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(sql)?;
+            let suspended: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_step WHERE task_id = ? AND status = 'suspended'",
+            )
+            .bind(&task_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(sql)?;
+            if pending.as_deref() != Some("pending") || suspended != 1 {
+                return Err(format!(
+                    "expected an unrun delivery and a suspended step, got {pending:?} / {suspended}"
+                ));
+            }
+            match point {
+                RestartPoint::AfterWakeBeforeSettle => {
+                    // What the delivery step does, up to its own completion.
+                    let consumer: String = sqlx::query_scalar(
+                        "SELECT id FROM check_consumer WHERE task_id = ? AND delivery_step_id = ?",
+                    )
+                    .bind(&task_id)
+                    .bind(&delivery)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(sql)?;
+                    let woken = world
+                        .live()
+                        .state
+                        .db
+                        .wake_suspended_hooks(&task_id, &consumer)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if woken != 1 {
+                        return Err("the delivery woke no step".to_owned());
+                    }
+                    sqlx::query("UPDATE check_consumer SET applied_at = ? WHERE id = ?")
+                        .bind(db::now_rfc3339())
+                        .bind(&consumer)
+                        .execute(&pool)
+                        .await
+                        .map_err(sql)?;
+                    sqlx::query(
+                        "UPDATE task_step SET status='done', completed_at=?, updated_at=? WHERE id = ?",
+                    )
+                    .bind(db::now_rfc3339())
+                    .bind(db::now_rfc3339())
+                    .bind(&delivery)
+                    .execute(&pool)
+                    .await
+                    .map_err(sql)?;
+                }
+                RestartPoint::DeliveryDeadLettered => {
+                    sqlx::query(
+                        "UPDATE task_step SET status='failed', last_error='dead-lettered', completed_at=?, updated_at=? WHERE id = ?",
+                    )
+                    .bind(db::now_rfc3339())
+                    .bind(db::now_rfc3339())
+                    .bind(&delivery)
+                    .execute(&pool)
+                    .await
+                    .map_err(sql)?;
+                    // Only the step's own deadline is left; it has passed.
+                    sqlx::query(
+                        "UPDATE task_step SET suspended_until='2000-01-01T00:00:00+00:00' WHERE task_id = ? AND status = 'suspended'",
+                    )
+                    .bind(&task_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(sql)?;
+                }
+                _ => {}
+            }
+        }
+        drop(pool);
+        world.crash_and_restart().await?;
+        world.quiesce().await?;
+        world.drive_to_settlement().await?;
+        for index in 0..2 {
+            let task = world.task(index).await?;
+            if task["status"] != "done" {
+                return Err(format!("task {index} ended in {}", task["status"]));
+            }
+        }
+        // One request, one run, one review attempt that passed: the restart
+        // repeated nothing.
+        let runs = world.check_runs(0).await?;
+        let consumers: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM check_consumer WHERE task_id = ?")
+                .bind(&task_id)
+                .fetch_one(&world.live().pool)
+                .await
+                .map_err(sql)?;
+        if runs != ["succeeded"] || consumers != 1 {
+            return Err(format!("check runs {runs:?}, consumers {consumers}; expected one of each"));
+        }
+        let reviews: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM review WHERE task_id = ? ORDER BY attempt_number")
+                .bind(&task_id)
+                .fetch_all(&world.live().pool)
+                .await
+                .map_err(sql)?;
+        if reviews != ["passed"] {
+            return Err(format!("review attempts {reviews:?}, expected one that passed"));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(violation) = outcome {
+        world.record_history().await;
+        panic!("{point:?}: {violation}\ntrace:\n{}", world.trace.join("\n"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_after_the_check_request_before_the_suspend_asks_once() {
+    restart_while_the_entry_check_is_awaited(RestartPoint::AfterRequestBeforeSuspend).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_after_the_check_delivery_before_the_wake_resumes_the_step() {
+    restart_while_the_entry_check_is_awaited(RestartPoint::AfterDeliveryBeforeWake).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_after_the_wake_before_the_settle_settles_from_the_stored_result() {
+    restart_while_the_entry_check_is_awaited(RestartPoint::AfterWakeBeforeSettle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_lettered_check_delivery_is_read_by_the_step_at_its_deadline() {
+    restart_while_the_entry_check_is_awaited(RestartPoint::DeliveryDeadLettered).await;
+}
+
 /// No pinned cap: the server resolves its own from the host's cores.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sequences_stay_live_without_a_pinned_run_cap() {
