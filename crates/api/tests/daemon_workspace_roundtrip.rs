@@ -192,6 +192,33 @@ impl Drop for DaemonLink {
     }
 }
 
+/// Bounds a wait by progress instead of by wall time: it is over only when
+/// the watched value has not changed for the whole limit.
+struct Stall {
+    seen: Option<String>,
+    since: tokio::time::Instant,
+    limit: Duration,
+}
+
+impl Stall {
+    fn new(limit: Duration) -> Self {
+        Self {
+            seen: None,
+            since: tokio::time::Instant::now(),
+            limit,
+        }
+    }
+
+    /// `true` once `observed` has stayed the same for the whole limit.
+    fn stalled(&mut self, observed: String) -> bool {
+        if self.seen.as_ref() != Some(&observed) {
+            self.seen = Some(observed);
+            self.since = tokio::time::Instant::now();
+        }
+        self.since.elapsed() >= self.limit
+    }
+}
+
 struct Fixture {
     harness: Harness,
     server: TestServer,
@@ -736,14 +763,42 @@ impl Fixture {
         );
     }
 
+    /// What the server has done so far, as one comparable value: versions of
+    /// the rows a reconciliation writes, settled Task steps and recorded
+    /// events. A wait that watches it tells a busy server from a stuck one.
+    async fn server_activity(&self) -> String {
+        sqlx::query_scalar(
+            "SELECT (SELECT COALESCE(SUM(version),0) FROM task) || '|' || \
+             (SELECT COALESCE(SUM(execution_version),0) FROM execution) || '|' || \
+             (SELECT COALESCE(SUM(version),0) FROM workspace_placement) || '|' || \
+             (SELECT COUNT(*) || ':' || COALESCE(SUM(attempts),0) FROM task_step WHERE status<>'pending') || '|' || \
+             (SELECT COUNT(*) FROM domain_event)",
+        )
+        .fetch_one(self.harness.state.db.pool())
+        .await
+        .unwrap()
+    }
+
+    /// Waits until the owner's journal is acknowledged empty. It fails only
+    /// when nothing has moved for 5 s (the journal, the frames the server
+    /// sent, the server's own rows), not after a fixed time: a loaded
+    /// machine is slow, not stuck.
     async fn wait_until_journal_empty(&self) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut stall = Stall::new(Duration::from_secs(5));
         loop {
             let pending = self.runtime.journal().pending().unwrap();
             if pending.is_empty() {
                 return;
             }
-            if tokio::time::Instant::now() >= deadline {
+            let observed = format!(
+                "{:?}|{}|{}",
+                pending.iter().map(JournalEntry::entry_id).collect::<Vec<_>>(),
+                self.link
+                    .as_ref()
+                    .map_or(0, |link| link.requests.lock().unwrap().len()),
+                self.server_activity().await
+            );
+            if stall.stalled(observed) {
                 panic!(
                     "owner journal acknowledgement arrives: pending_count={}, pending_entry_ids={:?}, last_server_frame={:?}",
                     pending.len(),
@@ -1083,6 +1138,9 @@ async fn assert_outage_order(socket_first: bool) {
         .as_deref()
         .is_some_and(|head| head != fixture.base_sha));
     fixture.reconnect().await;
+    // Bounded by progress, with its own budget: the wait above may have used
+    // most of the shared deadline on a loaded machine.
+    let mut stall = Stall::new(Duration::from_secs(10));
     loop {
         monitor.check_once().await.unwrap();
         let observed_placement = WorkspacePlacementRepo::get_by_id(&*database, &placement.id)
@@ -1104,7 +1162,22 @@ async fn assert_outage_order(socket_first: bool) {
         {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
+        let observed = format!(
+            "{:?}|{}|{}|{}|{:?}|{}|{:?}|{}|{}",
+            observed_placement.state,
+            observed_placement.version,
+            observed_task.status,
+            observed_task.version,
+            observed_execution.status,
+            observed_execution.execution_version,
+            pending.iter().map(JournalEntry::entry_id).collect::<Vec<_>>(),
+            fixture
+                .link
+                .as_ref()
+                .map_or(0, |link| link.requests.lock().unwrap().len()),
+            fixture.server_activity().await
+        );
+        if stall.stalled(observed) {
             panic!(
                 "retained terminal reconciles and advances the Task to Review: placement_state={:?}, placement_version={}, task_status={}, task_version={}, execution_status={:?}, execution_version={}, pending_journal_count={}, pending_entry_ids={:?}, last_server_frame={:?}",
                 observed_placement.state,
@@ -3511,8 +3584,35 @@ async fn cancel_during_slow_remote_merge_push_reports_done() {
             .is_err(),
         "Cancel waits for the protected push"
     );
-    // The push is still running after the 10 s acknowledgement window.
-    tokio::time::sleep(Duration::from_secs(11)).await;
+    // The push is still running 10 s after the Cancel was asked for. The
+    // Cancel waits at most 15 s from its own enqueue, so the hold is measured
+    // on the command's own clock (`created_at`), not from when this test saw
+    // it: a slow machine then spends none of the remaining margin on the
+    // detection above.
+    let enqueued = db
+        .task_steps(&task_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| {
+            s.kind == "command"
+                && serde_json::from_str::<Value>(&s.payload_json).unwrap()["preempt"] == true
+        })
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s.created_at)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        })
+        .expect("the preempting Cancel is enqueued");
+    let hold_until = enqueued + chrono::Duration::milliseconds(10_200);
+    while chrono::Utc::now() < hold_until {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!cancel.is_finished(), "Cancel still waits for the push");
+    assert!(
+        chrono::Utc::now() < enqueued + chrono::Duration::seconds(14),
+        "this machine was too slow to release the push inside the Cancel's own 15 s wait"
+    );
     std::fs::write(&release, "release").unwrap();
     let cancelled = tokio::time::timeout(Duration::from_secs(15), cancel)
         .await
