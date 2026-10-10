@@ -4716,6 +4716,83 @@ async fn queue_worker_rebases_checks_and_fast_forwards_on_a_daemon_owned_target(
     assert_eq!(checks, vec![(tip.clone(), "pass".to_owned())]);
 }
 
+/// The red twin of the test above: the rebased commit's real `ci_steps`
+/// command fails on the daemon. The head is ejected with the command's own
+/// failure, the default checkout is not moved, and the Task is sent back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn queue_worker_ejects_a_red_check_on_a_daemon_owned_target() {
+    let fixture = Fixture::file_backed("forge-queue-daemon-red").await;
+    let head = admit_queue_head(&fixture, &["test -f outside.txt", "exit 3"]).await;
+    std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&fixture.checkout, "outside").await.unwrap();
+    let moved_tip = git::get_current_sha(&fixture.checkout).await.unwrap();
+    let state = fixture.harness.state.clone();
+    let periodic = services::worker_runtime::PeriodicWorkers::new(state.db.clone());
+    let (stop_checks, checks_stopped) = tokio::sync::watch::channel(false);
+    let _checks = Arc::new(services::check_runner::worker::CheckRunWorker::new(
+        state.db.clone(),
+        Arc::new(services::check_runner::owners::WorkspaceCheckOwners::new(
+            state.db.clone(),
+            state.daemon_connections.clone(),
+            Duration::from_secs(60),
+        )),
+    ))
+    .start(&periodic, checks_stopped);
+
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the head to be ejected", {
+        queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Ejected
+            && task_status(&fixture, &head.task_id).await != "merging"
+    });
+    let _ = stop.send(true);
+    let _ = stop_checks.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let attempt = queue_attempt(&fixture, &head).await;
+    assert_eq!(
+        attempt.failure_kind,
+        Some(db::IntegrationFailureKind::CandidateCheckFailed)
+    );
+    assert!(
+        attempt
+            .failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("exited 3")),
+        "{:?}",
+        attempt.failure_message
+    );
+    // Rebased on the daemon, checked there, never fast-forwarded.
+    let link = fixture.link.as_ref().unwrap();
+    assert_eq!(attempt_requests(link, METHOD_WORKSPACE_RESET).len(), 1);
+    assert!(attempt_requests(link, METHOD_WORKSPACE_MERGE).is_empty());
+    assert_eq!(fast_forward_receipts(&attempt), 0);
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        moved_tip
+    );
+    assert_ne!(task_status(&fixture, &head.task_id).await, "done");
+    let checks: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id",
+    )
+    .fetch_all(state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        checks,
+        vec![(attempt.candidate_sha.clone().unwrap(), "fail".to_owned())]
+    );
+    {
+        use db::IntegrationQueueRepo;
+        let queue = state
+            .db
+            .integration_queue(&head.queue_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(queue.head_attempt_id.is_none(), "the slot is free");
+    }
+}
+
 /// A daemon-owned default checkout with uncommitted changes: the worker
 /// reads that on the daemon and parks the head `target_dirty` at once, before
 /// any effect, instead of spending rounds on the owner's refusals.

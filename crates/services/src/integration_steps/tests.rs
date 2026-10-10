@@ -1804,6 +1804,281 @@ async fn tasks_in_another_clone_merge_into_the_default_checkout_through_the_queu
     );
 }
 
+impl World {
+    /// An agent that holds the reviewer role of `task`.
+    async fn seed_reviewer(&self, task: &str) -> String {
+        let agent_id = format!("reviewer-{task}");
+        let now = db::now_rfc3339();
+        db::AgentRepo::create(
+            &*self.db,
+            db::CreateAgent {
+                id: agent_id.clone(),
+                name: agent_id.clone(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                max_concurrent_tasks: 2,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("agent creates");
+        db::TaskRoleAssignmentRepo::assign(
+            &*self.db,
+            db::CreateTaskRoleAssignment {
+                id: db::new_uuid_v4(),
+                task_id: task.to_owned(),
+                role_name: "reviewer".to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(agent_id.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("role assignment creates");
+        agent_id
+    }
+    async fn seed_execution(&self, task: &str, role: &str, agent: Option<&str>) -> String {
+        let id = db::new_uuid_v4();
+        let now = db::now_rfc3339();
+        db::ExecutionRepo::create(
+            &*self.db,
+            db::CreateExecution {
+                id: id.clone(),
+                task_id: task.to_owned(),
+                agent_id: agent.map(str::to_owned),
+                role: role.to_owned(),
+                // Stored settled; the reviewer's row is then marked running
+                // below, as it is while its contract is frozen. (Creating a
+                // running execution goes through dispatch admission, which
+                // this fixture has no machine for.)
+                status: db::ExecutionStatus::Completed,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: Some(format!("w-{task}")),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("execution creates");
+        if agent.is_some() {
+            sqlx::query("UPDATE execution SET status='running' WHERE id=?")
+                .bind(&id)
+                .execute(self.db.pool())
+                .await
+                .unwrap();
+        }
+        id
+    }
+    /// A passed agent review of `task`'s present commit against the present
+    /// target tip, exactly as a reviewer run that passed leaves it (the
+    /// fixture `seed_passed_carry_review` of the workflow action tests): the
+    /// executor's and the reviewer's executions, the frozen contract, the
+    /// frozen passed assessment and the passed Review row. `reviewed_paths`
+    /// is the change set the contract froze. Returns the contract's
+    /// execution id.
+    async fn seed_passed_review(&self, task: &str, reviewed_paths: &[&str]) -> String {
+        use db::ReviewConformanceRepo;
+        let agent = self.seed_reviewer(task).await;
+        let executor = self.seed_execution(task, "executor", None).await;
+        let reviewer = self.seed_execution(task, "reviewer", Some(&agent)).await;
+        let commit_sha = git::get_current_sha(&self.tree(task)).await.unwrap();
+        let base_sha = git_out(&self.repo(), &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap();
+        let context = ::review::contract::load_context(&self.db, task, Some(&reviewer))
+            .await
+            .expect("governing context loads");
+        let mut contract = api_types::ReviewContract {
+            execution_id: reviewer.clone(),
+            policy: api_types::REVIEW_CONFORMANCE_POLICY.to_owned(),
+            commit_sha,
+            base_sha,
+            candidate_changed_paths: reviewed_paths
+                .iter()
+                .map(|path| (*path).to_owned())
+                .collect(),
+            context,
+            check_results: Vec::new(),
+            digest: String::new(),
+        };
+        contract.digest = api_types::canonical_digest(&contract).expect("contract digests");
+        self.db
+            .create_review_contract(&contract)
+            .await
+            .expect("contract freezes");
+        let conformance = api_types::ReviewConformance {
+            status: api_types::ConformanceStatus::Passed,
+            contract: Some(contract),
+            assessment: Some(api_types::ReviewAssessment {
+                fixable_by: api_types::FixableBy::Coder,
+                repeat: false,
+                result: api_types::ReviewResult::Pass,
+                reason: "looks right".to_owned(),
+                report: String::new(),
+            }),
+            checks: Vec::new(),
+            reason: None,
+        };
+        self.db
+            .record_review_conformance(&conformance)
+            .await
+            .expect("assessment freezes");
+        sqlx::query("UPDATE execution SET status='completed' WHERE id=?")
+            .bind(&reviewer)
+            .execute(self.db.pool())
+            .await
+            .unwrap();
+        let now = db::now_rfc3339();
+        db::ReviewRepo::create(
+            &*self.db,
+            db::CreateReview {
+                id: db::new_uuid_v4(),
+                task_id: task.to_owned(),
+                execution_id: executor,
+                attempt_number: 1,
+                status: db::ReviewStatus::Passed,
+                step_results_json: json!({
+                    "ci_steps": [],
+                    "conformance": conformance,
+                    "auditor": { "verdict": "pass", "reason": "looks right" },
+                })
+                .to_string(),
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("passed review records");
+        reviewer
+    }
+}
+
+/// `carry_for` against a real review contract. Two Tasks were reviewed and
+/// passed by an agent reviewer; a third Task lands first and moves the
+/// target, so the queue rebases both. The first keeps its review: the
+/// rebased commit changes exactly what the reviewer saw, its check passes,
+/// the carry is recorded against the contract and charged, and it merges
+/// without a new review. The second loses it: its contract froze another
+/// change set than the candidate has, so the rebased commit is outside what
+/// was reviewed; it is sent back for review and never merges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_real_review_contract_is_carried_over_the_queue_rebase_or_lost_with_its_change_set() {
+    let world = World::new().await;
+    let first = world.add_task("one", "one.txt", "one\n").await;
+    let kept = world.add_task("two", "two.txt", "two\n").await;
+    let lost = world.add_task("three", "three.txt", "three\n").await;
+    for task in ["one", "two", "three"] {
+        review_ci(&world, task, &["test -f base"]).await;
+    }
+    let kept_contract = world.seed_passed_review("two", &["two.txt"]).await;
+    world.seed_passed_review("three", &["elsewhere.txt"]).await;
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually(
+        "one and two merge and three is sent back for review",
+        || async {
+            world.task("one").await.status == "done"
+                && world.task("two").await.status == "done"
+                && world.attempt(&lost.id).await.state == S::NeedsReview
+        },
+    )
+    .await;
+    eventually("the merged attempts complete", || async {
+        world.attempt(&first.id).await.state == S::Completed
+            && world.attempt(&kept.id).await.state == S::Completed
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let (two, three) = (world.attempt(&kept.id).await, world.attempt(&lost.id).await);
+    // Kept: one carry, of the rebased commit onto the tip it was rebased on,
+    // against the contract the reviewer froze; the allowance was charged.
+    assert_ne!(two.integrated_sha, two.original_candidate_sha);
+    let carries: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT task_id,contract_execution_id,commit_sha,base_sha FROM review_authority_carry ORDER BY created_at",
+    )
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        carries,
+        vec![(
+            "two".to_owned(),
+            kept_contract,
+            two.integrated_sha.clone().unwrap(),
+            two.integrated_before_sha.clone().unwrap(),
+        )],
+        "{carries:?}"
+    );
+    let spent: i64 = world
+        .scalar(
+            "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id=? AND kind='review_carry'),0)",
+            "two",
+        )
+        .await;
+    assert_eq!(spent, 1);
+    let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    assert_eq!(two.integrated_sha.as_deref(), Some(tip.as_str()));
+    // Lost: no carry, the reason names the path, and nothing of it landed.
+    assert!(
+        three
+            .failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("outside the reviewed change set")),
+        "{:?}",
+        three.failure_message
+    );
+    assert!(git_out(
+        &world.repo(),
+        &["cat-file", "-e", &format!("{tip}:three.txt")]
+    )
+    .await
+    .is_none());
+    assert_ne!(world.task("three").await.status, "done");
+    assert_eq!(
+        world
+            .step("three", IntegrationStepAction::SendBack)
+            .await
+            .len(),
+        1
+    );
+}
+
 /// A digest of every row of every table except the three the worker may
 /// write: the queue, the attempt and the Task-step queue (with
 /// `task_schedule_dirty`, which the `task_step` triggers maintain on every
