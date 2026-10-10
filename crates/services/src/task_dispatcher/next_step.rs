@@ -31,7 +31,6 @@ pub enum Step {
         role: String,
         agent_id: String,
     },
-    MergeEntry,
 }
 impl Step {
     pub fn identity(&self) -> String {
@@ -169,9 +168,9 @@ pub struct Facts {
     pub role_user: bool,
     /// The state has a role and nobody holds it.
     pub role_open: bool,
+    /// A root Task in a state whose entry admits to the integration queue,
+    /// with no entry hooks row and no integration attempt stated on it.
     pub missing_merge_entry: bool,
-    pub unsafe_merge_entry: bool,
-    pub merge_witness: bool,
 }
 pub struct Snapshot<'a> {
     pub state: &'a str,
@@ -524,27 +523,17 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
                 });
             }
             if f.missing_merge_entry {
-                if f.unsafe_merge_entry {
-                    return park(
-                        Reason::WorkflowInvalid {
-                            state: s.state.into(),
-                            cause: "entry includes custom hooks without a safe continuation".into(),
-                        },
-                        Owner::ProjectAgent,
-                        Action::EditWorkflow,
-                    );
-                }
-                return if f.merge_witness {
-                    Next::Step(Step::MergeEntry)
-                } else {
-                    park(
-                        Reason::UnknownCondition {
-                            owner: ENTRY_HOOKS_OWNER.into(),
-                        },
-                        Owner::Workflow,
-                        Action::ReconcileEntry,
-                    )
-                };
+                // Nothing replays an entry: admission to the integration
+                // queue is the entry hooks step's, and a Task that was
+                // merging before the queue was active is taken up by the
+                // start-time importer.
+                return park(
+                    Reason::UnknownCondition {
+                        owner: ENTRY_HOOKS_OWNER.into(),
+                    },
+                    Owner::Workflow,
+                    Action::ReconcileEntry,
+                );
             }
             // Nothing automatic continues from here, and that is not a
             // defect: a person holds the role, nobody was given it yet, or the
@@ -1120,35 +1109,6 @@ mod tests {
                 reason: Reason::UnknownCondition { .. },
                 owner: Owner::Workflow,
                 recovery: Action::ReconcileEntry
-            })
-        ));
-    }
-    #[test]
-    fn custom_entry_cannot_replay_even_with_transition_witness() {
-        let workflow = WorkflowEngine::resolve_workflow("{}");
-        let condition = TaskCondition::Clear {
-            evidence: ConditionEvidence::default(),
-        };
-        let facts = Facts {
-            missing_merge_entry: true,
-            unsafe_merge_entry: true,
-            merge_witness: true,
-            child_ready: true,
-            root_role_allowed: true,
-            reviewer_ready: true,
-            ..Default::default()
-        };
-        assert!(matches!(
-            next_step(&Snapshot {
-                state: "merging",
-                condition: &condition,
-                workflow: &workflow,
-                facts: &facts
-            }),
-            Next::Park(Park {
-                reason: Reason::WorkflowInvalid { .. },
-                recovery: Action::EditWorkflow,
-                ..
             })
         ));
     }

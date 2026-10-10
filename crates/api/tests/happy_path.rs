@@ -228,30 +228,60 @@ PY"# }
         listed_tasks.items.iter().any(|task| task.id == task_id),
         "normal non-automation task remains visible in project task list"
     );
-    // 3.2 stage B: the live merge path, not only a database fixture, records
-    // its passive shadow attempt, and the settled Task closes it.
-    let (shadow_state, shadow_current, shadow_observations): (String, bool, String) =
-        sqlx::query_as(
-            "SELECT state, current, observations_json FROM integration_attempt WHERE task_ref = ?",
-        )
-        .bind(&task_id)
-        .fetch_one(harness.state.db.pool())
-        .await
-        .expect("the merge recorded exactly one shadow integration attempt");
-    let shadow_observations: Vec<Value> = serde_json::from_str(&shadow_observations).unwrap();
-    assert_eq!(
-        (shadow_state.as_str(), shadow_current),
-        ("completed", false),
-        "{shadow_observations:?}"
-    );
-    assert_eq!(shadow_observations[0]["kind"], "admission");
-    let landed = shadow_observations
-        .iter()
-        .find(|o| o["kind"] == "done" && o["identity"].as_str().unwrap().ends_with("merge_outcome"))
-        .unwrap_or_else(|| panic!("no merge outcome observed: {shadow_observations:?}"));
+    // 3.2 stage D2b: the merge went through the integration queue. The
+    // entry of `merging` admitted exactly one attempt, bound to where the
+    // candidate lives, and the queue's `result` step completed it.
+    #[allow(clippy::type_complexity)]
+    let (state, current, key, workspace_bound, placement_bound, location_bound, owner_kind, candidate, integrated): (
+        String,
+        bool,
+        String,
+        bool,
+        bool,
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT state, current, admission_key, workspace_id IS NOT NULL, placement_id IS NOT NULL, \
+                repo_location_id IS NOT NULL, owner_kind, original_candidate_sha, integrated_sha \
+         FROM integration_attempt WHERE task_ref = ?",
+    )
+    .bind(&task_id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("the merge admitted exactly one integration attempt");
+    assert_eq!((state.as_str(), current), ("completed", false));
     assert!(
-        landed["target_tip_sha"].is_string() && landed["candidate_sha"].is_string(),
-        "the live merge's target read reached its step: {landed}"
+        key.starts_with("admit:"),
+        "admitted by the entry hook: {key}"
+    );
+    assert!(
+        workspace_bound && placement_bound && location_bound,
+        "admission records where the candidate lives"
+    );
+    assert_eq!(owner_kind.as_deref(), Some("server"));
+    let merged = run_git(&repo_path, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        integrated.as_deref(),
+        Some(merged.as_str()),
+        "the queue fast-forwarded the default checkout to the attempt's commit"
+    );
+    assert_eq!(
+        candidate, integrated,
+        "an unchanged target merges the reviewed commit as it is"
+    );
+    let merge_transitions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT from_state, to_state FROM transition_log WHERE task_id = ? AND from_state = 'merging'",
+    )
+    .bind(&task_id)
+    .fetch_all(harness.state.db.pool())
+    .await
+    .expect("transitions load");
+    assert_eq!(
+        merge_transitions,
+        vec![("merging".to_owned(), "done".to_owned())],
+        "the Task stays in merging while the queue works and leaves it once"
     );
 
     let persisted_task = TaskRepo::get_by_id(&*harness.state.db, &task_id, false)

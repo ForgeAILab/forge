@@ -415,10 +415,49 @@ impl TaskStepWorker {
     /// is parked) ends the drain. So does a check queued behind a full
     /// machine, once the Task states that it waits for a slot: only a run
     /// ending elsewhere frees one, and the check worker admits it then.
+    ///
+    /// A Task in the integration queue has no pending step while the queue
+    /// worker owns it: drain runs that worker's sweep itself and starts the
+    /// head drivers it returns, runs the check worker for a head's check,
+    /// and executes the steps of the head ahead of this Task in its queue,
+    /// until the Task leaves the queue or its attempt waits on something
+    /// only time or its owner ends (parked, quarantined, a suspended queue).
+    ///
+    /// Where the runtime's own queue worker is running, drain only waits for
+    /// it. Head drivers drain started itself stop when it returns; a head
+    /// they leave mid-way is taken over at its lease expiry.
     pub async fn drain(&self, task_id: &str) -> Result<db::Task> {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let mut drivers = JoinSet::new();
+        let drained = self.drain_with(task_id, &mut drivers, &stop).await;
+        stop.cancel();
+        while drivers.join_next().await.is_some() {}
+        drained
+    }
+    async fn drain_with(
+        &self,
+        task_id: &str,
+        drivers: &mut JoinSet<()>,
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> Result<db::Task> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
         let checks = self.task_service.check_worker_or_embedded();
+        let integration = self.task_service.integration_worker_or_embedded();
         loop {
+            while drivers.try_join_next().is_some() {}
+            // Whatever the step queue shows, a queue with work gets a head.
+            // A claim also re-opens a suspended queue whose target became
+            // ready, so a member of one is read again after the sweep.
+            let (mut queued_head, suspended) = self.integration_head_task(task_id).await?;
+            let pump = !integration.is_running();
+            if pump && (queued_head.is_some() || suspended) {
+                for driver in integration.sweep_once().await? {
+                    drivers.spawn(driver.run(stop.child_token()));
+                }
+                if suspended {
+                    queued_head = self.integration_head_task(task_id).await?.0;
+                }
+            }
             if self.db.pending_steps(task_id).await? == 0
                 && !self.db.task_step_is_running(task_id)
                 && !self.db.task_steps(task_id).await?.iter().any(|step| {
@@ -455,6 +494,56 @@ impl TaskStepWorker {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
+                if let Some(head_task) = queued_head {
+                    // The head's check, if it asked for one.
+                    let mut jobs = JoinSet::new();
+                    checks.sweep(&mut jobs).await?;
+                    while let Some(job) = jobs.join_next().await {
+                        job.map_err(|_| {
+                            ServiceError::invalid_operation("check job stopped during drain")
+                        })??;
+                    }
+                    // The sweep just tried to admit the head's check. One
+                    // still queued behind a full machine is answered only
+                    // when a run ends elsewhere: nothing here can advance it.
+                    let waits_for_slot: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM integration_attempt a \
+                           JOIN check_consumer c ON c.task_id=a.task_ref AND c.origin='integration' AND c.status_epoch=a.expected_epoch \
+                           JOIN check_run r ON r.id=c.run_id \
+                         WHERE a.task_ref=? AND a.current=1 AND a.state='checking' \
+                           AND c.cancelled_at IS NULL AND c.result_id IS NULL \
+                           AND r.state='queued' AND r.capacity_wait_since IS NOT NULL)",
+                    )
+                    .bind(&head_task)
+                    .fetch_one(self.db.pool())
+                    .await?;
+                    if waits_for_slot && self.db.pending_steps(task_id).await? == 0 {
+                        return TaskRepo::get_by_id(&*self.db, task_id, false)
+                            .await?
+                            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()));
+                    }
+                    // Another Task holds the slot: its steps are what this
+                    // Task waits for.
+                    if pump && head_task != task_id {
+                        let owner = db::new_uuid_v4();
+                        if let Some(step) = self
+                            .db
+                            .claim_step(&owner, Some(&head_task), &lease_deadline())
+                            .await?
+                        {
+                            let _activity = self.db.hold_task_step(&step);
+                            self.execute(step).await?;
+                            continue;
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ServiceError::invalid_operation(
+                            "task step drain timed out waiting for the integration queue",
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
                 return TaskRepo::get_by_id(&*self.db, task_id, false)
                     .await?
                     .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()));
@@ -474,6 +563,40 @@ impl TaskStepWorker {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
+    }
+    /// `Some` while `task_id` is in the integration queue with work the
+    /// queue worker can do now: the Task whose attempt holds (or will take)
+    /// the slot of its queue. `None` once the Task left the entry it was
+    /// admitted in, or its attempt waits on time or its owner.
+    ///
+    /// The flag: the Task is a queued member of a queue that is not open.
+    async fn integration_head_task(&self, task_id: &str) -> Result<(Option<String>, bool)> {
+        let row: Option<(String, Option<String>, Option<String>, bool)> = sqlx::query_as(
+            "SELECT a.state, \
+                    (SELECT q.state FROM integration_queue q WHERE q.id=a.queue_id), \
+                    (SELECT h.task_ref FROM integration_queue q JOIN integration_attempt h ON h.id=q.head_attempt_id WHERE q.id=a.queue_id), \
+                    (a.cancel_requested_at IS NULL AND (a.available_at IS NULL OR julianday(a.available_at)<=julianday('now'))) \
+             FROM integration_attempt a JOIN task t ON t.id=a.task_ref \
+             WHERE a.task_ref=? AND a.current=1 AND a.queue_id IS NOT NULL AND t.deleted_at IS NULL \
+               AND t.status=a.expected_status AND t.status_epoch=a.expected_epoch",
+        )
+        .bind(task_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some((state, queue_state, head_task, claimable)) = row else {
+            return Ok((None, false));
+        };
+        let open = queue_state.as_deref() == Some("open");
+        let live = match state.as_str() {
+            "queued" => open && claimable,
+            "validating" | "rebasing" | "checking" | "awaiting_task_step" | "ready_ff"
+            | "ff_inflight" | "applied" | "reconciling" => true,
+            _ => false,
+        };
+        Ok((
+            live.then(|| head_task.unwrap_or_else(|| task_id.to_owned())),
+            state == "queued" && !open && claimable,
+        ))
     }
     async fn execute(&self, step: TaskStep) -> Result<()> {
         let id = step.id.clone();

@@ -133,6 +133,7 @@ pub enum RuntimeWorker {
     StorageMaintenance,
     TaskSteps,
     CheckRuns,
+    IntegrationQueue,
 }
 
 impl RuntimeWorker {
@@ -151,7 +152,7 @@ impl RuntimeWorker {
     }
 }
 
-pub(crate) const COMMON_WORKERS: [RuntimeWorker; 18] = [
+pub(crate) const COMMON_WORKERS: [RuntimeWorker; 19] = [
     RuntimeWorker::CrashRecovery,
     RuntimeWorker::NotificationProjection,
     RuntimeWorker::OperatorStatusProjection,
@@ -170,6 +171,7 @@ pub(crate) const COMMON_WORKERS: [RuntimeWorker; 18] = [
     RuntimeWorker::TaskSteps,
     RuntimeWorker::ConflictHotspots,
     RuntimeWorker::CheckRuns,
+    RuntimeWorker::IntegrationQueue,
 ];
 
 /// Abortable ownership for a compatibility worker that starts before a
@@ -264,6 +266,7 @@ pub struct ForgeRuntime {
     /// Where a consumer family registers and a Task step asks for a check.
     pub check_consumers: Arc<crate::check_runner::consumer::TaskCheckConsumers>,
     check_worker: Arc<crate::check_runner::worker::CheckRunWorker>,
+    integration_worker: Arc<crate::integration_worker::IntegrationQueueWorker>,
     pub lifecycle_emitter: Arc<crate::lifecycle::LifecycleEventEmitter>,
     pub workspace_exec_locks: Arc<WorkspaceExecutionLockManager>,
     pub repo_cache_locks: Arc<RepoCacheLockManager>,
@@ -800,6 +803,9 @@ impl ForgeRuntimeBuilder {
         ));
         operator_status_service.set_event_relay(Arc::clone(&domain_event_broadcast));
         let storage_maintenance = Arc::new(StorageMaintenanceWorker::new(Arc::clone(&self.db)));
+        // One configuration for both sides of the queue's Task-step
+        // handshake: the worker and the merge-path check family.
+        let integration_config = crate::integration_worker::IntegrationWorkerConfig::default();
         // One constructor composes the runner, both consumer families
         // (review entry and the merge path) and the worker; tests build the
         // same set through it.
@@ -811,7 +817,13 @@ impl ForgeRuntimeBuilder {
         } = task_service.compose_checks(
             daemon_connections.clone(),
             Duration::from_secs(effective_config.workspace.max_disconnect_seconds),
+            &integration_config,
         );
+        // The integration queue worker over its production ports. Not
+        // started here: the supervisor starts it after owner reconciliation
+        // and the importer.
+        let integration_worker =
+            task_service.compose_integration(daemon_connections.clone(), integration_config);
         cleanup_scheduler.set_live_check_counter(check_owners.live_operation_counter());
         cleanup_scheduler
             .set_check_timeout(u64::from(effective_config.server.check_run_timeout_seconds));
@@ -873,6 +885,7 @@ impl ForgeRuntimeBuilder {
             check_runner,
             check_consumers,
             check_worker,
+            integration_worker,
             lifecycle_emitter,
             workspace_exec_locks,
             repo_cache_locks,
@@ -995,6 +1008,21 @@ impl RuntimeSupervisor {
             // API routes from starting, matching the legacy entry point.
             tracing::warn!(%error, "workflow template initialization failed");
         }
+        // Take every Task that was merging the old way into the integration
+        // queue, before any worker runs. Storage-only, bounded per pass,
+        // idempotent: a failure is logged and the next start continues.
+        match crate::integration_steps::import::import_at_start(&self.runtime.db).await {
+            Ok(report) if report.imported > 0 || report.continuations > 0 => tracing::info!(
+                imported = report.imported,
+                quarantined = report.quarantined,
+                continuations = report.continuations,
+                "integration import continued in-flight merges"
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "integration import failed; the next start continues it")
+            }
+        }
         // Reconcile what was committed before the restart. Everything else,
         // stranded integration entries included, is found by the first lap
         // of the dispatcher's paged sweep, which never delays startup.
@@ -1042,6 +1070,13 @@ impl RuntimeSupervisor {
         self.handles.push((
             RuntimeWorker::CheckRuns,
             Arc::clone(&self.runtime.check_worker).start(&periodic_workers, shutdown.clone()),
+        ));
+        // After owner reconciliation (crash recovery, above), the importer
+        // and the Task-step worker: the queue worker's first sweep claims
+        // every queue with work, and every head whose lease ran out.
+        self.handles.push((
+            RuntimeWorker::IntegrationQueue,
+            Arc::clone(&self.runtime.integration_worker).start(&periodic_workers, shutdown.clone()),
         ));
         self.handles.push((
             RuntimeWorker::TaskDispatcher,
@@ -1234,7 +1269,7 @@ mod tests {
 
     #[test]
     fn worker_set_is_explicit_and_stable() {
-        assert_eq!(COMMON_WORKERS.len(), 18);
+        assert_eq!(COMMON_WORKERS.len(), 19);
         assert_eq!(COMMON_WORKERS[0], RuntimeWorker::CrashRecovery);
         assert_eq!(COMMON_WORKERS[1], RuntimeWorker::NotificationProjection);
         assert_eq!(COMMON_WORKERS[2], RuntimeWorker::OperatorStatusProjection);
@@ -1244,6 +1279,7 @@ mod tests {
         assert_eq!(COMMON_WORKERS[15], RuntimeWorker::TaskSteps);
         assert_eq!(COMMON_WORKERS[16], RuntimeWorker::ConflictHotspots);
         assert_eq!(COMMON_WORKERS[17], RuntimeWorker::CheckRuns);
+        assert_eq!(COMMON_WORKERS[18], RuntimeWorker::IntegrationQueue);
     }
 
     #[tokio::test]
@@ -1292,8 +1328,8 @@ mod tests {
         assert!(!supervisor.started());
         supervisor.start().await.expect("runtime starts");
         assert!(supervisor.started());
-        assert_eq!(supervisor.workers().len(), 18);
-        assert_eq!(supervisor.worker_handle_count(), 17);
+        assert_eq!(supervisor.workers().len(), 19);
+        assert_eq!(supervisor.worker_handle_count(), 18);
         assert!(supervisor
             .workers()
             .contains(&RuntimeWorker::HeartbeatMonitor));
@@ -1345,6 +1381,7 @@ mod tests {
             "storage-maintenance",
             "environment-settings-observer",
             "check-runs",
+            "integration-queue",
         ];
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1395,7 +1432,7 @@ mod tests {
         let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
 
         supervisor.start().await.expect("runtime starts");
-        assert_eq!(supervisor.worker_handle_count(), 17);
+        assert_eq!(supervisor.worker_handle_count(), 18);
         supervisor.shutdown().await.expect("runtime shuts down");
     }
 }

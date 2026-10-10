@@ -21,9 +21,7 @@ pub use lifecycle::{
 #[cfg(test)]
 pub(crate) use merge::test_faults as merge_test_faults;
 pub(crate) use merge::{conflict_handoff_result, merge_failure_result, record_integration_failure};
-pub use merge::{
-    AutoCascadeOnMergeResult, CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge,
-};
+pub use merge::{CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge};
 pub use review::{
     run_ci_steps_in_step, set_entry_check_wall_seconds_for_test, AutoCascadeOnReviewPass,
     AutoCascadeOnUnconfiguredReview, RunCiSteps,
@@ -34,6 +32,3 @@ pub use subtasks::{
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-pub(crate) use merge::target_moved_result;

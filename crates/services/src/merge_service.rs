@@ -84,6 +84,15 @@ pub(crate) struct MergeIntent {
     pub target_branch: String,
 }
 
+/// See [`MergeService::integration_admission_facts`].
+pub(crate) struct IntegrationAdmissionFacts {
+    pub execution_id: String,
+    pub workspace: db::Workspace,
+    pub placement: db::WorkspacePlacement,
+    pub target_branch: String,
+    pub candidate_sha: String,
+}
+
 /// Git facts a review-authority carry needs about the Task's current HEAD.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewCarryFacts {
@@ -348,6 +357,48 @@ impl MergeService {
         Ok((workspace, resolved))
     }
 
+    /// What admission to the integration queue records about a Task entering
+    /// `merging`: the implementation execution's own workspace (validated,
+    /// and re-created from the Task branch when a server-owned worktree was
+    /// lost), the placement it merges from, the target branch and the
+    /// candidate commit. Reads only; the queue worker performs every effect.
+    pub(crate) async fn integration_admission_facts(
+        &self,
+        task: &db::Task,
+    ) -> Result<IntegrationAdmissionFacts> {
+        if task.parent_task_id.is_some() {
+            return Err(ServiceError::invalid_operation(
+                "subtasks do not merge; only root tasks merge to the default branch",
+            ));
+        }
+        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, task)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "task {} has no executor execution",
+                    task.id
+                ))
+            })?;
+        let (workspace, resolved) = self.ensure_delivery_workspace(task, &execution).await?;
+        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+            .await?
+            .filter(|repo| repo.project_id == task.project_id)
+            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
+        let candidate_sha = resolved
+            .git_query(api_types::WorkspaceGitQuery::Head, false)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("merge candidate has no HEAD"))?
+            .trim()
+            .to_owned();
+        Ok(IntegrationAdmissionFacts {
+            execution_id: execution.id,
+            target_branch: target_branch(&task.merge_config, &repo.default_branch)?,
+            placement: resolved.placement.clone(),
+            workspace,
+            candidate_sha,
+        })
+    }
+
     pub async fn merge(&self, task_id: impl Into<String>) -> Result<MergeOutcome> {
         let task_id = task_id.into();
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
@@ -386,11 +437,6 @@ impl MergeService {
                 .trim()
                 .to_owned()
         };
-        if !expected_target_sha.is_empty() {
-            if let Some(hook) = crate::workflow::engine::durable::current_hook(&task_id) {
-                db::note_integration_target(&hook.step.id, hook.index, None, &expected_target_sha);
-            }
-        }
         let spec = MergeSpec {
             target_branch,
             // Embedded integration retains its locked review-contract precondition.
@@ -405,33 +451,6 @@ impl MergeService {
             .merge(&resolved.placement, &spec)
             .await
             .map_err(Into::into)
-    }
-
-    pub(crate) async fn hook_merge_intent(&self, task_id: &str) -> Result<MergeIntent> {
-        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, &task)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation("merge has no implementation execution")
-            })?;
-        let (workspace, resolved) = self.ensure_delivery_workspace(&task, &execution).await?;
-        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
-        let candidate_sha = resolved
-            .git_query(api_types::WorkspaceGitQuery::Head, false)
-            .await?
-            .ok_or_else(|| ServiceError::invalid_operation("merge candidate has no HEAD"))?
-            .trim()
-            .to_owned();
-        Ok(MergeIntent {
-            execution_id: execution.id,
-            workspace_id: workspace.id,
-            candidate_sha,
-            target_branch: target_branch(&task.merge_config, &repo.default_branch)?,
-        })
     }
 
     pub(crate) async fn completed_hook_merge(
@@ -607,14 +626,6 @@ impl MergeService {
             };
             let target_sha =
                 crate::integration_effects::merge::target_tip(repo_path, &target_branch).await?;
-            if let Some(hook) = crate::workflow::engine::durable::current_hook(&task_id) {
-                db::note_integration_target(
-                    &hook.step.id,
-                    hook.index,
-                    Some(&worktree_sha),
-                    &target_sha,
-                );
-            }
             let task_branch = workspace::task_branch_name(&task_id);
             let effect = crate::integration_effects::merge::MergeEffectInput {
                 workspace: input.workspace,

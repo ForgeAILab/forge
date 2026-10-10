@@ -86,6 +86,10 @@ pub enum IntegrationStepAction {
     SendBack,
     Park,
     Clear,
+    /// Not asked for by the worker: enqueued once at start for an attempt
+    /// that was imported from a merge that was in flight before the queue
+    /// was active (`integration_steps::import`).
+    ImportContinue,
 }
 impl IntegrationStepAction {
     pub fn as_str(self) -> &'static str {
@@ -96,6 +100,7 @@ impl IntegrationStepAction {
             Self::SendBack => "send_back",
             Self::Park => "park",
             Self::Clear => "clear",
+            Self::ImportContinue => "import_continue",
         }
     }
 }
@@ -115,6 +120,11 @@ pub struct IntegrationStepRequest {
 }
 impl IntegrationStepRequest {
     pub fn causation_key(&self) -> String {
+        if self.action == IntegrationStepAction::ImportContinue {
+            // One continuation per imported attempt, whatever it has moved
+            // to since.
+            return format!("integration-import:{}", self.attempt_id);
+        }
         format!(
             "integration:{}:{}:{}",
             self.attempt_id,

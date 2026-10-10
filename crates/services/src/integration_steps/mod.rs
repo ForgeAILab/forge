@@ -3,9 +3,8 @@
 //! The queue worker (`integration_worker`) never writes Task state. Each of
 //! its requests arrives here as one `integration` Task step and is answered by
 //! an acknowledgment (and, for `settle`, a permit) written on the attempt in
-//! the same transaction as the step's Task write. Nothing enqueues such a
-//! step until the queue is activated (stage D2): today's merge path does not
-//! pass through this module.
+//! the same transaction as the step's Task write. This is the only path a
+//! merge takes.
 //!
 //! Per action: what the attempt must look like for the step to apply (it is
 //! enqueued *before* its attempt transition, so "not yet" is a retry, and an
@@ -20,6 +19,11 @@
 //! | `send_back` | `ejected`, `needs_review` | today's conflict handoff / merge failure / review refresh, states the typed reason and the handoff | `send_back` ack |
 //! | `park` | `parked`, `quarantined`, or `queued` | states `deferred` (or `waiting` once the queue is open again), `task.interruption_changed` for an intervention | `park` ack |
 //! | `clear` | `cancelled` | clears this attempt's integration statement | none (the attempt is terminal) |
+//! | `import_continue` | any imported state | the continuation of a merge that was in flight before the queue was active (`import`) | none |
+//!
+//! Admission (`admission`) is not a step of its own: it is the `run_merge`
+//! entry hook of the merge state, which creates the attempt and states
+//! `waiting`.
 use crate::{
     integration_worker::{
         IntegrationStepAck, IntegrationStepAction, IntegrationStepOutcome, IntegrationStepRequest,
@@ -37,6 +41,8 @@ use db::{
 };
 use std::sync::Arc;
 
+pub(crate) mod admission;
+pub mod import;
 mod port;
 mod send_back;
 mod settle;
@@ -178,7 +184,15 @@ impl IntegrationSteps {
         if request.action == IntegrationStepAction::Result {
             // The fast-forward is done and recorded: this step is the only
             // way the Task learns of it, so it never settles as a failure.
-            return self.result_step(step, &request).await;
+            let applied = self.result_step(step, &request).await;
+            self.wake_worker();
+            return applied;
+        }
+        if request.action == IntegrationStepAction::ImportContinue {
+            // Enqueued once per imported attempt: it never settles failed.
+            let continued = self.import_continue_step(step, &request).await;
+            self.wake_worker();
+            return continued;
         }
         let outcome = match request.action {
             IntegrationStepAction::RequestCheck => self.request_check(step, &request).await?,
@@ -194,9 +208,21 @@ impl IntegrationSteps {
             IntegrationStepAction::SendBack => self.send_back(step, &request).await?,
             IntegrationStepAction::Park => self.park(step, &request).await?,
             IntegrationStepAction::Clear => self.clear(step, &request).await?,
-            IntegrationStepAction::Result => unreachable!("handled above"),
+            IntegrationStepAction::Result | IntegrationStepAction::ImportContinue => {
+                unreachable!("handled above")
+            }
         };
-        self.conclude(step, outcome).await
+        let concluded = self.conclude(step, outcome).await;
+        self.wake_worker();
+        concluded
+    }
+
+    /// An answer may have been written on the attempt: its driver re-reads
+    /// now instead of at its next poll.
+    pub(crate) fn wake_worker(&self) {
+        if let Some(worker) = self.task_service.integration_worker() {
+            worker.notify_answered();
+        }
     }
 
     pub(crate) async fn conclude(&self, step: &TaskStep, outcome: StepOutcome) -> Result<()> {

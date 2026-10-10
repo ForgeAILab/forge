@@ -18,8 +18,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use workspace::RepoCacheLockManager;
 
-use super::merge::RequireConflictMarkersResolved;
-use super::merge::{merge_failure_result, target_moved_result, RunMerge};
+use super::merge::{merge_failure_result, RunMerge};
 use super::{
     AutoCascadeOnReviewPass, CheckRetryBudget, DependencyGate, DispatchRoleAgent, NotifyRoleHolder,
     RequireUpstreamRolesCompleted,
@@ -2472,67 +2471,6 @@ async fn seed_sibling_conflict_workspace(ctx: &HookContext) -> (TempDir, PathBuf
     (dir, worktree_path)
 }
 
-#[tokio::test]
-async fn rebase_conflict_is_handed_back_to_the_worker_with_committed_markers() {
-    let ctx = build_test_ctx(
-        "task-conflict-handoff",
-        default_states::MERGING,
-        default_states::MERGING,
-        None,
-    )
-    .await;
-    let (_dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
-    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-
-    let result = target_moved_result(&ctx, &task, "main advanced", "main").await;
-
-    let HookResult::Cascade { to, reason, bridge } = result else {
-        panic!("a sibling conflict goes back to the Worker, got {result:?}");
-    };
-    assert_eq!(to, default_states::MERGE_FAILED);
-    assert!(
-        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
-        "{reason}"
-    );
-    assert!(
-        !bridge.is_review_refresh(),
-        "a conflict needs the Worker, not a bare re-review: {reason}"
-    );
-    assert!(reason.contains("exports.py"), "{reason}");
-
-    // The branch sits on the new target, fully rebased, with the conflict
-    // committed for the Worker to reconcile by editing files.
-    let status = run_git(&worktree_path, &["status", "--porcelain"]);
-    assert!(status.is_empty(), "worktree is clean: {status}");
-    assert!(!git::detect_rebase_in_progress(&worktree_path)
-        .await
-        .expect("rebase state reads"));
-    let exports = std::fs::read_to_string(worktree_path.join("exports.py")).expect("exports reads");
-    assert!(exports.contains("<<<<<<< ") && exports.contains(">>>>>>> "));
-    assert!(worktree_path.join("api.py").exists());
-    assert_eq!(
-        run_git(&worktree_path, &["merge-base", "HEAD", "main"]),
-        run_git(&worktree_path, &["rev-parse", "main"]),
-    );
-
-    let current = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task reloads")
-        .expect("task exists");
-    assert!(current.blocked_json.is_none(), "nothing parks for a human");
-    let annotation: serde_json::Value = serde_json::from_str(
-        current
-            .error_annotation
-            .as_deref()
-            .expect("the conflict is annotated for the Worker prompt"),
-    )
-    .expect("annotation parses");
-    assert_eq!(annotation["type"], json!("merge_conflict"));
-}
-
 async fn record_conflict_handoff(ctx: &HookContext, reason: String, rejection: bool) {
     db::TransitionLogRepo::insert(
         &*ctx.db,
@@ -2602,138 +2540,6 @@ async fn conflict_handoff_preserves_later_merge_fix_follow_up() {
     assert!(matches!(budget_result, HookResult::Ok), "{budget_result:?}");
 }
 
-#[tokio::test]
-async fn run_merge_blocks_unresolved_handed_off_markers() {
-    let mut ctx = build_test_ctx(
-        "task-handoff-marker-block",
-        default_states::MERGING,
-        default_states::MERGING,
-        None,
-    )
-    .await;
-    let (dir, _worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
-    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let HookResult::Cascade { reason, .. } =
-        target_moved_result(&ctx, &task, "main advanced", "main").await
-    else {
-        panic!("conflict should hand off");
-    };
-    record_conflict_handoff(&ctx, reason, false).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
-        Arc::clone(&ctx.db),
-        Arc::clone(&ctx.event_bus),
-        dir.path().to_path_buf(),
-    )));
-
-    let result = RunMerge.execute(&ctx).await;
-    assert!(matches!(result, HookResult::Ok), "{result:?}");
-    let blocked = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task reloads")
-        .expect("task exists");
-    assert!(blocked
-        .blocked_json
-        .as_deref()
-        .is_some_and(|value| value.contains("unresolved Git conflict markers")));
-}
-
-#[tokio::test]
-async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
-    let mut ctx = build_test_ctx(
-        "task-handoff-exit-guard",
-        default_states::MERGING,
-        default_states::MERGING,
-        None,
-    )
-    .await;
-    let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
-    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let HookResult::Cascade { reason, .. } =
-        target_moved_result(&ctx, &task, "main advanced", "main").await
-    else {
-        panic!("conflict should hand off");
-    };
-    record_conflict_handoff(&ctx, reason, false).await;
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
-        Arc::clone(&ctx.db),
-        Arc::clone(&ctx.event_bus),
-        dir.path().to_path_buf(),
-    )));
-    ctx.from_state = default_states::MERGE_FAILED.to_owned();
-    ctx.to_state = default_states::REVIEW.to_owned();
-    ctx.triggered_by = api_types::Actor::system(api_types::SystemComponent::Workflow);
-
-    // The Worker has not touched the marked files yet.
-    let HookResult::Failed { reason } = RequireConflictMarkersResolved.execute(&ctx).await else {
-        panic!("committed markers must keep the task out of review");
-    };
-    assert!(reason.contains("exports.py"), "{reason}");
-
-    // Other exits from merge_failed are not this guard's concern.
-    let mut other = ctx.clone();
-    other.to_state = default_states::IN_PROGRESS.to_owned();
-    assert!(matches!(
-        RequireConflictMarkersResolved.execute(&other).await,
-        HookResult::Skipped { .. }
-    ));
-
-    // A repair that is committed clears the guard.
-    std::fs::write(worktree_path.join("exports.py"), "resolved = True\n").expect("repair writes");
-    git::commit_all(&worktree_path, "resolve handoff")
-        .await
-        .expect("repair commits");
-    let result = RequireConflictMarkersResolved.execute(&ctx).await;
-    assert!(matches!(result, HookResult::Ok), "{result:?}");
-}
-
-#[tokio::test]
-async fn handed_off_conflict_resolves_and_run_merge_integrates() {
-    let mut ctx = build_test_ctx(
-        "task-handoff-resolved",
-        default_states::MERGING,
-        default_states::MERGING,
-        None,
-    )
-    .await;
-    let (dir, worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
-    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-    let HookResult::Cascade { reason, .. } =
-        target_moved_result(&ctx, &task, "main advanced", "main").await
-    else {
-        panic!("conflict should hand off");
-    };
-    record_conflict_handoff(&ctx, reason, false).await;
-    std::fs::write(
-        worktree_path.join("exports.py"),
-        "core = 1\ncli = 1\napi = 1\n",
-    )
-    .expect("Worker resolves both sides");
-    run_git(&worktree_path, &["add", "-A"]);
-    run_git(&worktree_path, &["commit", "-m", "resolve handoff"]);
-    ctx.merge_service = Some(Arc::new(crate::merge_service::MergeService::new_for_test(
-        Arc::clone(&ctx.db),
-        Arc::clone(&ctx.event_bus),
-        dir.path().to_path_buf(),
-    )));
-
-    let result = RunMerge.execute(&ctx).await;
-    assert!(matches!(result, HookResult::Cascade { to, .. } if to == default_states::DONE));
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("repo/exports.py"))
-            .expect("integrated exports read"),
-        "core = 1\ncli = 1\napi = 1\n"
-    );
-}
-
 /// A candidate with no agent review contract (a human reviewer, or no
 /// reviewer) merges without a pinned object, so it meets a sibling's change as
 /// a plain merge conflict. That conflict is still the Worker's to reconcile.
@@ -2753,15 +2559,36 @@ async fn plain_merge_conflict_is_handed_back_to_the_worker() {
         dir.path().to_path_buf(),
     )));
 
+    // The entry hook only admits the Task: it finds no conflict itself.
     let result = RunMerge.execute(&ctx).await;
+    assert!(matches!(result, HookResult::Ok), "{result:?}");
+    let admitted = current_attempt(&ctx).await;
+    assert_eq!(admitted.state, db::IntegrationAttemptState::Queued);
 
-    let HookResult::Cascade { to, reason, bridge } = result else {
-        panic!("a plain merge conflict goes back to the Worker, got {result:?}");
-    };
-    assert_eq!(to, default_states::MERGE_FAILED);
+    // The queue's rebase meets the sibling's change, commits the conflict
+    // with its markers and releases the slot; its `send_back` step hands the
+    // files to the Worker.
+    ctx.task_service
+        .drain(&ctx.task_id)
+        .await
+        .expect("the queue hands the conflict back");
+    let handoff = db::TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("transitions load")
+        .into_iter()
+        .find(|entry| {
+            entry.from_state == default_states::MERGING
+                && entry.to_state == default_states::MERGE_FAILED
+        })
+        .expect("a plain merge conflict goes back to the Worker");
     assert!(
-        bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
-        "{reason}"
+        handoff.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
+        "{}",
+        handoff.trigger_reason
+    );
+    assert_eq!(
+        handoff.bridge.conflict_paths(),
+        Some(vec!["exports.py".to_owned()])
     );
     let exports = std::fs::read_to_string(worktree_path.join("exports.py")).expect("exports reads");
     assert!(exports.contains("<<<<<<< ") && exports.contains(">>>>>>> "));
@@ -2771,74 +2598,13 @@ async fn plain_merge_conflict_is_handed_back_to_the_worker() {
         .expect("task exists");
     assert!(current.blocked_json.is_none(), "nothing parks for a human");
     assert_eq!(current.review_passed_at, None);
-}
-
-#[tokio::test]
-async fn repeated_conflict_handoffs_escalate_in_a_single_task_write() {
-    let ctx = build_test_ctx(
-        "task-conflict-handoff-exhausted",
-        default_states::MERGING,
-        default_states::MERGING,
-        None,
-    )
-    .await;
-    let (_dir, _worktree_path) = seed_sibling_conflict_workspace(&ctx).await;
-    for _ in 0..5 {
-        db::TransitionLogRepo::insert(
-            &*ctx.db,
-            db::CreateTransitionLog {
-                id: new_uuid_v4(),
-                task_id: ctx.task_id.clone(),
-                from_state: default_states::MERGING.to_owned(),
-                to_state: default_states::MERGE_FAILED.to_owned(),
-                trigger_name: None,
-                triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow)
-                    .display(),
-                bridge: api_types::TransitionBridge::new(
-                    api_types::TransitionBridgeKind::ConflictHandoff,
-                ),
-                trigger_reason:
-                    "rebased onto main; conflicts were committed with markers in: exports.py"
-                        .to_owned(),
-                hook_results_json: None,
-                rejection: true,
-                created_at: now_rfc3339(),
-            },
-        )
-        .await
-        .expect("prior handoff records");
-    }
-    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task loads")
-        .expect("task exists");
-
-    let result = target_moved_result(&ctx, &task, "main advanced", "main").await;
-
-    assert!(matches!(result, HookResult::Ok), "{result:?}");
-    let blocked = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
-        .await
-        .expect("task reloads")
-        .expect("task exists");
     assert_eq!(
-        blocked.version,
-        task.version + 1,
-        "block and annotation land in one write, so one interruption event wakes the Project Agent"
-    );
-    assert!(blocked.blocked_json.is_some());
-    let annotation: api_types::TaskAnnotation = serde_json::from_str(
-        blocked
-            .error_annotation
-            .as_deref()
-            .expect("escalation is annotated"),
-    )
-    .expect("annotation parses");
-    let api_types::TaskAnnotation::Blocking(annotation) = annotation else {
-        panic!("escalation must be typed")
-    };
-    assert_eq!(
-        annotation.blocked_by.as_deref(),
-        Some("manual_workspace_repair")
+        db::IntegrationQueueRepo::integration_attempt(&*ctx.db, &admitted.id)
+            .await
+            .expect("attempt loads")
+            .expect("attempt exists")
+            .state,
+        db::IntegrationAttemptState::Ejected
     );
 }
 
@@ -4140,6 +3906,58 @@ async fn enter_review_after_bridge(
     refresh_project_authority(ctx).await;
 }
 
+/// What the merge hook did before the integration queue when the target had
+/// moved under a reviewed candidate: rebase the branch in place and bounce
+/// the Task through `merge_failed` with a typed bridge. The queue rebases
+/// inside `merging` now, so nothing produces the clean-rebase bridge any
+/// more; Tasks that were bounced before the upgrade still enter `review` on
+/// it, and a conflict the queue hands to the Worker still uses the
+/// conflict-handoff bridge. Returns the bridge's reason and the bridge.
+async fn pre_queue_bounce(ctx: &HookContext) -> (String, api_types::TransitionBridge) {
+    let workspace = WorkspaceRepo::get_by_task_id(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("workspace loads")
+        .expect("workspace exists");
+    let resolved = crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+        &ctx.workspace_backend_router,
+        &ctx.db,
+        &workspace,
+        &ctx.workspace_root,
+    )
+    .await
+    .expect("workspace resolves");
+    let outcome = resolved
+        .rebase_target("main", true)
+        .await
+        .expect("owner rebases");
+    let now = now_rfc3339();
+    TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, None, &now)
+        .await
+        .expect("the bounce clears the passed review");
+    match outcome {
+        api_types::WorkspaceOwnerOperationOutcome::Rebased => (
+            "main advanced; rebased onto main, re-review required".to_owned(),
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::TargetMovedRebase),
+        ),
+        api_types::WorkspaceOwnerOperationOutcome::Conflict { conflict_paths, .. } => (
+            format!(
+                "rebased onto main; conflicts were committed with markers in: {}",
+                conflict_paths.join(", ")
+            ),
+            api_types::TransitionBridge::conflict_handoff(&conflict_paths),
+        ),
+        other => panic!("unexpected rebase outcome {other:?}"),
+    }
+}
+
+/// The Task's current integration attempt.
+async fn current_attempt(ctx: &HookContext) -> db::IntegrationAttempt {
+    db::IntegrationQueueRepo::current_integration_attempt(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("attempt loads")
+        .expect("the Task is in the integration queue")
+}
+
 async fn carry_rows(ctx: &HookContext) -> Vec<(String, String, String, String)> {
     sqlx::query_as::<_, (String, String, String, String)>(
         "SELECT contract_execution_id, commit_sha, base_sha, kind
@@ -4239,6 +4057,47 @@ async fn review_digest_completion_uses_the_frozen_fingerprint_version() {
     }
 }
 
+/// The target moved under a reviewed candidate. Before the queue the entry
+/// hook rebased the branch and bounced the Task through `merge_failed` and
+/// `review`. Now it only admits the Task: nothing is rebased by the hook, no
+/// transition is asked for and the passed review stays; the queue rebases
+/// the candidate when it reaches the head.
+#[tokio::test]
+async fn a_moved_target_admits_the_task_instead_of_bouncing_it() {
+    let (harness, scenario) =
+        build_carry_scenario("task-queue-admit", "agent-queue-admit", false).await;
+    let ctx = harness.ctx.clone();
+    let result = RunMerge.execute(&ctx).await;
+    assert!(matches!(result, HookResult::Ok), "{result:?}");
+    assert_eq!(
+        run_git(&scenario.worktree, &["rev-parse", "HEAD"]),
+        scenario.commit_sha,
+        "the hook rebases nothing"
+    );
+    let attempt = current_attempt(&ctx).await;
+    assert_eq!(attempt.state, db::IntegrationAttemptState::Queued);
+    assert_eq!(
+        attempt.original_candidate_sha.as_deref(),
+        Some(scenario.commit_sha.as_str())
+    );
+    assert_eq!(
+        attempt.workspace_id.as_deref(),
+        Some(scenario.workspace_id.as_str())
+    );
+    assert!(attempt.placement_id.is_some() && attempt.repo_location_id.is_some());
+    assert_eq!(attempt.owner_kind, Some(db::IntegrationOwnerKind::Server));
+    assert!(attempt.placement_generation.is_some());
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(task.review_passed_at.is_some(), "the passed review stays");
+    // A hook that runs again for the same entry gets the same row.
+    let again = RunMerge.execute(&ctx).await;
+    assert!(matches!(again, HookResult::Ok), "{again:?}");
+    assert_eq!(current_attempt(&ctx).await.id, attempt.id);
+}
+
 #[tokio::test]
 async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
     let (harness, scenario) =
@@ -4246,10 +4105,7 @@ async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
 
-    let HookResult::Cascade { to, reason, bridge } = RunMerge.execute(&ctx).await else {
-        panic!("the moved target should bounce the merge through a rebase");
-    };
-    assert_eq!(to, default_states::MERGE_FAILED);
+    let (reason, bridge) = pre_queue_bounce(&ctx).await;
     assert!(
         bridge.bridge_kind == Some(api_types::TransitionBridgeKind::TargetMovedRebase),
         "{reason}"
@@ -4301,14 +4157,20 @@ async fn clean_rebase_carries_review_authority_and_merges_without_a_reviewer() {
     );
     assert_eq!(rows[0].3, "clean_rebase");
 
-    let merged = merge_again_from_review(&mut ctx).await;
-    assert!(
-        matches!(&merged, HookResult::Cascade { to, .. } if to == default_states::DONE),
-        "{merged:?}"
-    );
+    // Back in `merging` the Task is admitted to the queue with the carried
+    // commit as its candidate; the entry hook merges nothing itself.
+    let admitted = merge_again_from_review(&mut ctx).await;
+    assert!(matches!(admitted, HookResult::Ok), "{admitted:?}");
+    let attempt = current_attempt(&ctx).await;
+    assert_eq!(attempt.state, db::IntegrationAttemptState::Queued);
     assert_eq!(
+        attempt.original_candidate_sha.as_deref(),
+        Some(rebased_head.as_str())
+    );
+    assert_ne!(
         run_git(&scenario.repo_path, &["rev-parse", "main"]),
-        rebased_head
+        rebased_head,
+        "admission performs no Git effect"
     );
 }
 
@@ -4319,9 +4181,7 @@ async fn conflict_repair_by_the_worker_carries_review_authority() {
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
 
-    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
-        panic!("the conflicting sibling should hand the conflict back");
-    };
+    let (reason, bridge) = pre_queue_bounce(&ctx).await;
     assert!(
         bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
         "{reason}"
@@ -4359,14 +4219,14 @@ async fn conflict_repair_by_the_worker_carries_review_authority() {
     assert_eq!(rows[0].1, repaired_head);
     assert_eq!(rows[0].3, "conflict_repair");
 
-    let merged = merge_again_from_review(&mut ctx).await;
-    assert!(
-        matches!(&merged, HookResult::Cascade { to, .. } if to == default_states::DONE),
-        "{merged:?}"
-    );
+    let admitted = merge_again_from_review(&mut ctx).await;
+    assert!(matches!(admitted, HookResult::Ok), "{admitted:?}");
+    let attempt = current_attempt(&ctx).await;
+    assert_eq!(attempt.state, db::IntegrationAttemptState::Queued);
     assert_eq!(
-        std::fs::read_to_string(scenario.repo_path.join("shared.txt")).expect("shared reads"),
-        "core = 1\ncli = 1\napi = 1\n"
+        attempt.original_candidate_sha.as_deref(),
+        Some(repaired_head.as_str()),
+        "the Worker's repair is the candidate the queue is given"
     );
 }
 
@@ -4376,9 +4236,7 @@ async fn repair_touching_a_new_path_gets_a_full_review() {
         build_carry_scenario("task-carry-scope", "agent-carry-scope", true).await;
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
-    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
-        panic!("the conflicting sibling should hand the conflict back");
-    };
+    let (reason, bridge) = pre_queue_bounce(&ctx).await;
     std::fs::write(
         scenario.worktree.join("shared.txt"),
         "core = 1\ncli = 1\napi = 1\n",
@@ -4424,9 +4282,7 @@ async fn no_configured_checks_means_a_full_review() {
         build_carry_scenario("task-carry-no-ci", "agent-carry-no-ci", false).await;
     let mut ctx = harness.ctx.clone();
     let reviewers_before = reviewer_execution_count(&ctx).await;
-    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
-        panic!("the moved target should bounce the merge through a rebase");
-    };
+    let (reason, bridge) = pre_queue_bounce(&ctx).await;
     enter_review_after_bridge(
         &mut ctx,
         &reason,
@@ -4451,9 +4307,7 @@ async fn changed_governing_context_means_a_full_review() {
     let (harness, _scenario) =
         build_carry_scenario("task-carry-context", "agent-carry-context", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
-        panic!("the moved target should bounce the merge through a rebase");
-    };
+    let (reason, bridge) = pre_queue_bounce(&ctx).await;
     sqlx::query("UPDATE task SET description = 'a different acceptance scope' WHERE id = ?")
         .bind(&ctx.task_id)
         .execute(ctx.db.pool())
@@ -4484,9 +4338,7 @@ async fn other_review_entries_never_carry() {
     let (harness, _scenario) =
         build_carry_scenario("task-carry-entry", "agent-carry-entry", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
-        panic!("the moved target should bounce the merge through a rebase");
-    };
+    let (reason, bridge) = pre_queue_bounce(&ctx).await;
     // A user moving the Task is never mechanical.
     enter_review_after_bridge(
         &mut ctx,
@@ -4516,9 +4368,7 @@ async fn carry_for_an_old_review_is_ignored_after_a_newer_real_review() {
     let (harness, scenario) =
         build_carry_scenario("task-carry-superseded", "agent-carry-superseded", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
-        panic!("the moved target should bounce the merge through a rebase");
-    };
+    let (reason, bridge) = pre_queue_bounce(&ctx).await;
     let rebased_head = run_git(&scenario.worktree, &["rev-parse", "HEAD"]);
     enter_review_after_bridge(
         &mut ctx,
@@ -4586,9 +4436,7 @@ async fn carries_are_bounded_per_review() {
     let (harness, scenario) =
         build_carry_scenario("task-carry-bound", "agent-carry-bound", false).await;
     let mut ctx = harness.ctx.clone();
-    let HookResult::Cascade { reason, bridge, .. } = RunMerge.execute(&ctx).await else {
-        panic!("the moved target should bounce the merge through a rebase");
-    };
+    let (reason, bridge) = pre_queue_bounce(&ctx).await;
     let contract_execution_id: String =
         sqlx::query_scalar("SELECT execution_id FROM execution_review_contract WHERE task_id = ?")
             .bind(&ctx.task_id)

@@ -15,6 +15,11 @@
 #                       an ordinary pass
 #   IdleTickQuiescence  the dispatcher does no work on an idle tick; no recorded
 #                       outcome differs, so no line names it
+#   IntegrationQueueOwned  (plan 3.2 stage D2b) a Task in `merging` belongs to the
+#                       integration queue: the dispatcher neither replays its entry
+#                       nor resumes it after a Project pause. A pause marker left on
+#                       such a Task by an older binary is cleared by the start-time
+#                       importer's continuation step, which admits the Task again.
 
 steady todo_coder T: from=todo dv=2 status=in_progress ann=- B=- F=- E=- meta=[-] disp=[-] execs=[coder@A1:running] hooks=2
 steady todo_coder (pass): spawned=1 failed_ticks=[] slots=[active=1 parked=0 queued=0 limit=5]
@@ -1026,15 +1031,17 @@ wake refusal_none_todo (after): dv=0 status=todo ann=- B=- F=- E=- meta=[dispatc
 # The allowed exceptions.
 @ExplicitOwnerPark steady publication_claim_malformed T: from=planning dv=1 status=planning ann=workflow_guard_rejected/unknown_condition/Nothing owns this Task: no recorded owner for plan publication cleanup. Owner: the Project owner. Action: move the Task back to the previous state and forward again, or cancel it. B=- F=- E=- meta=[plan_publication_claim] disp=[-] execs=[] hooks=0
 @ExplicitOwnerPark steady merging_no_hooks T: from=merging dv=1 status=merging ann=workflow_guard_rejected/unknown_condition/Nothing owns this Task: no recorded owner for entry hooks. Owner: the Project owner. Action: move the Task back to the previous state and forward again, or cancel it. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
-@MissedWakeRepair steady merging_no_hooks_witness T: from=merging dv=2 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
 @ExplicitOwnerPark steady custom_state_unknown T: from=weird_state dv=1 status=weird_state ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `weird_state`: state has no automatic scheduling semantics. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defines. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
 @ExplicitOwnerPark steady merging_custom_hooks T: from=merging dv=1 status=merging ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `merging`: entry includes custom hooks without a safe continuation. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defin B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
 @ExplicitOwnerPark steady merging_custom_hooks_witness T: from=merging dv=1 status=merging ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `merging`: entry includes custom hooks without a safe continuation. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defin B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
 @ExplicitOwnerPark steady root_unknown_state_children R: from=weird_state dv=1 status=weird_state ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `weird_state`: state has no automatic scheduling semantics. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defines. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
 @ExplicitOwnerPark startup publication_claim_malformed T: from=planning dv=1 status=planning ann=workflow_guard_rejected/unknown_condition/Nothing owns this Task: no recorded owner for plan publication cleanup. Owner: the Project owner. Action: move the Task back to the previous state and forward again, or cancel it. B=- F=- E=- meta=[plan_publication_claim] disp=[-] execs=[] hooks=0
 @ExplicitOwnerPark startup merging_no_hooks T: from=merging dv=1 status=merging ann=workflow_guard_rejected/unknown_condition/Nothing owns this Task: no recorded owner for entry hooks. Owner: the Project owner. Action: move the Task back to the previous state and forward again, or cancel it. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
-@MissedWakeRepair startup merging_no_hooks_witness T: from=merging dv=2 status=merging ann=- B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=1
 @ExplicitOwnerPark startup custom_state_unknown T: from=weird_state dv=1 status=weird_state ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `weird_state`: state has no automatic scheduling semantics. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defines. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
 @ExplicitOwnerPark startup merging_custom_hooks T: from=merging dv=1 status=merging ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `merging`: entry includes custom hooks without a safe continuation. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defin B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
 @ExplicitOwnerPark startup merging_custom_hooks_witness T: from=merging dv=1 status=merging ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `merging`: entry includes custom hooks without a safe continuation. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defin B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
 @ExplicitOwnerPark startup root_unknown_state_children R: from=weird_state dv=1 status=weird_state ann=workflow_guard_rejected/workflow_invalid/Nothing can continue this Task from `weird_state`: state has no automatic scheduling semantics. Owner: the Project Agent. Action: edit the Project workflow or move the Task to a state it defines. B=- F=- E=- meta=[-] disp=[-] execs=[] hooks=0
+@IntegrationQueueOwned steady paused_integration T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[paused_integration] disp=[-] execs=[] hooks=0
+@IntegrationQueueOwned steady paused_integration (events): {}
+@IntegrationQueueOwned startup paused_integration T: from=merging dv=0 status=merging ann=- B=- F=- E=- meta=[paused_integration] disp=[-] execs=[] hooks=0
+@IntegrationQueueOwned startup paused_integration (events): {}

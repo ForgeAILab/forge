@@ -845,7 +845,10 @@ impl CheckConsumerFamily for IntegrationCheckFamily {
                 StepOutcome::Retry(_) | StepOutcome::RetryAt(..) => {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await
                 }
-                _ => return Ok(()),
+                _ => {
+                    self.steps.wake_worker();
+                    return Ok(());
+                }
             }
         }
         Err(db::DbError::VersionConflict.into())

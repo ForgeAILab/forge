@@ -835,17 +835,17 @@ async fn task_cancel_flags_the_attempt_in_its_own_transaction_and_clear_drops_th
         .await
         .is_empty());
 
-    // The worker releases the attempt and asks for the clear. (Until the
-    // cutover the stage B observation also ends an attempt that is not a
-    // queue head when its Task settles: either way it is cancelled.)
+    // The worker releases the attempt and asks for the clear. Nothing else
+    // ends an attempt: the flag alone leaves it where it was.
     world.ask(&flagged, IntegrationStepAction::Clear).await;
-    if world.attempt(&a.id).await.state != S::Cancelled {
-        let mut a = world.attempt(&a.id).await;
-        a.state = S::Cancelled;
-        a.current = false;
-        a.completed_at = Some(db::now_rfc3339());
-        world.db.transition_integration_attempt(a).await.unwrap();
-    }
+    assert_ne!(world.attempt(&a.id).await.state, S::Cancelled);
+    let mut released = world.attempt(&a.id).await;
+    released.state = S::Cancelled;
+    world
+        .db
+        .transition_integration_attempt(released)
+        .await
+        .unwrap();
     settled(&world, "t", IntegrationStepAction::Clear, "done").await;
     let task = world.task("t").await;
     assert_eq!(task.status, "cancelled");
@@ -1476,7 +1476,7 @@ impl Production {
         // again only to give it this worker's (fast) timers.
         let composed = world
             .service
-            .compose_checks(daemons, Duration::from_secs(60));
+            .compose_checks(daemons, Duration::from_secs(60), &config);
         IntegrationCheckFamily::register(
             &composed.consumers,
             Arc::new(
@@ -1633,6 +1633,7 @@ async fn a_no_verdict_answer_is_not_kept_for_the_commit_and_a_new_round_asks_aga
     world.service.compose_checks(
         Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers()),
         Duration::from_secs(60),
+        &crate::integration_worker::IntegrationWorkerConfig::default(),
     );
     let asked = |round: i64| {
         let world = &world;

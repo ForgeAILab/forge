@@ -1,14 +1,14 @@
 use crate::{
     workflow::{
         actions::{
-            AutoCascadeOnCompletion, AutoCascadeOnMergeResult, AutoCascadeOnReviewPass,
-            AutoCascadeOnUnassignedRole, AutoCascadeOnUnconfiguredReview, CancelPendingSubtasks,
-            CarryReviewAuthority, CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow,
-            DependencyGate, DispatchExecutor, DispatchFixAgent, DispatchRoleAgent,
-            NotifyRoleHolder, PropagateDoneToSubtasks, RequireCleanWorktree,
-            RequireConflictMarkersResolved, RequirePlanChecklistComplete,
-            RequireUpstreamRolesCompleted, RunBeforeWorkHooks, RunCiSteps, RunMerge,
-            SatisfyDependents, ScheduleWorkspaceCleanup, SubtaskSequenceComplete,
+            AutoCascadeOnCompletion, AutoCascadeOnReviewPass, AutoCascadeOnUnassignedRole,
+            AutoCascadeOnUnconfiguredReview, CancelPendingSubtasks, CarryReviewAuthority,
+            CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow, DependencyGate,
+            DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder,
+            PropagateDoneToSubtasks, RequireCleanWorktree, RequireConflictMarkersResolved,
+            RequirePlanChecklistComplete, RequireUpstreamRolesCompleted, RunBeforeWorkHooks,
+            RunCiSteps, RunMerge, SatisfyDependents, ScheduleWorkspaceCleanup,
+            SubtaskSequenceComplete,
         },
         HookAction,
     },
@@ -28,7 +28,6 @@ pub fn is_known_action(name: &str) -> bool {
             | "satisfy_dependents"
             | "auto_cascade_on_review_pass"
             | "auto_cascade_on_unconfigured_review"
-            | "auto_cascade_on_merge_result"
             | "auto_cascade_on_completion"
             | "auto_cascade_on_unassigned_role"
             | "check_merge_fix_budget"
@@ -96,7 +95,6 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "satisfy_dependents" => Box::new(SatisfyDependents),
         "auto_cascade_on_review_pass" => Box::new(AutoCascadeOnReviewPass),
         "auto_cascade_on_unconfigured_review" => Box::new(AutoCascadeOnUnconfiguredReview),
-        "auto_cascade_on_merge_result" => Box::new(AutoCascadeOnMergeResult),
         "auto_cascade_on_completion" => Box::new(AutoCascadeOnCompletion),
         "auto_cascade_on_unassigned_role" => Box::new(AutoCascadeOnUnassignedRole),
         "check_merge_fix_budget" => Box::new(CheckMergeFixBudget),

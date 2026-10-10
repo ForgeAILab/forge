@@ -9244,11 +9244,18 @@ async fn hook_restart_recognizes_merge_landed_before_checkpoint_even_after_sibli
         .unwrap()
         .unwrap();
     fixture.db.start_hook(&step, 0).await.unwrap();
-    let intent = fixture
+    // What the pre-upgrade hook recorded before it merged.
+    let facts = fixture
         .merge_service
-        .hook_merge_intent(&fixture.task.id)
+        .integration_admission_facts(&fixture.task)
         .await
         .unwrap();
+    let intent = crate::merge_service::MergeIntent {
+        execution_id: facts.execution_id,
+        workspace_id: facts.workspace.id,
+        candidate_sha: facts.candidate_sha,
+        target_branch: facts.target_branch,
+    };
     fixture
         .db
         .record_hook_effect(
@@ -9337,10 +9344,11 @@ async fn hook_restart_recognizes_merge_landed_before_checkpoint_even_after_sibli
 }
 
 // A Task left in `merging` by a pre-upgrade binary (merge interrupted, no
-// task_step row) is re-driven by the startup sweep, once.
+// task_step row) is taken into the integration queue by the start-time
+// importer, once, and merged by the queue (importer row P18).
 #[tokio::test]
 async fn legacy_merging_task_without_hook_step_is_merged_after_one_startup() {
-    use db::TaskStepRepo;
+    use db::{IntegrationQueueRepo, TaskStepRepo};
     let fixture = merge_gate_fixture(chrono::Duration::minutes(30)).await;
     assert!(fixture
         .db
@@ -9349,20 +9357,49 @@ async fn legacy_merging_task_without_hook_step_is_merged_after_one_startup() {
         .unwrap()
         .iter()
         .all(|step| !matches!(step.kind.as_str(), "hooks" | "cascade") && step.status == "done"));
-    // Startup and the slow sweep now use the same reconciliation path.
-    assert_eq!(fixture.dispatcher.startup_reconcile().await.unwrap(), 1);
+    // The wedge an older binary left: the review passed, the Task entered
+    // `merging`, and the merge's hooks row was lost.
+    review_passed(&fixture).await;
+    // Nothing replays the entry: the dispatcher leaves it to the importer.
     assert_eq!(fixture.dispatcher.startup_reconcile().await.unwrap(), 0);
-    let steps = fixture
+    let first = crate::integration_steps::import::import_at_start(&fixture.db)
+        .await
+        .unwrap();
+    assert_eq!((first.imported, first.continuations), (1, 1));
+    let imported = fixture
         .db
-        .task_steps(&fixture.task.id)
+        .current_integration_attempt(&fixture.task.id)
         .await
         .unwrap()
-        .into_iter()
-        .filter(|step| step.kind == "hooks")
-        .collect::<Vec<_>>();
-    assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].kind, "hooks");
-    assert!(steps[0].causation_key.ends_with(":recovered"));
+        .expect("the wedged entry is imported");
+    // Queued once the candidate's present HEAD is read: the continuation
+    // step reads it by admitting the Task again.
+    assert_eq!(
+        (imported.state, imported.resume_state),
+        (
+            db::IntegrationAttemptState::Parked,
+            Some(db::IntegrationAttemptState::Queued)
+        ),
+        "{:?}",
+        imported.failure_message
+    );
+    assert_eq!(
+        imported.admission_key,
+        format!("import:{}:0", fixture.task.id)
+    );
+    // A second start imports nothing and enqueues nothing.
+    let second = crate::integration_steps::import::import_at_start(&fixture.db)
+        .await
+        .unwrap();
+    assert_eq!((second.imported, second.continuations), (0, 0));
+    let steps = fixture.db.task_steps(&fixture.task.id).await.unwrap();
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step.causation_key == format!("integration-import:{}", imported.id))
+            .count(),
+        1
+    );
     fixture.dispatcher.drain_steps().await.unwrap();
     let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
@@ -9370,120 +9407,104 @@ async fn legacy_merging_task_without_hook_step_is_merged_after_one_startup() {
         .unwrap();
     assert_eq!(current.status, "done", "legacy merging Task is stranded");
     assert!(current.error_annotation.is_none());
-    assert_eq!(
-        fixture
-            .dispatcher
-            .recover_stranded_hook_entries()
-            .await
-            .unwrap(),
-        0
-    );
-}
-
-#[tokio::test]
-async fn startup_sweep_skips_held_blocked_and_non_merge_entries() {
-    use db::TaskStepRepo;
-    let fixture = merge_gate_fixture(chrono::Duration::minutes(30)).await;
-    // Held for a human: the owner's action owns it.
-    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
-        .bind(serde_json::json!({"awaiting_human": true, "awaiting_human_reason": "pull_request_merge"}).to_string())
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        fixture
-            .dispatcher
-            .recover_stranded_hook_entries()
-            .await
-            .unwrap(),
-        0
-    );
-    // Blocked with an annotation that waits for a human.
-    sqlx::query("UPDATE task SET metadata_json = NULL, error_annotation = ? WHERE id = ?")
-        .bind(serde_json::json!({"type": "manual_stop", "message": "paused"}).to_string())
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        fixture
-            .dispatcher
-            .recover_stranded_hook_entries()
-            .await
-            .unwrap(),
-        0
-    );
-    // A state without run_merge has no completion witness: never re-run.
-    sqlx::query("UPDATE task SET error_annotation = NULL, status = 'in_progress' WHERE id = ?")
-        .bind(&fixture.task.id)
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    assert_eq!(
-        fixture
-            .dispatcher
-            .recover_stranded_hook_entries()
-            .await
-            .unwrap(),
-        0
-    );
     assert!(fixture
         .db
-        .task_steps(&fixture.task.id)
+        .current_integration_attempt(&fixture.task.id)
         .await
         .unwrap()
-        .is_empty());
-}
-
-// Paused-integration resume must not re-enter `merging` on every scan while
-// the previous resume's hook step is still pending or running.
-#[tokio::test]
-async fn paused_integration_resume_does_not_supersede_its_own_pending_merge() {
-    use db::TaskStepRepo;
-    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
-    crate::deferred_dispatch::defer_integration_for_pause(&fixture.db, &fixture.task)
+        .is_none());
+    let third = crate::integration_steps::import::import_at_start(&fixture.db)
         .await
         .unwrap();
-    // Two dispatcher scans before the step worker gets to the merge (lane busy,
-    // or the merge/CI simply takes longer than one scan interval).
+    assert_eq!(third.continuations, 0);
+}
+
+// A pause marker left on a `merging` Task by an older binary is not the
+// dispatcher's any more: no scan re-enters `merging` for it. The start-time
+// importer's continuation step clears the marker and admits the Task, and
+// the queue merges it (importer rows P11 / P12).
+#[tokio::test]
+async fn a_paused_integration_marker_on_a_merging_task_is_continued_by_the_importer() {
+    use db::TaskStepRepo;
+    let fixture = merge_gate_fixture(chrono::Duration::minutes(3)).await;
+    review_passed(&fixture).await;
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    crate::deferred_dispatch::defer_integration_for_pause(&fixture.db, &task)
+        .await
+        .unwrap();
     fixture.dispatcher.check_once_and_drain().await.unwrap();
     fixture.dispatcher.check_once_and_drain().await.unwrap();
     let logs = TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
         .await
         .unwrap();
-    let resumes = logs
-        .iter()
-        .filter(|l| l.trigger_reason == "resuming integration after project pause")
-        .count();
+    assert_eq!(
+        logs.iter()
+            .filter(|l| l.trigger_reason == "resuming integration after project pause")
+            .count(),
+        0,
+        "the dispatcher no longer resumes a merging Task"
+    );
+    let marked = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(marked.status, "merging");
+    assert!(crate::deferred_dispatch::paused_integration(&marked).is_some());
+
+    let report = crate::integration_steps::import::import_at_start(&fixture.db)
+        .await
+        .unwrap();
+    assert_eq!(report.continuations, 1, "{report:?}");
+    let imported =
+        db::IntegrationQueueRepo::current_integration_attempt(&*fixture.db, &fixture.task.id)
+            .await
+            .unwrap()
+            .expect("imported");
+    let decision = imported.import_source_json.clone().unwrap()["decision"].clone();
     fixture.dispatcher.drain_steps().await.unwrap();
     let steps = fixture.db.task_steps(&fixture.task.id).await.unwrap();
-    assert_eq!(
-        resumes, 1,
-        "second scan re-entered merging and superseded the first merge hook"
-    );
     assert!(
-        steps.iter().all(|s| s.status != "superseded"),
+        steps.iter().all(|s| s.status != "failed"),
         "{:?}",
         steps
             .iter()
-            .map(|s| (&s.kind, &s.status))
+            .map(|s| (&s.kind, &s.status, &s.last_error))
             .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        steps
-            .iter()
-            .filter(|s| s.kind == "hooks" && s.expected_status == "merging")
-            .count(),
-        1,
-        "one merge step"
     );
     let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(current.status, "done");
+    let attempts: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT admission_key, state||'/'||(SELECT q.state||'/'||COALESCE(q.last_error_kind,'-')||'/'||COALESCE(q.head_attempt_id,'-')||'/'||COALESCE(q.lease_until,'-') FROM integration_queue q WHERE q.id=integration_attempt.queue_id)||'/'||COALESCE(available_at,'-')||'/'||operation_receipts_json, failure_message FROM integration_attempt WHERE task_ref=? ORDER BY created_at",
+    )
+    .bind(&fixture.task.id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        current.status,
+        "done",
+        "{decision}\n{attempts:?}\n{:?}",
+        steps
+            .iter()
+            .map(|s| (&s.kind, &s.status, &s.causation_key, &s.last_error))
+            .collect::<Vec<_>>()
+    );
     assert!(crate::deferred_dispatch::paused_integration(&current).is_none());
+    assert_eq!(
+        TransitionLogRepo::list_by_task(&*fixture.db, &fixture.task.id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|l| l.to_state == "merging")
+            .count(),
+        1,
+        "the Task never re-entered merging"
+    );
 }
 
 // A crash inside `rebase_target` leaves the rebase stopped on its conflict.
@@ -9713,6 +9734,48 @@ async fn embedded_rebase_target_aborts_an_interrupted_rebase_without_handoff() {
     assert_eq!(run_git(&worktree, &["rev-parse", "HEAD"]), candidate);
 }
 
+/// The fixture's Task as a passed review leaves it.
+async fn review_passed(fixture: &MergeGateFixture) {
+    let now = now_rfc3339();
+    TaskRepo::set_review_passed_at(&*fixture.db, &fixture.task.id, Some(now.clone()), &now)
+        .await
+        .unwrap();
+}
+
+/// Enter `merging` again, so the entry's hooks step (admission to the
+/// integration queue) is enqueued for the fixture's Task.
+async fn enter_merging(fixture: &MergeGateFixture) {
+    let project = ProjectRepo::get_by_id(&*fixture.db, &fixture.task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .dispatcher
+        .task_service
+        .workflow_execution()
+        .manual_override_transition_with_authority(
+            &task.id,
+            "merging",
+            task.version,
+            &workflow,
+            api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+            "resume integration",
+            false,
+            Some(crate::workflow::engine::WorkflowAuthority {
+                project_version: project.version,
+                workflow_definition: project.workflow_definition,
+                clear_review_passed_at_on_commit: false,
+            }),
+        )
+        .await
+        .unwrap();
+}
+
 // A transient `run_merge` failure (here a disconnected daemon) does not
 // settle the hook step: it retries on the step queue's back-off and merges.
 #[tokio::test]
@@ -9725,14 +9788,7 @@ async fn transient_merge_failure_retries_the_hook_step_then_merges() {
             daemon_id: "daemon-offline".into(),
         },
     );
-    assert_eq!(
-        fixture
-            .dispatcher
-            .recover_stranded_hook_entries()
-            .await
-            .unwrap(),
-        1
-    );
+    enter_merging(&fixture).await;
     fixture.dispatcher.drain_steps().await.unwrap();
     let current = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
@@ -9760,11 +9816,7 @@ async fn permanent_merge_failure_annotates_and_owner_retry_recovers() {
         &fixture.task.id,
         ServiceError::invalid_operation("merge target is unreadable"),
     );
-    fixture
-        .dispatcher
-        .recover_stranded_hook_entries()
-        .await
-        .unwrap();
+    enter_merging(&fixture).await;
     fixture.dispatcher.drain_steps().await.unwrap();
     let failed = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
         .await
@@ -9843,11 +9895,7 @@ async fn transient_merge_failures_settle_as_merge_failure_once_retries_are_spent
             method: "workspace.merge".into(),
         },
     );
-    fixture
-        .dispatcher
-        .recover_stranded_hook_entries()
-        .await
-        .unwrap();
+    enter_merging(&fixture).await;
     // Seven earlier attempts already spent their back-off.
     sqlx::query("UPDATE task_step SET attempts = 7 WHERE task_id = ?")
         .bind(&fixture.task.id)
@@ -9864,9 +9912,13 @@ async fn transient_merge_failures_settle_as_merge_failure_once_retries_are_spent
         serde_json::from_str(current.error_annotation.as_deref().expect("merge failure")).unwrap();
     assert_eq!(annotation["type"], "workspace_error");
     let steps = fixture.db.task_steps(&fixture.task.id).await.unwrap();
-    assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].status, "failed");
-    assert_eq!(steps[0].attempts, 8);
+    let merge: Vec<_> = steps
+        .iter()
+        .filter(|step| step.kind == "hooks" && step.expected_status == "merging")
+        .collect();
+    assert_eq!(merge.len(), 1);
+    assert_eq!(merge[0].status, "failed");
+    assert_eq!(merge[0].attempts, 8);
 }
 
 /// Run alone: the global SQLx subscriber measures only the dispatcher's calls.

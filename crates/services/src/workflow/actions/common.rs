@@ -408,15 +408,6 @@ pub(super) async fn persist_merge_error(
     .await
 }
 
-pub(super) async fn persist_target_repo_dirty_error(
-    ctx: &HookContext,
-    task: &db::Task,
-    message: &str,
-    _files: &[String],
-) -> db::Result<db::Task> {
-    persist_merge_error(ctx, task, api_types::FailureKind::TargetRepoDirty, message).await
-}
-
 pub(super) async fn block_task(
     ctx: &HookContext,
     task: &db::Task,

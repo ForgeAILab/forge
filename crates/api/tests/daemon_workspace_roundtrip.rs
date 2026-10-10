@@ -4988,7 +4988,11 @@ async fn queue_worker_rebases_checks_and_fast_forwards_on_a_daemon_owned_target(
     let (stop_checks, checks_stopped) = tokio::sync::watch::channel(false);
     let _checks = state
         .task_service
-        .compose_checks(state.daemon_connections.clone(), Duration::from_secs(60))
+        .compose_checks(
+            state.daemon_connections.clone(),
+            Duration::from_secs(60),
+            &services::integration_worker::IntegrationWorkerConfig::default(),
+        )
         .worker
         .start(&periodic, checks_stopped);
 
@@ -5063,7 +5067,11 @@ async fn queue_worker_ejects_a_red_check_on_a_daemon_owned_target() {
     let (stop_checks, checks_stopped) = tokio::sync::watch::channel(false);
     let _checks = state
         .task_service
-        .compose_checks(state.daemon_connections.clone(), Duration::from_secs(60))
+        .compose_checks(
+            state.daemon_connections.clone(),
+            Duration::from_secs(60),
+            &services::integration_worker::IntegrationWorkerConfig::default(),
+        )
         .worker
         .start(&periodic, checks_stopped);
 
@@ -5489,6 +5497,7 @@ macro_rules! start_check_worker {
             .compose_checks(
                 check_state.daemon_connections.clone(),
                 Duration::from_secs(60),
+                &services::integration_worker::IntegrationWorkerConfig::default(),
             )
             .worker
             .start(&check_periodic, checks_stopped);

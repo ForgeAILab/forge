@@ -232,6 +232,7 @@ impl HeadDriver {
             };
             tokio::select! {
                 _ = stop.cancelled() => break,
+                _ = self.w.answered() => {}
                 _ = self.w.clock.sleep(wait) => {}
             }
         }

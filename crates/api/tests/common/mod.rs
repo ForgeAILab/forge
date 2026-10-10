@@ -30,11 +30,20 @@ pub struct StepWorkerGuard {
     /// Review-entry CI is a check the durable runner executes: without its
     /// worker a Task entering review would wait for a result forever.
     checks: Option<tokio::task::JoinHandle<()>>,
+    /// A Task in `merging` is in the integration queue: without the queue
+    /// worker nothing would ever merge it.
+    integration: Option<tokio::task::JoinHandle<()>>,
 }
 impl StepWorkerGuard {
     pub fn start(state: &AppState) -> Self {
         let (stop, signal) = tokio::sync::watch::channel(false);
         Self {
+            integration: state.task_service.integration_worker().map(|worker| {
+                worker.start(
+                    &state.operator_status_service.periodic_workers(),
+                    signal.clone(),
+                )
+            }),
             stop,
             checks: state.task_service.check_worker().map(|worker| {
                 worker.start(
@@ -52,6 +61,9 @@ impl StepWorkerGuard {
         self.job.abort();
         if let Some(checks) = &self.checks {
             checks.abort();
+        }
+        if let Some(integration) = &self.integration {
+            integration.abort();
         }
     }
 }

@@ -1,10 +1,9 @@
-//! Stage B audit: the passive tables never block a deletion, shadow recording
-//! is bounded and cannot fail a real result, and the schema matches the enums.
+//! Storage audit: the queue tables never block a deletion, an attempt's
+//! observation row is bounded, and the schema matches the enums.
 use super::tests::{admission, fixture, seed, seed_delivery, FIXED_TIME};
 use super::*;
 use crate::{
-    create_sqlite_pool, run_migrations, ProjectRepo, RepoLocationRepo, RepoRepo, ReviewRepo,
-    TaskStepRepo, WorkspaceRepo,
+    create_sqlite_pool, run_migrations, ProjectRepo, RepoLocationRepo, RepoRepo, WorkspaceRepo,
 };
 use std::sync::Arc;
 
@@ -399,417 +398,9 @@ async fn parallel_connections_admit_once_and_claim_one_head() {
     assert_eq!(after.head_attempt_id.as_deref(), Some(input.id.as_str()));
 }
 
-async fn claimed_step(db: &SqliteDb, task: &str) -> crate::TaskStep {
-    let id = format!("step-{task}-{}", new_uuid_v4());
-    db.enqueue_step(&crate::EnqueueTaskStep {
-        id: id.clone(),
-        task_id: task.into(),
-        kind: "hooks".into(),
-        payload_json: "{}".into(),
-        causation_step_id: None,
-        causation_key: id.clone(),
-        chain_id: id.clone(),
-        chain_position: 1,
-        expected_status: "merging".into(),
-        expected_version: 1,
-        expected_epoch: Some(0),
-        lane: "long".into(),
-        available_at: FIXED_TIME.into(),
-    })
-    .await
-    .unwrap();
-    let step = db
-        .claim_step("owner", Some(task), "2099-01-01T00:00:00Z")
-        .await
-        .unwrap()
-        .unwrap();
-    sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at) VALUES(?,0,?)")
-        .bind(&step.id)
-        .bind(FIXED_TIME)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    step
-}
-fn intent() -> String {
-    serde_json::json!({"execution_id":"e-a","workspace_id":"w-a","candidate_sha":"candidate","target_branch":"main"}).to_string()
-}
 async fn observations(db: &SqliteDb, task: &str) -> (Vec<Value>, i64) {
     let (json, dropped): (String, i64) = sqlx::query_as("SELECT observations_json,observations_dropped FROM integration_attempt WHERE task_ref=? ORDER BY created_at DESC LIMIT 1").bind(task).fetch_one(db.pool()).await.unwrap();
     (serde_json::from_str::<Vec<Value>>(&json).unwrap(), dropped)
-}
-
-#[tokio::test]
-async fn a_task_that_loops_a_thousand_times_keeps_a_bounded_observation_row() {
-    let db = fixture().await;
-    seed_delivery(&db, "a").await;
-    let step = claimed_step(&db, "a").await;
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
-        .await
-        .unwrap();
-    let conflict = serde_json::json!({"kind":"conflict","conflict_paths":(0..400).map(|i| format!("src/file-{i}.rs")).collect::<Vec<_>>()}).to_string();
-    for index in 1..=1000 {
-        db.record_hook_effect(&step, index, "rebase_outcome", &conflict)
-            .await
-            .unwrap();
-    }
-    let (kept, dropped) = observations(&db, "a").await;
-    let retained = INTEGRATION_OBSERVATION_RECENT as usize + 1;
-    assert_eq!(kept.len(), retained);
-    assert_eq!(dropped, 1001 - retained as i64);
-    assert_eq!(kept[0]["kind"], "admission");
-    assert_eq!(kept[0]["identity"], format!("{}:0:merge_intent", step.id));
-    for (offset, observation) in kept[1..].iter().enumerate() {
-        let index = 1000 - INTEGRATION_OBSERVATION_RECENT as usize + 1 + offset;
-        assert_eq!(
-            observation["identity"],
-            format!("{}:{index}:rebase_outcome", step.id)
-        );
-        assert_eq!(
-            observation["conflict_paths"].as_array().unwrap().len(),
-            INTEGRATION_OBSERVATION_PATHS
-        );
-        assert_eq!(observation["paths_truncated"], true);
-    }
-    let bytes = count(
-        &db,
-        "SELECT length(CAST(observations_json AS BLOB)) FROM integration_attempt",
-    )
-    .await;
-    assert!(bytes as usize <= retained * INTEGRATION_OBSERVATION_BYTES);
-    // A replayed retained identity is not appended again.
-    db.record_hook_effect(&step, 1000, "rebase_outcome", &conflict)
-        .await
-        .unwrap();
-    assert_eq!(observations(&db, "a").await.1, dropped);
-    // The row stays a queued, current, passive attempt throughout.
-    let attempt = db.current_integration_attempt("a").await.unwrap().unwrap();
-    assert_eq!(attempt.state, IntegrationAttemptState::Queued);
-    assert_eq!(attempt.candidate_sha.as_deref(), Some("candidate"));
-}
-
-#[tokio::test]
-async fn admission_insert_failure_leaves_the_real_effect_and_no_partial_rows() {
-    let db = fixture().await;
-    seed_delivery(&db, "a").await;
-    let step = claimed_step(&db, "a").await;
-    let before = shadow::shadow_failure_count();
-    // The queue INSERT succeeds and the attempt INSERT fails: the savepoint
-    // must take the queue row back out, and the checkpoint must still commit.
-    sqlx::query("CREATE TRIGGER fail_attempt BEFORE INSERT ON integration_attempt BEGIN SELECT RAISE(ABORT,'forced'); END").execute(db.pool()).await.unwrap();
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
-        .await
-        .unwrap();
-    assert_eq!(
-        db.hook_effect(&step, 0, "merge_intent").await.unwrap(),
-        Some(intent())
-    );
-    assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM integration_queue").await,
-        0
-    );
-    assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM integration_attempt").await,
-        0
-    );
-    assert!(shadow::shadow_failure_count() > before);
-    sqlx::query("DROP TRIGGER fail_attempt")
-        .execute(db.pool())
-        .await
-        .unwrap();
-    sqlx::query("CREATE TRIGGER fail_queue BEFORE INSERT ON integration_queue BEGIN SELECT RAISE(ABORT,'forced'); END").execute(db.pool()).await.unwrap();
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
-        .await
-        .unwrap();
-    assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM integration_attempt").await,
-        0
-    );
-    sqlx::query("DROP TRIGGER fail_queue")
-        .execute(db.pool())
-        .await
-        .unwrap();
-    // The replayed intent admits once the fault is gone.
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
-        .await
-        .unwrap();
-    let (kept, _) = observations(&db, "a").await;
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0]["candidate_sha"], "candidate");
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
-        .await
-        .unwrap();
-    assert_eq!(observations(&db, "a").await.0.len(), 1);
-    assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM integration_attempt").await,
-        1
-    );
-}
-
-#[tokio::test]
-async fn a_check_constraint_failure_while_recording_keeps_the_real_effect() {
-    let db = fixture().await;
-    seed_delivery(&db, "a").await;
-    let step = claimed_step(&db, "a").await;
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
-        .await
-        .unwrap();
-    // Fill the row to just under its storage CHECK so the next append
-    // violates it inside the result transaction.
-    sqlx::query("UPDATE integration_attempt SET observations_json=json_array(json_object('identity','pad','pad',?))")
-        .bind("x".repeat(1_048_500))
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let before = shadow::shadow_failure_count();
-    let outcome = serde_json::json!({"kind":"rebased"}).to_string();
-    db.record_hook_effect(&step, 0, "rebase_outcome", &outcome)
-        .await
-        .unwrap();
-    assert_eq!(
-        db.hook_effect(&step, 0, "rebase_outcome").await.unwrap(),
-        Some(outcome)
-    );
-    assert_eq!(observations(&db, "a").await.0.len(), 1);
-    assert!(shadow::shadow_failure_count() > before);
-}
-
-#[tokio::test]
-async fn step_settlement_survives_a_recording_failure_and_pins_reserved_or_uncertain_attempts() {
-    let db = fixture().await;
-    seed_delivery(&db, "a").await;
-    let step = claimed_step(&db, "a").await;
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
-        .await
-        .unwrap();
-    // A step of a non-terminal Task records nothing and changes nothing.
-    let attempt = db.current_integration_attempt("a").await.unwrap().unwrap();
-    let mut tx = begin_immediate(db.pool()).await.unwrap();
-    db.observe_integration_terminal_best_effort(&mut tx, &step)
-        .await;
-    tx.commit().await.unwrap();
-    assert_eq!(
-        db.integration_attempt(&attempt.id).await.unwrap().unwrap(),
-        attempt
-    );
-    sqlx::query("UPDATE task SET status='cancelled' WHERE id='a'")
-        .execute(db.pool())
-        .await
-        .unwrap();
-    sqlx::query("CREATE TRIGGER fail_update BEFORE UPDATE ON integration_attempt BEGIN SELECT RAISE(ABORT,'forced'); END").execute(db.pool()).await.unwrap();
-    let mut tx = begin_immediate(db.pool()).await.unwrap();
-    db.finish_step_in_tx(&mut tx, &step, "done", None)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    assert_eq!(db.task_steps("a").await.unwrap()[0].status, "done");
-    assert!(db.current_integration_attempt("a").await.unwrap().is_some());
-    sqlx::query("DROP TRIGGER fail_update")
-        .execute(db.pool())
-        .await
-        .unwrap();
-    // Reserved as a queue head: the observation is kept, the attempt stays.
-    sqlx::query("UPDATE integration_queue SET head_attempt_id=?")
-        .bind(&attempt.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let mut tx = begin_immediate(db.pool()).await.unwrap();
-    db.observe_integration_terminal_best_effort(&mut tx, &step)
-        .await;
-    tx.commit().await.unwrap();
-    let pinned = db.current_integration_attempt("a").await.unwrap().unwrap();
-    assert_eq!(pinned.state, IntegrationAttemptState::Queued);
-    assert_eq!(
-        pinned.observations_json.as_array().unwrap().last().unwrap()["kind"],
-        "cancelled"
-    );
-    // Released and resolved: the passive attempt follows the legacy Task.
-    sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL")
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let next = crate::TaskStep {
-        id: "later-step".into(),
-        ..step.clone()
-    };
-    let mut tx = begin_immediate(db.pool()).await.unwrap();
-    db.observe_integration_terminal_best_effort(&mut tx, &next)
-        .await;
-    tx.commit().await.unwrap();
-    assert!(db.current_integration_attempt("a").await.unwrap().is_none());
-    let closed = db.integration_attempt(&attempt.id).await.unwrap().unwrap();
-    assert_eq!(closed.state, IntegrationAttemptState::Cancelled);
-    assert!(closed.completed_at.is_some() && !closed.current);
-    assert_eq!(closed.observations_json.as_array().unwrap().len(), 3);
-}
-
-#[tokio::test]
-async fn review_settlement_records_ci_and_survives_a_recording_failure() {
-    let db = fixture().await;
-    seed_delivery(&db, "a").await;
-    let step = claimed_step(&db, "a").await;
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
-        .await
-        .unwrap();
-    let details = serde_json::json!({"ci_steps":[{"exit_code":1}]}).to_string();
-    for (review, fail) in [("failing-observer", true), ("recorded", false)] {
-        sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,started_at,created_at,updated_at) VALUES(?,'a','e-a',?,'running',?,?,?)").bind(review).bind(if fail { 1 } else { 2 }).bind(FIXED_TIME).bind(FIXED_TIME).bind(FIXED_TIME).execute(db.pool()).await.unwrap();
-        if fail {
-            sqlx::query("CREATE TRIGGER fail_update BEFORE UPDATE ON integration_attempt BEGIN SELECT RAISE(ABORT,'forced'); END").execute(db.pool()).await.unwrap();
-        }
-        let updated = crate::task_writer::in_task_step(
-            step.clone(),
-            ReviewRepo::update_status(
-                &db,
-                review,
-                crate::ReviewStatus::Failed,
-                details.clone(),
-                Some(FIXED_TIME.into()),
-                FIXED_TIME,
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(updated.status, crate::ReviewStatus::Failed);
-        if fail {
-            sqlx::query("DROP TRIGGER fail_update")
-                .execute(db.pool())
-                .await
-                .unwrap();
-        }
-        let (kept, _) = observations(&db, "a").await;
-        assert_eq!(
-            kept.iter().any(|o| o["kind"] == "ci_failed"),
-            !fail,
-            "{review}"
-        );
-    }
-    // Outside the Task's own step the settlement records nothing.
-    sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,started_at,created_at,updated_at) VALUES('unowned','a','e-a',3,'running',?,?,?)").bind(FIXED_TIME).bind(FIXED_TIME).bind(FIXED_TIME).execute(db.pool()).await.unwrap();
-    ReviewRepo::update_status(
-        &db,
-        "unowned",
-        crate::ReviewStatus::Failed,
-        details,
-        Some(FIXED_TIME.into()),
-        FIXED_TIME,
-    )
-    .await
-    .unwrap();
-    assert_eq!(observations(&db, "a").await.0.len(), 2);
-}
-
-#[tokio::test]
-async fn a_locked_database_fails_only_the_recording_statement() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = file_db(&dir).await;
-    seed_delivery(&db, "a").await;
-    let step = claimed_step(&db, "a").await;
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
-        .await
-        .unwrap();
-    // Not reachable in production: every recording site has already written
-    // in its transaction, so it holds the write lock. Built here with a
-    // deferred transaction to prove a `database is locked` error is contained.
-    let mut reader = db.pool().acquire().await.unwrap();
-    sqlx::query("PRAGMA busy_timeout=0")
-        .execute(&mut *reader)
-        .await
-        .unwrap();
-    let mut tx = sqlx::Connection::begin(&mut *reader).await.unwrap();
-    sqlx::query("SELECT COUNT(*) FROM task")
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
-    let mut writer = begin_immediate(db.pool()).await.unwrap();
-    sqlx::query("UPDATE task SET title=title")
-        .execute(&mut *writer)
-        .await
-        .unwrap();
-    let before = shadow::shadow_failure_count();
-    let started = std::time::Instant::now();
-    crate::task_writer::in_task_step(
-        step.clone(),
-        db.observe_integration_review_best_effort(
-            &mut tx,
-            "a",
-            "review",
-            &crate::ReviewStatus::Failed,
-            &serde_json::json!({"ci_steps":[{"exit_code":1}]}),
-            None,
-        ),
-    )
-    .await;
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
-    assert!(shadow::shadow_failure_count() > before);
-    writer.rollback().await.unwrap();
-    // The transaction that failed to record is still usable and commits.
-    sqlx::query("UPDATE task SET title='real result' WHERE id='a'")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    drop(reader);
-    assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM task WHERE title='real result'").await,
-        1
-    );
-    assert_eq!(observations(&db, "a").await.0.len(), 1);
-}
-
-#[tokio::test]
-async fn target_read_buffer_is_scoped_to_its_own_step_and_hook() {
-    let db = fixture().await;
-    for task in ["a", "b"] {
-        seed_delivery(&db, task).await;
-    }
-    let (a, b) = (claimed_step(&db, "a").await, claimed_step(&db, "b").await);
-    let intent_b = intent().replace("e-a", "e-b").replace("w-a", "w-b");
-    // Outside any step, and for another step's id, a note is dropped.
-    note_integration_target(&a.id, 0, Some("leak"), "leak");
-    crate::task_writer::in_task_step(a.clone(), async {
-        note_integration_target(&b.id, 0, Some("leak"), "leak");
-        note_integration_target(&a.id, 7, Some("other-hook"), "other-hook");
-        db.record_hook_effect(&a, 0, "merge_intent", &intent())
-            .await
-            .unwrap();
-        note_integration_target(&a.id, 0, None, "tip-a");
-        // A nested step gets its own empty slot and cannot see the outer one.
-        crate::task_writer::in_task_step(b.clone(), async {
-            db.record_hook_effect(&b, 0, "merge_intent", &intent_b)
-                .await
-                .unwrap();
-        })
-        .await;
-        db.record_hook_effect(&a, 0, "merge_outcome", r#"{"Done":{"branch":"main"}}"#)
-            .await
-            .unwrap();
-    })
-    .await;
-    // The scope is gone: a later run of the same step starts empty.
-    crate::task_writer::in_task_step(a.clone(), async {
-        db.record_hook_effect(&a, 0, "merge_outcome", r#"{"Dirty":{}}"#)
-            .await
-            .unwrap();
-    })
-    .await;
-    let (of_a, _) = observations(&db, "a").await;
-    assert_eq!(
-        of_a.len(),
-        2,
-        "the replayed outcome identity is not re-recorded"
-    );
-    assert_eq!(of_a[0]["target_tip_sha"], Value::Null);
-    assert_eq!(of_a[0]["candidate_sha"], "candidate");
-    assert_eq!(of_a[1]["kind"], "done");
-    assert_eq!(of_a[1]["target_tip_sha"], "tip-a");
-    let (of_b, _) = observations(&db, "b").await;
-    assert_eq!(of_b.len(), 1);
-    assert_eq!(of_b[0]["target_tip_sha"], Value::Null);
-    assert!(!serde_json::to_string(&(of_a, of_b))
-        .unwrap()
-        .contains("leak"));
 }
 
 #[tokio::test]
@@ -906,7 +497,75 @@ async fn target_resolver_follows_the_repo_setting_and_suspends_instead_of_guessi
 }
 
 #[tokio::test]
-async fn stage_b_rows_are_disposable_and_reimport_after_discard_is_not_blocked() {
+async fn an_attempt_observed_a_thousand_times_keeps_a_bounded_observation_row() {
+    let db = fixture().await;
+    let q = db
+        .create_or_get_integration_queue("r", "main")
+        .await
+        .unwrap();
+    let attempt = db
+        .admit_integration_attempt(admission(&q, "a", "bounded"))
+        .await
+        .unwrap();
+    let paths: Vec<String> = (0..400).map(|i| format!("src/file-{i}.rs")).collect();
+    let observation = |index: usize| {
+        let mut observation = IntegrationObservation::new(
+            format!("observed:{index}"),
+            if index == 0 {
+                IntegrationOutcomeKind::Admission
+            } else {
+                IntegrationOutcomeKind::ConflictHandoff
+            },
+        );
+        if index > 0 {
+            observation.conflict_paths = Some(paths.clone());
+        }
+        observation
+    };
+    for index in 0..=1000 {
+        db.record_integration_observation(&attempt.id, observation(index))
+            .await
+            .unwrap();
+    }
+    let (kept, dropped) = observations(&db, "a").await;
+    let retained = INTEGRATION_OBSERVATION_RECENT as usize + 1;
+    assert_eq!(kept.len(), retained);
+    assert_eq!(dropped, 1001 - retained as i64);
+    // The first observation is kept; then the most recent ones.
+    assert_eq!(kept[0]["kind"], "admission");
+    assert_eq!(kept[0]["identity"], "observed:0");
+    for (offset, observation) in kept[1..].iter().enumerate() {
+        let index = 1000 - INTEGRATION_OBSERVATION_RECENT as usize + 1 + offset;
+        assert_eq!(observation["identity"], format!("observed:{index}"));
+        assert_eq!(
+            observation["conflict_paths"].as_array().unwrap().len(),
+            INTEGRATION_OBSERVATION_PATHS
+        );
+        assert_eq!(observation["paths_truncated"], true);
+    }
+    let bytes = count(
+        &db,
+        "SELECT length(CAST(observations_json AS BLOB)) FROM integration_attempt",
+    )
+    .await;
+    assert!(bytes as usize <= retained * INTEGRATION_OBSERVATION_BYTES);
+    // A replayed retained identity is not appended again.
+    let mut replay = observation(1000);
+    replay.recorded_at = kept[retained - 1]["recorded_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    db.record_integration_observation(&attempt.id, replay)
+        .await
+        .unwrap();
+    assert_eq!(observations(&db, "a").await.1, dropped);
+    // Observations never drive state.
+    let attempt = db.current_integration_attempt("a").await.unwrap().unwrap();
+    assert_eq!(attempt.state, IntegrationAttemptState::Queued);
+}
+
+#[tokio::test]
+async fn import_rows_are_disposable_and_an_existing_attempt_is_not_replaced() {
     let db = fixture().await;
     assert_eq!(db.import_integration_pass(100).await.unwrap().imported, 2);
     assert_eq!(db.import_integration_pass(100).await.unwrap().imported, 0);
@@ -917,18 +576,31 @@ async fn stage_b_rows_are_disposable_and_reimport_after_discard_is_not_blocked()
         .await
         .unwrap();
     assert_eq!(db.import_integration_pass(100).await.unwrap().imported, 2);
-    // Without the discard, an existing current (shadow) attempt is NOT
-    // replaced: the import row is retained non-current and asks for the fact.
+    // Without the discard, an existing current attempt (the one admission
+    // wrote for the Task) is NOT replaced: the import row is retained
+    // non-current and asks for the fact.
     sqlx::raw_sql("DELETE FROM integration_attempt; DELETE FROM integration_queue;")
         .execute(db.pool())
         .await
         .unwrap();
     seed_delivery(&db, "a").await;
-    let step = claimed_step(&db, "a").await;
-    db.record_hook_effect(&step, 0, "merge_intent", &intent())
+    let q = db
+        .create_or_get_integration_queue("r", "main")
+        .await
+        .unwrap();
+    let admitted = db
+        .admit_integration_attempt(admission(&q, "a", "admit:a:0"))
         .await
         .unwrap();
     db.import_integration_pass(100).await.unwrap();
+    assert_eq!(
+        db.current_integration_attempt("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        admitted.id
+    );
     let (current, facts): (bool, String) = sqlx::query_as("SELECT current,json_extract(import_source_json,'$.needed_facts') FROM integration_attempt WHERE task_ref='a' AND import_source_json IS NOT NULL").fetch_one(db.pool()).await.unwrap();
     assert!(!current);
     assert!(facts.contains("existing_attempt_identity"));

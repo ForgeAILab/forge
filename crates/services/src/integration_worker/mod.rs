@@ -173,6 +173,11 @@ pub struct IntegrationQueueWorker {
     pub(crate) config: IntegrationWorkerConfig,
     pub(crate) instance: String,
     wake: Notify,
+    /// A Task step answered a head: its driver re-reads at once instead of
+    /// at its next poll.
+    answered: Notify,
+    /// The supervised loop ([`Self::run`]) is live in this process.
+    running: std::sync::atomic::AtomicBool,
     shared: Mutex<Shared>,
     #[cfg(test)]
     fault: Mutex<Option<FaultHook>>,
@@ -214,6 +219,8 @@ impl IntegrationQueueWorker {
             config,
             instance: format!("integration-worker:{}", db::new_uuid_v4()),
             wake: Notify::new(),
+            answered: Notify::new(),
+            running: std::sync::atomic::AtomicBool::new(false),
             shared: Mutex::new(Shared::default()),
             #[cfg(test)]
             fault: Mutex::new(None),
@@ -225,6 +232,16 @@ impl IntegrationQueueWorker {
     pub fn with_locations(mut self, locations: Arc<dyn IntegrationLocationPort>) -> Self {
         self.locations = Some(locations);
         self
+    }
+
+    /// Called by the Task-step side after it wrote an answer on an attempt.
+    /// Only a wake: a driver that misses it reads the answer at its poll.
+    pub fn notify_answered(&self) {
+        self.answered.notify_waiters();
+        self.wake.notify_one();
+    }
+    pub(crate) async fn answered(&self) {
+        self.answered.notified().await
     }
 
     #[cfg(test)]
@@ -259,7 +276,23 @@ impl IntegrationQueueWorker {
         )
     }
 
+    /// Whether [`Self::run`] is live. A caller that pumps the worker by hand
+    /// (`TaskStepWorker::drain`) does so only while it is not.
+    pub fn is_running(&self) -> bool {
+        self.running.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        // Cleared on every way out, an aborted task included.
+        struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        self.running
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _running = Running(&self.running);
         let stop = CancellationToken::new();
         let mut heads: JoinSet<()> = JoinSet::new();
         // No transfer of this process is running yet: leftovers of a crashed

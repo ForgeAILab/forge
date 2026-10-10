@@ -442,6 +442,12 @@ pub struct TaskService {
     pub(crate) check_runner: Arc<std::sync::OnceLock<Arc<crate::check_runner::CheckRunner>>>,
     pub(crate) check_owners:
         Arc<std::sync::OnceLock<Arc<crate::check_runner::owners::WorkspaceCheckOwners>>>,
+    /// Bound once: the integration queue worker. Admission (`run_merge`)
+    /// wakes it, the Task-step side tells it an answer was written, and
+    /// `drain` pumps it. The runtime starts it; a service built without a
+    /// runtime composes one over the same production ports.
+    pub(crate) integration_worker:
+        Arc<std::sync::OnceLock<Arc<crate::integration_worker::IntegrationQueueWorker>>>,
     pub(crate) db: Arc<SqliteDb>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) merge_service: Option<Arc<MergeService>>,
@@ -548,6 +554,7 @@ impl TaskService {
         &self,
         daemon_connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
         disconnect_bound: std::time::Duration,
+        integration: &crate::integration_worker::IntegrationWorkerConfig,
     ) -> ComposedChecks {
         let runner = self
             .check_runner
@@ -562,9 +569,13 @@ impl TaskService {
                 ));
                 crate::integration_steps::IntegrationCheckFamily::register(
                     &consumers,
-                    Arc::new(crate::integration_steps::IntegrationSteps::new(
-                        self.clone(),
-                    )),
+                    // The merge-path family answers the queue worker: both
+                    // sides of that handshake use the worker's timers.
+                    Arc::new(
+                        crate::integration_steps::IntegrationSteps::new(self.clone()).with_timers(
+                            crate::integration_steps::IntegrationStepTimers::from(integration),
+                        ),
+                    ),
                 );
                 consumers.register(
                     db::CheckConsumerOrigin::Entry,
@@ -610,12 +621,80 @@ impl TaskService {
             return worker;
         }
         self.compose_checks(
-            self.daemon_connections.clone().unwrap_or_else(|| {
-                Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers())
-            }),
+            self.embedded_daemon_connections(),
             std::time::Duration::from_secs(60),
+            &Self::embedded_integration_config(),
         )
         .worker
+    }
+    fn embedded_daemon_connections(
+        &self,
+    ) -> Arc<crate::daemon_transport::DaemonConnectionRegistry> {
+        self.daemon_connections.clone().unwrap_or_else(|| {
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers())
+        })
+    }
+    /// The timers of a queue worker nothing supervises (a service built
+    /// without a runtime, which `drain` pumps): short waits, because nothing
+    /// else wakes it.
+    fn embedded_integration_config() -> crate::integration_worker::IntegrationWorkerConfig {
+        crate::integration_worker::IntegrationWorkerConfig {
+            poll: std::time::Duration::from_millis(20),
+            sweep_interval: std::time::Duration::from_millis(100),
+            conflict_backoff: std::time::Duration::from_millis(5),
+            // A head a drain left mid-way is taken over soon after.
+            lease: std::time::Duration::from_secs(3),
+            renew_every: std::time::Duration::from_millis(750),
+            ..Default::default()
+        }
+    }
+    /// The one place the integration queue worker of a Task service is
+    /// composed, over its production ports (`integration_ports`). Not
+    /// started: the runtime starts it after owner reconciliation and the
+    /// importer. Idempotent: the first composition wins. The same `config`
+    /// goes to [`Self::compose_checks`].
+    pub fn compose_integration(
+        &self,
+        daemon_connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
+        config: crate::integration_worker::IntegrationWorkerConfig,
+    ) -> Arc<crate::integration_worker::IntegrationQueueWorker> {
+        self.integration_worker
+            .get_or_init(|| {
+                let locations = Arc::new(crate::repo_location::RepoLocationService::new(
+                    self.db.clone(),
+                    Arc::new(crate::repo_location::RemoteDaemonLocationVerifier::new(
+                        daemon_connections.clone(),
+                        self.workspace_root.clone(),
+                    )),
+                ));
+                crate::integration_ports::build_integration_worker(
+                    self.db.clone(),
+                    self.workspace_backend_router.clone(),
+                    daemon_connections,
+                    locations,
+                    config,
+                )
+            })
+            .clone()
+    }
+    pub fn integration_worker(
+        &self,
+    ) -> Option<Arc<crate::integration_worker::IntegrationQueueWorker>> {
+        self.integration_worker.get().cloned()
+    }
+    /// The queue worker `drain` pumps. The runtime composes it before any
+    /// step runs; a service built without a runtime composes the same worker
+    /// here, with the check runtime on the same timers.
+    pub fn integration_worker_or_embedded(
+        &self,
+    ) -> Arc<crate::integration_worker::IntegrationQueueWorker> {
+        if let Some(worker) = self.integration_worker() {
+            return worker;
+        }
+        let config = Self::embedded_integration_config();
+        let daemons = self.embedded_daemon_connections();
+        self.compose_checks(daemons.clone(), std::time::Duration::from_secs(60), &config);
+        self.compose_integration(daemons, config)
     }
     pub fn check_consumers(
         &self,
@@ -644,6 +723,7 @@ impl TaskService {
             check_runner: Arc::default(),
             check_owners: Arc::default(),
             check_worker: Arc::default(),
+            integration_worker: Arc::default(),
             event_bus,
             merge_service: None,
             cleanup_scheduler: None,

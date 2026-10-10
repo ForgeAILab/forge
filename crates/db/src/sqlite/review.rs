@@ -287,15 +287,6 @@ async fn update_status_inner(
     } else {
         None
     };
-    db.observe_integration_review_best_effort(
-        &mut transaction,
-        &review.task_id,
-        id,
-        &status,
-        &details,
-        None,
-    )
-    .await;
     transaction.commit().await?;
     Ok((updated_review, updated_task))
 }
@@ -541,15 +532,6 @@ async fn update_status_with_review_authority_inner(
     } else {
         None
     };
-    db.observe_integration_review_best_effort(
-        &mut transaction,
-        &review.task_id,
-        id,
-        &status,
-        &details,
-        carry,
-    )
-    .await;
     transaction.commit().await?;
     Ok((updated_review, updated_task))
 }

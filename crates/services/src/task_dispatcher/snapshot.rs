@@ -287,7 +287,12 @@ impl TaskDispatcher {
             metadata["environment_wait"]["kind"].as_str(),
             Some("environment_unverified" | "provision_failed")
         );
-        f.integrate = deferred_dispatch::paused_integration(t).is_some();
+        // A state whose entry admits the Task to the integration queue. The
+        // queue worker parks and re-queues such a Task across a Project
+        // pause; the pause marker continues other states only.
+        let merge_state =
+            state.is_some_and(|s| s.hooks.on_enter.iter().any(|h| h.action == "run_merge"));
+        f.integrate = !merge_state && deferred_dispatch::paused_integration(t).is_some();
         // The key is the fact, as the base scan listed it. An intent that no
         // longer parses still reaches the replay, which blocks the Task with
         // `recovery_required` instead of dispatching past it.
@@ -577,25 +582,12 @@ impl TaskDispatcher {
                 f.review_refresh = crate::workflow::review_refresh_target(&w, &t.status);
             }
         }
+        // The entry of such a state admits the Task to the integration
+        // queue, and the attempt states itself on the Task's condition.
         f.missing_merge_entry = t.parent_task_id.is_none()
             && !r.entry_hooks_seen
-            && state.is_some_and(|s| s.hooks.on_enter.iter().any(|h| h.action == "run_merge"));
-        f.unsafe_merge_entry = state.is_some_and(|s| {
-            s.hooks
-                .on_enter
-                .iter()
-                .chain(&s.hooks.after_enter)
-                .any(|h| {
-                    !matches!(
-                        h.action.as_str(),
-                        "run_merge" | "auto_cascade_on_merge_result"
-                    )
-                })
-        });
-        f.merge_witness = r
-            .transitions
-            .iter()
-            .any(|e| e.to_state == t.status && e.from_state != e.to_state);
+            && merge_state
+            && t.condition.integration_attempt().is_none();
         Prepared {
             read: r,
             workflow: w,

@@ -28,8 +28,6 @@ pub(crate) use helpers::is_blocking_annotation_type;
 mod initial_scheduling;
 mod repo_pause_sync;
 pub mod slots;
-#[cfg(test)]
-mod stranded_hooks;
 mod workspace_blocking;
 
 /// A handle to the one dispatcher instance of a runtime. The instance owns

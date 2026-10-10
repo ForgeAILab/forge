@@ -223,7 +223,16 @@ impl IntegrationSteps {
             }
             let coordination_root =
                 crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
-            let result = if !coordination_root && !paths.is_empty() {
+            // A merge-fix budget of 0 opts the Project out of automatic
+            // merge repair: the conflict stops at the merge gate for its
+            // owner instead of going to the Worker.
+            let repair_allowed = db::budget::limit(
+                &task,
+                db::budget::Kind::MergeFix,
+                Some(&ctx.state_config),
+                ctx.gate_config.as_ref(),
+            )? != 0;
+            let result = if !coordination_root && !paths.is_empty() && repair_allowed {
                 conflict_handoff_result(&ctx, &task, &target_branch, &paths).await
             } else {
                 merge_failure_result(

@@ -1105,12 +1105,6 @@ impl TaskDispatcher {
             Step::Role { role, agent_id } => {
                 self.enqueue_resolved_role(p, project, role, agent_id).await
             }
-            Step::MergeEntry => self
-                .task_service
-                .workflow_execution()
-                .enqueue_recovered_entry_hooks(task, p.read.epoch, project, &p.workflow)
-                .await
-                .map(|id| u64::from(id.is_some())),
         }
     }
     /// Whether each candidate's target Agent can take work, read once per

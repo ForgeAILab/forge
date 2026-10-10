@@ -1144,6 +1144,7 @@ const ALLOWED: &[&str] = &[
     "ExplicitOwnerPark",
     "MissedWakeRepair",
     "IdleTickQuiescence",
+    "IntegrationQueueOwned",
 ];
 
 fn key(line: &str) -> &str {
