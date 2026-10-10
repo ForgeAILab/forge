@@ -7783,8 +7783,9 @@ its retained intent reports `interrupted`, never a pass or permission to rerun.
 
 New execution policies clear ambient environment, disable login-profile loading
 and pass only declared keys plus the receiving machine's existing five build
-budget variables and niceness. The canonical CI policy additionally passes the
-owner's canonical environment (see "Reusable results" below). The explicit frozen `legacy-server/1` and
+budget variables and niceness. The canonical CI policy is the exception: it
+clears nothing and runs a step exactly as the frozen server policy does (see
+"Reusable results" below). The explicit frozen `legacy-server/1` and
 `legacy-daemon/1` policies preserve existing login-shell/environment/Git-variable
 behavior during caller migration: the child inherits the owner process
 environment (PATH, HOME, toolchain variables), then the Project environment and
@@ -8058,96 +8059,136 @@ CI row is promoted to cache.
 #### Reusable results: the canonical CI policy (3.3 stage D part 2, scope 1)
 
 `canonical-ci/1` (`api_types::CANONICAL_CI_POLICY`) is the execution policy
-under which a CI bundle's result may stand for a later request. It is built by
-`build_check_spec` only when the caller sets `canonical_policy`, only for the
-entry-CI bundle and only for a server-owned checkout; every other combination
-is refused. **No production family requests it yet**: review-entry CI still
-runs inline under `legacy-server/1` / `legacy-daemon/1` until the review-entry
-cutover, so no Project's behaviour changes with this stage. What exists is the
-policy, its witness, its identity and its certification, proven through the
-real server owner.
+under which a CI bundle's result may stand for a later request. **No
+production family requests it yet**: review-entry CI still runs inline under
+`legacy-server/1` / `legacy-daemon/1` until the review-entry cutover, so no
+Project's behaviour changes with this stage.
 
-What a canonical command runs with:
+**A canonical step runs exactly as an inline CI step runs today.** `bash -lc`
+in the Task worktree; the owner process's environment, inherited, after the
+login profile ran; the Project environment values on top; the machine build
+budget and niceness; `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` removed.
+Nothing is cleared and nothing has to be declared, so a step that relies on a
+variable from the server's environment or from a profile keeps working. A
+service one step starts is still there for the next step. The policy does not
+restrict what a step sees; it records it, and a result is reused only when
+everything recorded is the same.
 
-| Input | Source | Where it is identified |
-|---|---|---|
-| Commit | the Task worktree at the requested commit (the owner re-reads HEAD before it starts) | `check_run.commit_sha`, the scope identity |
-| Commands, order, cwd, stop policy, policy revision | the spec | the digest |
-| `PATH`, `HOME` | declared by every canonical spec (`CANONICAL_ENVIRONMENT_KEYS`); the owner's value unless the Project sets the key | the digest, as a controlled value |
-| Project environment values | declared key by key | the digest, as an opaque revision: a digest keyed with a random salt the server creates once and keeps in `system_setting` (`check_value_revision_salt`, hidden from and not writable through the admin settings API), so neither the value nor a public hash of it is in the identity. The salt is durable: a request stated before a restart is verified with the same revision after it |
-| `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `TMPDIR`, `CARGO_HOME`, `RUSTUP_HOME`, `GOPATH`, `GOROOT`, `JAVA_HOME` | passed through from the owner when it sets them (`CANONICAL_PASSTHROUGH_KEYS`); fixed by the policy revision | the owner's environment identity (names and values, hashed) |
-| Shell, runner, OS, architecture | the owner | the owner's environment identity |
-| Machine build budget (five variables, niceness) | the owner, as for every run | not identified: it bounds how fast a step runs, not what it produces |
+`build_check_spec` builds it when the caller sets `canonical_policy`, for the
+entry-CI bundle in a server-owned Task worktree. A daemon-owned checkout, or a
+bundle with no worktree, gets its owner's frozen policy instead (a clean
+fallback at spec-build time: the check always runs and is never reused).
+Asking for the canonical policy for any other family is a caller error.
 
-Everything else is cleared: `env_clear`, `bash --noprofile -lc`. The owner's
-values are read once per process from a login shell (`check_executor::
-canonical_environment`), so `PATH` is the one a legacy `bash -lc` step saw and
-tools a profile puts on `PATH` are still found. A variable that only the
-profile or the server's own environment exported, and that is not in the
-table, is no longer visible: a Project that needs one declares it in its
-Project environment. That set is deliberately small. `PATH` and `HOME` locate
-every toolchain installed in its default place; the pass-through keys are who
-runs, the locale (it changes sort order and test output), the scratch
-directory, and the toolchain roots that cannot be derived from `HOME` once an
-install is relocated.
+What two runs with the same identity can still differ in:
 
-The minimal set differs per machine, so none of it is left out of the
-identity: the values are in the digest (`PATH`, `HOME`) or in the environment
-identity (`ServerCheckExecutionInputs`: `environment_revision` is the digest
-of the canonical names and values, `shell_revision` the shell's version,
-`runner_revision` the policy and the Forge version). The requester computes
-that identity with the same function the owner uses, the owner recomputes it
-before it starts, and `validate_receipt` refuses a receipt whose attestation
-is not the identity's. Before it starts the owner also compares every declared
-value with the identity (`owners.rs` `environment`): a `PATH`, `HOME` or
-Project value that moved since the request refuses the run instead of filing
-a result under an identity that does not describe it. Tool versions are not
-probed: an upgrade in place behind an unchanged `PATH` is not seen (a Forge
-upgrade is: it changes `runner_revision`).
-
-The witness, taken by the executor beside the commands:
-
-- `prepared_head`: HEAD before the first command;
-- clean start: `git status --porcelain` is empty before the first command
-  (nothing modified, staged or untracked; ignored files such as build output
-  do not count), within 20 seconds;
-- `finished_head` and tracked changes (`git diff --quiet HEAD`) after the last;
-- `tracked_changes` on the receipt is the single answer: `false` only for a
-  clean start and no tracked change after; `true` for a start that was not
-  clean; absent when the start could not be witnessed;
-- `process_tree_stopped` per command: the canonical policy stops each
-  command's process group when it exits, so a step can no longer leave a
-  service running for a later step.
-
-A daemon owner would return the same witness (the executor is shared), but no
-daemon runs the policy: a daemon attests no inputs yet, `prepare` refuses the
-canonical policy for a daemon placement and the builder refuses to build it.
-Daemon-placed checks therefore stay on `legacy-daemon/1`, uncacheable.
-
-**Verdict and reuse are separate.** The canonical policy runs in the Task
-worktree, as CI steps always did, so a step that rewrites a tracked file
-(a lockfile, generated code), commits, starts on a worktree that is not
-clean, or whose process tree was not confirmed stopped still produces that
-Task's verdict, exactly as before. It is only never reused:
-`CheckResultEvidence.reusable` is set by `validate_receipt` for a pass with
-the complete witness, and `finish_check_run` stores `check_result.cacheable`
-as "run cacheable, certified and reusable" instead of copying the run's flag.
-A consumer repeating its own request for such a run is `Joined` to it, never
-`Hit`. Timed-out, cancelled, failed and infrastructure results are never
-certified, hence never reusable. Every other non-legacy policy keeps the
-strict rule (no witness, no pass).
-
-| Request for commit + spec + environment | Outcome |
+| Input | How it is bound |
 |---|---|
-| unchanged, earlier reusable pass | `Hit`: no run row, no slot, no process |
-| unchanged, a run is in flight (any Task) | `Joined`: one run, one result per consumer |
-| another commit, command, Project value, owner environment identity or policy | `Scheduled`: its own run |
-| earlier pass left a tracked change, started dirty, moved HEAD | `Scheduled` |
-| earlier run failed, timed out, was cancelled or failed infrastructure | `Scheduled` |
+| Commit | In the identity (`commit_sha`). Witnessed: the owner re-reads HEAD before it starts (a moved HEAD is an infrastructure failure, as before), the executor records `prepared_head` before the first command and `finished_head` after the last. |
+| Tracked changes | Witnessed. `git status --porcelain` must be empty before the first command and `git diff --quiet HEAD` clean after the last. Otherwise the result is the asking Task's verdict and is not reusable. |
+| Untracked files Git does not ignore | Witnessed by the same `git status` before the first command: a run that starts with one is not reusable. A file a step leaves behind makes the next run on that worktree not reusable. |
+| Ignored files (build output, installed dependencies) | In the identity, by worktree: a canonical spec is scoped to its workspace and placement generation (`CheckScope::Workspace`), so a result only ever answers for the worktree that produced it. Accepted limit: within that worktree, ignored files that changed since the run are not seen. The run is deliberately in the Task worktree and not in a clean checkout, because a cold build on every review is the cost this work removes. |
+| Commands, order, working directory, per-command limit, stop rule, policy revision | In the identity (the spec digest). |
+| Project environment values | In the identity twice: each declared key as an opaque salted revision, and the whole Project environment inside the environment revision below. |
+| The owner's inherited environment | In the identity: `environment_revision` is a salted digest over every variable a login shell on the owner exports, by name and value, minus the denylist below. Read by one login shell per request and once more by the owner right before the run. |
+| Shell version, OS, architecture | In the identity (`shell_revision`; `ServerCheckExecutionInputs::identity`). |
+| Forge version | In the identity: `runner_revision` is the policy name and the workspace version, so every release starts with no reusable result. |
+| Machine | Not named. Only the server owner runs the policy, and every digest is keyed with a salt that lives in this installation's database, so a result cannot be found from another installation. A database moved to another machine reuses a result only if the whole inherited environment is identical there. |
+| Tool versions behind an unchanged `PATH` | Accepted limit: not probed. A compiler upgraded in place is not seen until the Forge version, the environment or the commit changes. |
+| The login profile's own non-determinism | Accepted limit: the probe and each step run the profile separately. A profile that exports something different on each run makes every run a miss if it does so in an exported variable, and is not seen otherwise. |
+| Time and network (a step that downloads `latest`, a test that depends on the date) | Accepted limit: not seen. There is no per-Project switch to turn reuse off yet; one would be an optional field of the review config and is left to the cutover, where it first has an effect. |
+| Machine build budget (five variables Forge adds when neither the operator nor the Project sets them) and niceness | Not in the identity: they bound how fast a step runs. If the operator, the profile or the Project sets one of the variables, that value is in the identity like any other. |
+| Whole-run wall limit | Not in the identity (fixed per run when scheduled). A run stopped by it is never reusable. |
+
+Left out of the environment digest (`check_executor::
+ENVIRONMENT_IDENTITY_DENYLIST`), because a shell or the session that started
+the server sets them per process and no build takes an input from them:
+
+| Variables | Why |
+|---|---|
+| `PWD`, `OLDPWD` | the shell's own directory bookkeeping; the step runs in the checkout, the probe does not |
+| `SHLVL`, `_` | set by every shell for itself |
+| `COLUMNS`, `LINES` | the size of the terminal the server was started from |
+| `TERM_SESSION_ID`, `ITERM_SESSION_ID`, `SECURITYSESSIONID`, `XDG_SESSION_ID`, `WINDOWID`, `TMUX`, `TMUX_PANE`, `STY` | the id of the terminal, multiplexer or login session the server was started from |
+| `SSH_CLIENT`, `SSH_CONNECTION`, `SSH_TTY` | the address and port of the SSH connection the server was started over |
+| `INVOCATION_ID`, `JOURNAL_STREAM`, `SYSTEMD_EXEC_PID` | per-start ids a service manager gives the server |
+
+Everything else is in the digest, including `TMPDIR`, `SSH_AUTH_SOCK` and
+anything else that changes when the server is restarted from a different
+session: a restart into a different environment loses the stored results (a
+miss) and nothing else.
+
+**Values never leave the machine.** The digests are keyed with a random salt
+the server creates on first use and keeps in `system_setting`
+(`check_value_revision_salt`). Creation is one `INSERT OR IGNORE` followed by
+a read, so concurrent first users agree on one salt. The key is not listed by
+and cannot be written or deleted through the admin settings API, which is the
+only surface that reads `system_setting` rows generically; it is in no event,
+export, log line or MCP result. It survives a restart. Losing it changes
+every identity: stored results are not found again and nothing else happens.
+The probe's output is parsed in memory and never logged.
+
+**The login-shell probe** (`check_executor::inherited_environment`) costs one
+login shell, the same as one step, per request and per run. It is bounded at
+ten seconds and its process group is stopped when the bound passes. A profile
+that hangs, ends the shell early or prints more than 4 MiB makes the probe
+answer nothing: the request is then unattested, the check runs exactly as
+before and its result is not reusable (one warning is logged, with no
+values). The probe does not read the shell's exit status, because a logout
+script may replace it; it reads its own start and end marks, so profile and
+logout output around them is ignored.
+
+**A changed environment is a miss, never a refusal.** Right before a run the
+owner computes the environment revision again from what the steps are about
+to inherit. If it is not the one the request named (a Project value was
+edited while the run was queued, the server restarted into another
+environment, the login shell did not answer), the run still executes with the
+environment in force, as entry CI always did, and the receipt attests
+nothing. `validate_receipt` accepts an unattested canonical receipt as a
+verdict and marks it not reusable; it still refuses a receipt that attests
+something other than the request named.
+
+**The process tree is stopped when the run ends**, not after each step. Each
+step runs in its own process group and its descendants are left running when
+it exits. After the last step (pass, fail, timeout or cancellation) and
+before the final Git witness, the executor stops every step's group (TERM,
+500 ms, KILL) and checks that no member is left
+(`process_supervisor::stop_group`). `process_tree_stopped` on every command
+of a canonical receipt is that verified answer for the whole run. A run whose
+tree was not verified stopped is a verdict and is not reusable. Limits: a
+descendant that left its group (`setsid`) is neither seen nor stopped, and a
+server that dies mid-run leaves the tree to the operating system, as before.
+
+**Verdict and reuse are separate.** `CheckResultEvidence.reusable` is set by
+`validate_receipt` only for a pass that is attested, fully witnessed and
+verified stopped; `finish_check_run` stores `check_result.cacheable` as "run
+cacheable, certified and reusable". Everything else is delivered once to the
+consumers of that run and never found by a later request:
+
+| Request (same worktree, commit, spec, environment) | Outcome |
+|---|---|
+| earlier reusable pass | `Hit`: no run row, no slot, no process |
+| a run is in flight | `Joined`: one run, one result per consumer |
+| the same request key again, after its run ended | `Joined` to its own run and answered by that run's result, whatever it was |
+| earlier pass was not reusable (tracked change, untracked file at the start, moved HEAD, unattested, tree not stopped) | `Scheduled` |
+| earlier run failed, timed out, was cancelled or failed infrastructure | `Scheduled`: a red result is never reused, so a re-review of a red commit runs again and a flaky failure does not stick |
+| another worktree, commit, command, Project value, inherited variable, shell, Forge version or policy | `Scheduled`: its own identity |
+
+A consumer that joins a run in flight gets that run's verdict even when the
+run turns out not to be reusable. Because the identity names the worktree,
+only requests for the same worktree can join.
+
+**Daemon placements** are never canonical. The builder falls back to
+`legacy-daemon/1` and `CheckOwnerPort::prepare` refuses a canonical run on a
+daemon placement as a second guard. For parity a daemon would have to probe
+and attest its own inherited environment with a salt it keeps, return that
+attestation with the receipt, and run the run-end tree stop; the attestation
+is a change of the wire shape and therefore a daemon protocol bump.
 
 Neither the spec revision nor the digest schema changes: the policy string is
 already a digest input, so no stored result of a legacy policy can satisfy a
-canonical request, and the digest's shape is the same.
+canonical request. No result was ever stored under `canonical-ci/1` before
+this definition, so the policy revision stays `1`.
 
 The owner supervision guarantees tested here cover normal cancellation, dropped
 futures, retained receipts and restart reconciliation. Abrupt process death

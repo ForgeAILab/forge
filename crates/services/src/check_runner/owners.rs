@@ -77,35 +77,16 @@ impl WorkspaceCheckOwners {
         .map_err(ServiceError::invalid_operation)?;
         // Secret bytes never enter check storage. Controlled values must still
         // equal the declared snapshot; volatile values make the key uncacheable.
-        // Under the canonical policy a key the Project does not set is the
-        // owner's own value, and a Project value is compared by its revision:
-        // a run never executes with an environment its identity does not name.
-        let owner = if record.run.identity.inputs.spec.execution_policy == CANONICAL_CI_POLICY {
-            Some(check_executor::canonical_environment().await)
-        } else {
-            None
-        };
+        // The canonical policy states its Project values as revisions and
+        // never refuses here: its owner compares the whole environment before
+        // it runs, and one that moved makes the result not reusable.
         for (key, value) in &record.run.identity.inputs.environment {
-            let actual = environment.env.get(key);
-            let unchanged = match value {
-                CheckEnvironmentValue::ControlledValue(expected) => {
-                    actual.or_else(|| owner.and_then(|owner| owner.values.get(key)))
-                        == Some(expected)
+            if let CheckEnvironmentValue::ControlledValue(expected) = value {
+                if environment.env.get(key) != Some(expected) {
+                    return Err(ServiceError::invalid_operation(
+                        "check environment revision changed",
+                    ));
                 }
-                CheckEnvironmentValue::SecretRevision(expected) if owner.is_some() => {
-                    match actual {
-                        Some(actual) => {
-                            super::policy::value_revision(&self.db, key, actual).await? == *expected
-                        }
-                        None => false,
-                    }
-                }
-                _ => true,
-            };
-            if !unchanged {
-                return Err(ServiceError::invalid_operation(
-                    "check environment revision changed",
-                ));
             }
         }
         Ok(environment.env)
@@ -177,9 +158,17 @@ impl WorkspaceCheckOwners {
             let actual=tokio::time::timeout(Duration::from_secs(2),git::get_current_sha(Path::new(path))).await.map_err(|_| ServiceError::invalid_operation("check candidate witness timed out"))??;
             if actual!=record.run.identity.commit_sha { return Err(ServiceError::invalid_operation("check candidate changed")); }
             let environment=self.environment(record).await?;
-            // The canonical policy is attested by this owner, now: a receipt
-            // whose attestation differs from the identity certifies nothing.
-            let inputs=if record.run.identity.inputs.spec.execution_policy==CANONICAL_CI_POLICY { Some(check_executor::canonical_inputs().await.map_err(ServiceError::invalid_operation)?) } else { None };
+            // The canonical policy is attested by this owner, now, from the
+            // environment the steps are about to inherit. When that is not
+            // the environment the request named (a Project value was edited,
+            // the server restarted into another environment, the login shell
+            // did not answer), the run still executes with what is in force,
+            // as entry CI always did; the receipt then attests nothing and
+            // the result is its consumers' verdict, never reused.
+            let inputs=if record.run.identity.inputs.spec.execution_policy==CANONICAL_CI_POLICY {
+                let stated=&record.run.identity.inputs.environment_identity;
+                super::policy::attest(&self.db,&environment).await?.filter(|inputs| matches!(stated,CheckEnvironmentIdentity::Attested { .. }) && inputs.identity().as_ref()==Ok(stated))
+            } else { None };
             crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
                 operation_id:&id,spec:&record.run.identity.inputs.spec,target:check_executor::CheckoutTarget::Workspace(Path::new(path)),owner:intent.owner.clone(),input_revisions:inputs.as_ref(),environment:&environment,deadline:Some(deadline),cancel:&token,permit:&check_executor::CheckPermit::already_admitted(),cleanup:check_executor::CleanupPlan { commands:&[],timeout:check_executor::CLEANUP_TIMEOUT },output_limit:check_executor::OUTPUT_TAIL_BYTES,
             }).await

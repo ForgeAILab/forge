@@ -12,9 +12,22 @@ pub(super) fn validate_receipt(
 ) -> Result<CheckResultEvidence> {
     let refuse =
         || ServiceError::invalid_operation("check receipt does not certify the admitted inputs");
+    let policy = run.identity.inputs.spec.execution_policy.as_str();
+    let legacy = matches!(policy, "legacy-server/1" | "legacy-daemon/1");
+    // The canonical CI policy runs in the Task worktree with the environment
+    // in force, as the steps always did. A step that leaves a tracked change,
+    // a worktree that was not clean, a process tree that was not verified
+    // stopped or an environment that is no longer the one the request named
+    // is still that Task's verdict, exactly as before; it is only never
+    // reused. Every other non-legacy policy keeps the strict rule: no
+    // attestation or witness, no pass.
+    let canonical = policy == CANONICAL_CI_POLICY;
+    let attested = receipt.execution_inputs == run.identity.inputs.environment_identity;
+    // An owner may attest less than the request named, never something else.
+    let unattested = canonical && receipt.execution_inputs == CheckEnvironmentIdentity::NotAttested;
     if receipt.operation_id != run.operation_id
         || receipt.owner != intent.owner
-        || receipt.execution_inputs != run.identity.inputs.environment_identity
+        || !(attested || unattested)
     {
         return Err(refuse());
     }
@@ -34,14 +47,6 @@ pub(super) fn validate_receipt(
     {
         return Err(refuse());
     }
-    let policy = run.identity.inputs.spec.execution_policy.as_str();
-    let legacy = matches!(policy, "legacy-server/1" | "legacy-daemon/1");
-    // The canonical CI policy runs in the Task worktree, as the steps always
-    // did. A step that leaves a tracked change, a worktree that was not clean
-    // or a process tree that was not confirmed stopped is still that Task's
-    // verdict, exactly as before; it is only never reused. Every other
-    // non-legacy policy keeps the strict rule: no witness, no pass.
-    let canonical = policy == CANONICAL_CI_POLICY;
     let witnessed = receipt.prepared_head.as_deref() == Some(&run.identity.commit_sha)
         && receipt.finished_head == receipt.prepared_head
         && receipt.tracked_changes == Some(false);
@@ -101,6 +106,11 @@ pub(super) fn validate_receipt(
         }
     }
     let reusable = receipt.outcome == CheckExecutionOutcome::Passed
+        && attested
+        && matches!(
+            receipt.execution_inputs,
+            CheckEnvironmentIdentity::Attested { .. }
+        )
         && witnessed
         && receipt.commands.iter().all(|c| c.process_tree_stopped)
         && matches!(

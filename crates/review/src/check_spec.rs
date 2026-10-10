@@ -30,9 +30,10 @@ pub struct CheckSpecConfiguration<'a> {
     pub event: LifecycleEvent,
     pub role: &'a str,
     pub owner_is_daemon: bool,
-    /// Build the bundle for the durable runner's canonical, reusable policy
-    /// instead of the frozen policy of the inline path. Entry CI on a
-    /// server-owned checkout only.
+    /// Ask for the durable runner's canonical, reusable policy instead of the
+    /// frozen policy of the inline path. It is defined for entry CI in a
+    /// server-owned Task worktree; a daemon-owned checkout, or no worktree,
+    /// gets the frozen policy of its owner (always runs, never reused).
     pub canonical_policy: bool,
     /// The Task worktree the bundle would run in, when one exists: workspace
     /// id and placement generation. Families that act on the worktree put it
@@ -110,14 +111,17 @@ pub fn build_check_spec(
     } else {
         purpose
     };
-    // The canonical policy is defined for the CI bundle on a server-owned
-    // checkout. A daemon owner attests no inputs yet, and the manual
-    // ReviewRunner, conformance and every other family keep the frozen policy
-    // of their own execution path.
-    let canonical = config.canonical_policy;
-    if canonical && (family != CheckPurpose::EntryCi || config.owner_is_daemon) {
-        return Err("the canonical policy runs entry CI on a server-owned checkout only".into());
+    // The canonical policy is defined for the CI bundle in a server-owned
+    // Task worktree. The manual ReviewRunner, conformance and every other
+    // family keep the frozen policy of their own execution path: asking for
+    // the canonical one there is a caller error. A daemon owner attests no
+    // inputs yet, and without a worktree there is nothing to scope a result
+    // to: both are ordinary placements and fall back to the frozen policy.
+    if config.canonical_policy && family != CheckPurpose::EntryCi {
+        return Err("the canonical policy is defined for entry CI only".into());
     }
+    let canonical =
+        config.canonical_policy && !config.owner_is_daemon && config.workspace.is_some();
     let mut has_setup = false;
     let mut spec = CheckSpec {
         schema_revision: CHECK_SPEC_REVISION,
@@ -136,12 +140,7 @@ pub fn build_check_spec(
         }
         .into(),
     };
-    let mut keys: BTreeSet<_> = config.environment.env.keys().cloned().collect();
-    if canonical {
-        // The canonical policy clears the ambient environment, so the spec
-        // names what replaces it and the digest covers it.
-        keys.extend(CANONICAL_ENVIRONMENT_KEYS.map(str::to_owned));
-    }
+    let keys: BTreeSet<_> = config.environment.env.keys().cloned().collect();
     let mut add = |id: String,
                    command: String,
                    cwd,
@@ -352,6 +351,10 @@ pub fn build_check_spec(
         generation: workspace.generation,
     });
     spec.scope = match check_family_scope(purpose, config.queue_head_bundle, has_setup) {
+        // A canonical run executes in the Task worktree, with whatever
+        // ignored build output that worktree holds. Its result is evidence
+        // for that worktree only, so the worktree is part of its identity.
+        CheckFamilyScope::Commit if canonical => workspace.unwrap_or(CheckScope::Commit),
         CheckFamilyScope::Commit => CheckScope::Commit,
         CheckFamilyScope::Probe => workspace.unwrap_or(CheckScope::Commit),
         CheckFamilyScope::Worktree => match workspace {

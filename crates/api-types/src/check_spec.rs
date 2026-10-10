@@ -5,35 +5,15 @@ use ts_rs::TS;
 
 pub const CHECK_SPEC_REVISION: u32 = 2;
 pub const CHECK_DIGEST_SCHEMA: &str = "forge.check-execution/2";
-/// The canonical CI policy: ambient environment cleared, no login profile,
-/// every command's process group stopped when it exits, a whole-run wall
-/// limit, and a Git witness (clean checkout at the commit before, same HEAD
-/// and no tracked change after). Besides the keys a spec declares, a command
-/// sees only the owner's values of [`CANONICAL_PASSTHROUGH_KEYS`] and the
-/// machine build budget. A change to any of that is a new revision.
+/// The canonical CI policy, the only one whose result may be reused. A step
+/// runs as it always did (login shell, the owner's inherited environment, the
+/// Project values, the machine build budget, in the Task worktree; a service
+/// one step starts is there for the next). What the policy adds is evidence:
+/// the owner attests the environment the steps inherit, the executor
+/// witnesses a clean checkout at the commit before and the same HEAD with no
+/// tracked change after, and the whole run's process tree is stopped and
+/// verified when the run ends. A change to any of that is a new revision.
 pub const CANONICAL_CI_POLICY: &str = "canonical-ci/1";
-/// Declared by every canonical spec, so the digest names what the commands
-/// can see. Their values are the owner's; a Project value for the same key
-/// takes precedence.
-pub const CANONICAL_ENVIRONMENT_KEYS: [&str; 2] = ["HOME", "PATH"];
-/// Passed through from the owner's login environment when it sets them, and
-/// bound by the owner's environment identity (never silently outside it):
-/// who runs (`USER`, `LOGNAME`, `SHELL`), locale (`LANG`, `LC_ALL`), the
-/// scratch location (`TMPDIR`) and the toolchain roots a relocated install
-/// cannot be found without.
-pub const CANONICAL_PASSTHROUGH_KEYS: [&str; 11] = [
-    "CARGO_HOME",
-    "GOPATH",
-    "GOROOT",
-    "JAVA_HOME",
-    "LANG",
-    "LC_ALL",
-    "LOGNAME",
-    "RUSTUP_HOME",
-    "SHELL",
-    "TMPDIR",
-    "USER",
-];
 
 /// Why a consumer asked for a check. It selects the bundle the builder
 /// assembles and is recorded on the consumer row; it is NOT part of the spec

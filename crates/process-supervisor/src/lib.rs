@@ -52,6 +52,9 @@ pub struct ProcessOutput {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub descendants_stopped: bool,
+    /// The command's process group (the leader's id). A caller that left the
+    /// descendants running passes it to [`stop_group`] when its run ends.
+    pub group: Option<u32>,
     pub stdout_drain_incomplete: bool,
     pub stderr_drain_incomplete: bool,
 }
@@ -104,6 +107,57 @@ fn signal(signal: &str, id: u32) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+#[cfg(unix)]
+fn group_alive(id: u32) -> Option<bool> {
+    std::process::Command::new("kill")
+        .args(["-0", "--", &format!("-{id}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .map(|status| status.success())
+}
+/// Stop a process group a finished command left running, with the same
+/// TERM / 500 ms / KILL sequence, and say whether it is really gone: `true`
+/// only when the group has no member left afterwards. Blocking (up to about
+/// three seconds); call it off the async runtime.
+///
+/// Limits: ids 0 and 1 are never signalled; a descendant that left the group
+/// (`setsid`) is not seen and not stopped. The id of a group whose every
+/// member already exited can in principle be taken by an unrelated new group
+/// of the same user before this is called; that group would be signalled.
+#[cfg(unix)]
+pub fn stop_group(id: u32) -> bool {
+    if id <= 1 {
+        return false;
+    }
+    match group_alive(id) {
+        None => return false,
+        Some(false) => return true,
+        Some(true) => {}
+    }
+    signal("TERM", id);
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until && group_alive(id) == Some(true) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    signal("KILL", id);
+    // A killed member is gone once its parent (or init) has reaped it.
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        match group_alive(id) {
+            Some(false) => return true,
+            None => return false,
+            Some(true) if Instant::now() >= until => return false,
+            Some(true) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+#[cfg(not(unix))]
+pub fn stop_group(_id: u32) -> bool {
+    false
 }
 #[derive(Default)]
 struct Stream {
@@ -307,6 +361,7 @@ pub async fn run(
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
         descendants_stopped: stop_descendants || termination != Termination::Exited,
+        group: leader.filter(|id| *id > 1),
         stdout_drain_incomplete: !stdout.eof,
         stderr_drain_incomplete: !stderr.eof,
     })
