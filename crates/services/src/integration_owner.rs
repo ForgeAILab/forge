@@ -852,13 +852,14 @@ async fn server_fast_forward_transferred(
             files: git::status_porcelain(input.repo_path).await?,
         }));
     }
-    let applied = match git::integration::apply_merge(
+    // A compare-and-swap of the branch from the witnessed tip to the
+    // candidate: a writer that moved the target after the read above loses
+    // nothing and gains nothing, the swap just does not happen.
+    let applied = match git::integration::fast_forward_exact(
         input.repo_path,
         input.target_branch,
         candidate,
-        true,
-        false,
-        Some(input.observed_target_sha),
+        input.observed_target_sha,
         git::integration::FastForwardLimits {
             deadline: Duration::from_secs(30),
             output_bytes: ::review::contract::MAX_EVIDENCE_BYTES,

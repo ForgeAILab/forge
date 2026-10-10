@@ -1471,32 +1471,22 @@ fn production_ports(
 impl Production {
     fn new(world: &World) -> Self {
         let (worker, daemons, config) = production_ports(world);
-        // The check runner, its consumers and the merge-path family.
-        let runner = Arc::new(crate::check_runner::CheckRunner::new(world.db.clone()));
-        let consumers = Arc::new(crate::check_runner::consumer::TaskCheckConsumers::new(
-            world.db.clone(),
-            runner,
-        ));
-        let _ = world.service.check_consumers.set(consumers.clone());
+        // The check runner, its consumer families and its worker, as the
+        // one constructor builds them. The merge-path family is registered
+        // again only to give it this worker's (fast) timers.
+        let composed = world
+            .service
+            .compose_checks(daemons, Duration::from_secs(60));
         IntegrationCheckFamily::register(
-            &consumers,
+            &composed.consumers,
             Arc::new(
                 IntegrationSteps::new(world.service.clone())
                     .with_timers(IntegrationStepTimers::from(&config)),
             ),
         );
-        let owners = Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
-            world.db.clone(),
-            daemons,
-            Duration::from_secs(60),
-        ));
         let (stop, stopped) = tokio::sync::watch::channel(false);
         let periodic = crate::worker_runtime::PeriodicWorkers::new(world.db.clone());
-        let checks = Arc::new(crate::check_runner::worker::CheckRunWorker::new(
-            world.db.clone(),
-            owners,
-        ))
-        .start(&periodic, stopped);
+        let checks = composed.worker.start(&periodic, stopped);
         Self {
             worker,
             stop,
@@ -1626,6 +1616,97 @@ async fn real_ci_steps_decide_the_head_through_the_production_ports() {
         .unwrap()
         .head_attempt_id
         .is_none());
+}
+
+/// A check that ended "no verdict after its retries" says nothing about the
+/// commit. The round that waited for it is told so (and parks, counted). A
+/// later round of the same commit must not read that stored answer again:
+/// it would park on every retry and end at the owner without the check ever
+/// running again. The new round's ask re-arms the consumer (a fresh
+/// infrastructure budget, a new run) and waits. Only an answer whose cleanup
+/// is unproven still stands, which the counted retries bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_no_verdict_answer_is_not_kept_for_the_commit_and_a_new_round_asks_again() {
+    let world = World::new().await;
+    let a = world.add_task("one", "one.txt", "one\n").await;
+    review_ci(&world, "one", &["true"]).await;
+    world.service.compose_checks(
+        Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers()),
+        Duration::from_secs(60),
+    );
+    let asked = |round: i64| {
+        let world = &world;
+        let id = a.id.clone();
+        async move {
+            let placed = world.place(&id, "checking", round).await;
+            world.ask(&placed, IntegrationStepAction::RequestCheck).await;
+            eventually("the request_check step to finish", || async {
+                let steps = world.step("one", IntegrationStepAction::RequestCheck).await;
+                steps.len() as i64 == round && steps.iter().all(|step| step.status == "done")
+            })
+            .await;
+            world.attempt(&id).await
+        }
+    };
+    // Round 1 asks; the run exists and nothing has answered yet.
+    let first = asked(1).await;
+    assert_eq!(first.state, S::Checking);
+    assert!(ack(&first, IntegrationStepAction::Settle).is_none());
+    let (consumer, run): (String, String) =
+        sqlx::query_as("SELECT id,run_id FROM check_consumer WHERE task_id='one'")
+            .fetch_one(world.db.pool())
+            .await
+            .unwrap();
+    // The run ends without a verdict after its retries, and that answer was
+    // delivered and applied (round 1 parked on it).
+    let now = db::now_rfc3339();
+    let step = world.step("one", IntegrationStepAction::RequestCheck).await[0]
+        .id
+        .clone();
+    let exhaust = |cleanup: &'static str, result: &'static str| {
+        let (world, run, consumer, now, step) = (&world, run.clone(), consumer.clone(), now.clone(), step.clone());
+        async move {
+            let pool = world.db.pool();
+            sqlx::query("UPDATE check_run SET state='failed',lease_owner=NULL,lease_until=NULL,finished_at=? WHERE id=?")
+                .bind(&now).bind(&run).execute(pool).await.unwrap();
+            sqlx::query("INSERT INTO check_result(id,run_id,identity_key,outcome,cleanup,certified,cacheable,steps_json,output_truncated,created_at) SELECT ?,id,identity_key,'infrastructure_failed',?,0,0,'[]',0,? FROM check_run WHERE id=?")
+                .bind(result).bind(cleanup).bind(&now).bind(&run).execute(pool).await.unwrap();
+            sqlx::query("UPDATE check_consumer SET run_id=?,result_id=?,infrastructure_retries=2,delivery_step_id=?,applied_at=? WHERE id=?")
+                .bind(&run).bind(result).bind(&step).bind(&now).bind(&consumer).execute(pool).await.unwrap();
+        }
+    };
+    exhaust("not_performed", "no-verdict-1").await;
+
+    // Round 2, same commit: asked again, not answered from the stored row.
+    let second = asked(2).await;
+    assert_eq!(second.candidate_sha, first.candidate_sha);
+    assert_eq!(second.state, S::Checking);
+    assert!(
+        ack(&second, IntegrationStepAction::Settle).is_none(),
+        "{:?}",
+        second.effect_ack_json
+    );
+    let (retries, delivery, applied): (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT infrastructure_retries,delivery_step_id,applied_at FROM check_consumer WHERE id=?",
+    )
+    .bind(&consumer)
+    .fetch_one(world.db.pool())
+    .await
+    .unwrap();
+    assert_eq!((retries, delivery, applied), (0, None, None));
+    assert_eq!(
+        world
+            .scalar::<i64>("SELECT COUNT(*) FROM check_consumer WHERE task_id=?", "one")
+            .await,
+        1
+    );
+
+    // An exhausted answer whose cleanup is unproven is not run again from
+    // here: it stands as "no verdict" for this round too.
+    exhaust("uncertain", "no-verdict-2").await;
+    let third = asked(3).await;
+    let answer = ack(&third, IntegrationStepAction::Settle).expect("answered");
+    assert_eq!(answer.outcome, IntegrationStepOutcome::Infrastructure);
 }
 
 impl World {

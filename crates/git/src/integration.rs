@@ -157,6 +157,136 @@ pub async fn apply_merge(
     }
 }
 
+/// Fast-forward a checked-out branch to exactly `candidate`, as a
+/// compare-and-swap on the tip the caller witnessed.
+///
+/// `git merge --ff-only` moves the branch from whatever tip it reads itself,
+/// so a writer between the caller's read and the merge goes unnoticed. Here
+/// the ref is written by `update-ref <branch> <candidate> <expected_target>`:
+/// Git takes the ref lock, compares and writes in one step, so the branch
+/// moves from exactly `expected_target` to exactly `candidate` or not at all.
+/// The candidate must contain `expected_target` (checked, not assumed).
+///
+/// The work tree is brought to the candidate first by a two-tree
+/// `read-tree -m -u` (what a fast-forward merge does; it refuses to overwrite
+/// a local change). When the swap then loses, the work tree is taken back to
+/// the tip the branch has now. The caller holds the checkout's owner lock
+/// and has seen a clean work tree. No `post-merge` hook runs.
+pub async fn fast_forward_exact(
+    repo: &Path,
+    target_branch: &str,
+    candidate: &str,
+    expected_target: &str,
+    limits: FastForwardLimits,
+) -> Result<MergeApplyOutcome> {
+    let target_ref = format!("refs/heads/{target_branch}");
+    let text = |output: &std::process::Output| {
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    let refused = |what: &str, output: &std::process::Output| MergeApplyOutcome::ReviewRequired {
+        reason: format!("{what}: {}", String::from_utf8_lossy(&output.stderr).trim()),
+    };
+    if !is_object_id(candidate) || !is_object_id(expected_target) {
+        return Ok(MergeApplyOutcome::ReviewRequired {
+            reason: "fast-forward needs full object ids".into(),
+        });
+    }
+    let head = crate::command_output(repo, &["symbolic-ref", "-q", "HEAD"]).await?;
+    if !head.status.success() || text(&head) != target_ref {
+        crate::checkout_branch(repo, target_branch).await?;
+    }
+    let tip = async {
+        let output = crate::command_output(
+            repo,
+            &["rev-parse", "--verify", "--quiet", &format!("{target_ref}^{{commit}}")],
+        )
+        .await?;
+        Ok::<_, GitError>(text(&output))
+    };
+    if tip.await? != expected_target {
+        return Ok(MergeApplyOutcome::TargetMoved);
+    }
+    let commit = crate::command_output(
+        repo,
+        &["rev-parse", "--verify", "--quiet", &format!("{candidate}^{{commit}}")],
+    )
+    .await?;
+    if !commit.status.success() || text(&commit) != candidate {
+        return Ok(refused("the candidate is not a commit of this repository", &commit));
+    }
+    let contains = crate::command_output(
+        repo,
+        &["merge-base", "--is-ancestor", expected_target, candidate],
+    )
+    .await?;
+    if !contains.status.success() {
+        return Ok(refused("the candidate does not contain the target tip", &contains));
+    }
+    if candidate == expected_target {
+        return Ok(MergeApplyOutcome::Applied);
+    }
+    let restore = |to: String| async move {
+        let _ = crate::command_output(repo, &["read-tree", "--reset", "-u", &to]).await;
+    };
+    let moved = match tokio::time::timeout(
+        limits.deadline,
+        crate::command_output_bounded(
+            repo,
+            &["read-tree", "-m", "-u", expected_target, candidate],
+            limits.output_bytes,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() => None,
+        // Checked before anything is written: the work tree is as it was.
+        Ok(Ok(output)) => Some(refused("the work tree could not be fast-forwarded", &output)),
+        Ok(Err(error)) => Some(MergeApplyOutcome::ReviewRequired {
+            reason: error.to_string(),
+        }),
+        Err(_) => {
+            restore(expected_target.to_owned()).await;
+            Some(MergeApplyOutcome::ReviewRequired {
+                reason: "fast-forward timed out".into(),
+            })
+        }
+    };
+    if let Some(outcome) = moved {
+        return Ok(outcome);
+    }
+    let swap = crate::command_output(
+        repo,
+        &[
+            "update-ref",
+            "-m",
+            &format!("forge: fast-forward to {candidate}"),
+            &target_ref,
+            candidate,
+            expected_target,
+        ],
+    )
+    .await?;
+    let now = crate::command_output(
+        repo,
+        &["rev-parse", "--verify", "--quiet", &format!("{target_ref}^{{commit}}")],
+    )
+    .await?;
+    let now = text(&now);
+    if now == candidate && swap.status.success() {
+        return Ok(MergeApplyOutcome::Applied);
+    }
+    // The swap lost (or was refused): nothing of ours is in the branch. The
+    // work tree goes back to what the branch holds.
+    if !now.is_empty() {
+        restore(now.clone()).await;
+    }
+    Ok(if now != expected_target {
+        MergeApplyOutcome::TargetMoved
+    } else {
+        refused("the target ref could not be written", &swap)
+    })
+}
+
 /// Largest Git object transfer between two checkouts of one repository.
 pub const MAX_OBJECT_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
 /// The only ref namespace an object import may write.
@@ -1508,5 +1638,104 @@ mod transfer_tests {
             .filter(|name| name.starts_with("forge-incoming-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    fn limits() -> FastForwardLimits {
+        FastForwardLimits {
+            deadline: std::time::Duration::from_secs(30),
+            output_bytes: 64 * 1024,
+        }
+    }
+
+    /// The target clone holds the source's tip as an object, not in `main`.
+    fn fetched() -> Pair {
+        let pair = pair();
+        git(
+            &pair.target,
+            &[
+                "fetch",
+                "-q",
+                pair.source.to_str().unwrap(),
+                "main:refs/forge/integration/k",
+            ],
+        );
+        pair
+    }
+
+    #[tokio::test]
+    async fn an_exact_fast_forward_moves_the_branch_once_from_the_witnessed_tip() {
+        let pair = fetched();
+        let outcome = fast_forward_exact(&pair.target, "main", &pair.tip, &pair.base, limits())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MergeApplyOutcome::Applied), "{outcome:?}");
+        assert_eq!(git(&pair.target, &["rev-parse", "refs/heads/main"]), pair.tip);
+        assert_eq!(git(&pair.target, &["rev-parse", "HEAD"]), pair.tip);
+        assert_eq!(git(&pair.target, &["status", "--porcelain"]), "");
+        assert!(pair.target.join("work.txt").exists());
+        // One reflog entry for the move, from the witnessed tip.
+        let reflog = git(&pair.target, &["reflog", "show", "--format=%H %gs", "main"]);
+        let moves: Vec<&str> = reflog.lines().filter(|line| line.contains("forge: fast-forward")).collect();
+        assert_eq!(moves.len(), 1, "{reflog}");
+        // Asked again with the same witness the tip is no longer the
+        // expected one: nothing is written a second time.
+        let again = fast_forward_exact(&pair.target, "main", &pair.tip, &pair.base, limits())
+            .await
+            .unwrap();
+        assert!(matches!(again, MergeApplyOutcome::TargetMoved), "{again:?}");
+        let reflog = git(&pair.target, &["reflog", "show", "--format=%H %gs", "main"]);
+        assert_eq!(reflog.lines().filter(|line| line.contains("forge: fast-forward")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_exact_fast_forward_refuses_a_moved_target_and_a_candidate_off_the_tip() {
+        // The target moved after the caller read it.
+        let pair = fetched();
+        let moved = commit(&pair.target, "other.txt", "other\n");
+        let before = snapshot(&pair.target);
+        let outcome = fast_forward_exact(&pair.target, "main", &pair.tip, &pair.base, limits())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MergeApplyOutcome::TargetMoved), "{outcome:?}");
+        assert_eq!(git(&pair.target, &["rev-parse", "refs/heads/main"]), moved);
+        assert_eq!(snapshot(&pair.target), before);
+        // The candidate does not contain the tip it is said to follow: the
+        // witness is right, the object is not a fast-forward of it.
+        let outcome = fast_forward_exact(&pair.target, "main", &pair.tip, &moved, limits())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MergeApplyOutcome::ReviewRequired { .. }), "{outcome:?}");
+        assert_eq!(git(&pair.target, &["rev-parse", "refs/heads/main"]), moved);
+        assert_eq!(snapshot(&pair.target), before);
+        // An object this repository does not hold.
+        let unknown = "0123456789abcdef0123456789abcdef01234567";
+        let outcome = fast_forward_exact(&pair.target, "main", unknown, &moved, limits())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MergeApplyOutcome::ReviewRequired { .. }), "{outcome:?}");
+        assert_eq!(snapshot(&pair.target), before);
+    }
+
+    /// The compare-and-swap itself loses (here: the repository's
+    /// reference-transaction hook refuses the write). The branch is where it
+    /// was and the work tree is taken back to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lost_swap_leaves_the_branch_and_the_work_tree_as_they_were() {
+        use std::os::unix::fs::PermissionsExt;
+        let pair = fetched();
+        let hooks = pair.target.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("reference-transaction");
+        std::fs::write(&hook, "#!/bin/sh\n[ \"$1\" = prepared ] && exit 1\nexit 0\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let outcome = fast_forward_exact(&pair.target, "main", &pair.tip, &pair.base, limits())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MergeApplyOutcome::ReviewRequired { .. }), "{outcome:?}");
+        std::fs::remove_file(&hook).unwrap();
+        assert_eq!(git(&pair.target, &["rev-parse", "refs/heads/main"]), pair.base);
+        assert_eq!(git(&pair.target, &["status", "--porcelain"]), "");
+        assert!(!pair.target.join("work.txt").exists());
     }
 }

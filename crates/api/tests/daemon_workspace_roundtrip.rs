@@ -4978,15 +4978,11 @@ async fn queue_worker_rebases_checks_and_fast_forwards_on_a_daemon_owned_target(
     let state = fixture.harness.state.clone();
     let periodic = services::worker_runtime::PeriodicWorkers::new(state.db.clone());
     let (stop_checks, checks_stopped) = tokio::sync::watch::channel(false);
-    let _checks = Arc::new(services::check_runner::worker::CheckRunWorker::new(
-        state.db.clone(),
-        Arc::new(services::check_runner::owners::WorkspaceCheckOwners::new(
-            state.db.clone(),
-            state.daemon_connections.clone(),
-            Duration::from_secs(60),
-        )),
-    ))
-    .start(&periodic, checks_stopped);
+    let _checks = state
+        .task_service
+        .compose_checks(state.daemon_connections.clone(), Duration::from_secs(60))
+        .worker
+        .start(&periodic, checks_stopped);
 
     let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
     queue_eventually!(&fixture, &head, "the Task to merge", {
@@ -5057,15 +5053,11 @@ async fn queue_worker_ejects_a_red_check_on_a_daemon_owned_target() {
     let state = fixture.harness.state.clone();
     let periodic = services::worker_runtime::PeriodicWorkers::new(state.db.clone());
     let (stop_checks, checks_stopped) = tokio::sync::watch::channel(false);
-    let _checks = Arc::new(services::check_runner::worker::CheckRunWorker::new(
-        state.db.clone(),
-        Arc::new(services::check_runner::owners::WorkspaceCheckOwners::new(
-            state.db.clone(),
-            state.daemon_connections.clone(),
-            Duration::from_secs(60),
-        )),
-    ))
-    .start(&periodic, checks_stopped);
+    let _checks = state
+        .task_service
+        .compose_checks(state.daemon_connections.clone(), Duration::from_secs(60))
+        .worker
+        .start(&periodic, checks_stopped);
 
     let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
     queue_eventually!(&fixture, &head, "the head to be ejected", {
@@ -5484,15 +5476,14 @@ macro_rules! start_check_worker {
         let check_state = $fixture.harness.state.clone();
         let check_periodic = services::worker_runtime::PeriodicWorkers::new(check_state.db.clone());
         let ($stop, checks_stopped) = tokio::sync::watch::channel(false);
-        let _checks = Arc::new(services::check_runner::worker::CheckRunWorker::new(
-            check_state.db.clone(),
-            Arc::new(services::check_runner::owners::WorkspaceCheckOwners::new(
-                check_state.db.clone(),
+        let _checks = check_state
+            .task_service
+            .compose_checks(
                 check_state.daemon_connections.clone(),
                 Duration::from_secs(60),
-            )),
-        ))
-        .start(&check_periodic, checks_stopped);
+            )
+            .worker
+            .start(&check_periodic, checks_stopped);
     };
 }
 

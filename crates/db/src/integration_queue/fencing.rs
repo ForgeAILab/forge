@@ -270,6 +270,13 @@ pub(crate) async fn settle_removed_integration_owner(
         record_in_tx(tx, &receipt).await?;
         sqlx::query("UPDATE integration_attempt SET state=CASE WHEN state='quarantined' OR EXISTS(SELECT 1 FROM integration_queue q WHERE q.id=integration_attempt.queue_id AND q.state='quarantined') THEN 'quarantined' ELSE 'parked' END,failure_kind='infrastructure',failure_message=?,revision=revision+1,updated_at=? WHERE id=?")
             .bind(message).bind(now_rfc3339()).bind(&receipt.request.fence.attempt_id).execute(&mut **tx).await?;
+        // A parked attempt holds no slot (as in `transition_integration_attempt`).
+        // Left as the queue's head it would be claimed again on every sweep
+        // and never driven, with every other member waiting behind it. Its
+        // effect was settled just above, so nothing uncertain is released.
+        // A quarantined head keeps the slot: its queue re-opens through it.
+        sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL,lease_owner=NULL,lease_until=NULL,revision=revision+1,updated_at=? WHERE head_attempt_id=? AND EXISTS(SELECT 1 FROM integration_attempt a WHERE a.id=integration_queue.head_attempt_id AND a.state='parked')")
+            .bind(now_rfc3339()).bind(&receipt.request.fence.attempt_id).execute(&mut **tx).await?;
     }
     // Location deletion's existing queue update owns its single revision
     // increment and target-unconfigured projection in this transaction.
@@ -344,6 +351,55 @@ async fn verify(
         return Ok(Some(IntegrationEffectRefusal::ForeignOwner));
     }
     Ok(None)
+}
+
+/// `witness.effect_owner` is the caller's word for who performs a queue
+/// claim's effect. Everything that follows trusts it: the owner lock, which
+/// owner is asked for the receipt, and which removal settles the intent. It
+/// is therefore admitted only when the attempt's own durable owner fields
+/// (written at admission, from the Task's placement) say the same:
+///
+/// * only a rebase is performed off the target's owner;
+/// * the named owner is the one the attempt records for the Task's checkout
+///   (kind, daemon and runtime, and the repo location while it exists);
+/// * that owner is not the target's owner (then no `effect_owner` is named);
+/// * and a rebase that names none is refused when the attempt records
+///   another owner than the target's, so it is never journaled against an
+///   owner that does not hold the Task's checkout.
+async fn verify_effect_owner(
+    tx: &mut Transaction<'_, Sqlite>,
+    request: &IntegrationEffectRequest,
+) -> Result<Option<IntegrationEffectRefusal>> {
+    if is_task_step(request) {
+        return Ok(None);
+    }
+    let a = attempt_in_tx(tx, &request.fence.attempt_id).await?;
+    let target = &request.fence.target_owner;
+    let recorded = a.owner_kind.map(|kind| kind.to_string());
+    let same_as_target = |kind: &str, daemon: Option<&str>| {
+        target["owner_kind"].as_str() == Some(kind)
+            && (kind != "daemon" || target["daemon_id"].as_str() == daemon)
+    };
+    let Some(named) = request.witness.get("effect_owner") else {
+        let foreign = request.kind == IntegrationOperationKind::Rebase
+            && recorded
+                .as_deref()
+                .is_some_and(|kind| !same_as_target(kind, a.daemon_id.as_deref()));
+        return Ok(foreign.then_some(IntegrationEffectRefusal::ForeignOwner));
+    };
+    let kind = named["owner_kind"].as_str().unwrap_or_default();
+    let holds = request.kind == IntegrationOperationKind::Rebase
+        && named.is_object()
+        && recorded.as_deref() == Some(kind)
+        && (kind != "daemon"
+            || (named["daemon_id"].as_str().is_some()
+                && named["daemon_id"].as_str() == a.daemon_id.as_deref()
+                && named["runtime_id"].as_str() == a.runtime_id.as_deref()))
+        && a.repo_location_id
+            .as_deref()
+            .is_none_or(|location| named["location_id"].as_str() == Some(location))
+        && !same_as_target(kind, named["daemon_id"].as_str());
+    Ok((!holds).then_some(IntegrationEffectRefusal::ForeignOwner))
 }
 
 /// The original owner may reconcile after its lease expired or was replaced.
@@ -542,6 +598,9 @@ impl SqliteDb {
             });
         }
         if let Some(refusal) = verify(&mut tx, &request.fence).await? {
+            return Ok(IntegrationEffectAdmission::Refused(refusal));
+        }
+        if let Some(refusal) = verify_effect_owner(&mut tx, &request).await? {
             return Ok(IntegrationEffectAdmission::Refused(refusal));
         }
         let size: i64 = sqlx::query_scalar(
@@ -1365,8 +1424,15 @@ mod tests {
             .create_or_get_integration_queue("r", "main")
             .await
             .unwrap();
-        let a = db
-            .admit_integration_attempt(admission(&q, "a", "task-owner"))
+        // Admission records the owner of the Task's checkout on the attempt.
+        let mut admitted = admission(&q, "a", "task-owner");
+        admitted.owner_kind = Some(IntegrationOwnerKind::Daemon);
+        admitted.daemon_id = Some("d".into());
+        admitted.runtime_id = Some("rt".into());
+        let a = db.admit_integration_attempt(admitted).await.unwrap();
+        // A second member waits behind the head.
+        let b = db
+            .admit_integration_attempt(admission(&q, "b", "second"))
             .await
             .unwrap();
         let q = db.integration_queue(&q.id).await.unwrap().unwrap();
@@ -1381,6 +1447,55 @@ mod tests {
             witness: serde_json::json!({"workspace":{"handle":"task-tree"},"effect_owner":{"location_id":"task-location","owner_kind":"daemon","daemon_id":"d","runtime_id":"rt"}}),
         };
         assert_eq!(request.effect_owner()["daemon_id"], "d");
+        // The witness alone names no owner: one the attempt does not record
+        // (another daemon, another runtime of the daemon, the target's own
+        // owner), one on another effect than the rebase, and a rebase that
+        // names none although the Task's checkout is elsewhere are refused
+        // before any intent exists.
+        let forged = |owner: Value, kind: IntegrationOperationKind| {
+            let mut witness = serde_json::json!({"workspace":{"handle":"task-tree"}});
+            if !owner.is_null() {
+                witness["effect_owner"] = owner;
+            }
+            IntegrationEffectRequest {
+                fence: request.fence.clone(),
+                kind,
+                witness,
+            }
+        };
+        for (owner, kind) in [
+            (
+                serde_json::json!({"location_id":"task-location","owner_kind":"daemon","daemon_id":"other","runtime_id":"rt"}),
+                IntegrationOperationKind::Rebase,
+            ),
+            (
+                serde_json::json!({"location_id":"task-location","owner_kind":"daemon","daemon_id":"d","runtime_id":"other"}),
+                IntegrationOperationKind::Rebase,
+            ),
+            (
+                serde_json::json!({"location_id":"task-location","owner_kind":"server","daemon_id":null,"runtime_id":null}),
+                IntegrationOperationKind::Rebase,
+            ),
+            (
+                serde_json::json!({"location_id":"task-location","owner_kind":"daemon","daemon_id":"d","runtime_id":"rt"}),
+                IntegrationOperationKind::FastForward,
+            ),
+            (serde_json::json!("d"), IntegrationOperationKind::Rebase),
+            (Value::Null, IntegrationOperationKind::Rebase),
+        ] {
+            assert!(
+                matches!(
+                    db.begin_integration_effect(forged(owner.clone(), kind))
+                        .await
+                        .unwrap(),
+                    IntegrationEffectAdmission::Refused(IntegrationEffectRefusal::ForeignOwner)
+                ),
+                "{owner} {kind:?}"
+            );
+        }
+        let untouched = db.integration_attempt(&a.id).await.unwrap().unwrap();
+        assert!(untouched.effect_intent_json.is_none());
+        assert_eq!(untouched.effect_receipts_json, serde_json::json!([]));
         let IntegrationEffectAdmission::Started(mut guard) =
             db.begin_integration_effect(request.clone()).await.unwrap()
         else {
@@ -1432,6 +1547,15 @@ mod tests {
         let q = db.integration_queue(&q.id).await.unwrap().unwrap();
         assert_eq!(q.state, IntegrationQueueState::Open);
         drop(guard);
+        // The parked attempt holds no slot: the member behind it is claimed
+        // next, the queue does not wait for the removed machine's Task.
+        assert_eq!(q.head_attempt_id, None);
+        assert_eq!(q.lease_owner, None);
+        let claimed = db
+            .claim_integration_queue(&q.id, q.revision, "worker", &now, "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(claimed.head_attempt_id.as_deref(), Some(b.id.as_str()));
     }
 
     #[tokio::test]

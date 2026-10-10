@@ -1875,6 +1875,110 @@ async fn parked_infrastructure_retries_then_needs_the_owner_and_transfer_cap_par
         .as_deref()
         .unwrap()
         .starts_with("transfer_too_large"));
+    // Nothing was moved, the slot is free, and whatever the refused transfer
+    // left on either end is released like any other exit's.
+    assert!(world.queue_of(&c).await.head_attempt_id.is_none());
+    let released = world.transfer.released.lock().unwrap().clone();
+    assert!(released.iter().any(|release| release.attempt_id == c.id));
+    // The cap a production worker runs with.
+    assert_eq!(
+        IntegrationWorkerConfig::default().transfer_cap_bytes,
+        256 * 1024 * 1024
+    );
+    assert_eq!(
+        IntegrationWorkerConfig::default().transfer_cap_bytes,
+        git::integration::MAX_OBJECT_TRANSFER_BYTES
+    );
+}
+
+/// The machine that holds the head's Task checkout is removed while its
+/// rebase is in flight there (the default checkout is on the server). The
+/// removal settles the effect as failed for the owner that performed it and
+/// parks the attempt. A parked attempt holds no slot: the worker's session
+/// for it ends, and the member behind it is claimed and merges. The queue
+/// does not wait for the removed machine's Task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_head_whose_task_machine_is_removed_mid_rebase_does_not_stall_the_queue() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    let b = world.add_task("r", "b", "b.txt", "b\n").await;
+    let now = db::now_rfc3339();
+    let pool = world.db.pool();
+    sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,created_at,updated_at) VALUES ('d','remote-machine','host','linux','aarch64','offline',?,?)").bind(&now).bind(&now).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO runtime(id,daemon_id,kind,workspace_root,status,labels_json,created_at,updated_at) VALUES ('rt','d','codex','root','offline','{}',?,?)").bind(&now).bind(&now).execute(pool).await.unwrap();
+    // Admission recorded the Task's owner: daemon `d`.
+    sqlx::query("UPDATE integration_attempt SET owner_kind='daemon',daemon_id='d',runtime_id='rt' WHERE id=?")
+        .bind(&a.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut pump = Pump::new(world.worker());
+    let mut drivers = pump.worker.sweep_once().await.unwrap();
+    assert_eq!(drivers.len(), 1);
+    let queue = world.queue_of(&a).await;
+    assert_eq!(queue.head_attempt_id.as_deref(), Some(a.id.as_str()));
+    // The head is rebasing on `d`: a started intent that names it as the
+    // performing owner, as the routing owner records it.
+    sqlx::query("UPDATE integration_attempt SET state='rebasing',revision=revision+1 WHERE id=?")
+        .bind(&a.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let request = db::IntegrationEffectRequest {
+        fence: world
+            .db
+            .integration_owner_fence(&a.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        kind: IntegrationOperationKind::Rebase,
+        witness: json!({"workspace":{"handle":"tree-on-d"},"target_branch":"main","effect_owner":{"location_id":"l-d","owner_kind":"daemon","daemon_id":"d","runtime_id":"rt"}}),
+    };
+    let db::IntegrationEffectAdmission::Started(mut guard) = world
+        .db
+        .begin_integration_effect(request.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("the rebase was not admitted");
+    };
+    assert!(guard.start().await.unwrap().is_none());
+    drop(guard);
+
+    world
+        .db
+        .remove_daemon("d", "admin", true, "local-host", false)
+        .await
+        .unwrap();
+    // Settled by the removal, for the owner that performed it.
+    let parked = world.attempt(&a.id).await;
+    assert_eq!(parked.state, S::Parked);
+    assert!(parked.effect_intent_json.is_none());
+    let receipt = world
+        .db
+        .integration_effect_receipt(&request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.operation_state, db::IntegrationOperationState::Failed);
+    let queue = world.queue_of(&a).await;
+    assert_eq!(queue.state, db::IntegrationQueueState::Open);
+    assert_eq!(queue.head_attempt_id, None);
+    // The session that drove the removed head ends without a write.
+    assert_eq!(drivers[0].pass().await.unwrap(), Pass::Lost);
+    drivers.clear();
+    // The member behind it proceeds to the merge.
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&b.id).await.state, S::Completed);
+    assert_eq!(ff_successes(&world, &b.id).await, 1);
+    let after = world.attempt(&a.id).await;
+    assert_eq!(after.state, S::Parked);
+    assert_eq!(
+        after.failure_kind,
+        Some(IntegrationFailureKind::Infrastructure)
+    );
+    assert_eq!(ff_successes(&world, &a.id).await, 0);
+    assert!(world.queue_of(&a).await.head_attempt_id.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1186,3 +1186,336 @@ async fn an_interrupted_transfer_restarts_from_its_first_chunk() {
         .iter()
         .all(|name| !name.ends_with(".part")));
 }
+
+// ----- the fast-forward of a transferred candidate ---------------------------
+//
+// `location-2` is the queue's default checkout on this owner; the candidate
+// was made in another checkout and reaches it only as the ref the claim
+// generation's outbound transfer binds (`<attempt>-<generation>-out`).
+
+struct TransferredHead {
+    transfer: Transfer,
+    clone: PathBuf,
+}
+
+impl TransferredHead {
+    async fn new() -> Self {
+        let transfer = transfer().await;
+        let clone = transfer.fixture.dir.path().join("secondary");
+        Self { transfer, clone }
+    }
+    fn key(generation: i64) -> String {
+        object_transfer_key("attempt-1", generation, ObjectTransferDirection::Outbound)
+    }
+    /// Bind `sha` (a commit of `location-1`) under `key` in the default
+    /// checkout, as the outbound import does.
+    async fn bind(&self, key: &str, sha: &str) {
+        local_git(
+            &self.clone,
+            &[
+                "fetch",
+                "-q",
+                self.transfer.fixture.repo.to_str().unwrap(),
+                &format!("{sha}:refs/forge/integration/{key}"),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    fn request(&self, generation: i64, candidate: &str, target: &str) -> WorkspaceIntegrationRequest {
+        let version = self.transfer.fixture.backend.state.lock().unwrap().locations["location-2"].version;
+        let mut fence = self.transfer.fence.clone();
+        fence.generation = generation;
+        fence.target_owner = serde_json::json!({"location_id":"location-2","owner_kind":"daemon","daemon_id":"daemon-1","runtime_id":"runtime-1","generation":version});
+        WorkspaceIntegrationRequest {
+            fence,
+            kind: WorkspaceIntegrationKind::FastForward,
+            witness: serde_json::json!({"workspace":{"workspace_id":"workspace-9","placement_id":"placement-9","generation":1,"handle":"elsewhere","owner":{"kind":"server"}},"target_branch":"main","task_branch":"task","expected_head_sha":candidate,"expected_target_sha":target,"reviewed":{"commit_sha":candidate,"base_sha":target},"candidate_transfer_key":Self::key(generation)}),
+        }
+    }
+    fn params(&self, request: &WorkspaceIntegrationRequest) -> Value {
+        let candidate = request.witness["expected_head_sha"].as_str().unwrap().to_owned();
+        serde_json::to_value(WorkspaceReviewedMergeParams {
+            merge: WorkspaceMergeParams {
+                fence: WorkspaceMutationFence {
+                    integration: WorkspaceIntegrationBinding::Attempt {
+                        request: request.clone(),
+                    },
+                    daemon_id: "daemon-1".into(),
+                    runtime_id: "runtime-1".into(),
+                    placement_id: String::new(),
+                    operation_id: request.operation_id(),
+                    generation: 0,
+                    expected: WorkspaceOperationExpected::BaseSha {
+                        sha: candidate.clone(),
+                    },
+                },
+                workspace_handle: String::new(),
+                repo_location_id: "location-2".into(),
+                target_branch: "main".into(),
+                expected_target_sha: request.witness["expected_target_sha"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
+                handed_off_paths: Vec::new(),
+            },
+            reviewed_commit_sha: Some(candidate),
+            candidate_transfer_key: request.witness["candidate_transfer_key"]
+                .as_str()
+                .map(str::to_owned),
+        })
+        .unwrap()
+    }
+    async fn merge(&self, backend: &DaemonWorkspaceBackend, params: Value) -> CommandResult<Value> {
+        backend.handle(METHOD_WORKSPACE_MERGE, params, Vec::new).await
+    }
+    async fn tip(&self) -> String {
+        local_git(&self.clone, &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap()
+    }
+    /// How often Forge moved `main` of the default checkout.
+    async fn moves(&self) -> usize {
+        local_git(&self.clone, &["reflog", "show", "--format=%gs", "main"])
+            .await
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("forge: fast-forward"))
+            .count()
+    }
+    async fn lookup(
+        &self,
+        backend: &DaemonWorkspaceBackend,
+        request: &WorkspaceIntegrationRequest,
+    ) -> WorkspaceReconcileResult {
+        // As the server asks for it: a transferred fast-forward names no
+        // worktree of this owner.
+        call(
+            backend,
+            METHOD_WORKSPACE_DESCRIBE,
+            WorkspaceReconcileParams {
+                integration: WorkspaceIntegrationBinding::Attempt {
+                    request: request.clone(),
+                },
+                workspace: WorkspaceHandleReference {
+                    daemon_id: "daemon-1".into(),
+                    runtime_id: "runtime-1".into(),
+                    placement_id: String::new(),
+                    workspace_handle: String::new(),
+                    generation: 0,
+                },
+                operation: WorkspaceReconcileOperation::Reconcile,
+                operation_id: request.operation_id(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+}
+
+fn refusal_kind(result: CommandResult<Value>) -> Value {
+    let error = result.unwrap_err();
+    assert_eq!(error.code, "integration_owner_refused", "{error:?}");
+    error.details.unwrap()["refusal"].clone()
+}
+
+#[tokio::test]
+async fn a_transferred_candidate_is_fast_forwarded_once_from_its_own_generations_ref() {
+    let head = TransferredHead::new().await;
+    let (base, tip) = (head.transfer.base.clone(), head.transfer.tip.clone());
+    let backend = &head.transfer.fixture.backend;
+    head.bind(&TransferredHead::key(1), &tip).await;
+    let request = head.request(1, &tip, &base);
+    let params = head.params(&request);
+    let done = head.merge(backend, params.clone()).await.unwrap();
+    assert_eq!(done["outcome"]["kind"], "done", "{done}");
+    assert_eq!(done["outcome"]["after_sha"], tip);
+    assert_eq!(done["integration_receipt"]["operation_state"], "succeeded");
+    assert_eq!(head.tip().await, tip);
+    assert_eq!(
+        local_git(&head.clone, &["status", "--porcelain"]).await.unwrap(),
+        ""
+    );
+    assert_eq!(head.moves().await, 1);
+    // The same frame again (a lost reply) is answered from the journal,
+    // also by a restarted owner: no Git, no second move.
+    assert_eq!(head.merge(backend, params.clone()).await.unwrap(), done);
+    let restarted = restart(&head.transfer.fixture);
+    assert_eq!(head.merge(&restarted, params).await.unwrap(), done);
+    assert_eq!(head.moves().await, 1);
+    // The lookup the server sends for it returns the same receipt.
+    let found = head.lookup(&restarted, &request).await;
+    assert_eq!(receipt(&found), done["integration_receipt"]);
+}
+
+#[tokio::test]
+async fn the_transferred_fast_forward_gate_refuses_everything_but_the_permitted_commit() {
+    // Wrong commit: the right key holds another commit than the request's.
+    let head = TransferredHead::new().await;
+    let (base, tip) = (head.transfer.base.clone(), head.transfer.tip.clone());
+    let backend = &head.transfer.fixture.backend;
+    std::fs::write(head.transfer.fixture.repo.join("other"), "other\n").unwrap();
+    let other = git::commit_all(&head.transfer.fixture.repo, "other")
+        .await
+        .unwrap();
+    head.bind(&TransferredHead::key(1), &other).await;
+    let request = head.request(1, &tip, &base);
+    assert_eq!(
+        refusal_kind(head.merge(backend, head.params(&request)).await),
+        "witness_mismatch"
+    );
+    assert_eq!(head.tip().await, base);
+
+    // Missing ref: nothing was transferred under this generation's key.
+    let head = TransferredHead::new().await;
+    let backend = &head.transfer.fixture.backend;
+    let request = head.request(1, &tip_of(&head), &head.transfer.base);
+    assert_eq!(
+        refusal_kind(head.merge(backend, head.params(&request)).await),
+        "witness_mismatch"
+    );
+    assert_eq!(head.tip().await, head.transfer.base);
+
+    // Wrong generation: the candidate sits under an older generation's key.
+    // The request of generation 2 may name only its own key, and that key
+    // holds nothing.
+    let head = TransferredHead::new().await;
+    let (base, tip) = (head.transfer.base.clone(), head.transfer.tip.clone());
+    let backend = &head.transfer.fixture.backend;
+    head.bind(&TransferredHead::key(1), &tip).await;
+    let request = head.request(2, &tip, &base);
+    assert_eq!(
+        refusal_kind(head.merge(backend, head.params(&request)).await),
+        "witness_mismatch"
+    );
+    let mut replayed = head.request(3, &tip, &base);
+    replayed.witness["candidate_transfer_key"] = serde_json::json!(TransferredHead::key(1));
+    assert_eq!(
+        refusal_kind(head.merge(backend, head.params(&replayed)).await),
+        "witness_mismatch"
+    );
+    // A key of another attempt, bound to the very same commit.
+    head.bind("attempt-9-4-out", &tip).await;
+    let mut foreign = head.request(4, &tip, &base);
+    foreign.witness["candidate_transfer_key"] = serde_json::json!("attempt-9-4-out");
+    assert_eq!(
+        refusal_kind(head.merge(backend, head.params(&foreign)).await),
+        "witness_mismatch"
+    );
+    // A fast-forward that names another performing owner is nobody's.
+    let mut forged = head.request(5, &tip, &base);
+    forged.witness["effect_owner"] = serde_json::json!({"location_id":"location-2","owner_kind":"daemon","daemon_id":"daemon-1","runtime_id":"runtime-1"});
+    head.bind(&TransferredHead::key(5), &tip).await;
+    assert_eq!(
+        refusal_kind(head.merge(backend, head.params(&forged)).await),
+        "foreign_owner"
+    );
+    // Only a queue claim may fast-forward from a transfer ref.
+    let mut plain = head.params(&head.request(6, &tip, &base));
+    plain["integration"] = serde_json::json!({"kind":"task_step"});
+    let refused = head.merge(backend, plain).await.unwrap_err();
+    assert_eq!(refused.code, INVALID_INPUT, "{refused:?}");
+    assert_eq!(head.tip().await, base);
+    assert_eq!(head.moves().await, 0);
+
+    // Moved target: the default branch is no longer the tip the rebase was
+    // onto. Nothing is written and the moved tip stays.
+    let head = TransferredHead::new().await;
+    let (base, tip) = (head.transfer.base.clone(), head.transfer.tip.clone());
+    let backend = &head.transfer.fixture.backend;
+    head.bind(&TransferredHead::key(1), &tip).await;
+    std::fs::write(head.clone.join("outside"), "outside\n").unwrap();
+    let moved = git::commit_all(&head.clone, "outside").await.unwrap();
+    let request = head.request(1, &tip, &base);
+    assert_eq!(
+        refusal_kind(head.merge(backend, head.params(&request)).await),
+        "witness_mismatch"
+    );
+    assert_eq!(head.tip().await, moved);
+    assert_eq!(head.moves().await, 0);
+
+    // Dirty target: a typed outcome, the branch does not move.
+    let head = TransferredHead::new().await;
+    let (base, tip) = (head.transfer.base.clone(), head.transfer.tip.clone());
+    let backend = &head.transfer.fixture.backend;
+    head.bind(&TransferredHead::key(1), &tip).await;
+    std::fs::write(head.clone.join("README.md"), "edited by hand\n").unwrap();
+    let request = head.request(1, &tip, &base);
+    let dirty = head.merge(backend, head.params(&request)).await.unwrap();
+    assert_eq!(dirty["outcome"]["kind"], "target_dirty", "{dirty}");
+    assert_eq!(head.tip().await, base);
+    assert_eq!(
+        std::fs::read_to_string(head.clone.join("README.md")).unwrap(),
+        "edited by hand\n"
+    );
+    assert_eq!(head.moves().await, 0);
+}
+
+fn tip_of(head: &TransferredHead) -> String {
+    head.transfer.tip.clone()
+}
+
+/// The owner restarts in the middle of a transferred fast-forward: its
+/// journal holds a started intent without an outcome. The lookup settles it
+/// from the default checkout alone, in both directions, and the delayed
+/// frame of the operation can never run afterwards.
+#[tokio::test]
+async fn an_owner_restart_during_a_transferred_fast_forward_is_settled_by_the_lookup() {
+    // Stopped before the branch moved: provably not landed.
+    let head = TransferredHead::new().await;
+    let (base, tip) = (head.transfer.base.clone(), head.transfer.tip.clone());
+    head.bind(&TransferredHead::key(1), &tip).await;
+    let request = head.request(1, &tip, &base);
+    let params = head.params(&request);
+    announce(&head.transfer.fixture.backend, &request.fence, None)
+        .await
+        .unwrap();
+    retain_intent(&head.transfer.fixture, METHOD_WORKSPACE_MERGE, params.clone());
+    let restarted = restart(&head.transfer.fixture);
+    let found = head.lookup(&restarted, &request).await;
+    assert_eq!(receipt(&found)["result"]["kind"], "not_performed", "{found:?}");
+    assert_eq!(receipt(&found)["operation_state"], "failed");
+    assert_eq!(head.tip().await, base);
+    // Settled for good: asked again, and the late frame, get the same
+    // answer and move nothing.
+    assert_eq!(receipt(&head.lookup(&restarted, &request).await), receipt(&found));
+    let late = head.merge(&restarted, params).await.unwrap_err();
+    assert_eq!(
+        late.details.unwrap()["integration_receipt"],
+        receipt(&found)
+    );
+    assert_eq!(head.tip().await, base);
+    assert_eq!(head.moves().await, 0);
+
+    // Stopped after the branch moved: proven landed, never repeated.
+    let head = TransferredHead::new().await;
+    let (base, tip) = (head.transfer.base.clone(), head.transfer.tip.clone());
+    head.bind(&TransferredHead::key(1), &tip).await;
+    let request = head.request(1, &tip, &base);
+    let params = head.params(&request);
+    announce(&head.transfer.fixture.backend, &request.fence, None)
+        .await
+        .unwrap();
+    retain_intent(&head.transfer.fixture, METHOD_WORKSPACE_MERGE, params.clone());
+    let landed = git::integration::fast_forward_exact(
+        &head.clone,
+        "main",
+        &tip,
+        &base,
+        git::integration::FastForwardLimits {
+            deadline: Duration::from_secs(30),
+            output_bytes: 64 * 1024,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(landed, git::integration::MergeApplyOutcome::Applied));
+    let restarted = restart(&head.transfer.fixture);
+    let found = head.lookup(&restarted, &request).await;
+    assert_eq!(receipt(&found)["operation_state"], "succeeded", "{found:?}");
+    assert_eq!(receipt(&found)["result"]["outcome"]["Done"]["after_sha"], tip);
+    let late = head.merge(&restarted, params).await.unwrap();
+    assert_eq!(late["integration_receipt"], receipt(&found));
+    assert_eq!(head.tip().await, tip);
+    assert_eq!(head.moves().await, 1);
+}

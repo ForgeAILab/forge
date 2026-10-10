@@ -493,6 +493,32 @@ impl TaskCheckConsumers {
         Ok(CheckApplyOutcome::Applied)
     }
 
+    /// The step that owns the Task asks again for a consumer whose answer
+    /// was "no verdict after the automatic retries". That answer says
+    /// nothing about the commit, so it is never kept as the commit's
+    /// verdict: the same consumer gets a fresh infrastructure budget and a
+    /// new run, and the Task waits for its result again. `false` when the
+    /// consumer is not in that state (its exhausted answer was not applied
+    /// yet, its cleanup is unproven, or the Task left the status entry):
+    /// nothing changes and the stored answer stands.
+    pub async fn ask_again_after_no_verdict(&self, consumer: &db::CheckConsumer) -> Result<bool> {
+        if !self
+            .store
+            .rearm_exhausted_check_consumer(&consumer.id)
+            .await?
+        {
+            return Ok(false);
+        }
+        if consumer
+            .task_id
+            .as_deref()
+            .is_some_and(db::task_writer::owns_task)
+        {
+            self.state_wait(consumer, CheckWaitPhase::Result).await?;
+        }
+        Ok(true)
+    }
+
     /// The owner's `retry` of a Task parked by exhausted check retries: the
     /// same consumer asks again with a fresh infrastructure budget and the
     /// Task goes back to waiting for its result. `false` when the Task is

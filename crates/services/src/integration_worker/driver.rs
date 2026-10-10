@@ -151,6 +151,9 @@ pub struct HeadDriver {
     result_checked: Option<DateTime<Utc>>,
     /// The ends of an object transfer this session made for the head.
     transferred: Option<ObjectTransferRelease>,
+    /// The head this session last drove. When it leaves the slot its
+    /// transfer refs are released, whichever session bound them.
+    head_seen: Option<String>,
     /// The claim generation whose inbound transfer this session made.
     inbound_generation: Option<i64>,
     /// Permits this session could not use (they did not bind the head).
@@ -180,6 +183,7 @@ impl HeadDriver {
             since: None,
             result_checked: None,
             transferred: None,
+            head_seen: None,
             inbound_generation: None,
             refused_permits: 0,
             reasked: 0,
@@ -241,7 +245,14 @@ impl HeadDriver {
             Err(error) if is_conflict(&error) => Ok(Pass::Wait(self.w.config.conflict_backoff)),
             Ok(pass @ (Pass::Released | Pass::Lost)) => {
                 if pass == Pass::Released {
-                    if let Some(release) = self.transferred.take() {
+                    // A session that took the head over (a restart, a lost
+                    // lease) made no transfer itself, but the head it
+                    // releases may have refs from the session before it.
+                    let release = match self.transferred.take() {
+                        Some(release) => Some(release),
+                        None => self.recorded_release().await,
+                    };
+                    if let Some(release) = release {
                         // Best effort: a leftover ref holds objects only; the
                         // transfer owner also sweeps ended attempts at start.
                         if let Err(error) = self.w.transfer.release(release).await {
@@ -256,6 +267,38 @@ impl HeadDriver {
         }
     }
 
+    /// The two ends an attempt's transfers were made between, from its own
+    /// durable owner fields: the Task's repo location and the queue's
+    /// target. `None` when the Task is placed in the default checkout (no
+    /// transfer was ever needed) or the rows no longer say.
+    async fn recorded_release(&self) -> Option<ObjectTransferRelease> {
+        let a = self.w.attempt(self.head_seen.as_deref()?).await.ok()?;
+        let queue = self.w.queue(&self.queue_id).await.ok()?;
+        let task_location = a.repo_location_id.clone()?;
+        let target_location = queue.target_location_id.clone()?;
+        if task_location == target_location {
+            return None;
+        }
+        let owner = match a.owner_kind? {
+            db::IntegrationOwnerKind::Server => EffectOwner::Server,
+            db::IntegrationOwnerKind::Daemon => EffectOwner::Daemon {
+                daemon_id: a.daemon_id.clone()?,
+                runtime_id: a.runtime_id.clone()?,
+            },
+        };
+        Some(ObjectTransferRelease {
+            attempt_id: a.id,
+            task: ObjectTransferEndpoint {
+                repo_location_id: task_location,
+                owner,
+            },
+            target: ObjectTransferEndpoint {
+                repo_location_id: target_location,
+                owner: target_owner(queue.target_owner_json.as_ref())?,
+            },
+        })
+    }
+
     async fn step(&mut self) -> Result<Pass> {
         let w = Arc::clone(&self.w);
         if !w.renew_if_due(&self.queue_id, self.generation).await? {
@@ -265,6 +308,7 @@ impl HeadDriver {
         let Some(head) = queue.head_attempt_id.clone() else {
             return Ok(Pass::Released);
         };
+        self.head_seen = Some(head.clone());
         let a = w.attempt(&head).await?;
         let now = w.clock.now();
         if self.since.map(|(state, _)| state) != Some(a.state) {
@@ -754,9 +798,19 @@ impl HeadDriver {
                 ],
                 facts.target_tip.clone(),
             ),
-            ObjectTransferDirection::Outbound => {
-                (vec![facts.target_tip.clone()], facts.candidate_head.clone())
-            }
+            // Outbound, the commit sent is the one the permit binds (the
+            // attempt's candidate), never whatever the Task's checkout has
+            // as HEAD at this moment: the ref the transfer binds on the
+            // target's owner can then only hold the checked candidate.
+            ObjectTransferDirection::Outbound => (
+                vec![
+                    facts.target_tip.clone(),
+                    a.target_tip_sha.clone().unwrap_or_default(),
+                ],
+                a.candidate_sha
+                    .clone()
+                    .unwrap_or_else(|| facts.candidate_head.clone()),
+            ),
         };
         let mut seen = HashSet::new();
         let have: Vec<String> = have
@@ -1465,6 +1519,23 @@ impl HeadDriver {
                     .await
             }
         };
+        // The Task's checkout no longer holds the candidate the permit was
+        // written for. The permit is dropped and the Task step decides again
+        // (it refuses a changed candidate); nothing is sent to the target.
+        if !facts.shared_object_store
+            && a.candidate_sha.as_deref() != Some(facts.candidate_head.as_str())
+        {
+            self.w
+                .advance(&a.id, S::AwaitingTaskStep, |a| {
+                    a.permit_json = None;
+                    a.effect_seq += 1;
+                    a.effect_ack_json = None;
+                    a.acknowledged_at = None;
+                    a.deadline = None;
+                })
+                .await?;
+            return Ok(Pass::Progress);
+        }
         if let Some(pass) = self
             .transfer(&a, queue, &facts, ObjectTransferDirection::Outbound)
             .await?

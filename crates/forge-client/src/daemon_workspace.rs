@@ -1985,13 +1985,13 @@ impl DaemonWorkspaceBackend {
                     target_branch: params.target_branch.clone(),
                 }
             } else {
-                match git::integration::apply_merge(
+                // A compare-and-swap of the branch from the witnessed tip
+                // to the candidate, which must contain that tip.
+                match git::integration::fast_forward_exact(
                     &target,
                     &params.target_branch,
                     head,
-                    true,
-                    false,
-                    Some(&params.expected_target_sha),
+                    &params.expected_target_sha,
                     git::integration::FastForwardLimits {
                         deadline: Duration::from_secs(30),
                         output_bytes: MAX_DIFF_BYTES,

@@ -221,6 +221,34 @@ impl DaemonWorkspaceBackend {
                 "only run and merge intents can be reconciled",
             ));
         }
+        // A queue claim's fast-forward is judged under the lock of the
+        // checkout it writes: a lookup that arrives while the effect is
+        // still running in this process waits for it and reads its outcome,
+        // instead of reading refs the effect is about to move.
+        let queue_fast_forward = match &operation.fence.integration {
+            WorkspaceIntegrationBinding::Attempt { request }
+                if request.kind == WorkspaceIntegrationKind::FastForward
+                    && operation.method == METHOD_WORKSPACE_MERGE =>
+            {
+                Some(request.clone())
+            }
+            _ => None,
+        };
+        let _checkout = if queue_fast_forward.is_some() && operation.outcome.is_none() {
+            let lock = self.owner_lock(&self.checkout_key(&operation.request));
+            let guard = lock.lock_owned().await;
+            if let Some(current) = self
+                .journal
+                .operation(&params.operation_id)
+                .map_err(storage_error)?
+            {
+                operation = current;
+            }
+            Some(guard)
+        } else {
+            None
+        };
+        let mut not_landed = false;
         if operation.outcome.is_none() {
             let outcome = if integration && !operation.effect_started {
                 Err(error(
@@ -233,6 +261,27 @@ impl DaemonWorkspaceBackend {
                     .await
                 {
                     Ok(result) => encode(result),
+                    // The effect stopped (this owner restarted, or the
+                    // request was dropped) and nothing runs it now. A
+                    // fast-forward that landed is in the target branch; a
+                    // candidate that is not, did not land. That is a proof,
+                    // not a guess, and the delayed frame of this operation
+                    // is refused from here on (its outcome is recorded).
+                    Err(_)
+                        if match &queue_fast_forward {
+                            Some(request) => {
+                                self.fast_forward_never_landed(&operation.request, request)
+                                    .await
+                            }
+                            None => false,
+                        } =>
+                    {
+                        not_landed = true;
+                        Err(error(
+                            WORKSPACE_ERROR,
+                            "integration intent was not performed",
+                        ))
+                    }
                     Err(failure) => {
                         let mut interrupted = interrupted_error(&params.operation_id);
                         interrupted.message = format!(
@@ -248,6 +297,10 @@ impl DaemonWorkspaceBackend {
                 Err(interrupted_error(&params.operation_id))
             };
             operation.outcome = Some(outcome);
+            if not_landed {
+                // Receipt `not_performed`, settled, never `uncertain`.
+                operation.effect_started = false;
+            }
             let uncertain = operation.effect_started
                 && operation
                     .outcome
@@ -272,6 +325,60 @@ impl DaemonWorkspaceBackend {
             outcome,
             owner_fence: announce(intent),
         })
+    }
+
+    /// An interrupted queue fast-forward provably did not land: the target
+    /// branch of the default checkout does not contain the candidate (it is
+    /// not an ancestor of the tip, or this repository does not even hold the
+    /// object). Anything unreadable is not a proof.
+    async fn fast_forward_never_landed(
+        &self,
+        journaled: &Value,
+        request: &WorkspaceIntegrationRequest,
+    ) -> bool {
+        let (Some(location_id), Some(branch), Some(candidate)) = (
+            journaled["repo_location_id"].as_str(),
+            journaled["target_branch"].as_str(),
+            request.witness["expected_head_sha"].as_str(),
+        ) else {
+            return false;
+        };
+        if !matches!(candidate.len(), 40 | 64)
+            || !candidate.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return false;
+        }
+        let Ok((_, target)) = self.location_path(location_id).await else {
+            return false;
+        };
+        let Ok(tip) = resolve_commit(&target, &format!("refs/heads/{branch}")).await else {
+            return false;
+        };
+        let run = |args: &'static [&'static str], tail: Vec<String>| {
+            let target = target.clone();
+            async move {
+                let mut all: Vec<&str> = args.to_vec();
+                all.extend(tail.iter().map(String::as_str));
+                git::command_output(&target, &all).await.ok()
+            }
+        };
+        let Some(held) = run(&["cat-file", "-e"], vec![format!("{candidate}^{{commit}}")]).await
+        else {
+            return false;
+        };
+        if !held.status.success() {
+            // A landed commit is reachable from the branch, so it is held.
+            return held.status.code() == Some(1) || held.status.code() == Some(128);
+        }
+        let Some(ancestor) = run(
+            &["merge-base", "--is-ancestor"],
+            vec![candidate.to_owned(), tip],
+        )
+        .await
+        else {
+            return false;
+        };
+        ancestor.status.code() == Some(1)
     }
 
     async fn recover_merge(

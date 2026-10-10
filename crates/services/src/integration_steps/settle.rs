@@ -356,7 +356,20 @@ impl IntegrationSteps {
             {
                 let run = self.db.check_run(run_id).await?;
                 let result = self.db.check_result(result_id).await?;
-                if let (Some(run), Some(result)) = (run, result) {
+                // "No verdict after its retries" is not a verdict on the
+                // commit. It was told to the round that waited for it; a
+                // later round of the same commit (this ask) is not answered
+                // with it again, or every retry of the head would park on
+                // the same stored answer. The consumer asks again, with a
+                // fresh run, and this head waits for that result.
+                let no_verdict = result
+                    .as_ref()
+                    .is_some_and(|result| result.outcome == CheckResultOutcome::InfrastructureFailed);
+                let asked_again = no_verdict
+                    && consumers
+                        .ask_again_after_no_verdict(&delivery.consumer)
+                        .await?;
+                if let (Some(run), Some(result), false) = (run, result, asked_again) {
                     let application = CheckApplication {
                         task_id: task.id.clone(),
                         status_epoch: attempt.expected_epoch,
