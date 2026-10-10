@@ -46,6 +46,16 @@ pub fn is_known_action(name: &str) -> bool {
     )
 }
 
+/// Hook actions that existed in a released version and were removed. A
+/// stored workflow that names one is rewritten by its migration; a workflow
+/// template file is rewritten when it is read
+/// (`template_service::strip_removed_hooks`). Nothing accepts these names:
+/// a workflow that still carries one is refused as an unknown action.
+///
+/// - `auto_cascade_on_merge_result` (removed with the integration queue):
+///   it only ever answered `Ok` or `Skipped`.
+pub const REMOVED_HOOK_ACTIONS: &[&str] = &["auto_cascade_on_merge_result"];
+
 /// Dispatch-style actions are the hooks that start (or hand off) role work.
 /// The engine gives their failures special treatment when they gate entry into
 /// an `active` state: a failed dispatch means no execution exists, so the task
