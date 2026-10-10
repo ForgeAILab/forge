@@ -545,6 +545,27 @@ impl SqliteDb {
             .rows_affected()
             == 1)
     }
+    /// Project deletion: nobody waits for this Project's unfinished check
+    /// runs any more. The check worker stops a run without consumers (a
+    /// queued one is cancelled, a running one is cancelled on its owner).
+    pub async fn cancel_project_check_consumers(&self, project_id: &str) -> Result<u64> {
+        Ok(sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE cancelled_at IS NULL AND applied_at IS NULL AND run_id IN (SELECT id FROM check_run WHERE project_id=? AND state IN ('queued','running','cancelling','cleaning','uncertain'))")
+            .bind(now_rfc3339())
+            .bind(project_id)
+            .execute(self.pool())
+            .await?
+            .rows_affected())
+    }
+    /// The Project's check runs that have not settled: `(id, version, state)`.
+    pub async fn live_project_check_runs(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, i64, String)>> {
+        Ok(sqlx::query_as("SELECT id,version,state FROM check_run WHERE project_id=? AND state IN ('queued','running','cancelling','cleaning','uncertain') ORDER BY created_at,id")
+            .bind(project_id)
+            .fetch_all(self.pool())
+            .await?)
+    }
     /// The abandoned wait of `step_id` was cleaned up.
     pub async fn forget_check_wait(&self, step_id: &str) -> Result<()> {
         sqlx::query("UPDATE task_step SET awaited_consumer_id=NULL WHERE id=? AND status NOT IN ('suspended','pending','claimed')")

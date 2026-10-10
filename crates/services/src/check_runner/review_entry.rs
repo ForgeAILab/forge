@@ -61,12 +61,12 @@ fn awaits_ci(review: &db::Review) -> bool {
 /// Hooks steps of this Task that were superseded while they waited for
 /// review-entry CI (the Task was cancelled, held or left `review`) never read
 /// the result. For each one:
+/// - the consumer is cancelled, so a late delivery is stale and the check
+///   worker stops a run nobody waits for and frees its slot;
 /// - a run still executing on a daemon is cancelled there when the daemon is
 ///   reachable, and otherwise fences the workspace with a
 ///   `pending_remote_cancel` marker until the daemon confirms, exactly as a
 ///   preempted remote command does;
-/// - the consumer is cancelled, so a late delivery is stale and the check
-///   worker stops a run nobody waits for and frees its slot;
 /// - the review attempt the step opened is cancelled, so no attempt stays
 ///   `running`.
 ///
@@ -81,8 +81,13 @@ pub async fn abandon_superseded_waits(
             .await?
             .filter(|state| state.consumer.origin == db::CheckConsumerOrigin::Entry);
         if let Some(state) = &state {
-            fence_remote_run(db, daemons.clone(), &step_id, &state.consumer).await?;
+            // The consumer is cancelled before the run's dispatch record is
+            // read. The check worker looks for a waiting consumer right
+            // after it writes that record and before it sends anything: so
+            // either it sees this cancel and dispatches nothing, or its
+            // record is already there for the fence below to read.
             db.cancel_abandoned_check_consumer(&consumer_id).await?;
+            fence_remote_run(db, daemons.clone(), &step_id, &state.consumer).await?;
             // The wait is over: the Task no longer states that it waits for
             // this check. Only the Task's own step may write its condition.
             if db::task_writer::owns_task(task_id) {

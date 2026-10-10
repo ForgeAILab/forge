@@ -31,6 +31,10 @@
 //! instead of derived from the host's cores, so a 4-core CI runner and a
 //! workstation walk the same histories. It is the automatic cap of a small
 //! machine: runs, and review checks, do wait for a slot in these sequences.
+//! `sequences_stay_live_at_run_cap_1` and `sequences_stay_live_without_a_pinned_run_cap`
+//! walk a few of the same sequences with one slot and with the host's own cap:
+//! a machine limited to one run is a supported setting, and with it a Task's
+//! whole life (run, review check, reviewer, merge) happens in that one slot.
 #![allow(dead_code)]
 mod common;
 
@@ -462,6 +466,19 @@ const QUIESCENCE_FLOOR: Duration = Duration::from_millis(250);
 /// The server's run cap in every model stack: what a 4-core machine resolves
 /// on its own (`config::automatic_run_cap_for_cores`).
 const MODEL_RUN_CAP: u32 = 2;
+tokio::task_local! {
+    /// The cap a test pins for the stacks it boots; `None` leaves the cap to
+    /// the host (`max_concurrent_runs` unset).
+    static PINNED_RUN_CAP: Option<u32>;
+}
+
+/// A test's own pin first, then `FORGE_MODEL_RUN_CAP`, then `MODEL_RUN_CAP`.
+fn run_cap() -> Option<u32> {
+    PINNED_RUN_CAP.try_with(|cap| *cap).unwrap_or_else(|_| {
+        Some(env_number("FORGE_MODEL_RUN_CAP").map_or(MODEL_RUN_CAP, |cap| cap as u32))
+    })
+}
+
 const BUSY_RETRIES: usize = 8;
 const SETTLE_ROUNDS: usize = 20;
 const INITIAL: [&str; 2] = ["backlog", "todo"];
@@ -490,8 +507,7 @@ impl World {
         let workspaces = dir.join("workspaces");
         let mut config = config::ForgeConfig::with_data_dir(dir.join("data"));
         config.workspace.root = workspaces.clone();
-        config.server.max_concurrent_runs =
-            Some(env_number("FORGE_MODEL_RUN_CAP").map_or(MODEL_RUN_CAP, |cap| cap as u32));
+        config.server.max_concurrent_runs = run_cap();
         let runtime = Arc::new(
             services::ForgeRuntimeBuilder::from_config(
                 Arc::clone(&db),
@@ -1959,6 +1975,612 @@ async fn random_sequences_keep_every_task_live() {
     .await;
 }
 
+/// The sequences the extra caps walk: every Task lifecycle shape (plain
+/// success, a failed run retried, a review sent back, two Tasks for one slot,
+/// a crash in flight) and two generated seeds. Fewer than the default cap's
+/// set, to keep the target's runtime in bounds.
+fn cap_matrix_cases() -> Vec<(String, Vec<Step>)> {
+    use Action::{Claim, Create, Finish, Verdict};
+    let mut cases = vec![
+        (
+            "one Task runs, is checked, reviewed and merged".to_owned(),
+            vec![step(Create), step(Finish(0, Outcome::Success))],
+        ),
+        (
+            "a failed run is retried".to_owned(),
+            vec![step(Create), step(Finish(0, Outcome::Fail))],
+        ),
+        (
+            "a usage limit is waited out".to_owned(),
+            vec![
+                step(Create),
+                step(Claim(0)),
+                step(Finish(0, Outcome::UsageLimit)),
+            ],
+        ),
+        (
+            "review sends the Task back".to_owned(),
+            vec![
+                step(Create),
+                step(Verdict(0, false)),
+                step(Finish(0, Outcome::Success)),
+            ],
+        ),
+        (
+            "three Tasks share the slots".to_owned(),
+            vec![
+                step(Create),
+                step(Create),
+                step(Create),
+                step(Finish(0, Outcome::Success)),
+                step(Finish(1, Outcome::Fail)),
+            ],
+        ),
+        (
+            "crash with a run in flight".to_owned(),
+            vec![step(Create), crash_after(Create)],
+        ),
+    ];
+    cases.extend([3, 5].map(|seed| (format!("FORGE_MODEL_SEED={seed}"), generate(seed, 16))));
+    cases
+}
+
+/// A machine with `max_concurrent_runs: 1`. Before the fix a single Task
+/// parked on a machine slot that its own running execution held
+/// (`placement::machine_precheck::task_blocked` counted it), and nothing but
+/// another Task's dispatch retired that wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequences_stay_live_at_run_cap_1() {
+    PINNED_RUN_CAP
+        .scope(Some(1), run_cases(cap_matrix_cases()))
+        .await;
+}
+
+/// With one slot the whole lifecycle still happens, each stage in that slot:
+/// the coder run, the review-entry check, the reviewer run and the merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_slot_carries_a_task_from_run_to_merge() {
+    PINNED_RUN_CAP
+        .scope(Some(1), async {
+            let mut world = World::new().await;
+            let outcome: Result<(), String> = async {
+                for action in [Action::Create, Action::Finish(0, Outcome::Success)] {
+                    let applied = world.apply(&action).await?;
+                    world.quiesce().await?;
+                    let state = world.check_quiescent().await?;
+                    world
+                        .trace
+                        .push(format!("{action:?} -> {applied}: {state}"));
+                }
+                world.drive_to_settlement().await?;
+                let task = world.task(0).await?;
+                if task["status"] != "done" {
+                    return Err(format!("the Task ended in {}", task["status"]));
+                }
+                let pool = &world.live.as_ref().expect("the stack is up").pool;
+                let checks: Vec<(String,)> = sqlx::query_as("SELECT state FROM check_run")
+                    .fetch_all(pool)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if checks.is_empty() || checks.iter().any(|(state,)| state != "succeeded") {
+                    return Err(format!("review-entry check runs: {checks:?}"));
+                }
+                let runs: Vec<(String, String)> =
+                    sqlx::query_as("SELECT role, status FROM execution ORDER BY created_at, rowid")
+                        .fetch_all(pool)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                for role in ["coder", "reviewer"] {
+                    if !runs
+                        .iter()
+                        .any(|(ran, status)| ran == role && status == "completed")
+                    {
+                        return Err(format!("no completed {role} run in {runs:?}"));
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(violation) = outcome {
+                panic!("{violation}\ntrace:\n{}", world.trace.join("\n"));
+            }
+        })
+        .await;
+}
+
+/// How a pause lands on a Task whose review-entry check is requested and not
+/// yet finished (its hooks step is suspended).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PauseKind {
+    Project,
+    /// Both of the Project's Agents: the reviewer is the check's follow-up.
+    Agents,
+    /// The Task itself: `hold` is the owner's Task-level pause.
+    TaskHold,
+}
+
+impl World {
+    /// The states of the check runs the Task asked for, oldest first.
+    async fn check_runs(&self, index: usize) -> Result<Vec<String>, String> {
+        sqlx::query_scalar(
+            "SELECT r.state FROM check_run r JOIN check_consumer c ON c.run_id = r.id
+             WHERE c.task_id = ? ORDER BY r.created_at, r.rowid",
+        )
+        .bind(&self.tasks[index])
+        .fetch_all(&self.live().pool)
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    async fn pause_agents(&mut self, pause: bool) -> Result<(), String> {
+        let verb = if pause { "pause" } else { "resume" };
+        for agent in [self.coder_id.clone(), self.reviewer_id.clone()] {
+            let uri = format!("/api/v1/agents/{agent}/{verb}");
+            let (status, body) = self.request(Method::POST, &uri, None).await?;
+            if !status.is_success() {
+                return Err(format!("agent {verb} was refused: {status} {body}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A pause while the Task's hooks step is suspended on its review-entry
+/// check (here: queued behind a full machine). The check is machine work
+/// already asked for:
+/// - **Project pause, Agent pause**: the check runs to its end and its result
+///   is applied; the pause only holds what comes after it (the reviewer run).
+///   Resuming continues from the applied result: the check is not run again.
+/// - **Task hold**: not on offer in this state. A Task waiting for its entry
+///   check offers `cancel` only (which abandons the wait and stops the run);
+///   there is no Task-level pause to resume from, and the check finishes.
+async fn pause_while_the_entry_check_is_pending(
+    kind: PauseKind,
+    keep_one_slot: bool,
+) -> Result<Vec<String>, String> {
+    // Pinned: the case starts with two Tasks running side by side.
+    PINNED_RUN_CAP
+        .scope(
+            Some(MODEL_RUN_CAP),
+            pause_with_two_slots_then_one(kind, keep_one_slot),
+        )
+        .await
+}
+
+async fn pause_with_two_slots_then_one(
+    kind: PauseKind,
+    keep_one_slot: bool,
+) -> Result<Vec<String>, String> {
+    let mut world = World::new().await;
+    let outcome: Result<(), String> = async {
+        // Two Tasks run. The machine then has one slot, which the second
+        // Task's run holds: the first Task's entry check is requested and
+        // waits for it, its hooks step suspended.
+        for action in [Action::Create, Action::Create] {
+            world.apply(&action).await?;
+            world.quiesce().await?;
+        }
+        let cap = &world.live().state.db.server_run_cap;
+        cap.set(Some(1), 1, &cap.embedded_machine_id());
+        world.apply(&Action::Finish(0, Outcome::Success)).await?;
+        world.quiesce().await?;
+        let task = world.task(0).await?;
+        if task["status"] != "review" || world.check_runs(0).await? != ["queued"] {
+            return Err(format!(
+                "expected a Task in review with one queued check, got {} {:?}",
+                task["status"],
+                world.check_runs(0).await?
+            ));
+        }
+        match kind {
+            PauseKind::Project => {
+                world.apply(&Action::PauseProject).await?;
+            }
+            PauseKind::Agents => world.pause_agents(true).await?,
+            PauseKind::TaskHold => {
+                let (_, offers) = world.offers(0).await?;
+                let verbs: Vec<&str> = offers
+                    .iter()
+                    .filter_map(|offer| offer["action"]["verb"].as_str())
+                    .collect();
+                if verbs != ["cancel"] {
+                    return Err(format!(
+                        "a Task waiting for its entry check offers {verbs:?}, expected only cancel"
+                    ));
+                }
+            }
+        }
+        world.quiesce().await?;
+        // The slot frees: the check that was asked for before the pause runs.
+        world.apply(&Action::Finish(1, Outcome::Success)).await?;
+        let settled = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                world.quiesce().await?;
+                let runs = world.check_runs(0).await?;
+                if runs
+                    .iter()
+                    .all(|state| ["succeeded", "failed", "cancelled"].contains(&state.as_str()))
+                {
+                    return Ok::<_, String>(runs);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| "the check did not finish under the pause".to_owned())??;
+        world.quiesce().await?;
+        let paused = world.task(0).await?;
+        world.trace.push(format!(
+            "{kind:?} paused: checks {settled:?}, task {} {}",
+            paused["status"], paused["condition"]
+        ));
+        let reviewer_runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution WHERE role = 'reviewer' AND task_id = ?",
+        )
+        .bind(&world.tasks[0])
+        .fetch_one(&world.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        match kind {
+            PauseKind::Project | PauseKind::Agents => {
+                if settled != ["succeeded"] {
+                    return Err(format!("the check did not run to its end: {settled:?}"));
+                }
+                let applied: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND applied_at IS NOT NULL",
+                )
+                .bind(&world.tasks[0])
+                .fetch_one(&world.live().pool)
+                .await
+                .map_err(|error| error.to_string())?;
+                if applied != 1 {
+                    return Err("the finished check's result was not applied".to_owned());
+                }
+                if paused["status"] != "review" || reviewer_runs != 0 {
+                    return Err(format!(
+                        "the pause did not hold the reviewer run: {} with {reviewer_runs} reviewer run(s)",
+                        paused["status"]
+                    ));
+                }
+            }
+            PauseKind::TaskHold => {
+                if settled != ["succeeded"] {
+                    return Err(format!("the check did not run to its end: {settled:?}"));
+                }
+            }
+        }
+        if !keep_one_slot {
+            // The pause is what this case is about. With one slot, the two
+            // Tasks' follow-up runs would also race for it after the resume
+            // (see the ignored case at the end of this file).
+            let cap = &world.live().state.db.server_run_cap;
+            cap.set(Some(MODEL_RUN_CAP), MODEL_RUN_CAP, &cap.embedded_machine_id());
+        }
+        match kind {
+            PauseKind::Project => {
+                world.apply(&Action::ResumeProject).await?;
+            }
+            PauseKind::Agents => world.pause_agents(false).await?,
+            PauseKind::TaskHold => {}
+        }
+        world.quiesce().await?;
+        world.drive_to_settlement().await?;
+        for index in 0..2 {
+            let task = world.task(index).await?;
+            if task["status"] != "done" {
+                return Err(format!("task {index} ended in {}", task["status"]));
+            }
+        }
+        let runs = world.check_runs(0).await?;
+        if runs != ["succeeded"] {
+            return Err(format!("check runs after resume: {runs:?}, expected one"));
+        }
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => Ok(world.trace),
+        Err(violation) => Err(format!("{violation}\ntrace:\n{}", world.trace.join("\n"))),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_pause_lets_the_pending_entry_check_finish_and_resume_does_not_repeat_it() {
+    if let Err(violation) = pause_while_the_entry_check_is_pending(PauseKind::Project, false).await
+    {
+        panic!("{violation}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_pause_lets_the_pending_entry_check_finish_and_resume_does_not_repeat_it() {
+    if let Err(violation) = pause_while_the_entry_check_is_pending(PauseKind::Agents, false).await {
+        panic!("{violation}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_waiting_for_its_pending_entry_check_offers_cancel_and_no_hold() {
+    if let Err(violation) = pause_while_the_entry_check_is_pending(PauseKind::TaskHold, false).await
+    {
+        panic!("{violation}");
+    }
+}
+
+/// Where the server dies while a Task's hooks step waits for its review-entry
+/// check. The process is dropped and a new one is built on the same database.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RestartPoint {
+    /// The check was requested; the step had not yet been suspended.
+    AfterRequestBeforeSuspend,
+    /// The result's delivery step is enqueued and has not run.
+    AfterDeliveryBeforeWake,
+    /// The delivery woke the hooks step and the runtime stopped as that
+    /// step, claimed, was about to read the result.
+    AfterWakeBeforeSettle,
+    /// The delivery step is dead-lettered: nothing wakes the hooks step but
+    /// its own deadline.
+    DeliveryDeadLettered,
+}
+
+async fn restart_while_the_entry_check_is_awaited(point: RestartPoint) {
+    // Pinned: the case starts with two Tasks running side by side.
+    PINNED_RUN_CAP
+        .scope(Some(MODEL_RUN_CAP), restart_with_two_slots_then_one(point))
+        .await;
+}
+
+async fn restart_with_two_slots_then_one(point: RestartPoint) {
+    let mut world = World::new().await;
+    let outcome: Result<(), String> = async {
+        // As in the pause tests: the first Task's check waits for the one
+        // slot, which the second Task's run holds.
+        for action in [Action::Create, Action::Create] {
+            world.apply(&action).await?;
+            world.quiesce().await?;
+        }
+        let cap = &world.live().state.db.server_run_cap;
+        cap.set(Some(1), 1, &cap.embedded_machine_id());
+        world.apply(&Action::Finish(0, Outcome::Success)).await?;
+        world.quiesce().await?;
+        if world.check_runs(0).await? != ["queued"] {
+            return Err(format!("expected one queued check: {:?}", world.check_runs(0).await?));
+        }
+        let task_id = world.tasks[0].clone();
+        let pool = world.live().pool.clone();
+        let sql = |error: sqlx::Error| error.to_string();
+        if point == RestartPoint::AfterRequestBeforeSuspend {
+            // The consumer and its run are stored; the step still holds the
+            // claim of a process that is gone.
+            let changed = sqlx::query(
+                "UPDATE task_step SET status='claimed', claimed_by='dead-process',
+                        lease_until='2000-01-01T00:00:00+00:00', attempts=attempts+1,
+                        suspended_until=NULL, awaited_consumer_id=NULL
+                 WHERE task_id = ? AND status = 'suspended'",
+            )
+            .bind(&task_id)
+            .execute(&pool)
+            .await
+            .map_err(sql)?
+            .rows_affected();
+            if changed != 1 {
+                return Err("no suspended hooks step to rewind".to_owned());
+            }
+        } else {
+            // The slot frees; the check worker runs the check and enqueues
+            // its delivery. No Task step runs: the model has no step worker.
+            world.apply(&Action::Finish(1, Outcome::Success)).await?;
+            let delivery: String = tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let step: Option<String> = sqlx::query_scalar(
+                        "SELECT c.delivery_step_id FROM check_consumer c JOIN check_run r ON r.id = c.run_id
+                         WHERE c.task_id = ? AND r.state = 'succeeded' AND c.delivery_step_id IS NOT NULL",
+                    )
+                    .bind(&task_id)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(sql)?;
+                    if let Some(step) = step {
+                        return Ok::<_, String>(step);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .map_err(|_| "the check result was not delivered".to_owned())??;
+            let pending: Option<String> =
+                sqlx::query_scalar("SELECT status FROM task_step WHERE id = ?")
+                    .bind(&delivery)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(sql)?;
+            let suspended: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_step WHERE task_id = ? AND status = 'suspended'",
+            )
+            .bind(&task_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(sql)?;
+            if pending.as_deref() != Some("pending") || suspended != 1 {
+                return Err(format!(
+                    "expected an unrun delivery and a suspended step, got {pending:?} / {suspended}"
+                ));
+            }
+            match point {
+                RestartPoint::AfterWakeBeforeSettle => {
+                    // The real runtime runs the delivery step and claims the
+                    // woken hooks step, and is stopped right there: the step
+                    // parks at the armed point and the drain that carries it
+                    // is dropped, as a process that died holding the claim.
+                    use services::workflow::actions::review_entry_halt as halt;
+                    let reached = halt::arm(&task_id, halt::AFTER_WAKE_BEFORE_SETTLE);
+                    let service = world.live().state.task_service.clone();
+                    let id = task_id.clone();
+                    let running = tokio::spawn(async move { service.drain(&id).await });
+                    let stopped =
+                        tokio::time::timeout(Duration::from_secs(60), reached.notified()).await;
+                    running.abort();
+                    let _ = running.await;
+                    halt::disarm(&task_id);
+                    if stopped.is_err() {
+                        return Err("the woken hooks step never ran".to_owned());
+                    }
+                    let delivered: Option<String> =
+                        sqlx::query_scalar("SELECT status FROM task_step WHERE id = ?")
+                            .bind(&delivery)
+                            .fetch_optional(&pool)
+                            .await
+                            .map_err(sql)?;
+                    let applied: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM check_consumer WHERE task_id = ? AND applied_at IS NOT NULL",
+                    )
+                    .bind(&task_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(sql)?;
+                    let claimed: Vec<(String, String)> = sqlx::query_as(
+                        "SELECT kind, status FROM task_step WHERE task_id = ? AND status IN ('claimed','pending','suspended')",
+                    )
+                    .bind(&task_id)
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(sql)?;
+                    if delivered.as_deref() != Some("done")
+                        || applied != 1
+                        || claimed != [("hooks".to_owned(), "claimed".to_owned())]
+                    {
+                        return Err(format!(
+                            "expected a finished delivery and a claimed hooks step, got {delivered:?} / {applied} / {claimed:?}"
+                        ));
+                    }
+                    let reviews: Vec<String> =
+                        sqlx::query_scalar("SELECT status FROM review WHERE task_id = ?")
+                            .bind(&task_id)
+                            .fetch_all(&pool)
+                            .await
+                            .map_err(sql)?;
+                    if reviews != ["running"] {
+                        return Err(format!("the attempt settled before the stop: {reviews:?}"));
+                    }
+                    // Time passes: the dead process's claim runs out.
+                    sqlx::query(
+                        "UPDATE task_step SET lease_until='2000-01-01T00:00:00+00:00' WHERE task_id = ? AND status = 'claimed'",
+                    )
+                    .bind(&task_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(sql)?;
+                }
+                RestartPoint::DeliveryDeadLettered => {
+                    sqlx::query(
+                        "UPDATE task_step SET status='failed', last_error='dead-lettered', completed_at=?, updated_at=? WHERE id = ?",
+                    )
+                    .bind(db::now_rfc3339())
+                    .bind(db::now_rfc3339())
+                    .bind(&delivery)
+                    .execute(&pool)
+                    .await
+                    .map_err(sql)?;
+                    // Only the step's own deadline is left; it has passed.
+                    sqlx::query(
+                        "UPDATE task_step SET suspended_until='2000-01-01T00:00:00+00:00' WHERE task_id = ? AND status = 'suspended'",
+                    )
+                    .bind(&task_id)
+                    .execute(&pool)
+                    .await
+                    .map_err(sql)?;
+                }
+                _ => {}
+            }
+        }
+        drop(pool);
+        world.crash_and_restart().await?;
+        world.quiesce().await?;
+        world.drive_to_settlement().await?;
+        for index in 0..2 {
+            let task = world.task(index).await?;
+            if task["status"] != "done" {
+                return Err(format!("task {index} ended in {}", task["status"]));
+            }
+        }
+        // One request, one run, one review attempt that passed: the restart
+        // repeated nothing.
+        let runs = world.check_runs(0).await?;
+        let consumers: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM check_consumer WHERE task_id = ?")
+                .bind(&task_id)
+                .fetch_one(&world.live().pool)
+                .await
+                .map_err(sql)?;
+        if runs != ["succeeded"] || consumers != 1 {
+            return Err(format!("check runs {runs:?}, consumers {consumers}; expected one of each"));
+        }
+        let reviews: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM review WHERE task_id = ? ORDER BY attempt_number")
+                .bind(&task_id)
+                .fetch_all(&world.live().pool)
+                .await
+                .map_err(sql)?;
+        if reviews != ["passed"] {
+            return Err(format!("review attempts {reviews:?}, expected one that passed"));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(violation) = outcome {
+        world.record_history().await;
+        panic!("{point:?}: {violation}\ntrace:\n{}", world.trace.join("\n"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_after_the_check_request_before_the_suspend_asks_once() {
+    restart_while_the_entry_check_is_awaited(RestartPoint::AfterRequestBeforeSuspend).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_after_the_check_delivery_before_the_wake_resumes_the_step() {
+    restart_while_the_entry_check_is_awaited(RestartPoint::AfterDeliveryBeforeWake).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_after_the_wake_before_the_settle_settles_from_the_stored_result() {
+    restart_while_the_entry_check_is_awaited(RestartPoint::AfterWakeBeforeSettle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_lettered_check_delivery_is_read_by_the_step_at_its_deadline() {
+    restart_while_the_entry_check_is_awaited(RestartPoint::DeliveryDeadLettered).await;
+}
+
+/// One slot. After the Project is resumed, the first Task's reviewer run
+/// takes the slot and the second Task (whose coder run ended under the pause)
+/// is refused a run slot. Its `machine_capacity` wait and its
+/// `task_schedule_wait` row (`daemon_id = '*'`) are written after the
+/// dispatcher read the machine as full. When the reviewer run ended between
+/// that read and those writes, the mark for "waiters on a run slot" found no
+/// waiter: the Task stayed `in_progress`, parked on `capacity` (scope
+/// `machine`), with the machine idle, no step pending and nothing due.
+///
+/// A Task that starts waiting for a run slot is now read once more after its
+/// wait row exists (`SqliteDb::schedule_wait`), and every such row carries a
+/// recheck deadline. This case failed in about two of three runs of the
+/// whole target on a loaded machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_slot_wait_registered_after_the_release_is_still_woken() {
+    if let Err(violation) = pause_while_the_entry_check_is_pending(PauseKind::Project, true).await {
+        panic!("{violation}");
+    }
+}
+
+/// No pinned cap: the server resolves its own from the host's cores.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequences_stay_live_without_a_pinned_run_cap() {
+    PINNED_RUN_CAP
+        .scope(None, run_cases(cap_matrix_cases()))
+        .await;
+}
+
 /// Sequences for wedges this project has shipped, as far as the action set
 /// can express them. Each must end with every Task settled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2112,6 +2734,14 @@ async fn a_held_task_always_offers_its_release() {
 /// Agent is that Task's exit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn start_on_a_queued_task_does_not_park_it_as_failed() {
+    // Pinned: the third Task must queue behind the Agent's two runs. With one
+    // machine slot it waits for the machine instead and `start` is not offered.
+    PINNED_RUN_CAP
+        .scope(Some(MODEL_RUN_CAP), start_on_a_queued_task())
+        .await;
+}
+
+async fn start_on_a_queued_task() {
     use Action::{Create, PauseAgent, Take};
     for (sequence, expected) in [
         (vec![Create, Create, Create, Take(2, "start")], "start"),
@@ -2375,6 +3005,104 @@ async fn a_task_rebased_after_merge_contention_runs_its_review_entry_again() {
         ],
     )])
     .await;
+}
+
+/// The second review entry, directly. Two Tasks branch from the same target.
+/// The first merges; the second passed its review on the old target, fails
+/// its merge because the target moved, is rebased and enters `review` again.
+/// That second entry requests its own entry check for the rebased commit,
+/// the check runs, settles, and the Task merges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_second_review_entry_after_a_rebase_requests_runs_and_settles_its_check() {
+    // Pinned: both Tasks run side by side and branch from the same target.
+    PINNED_RUN_CAP
+        .scope(Some(MODEL_RUN_CAP), second_review_entry_after_a_rebase())
+        .await;
+}
+
+async fn second_review_entry_after_a_rebase() {
+    let mut world = World::new().await;
+    let outcome: Result<(), String> = async {
+        for action in [
+            Action::Create,
+            Action::Create,
+            Action::Finish(0, Outcome::Success),
+            Action::Finish(1, Outcome::Success),
+        ] {
+            let applied = world.apply(&action).await?;
+            world.quiesce().await?;
+            let state = world.check_quiescent().await?;
+            world.trace.push(format!("{action:?} -> {applied}: {state}"));
+        }
+        world.drive_to_settlement().await?;
+        let pool = world.live().pool.clone();
+        let sql = |error: sqlx::Error| error.to_string();
+        for index in 0..2 {
+            let task = world.task(index).await?;
+            if task["status"] != "done" {
+                return Err(format!("task {index} ended in {}", task["status"]));
+            }
+        }
+        // Whichever Task merged second is the one that was rebased.
+        let rebased: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT task_id FROM transition_log WHERE from_state = 'merge_failed' AND to_state = 'review'",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(sql)?;
+        let [task_id] = rebased.as_slice() else {
+            return Err(format!(
+                "expected exactly one Task to re-enter review from merge_failed, got {rebased:?}"
+            ));
+        };
+        let entries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM transition_log WHERE task_id = ? AND to_state = 'review'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(sql)?;
+        // One consumer per entry, each with its own run on its own commit,
+        // each run finished and its result applied to that entry.
+        let checks: Vec<(String, String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT c.origin, r.commit_sha, r.state, c.applied_at, c.status_epoch
+             FROM check_consumer c JOIN check_run r ON r.id = c.run_id
+             WHERE c.task_id = ? ORDER BY c.created_at, c.rowid",
+        )
+        .bind(task_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(sql)?;
+        if entries != 2 || checks.len() != 2 {
+            return Err(format!("{entries} review entries with checks {checks:?}; expected two of each"));
+        }
+        let (first, second) = (&checks[0], &checks[1]);
+        if checks.iter().any(|(origin, _, state, applied, _)| {
+            origin != "entry" || state != "succeeded" || applied.is_none()
+        }) {
+            return Err(format!("an entry check did not run and settle: {checks:?}"));
+        }
+        if first.1 == second.1 || first.4 == second.4 {
+            return Err(format!(
+                "the second entry did not ask for the rebased commit under its own entry: {checks:?}"
+            ));
+        }
+        let reviews: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM review WHERE task_id = ? ORDER BY attempt_number")
+                .bind(task_id)
+                .fetch_all(&pool)
+                .await
+                .map_err(sql)?;
+        if reviews.len() != 2 || reviews.iter().any(|status| status != "passed") {
+            return Err(format!("review attempts {reviews:?}; expected two that passed"));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(violation) = outcome {
+        world.record_history().await;
+        panic!("{violation}\ntrace:\n{}", world.trace.join("\n"));
+    }
 }
 
 /// Found by this model, fixed. A subtask used to be accepted under a parent

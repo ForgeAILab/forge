@@ -2011,7 +2011,14 @@ Project-Chat LCM timelines, entries, operations, and nodes — and then the
 Project itself; the database permits those deletes only while the exact Project
 deletion guard is active. Before authoritative deletion, the API requires
 Project owner/admin authorization and, for `?force=true`, provider-acknowledged
-execution cancellation plus Workspace lease revocation. The final
+execution cancellation plus Workspace lease revocation. An unfinished check run
+(`queued`, `running`, `cancelling`, `cleaning`, `uncertain`) is in-flight work
+like a running execution: the guard counts it (`live_check_runs`) and refuses.
+Force cancels the runs' consumers, settles queued runs as cancelled at once, and
+waits up to three seconds for the check worker to stop running ones on their
+owner; a run that has not settled (an unreachable daemon cannot confirm the
+stop) keeps the refusal, so the `check_run` row that fences the remote
+operation is never deleted from under it. The final
 `BEGIN IMMEDIATE` transaction captures the exact Task IDs, Workspace paths, and
 Project repository paths present at its boundary; it does not rename live paths
 before commit. After commit, the API reacquires `BEGIN IMMEDIATE` immediately
@@ -2187,9 +2194,9 @@ Server host occupancy combines placements with no execution daemon and those
 routed to this host's embedded daemon; chats of unpinned or embedded-daemon
 Agents use that same slot pool. Workspace-less executions use their frozen
 executor daemon id, falling back to the Agent pin. Ready placements use no slot. Capacity is rechecked at start; a refusal
-leaves the workspace ready and parks the Task for a later tick. Review check runs and merges do not consume slots: running checks
-currently have no durable record to count. This is a known limit pending the
-workflow refactor.
+leaves the workspace ready and parks the Task for a later tick. Check runs on the
+durable check runner count in the same occupancy and go ahead of new
+executions when a slot frees; merges consume no slot.
 
 The resolved server configuration initializes one shared `MachineRunCap`
 plain handle defined by `db` during runtime composition. Bare `SqliteDb::new`
@@ -3983,6 +3990,12 @@ examines all potentially usable locations, including unverified clones; unknown
 facts, a possibly free machine or another placement refusal delegate to reserve.
 It uses the placement filters and server executor availability, without clone
 verification, persisted location writes, a sweep or a writer lock.
+A Task never waits for a slot it holds: when one of the Task's own executions
+is running the precheck answers "not waiting" before it counts the machine, so
+a machine capped at one run (`max_concurrent_runs: 1`, a supported setting)
+does not show its only running Task as a capacity waiter, and a wait recorded
+earlier is retired at that same observation. The run's follow-up (retry, review
+entry check, reviewer) asks for a slot only after that execution has ended.
 The durable reserve/start transactions still fence races. A machine or Project capacity waiter in an active/gate state
 counts as parked until dispatch observes a different outcome; a plain edit does
 not un-park it, and its metadata change moves the Project list revision used by
@@ -4003,7 +4016,9 @@ admissions wait.
 There is no fairness guarantee across Projects: Projects are scanned oldest first,
 active work is scanned before `todo`, and follow-ups or chat turns can take a freed
 slot before the next dispatcher tick. Waiters resume on that tick. Review check
-runs and merges take no slot because there is no durable running-check record.
+runs take a slot through the durable check runner, and queued checks are
+admitted before new executions (see "Who gets a freed slot" under the durable
+check runner); merges take no slot.
 
 Automatic dispatch keeps transient owner-unreachable, capacity, and
 `environment_probe_pending` refusals queued. Initial dispatch reads the same
@@ -8695,6 +8710,95 @@ queued checks do not. Slot release is observed by the periodic scan without a
 notification race. Operations includes admitted, borrowed and capacity-wait
 counts; per-machine `active_runs` includes exclusive check slots.
 
+**Who gets a freed slot.** Work closer to done goes first. On a machine with a
+run cap `C`, let `k` be the checks that hold a slot of their own, `q` the
+queued checks a consumer still waits for, and `S = max(C - 1, 1)` the checks'
+share. Three rules, all evaluated in the admission transactions on the shared
+occupancy query (`db::machine_capacity`):
+
+1. **An execution leaves room for queued checks.** A reservation, an execution
+   start and the dispatcher's precheck are refused (`machine_capacity`) while
+   `active + min(q, max(S - k, 0)) >= C`: free slots are kept for the queue
+   until checks hold their share. A queued check reserves nothing durable; the
+   count is read each time.
+2. **Checks are admitted in queue order**: review-entry checks, then
+   integration head checks, then any other origin, oldest first within each. A
+   check takes a slot of its own only when the checks ahead of it in that
+   machine's queue still leave it one (`active + ahead < C`), so a sweep that
+   reaches a later check first does not let it jump the queue. A check that
+   borrows its own Task's slot is not subject to the order.
+3. **Checks stay within their share while a Task waits for a run slot** this
+   machine could give: no check is admitted to its own slot once `k >= S`.
+   With no Task waiting, checks may use every slot. A waiter is a Task with a
+   run-slot wait (`task_schedule_wait.daemon_id = '*'`) that holds no slot
+   itself (no running execution) and whose worktree, if it has one, is on
+   this machine. A Task that waits for a machine's readiness or reconnect
+   asks for no slot and does not count.
+
+`q` counts a queued check only while a consumer can still use its result: the
+consumer is not cancelled and its Task is still in the status entry it asked
+from. A check whose Task was cancelled, deleted or left `review` reserves
+nothing from that commit on (the worker cancels the run when it next looks).
+A check queued for machine A is counted on A only. A check for a daemon that
+is offline reserves on that daemon only, where no execution can start either,
+and a queued run expires after 30 minutes.
+
+**A Task and its own slot.** The dispatcher's precheck answers "not waiting"
+for a Task whose own run of the role in question is running: that Task is in
+flight, nothing more is dispatched for it until the run ends, and a capacity
+wait left on it is retired. Any other running execution of the Task (an
+interactive session, a run of another role) is not that: a dispatch then needs
+a second slot, the reserve and start transactions count the first one against
+it, and the Task waits for a run slot. Fairness is per slot, not per Task:
+such a Task already fills one slot, so under rule 1 it is admitted only at a
+release where no queued check is kept a slot (with the machine otherwise full
+of checks, `active = C - 1` and one kept slot refuse it). While checks keep
+queuing it keeps waiting, visibly, until its other run ends; it is not one of
+the waiters the bound below speaks of. A review-entry check never needs a
+second slot while its Task's run or reservation holds one: it borrows that
+slot and takes it over when the run ends, so the machine's count does not
+change.
+
+One approximation, on the cautious side. Rule 1 counts a queued check that
+will borrow its own Task's slot when the worker next looks at it, so a slot
+can be kept for one sweep (about a second) that nobody needed.
+
+**A run-slot waiter cannot miss its wake.** A Task that waits for a run slot
+has a `task_schedule_wait` row with `daemon_id = '*'`; every commit that frees
+a slot marks those rows' Tasks dirty (the end of an execution, a placement, a
+chat turn or an admission step, and since `V202610101906` a check run leaving
+`queued`/`running`/`cancelling`/`cleaning`/`uncertain`, a check run deleted in
+one of those states, and a check consumer being cancelled). Two things make
+that level-triggered:
+
+- *Registration.* Whoever decided the Task waits read the machines before the
+  row existed, so a release between that read and the row marked nobody.
+  `SqliteDb::schedule_wait` marks the Task dirty in the same commit that first
+  writes `'*'` for it. The pass this causes reads the machines with the row in
+  place: a release committed before that read is seen by it, one committed
+  after it finds the row. A row that already says `'*'` marks nothing, so a
+  Task that keeps waiting is not read in a loop, and an unchanged row costs no
+  write.
+- *Backstop.* Every wait for a machine carries a durable recheck deadline on
+  that row: 60 s for a run slot (`SLOT_WAIT_RECHECK`), 30 s while the Task
+  waits for disk or any machine is under its free-space floor
+  (`DISK_WAIT_RECHECK`; free disk comes back with no commit at all). The
+  deadline survives a restart and is due at once after one; a Task read again
+  before it fires keeps it. No ordering of a release and a wait, and no
+  release that marks nobody, parks a Task on an idle machine for longer than
+  one period.
+
+Neither side starves. A queued check at the head of its queue is admitted at
+the first slot release after `k < S` (rule 1 keeps the slot from executions);
+one at position `p` after at most `p` further check completions, each bounded
+by the run's wall limit. For `C >= 2` executions always keep one slot turning
+over (rule 3), so a waiting Task is dispatched at the next release of that
+slot. For `C = 1` the single slot goes to the queued check first; an execution
+waits for at most the checks queued at that moment plus the one a running job
+can still produce, because a check is only ever requested by a Task entering
+review or its integration attempt, and no new run means no new check. Among
+executions the dispatcher's existing order is unchanged.
+
 Result delivery enqueues an entry-fenced `apply_check_result` Task command with
 consumer/result/run identities, exact commit and spec digest. The consumer's
 `delivery_step_id` and enqueue share a transaction. Its marker survives Task-step
@@ -9019,6 +9123,13 @@ finds its Task has left the entry:
   workspace the Task has moved on from.
 - **Consumer.** It is cancelled, so a late delivery is `Stale` and is applied
   to nothing, whether or not the Task's status epoch moved (a Hold keeps it).
+  The consumer is cancelled *before* the run's dispatch record is read for the
+  remote fence above, and the check worker looks for a waiting consumer once
+  more after it has written that record and before it sends anything. A
+  cancel that lands while the owner prepares (no record yet, nothing to
+  fence) is therefore seen by the worker, which ends the run as cancelled
+  without starting an operation; one that lands later finds the record and
+  fences it. No ordering leaves a started remote operation unfenced.
 - **Task condition.** The check wait is cleared (in the Task's own step).
 - **Review attempt.** It is cancelled (`execution_retry.status =
   cancelled_authority_lost`).
@@ -9028,10 +9139,49 @@ live consumer (`CONSUMER_LIVENESS_INTERVAL`; the lease is renewed every 15 s)
 and cancels a run nobody waits for, so its machine slot is freed promptly.
 An unreachable daemon keeps the run `uncertain` (slot and single-flight
 identity retained) until it confirms the stop, is removed, or passes the
-disconnected-owner bound. Deleting the Project removes the Task, its
-steps (the suspended one included) and its check rows by cascade; the worker
-driving the run finds no consumer at its next look, tells the owner to stop
-(best effort when the run row is already gone) and drops the run.
+disconnected-owner bound. A Project is not deleted from under a live check
+run: the delete guard counts unfinished runs (`project_in_use`,
+`live_check_runs`). A forced delete has two phases. First, without changing
+anything, it looks for a run dispatched to a daemon that is not connected and
+not removed (`TaskService::project_deletion_unreachable_machines`): such a
+run cannot be stopped now, so the request is refused naming the machine and
+nothing is cancelled. Only then does it cancel the consumers, settle queued
+runs and wait (four seconds for the whole request) for the worker to stop
+running ones. A machine that is gone for good is removed by its owner: the
+worker settles the runs of a removed machine and the delete goes through. Should a run row disappear under its worker anyway,
+the worker finds no consumer at its next look, tells the owner to stop (best
+effort) and drops the run.
+
+**A pause while the step is suspended.** The check is machine work already
+asked for, so no pause stops it:
+
+| Pause | The pending check | Afterwards |
+|---|---|---|
+| Project pause | runs to its end; the result is delivered and applied, the review attempt settles | the reviewer run is held by the pause; resume dispatches it. The check is not run again |
+| Agent pause (coder, reviewer) | as above | the Task waits in `review` for its paused reviewer (`agent`); resume dispatches it |
+| Task `hold` | not offered while the Task waits for its entry check: the Task offers `cancel` only, which abandons the wait as described above | - |
+
+A Project pause or resume (like any Project edit) moves the Project version,
+which is the fence a hooks step was admitted under. A step that waited for a
+check therefore re-reads the Project when it continues: while the Project
+workflow and the entry's two merged state configurations are what the step
+froze, it continues under the current Project version; a changed workflow or
+state configuration still ends it with a version conflict. Without this the
+woken step failed, the attempt was cancelled, and recovery dispatched a
+reviewer that had no CI result to read.
+
+What changed while the step waited decides what happens to the result:
+
+| Changed during the wait | The finished check |
+|---|---|
+| Nothing the entry was admitted under (a pause, a resume, a rename, a limit) | applied; the attempt settles |
+| The Project environment | applied: the run that ran is the run that was asked for. Its result answers the old environment only (the environment is part of the check identity), so the next entry runs again |
+| The Project workflow, or the review configuration of the Project (`default_review_config`, with `ci_steps`) where the Task does not override it | not applied. The attempt is cancelled (`cancelled_authority_lost`), the Task parks `cascade_failed` in `review` and offers Restart, Request changes, Advance (override) and Cancel |
+| The Task's own state configuration (`task_state_config`, with its `ci_steps`) | not applied, as above. No Project version moves for this, so the step compares what it froze whenever it waited for a check |
+
+The verdict of commands the entry no longer has is never written to the
+review attempt. The Task does not ask for a new check by itself: its owner
+restarts it or sends it back, and the next entry runs the current commands.
 
 **Liveness of the wait.** Every way the answer can fail to arrive ends in a
 resume or a typed condition, never a silent wait:

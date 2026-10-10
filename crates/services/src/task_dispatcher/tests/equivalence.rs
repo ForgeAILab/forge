@@ -1144,7 +1144,26 @@ const ALLOWED: &[&str] = &[
     "ExplicitOwnerPark",
     "MissedWakeRepair",
     "IdleTickQuiescence",
+    // The base counted a Task's own running execution against that Task: on
+    // a full machine every running Task was given a `machine_capacity` wait
+    // (or the `project_capacity` wait it was converted to). A Task that
+    // holds the slot waits for none.
+    "OwnSlotIsNoWait",
 ];
+
+/// `OwnSlotIsNoWait` may only remove a capacity wait from a Task whose own
+/// execution is running, and change nothing else.
+fn own_slot_exception_is_sound(recorded: &str, expected: &str) -> bool {
+    let Some((head, rest)) = recorded.split_once("meta=[dispatch_disposition] disp=[") else {
+        return false;
+    };
+    let Some((disposition, tail)) = rest.split_once("] ") else {
+        return false;
+    };
+    (disposition.starts_with("machine_capacity:") || disposition.starts_with("project_capacity:"))
+        && tail.contains(":running]")
+        && expected == format!("{head}meta=[-] disp=[-] {tail}")
+}
 
 fn key(line: &str) -> &str {
     line.split_once(": ").map_or(line, |(key, _)| key)
@@ -1191,6 +1210,12 @@ fn settle(section: &str, lines: Vec<String>) {
                     expected, recorded,
                     "exception {name} changes nothing: {line}"
                 );
+                if name == &"OwnSlotIsNoWait" {
+                    assert!(
+                        own_slot_exception_is_sound(recorded, expected),
+                        "{name} may only clear a running Task's own capacity wait: {recorded}"
+                    );
+                }
                 if name == &"ExplicitOwnerPark" {
                     // The park may only add a visible blocker to a Task the
                     // base left untouched: no step, owner or annotation.

@@ -1316,8 +1316,8 @@ mod tests {
             CREATE TABLE execution (task_id TEXT, workspace_id TEXT, agent_id TEXT, status TEXT, executor_config_snapshot_json TEXT);
             CREATE TABLE agent_current (id TEXT, daemon_id TEXT);
             CREATE TABLE agent_chat_turn_job (responder_identity_id TEXT, status TEXT);
-            CREATE TABLE check_run (id TEXT, machine_id TEXT, state TEXT, admitted_at TEXT);
-            CREATE TABLE check_consumer (task_id TEXT, status_epoch INTEGER, run_id TEXT, cancelled_at TEXT);
+            CREATE TABLE check_run (id TEXT, machine_id TEXT, state TEXT, admitted_at TEXT, created_at TEXT);
+            CREATE TABLE check_consumer (task_id TEXT, status_epoch INTEGER, run_id TEXT, cancelled_at TEXT, origin TEXT);
             CREATE TABLE task (id TEXT, status_epoch INTEGER, deleted_at TEXT);
             INSERT INTO daemon VALUES ('provider','Host','capacity-test-host',100,NULL,NULL);
             INSERT INTO execution VALUES (NULL,NULL,NULL,'running','{"daemon_id":"provider"}');"#)

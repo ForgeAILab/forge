@@ -785,6 +785,451 @@ async fn full_owner_machine_queues_without_charging_wall_time_and_join_and_hit_t
     assert_eq!(count.active_runs(), 1);
 }
 
+/// The slot rules under a steady stream of new Tasks, on a machine with two
+/// slots. A stream Task is an execution that wants a slot at every turn; a
+/// queued check is a Task in `review`. Every turn releases one slot (the
+/// oldest run ends), then the check runner and the dispatcher each ask.
+/// Checks go first and are admitted in queue order; executions keep a slot.
+struct SlotStream {
+    store: Arc<SqliteDb>,
+    started: usize,
+}
+impl SlotStream {
+    async fn capacity(&self) -> db::machine_capacity::MachineCapacity {
+        let mut tx = db::begin_immediate(self.store.pool()).await.unwrap();
+        db::machine_capacity::count_machine_capacity(&mut tx, None, Some(2), "server-machine")
+            .await
+            .unwrap()
+    }
+    /// A new Task's execution asks for a slot, as the reserve and start
+    /// transactions ask. A refused one waits for a run slot.
+    async fn dispatch(&mut self) -> bool {
+        let id = format!("stream-{}", self.started);
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT OR IGNORE INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'p','stream','in_progress',?,?)").bind(&id).bind(&now).bind(&now).execute(self.store.pool()).await.unwrap();
+        if !self.capacity().await.admits_execution() {
+            self.store
+                .schedule_wait(&id, ("p", false), None, Some("*"), None)
+                .await
+                .unwrap();
+            return false;
+        }
+        self.store
+            .schedule_wait(&id, ("p", false), None, None, None)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'coder','running',?,?)").bind(&id).bind(&id).bind(&now).bind(&now).execute(self.store.pool()).await.unwrap();
+        self.started += 1;
+        true
+    }
+    async fn finish_oldest_execution(&self) -> bool {
+        sqlx::query("UPDATE execution SET status='completed' WHERE id=(SELECT id FROM execution WHERE status='running' ORDER BY created_at,rowid LIMIT 1)")
+            .execute(self.store.pool()).await.unwrap().rows_affected() == 1
+    }
+    async fn try_admit(&self, run: &StoredCheckRun) -> Option<StoredCheckRun> {
+        let run = self.store.check_run(&run.id).await.unwrap().unwrap();
+        let now = db::now_rfc3339();
+        let until = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+        match self
+            .store
+            .admit_check_run(&run, "stream", &now, &until)
+            .await
+            .unwrap()
+        {
+            CheckAdmission::Admitted(run) => Some(*run),
+            CheckAdmission::Waiting => None,
+        }
+    }
+}
+
+/// An admitted check ends with a passing result and frees its slot.
+async fn finish_check(store: &SqliteDb, run: &StoredCheckRun) {
+    let now = db::now_rfc3339();
+    sqlx::query("UPDATE check_run SET state='succeeded',lease_owner=NULL,lease_until=NULL,finished_at=?,updated_at=?,version=version+1 WHERE id=? AND state='running'")
+        .bind(&now)
+        .bind(&now)
+        .bind(&run.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+}
+
+async fn queue_check(
+    runner: &CheckRunner,
+    key: &str,
+    origin: CheckConsumerOrigin,
+) -> StoredCheckRun {
+    let mut req = request(key);
+    req.identity.commit_sha = format!(
+        "{:0>40}",
+        key.len() * 7919 + key.bytes().map(usize::from).sum::<usize>()
+    );
+    req.origin = origin;
+    scheduled(runner.request(req).await.unwrap())
+}
+
+#[tokio::test]
+async fn a_queued_check_gets_the_next_freed_slot_and_executions_keep_one() {
+    let (_temp, store, runner) = fixture().await;
+    store.server_run_cap.set(Some(2), 2, "server-machine");
+    let mut stream = SlotStream {
+        store: store.clone(),
+        started: 0,
+    };
+    // The machine is full of new Tasks' runs and more are waiting.
+    assert!(stream.dispatch().await);
+    assert!(stream.dispatch().await);
+    assert!(!stream.dispatch().await);
+    // A Task reaches review: its entry check is queued behind the full machine.
+    let first = queue_check(&runner, "first", CheckConsumerOrigin::Entry).await;
+    assert!(stream.try_admit(&first).await.is_none());
+    assert_eq!(stream.capacity().await.queued_checks, 1);
+
+    // One slot release. The dispatcher asks first and is refused: the slot
+    // is kept for the queued check, which takes it.
+    assert!(stream.finish_oldest_execution().await);
+    assert!(stream.capacity().await.has_capacity());
+    assert!(!stream.dispatch().await, "a new run took the check's slot");
+    let first = stream
+        .try_admit(&first)
+        .await
+        .expect("the queued check runs after one release");
+
+    // Two more checks queue while the first runs: an integration head check
+    // that is older than a review-entry check. Entry goes first.
+    let head = queue_check(
+        &runner,
+        "integration-head",
+        CheckConsumerOrigin::Integration,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let entry = queue_check(&runner, "second-entry", CheckConsumerOrigin::Entry).await;
+    assert!(!stream.dispatch().await);
+    let before = stream.started;
+
+    // Release 1 (a run ends). Checks already hold their share (all but one
+    // slot) and a Task waits: the slot goes to an execution.
+    assert!(stream.finish_oldest_execution().await);
+    assert!(stream.try_admit(&head).await.is_none());
+    assert!(stream.try_admit(&entry).await.is_none());
+    assert!(stream.dispatch().await, "executions lost their one slot");
+    assert!(!stream.dispatch().await);
+
+    // Release 2 (the running check ends). The slot is kept from the stream
+    // and goes to the queue's head, which is the entry check although the
+    // sweep reaches the integration check first.
+    finish_check(&store, &first).await;
+    assert!(!stream.dispatch().await, "a new run took the check's slot");
+    assert!(stream.try_admit(&head).await.is_none());
+    let entry = stream.try_admit(&entry).await.expect("entry check first");
+    assert!(stream.try_admit(&head).await.is_none());
+
+    // Release 3 (a run ends): an execution again.
+    assert!(stream.finish_oldest_execution().await);
+    assert!(stream.try_admit(&head).await.is_none());
+    assert!(stream.dispatch().await);
+    assert!(!stream.dispatch().await);
+
+    // Release 4 (the entry check ends): the integration head check.
+    finish_check(&store, &entry).await;
+    assert!(!stream.dispatch().await);
+    let head = stream.try_admit(&head).await.expect("then the head check");
+
+    // No check queued: every freed slot is an execution's again.
+    finish_check(&store, &head).await;
+    assert!(stream.dispatch().await);
+    assert!(stream.finish_oldest_execution().await);
+    assert!(stream.dispatch().await);
+    assert_eq!(stream.started, before + 4);
+    let capacity = stream.capacity().await;
+    assert_eq!((capacity.active_runs(), capacity.queued_checks), (2, 0));
+}
+
+/// One slot: the queued check takes it before any new run, and the run that
+/// follows the check is admitted as soon as no check is queued.
+#[tokio::test]
+async fn with_one_slot_the_queued_check_runs_before_the_next_new_run() {
+    let (_temp, store, runner) = fixture().await;
+    store.server_run_cap.set(Some(1), 1, "server-machine");
+    let stream = SlotStream {
+        store: store.clone(),
+        started: 0,
+    };
+    let one =
+        |capacity: db::machine_capacity::MachineCapacity| db::machine_capacity::MachineCapacity {
+            max_concurrent_runs: Some(1),
+            ..capacity
+        };
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('run','p','run','in_progress',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('run','run','coder','running',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    let check = queue_check(&runner, "entry", CheckConsumerOrigin::Entry).await;
+    assert!(stream.try_admit(&check).await.is_none());
+    assert!(stream.finish_oldest_execution().await);
+    let free = one(stream.capacity().await);
+    assert!(free.has_capacity() && !free.admits_execution());
+    let check = stream
+        .try_admit(&check)
+        .await
+        .expect("the check takes the one slot");
+    assert!(!one(stream.capacity().await).admits_execution());
+    finish_check(&store, &check).await;
+    assert!(one(stream.capacity().await).admits_execution());
+}
+
+/// A queued check reserves a slot only while somebody can still use its
+/// result. The consumer of a Task that was cancelled or left `review` is
+/// cancelled when the worker next looks at the run; until then the run must
+/// not keep a free slot from executions.
+#[tokio::test]
+async fn a_queued_check_whose_task_left_review_reserves_no_slot() {
+    let (_temp, store, runner) = fixture().await;
+    store.server_run_cap.set(Some(2), 2, "server-machine");
+    let stream = SlotStream {
+        store: store.clone(),
+        started: 0,
+    };
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('run','p','run','in_progress',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('run','run','coder','running',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    queue_check(&runner, "left-review", CheckConsumerOrigin::Entry).await;
+    let reserved = stream.capacity().await;
+    assert_eq!(reserved.queued_checks, 1);
+    assert!(reserved.has_capacity() && !reserved.admits_execution());
+    // The Task leaves the status it asked from (cancel, hold, a new entry).
+    sqlx::query("UPDATE task SET status_epoch=status_epoch+1 WHERE id='t'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let released = stream.capacity().await;
+    assert_eq!(released.queued_checks, 0);
+    assert!(released.admits_execution());
+    // The same for a deleted Task.
+    sqlx::query("UPDATE task SET status_epoch=status_epoch-1 WHERE id='t'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(stream.capacity().await.queued_checks, 1);
+    sqlx::query("UPDATE task SET deleted_at=? WHERE id='t'")
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(stream.capacity().await.admits_execution());
+}
+
+/// Rule 3 (checks stay within their share while a Task waits for a run
+/// slot) counts only Tasks that really wait for a slot this machine could
+/// give: not a readiness or reconnect wait that names the machine, not a
+/// Task that holds a slot, not a Task whose worktree is on another machine.
+#[tokio::test]
+async fn only_real_run_slot_waiters_hold_checks_to_their_share() {
+    let (temp, store, _runner) = fixture().await;
+    let now = db::now_rfc3339();
+    let waiters = |machine: Option<&'static str>| {
+        let store = store.clone();
+        async move {
+            let mut tx = db::begin_immediate(store.pool()).await.unwrap();
+            db::machine_capacity::run_slot_waiters(&mut tx, machine, "server-machine")
+                .await
+                .unwrap()
+        }
+    };
+    for id in ["named", "holder", "placed", "waiter"] {
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'p','w','in_progress',?,?)").bind(id).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    }
+    // Waits for the machine's readiness, not for a slot.
+    store
+        .schedule_wait("named", ("p", false), None, Some("server-daemon"), None)
+        .await
+        .unwrap();
+    assert!(!waiters(None).await);
+    assert!(!waiters(Some("server-daemon")).await);
+    // Holds a slot itself.
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('holder','holder','interactive','running',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    store
+        .schedule_wait("holder", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    assert!(!waiters(None).await);
+    // Its worktree is on the server: a slot on another machine is no use.
+    sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES('w','placed','r',?,'task/branch','ready',?,?)").bind(temp.path().to_str()).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('l','r','server',?,'primary_checkout',1,'ready',?,?)").bind(temp.path().to_str()).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES('pl','w','placed','server','l',?,1,'ready','scheduler','{}',?,?)").bind(temp.path().to_str()).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    store
+        .schedule_wait("placed", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    assert!(!waiters(Some("another-machine")).await);
+    assert!(waiters(None).await);
+    sqlx::query("DELETE FROM task_schedule_wait WHERE task_id='placed'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    // No worktree yet: whichever machine has room.
+    store
+        .schedule_wait("waiter", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    assert!(waiters(None).await && waiters(Some("another-machine")).await);
+}
+
+/// A check that stops holding or reserving a slot is a release for the Tasks
+/// that wait for a run slot: its end, the cancellation of a queued one, and
+/// its last consumer giving up each mark those waiters. Before, only the end
+/// of an execution did, and a slot a check freed could stay unused.
+#[tokio::test]
+async fn a_check_that_frees_a_slot_marks_the_run_slot_waiters() {
+    let (_temp, store, runner) = fixture().await;
+    store.server_run_cap.set(Some(1), 1, "server-machine");
+    let now = db::now_rfc3339();
+    for id in ["slot", "named", "agent"] {
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'p','waiter','todo',?,?)").bind(id).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    }
+    store
+        .schedule_wait("slot", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    store
+        .schedule_wait("named", ("p", false), None, Some("another-machine"), None)
+        .await
+        .unwrap();
+    store
+        .schedule_wait("agent", ("p", false), Some("someone"), None, None)
+        .await
+        .unwrap();
+    let marked = || async {
+        let ids = store.dirty_schedule_tasks(100).await.unwrap();
+        sqlx::query("DELETE FROM task_schedule_dirty")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        ids.into_iter()
+            .filter(|id| ["slot", "named", "agent"].contains(&id.as_str()))
+            .collect::<Vec<_>>()
+    };
+    marked().await;
+
+    // Queued, then admitted: it takes a slot, which frees nothing.
+    let running = queue_check(&runner, "runs", CheckConsumerOrigin::Entry).await;
+    let running = admit(&store, &running).await;
+    assert!(marked().await.is_empty());
+    // It ends.
+    finish_check(&store, &running).await;
+    assert_eq!(marked().await, ["slot"]);
+
+    // A queued check keeps the slot from executions. Its consumer gives up.
+    let queued = queue_check(&runner, "queued", CheckConsumerOrigin::Entry).await;
+    assert!(marked().await.is_empty());
+    sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE run_id=?")
+        .bind(db::now_rfc3339())
+        .bind(&queued.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(marked().await, ["slot"]);
+    // The queued run itself is cancelled, and later deleted with its Project.
+    sqlx::query(
+        "UPDATE check_run SET state='cancelled',finished_at=?,version=version+1 WHERE id=?",
+    )
+    .bind(db::now_rfc3339())
+    .bind(&queued.id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(marked().await, ["slot"]);
+    sqlx::query("DELETE FROM check_run WHERE id=?")
+        .bind(&queued.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(marked().await.is_empty(), "a settled run frees nothing");
+    let last = queue_check(&runner, "deleted", CheckConsumerOrigin::Entry).await;
+    marked().await;
+    sqlx::query("DELETE FROM check_run WHERE id=?")
+        .bind(&last.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(marked().await, ["slot"]);
+}
+
+/// An owner whose `prepare` is the window in question: the consumer's Task
+/// is cancelled while the owner prepares, before any dispatch record exists.
+struct CancelledWhilePreparing {
+    store: Arc<SqliteDb>,
+    inner: TestOwner,
+}
+#[async_trait::async_trait]
+impl CheckOwnerPort for CancelledWhilePreparing {
+    async fn prepare(&self, run: &StoredCheckRun) -> Result<CheckDispatchIntent> {
+        // The canceller looked for a dispatch to fence and found none.
+        assert!(self
+            .store
+            .check_worker_record(&run.id)
+            .await
+            .unwrap()
+            .dispatch
+            .is_none());
+        sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE run_id=?")
+            .bind(db::now_rfc3339())
+            .bind(&run.id)
+            .execute(self.store.pool())
+            .await
+            .unwrap();
+        self.inner.prepare(run).await
+    }
+    async fn run(
+        &self,
+        record: &CheckWorkerRecord,
+        cancel: &CancellationToken,
+    ) -> Result<DaemonCheckResult> {
+        self.inner.run(record, cancel).await
+    }
+    async fn lookup(&self, record: &CheckWorkerRecord) -> Result<DaemonCheckResult> {
+        self.inner.lookup(record).await
+    }
+    async fn cancel(&self, record: &CheckWorkerRecord) -> Result<DaemonCheckResult> {
+        self.inner.cancel(record).await
+    }
+    async fn owner_gone(&self, record: &CheckWorkerRecord) -> Result<bool> {
+        self.inner.owner_gone(record).await
+    }
+    async fn acknowledge(&self, record: &CheckWorkerRecord) -> Result<()> {
+        self.inner.acknowledge(record).await
+    }
+}
+
+/// A cancel between the worker's prepare and its dispatch record cannot
+/// fence the operation (there is no record to read yet). The worker looks
+/// for a waiting consumer again after it wrote the record and before it
+/// sends anything: the operation never starts, so there is nothing to fence.
+#[tokio::test]
+async fn a_cancel_between_prepare_and_the_dispatch_record_starts_no_operation() {
+    let (_temp, store, runner) = fixture().await;
+    let run = scheduled(runner.request(request("cancel-in-prepare")).await.unwrap());
+    let owner = Arc::new(CancelledWhilePreparing {
+        store: store.clone(),
+        inner: TestOwner::default(),
+    });
+    CheckRunWorker::new(store.clone(), owner.clone())
+        .drive(admit(&store, &run).await)
+        .await
+        .unwrap();
+    assert_eq!(owner.inner.runs.load(Ordering::SeqCst), 0, "dispatched");
+    let record = store.check_worker_record(&run.id).await.unwrap();
+    assert_eq!(record.run.state, CheckRunState::Cancelled);
+    assert!(record.receipt.is_none());
+    // The slot is free again.
+    let mut tx = db::begin_immediate(store.pool()).await.unwrap();
+    let count =
+        db::machine_capacity::count_machine_capacity(&mut tx, None, Some(1), "server-machine")
+            .await
+            .unwrap();
+    assert_eq!(count.active_runs(), 0);
+}
+
 /// Every run this worker dispatches executes in its Task's existing
 /// worktree, so the disk floor never holds one back: a wait here would keep
 /// a reviewed Task from finishing (which is how its worktree is given back)

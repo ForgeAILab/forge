@@ -485,6 +485,52 @@ pub fn set_entry_check_wall_seconds_for_test(task_id: &str, seconds: u64) {
         .unwrap_or_else(|p| p.into_inner())
         .push((task_id.to_owned(), seconds));
 }
+/// Test seam: a runtime is stopped at a named point of a Task's review
+/// entry. An armed Task's step parks there for good and says so; the test
+/// then drops the runtime, as a process that died at that point. Nothing is
+/// armed outside tests, and an unarmed Task passes straight through.
+#[doc(hidden)]
+pub mod halt {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    /// The woken hooks step is claimed and about to read its check result.
+    pub const AFTER_WAKE_BEFORE_SETTLE: &str = "after_wake_before_settle";
+
+    type Armed = (String, &'static str, Arc<Notify>);
+    static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
+
+    /// The returned handle is notified when the Task's step reaches `point`.
+    pub fn arm(task_id: &str, point: &'static str) -> Arc<Notify> {
+        let reached = Arc::new(Notify::new());
+        ARMED.lock().unwrap_or_else(|p| p.into_inner()).push((
+            task_id.to_owned(),
+            point,
+            reached.clone(),
+        ));
+        reached
+    }
+
+    pub fn disarm(task_id: &str) {
+        ARMED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(id, _, _)| id != task_id);
+    }
+
+    pub(crate) async fn reach(task_id: &str, point: &'static str) {
+        let reached = ARMED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(id, at, _)| id == task_id && *at == point)
+            .map(|(_, _, reached)| reached.clone());
+        if let Some(reached) = reached {
+            reached.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+}
 /// When a suspended step looks again on its own: past the run's wall limit
 /// and the worker's settlement grace.
 fn entry_check_wake_seconds(task_id: &str) -> i64 {

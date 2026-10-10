@@ -8,6 +8,7 @@ use std::{
 };
 
 use api_types::*;
+use axum::http::{Method, StatusCode};
 use db::{
     AssigneeKind, CreateExecution, CreateProject, CreateRepo, CreateRepoLocation, CreateReview,
     CreateTask, CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspacePlacement, ExecutionRepo,
@@ -3175,6 +3176,265 @@ async fn disconnected_cancel_fences_workspace_until_real_owner_reconnect_cleanup
             .status,
         "cancelled"
     );
+}
+
+/// A Task in `review` whose entry CI runs on the fixture's daemon; returns
+/// once the step has started there.
+async fn start_remote_review_ci(fixture: &Fixture, name: &str) -> std::path::PathBuf {
+    let db = &fixture.harness.state.db;
+    let task_id = fixture.resolved.placement.task_id.clone();
+    let started = fixture._daemon_root.path().join(format!("{name}-started"));
+    let completed = fixture
+        ._daemon_root
+        .path()
+        .join(format!("{name}-completed"));
+    sqlx::query("UPDATE task SET task_state_config=?,status='merge_failed' WHERE id=?").bind(json!({"review":{"ci_steps":[format!("touch {}; sleep 120; touch {}",quote(&started.to_string_lossy()),quote(&completed.to_string_lossy()))]}}).to_string()).bind(&task_id).execute(db.pool()).await.unwrap();
+    let task = TaskRepo::get_by_id(&**db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .harness
+        .state
+        .task_service
+        .transition(
+            &task_id,
+            "review".to_owned(),
+            services::task_service::TransitionOptions {
+                bridge: Default::default(),
+                version: task.version,
+                triggered_by: Actor::system(SystemComponent::Workflow),
+                reason: Some("remote CI".into()),
+                rejection: false,
+                defer_dispatch_seconds: None,
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    completed
+}
+
+async fn live_check_runs(db: &db::SqliteDb, project_id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT state FROM check_run WHERE project_id=? AND state NOT IN ('succeeded','failed','cancelled')")
+        .bind(project_id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+}
+
+/// Project deletion while review-entry CI runs on a reachable daemon: the
+/// plain delete is refused for the live check run; the forced one stops the
+/// run on the daemon, waits for it to settle and only then deletes.
+#[tokio::test]
+async fn project_delete_stops_a_remote_review_check_on_a_connected_daemon_first() {
+    use db::ProjectRepo;
+    let fixture = Fixture::new("forge-remote-ci-project-delete").await;
+    let db = fixture.harness.state.db.clone();
+    let service = fixture.harness.state.task_service.clone();
+    let task_id = fixture.resolved.placement.task_id.clone();
+    let project_id = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .project_id;
+    let completed = start_remote_review_ci(&fixture, "delete-ci").await;
+    match ProjectRepo::ensure_deletable(&*db, &project_id).await {
+        Err(db::DbError::ProjectInUse {
+            live_check_runs, ..
+        }) => assert_eq!(live_check_runs, 1),
+        other => panic!("a live check run must refuse deletion, got {other:?}"),
+    }
+    assert_eq!(live_check_runs(&db, &project_id).await.len(), 1);
+
+    // What `DELETE ...?force=true` does: stop, then the guarded delete, with
+    // its bounded retries.
+    let mut deleted = false;
+    for _ in 0..3 {
+        assert!(service
+            .project_deletion_unreachable_machines(&project_id)
+            .await
+            .unwrap()
+            .is_empty());
+        service
+            .prepare_project_deletion(
+                &project_id,
+                tokio::time::Instant::now() + Duration::from_secs(4),
+            )
+            .await
+            .unwrap();
+        match ProjectRepo::delete_with_workspace_paths(&*db, &project_id).await {
+            Ok(_) => {
+                deleted = true;
+                break;
+            }
+            Err(db::DbError::ProjectInUse { .. }) => {}
+            Err(error) => panic!("forced deletion failed: {error}"),
+        }
+    }
+    assert!(deleted, "the remote run was not settled for deletion");
+    assert!(
+        !fixture
+            .link
+            .as_ref()
+            .unwrap()
+            .requests(api_types::METHOD_CHECK_CANCEL)
+            .is_empty(),
+        "the daemon was told to stop the check before its row was deleted"
+    );
+    assert!(!completed.exists());
+    assert!(ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// The same with the daemon unreachable: the stop cannot be confirmed, so
+/// the forced delete is refused too, before it cancels anything. The refusal
+/// names the machine; the Task keeps its review entry and its check, and the
+/// run's row, which is what fences the remote process, stays. Removing the
+/// machine is the way out when it is gone for good: its run is settled and
+/// the delete goes through.
+#[tokio::test]
+async fn project_delete_is_refused_while_an_unreachable_daemon_may_still_run_the_check() {
+    use db::ProjectRepo;
+    let mut fixture = Fixture::new("forge-remote-ci-project-delete-offline").await;
+    let db = fixture.harness.state.db.clone();
+    let service = fixture.harness.state.task_service.clone();
+    let task_id = fixture.resolved.placement.task_id.clone();
+    let project_id = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .project_id;
+    start_remote_review_ci(&fixture, "delete-offline-ci").await;
+    fixture.link.take();
+    fixture
+        .harness
+        .state
+        .daemon_connections
+        .unregister(&fixture.daemon_id);
+    let waiting = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM check_consumer WHERE project_id=? AND cancelled_at IS NULL",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    };
+    let hostname: String = sqlx::query_scalar("SELECT hostname FROM daemon WHERE id=?")
+        .bind(&fixture.daemon_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+
+    // The request itself: refused within the bound, naming the machine, and
+    // nothing was cancelled. The fixture's Project was seeded without
+    // members; the caller must administer it.
+    sqlx::query("INSERT OR IGNORE INTO project_member(id,project_id,user_id,role,created_at,updated_at) SELECT lower(hex(randomblob(16))),?,id,'owner',?,? FROM user")
+        .bind(&project_id)
+        .bind(db::now_rfc3339())
+        .bind(db::now_rfc3339())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let asked = std::time::Instant::now();
+    let forced = common::raw_empty_request(
+        &fixture.harness.app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{project_id}?force=true"),
+    )
+    .await;
+    let body: Value = common::parse_response(forced, StatusCode::CONFLICT).await;
+    assert!(
+        asked.elapsed() <= Duration::from_secs(5),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert_eq!(body["code"], "project_in_use");
+    assert_eq!(body["details"]["force_cancellation_incomplete"], true);
+    assert_eq!(body["details"]["cancelled"], false);
+    assert_eq!(body["details"]["unreachable_machines"], json!([hostname]));
+    assert_eq!(body["details"]["live_check_runs"], 1);
+    assert!(
+        body["message"].as_str().unwrap().contains(&hostname),
+        "{body}"
+    );
+    assert!(ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .is_some());
+    let live = live_check_runs(&db, &project_id).await;
+    assert_eq!(
+        live.len(),
+        1,
+        "the run still fences its operation: {live:?}"
+    );
+    assert_eq!(
+        waiting().await,
+        1,
+        "a refused delete cancelled the consumer"
+    );
+    let reviews: Vec<String> = sqlx::query_scalar("SELECT status FROM review WHERE task_id=?")
+        .bind(&task_id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        reviews.iter().all(|status| status == "running"),
+        "the Task lost its review entry to a refused delete: {reviews:?}"
+    );
+
+    // The machine is gone for good: the owner removes it. The check worker
+    // settles the run of a removed machine and the delete goes through.
+    sqlx::query("UPDATE daemon SET status='offline' WHERE id=?")
+        .bind(&fixture.daemon_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.remove_daemon(
+        &fixture.daemon_id,
+        "owner",
+        true,
+        &config::embedded_machine_id(),
+        false,
+    )
+    .await
+    .expect("the machine is removed");
+    assert!(service
+        .project_deletion_unreachable_machines(&project_id)
+        .await
+        .unwrap()
+        .is_empty());
+    let mut status = StatusCode::CONFLICT;
+    for _ in 0..10 {
+        status = common::raw_empty_request(
+            &fixture.harness.app,
+            Method::DELETE,
+            &format!("/api/v1/projects/{project_id}?force=true"),
+        )
+        .await
+        .status();
+        if status == StatusCode::NO_CONTENT {
+            break;
+        }
+    }
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "removing the machine did not unblock the delete"
+    );
+    assert!(ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// Hold with the owner disconnected parks the follow-up action on the

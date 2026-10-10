@@ -239,6 +239,26 @@ pub async fn incremental_vacuum(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// Close the pool and every connection it still has. `Pool::close` alone can
+/// return with a connection left open: a connection dropped just before the
+/// call is returned to the pool by a background task, and when that task
+/// passed its closed-pool check before the pool was marked closed, it puts
+/// the connection back into the idle queue while `close` is in its last wait,
+/// after `close` drained that queue for the last time. Such a connection
+/// keeps the database file open until the pool itself is dropped, which is
+/// enough to refuse an exclusive open that does not wait
+/// ([`convert_sqlite_to_incremental`]).
+pub async fn close_sqlite_pool(pool: &SqlitePool) {
+    loop {
+        // A repeated close drains the idle queue again.
+        pool.close().await;
+        if pool.size() == 0 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 /// One-time offline conversion. The caller must hold the data-root runtime
 /// lock. A dedicated exclusive connection prevents other SQLite connections
 /// from accessing the file during the full VACUUM, with no busy retry.

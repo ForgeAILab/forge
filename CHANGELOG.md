@@ -43,6 +43,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   nothing runs for it (no execution, lease, dispatched check run, or hook or
   command of the server in its directory). Before, the directories of a Task deleted in a
   non-terminal state stayed on disk indefinitely.
+- **Project deletion counts unfinished check runs.** `DELETE
+  /api/v1/projects/{id}` now refuses with `409 project_in_use` while a check
+  run of the Project (review-entry or integration CI on the durable check
+  runner) is queued, running, stopping or of unknown result; `details` gain
+  `live_check_runs`. Before, the delete went through and could leave the
+  check's processes running on a machine with nothing left to stop them.
+  `?force=true` works in two phases. If a check run is on a daemon that is
+  not connected, the request is refused at once and nothing is cancelled
+  (`details.unreachable_machines` names the machines, `details.cancelled:
+  false`); reconnect the machine or remove it and delete again. Otherwise it
+  cancels queued runs, stops running ones on their machine and waits at most
+  four seconds for them to settle; if one has not, the answer stays `409`
+  with `force_cancellation_incomplete` and `details.cancelled: true`, nothing
+  is deleted, and the check runs it cancelled fail their Tasks' review entry.
+  A refusal answers within about five seconds.
 
 - **Review-entry CI runs on the durable check runner (3.3 stage D part 2).**
   The `ci_steps` a Task runs when it enters `review` are no longer executed
@@ -989,6 +1004,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **A freed machine slot goes to a queued review check before a new run.**
+  A queued check reserved nothing, so under sustained load the dispatcher
+  could give every freed slot to a new execution and a Task in `review` waited
+  without bound. Now: a new execution (reservation, start) is refused with the
+  ordinary `machine_capacity` wait while a queued check still needs a slot;
+  queued checks are admitted in order (review entry, then integration head,
+  oldest first); and while a Task waits for a run slot on the machine, checks
+  hold at most all but one of its slots (the one slot of a one-slot machine),
+  so executions keep progressing. A Task may therefore show `Waiting for a
+  Slot` although the machine has a free slot: that slot is kept for a check.
 
 - **Merge queue: production ports, still not started (3.2 stage D2a).**
   Everything the queue worker needs to run against real machines now exists;
@@ -2337,6 +2363,58 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   sweep of run directories at start-up no longer removes the directory of a
   run a previous process left detached and still alive (server and daemon):
   it is age-gated like the periodic sweep.
+
+- **Pausing or editing a Project while a Task's review CI runs no longer
+  costs the Task its result.** The Task's review-entry step was fenced on the
+  Project version, which a pause, a resume or any Project edit moves. When the
+  CI finished the step failed with `version conflict`, the review attempt was
+  cancelled, the Task parked as `cascade_failed`, and `retry` dispatched a
+  reviewer that failed with `pre-review result for required check ... is
+  unavailable`. The step now continues when the Project workflow and the
+  state configuration it was admitted under are unchanged: the finished check
+  is applied, a pause holds only the reviewer run, and resume does not run the
+  check again. A changed workflow or state configuration still ends the step.
+
+- **A Task no longer stays `Waiting for a Slot` on an idle machine.** A Task
+  that waits for a run slot is looked at again when a slot is released. Three
+  ways to miss that are closed. (1) The wait was recorded just after the
+  release it should have seen (the dispatcher read the machine as full, the
+  run ended, then the wait was written): nothing looked at the Task again.
+  Seen with `max_concurrent_runs: 1` after a Project resume. A Task that
+  starts waiting for a slot is now read once more after its wait is recorded.
+  (2) A slot freed by a check run (review or integration CI) that ended, by a
+  queued check that was cancelled or expired, or by a check nobody waited for
+  any more woke no waiting Task; it does now. (3) Whatever else goes wrong,
+  every Task that waits for a run slot is read again at least every 60
+  seconds (30 while a machine is short of disk), also after a restart.
+
+- **Slot rules count only what is real.** (1) A Task with a running
+  interactive session (or a run of another role) on a full machine was told
+  it did not wait for a slot; every dispatcher pass then cleared its wait,
+  tried, was refused and recorded the wait again. It now waits, once, like
+  any other Task. (2) A queued check whose Task was cancelled, deleted or
+  left `review` kept a free slot from new runs until the check worker next
+  looked at it; it reserves nothing from that commit on. (3) Checks were held
+  to their share of a machine's slots while a Task waited for that machine's
+  readiness or reconnect; only Tasks that wait for a run slot the machine
+  could give count now.
+
+- **A review check for commands the Task no longer has is not applied.**
+  Editing a Task's own review configuration (`task_state_config`, with its
+  `ci_steps`) while its review-entry check ran moved no Project version, so
+  the finished check of the old commands was applied to the review attempt.
+  The step now compares what it was admitted under whenever it waited for a
+  check; on a difference the attempt is cancelled and the Task parks for its
+  owner, exactly as after a Project workflow or review-configuration edit.
+
+- **A machine limited to one run no longer parks its own running Task.**
+  With `max_concurrent_runs: 1` (server setting, or a daemon's cap or admin
+  run limit) the dispatcher's capacity precheck counted a Task's own running
+  execution against that Task: every running Task was shown as `Waiting for a
+  Slot` on the machine it was running on, and after a failed run the wait
+  could stay although nothing held the slot. A Task that holds the slot is no
+  longer a capacity waiter and a stale wait is retired when the Task is next
+  observed. The cause predates the review-entry check cutover.
 
 - **Three waits that showed nothing, or lost what they waited for, are now
   typed and visible.** (1) A Task whose Agent is paused or unreachable kept a

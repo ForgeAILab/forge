@@ -866,13 +866,74 @@ impl TaskService {
         self.event_bus.publish(event);
     }
 
-    /// Make a forced Project deletion safe to commit. Every running execution
-    /// is terminalized through the owner/version CAS and its provider is asked
-    /// to stop; any provider failure is returned. Leases that are not attached
-    /// to one of those executions are revoked explicitly as well. The caller
-    /// still performs a final DB in-use check immediately before deletion to
-    /// catch work admitted concurrently with this pass.
-    pub async fn prepare_project_deletion(&self, project_id: &str) -> Result<()> {
+    /// Phase one of a forced Project deletion. It changes nothing. A check
+    /// run that was dispatched to a daemon which is not connected (and not
+    /// removed) cannot be stopped or confirmed now, and its row is what
+    /// fences the process on that machine, so the deletion will be refused
+    /// whatever else is cancelled. The machines of those runs are returned:
+    /// the caller refuses before it cancels anything. A queued run, a run on
+    /// the server, a run on a connected daemon, a run whose owner already
+    /// reported and a run on a removed machine can all be settled.
+    pub async fn project_deletion_unreachable_machines(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<String>> {
+        validate_required("project_id", project_id)?;
+        let mut machines = std::collections::BTreeSet::new();
+        for (id, _, state) in self.db.live_project_check_runs(project_id).await? {
+            if state == "queued" {
+                continue;
+            }
+            let record = match db::CheckWorkerRepo::check_worker_record(&*self.db, &id).await {
+                Ok(record) => record,
+                Err(DbError::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if record.run.state.terminal() || record.receipt.is_some() {
+                continue;
+            }
+            let Some(db::CheckDispatchIntent {
+                target: db::CheckDispatchTarget::Daemon { workspace },
+                ..
+            }) = &record.dispatch
+            else {
+                continue;
+            };
+            let daemon: Option<(Option<String>, String)> =
+                sqlx::query_as("SELECT removed_at, hostname FROM daemon WHERE id = ?")
+                    .bind(&workspace.daemon_id)
+                    .fetch_optional(self.db.pool())
+                    .await?;
+            let Some((None, hostname)) = daemon else {
+                // Removed or unknown: the check worker settles the run.
+                continue;
+            };
+            if !self
+                .daemon_connections
+                .as_ref()
+                .is_some_and(|registry| registry.is_connected(&workspace.daemon_id))
+            {
+                machines.insert(hostname);
+            }
+        }
+        Ok(machines.into_iter().collect())
+    }
+
+    /// Phase two of a forced Project deletion: make it safe to commit. Every
+    /// running execution is terminalized through the owner/version CAS and
+    /// its provider is asked to stop; any provider failure is returned.
+    /// Leases that are not attached to one of those executions are revoked
+    /// explicitly as well. Unfinished check runs are stopped and given until
+    /// `settle_until` to settle; the deadline is the caller's, so a request
+    /// that calls this several times waits once. The caller asks
+    /// [`Self::project_deletion_unreachable_machines`] first and still
+    /// performs a final DB in-use check immediately before deletion to catch
+    /// work admitted concurrently with this pass.
+    pub async fn prepare_project_deletion(
+        &self,
+        project_id: &str,
+        settle_until: tokio::time::Instant,
+    ) -> Result<()> {
         validate_required("project_id", project_id)?;
 
         let running = ExecutionRepo::list_running_for_project(&*self.db, project_id).await?;
@@ -932,7 +993,72 @@ impl TaskService {
                 }
             }
         }
-        Ok(())
+        self.stop_project_check_runs(project_id, settle_until).await
+    }
+
+    /// Force deletion stops the Project's unfinished check runs first and
+    /// waits, until `settle_until`, for each to settle. Their consumers are
+    /// cancelled, so nobody waits for a result: a queued run is cancelled
+    /// here, a running one is cancelled on its owner by the check worker
+    /// (which notices a run without consumers within about a second). A run
+    /// that has not settled by then stays live, and the deletion guard then
+    /// refuses: the row that fences the process is never deleted from under
+    /// it. Without a check worker nothing can settle a run, so nothing is
+    /// cancelled either.
+    async fn stop_project_check_runs(
+        &self,
+        project_id: &str,
+        settle_until: tokio::time::Instant,
+    ) -> Result<()> {
+        if self
+            .db
+            .live_project_check_runs(project_id)
+            .await?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let Some(worker) = self.check_worker() else {
+            return Ok(());
+        };
+        self.db.cancel_project_check_consumers(project_id).await?;
+        loop {
+            let live = self.db.live_project_check_runs(project_id).await?;
+            if live.is_empty() {
+                return Ok(());
+            }
+            for (id, version, state) in &live {
+                if state != "queued" {
+                    continue;
+                }
+                // A queued run has spawned nothing: it is settled as
+                // cancelled at once instead of at the worker's next sweep
+                // (or, on a full machine, when a slot frees).
+                let until = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+                match db::CheckRunRepo::claim_check_run(
+                    &*self.db,
+                    id,
+                    *version,
+                    "project-deletion",
+                    &now_rfc3339(),
+                    &until,
+                )
+                .await
+                {
+                    Ok(run) => {
+                        if let Err(error) = worker.drive(run).await {
+                            tracing::warn!(run_id = %id, %error, "queued check run was not cancelled for Project deletion");
+                        }
+                    }
+                    Err(DbError::VersionConflict | DbError::NotFound) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if tokio::time::Instant::now() >= settle_until {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Prepare the scheduler-owned lease installed with a newly-created

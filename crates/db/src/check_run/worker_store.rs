@@ -214,7 +214,16 @@ impl CheckWorkerRepo for SqliteDb {
             // review or the merge is how the worktree is given back. A wait
             // here would also end in the queued-run expiry below, which
             // settles the run as an infrastructure failure.
-            if !capacity.has_capacity()
+            // A slot of its own needs a free one that the checks queued ahead
+            // of this run leave it, and room in the checks' share while a
+            // Task waits for a run slot here. Borrowing needs none of it.
+            let own_slot = capacity.has_capacity()
+                && capacity.admits_check(
+                    crate::machine_capacity::checks_queued_ahead(&mut tx, &run.id, &embedded)
+                        .await?,
+                    crate::machine_capacity::run_slot_waiters(&mut tx, machine, &embedded).await?,
+                );
+            if !own_slot
                 && !crate::machine_capacity::check_borrows_machine_slot(
                     &mut tx, &run.id, machine, &embedded,
                 )

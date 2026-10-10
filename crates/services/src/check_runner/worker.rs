@@ -248,6 +248,27 @@ impl CheckRunWorker {
                 .record_check_dispatch(&fence(&run), &intent, &now.to_rfc3339(), &deadline)
                 .await?;
             record = self.store.check_worker_record(&run.id).await?;
+            // A cancel that landed while the owner prepared found no dispatch
+            // record, so it could not put the operation under the remote
+            // cancellation fence. Nothing has been sent yet: with nobody left
+            // waiting the run ends here and no operation ever starts. A
+            // cancel that lands after this look reads the record just written
+            // and fences the operation itself (it cancels its consumer first
+            // and reads the record second, so one of the two always holds).
+            if self
+                .store
+                .active_check_consumers(&run.id, &db::now_rfc3339())
+                .await?
+                .is_empty()
+            {
+                return self
+                    .settle_without_receipt(
+                        run,
+                        CheckResultOutcome::Cancelled,
+                        CheckCleanup::NotPerformed,
+                    )
+                    .await;
+            }
         }
         let cancel = CancellationToken::new();
         let dispatch = run.state == CheckRunState::Running;

@@ -85,11 +85,14 @@ pub enum DbError {
     #[error("repo {repo_id} has active executions or workspace leases")]
     RepoInUse { repo_id: String },
 
-    #[error("project {project_id} has {running_executions} running execution(s) and {active_leases} active workspace lease(s)")]
+    #[error("project {project_id} has {running_executions} running execution(s), {active_leases} active workspace lease(s) and {live_check_runs} unfinished check run(s)")]
     ProjectInUse {
         project_id: String,
         running_executions: i64,
         active_leases: i64,
+        /// Check runs that are queued, running, being cancelled or cleaned,
+        /// or whose result is not known yet.
+        live_check_runs: i64,
     },
 
     #[error("{resource} is in use: {reason}")]
