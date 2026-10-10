@@ -942,6 +942,34 @@ impl TaskService {
         })
     }
 
+    /// The refusal of a worktree that would have to be made again on a
+    /// machine short of disk: the same `disk_pressure` placement refusal a
+    /// new worktree gets, so the Task takes the same self-clearing wait.
+    fn refuse_recreation_under_disk_pressure(
+        &self,
+        admission: &WorkspaceAdmission,
+        pressure: Option<api_types::DiskPressureKind>,
+    ) -> Result<()> {
+        if pressure.is_none() {
+            return Ok(());
+        }
+        let placement = &admission.placement;
+        Err(ServiceError::PlacementUnavailable(
+            crate::placement::PlacementUnavailable {
+                task_id: admission.claiming_task.id.clone(),
+                repo_id: admission.workspace.repo_id.clone(),
+                rejected_candidates: vec![crate::placement::CandidateRejection {
+                    failing_checks: Vec::new(),
+                    repo_location_id: placement.repo_location_id.clone(),
+                    owner_kind: placement.owner_kind.to_string(),
+                    daemon_id: placement.daemon_id.clone(),
+                    runtime_id: placement.runtime_id.clone(),
+                    filter_codes: vec![crate::placement::PlacementFilterCode::DiskPressure],
+                }],
+            },
+        ))
+    }
+
     pub(super) async fn prepare_claim_workspace(
         &self,
         mut admission: WorkspaceAdmission,
@@ -949,6 +977,23 @@ impl TaskService {
         if admission.placement.state == PlacementState::Ready
             && admission.placement.owner_kind == PlacementOwnerKind::Server
         {
+            // A ready placement is admitted under disk pressure because its
+            // worktree exists. One whose directory is gone (deleted, or
+            // cleaned and waiting for its next run) would be made again
+            // here: that is new disk, refused like a new worktree.
+            // A server placement's handle is its worktree directory.
+            if admission.workspace.status != WorkspaceStatus::Ready
+                || !admission
+                    .placement
+                    .workspace_handle
+                    .as_deref()
+                    .is_some_and(|worktree| Path::new(worktree).is_dir())
+            {
+                self.refuse_recreation_under_disk_pressure(
+                    &admission,
+                    self.db.disk_admission.server_pressure(),
+                )?;
+            }
             // The launch guard every executor family shares: the workspace
             // manager checks the recorded worktree against disk and Git and
             // repairs what it can, so a CLI executor is never started in a
@@ -1051,6 +1096,15 @@ impl TaskService {
                 }
             };
             if needs_recreation {
+                let pressure = match admission.placement.daemon_id.as_deref() {
+                    Some(daemon_id) => self.db.disk_admission.pressure_of(
+                        db::machine_disk::daemon_disk(&self.db, daemon_id)
+                            .await?
+                            .as_ref(),
+                    ),
+                    None => self.db.disk_admission.server_pressure(),
+                };
+                self.refuse_recreation_under_disk_pressure(&admission, pressure)?;
                 admission.workspace = prepare_workspace(
                     &self.db,
                     &self.workspace_root,
@@ -4053,6 +4107,36 @@ pub(crate) mod tests {
             .await
             .expect("an existing valid worktree is never refused for disk");
         assert_eq!(again.placement.id, prepared.placement.id);
+        let again = service.prepare_claim_workspace(again).await.unwrap();
+        // The same Task with its worktree gone: making it again is new disk,
+        // refused with the same code; it is made once the disk has room.
+        let worktree = PathBuf::from(again.placement.workspace_handle.as_deref().unwrap());
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let gone = service
+            .reserve_claim_workspace(&cleared, Some(&agent), "coder")
+            .await
+            .expect("the ready placement itself is still admitted");
+        let recreate = service
+            .prepare_claim_workspace(gone)
+            .await
+            .err()
+            .expect("a recreate is refused under the floor");
+        assert_eq!(
+            crate::placement::capacity_wait_of(&recreate),
+            Some(crate::placement::CapacityWait::Disk),
+            "{recreate:?}"
+        );
+        assert!(!worktree.exists());
+        free.store(500, Ordering::SeqCst);
+        db.disk_admission.refresh();
+        let gone = service
+            .reserve_claim_workspace(&cleared, Some(&agent), "coder")
+            .await
+            .unwrap();
+        service.prepare_claim_workspace(gone).await.unwrap();
+        assert!(worktree.is_dir());
+        free.store(10, Ordering::SeqCst);
+        db.disk_admission.refresh();
         // A second Task, which would need a new worktree, still waits.
         let other = seed_task(&db, &project_id, None).await;
         assert!(matches!(

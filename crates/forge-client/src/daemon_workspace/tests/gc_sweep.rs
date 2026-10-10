@@ -57,6 +57,11 @@ async fn a_daemon_whose_state_was_lost_never_sweeps_the_root_the_old_state_owns(
     // The first daemon adopts the root; its directories are live to it.
     let first = backend_on(&root, &old_state);
     assert!(first.gc_lock.is_some());
+    assert_eq!(
+        gc::disk_report(&root).and_then(|facts| facts.gc_state).as_deref(),
+        Some("owned"),
+        "the daemon reports that its collector runs on this root"
+    );
     let live = forge_made_orphan(&root);
     drop(first);
 
@@ -309,4 +314,48 @@ async fn gc_removes_cleaned_handle_leftovers_and_the_legacy_codex_home_only_when
     assert_eq!((report.removed, report.errors), (1, 0));
     assert!(!legacy.exists());
     assert!(log.exists());
+}
+
+/// The report of a daemon carries the disk facts of its workspace root and
+/// whether its collector runs there; the floor comes from the server.
+#[test]
+fn disk_report_reads_the_root_and_says_whether_its_collector_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let report = gc::disk_report(&root).expect("a real directory is readable");
+    assert!(report.total_bytes >= report.free_bytes && report.total_bytes > 0);
+    assert!(chrono::DateTime::parse_from_rfc3339(&report.measured_at).is_ok());
+    // Nobody adopted this root: the server is told nothing collects here.
+    assert_eq!(report.gc_state.as_deref(), Some("unclaimed"));
+    // Unreadable: no facts, and the server then refuses nothing for disk.
+    assert!(gc::disk_report(&root.join("no/such/place")).is_none());
+    // The wire shape the server parses.
+    let wire = serde_json::to_value(api_types::DaemonReportRequest {
+        max_concurrent_runs: None,
+        disk: Some(report.clone()),
+        detected_clis: Vec::new(),
+        runtimes: None,
+        labels: None,
+        active_execution_ids: None,
+    })
+    .unwrap();
+    assert_eq!(wire["disk"]["free_bytes"], report.free_bytes);
+    assert_eq!(wire["disk"]["gc_state"], "unclaimed");
+}
+
+#[test]
+fn collector_floor_is_the_one_the_server_sent() {
+    let sent = FreeFloor {
+        min_free_bytes: 123,
+        min_free_percent: 7,
+        min_free_inode_percent: 3,
+        gc_free_bytes: Some(456),
+        gc_free_percent: None,
+    };
+    // A reply without a floor changes nothing.
+    gc::accept_floor(None);
+    gc::accept_floor(Some(sent));
+    assert_eq!(gc::floor(), sent);
+    gc::accept_floor(None);
+    assert_eq!(gc::floor(), sent);
 }

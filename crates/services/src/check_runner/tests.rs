@@ -785,6 +785,72 @@ async fn full_owner_machine_queues_without_charging_wall_time_and_join_and_hit_t
     assert_eq!(count.active_runs(), 1);
 }
 
+/// A check always needs a new checkout. Under the disk floor it is the same
+/// typed capacity wait as a full machine: queued, told once, no wall time
+/// charged, and admitted by the next sweep that finds the reading recovered.
+/// It is never failed for it.
+#[tokio::test]
+async fn a_check_under_the_disk_floor_waits_then_runs_when_the_reading_recovers() {
+    let (_temp, store, runner) = fixture().await;
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(10));
+    let reading = Arc::clone(&free);
+    store.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(move || {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: reading.load(Ordering::SeqCst),
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: db::now_rfc3339(),
+                gc_state: None,
+            })
+        }),
+    );
+    let run = scheduled(runner.request(cacheable_request("disk-a")).await.unwrap());
+    let until = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+    for _ in 0..2 {
+        let current = store.check_worker_record(&run.id).await.unwrap().run;
+        assert!(matches!(
+            store
+                .admit_check_run(&current, "waiting", &db::now_rfc3339(), &until)
+                .await
+                .unwrap(),
+            CheckAdmission::Waiting
+        ));
+    }
+    let waiting = store.check_worker_record(&run.id).await.unwrap();
+    assert!(waiting.admitted_at.is_none() && waiting.deadline_at.is_none());
+    assert_eq!(waiting.run.state, CheckRunState::Queued);
+    assert_eq!(
+        store.check_run_counts().await.unwrap().waiting_for_capacity,
+        1
+    );
+
+    // The reading recovers: the same run is admitted and runs.
+    free.store(500, Ordering::SeqCst);
+    store.disk_admission.refresh();
+    let admitted = admit(&store, &waiting.run).await;
+    assert_eq!(
+        store.check_run_counts().await.unwrap().waiting_for_capacity,
+        0
+    );
+    let owner = Arc::new(TestOwner::default());
+    CheckRunWorker::new(store.clone(), owner.clone())
+        .drive(admitted)
+        .await
+        .unwrap();
+    assert_eq!(owner.runs.load(Ordering::SeqCst), 1);
+    let finished = store.check_run(&run.id).await.unwrap().unwrap().state;
+    assert!(
+        !matches!(
+            finished,
+            CheckRunState::Failed | CheckRunState::Cancelled | CheckRunState::Queued
+        ),
+        "{finished:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_check_borrows_the_same_tasks_reservation_and_keeps_its_slot_when_it_expires() {
     let (temp, store, runner) = fixture().await;
