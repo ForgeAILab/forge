@@ -118,22 +118,22 @@ impl HookAction for RunMerge {
         .await
         {
             Ok(attempt) => attempt,
-                Err(error) if crate::worker_runtime::queue::retryable(&error) => {
-                    return failed(ctx, error)
-                }
-                // No candidate can be named (no implementation run, the
-                // workspace or its repository is gone): the same failure the
-                // merge itself reported.
-                Err(error) => {
-                    return merge_failure_result(
-                        ctx,
-                        &task,
-                        error.to_string(),
-                        api_types::FailureKind::WorkspaceError,
-                    )
-                    .await
-                }
-            };
+            Err(error) if crate::worker_runtime::queue::retryable(&error) => {
+                return failed(ctx, error)
+            }
+            // No candidate can be named (no implementation run, the
+            // workspace or its repository is gone): the same failure the
+            // merge itself reported.
+            Err(error) => {
+                return merge_failure_result(
+                    ctx,
+                    &task,
+                    error.to_string(),
+                    api_types::FailureKind::WorkspaceError,
+                )
+                .await
+            }
+        };
         if let Err(error) =
             crate::integration_steps::admission::state_waiting(&ctx.db, &attempt).await
         {

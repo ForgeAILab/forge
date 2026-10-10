@@ -2858,7 +2858,8 @@ impl World {
                     .bind(format!("legacy-op-{task}")).bind(format!("s-{task}")).bind(format!("w-{task}")).bind(format!("pl-{task}")).bind(&now).execute(pool).await.unwrap();
             }
             Legacy::IntentWithoutOutcome => {
-                let intent = serde_json::json!({"target_branch":"main","candidate_sha":head}).to_string();
+                let intent =
+                    serde_json::json!({"target_branch":"main","candidate_sha":head}).to_string();
                 sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,effects_json) VALUES(?,0,?,?)")
                     .bind(format!("s-{task}")).bind(&now)
                     .bind(serde_json::json!({"merge_intent":intent}).to_string())
@@ -2905,11 +2906,24 @@ async fn an_imported_unknown_merge_that_landed_is_reported_and_never_repeated() 
         );
         let b = world.add_task("r", "b", "b.txt", "b\n").await;
         // Run twice: a second start imports nothing more.
-        assert_eq!(world.db.import_integration_pass(100).await.unwrap().imported, 0);
+        assert_eq!(
+            world
+                .db
+                .import_integration_pass(100)
+                .await
+                .unwrap()
+                .imported,
+            0
+        );
         let mut pump = Pump::new(world.worker());
         world.settle(&mut pump).await;
         let end = world.attempt(&imported.id).await;
-        assert_eq!(end.state, S::Completed, "{shape:?}: {:?}", end.failure_message);
+        assert_eq!(
+            end.state,
+            S::Completed,
+            "{shape:?}: {:?}",
+            end.failure_message
+        );
         assert_eq!(end.integrated_sha.as_deref(), Some(head.as_str()));
         assert_eq!(ff_successes(&world, &imported.id).await, 0, "{shape:?}");
         assert_eq!(
@@ -2938,7 +2952,12 @@ async fn an_imported_unknown_merge_that_did_not_land_is_merged_once_by_the_queue
         let mut pump = Pump::new(world.worker());
         world.settle(&mut pump).await;
         let end = world.attempt(&imported.id).await;
-        assert_eq!(end.state, S::Completed, "{shape:?}: {:?}", end.failure_message);
+        assert_eq!(
+            end.state,
+            S::Completed,
+            "{shape:?}: {:?}",
+            end.failure_message
+        );
         assert_eq!(world.tip("r").await, head, "{shape:?}");
         assert_eq!(ff_successes(&world, &imported.id).await, 1, "{shape:?}");
         assert_eq!(

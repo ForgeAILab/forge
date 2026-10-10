@@ -39,9 +39,7 @@ use crate::{
     workflow::engine::WorkflowEngine,
     Result, ServiceError,
 };
-use api_types::{
-    IntegrationDeferralCause, IntegrationPhase, IntegrationReason,
-};
+use api_types::{IntegrationDeferralCause, IntegrationPhase, IntegrationReason};
 use db::{
     ConditionStatement, IntegrationAttempt, IntegrationAttemptState as S, IntegrationQueueRepo,
     SqliteDb, TaskRepo, TaskStep, TaskStepRepo,
@@ -254,12 +252,20 @@ impl IntegrationSteps {
             S::Queued | S::Parked if !in_merge_state => Ok(StepOutcome::Skip(
                 "the Task is not in a merge state; its own flow continues".into(),
             )),
-            // A row without the owner fields (a shadow row), or one parked
-            // under the legacy pause marker: admitted again, bound to the
-            // Task's placement and present candidate.
+            // Admitted again, bound to the Task's placement and present
+            // candidate: a shadow row (no owner fields, never classified), a
+            // row the importer classified as queued, one parked under the
+            // legacy pause marker, and one that waits only for a fact of the
+            // candidate. NOT a row parked for its owner (blocked, failed,
+            // held, waiting for a human, an owner machine or an accepted
+            // command, a lost workspace): the importer leaves the candidate
+            // of every row unnamed, so "has no owner fields" would take all
+            // of those into the queue and merge a Task its owner stopped.
             S::Queued | S::Parked
                 if attempt.available_at.is_none()
-                    && (super::admission::unbound(&attempt)
+                    && ((attempt.import_source_json.is_none()
+                        && super::admission::unbound(&attempt))
+                        || (attempt.state == S::Queued && super::admission::unbound(&attempt))
                         || (attempt.state == S::Parked
                             && (marker.is_some()
                                 || matches!(priority, Some(10..=12))

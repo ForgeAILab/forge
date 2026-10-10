@@ -530,7 +530,10 @@ mod tests {
             .unwrap()
             .contains("auto_cascade_on_merge_result"));
 
-        let loaded = service.get_template("mine").await.expect("the template loads");
+        let loaded = service
+            .get_template("mine")
+            .await
+            .expect("the template loads");
         assert_eq!(loaded.display_name, "Mine");
         assert_eq!(loaded.description, "kept");
         assert_eq!(loaded.definition, default_workflow());

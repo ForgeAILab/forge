@@ -2592,8 +2592,7 @@ async fn reenter_merging(ctx: &HookContext) {
 // queue head's, the handoff its `send_back` step's.
 #[tokio::test]
 async fn rebase_conflict_is_handed_back_to_the_worker_with_committed_markers() {
-    let (ctx, _dir, worktree_path, handoff) =
-        queue_conflict_handoff("task-conflict-handoff").await;
+    let (ctx, _dir, worktree_path, handoff) = queue_conflict_handoff("task-conflict-handoff").await;
     assert!(
         handoff.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff),
         "{}",
@@ -2702,7 +2701,10 @@ async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
     ctx.triggered_by = api_types::Actor::system(api_types::SystemComponent::Workflow);
 
     // The Worker has not touched the marked files yet.
-    let HookResult::Failed { reason } = super::merge::RequireConflictMarkersResolved.execute(&ctx).await else {
+    let HookResult::Failed { reason } = super::merge::RequireConflictMarkersResolved
+        .execute(&ctx)
+        .await
+    else {
         panic!("committed markers must keep the task out of review");
     };
     assert!(reason.contains("exports.py"), "{reason}");
@@ -2711,7 +2713,9 @@ async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
     let mut other = ctx.clone();
     other.to_state = default_states::IN_PROGRESS.to_owned();
     assert!(matches!(
-        super::merge::RequireConflictMarkersResolved.execute(&other).await,
+        super::merge::RequireConflictMarkersResolved
+            .execute(&other)
+            .await,
         HookResult::Skipped { .. }
     ));
 
@@ -2720,7 +2724,9 @@ async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
     git::commit_all(&worktree_path, "resolve handoff")
         .await
         .expect("repair commits");
-    let result = super::merge::RequireConflictMarkersResolved.execute(&ctx).await;
+    let result = super::merge::RequireConflictMarkersResolved
+        .execute(&ctx)
+        .await;
     assert!(matches!(result, HookResult::Ok), "{result:?}");
 }
 
@@ -2728,8 +2734,7 @@ async fn merge_failed_exit_guard_rejects_unresolved_markers_before_review() {
 // superseded, keeping its place) and the queue fast-forwards it.
 #[tokio::test]
 async fn handed_off_conflict_resolves_and_run_merge_integrates() {
-    let (ctx, dir, worktree_path, _handoff) =
-        queue_conflict_handoff("task-handoff-resolved").await;
+    let (ctx, dir, worktree_path, _handoff) = queue_conflict_handoff("task-handoff-resolved").await;
     let ejected = current_attempt(&ctx).await;
     std::fs::write(
         worktree_path.join("exports.py"),
@@ -2743,8 +2748,14 @@ async fn handed_off_conflict_resolves_and_run_merge_integrates() {
     let result = RunMerge.execute(&ctx).await;
     assert!(matches!(result, HookResult::Ok), "{result:?}");
     let admitted = current_attempt(&ctx).await;
-    assert_eq!(admitted.predecessor_attempt_id.as_deref(), Some(ejected.id.as_str()));
-    assert_eq!(admitted.queue_seq, ejected.queue_seq, "the Task keeps its place");
+    assert_eq!(
+        admitted.predecessor_attempt_id.as_deref(),
+        Some(ejected.id.as_str())
+    );
+    assert_eq!(
+        admitted.queue_seq, ejected.queue_seq,
+        "the Task keeps its place"
+    );
     ctx.task_service
         .drain(&ctx.task_id)
         .await

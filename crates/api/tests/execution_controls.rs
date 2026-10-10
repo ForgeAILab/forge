@@ -1269,7 +1269,10 @@ async fn cancel_after_the_merge_queue_committed_the_fast_forward_answers_409_tas
         .unwrap();
     assert_eq!(current.status, "merging", "the Cancel was not applied");
     let held = db.integration_attempt(&attempt.id).await.unwrap().unwrap();
-    assert!(held.cancel_requested_at.is_none(), "the merge is not flagged");
+    assert!(
+        held.cancel_requested_at.is_none(),
+        "the merge is not flagged"
+    );
     assert_eq!(held.state, db::IntegrationAttemptState::FfInflight);
     // The protected step is still first in line.
     let steps = db.task_steps(&task.id).await.unwrap();

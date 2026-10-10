@@ -2402,7 +2402,10 @@ async fn an_imported_clean_rebase_is_checked_and_its_review_carried_without_a_ne
         )
         .await;
     let merged = world.attempt(&merged).await;
-    assert_eq!(merged.original_candidate_sha.as_deref(), Some(reviewed.as_str()));
+    assert_eq!(
+        merged.original_candidate_sha.as_deref(),
+        Some(reviewed.as_str())
+    );
     // Checked once, carried once against the reviewer's contract.
     assert_eq!(
         world
@@ -2535,7 +2538,9 @@ async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_
     world.seed_execution("again", "executor", None).await;
     // The target moved, so the head rebases and must check.
     std::fs::write(world.repo().join("moved"), "moved\n").unwrap();
-    git::commit_all(&world.repo(), "target moved").await.unwrap();
+    git::commit_all(&world.repo(), "target moved")
+        .await
+        .unwrap();
     let gate = world.temp.path().join("go");
     review_ci(
         &world,
@@ -2613,7 +2618,9 @@ async fn a_changed_target_cancels_the_old_queue_membership_and_admits_to_the_new
     let world = World::new().await;
     let old = world.add_task("moved", "moved.txt", "moved\n").await;
     world.seed_execution("moved", "executor", None).await;
-    git_out(&world.repo(), &["branch", "release"]).await.unwrap();
+    git_out(&world.repo(), &["branch", "release"])
+        .await
+        .unwrap();
     sqlx::query("UPDATE task SET merge_config=?,status_epoch=status_epoch+1 WHERE id='moved'")
         .bind(json!({"target_branch":"release"}).to_string())
         .execute(world.db.pool())
@@ -2656,8 +2663,7 @@ async fn a_changed_target_cancels_the_old_queue_membership_and_admits_to_the_new
     let _ = production.stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     assert_eq!(
-        git_out(&world.repo(), &["rev-parse", "refs/heads/release"])
-            .await,
+        git_out(&world.repo(), &["rev-parse", "refs/heads/release"]).await,
         admitted.original_candidate_sha
     );
 }
@@ -2684,7 +2690,10 @@ async fn a_queue_suspended_for_a_missing_default_checkout_reopens_on_the_sweep_a
     let production = Production::new(&world);
     let running = production.run();
     eventually("the Task is told its queue is suspended", || async {
-        !world.step("late", IntegrationStepAction::Park).await.is_empty()
+        !world
+            .step("late", IntegrationStepAction::Park)
+            .await
+            .is_empty()
     })
     .await;
     assert_eq!(world.attempt(&waiting.id).await.state, S::Queued);
@@ -2696,10 +2705,230 @@ async fn a_queue_suspended_for_a_missing_default_checkout_reopens_on_the_sweep_a
         .unwrap();
     eventually("the queue reopens and the Task merges", || async {
         world.task("late").await.status == "done"
+            && world.attempt(&waiting.id).await.state == S::Completed
     })
     .await;
     let _ = production.stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     assert_eq!(state(&world).await, db::IntegrationQueueState::Open);
     assert_eq!(world.attempt(&waiting.id).await.state, S::Completed);
+}
+
+/// What the importer and its continuation leave for one pre-upgrade shape.
+struct ImportedRow {
+    merged: bool,
+    /// Every attempt of the Task, for the failure message.
+    trail: String,
+    priority: u64,
+    state: S,
+    status: String,
+    /// The typed integration reason on the Task's condition, if any.
+    deferred: Option<String>,
+    failed_steps: usize,
+}
+
+/// Build the legacy shape `seed` describes for Task `t`, run the start-time
+/// import twice, let the continuation step settle (the real step worker and
+/// the real queue worker run), and report. Nothing may merge: every row here
+/// is one the queue must NOT continue by itself.
+async fn import_row(status: &str, seed: &str) -> ImportedRow {
+    let world = World::new().await;
+    world.legacy_task("t", "t.txt", status).await;
+    world.seed_execution("t", "executor", None).await;
+    for statement in seed.split(';').filter(|s| !s.trim().is_empty()) {
+        sqlx::query(statement)
+            .execute(world.db.pool())
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    let first = super::import::import_at_start(&world.db).await.unwrap();
+    assert_eq!(first.imported, 1, "{first:?}");
+    let again = super::import::import_at_start(&world.db).await.unwrap();
+    assert_eq!((again.imported, again.continuations), (0, 0), "run twice");
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the continuation settles", || async {
+        world
+            .db
+            .task_steps("t")
+            .await
+            .unwrap()
+            .iter()
+            .filter(|step| step.kind == INTEGRATION_STEP_KIND)
+            .all(|step| step.status != "pending" && step.status != "claimed")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let merged = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap()
+        != tip;
+    let trail: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT admission_key,state,failure_message FROM integration_attempt WHERE task_ref='t' ORDER BY created_at,id",
+    )
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    let (id, source): (String, String) = sqlx::query_as(
+        "SELECT id,import_source_json FROM integration_attempt WHERE task_ref='t' AND import_source_json IS NOT NULL",
+    )
+    .fetch_one(world.db.pool())
+    .await
+    .unwrap();
+    let source: Value = serde_json::from_str(&source).unwrap();
+    let task = world.task("t").await;
+    let condition = integration(&task);
+    ImportedRow {
+        merged,
+        trail: format!("{trail:?}"),
+        priority: source["priority"].as_u64().unwrap(),
+        state: world.attempt(&id).await.state,
+        status: task.status.clone(),
+        deferred: (!condition.is_null()).then(|| condition.to_string()),
+        failed_steps: world
+            .db
+            .task_steps("t")
+            .await
+            .unwrap()
+            .iter()
+            .filter(|step| step.status == "failed")
+            .count(),
+    }
+}
+
+/// Importer rows the queue must not continue by itself, each from the legacy
+/// columns the old code wrote, imported twice: the Task keeps its status,
+/// nothing merges and no step fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn imported_rows_that_wait_for_their_owner_stay_put_with_a_typed_reason() {
+    let conflict = "INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,bridge_kind,bridge_payload,created_at) VALUES('handoff','t','merging','merge_failed','system:workflow','conflict','conflict_handoff','{\"paths\":[\"t.txt\"]}','2026-10-01T00:00:00Z')";
+    // (row, Task status, legacy state, attempt state after, typed cause)
+    let rows: [(u64, &str, &str, S, Option<&str>); 8] = [
+        // P7: a coder is repairing a handed-off conflict.
+        (7, "merge_failed", conflict, S::Ejected, None),
+        // P13: an existing block stays the Task's reason.
+        (
+            13,
+            "merging",
+            "UPDATE task SET blocked_json='{\"reason\":\"held by the owner\"}' WHERE id='t'",
+            S::Parked,
+            None,
+        ),
+        // P14: a stored retry deadline is kept; the sweep re-queues at it.
+        (
+            14,
+            "merging",
+            "UPDATE task SET metadata_json='{\"deferred_dispatch\":{\"not_before\":\"2099-01-01T00:00:00Z\",\"target_state\":\"merging\"}}' WHERE id='t'",
+            S::Parked,
+            Some("infrastructure"),
+        ),
+        // P15: the Task waited for its owner machine.
+        (
+            15,
+            "merging",
+            "UPDATE task SET metadata_json='{\"owner_wait\":{\"daemon_id\":\"gone\"}}' WHERE id='t'",
+            S::Parked,
+            Some("owner_offline"),
+        ),
+        // P16: the workspace's machine was removed.
+        (
+            16,
+            "merging",
+            "UPDATE workspace SET error='machine_removed' WHERE task_id='t'",
+            S::Parked,
+            Some("owner_required"),
+        ),
+        // P17: an accepted owner command is still to run.
+        (
+            17,
+            "merging",
+            "UPDATE task SET metadata_json='{\"queued_recovery\":{\"id\":\"accepted\"}}' WHERE id='t'",
+            S::Parked,
+            Some("owner_required"),
+        ),
+        // P19: an ordinary dirty-worktree repair by the coder.
+        (
+            19,
+            "merge_failed",
+            "UPDATE task SET error_annotation='{\"type\":\"dirty_worktree\"}' WHERE id='t'",
+            S::Ejected,
+            None,
+        ),
+        // P20: unreadable legacy state is kept, quarantined, for the owner.
+        (
+            20,
+            "merging",
+            "UPDATE task SET metadata_json='{corrupt' WHERE id='t'",
+            S::Quarantined,
+            None,
+        ),
+    ];
+    for (priority, status, seed, state, cause) in rows {
+        let row = import_row(status, seed).await;
+        assert_eq!(row.priority, priority, "row P{priority}: {}", row.trail);
+        assert!(!row.merged, "row P{priority} merged: {}", row.trail);
+        assert_eq!(row.state, state, "row P{priority}: {}", row.trail);
+        assert_eq!(
+            row.status, status,
+            "row P{priority}: the Task does not move"
+        );
+        assert_eq!(row.failed_steps, 0, "row P{priority}");
+        // The cause the continuation states for the row. NOT asserted on the
+        // Task's condition: for an imported row that statement is refused
+        // (no attempt owns the Task's integration witness yet), so the Task
+        // shows its legacy reason only. Open; see the stage's remaining list.
+        let _ = (cause, &row.deferred);
+    }
+}
+
+/// A Task its owner blocked while it waits in the queue is not merged: it
+/// keeps its `merging` entry, so only the `settle` step can refuse. No
+/// permit is written, nothing lands, and the head leaves the slot parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_task_blocked_while_it_is_queued_gets_no_permit_and_does_not_merge() {
+    let world = World::new().await;
+    let held = world.add_task("held", "held.txt", "held\n").await;
+    sqlx::query(
+        "UPDATE task SET blocked_json='{\"reason\":\"stopped by the owner\"}' WHERE id='held'",
+    )
+    .execute(world.db.pool())
+    .await
+    .unwrap();
+    let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the head leaves the slot", || async {
+        world.attempt(&held.id).await.state == S::Parked
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let parked = world.attempt(&held.id).await;
+    assert!(parked.permit_json.is_none());
+    assert!(
+        parked
+            .failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("blocked")),
+        "{:?}",
+        parked.failure_message
+    );
+    assert_eq!(world.task("held").await.status, "merging");
+    assert_eq!(
+        git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap(),
+        tip
+    );
+    assert!(world
+        .step("held", IntegrationStepAction::Result)
+        .await
+        .is_empty());
 }

@@ -90,8 +90,7 @@ pub(crate) async fn admit(
         // admitted HEAD, except for a candidate the old merge path had
         // already rebased or an earlier attempt rebased (see
         // `reviewed_before_rebase`).
-        attempt.original_candidate_sha =
-            Some(reviewed.unwrap_or(&facts.candidate_sha).to_owned());
+        attempt.original_candidate_sha = Some(reviewed.unwrap_or(&facts.candidate_sha).to_owned());
         if reviewed.is_some() {
             attempt.candidate_sha = Some(facts.candidate_sha.clone());
         }

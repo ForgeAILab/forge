@@ -898,7 +898,14 @@ async fn seed_merge_history(db: &SqliteDb, n: usize) {
         let id = format!("h{i:05}");
         sqlx::query("INSERT INTO task(id,project_id,title,status,status_epoch,review_passed_at,created_at,updated_at) VALUES(?,'p',?,'done',5,?,?,?)")
             .bind(&id).bind(&id).bind(FIXED_TIME).bind(FIXED_TIME).bind(FIXED_TIME).execute(&mut *tx).await.unwrap();
-        for (n, (from, to)) in [("in_progress", "review"), ("review", "merging"), ("merging", "done")].iter().enumerate() {
+        for (n, (from, to)) in [
+            ("in_progress", "review"),
+            ("review", "merging"),
+            ("merging", "done"),
+        ]
+        .iter()
+        .enumerate()
+        {
             sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at) VALUES(?,?,?,?,'system','history',?)")
                 .bind(format!("{id}-{n}")).bind(&id).bind(from).bind(to).bind(FIXED_TIME).execute(&mut *tx).await.unwrap();
         }
@@ -932,7 +939,10 @@ async fn start_time_import_of_a_large_history_is_bounded() {
     let mut imported = 0;
     let mut passes = 0;
     loop {
-        let pass = db.import_integration_pass(INTEGRATION_IMPORT_PAGE).await.unwrap();
+        let pass = db
+            .import_integration_pass(INTEGRATION_IMPORT_PAGE)
+            .await
+            .unwrap();
         imported += pass.imported;
         passes += 1;
         if !pass.remaining || pass.examined == 0 {
@@ -941,7 +951,10 @@ async fn start_time_import_of_a_large_history_is_bounded() {
     }
     let first = started.elapsed();
     let started = std::time::Instant::now();
-    let again = db.import_integration_pass(INTEGRATION_IMPORT_PAGE).await.unwrap();
+    let again = db
+        .import_integration_pass(INTEGRATION_IMPORT_PAGE)
+        .await
+        .unwrap();
     let second = started.elapsed();
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_attempt")
         .fetch_one(db.pool())
