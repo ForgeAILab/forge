@@ -380,6 +380,33 @@ async fn the_live_queue_list_covers_targets_and_outstanding_intents() {
         fences.live_queue_ids("d-other", "q-asking").await.unwrap(),
         vec!["q-asking".to_owned()]
     );
+    // A queue whose default checkout is elsewhere (here: on the server) is
+    // live on the daemon that holds its HEAD's Task for exactly as long as
+    // that attempt is the head: the daemon rebases for it, so its fence must
+    // survive another queue's announcement, and must not stay after it.
+    sqlx::query("UPDATE integration_attempt SET owner_kind='daemon',daemon_id='d-task',runtime_id='rt-task' WHERE id=?")
+        .bind(&f.fence.attempt_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        fences.live_queue_ids("d-task", "q-asking").await.unwrap(),
+        {
+            let mut live = vec![f.fence.queue_id.clone(), "q-asking".to_owned()];
+            live.sort();
+            live
+        }
+    );
+    sqlx::query("UPDATE integration_queue SET head_attempt_id=NULL,lease_owner=NULL,lease_until=NULL WHERE id=?")
+        .bind(&f.fence.queue_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        fences.live_queue_ids("d-task", "q-asking").await.unwrap(),
+        vec!["q-asking".to_owned()],
+        "a queue whose head moved on is dropped: the list does not grow"
+    );
     // An unreachable daemon: the announcement fails and nothing is recorded
     // as announced, so the effect that needed it is never begun.
     assert!(fences.announce("d-1", "rt-1", &f.fence).await.is_err());

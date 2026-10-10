@@ -5926,6 +5926,12 @@ next member on the following sweep instead of re-claiming a parked head
 forever. A quarantined head keeps the slot, because its queue re-opens
 through it.
 
+A rebase that cannot even be asked for (the owner could not be told the
+claim, or storage refused the effect before any intent) ran nothing: the head
+parks as a counted infrastructure retry and leaves the slot, instead of
+staying in `rebasing` to be re-claimed at every lease expiry. A request that
+failed after its intent stays an unknown result for its owner, as before.
+
 Transfer refs are released on both ends whenever the head leaves the slot.
 The session that releases it may not be the one that made the transfer (a
 takeover, a restart): it then takes the two ends from the attempt's durable

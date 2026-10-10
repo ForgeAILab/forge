@@ -999,6 +999,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - A head check that ended without a result after its retries is asked
     again by the next round of the same commit, instead of parking the head
     on the same stored answer on every retry.
+  - A head whose rebase could not even be requested (its machine could not
+    be told the claim) parks with a counted retry and lets the Tasks behind
+    it go on, instead of holding the queue.
   - After a daemon reconnects, a queue head waits until the Task's checkout
     is ready on it again before asking for the head check, instead of
     parking on a check that could not start.
