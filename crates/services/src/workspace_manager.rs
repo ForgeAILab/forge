@@ -38,8 +38,6 @@ pub(crate) enum Purpose {
     /// Launch an execution. May recreate the worktree and may put a clean
     /// worktree back on the Task branch.
     Execute,
-    /// Review the candidate. May recreate; never moves HEAD.
-    Review,
     /// Run a check or CI step. May recreate; never moves HEAD.
     Check,
     /// Rebase, merge or deliver. May recreate; never moves HEAD.

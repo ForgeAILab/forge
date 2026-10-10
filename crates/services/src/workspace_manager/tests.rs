@@ -9,9 +9,8 @@ use crate::task_service::workspace::{
     tests::{seed_project_with_real_repo, seed_task, sqlite_db},
 };
 
-const REPAIRING: [Purpose; 6] = [
+const REPAIRING: [Purpose; 5] = [
     Purpose::Execute,
-    Purpose::Review,
     Purpose::Check,
     Purpose::Integrate,
     Purpose::Hook,
@@ -19,12 +18,7 @@ const REPAIRING: [Purpose; 6] = [
 ];
 
 /// Purposes that act on the candidate without being allowed to move it.
-const CANDIDATE: [Purpose; 4] = [
-    Purpose::Review,
-    Purpose::Check,
-    Purpose::Integrate,
-    Purpose::Hook,
-];
+const CANDIDATE: [Purpose; 3] = [Purpose::Check, Purpose::Integrate, Purpose::Hook];
 
 struct Fixture {
     db: SqliteDb,
@@ -376,7 +370,7 @@ async fn worktree_of_another_repository_off_the_task_branch_is_never_used() {
         fixture.check(Purpose::Inspect).await,
         "not of the recorded repository",
     );
-    for purpose in [Purpose::Execute, Purpose::Review, Purpose::Hook] {
+    for purpose in [Purpose::Execute, Purpose::Check, Purpose::Hook] {
         assert!(
             fixture.check(purpose).await.is_err(),
             "{purpose:?}: a worktree of the wrong repository is not handed out"
@@ -618,10 +612,9 @@ async fn worktree_behind_the_task_branch_returns_to_it_only_for_a_clean_launch()
     assert_eq!(fixture.head_ref(), fixture.task_ref());
 }
 
-/// Every purpose a Task step uses: launch, review, check, hook, delivery.
-const STEPS: [Purpose; 5] = [
+/// Every purpose a Task step uses: launch, check, hook, delivery.
+const STEPS: [Purpose; 4] = [
     Purpose::Execute,
-    Purpose::Review,
     Purpose::Check,
     Purpose::Hook,
     Purpose::Integrate,
@@ -892,7 +885,7 @@ async fn workspace_root_behind_a_symbolic_link_is_healthy_and_repairable() {
     assert_eq!(valid.repair(), Repair::Recovered);
     assert!(fixture.path.join(".git").exists());
     fixture
-        .check(Purpose::Review)
+        .check(Purpose::Check)
         .await
         .expect("healthy after the repair");
 }

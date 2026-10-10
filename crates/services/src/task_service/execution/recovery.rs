@@ -1505,8 +1505,7 @@ impl TaskService {
         if review_only {
             let id = uuid::Uuid::parse_str(&updated.id)
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            let (task, _) = Box::pin(self.rerun_review(id)).await?;
-            return Ok(task);
+            return Box::pin(self.rerun_review(id)).await;
         }
         Ok(updated)
     }

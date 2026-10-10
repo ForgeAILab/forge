@@ -13,7 +13,7 @@ use crate::{
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Assignee, Result, ServiceError,
 };
-use ::review::{ReviewRequest, ReviewRunner};
+use ::review::ReviewRunner;
 use ::workspace::{RepoCacheLockManager, WorkspaceManager};
 use api_types::{Actor, ProjectSettings, UserActionSource};
 use chrono::{DateTime, Utc};
@@ -70,7 +70,7 @@ mod proposal;
 mod reorder_subtasks;
 mod repository_authority;
 mod review;
-mod review_config;
+pub(crate) use review::retired_review_rerun;
 mod roles;
 pub(crate) use roles::RoleSweepEvent;
 mod subtask;
@@ -231,7 +231,6 @@ use self::{
         executor_snapshot_with_resume_thread, parse_json_value, truncate_utf8_bytes,
     },
     logs::execution_logs_path,
-    review_config::review_config_from_json,
     validation::{serialize_config, validate_required},
     workspace::{default_workspace_root, prepare_workspace, reset_workspace},
 };

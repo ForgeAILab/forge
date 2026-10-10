@@ -915,13 +915,19 @@ impl HeartbeatMonitor {
             });
 
             if let Some(task_service) = self.task_service.as_ref() {
-                if let Err(error) = cascade_recovered_execution(
-                    task_service,
-                    &updated,
-                    stalled_execution_should_block_task(&updated),
-                )
-                .await
-                {
+                // The lease owner names the retired pipeline; the terminal
+                // CAS just released it, so it is read from the row as it was.
+                let settled = if crate::task_service::retired_review_rerun(&execution) {
+                    task_service.settle_retired_review_rerun(&updated).await
+                } else {
+                    cascade_recovered_execution(
+                        task_service,
+                        &updated,
+                        stalled_execution_should_block_task(&updated),
+                    )
+                    .await
+                };
+                if let Err(error) = settled {
                     tracing::warn!(
                         execution_id = %updated.id,
                         task_id = %updated.task_id,
@@ -1654,6 +1660,9 @@ async fn cascade_recovered_execution(
     execution: &Execution,
     block_non_reviewer: bool,
 ) -> Result<()> {
+    if crate::task_service::retired_review_rerun(execution) {
+        return task_service.settle_retired_review_rerun(execution).await;
+    }
     if execution.role == crate::workflow::default_roles::REVIEWER {
         task_service
             .maybe_cascade_executor_completion(&execution.id)

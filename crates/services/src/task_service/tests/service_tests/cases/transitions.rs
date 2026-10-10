@@ -431,16 +431,25 @@ async fn review_rerun_recovers_deleted_worktree_from_existing_branch() {
         .await
         .unwrap());
 
-    let (settled, review) = service
+    let entered = service
         .rerun_review(Uuid::parse_str(&task.id).unwrap())
         .await
         .unwrap();
+    assert_eq!(entered.status, "review", "the retry only re-enters review");
+    let settled = service.drain(&task.id).await.unwrap();
     assert_eq!(settled.status, "merging");
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| review.attempt_number)
+        .unwrap();
     assert_eq!(review.status, ReviewStatus::Passed);
     assert_eq!(review.execution_id, execution.id);
-    // CI-only reruns persist the step array directly; the workflow entry
-    // hook and auditor reviews use an object containing `ci_steps` instead.
-    let steps: Vec<Value> = serde_json::from_str(&review.step_results_json).unwrap();
+    // The retried entry records what every review entry records: an object
+    // whose `ci_steps` lists the commands the check runner ran.
+    let details: Value = serde_json::from_str(&review.step_results_json).unwrap();
+    let steps = details["ci_steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0]["index"], 0);
     assert_eq!(

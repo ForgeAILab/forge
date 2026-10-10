@@ -4638,6 +4638,7 @@ mod audit_worker;
 
 #[path = "tests/durable_23b.rs"]
 mod durable_23b;
+mod rerun_review;
 
 #[tokio::test]
 async fn removed_dispatch_annotation_retries_preserve_a_queued_manual_stop() {

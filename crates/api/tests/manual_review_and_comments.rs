@@ -594,6 +594,7 @@ async fn rerun_review_pass_cascades_through_merge_instead_of_parking() {
         &worktree_path,
     )
     .await;
+    set_review_ci_steps(&harness.state.db, &task_id, &["true"]).await;
 
     let accepted: TaskResponse = json_request(
         &harness.app,
@@ -611,14 +612,9 @@ async fn rerun_review_pass_cascades_through_merge_instead_of_parking() {
         .test_dispatch_task_action(&task_id)
         .await
         .unwrap();
-    let result: TaskResponse = json_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}"),
-        json!(null),
-        StatusCode::OK,
-    )
-    .await;
+    // The retry only re-enters `review`: its checks and verdict come from the
+    // durable entry that the Task's own steps run.
+    let settled = common::drain(&harness.state, &harness.app, &task_id).await;
     let result_review = ReviewRepo::list_by_task(&*harness.state.db, &task_id)
         .await
         .unwrap()
@@ -627,8 +623,9 @@ async fn rerun_review_pass_cascades_through_merge_instead_of_parking() {
         .unwrap();
 
     assert_eq!(result_review.status, db::ReviewStatus::Passed);
-    let settled = common::drain(&harness.state, &harness.app, &result.id).await;
+    assert_eq!(result_review.attempt_number, 2);
     assert_eq!(settled.status, "done");
+    assert_no_synthetic_reviewer_execution(&harness.state.db, &task_id).await;
 }
 
 #[tokio::test]
@@ -666,30 +663,7 @@ async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
         &worktree_path,
     )
     .await;
-    let task = TaskRepo::get_by_id(&*harness.state.db, &task_id, false)
-        .await
-        .expect("Task lookup")
-        .expect("Task exists");
-    TaskRepo::update(
-        &*harness.state.db,
-        UpdateTask {
-            id: task.id.clone(),
-            expected_version: task.version,
-            title: None,
-            description: None,
-            priority: None,
-            merge_config: None,
-            plan: None,
-            error_annotation: None,
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: Some(Some(json!({"review":{"ci_steps":["false"]}}).to_string())),
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("review CI config updates");
+    set_review_ci_steps(&harness.state.db, &task_id, &["false"]).await;
 
     let accepted: TaskResponse = json_request(
         &harness.app,
@@ -707,14 +681,7 @@ async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
         .test_dispatch_task_action(&task_id)
         .await
         .unwrap();
-    let result: TaskResponse = json_request(
-        &harness.app,
-        Method::GET,
-        &format!("/api/v1/tasks/{task_id}"),
-        json!(null),
-        StatusCode::OK,
-    )
-    .await;
+    let result = common::drain(&harness.state, &harness.app, &task_id).await;
     let result_review = ReviewRepo::list_by_task(&*harness.state.db, &task_id)
         .await
         .unwrap()
@@ -725,6 +692,47 @@ async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
     assert_eq!(result_review.status, db::ReviewStatus::Failed);
     assert_eq!(result.status, "in_progress");
     assert!(result.review_passed_at.is_none());
+    assert_no_synthetic_reviewer_execution(&harness.state.db, &task_id).await;
+}
+
+async fn set_review_ci_steps(db: &db::SqliteDb, task_id: &str, steps: &[&str]) {
+    let task = TaskRepo::get_by_id(db, task_id, false)
+        .await
+        .expect("Task lookup")
+        .expect("Task exists");
+    TaskRepo::update(
+        db,
+        UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: Some(Some(json!({"review":{"ci_steps":steps}}).to_string())),
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("review CI config updates");
+}
+
+/// A review-check retry runs no reviewer execution of its own: the only
+/// executions a Task has afterwards are the ones real roles ran.
+async fn assert_no_synthetic_reviewer_execution(db: &db::SqliteDb, task_id: &str) {
+    let agentless: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer' AND agent_id IS NULL",
+    )
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("executions count");
+    assert_eq!(agentless, 0, "no synthetic reviewer execution is created");
 }
 
 // ── Harness ──
