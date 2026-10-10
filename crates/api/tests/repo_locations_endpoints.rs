@@ -350,7 +350,8 @@ async fn accepted_daemon_handshake_retries_shared_mount_verification() {
     assert_eq!(params.daemon_id, registration.daemon_id);
     assert_eq!(params.runtime_id, runtime_id);
     assert_eq!(params.path, fixture.checkout.to_string_lossy());
-    assert_eq!(params.expected_version, location.version);
+    // The verify carries the version its stored result will have.
+    assert_eq!(params.expected_version, location.version + 1);
     let probe = params.probe.expect("shared mount carries probe");
     let probe_path = PathBuf::from(&probe.path);
     assert!(probe_path.starts_with(

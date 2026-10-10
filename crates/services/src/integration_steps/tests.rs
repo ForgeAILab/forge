@@ -1646,6 +1646,15 @@ impl World {
         )
         .await
         .expect("clone");
+        // A clone does not copy the source's local identity.
+        for (key, value) in [
+            ("user.name", "Forge test"),
+            ("user.email", "forge@example.invalid"),
+        ] {
+            git_out(&clone, &["config", key, value])
+                .await
+                .expect("identity");
+        }
         let now = db::now_rfc3339();
         sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('l-c','r','server',?,'managed_clone',0,'ready',?,?)").bind(clone.to_str()).bind(&now).bind(&now).execute(self.db.pool()).await.unwrap();
     }
