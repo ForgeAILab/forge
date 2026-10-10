@@ -265,17 +265,28 @@ pub async fn checks_queued_ahead(
         .await?)
 }
 
-/// Whether a Task waits for a run slot this machine could give: the
-/// scheduler's own wait rows (`'*'` is a slot on whichever machine fits).
+/// Whether a Task waits for a run slot this machine could give. Only the
+/// scheduler's run-slot waits count (`daemon_id = '*'`): a Task that waits
+/// for a machine's readiness or reconnect asks for no slot. A waiter whose
+/// worktree lives on another machine cannot use a slot here, and a Task with
+/// a running execution holds a slot rather than waiting for one.
 pub async fn run_slot_waiters(
     tx: &mut Transaction<'_, Sqlite>,
     machine: Option<&str>,
     embedded_machine_id: &str,
 ) -> Result<bool> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM task_schedule_wait w WHERE w.daemon_id='*'
-            OR CASE WHEN w.daemon_id IN (SELECT id FROM daemon WHERE machine_id=?)
-                THEN 'server_host' ELSE w.daemon_id END = COALESCE(?, 'server_host'))",
+        "SELECT EXISTS(SELECT 1 FROM task_schedule_wait w
+            JOIN task t ON t.id=w.task_id AND t.deleted_at IS NULL
+            LEFT JOIN workspace_placement p ON p.task_id=COALESCE(t.parent_task_id,t.id)
+                AND p.state<>'cleaned'
+            WHERE w.daemon_id='*'
+              AND NOT EXISTS(SELECT 1 FROM execution e WHERE e.task_id=t.id AND e.status='running')
+              AND (p.id IS NULL OR CASE
+                    WHEN COALESCE(p.execution_daemon_id,p.daemon_id) IS NULL
+                      OR COALESCE(p.execution_daemon_id,p.daemon_id) IN (SELECT id FROM daemon WHERE machine_id=?)
+                    THEN 'server_host' ELSE COALESCE(p.execution_daemon_id,p.daemon_id) END
+                  = COALESCE(?, 'server_host')))",
     )
     .bind(embedded_machine_id)
     .bind(machine)

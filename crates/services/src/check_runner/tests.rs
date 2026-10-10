@@ -978,6 +978,103 @@ async fn with_one_slot_the_queued_check_runs_before_the_next_new_run() {
     assert!(one(stream.capacity().await).admits_execution());
 }
 
+/// A queued check reserves a slot only while somebody can still use its
+/// result. The consumer of a Task that was cancelled or left `review` is
+/// cancelled when the worker next looks at the run; until then the run must
+/// not keep a free slot from executions.
+#[tokio::test]
+async fn a_queued_check_whose_task_left_review_reserves_no_slot() {
+    let (_temp, store, runner) = fixture().await;
+    store.server_run_cap.set(Some(2), 2, "server-machine");
+    let stream = SlotStream {
+        store: store.clone(),
+        started: 0,
+    };
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('run','p','run','in_progress',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('run','run','coder','running',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    queue_check(&runner, "left-review", CheckConsumerOrigin::Entry).await;
+    let reserved = stream.capacity().await;
+    assert_eq!(reserved.queued_checks, 1);
+    assert!(reserved.has_capacity() && !reserved.admits_execution());
+    // The Task leaves the status it asked from (cancel, hold, a new entry).
+    sqlx::query("UPDATE task SET status_epoch=status_epoch+1 WHERE id='t'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let released = stream.capacity().await;
+    assert_eq!(released.queued_checks, 0);
+    assert!(released.admits_execution());
+    // The same for a deleted Task.
+    sqlx::query("UPDATE task SET status_epoch=status_epoch-1 WHERE id='t'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(stream.capacity().await.queued_checks, 1);
+    sqlx::query("UPDATE task SET deleted_at=? WHERE id='t'")
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(stream.capacity().await.admits_execution());
+}
+
+/// Rule 3 (checks stay within their share while a Task waits for a run
+/// slot) counts only Tasks that really wait for a slot this machine could
+/// give: not a readiness or reconnect wait that names the machine, not a
+/// Task that holds a slot, not a Task whose worktree is on another machine.
+#[tokio::test]
+async fn only_real_run_slot_waiters_hold_checks_to_their_share() {
+    let (temp, store, _runner) = fixture().await;
+    let now = db::now_rfc3339();
+    let waiters = |machine: Option<&'static str>| {
+        let store = store.clone();
+        async move {
+            let mut tx = db::begin_immediate(store.pool()).await.unwrap();
+            db::machine_capacity::run_slot_waiters(&mut tx, machine, "server-machine")
+                .await
+                .unwrap()
+        }
+    };
+    for id in ["named", "holder", "placed", "waiter"] {
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES(?,'p','w','in_progress',?,?)").bind(id).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    }
+    // Waits for the machine's readiness, not for a slot.
+    store
+        .schedule_wait("named", ("p", false), None, Some("server-daemon"), None)
+        .await
+        .unwrap();
+    assert!(!waiters(None).await);
+    assert!(!waiters(Some("server-daemon")).await);
+    // Holds a slot itself.
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('holder','holder','interactive','running',?,?)").bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    store
+        .schedule_wait("holder", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    assert!(!waiters(None).await);
+    // Its worktree is on the server: a slot on another machine is no use.
+    sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES('w','placed','r',?,'task/branch','ready',?,?)").bind(temp.path().to_str()).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('l','r','server',?,'primary_checkout',1,'ready',?,?)").bind(temp.path().to_str()).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES('pl','w','placed','server','l',?,1,'ready','scheduler','{}',?,?)").bind(temp.path().to_str()).bind(&now).bind(&now).execute(store.pool()).await.unwrap();
+    store
+        .schedule_wait("placed", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    assert!(!waiters(Some("another-machine")).await);
+    assert!(waiters(None).await);
+    sqlx::query("DELETE FROM task_schedule_wait WHERE task_id='placed'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    // No worktree yet: whichever machine has room.
+    store
+        .schedule_wait("waiter", ("p", false), None, Some("*"), None)
+        .await
+        .unwrap();
+    assert!(waiters(None).await && waiters(Some("another-machine")).await);
+}
+
 /// A check that stops holding or reserving a slot is a release for the Tasks
 /// that wait for a run slot: its end, the cancellation of a queued one, and
 /// its last consumer giving up each mark those waiters. Before, only the end

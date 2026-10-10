@@ -34,10 +34,15 @@ base_jobs AS (
 ), check_queue AS (
     -- Queued checks somebody still waits for, in admission order: review
     -- entry, then integration head, then the rest; oldest first within each.
+    -- A consumer whose Task was deleted or left the status it asked from
+    -- waits for nothing (the check worker cancels it when it next looks at
+    -- the run): its run reserves no slot in the meantime.
     SELECT r.id, r.created_at, CASE WHEN r.machine_id IS NULL OR r.machine_id IN (SELECT id FROM embedded)
         THEN 'server_host' ELSE r.machine_id END AS machine_key,
         (SELECT MIN(CASE c.origin WHEN 'entry' THEN 0 WHEN 'integration' THEN 1 ELSE 2 END)
-         FROM check_consumer c WHERE c.run_id=r.id AND c.cancelled_at IS NULL) AS queue_rank
+         FROM check_consumer c WHERE c.run_id=r.id AND c.cancelled_at IS NULL
+           AND EXISTS(SELECT 1 FROM task t WHERE t.id=c.task_id AND t.status_epoch=c.status_epoch
+                      AND t.deleted_at IS NULL)) AS queue_rank
     FROM check_run r WHERE r.state='queued'
 ), runs AS (
     SELECT machine_key, running_executions, reservations, active_chat_turns, 0 AS check_runs, 0 AS borrowed_check_runs, 0 AS queued_checks FROM physical_jobs

@@ -45,13 +45,6 @@ pub(crate) async fn task_blocked(
     {
         return Ok(None);
     }
-    // A Task never waits for the slot it holds itself. The dispatcher asks
-    // this for Tasks in flight too (so a stale wait is retired); the Task's
-    // own running execution is what filled the machine, and its follow-up
-    // (retry, review entry, reviewer) asks again after that execution ended.
-    if task_holds_run_slot(db, &task.id).await? {
-        return Ok(None);
-    }
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("project", &task.project_id))?;
@@ -72,6 +65,13 @@ pub(crate) async fn task_blocked(
                 .and_then(crate::workflow::effective_role)
         })
         .unwrap_or("coder");
+    // A Task never waits for the slot it holds itself. The dispatcher asks
+    // this for Tasks in flight too (so a stale wait is retired); the Task's
+    // own running execution is what filled the machine, and its follow-up
+    // (retry, review entry, reviewer) asks again after that execution ended.
+    if task_holds_run_slot(db, &task.id, role).await? {
+        return Ok(None);
+    }
     let prepared = super::context::prepare_selection(db, task, Some(agent), role, adapters).await?;
     let binding = WorkspacePlacementRepo::get_for_task(db, &task.id).await?;
     if binding
@@ -126,14 +126,27 @@ pub(crate) async fn task_blocked(
     })
 }
 
-/// Whether one of the Task's own executions is running. A live reservation
-/// needs no clause: a placement that is not `ready` or `cleaned` already ends
-/// the precheck above the selection.
-async fn task_holds_run_slot(db: &db::SqliteDb, task_id: &str) -> Result<bool> {
+/// Whether the Task's own run of this role is running: the Task is in flight
+/// for it and nothing more is dispatched until that run ends. A running
+/// execution of another kind (an interactive session, a run of another role)
+/// is not that: a dispatch for `role` then needs a second slot, and the
+/// reserve and start transactions count the first one against it. Answering
+/// "not waiting" there had the dispatcher retire the wait, try, be refused
+/// and record the wait again on every pass. A live reservation needs no
+/// clause: a placement that is not `ready` or `cleaned` already ends the
+/// precheck above the selection.
+async fn task_holds_run_slot(db: &db::SqliteDb, task_id: &str, role: &str) -> Result<bool> {
+    let executor = if role == crate::workflow::default_roles::CODER {
+        "executor"
+    } else {
+        role
+    };
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND status = 'running')",
+        "SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND status = 'running' AND role IN (?, ?))",
     )
     .bind(task_id)
+    .bind(role)
+    .bind(executor)
     .fetch_one(db.pool())
     .await?)
 }

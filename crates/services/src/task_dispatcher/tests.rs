@@ -8084,6 +8084,60 @@ async fn machine_capacity_task_does_not_wait_for_its_own_slot() {
     let task = machine_capacity_task(&db, &running.id).await;
     assert!(deferred_dispatch::dispatch_disposition(&task).is_none());
 
+    // A running execution that is not the Task's run of the role asked for
+    // (an interactive session) holds a slot, and a coder dispatch needs a
+    // second one: the Task does wait, and the wait is stable. Answering "not
+    // waiting" had every pass retire the wait, try, be refused by the
+    // reserve transaction and record the wait again.
+    let session = seed_task(&db, &project_id, "SESSION", "in_progress", 0).await;
+    assign_role(&db, &session.id, "coder", &agent_id).await;
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE task_id = ?")
+        .bind(&running.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    seed_running_execution(&db, &session.id, &agent_id, "interactive").await;
+    let task = machine_capacity_task(&db, &session.id).await;
+    assert!(dispatcher
+        .task_service
+        .capacity_wait_for(&task, &agent, Some("coder"))
+        .await
+        .unwrap()
+        .is_some());
+    dispatcher.check_once_and_drain().await.unwrap();
+    dispatcher.check_once_and_drain().await.unwrap();
+    let settled = machine_capacity_task(&db, &session.id).await;
+    assert_eq!(
+        deferred_dispatch::current_dispatch_disposition(&settled)
+            .map(|wait| wait.capability)
+            .as_deref(),
+        Some("machine_capacity")
+    );
+    for _ in 0..3 {
+        dispatcher.check_once_and_drain().await.unwrap();
+        let again = machine_capacity_task(&db, &session.id).await;
+        assert_eq!(again.version, settled.version, "the wait is rewritten");
+    }
+    let runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
+    )
+    .bind(&session.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(runs, 1, "a second run was admitted over the cap");
+    sqlx::query("UPDATE execution SET status = 'completed' WHERE task_id = ?")
+        .bind(&session.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task SET status = 'done' WHERE id = ?")
+        .bind(&session.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    seed_running_execution(&db, &running.id, &agent_id, "coder").await;
+
     // Another Task on the same machine does wait for it.
     let queued = seed_task(&db, &project_id, "WAIT", "todo", 0).await;
     assign_role(&db, &queued.id, "coder", &agent_id).await;
