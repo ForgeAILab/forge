@@ -1502,6 +1502,8 @@ async fn a_rebased_head_waits_for_a_ready_placement_before_it_asks_for_the_check
                 parked.failure_message
             );
             assert!(parked.available_at.is_some(), "retried by the sweep");
+            // Parked means out of the slot: the queue goes on without it.
+            assert!(world.queue_of(&a).await.head_attempt_id.is_none());
         }
     }
 }

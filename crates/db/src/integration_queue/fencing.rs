@@ -371,7 +371,12 @@ async fn verify_effect_owner(
     request: &IntegrationEffectRequest,
 ) -> Result<Option<IntegrationEffectRefusal>> {
     if is_task_step(request) {
-        return Ok(None);
+        // Today's merge path: the step's own fence names its owner. It
+        // never performs an effect for another one.
+        return Ok(request
+            .witness
+            .get("effect_owner")
+            .map(|_| IntegrationEffectRefusal::ForeignOwner));
     }
     let a = attempt_in_tx(tx, &request.fence.attempt_id).await?;
     let target = &request.fence.target_owner;
@@ -1558,6 +1563,86 @@ mod tests {
         assert_eq!(claimed.head_attempt_id.as_deref(), Some(b.id.as_str()));
     }
 
+    /// The owner lock follows the owner that performs the effect, and a
+    /// rebase locks only the Task's own worktree there. Two queues whose
+    /// heads are placed on one daemon rebase at the same time: neither waits
+    /// for the other, and the default checkout's owner is not locked at all.
+    /// The same worktree is still one effect at a time.
+    #[tokio::test]
+    async fn two_queues_rebasing_on_one_task_owner_do_not_wait_for_each_other() {
+        let db = fixture().await;
+        let now = now_rfc3339();
+        let mut guards = Vec::new();
+        let mut fences = Vec::new();
+        for (branch, task, handle) in [("main", "a", "tree-a"), ("release", "b", "tree-b")] {
+            let q = db
+                .create_or_get_integration_queue("r", branch)
+                .await
+                .unwrap();
+            let mut admitted = admission(&q, task, branch);
+            admitted.owner_kind = Some(IntegrationOwnerKind::Daemon);
+            admitted.daemon_id = Some("d".into());
+            admitted.runtime_id = Some("rt".into());
+            let a = db.admit_integration_attempt(admitted).await.unwrap();
+            let q = db.integration_queue(&q.id).await.unwrap().unwrap();
+            db.claim_integration_queue(&q.id, q.revision, "worker", &now, "2099-01-01T00:00:00Z")
+                .await
+                .unwrap();
+            let fence = db.integration_owner_fence(&a.id).await.unwrap().unwrap();
+            fences.push(fence.clone());
+            let request = IntegrationEffectRequest {
+                fence,
+                kind: IntegrationOperationKind::Rebase,
+                witness: serde_json::json!({"workspace":{"handle":handle},"effect_owner":{"location_id":"task-location","owner_kind":"daemon","daemon_id":"d","runtime_id":"rt"}}),
+            };
+            // The first queue's rebase is still in flight (its guard is held).
+            let admitted = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                db.begin_integration_effect(request),
+            )
+            .await
+            .expect("a rebase does not wait behind another queue's rebase")
+            .unwrap();
+            let IntegrationEffectAdmission::Started(mut guard) = admitted else {
+                panic!("not admitted");
+            };
+            assert!(guard.start().await.unwrap().is_none());
+            guards.push(guard);
+        }
+        // Both are listed for the daemon that performs them.
+        assert_eq!(
+            db.outstanding_integration_effects("daemon", Some("d"))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        // The server's default checkout is free meanwhile: its lock is not
+        // one of the two held (taking it does not wait).
+        let server = IntegrationEffectRequest {
+            fence: fences[0].clone(),
+            kind: IntegrationOperationKind::FastForward,
+            witness: serde_json::json!({}),
+        };
+        let free = tokio::time::timeout(std::time::Duration::from_secs(5), lock_owner(&server))
+            .await
+            .expect("the target owner's checkout lock is not held by a rebase elsewhere");
+        drop(free);
+        // The same worktree on that daemon is one effect at a time.
+        let same = IntegrationEffectRequest {
+            fence: fences[1].clone(),
+            kind: IntegrationOperationKind::Rebase,
+            witness: serde_json::json!({"workspace":{"handle":"tree-a"},"effect_owner":{"location_id":"task-location","owner_kind":"daemon","daemon_id":"d","runtime_id":"rt"}}),
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), lock_owner(&same))
+                .await
+                .is_err(),
+            "one worktree, one effect"
+        );
+        drop(guards);
+    }
+
     #[tokio::test]
     async fn machine_removal_settles_attempt_and_preserves_quarantine() {
         for quarantined in [false, true] {
@@ -1622,6 +1707,21 @@ mod tests {
                 }
             );
             assert!(q.lease_owner.is_none());
+            // A parked attempt gives up the slot with the removal; a
+            // quarantined one keeps it, its queue re-opens through it.
+            assert_eq!(
+                settled.state,
+                if quarantined {
+                    IntegrationAttemptState::Quarantined
+                } else {
+                    IntegrationAttemptState::Parked
+                }
+            );
+            assert_eq!(
+                q.head_attempt_id,
+                quarantined.then(|| a.id.clone()),
+                "quarantined={quarantined}"
+            );
             drop(guard);
         }
     }

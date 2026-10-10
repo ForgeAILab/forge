@@ -6356,6 +6356,119 @@ async fn two_daemons_rebase_conflict_sends_the_task_back_with_the_conflict_hando
     let _ = (&second.runtime, &second.token);
 }
 
+/// Two daemons, lost fast-forward reply: the Task is on one daemon, the
+/// default checkout on the other, whose reply is lost with its connection.
+/// The Task's daemon stays connected and is never asked about that effect;
+/// the receipt comes from the daemon that performed it when it is back, and
+/// the branch is moved once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_daemons_lost_fast_forward_reply_is_settled_by_the_target_daemon_alone() {
+    use db::IntegrationOperationKind as Kind;
+    let mut fixture = Fixture::file_backed("forge-queue-two-daemons-ff-lost").await;
+    let second = extra_daemon(&fixture, "forge-queue-two-daemons-ff-lost").await;
+    let (resolved, task_clone, candidate) = daemon_clone_task(
+        &fixture,
+        &second.daemon_id,
+        &second.runtime_id,
+        second.root.path(),
+    )
+    .await;
+    let head = admit_placed_head(&fixture, &resolved.placement, candidate, &[]).await;
+    fixture
+        .link
+        .as_ref()
+        .unwrap()
+        .drop_replies
+        .lock()
+        .unwrap()
+        .insert(METHOD_WORKSPACE_MERGE.into());
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(600));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while git::get_current_sha(&fixture.checkout).await.unwrap() != head.candidate {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the target's daemon fast-forwards the transferred candidate");
+    assert_eq!(
+        attempt_requests(fixture.link.as_ref().unwrap(), METHOD_WORKSPACE_MERGE).len(),
+        1
+    );
+    fixture.link.take();
+    common::fake_daemon::wait_until_disconnected(&fixture.harness.state, &fixture.daemon_id).await;
+    queue_eventually!(
+        &fixture,
+        &head,
+        "the head to hold an unknown fast-forward",
+        {
+            let attempt = queue_attempt(&fixture, &head).await;
+            attempt.effect_intent_json.is_some()
+                && matches!(
+                    attempt.state,
+                    db::IntegrationAttemptState::Reconciling
+                        | db::IntegrationAttemptState::Quarantined
+                )
+        }
+    );
+    {
+        // The unknown effect belongs to the default checkout's daemon. The
+        // Task's daemon is connected and has nothing to say about it: the
+        // head stays unknown until the performing owner is back.
+        let attempt = queue_attempt(&fixture, &head).await;
+        let intent = attempt.effect_intent_json.clone().unwrap();
+        assert!(intent["request"]["witness"].get("effect_owner").is_none());
+        assert_eq!(
+            intent["request"]["fence"]["target_owner"]["daemon_id"],
+            json!(fixture.daemon_id)
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(queue_attempt(&fixture, &head)
+            .await
+            .effect_intent_json
+            .is_some());
+        assert_eq!(task_status(&fixture, &head.task_id).await, "merging");
+    }
+    let reflog = git_sync(&fixture.checkout, &["reflog", "--all"]);
+    fixture.reconnect().await;
+    queue_eventually!(
+        &fixture,
+        &head,
+        "the Task to be done after the reconnect",
+        {
+            task_status(&fixture, &head.task_id).await == "done"
+                && queue_attempt(&fixture, &head).await.state
+                    == db::IntegrationAttemptState::Completed
+        }
+    );
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let attempt = queue_attempt(&fixture, &head).await;
+    assert_eq!(
+        attempt.integrated_sha.as_deref(),
+        Some(head.candidate.as_str())
+    );
+    assert_eq!(
+        receipt_owners(&attempt, Kind::FastForward),
+        vec![(
+            db::IntegrationOperationState::Succeeded,
+            Some(fixture.daemon_id.clone())
+        )]
+    );
+    assert!(
+        attempt_requests(fixture.link.as_ref().unwrap(), METHOD_WORKSPACE_MERGE).is_empty(),
+        "the fast-forward was not repeated after the reconnect"
+    );
+    assert!(
+        attempt_requests(second.link.as_ref().unwrap(), METHOD_WORKSPACE_MERGE).is_empty(),
+        "the Task's daemon was never asked to fast-forward"
+    );
+    assert_eq!(git_sync(&fixture.checkout, &["reflog", "--all"]), reflog);
+    queue_eventually!(&fixture, &head, "the transfer refs to be released", {
+        integration_refs(&fixture.checkout).is_empty() && integration_refs(&task_clone).is_empty()
+    });
+    let _ = (&second.runtime, &second.token);
+}
+
 /// Two clones on ONE daemon: the Task in one, the default checkout in the
 /// other. One owner performs both effects; the fast-forward takes the
 /// candidate from the transferred ref (the clones share no Git common dir).

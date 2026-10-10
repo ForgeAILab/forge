@@ -1736,6 +1736,81 @@ mod tests {
             }
         }
     }
+    /// The server stops in the middle of a transferred fast-forward (the
+    /// Task's checkout is on another machine). At the next start the intent
+    /// is settled from the default checkout alone: a branch that never moved
+    /// is "not performed", a branch at the candidate is the merge, proven
+    /// and not repeated.
+    #[tokio::test]
+    async fn a_server_restart_during_a_transferred_fast_forward_is_settled_from_the_checkout() {
+        for landed in [false, true] {
+            let f = fixture_with_storage(true).await;
+            let away = EffectWorkspace {
+                owner: EffectOwner::Daemon {
+                    daemon_id: "d".into(),
+                    runtime_id: "rt".into(),
+                },
+                ..f.workspace.clone()
+            };
+            let request = IntegrationEffectRequest {
+                fence: f.fence.clone(),
+                kind: IntegrationOperationKind::FastForward,
+                witness: json!({"workspace":away,"target_branch":"main","task_branch":"candidate","expected_head_sha":f.head,"expected_target_sha":f.target,"reviewed":{"commit_sha":f.head,"base_sha":f.target}}),
+            };
+            let IntegrationEffectAdmission::Started(mut guard) =
+                f.db.begin_integration_effect(request.clone()).await.unwrap()
+            else {
+                panic!("not admitted");
+            };
+            assert!(guard.start().await.unwrap().is_none());
+            // The process dies here, before or after the branch moved.
+            drop(guard);
+            if landed {
+                let applied = git::integration::fast_forward_exact(
+                    &f.repo,
+                    "main",
+                    &f.head,
+                    &f.target,
+                    git::integration::FastForwardLimits {
+                        deadline: Duration::from_secs(30),
+                        output_bytes: 64 * 1024,
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    applied,
+                    git::integration::MergeApplyOutcome::Applied
+                ));
+            }
+            let reflog = git_at(&f.repo, &["reflog", "--all"]).await;
+            ServerIntegrationOwner::new(f.db.clone())
+                .reconcile_outstanding()
+                .await
+                .unwrap();
+            let receipt =
+                f.db.integration_effect_receipt(&request)
+                    .await
+                    .unwrap()
+                    .expect("settled at start");
+            if landed {
+                assert_eq!(receipt.operation_state, IntegrationOperationState::Succeeded);
+                assert_eq!(receipt.result["outcome"]["Done"]["after_sha"], json!(f.head));
+            } else {
+                assert_eq!(receipt.operation_state, IntegrationOperationState::Failed);
+                assert_eq!(receipt.result["kind"], "not_performed");
+            }
+            assert_eq!(git_at(&f.repo, &["reflog", "--all"]).await, reflog);
+            assert!(f
+                .db
+                .integration_attempt(&f.fence.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .effect_intent_json
+                .is_none());
+        }
+    }
     /// A Task's checkout that is not on this server can never be merged
     /// here without a reviewed candidate (there is no worktree to merge).
     #[tokio::test]

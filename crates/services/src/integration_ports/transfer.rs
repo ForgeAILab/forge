@@ -304,6 +304,19 @@ impl ObjectTransferPort for OwnerObjectTransfer {
                 ))
             }
         };
+        // The source says which commit it packed. Only the commit that was
+        // asked for is imported: the ref a key binds on the receiver can
+        // then never hold anything else.
+        if export.tip_sha != request.want {
+            if let End::Daemon(daemon) = &source {
+                self.client
+                    .release_objects(daemon.daemon_id, daemon.runtime_id, &key)
+                    .await;
+            }
+            return Err(ServiceError::invalid_operation(
+                "object transfer export returned another commit than the one asked for",
+            ));
+        }
         let outcome = if export.total_bytes > request.max_bytes {
             Ok(ObjectTransferOutcome::TooLarge {
                 bytes: export.total_bytes,
