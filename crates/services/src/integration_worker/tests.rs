@@ -72,6 +72,9 @@ struct FakeSteps {
     dead: Mutex<HashSet<String>>,
     /// Every deciding step of these Tasks dies instead of answering.
     dying: Mutex<HashSet<String>>,
+    /// Steps that settled without applying because their Task had left the
+    /// status entry of the attempt (`task|causation key`).
+    left: Mutex<HashSet<String>>,
 }
 impl FakeSteps {
     fn hold(&self, task: &str, action: IntegrationStepAction) {
@@ -233,7 +236,9 @@ impl IntegrationStepPort for FakeSteps {
     }
     async fn step_state(&self, request: &IntegrationStepRequest) -> Result<IntegrationStepState> {
         let key = format!("{}|{}", request.task_id, request.causation_key());
-        Ok(if self.dead.lock().unwrap().contains(&key) {
+        Ok(if self.left.lock().unwrap().contains(&key) {
+            IntegrationStepState::TaskLeft
+        } else if self.dead.lock().unwrap().contains(&key) {
             IntegrationStepState::Dead
         } else if self.answered.lock().unwrap().contains(&key) {
             IntegrationStepState::Done
@@ -2179,6 +2184,147 @@ async fn a_waiting_check_is_asked_again_and_an_applied_head_re_arms_its_result()
     world.steps.unhold("a", IntegrationStepAction::Result);
     world.settle(&mut pump).await;
     assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+}
+
+/// The `clear` path of the release-step sweep. An attempt cancelled because
+/// its Task left `merging` tells the Task through one `clear` step. One that
+/// settled without applying (dead, or refused because the Task had left its
+/// entry, which a cancelled attempt's Task has by definition) is asked again
+/// under the next key, three times, without writing the terminal attempt
+/// row; then the queue says so in `last_error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_clear_step_is_asked_again_three_times_then_the_queue_says_so() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "base", "from a\n").await;
+    // The Task leaves `merging` before its head is validated.
+    sqlx::query("UPDATE task SET status='cancelled' WHERE id='a'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let mut pump = Pump::new(world.worker());
+    world.settle(&mut pump).await;
+    let cancelled = world.attempt(&a.id).await;
+    assert_eq!(cancelled.state, S::Cancelled);
+    assert!(cancelled.cancel_requested_at.is_none());
+    let clears = || -> Vec<i64> {
+        world
+            .steps
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.task_id == "a" && request.action == IntegrationStepAction::Clear
+            })
+            .map(|request| request.effect_seq)
+            .collect()
+    };
+    let key = |seq: i64| format!("a|integration:{}:{seq}:clear", a.id);
+    assert_eq!(clears(), vec![cancelled.effect_seq]);
+    // A healthy step is never asked again.
+    assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    assert_eq!(clears(), vec![cancelled.effect_seq]);
+    for round in 0..3 {
+        // Dead, or refused because the Task left: both are asked again.
+        let settled = key(cancelled.effect_seq + round);
+        if round == 1 {
+            world.steps.left.lock().unwrap().insert(settled);
+        } else {
+            world.steps.dead.lock().unwrap().insert(settled);
+        }
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+        assert_eq!(
+            clears(),
+            (0..=round + 1)
+                .map(|extra| cancelled.effect_seq + extra)
+                .collect::<Vec<_>>()
+        );
+        // Asked once per settled step, not once per sweep.
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+        assert_eq!(clears().len() as i64, round + 2);
+        assert!(world.queue_of(&a).await.last_error.is_none());
+        // The terminal row is not written again.
+        assert_eq!(world.attempt(&a.id).await.revision, cancelled.revision);
+    }
+    // The third re-ask settled without applying too: the owner is told, once.
+    world
+        .steps
+        .dead
+        .lock()
+        .unwrap()
+        .insert(key(cancelled.effect_seq + 3));
+    assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    let queue = world.queue_of(&a).await;
+    let message = queue.last_error.clone().unwrap();
+    assert!(
+        message.starts_with("task_step_failed: the `clear` step of Task a"),
+        "{message}"
+    );
+    for _ in 0..3 {
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    }
+    assert_eq!(clears().len(), 4, "the first ask and three re-asks");
+    assert_eq!(world.queue_of(&a).await.revision, queue.revision);
+    let now = world.attempt(&a.id).await;
+    assert_eq!(now.state, S::Cancelled);
+    assert_eq!(now.revision, cancelled.revision);
+}
+
+/// The `TaskLeft` path of the release-step sweep. A `send_back` step that
+/// settled without applying because its Task had left the status entry of
+/// the attempt is not asked again: the Task moved on by another route and
+/// there is nothing left to tell it. The attempt records that once, and the
+/// queue's owner is not bothered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_step_whose_task_left_is_not_asked_again() {
+    let world = World::new().await;
+    let a = world.add_task("r", "a", "base", "from a\n").await;
+    let b = world.add_task("r", "b", "base", "from b\n").await;
+    let mut pump = Pump::new(world.worker());
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+    let ejected = world.attempt(&b.id).await;
+    assert_eq!(ejected.state, S::Ejected);
+    let send_backs = || {
+        world
+            .steps
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.task_id == "b" && request.action == IntegrationStepAction::SendBack
+            })
+            .count()
+    };
+    assert_eq!(send_backs(), 1);
+    world.steps.left.lock().unwrap().insert(format!(
+        "b|integration:{}:{}:send_back",
+        b.id, ejected.effect_seq
+    ));
+    assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    let now = world.attempt(&b.id).await;
+    assert_eq!(now.state, S::Ejected);
+    assert_eq!(now.effect_seq, ejected.effect_seq, "no new ask");
+    assert_eq!(send_backs(), 1);
+    let journal = now.operation_receipts_json.as_array().unwrap().clone();
+    let noted: Vec<_> = journal
+        .iter()
+        .filter(|entry| entry["kind"] == "worker_reask_exhausted")
+        .collect();
+    assert_eq!(noted.len(), 1, "{journal:?}");
+    assert_eq!(noted[0]["reason"], "task_left");
+    assert_eq!(noted[0]["action"], "send_back");
+    assert!(journal.iter().all(|entry| entry["kind"] != "worker_reask"));
+    assert!(world.queue_of(&b).await.last_error.is_none());
+    // Noted once: later sweeps leave the attempt and the queue alone.
+    let queue_revision = world.queue_of(&b).await.revision;
+    for _ in 0..3 {
+        assert!(pump.worker.sweep_once().await.unwrap().is_empty());
+    }
+    assert_eq!(world.attempt(&b.id).await.revision, now.revision);
+    assert_eq!(world.queue_of(&b).await.revision, queue_revision);
+    assert_eq!(send_backs(), 1);
 }
 
 /// Blocker 6 of the D2a review. A released attempt's `send_back` step that
