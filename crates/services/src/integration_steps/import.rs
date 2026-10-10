@@ -27,20 +27,20 @@
 //! | `applied` (the merge landed and was recorded) | this step: evidence, comment, `done`, then the attempt is completed |
 //! | `reconciling` (unknown result) | the queue worker's owner lookup; this step states the phase |
 //! | `queued`, Task in a merge state | the queue worker; this step states `waiting` (a row without the owner fields is admitted again first) |
-//! | `queued` on a clean-rebase bridge, Task in `merge_failed` / `review` | this step returns the Task to the merge state (bridge `integration_import`); the entry admits it |
+//! | any state, Task not in a merge state (repair, re-review, the old clean-rebase bounce) | the Task's own flow; nothing is written and the next merge entry supersedes the row |
 //! | `parked` under a Project pause marker | this step clears the marker and admits the Task again; the worker holds it while the Project is paused |
+//! | `parked` until the candidate is read (a rebase the old path started or finished, a stored review carry) | this step admits the Task again; a rebased commit is admitted against the commit its review passed, so the head checks it and the review is carried |
 //! | `parked` with a deadline | the worker's sweep at the deadline; this step states the wait |
 //! | `parked` / `quarantined` otherwise | the owner's existing action; this step states why |
 //! | `ejected`, `needs_review` | the repair or review already in progress; nothing is written |
 use super::{attempt_ref, bounded, IntegrationSteps, StepOutcome, TaskStepIntegrationPort};
 use crate::{
     integration_worker::{IntegrationStepAction, IntegrationStepRequest},
-    workflow::engine::{WorkflowAuthority, WorkflowEngine},
+    workflow::engine::WorkflowEngine,
     Result, ServiceError,
 };
 use api_types::{
-    IntegrationDeferralCause, IntegrationPhase, IntegrationReason, TransitionBridge,
-    TransitionBridgeKind,
+    IntegrationDeferralCause, IntegrationPhase, IntegrationReason,
 };
 use db::{
     ConditionStatement, IntegrationAttempt, IntegrationAttemptState as S, IntegrationQueueRepo,
@@ -89,21 +89,18 @@ fn import_priority(attempt: &IntegrationAttempt) -> Option<u64> {
         .and_then(|source| source["priority"].as_u64())
 }
 
-/// The importer classified the row as "queued, once a fact only the Task's
-/// checkout can give is read" (the candidate's present HEAD): admission
-/// reads it.
+/// The importer classified the row as "continues in the queue once a fact
+/// only the Task's checkout can give is read": the candidate's present HEAD
+/// (rows P4, P11, P12, P18), a rebase the old path started (P5) or finished
+/// (P6), or a stored review carry (P9). Admission reads the HEAD and the
+/// head's validation reads the rest: a stopped rebase parks typed, a
+/// rebased commit is checked and its review carried, a carried commit is
+/// matched against the newest carry.
 fn needs_fact_to_queue(attempt: &IntegrationAttempt) -> bool {
-    attempt.resume_state == Some(S::Queued)
-        && attempt.failure_kind == Some(db::IntegrationFailureKind::NeedsFact)
-}
-
-/// An imported clean-rebase bridge whose Task is not in a merge state: the
-/// Task goes back to the merge state before anything may claim the row.
-fn returns_to_merge(attempt: &IntegrationAttempt, in_merge_state: bool) -> bool {
-    !in_merge_state
-        && import_priority(attempt) == Some(6)
-        && (attempt.state == S::Queued
-            || (attempt.state == S::Parked && attempt.resume_state == Some(S::Queued)))
+    matches!(
+        attempt.resume_state,
+        Some(S::Queued | S::Rebasing | S::Checking | S::Validating)
+    ) && attempt.failure_kind == Some(db::IntegrationFailureKind::NeedsFact)
 }
 
 /// Run the importer to its end and enqueue the continuation steps. Called
@@ -143,34 +140,12 @@ pub async fn import_at_start(db: &Arc<SqliteDb>) -> Result<ImportReport> {
 }
 
 async fn enqueue_continuation(db: &Arc<SqliteDb>, attempt_id: &str) -> Result<bool> {
-    let Some(mut attempt) = db.integration_attempt(attempt_id).await? else {
+    let Some(attempt) = db.integration_attempt(attempt_id).await? else {
         return Ok(false);
     };
     let Some(task) = TaskRepo::get_by_id(&**db, &attempt.task_ref, false).await? else {
         return Ok(false);
     };
-    let Some(project) = db::ProjectRepo::get_by_id(&**db, &task.project_id).await? else {
-        return Ok(false);
-    };
-    let workflow = WorkflowEngine::resolve_workflow_for_task(
-        &task,
-        &project.workflow_definition,
-        &crate::worker_runtime::queue::cascade_actor(),
-    );
-    if returns_to_merge(&attempt, merge_state(&workflow, &attempt.expected_status))
-        && attempt.state == S::Queued
-    {
-        // Nothing may claim this row: the Task is not in a merge state. The
-        // step returns the Task there and its entry admits a successor.
-        let mut parked = attempt.clone();
-        parked.state = S::Parked;
-        parked.resume_state = Some(S::Queued);
-        match db.transition_integration_attempt(parked).await {
-            Ok(updated) => attempt = updated,
-            Err(db::DbError::VersionConflict | db::DbError::InvalidTransition) => return Ok(false),
-            Err(error) => return Err(error.into()),
-        }
-    }
     let request = IntegrationStepRequest {
         task_id: attempt.task_ref.clone(),
         queue_id: attempt.queue_id.clone().unwrap_or_default(),
@@ -272,12 +247,10 @@ impl IntegrationSteps {
 
         match attempt.state {
             S::Applied if in_merge_state => self.import_applied(step, request, &attempt).await,
-            // A clean-rebase bridge left the Task in `merge_failed` / `review`
-            // (the row was parked at start so nothing could claim it).
-            S::Queued | S::Parked if returns_to_merge(&attempt, in_merge_state) => {
-                self.import_return_to_merge(step, &attempt, &task, &project, &workflow)
-                    .await
-            }
+            // Not in a merge state (a conflict repair, a re-review, or the
+            // old clean-rebase bounce between `merging` and `review`): the
+            // Task's own flow continues exactly as before the upgrade, and
+            // its next entry of the merge state supersedes this row.
             S::Queued | S::Parked if !in_merge_state => Ok(StepOutcome::Skip(
                 "the Task is not in a merge state; its own flow continues".into(),
             )),
@@ -461,62 +434,6 @@ impl IntegrationSteps {
         if let Some(worker) = self.task_service.integration_worker() {
             worker.notify_answered();
         }
-        Ok(StepOutcome::Settled)
-    }
-
-    /// Return a Task that sits between `merging` and its re-review on a clean
-    /// rebase to the merge state, once. No coder, no reviewer, no budget:
-    /// the bridge that brought it here was already charged.
-    async fn import_return_to_merge(
-        &self,
-        step: &TaskStep,
-        attempt: &IntegrationAttempt,
-        task: &db::Task,
-        project: &db::Project,
-        workflow: &api_types::WorkflowDefinition,
-    ) -> Result<StepOutcome> {
-        let Some(target) = workflow
-            .states
-            .iter()
-            .find(|state| merge_state(workflow, &state.name))
-            .map(|state| state.name.clone())
-        else {
-            return Ok(StepOutcome::Skip("the workflow has no merge state".into()));
-        };
-        let follow_up = self
-            .engine
-            .bind(&self.task_service)
-            .cascade_step_input(
-                task,
-                workflow,
-                target,
-                "the merge queue continues a rebase that was in flight before the upgrade"
-                    .to_owned(),
-                TransitionBridge::new(TransitionBridgeKind::IntegrationImport),
-                false,
-                false,
-                Some(WorkflowAuthority {
-                    project_version: project.version,
-                    workflow_definition: project.workflow_definition.clone(),
-                    clear_review_passed_at_on_commit: false,
-                }),
-                Some(step),
-                format!("{}:cascade", step.causation_key),
-                Some(attempt.expected_epoch),
-            )
-            .await?;
-        let mut tx = db::begin_immediate(self.db.pool()).await?;
-        if !Self::entry_live_in_tx(&mut tx, attempt).await? {
-            return Ok(StepOutcome::Skip(
-                "Task left the entry the attempt was imported in".into(),
-            ));
-        }
-        self.db
-            .finish_step_in_tx(&mut tx, step, "done", None)
-            .await?;
-        self.db.enqueue_step_in_tx(&mut tx, &follow_up).await?;
-        tx.commit().await?;
-        self.task_service.dispatch_wake.notify_one();
         Ok(StepOutcome::Settled)
     }
 }

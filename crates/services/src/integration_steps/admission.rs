@@ -59,7 +59,7 @@ pub(crate) async fn admit(
         .create_or_get_integration_queue(&facts.workspace.repo_id, &facts.target_branch)
         .await?;
     let placement = &facts.placement;
-    let build = |key: String| {
+    let build = |key: String, reviewed: Option<&str>| {
         let mut attempt = IntegrationAttempt::new(
             Some(queue.id.clone()),
             task.id.clone(),
@@ -84,13 +84,21 @@ pub(crate) async fn admit(
         attempt.daemon_id = placement.daemon_id.clone();
         attempt.runtime_id = placement.runtime_id.clone();
         attempt.placement_generation = Some(placement.generation);
-        attempt.original_candidate_sha = Some(facts.candidate_sha.clone());
+        // `original_candidate_sha` is the commit the review passed; the
+        // worker checks any other commit before it may merge. It is the
+        // admitted HEAD, except for a candidate the old merge path had
+        // already rebased (see `rebased_before_the_queue`).
+        attempt.original_candidate_sha =
+            Some(reviewed.unwrap_or(&facts.candidate_sha).to_owned());
+        if reviewed.is_some() {
+            attempt.candidate_sha = Some(facts.candidate_sha.clone());
+        }
         attempt
     };
     for _ in 0..3 {
         let Some(current) = db.current_integration_attempt(&task.id).await? else {
             match db
-                .admit_integration_attempt(build(format!("admit:{}:{epoch}", task.id)))
+                .admit_integration_attempt(build(format!("admit:{}:{epoch}", task.id), None))
                 .await
             {
                 Ok(attempt) => return Ok(attempt),
@@ -104,7 +112,10 @@ pub(crate) async fn admit(
             && current.queue_id.as_deref() == Some(queue.id.as_str())
             && current.placement_id.as_deref() == Some(placement.id.as_str())
             && current.placement_generation == Some(placement.generation)
-            && current.original_candidate_sha.as_deref() == Some(facts.candidate_sha.as_str());
+            && (current.original_candidate_sha.as_deref() == Some(facts.candidate_sha.as_str())
+                || (current.import_source_json.is_none()
+                    && current.candidate_sha.as_deref() == Some(facts.candidate_sha.as_str())
+                    && current.state == S::Queued));
         if same_entry && bound(&current) {
             return Ok(current);
         }
@@ -136,11 +147,11 @@ pub(crate) async fn admit(
             }
             return Err(DbError::VersionConflict.into());
         }
-        let successor = build(format!(
-            "admit:{}:{epoch}:{}",
-            task.id,
-            current.attempt_number + 1
-        ));
+        let reviewed = rebased_before_the_queue(db, &current, task, &facts.candidate_sha).await;
+        let successor = build(
+            format!("admit:{}:{epoch}:{}", task.id, current.attempt_number + 1),
+            reviewed.as_deref(),
+        );
         match db
             .supersede_integration_attempt(&current.id, current.revision, successor)
             .await
@@ -156,6 +167,41 @@ pub(crate) async fn admit(
         }
     }
     Err(DbError::VersionConflict.into())
+}
+
+/// The reviewed commit of a candidate the old merge path rebased before the
+/// queue existed (importer row P6: a recorded clean rebase, or the Task
+/// between `merging` and its re-review on the `target_moved_rebase` bridge).
+///
+/// The review passed on the commit before that rebase, and the old path
+/// would have run the review checks on the rebased commit and carried the
+/// review. Admitting the rebased HEAD as "the reviewed commit" would skip
+/// the check and so cost a full review; naming the reviewed commit instead
+/// makes the worker check the rebased commit and lets `settle` carry the
+/// review by the same predicates the old review entry used. `None` for every
+/// other admission, and when no passed review pins a commit.
+async fn rebased_before_the_queue(
+    db: &Arc<SqliteDb>,
+    superseded: &IntegrationAttempt,
+    task: &db::Task,
+    candidate_sha: &str,
+) -> Option<String> {
+    let mechanical = superseded
+        .import_source_json
+        .as_ref()
+        .is_some_and(|source| source["priority"].as_u64() == Some(6));
+    if !mechanical {
+        return None;
+    }
+    let mut tx = db.pool().begin().await.ok()?;
+    let base = db.attempt_carry_base_in_tx(&mut tx, &task.id).await;
+    let _ = tx.rollback().await;
+    match base {
+        Ok(Some(base)) if base.candidate.commit_sha != candidate_sha => {
+            Some(base.candidate.commit_sha)
+        }
+        _ => None,
+    }
 }
 
 /// State `waiting` for a freshly admitted attempt, under the hook step's

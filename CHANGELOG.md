@@ -55,9 +55,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     drops the removed hook name and keeps everything else. A workflow YAML
     template on disk that names the hook must be edited by hand: it is
     refused as an unknown action.
-  - **Transition bridge kinds add `integration_import`** (an exhaustive enum
-    for typed clients): the one transition that returns a Task to `merging`
-    when the upgrade finds it between a clean rebase and its re-review.
   - **Upgrade.** Merges that are in flight when the server is upgraded are
     taken into the queue at the first start: a merge that already landed is
     reported, an unknown result is looked up before anything is repeated, a

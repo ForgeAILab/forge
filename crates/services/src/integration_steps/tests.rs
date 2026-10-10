@@ -2285,3 +2285,236 @@ async fn the_worker_over_production_ports_writes_only_queue_attempt_and_task_ste
         "nothing merged without a Task step"
     );
 }
+
+// ----- importer continuation from pre-upgrade fixtures (plan 3.2 stage D2b) --
+
+impl World {
+    /// A Task in `status` as a server without the queue left it: one commit
+    /// writing `file` in its worktree, no attempt. Returns that commit.
+    async fn legacy_task(&self, task: &str, file: &str, status: &str) -> String {
+        let (repo, tree) = (self.repo(), self.tree(task));
+        let branch = format!("task-{task}");
+        git_out(
+            &repo,
+            &["worktree", "add", "-b", &branch, tree.to_str().unwrap()],
+        )
+        .await
+        .expect("worktree");
+        std::fs::write(tree.join(file), "legacy\n").unwrap();
+        git::commit_all(&tree, task).await.unwrap();
+        let now = db::now_rfc3339();
+        let pool = self.db.pool();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,review_passed_at,created_at,updated_at) VALUES(?,'p',?,?,?,?,?)").bind(task).bind(task).bind(status).bind(&now).bind(&now).bind(&now).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES(?,?,'r',?,?,'ready',?,?)").bind(format!("w-{task}")).bind(task).bind(tree.to_str()).bind(&branch).bind(&now).bind(&now).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES(?,?,?,'server','l-r',?,1,'ready','scheduler','{}',?,?)").bind(format!("pl-{task}")).bind(format!("w-{task}")).bind(task).bind(tree.to_str()).bind(&now).bind(&now).execute(pool).await.unwrap();
+        git::get_current_sha(&tree).await.unwrap()
+    }
+    /// Somebody else's commit lands on the target, and the old merge path
+    /// rebases the Task's branch onto it cleanly. Returns the rebased commit.
+    async fn old_path_rebase(&self, task: &str) -> String {
+        std::fs::write(self.repo().join("moved"), "moved\n").unwrap();
+        git::commit_all(&self.repo(), "target moved").await.unwrap();
+        git_out(&self.tree(task), &["rebase", "main"])
+            .await
+            .expect("clean rebase");
+        git::get_current_sha(&self.tree(task)).await.unwrap()
+    }
+    /// The settled hooks step of the old `merging` entry, with `effects` as
+    /// its retained checkpoint.
+    async fn old_merge_step(&self, task: &str, effects: Value) {
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO task_step(id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,status,available_at,attempts,created_at,updated_at,expected_epoch,lane) VALUES(?,?,(SELECT COALESCE(MAX(seq),0)+1 FROM task_step WHERE task_id=?),'hooks','{}','entry',?,1,'merging',1,'failed',?,1,?,?,0,'long')")
+            .bind(format!("s-{task}")).bind(task).bind(task).bind(format!("c-{task}")).bind(&now).bind(&now).bind(&now).execute(self.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,effects_json) VALUES(?,0,?,?)")
+            .bind(format!("s-{task}")).bind(&now).bind(effects.to_string())
+            .execute(self.db.pool()).await.unwrap();
+    }
+    async fn imported(&self, task: &str) -> (IntegrationAttempt, u64) {
+        let report = super::import::import_at_start(&self.db).await.unwrap();
+        assert_eq!(report.continuations, 1, "{report:?}");
+        // A second start imports and enqueues nothing.
+        let again = super::import::import_at_start(&self.db).await.unwrap();
+        assert_eq!((again.imported, again.continuations), (0, 0));
+        let attempt = self
+            .db
+            .current_integration_attempt(task)
+            .await
+            .unwrap()
+            .expect("imported");
+        let priority = attempt.import_source_json.as_ref().unwrap()["priority"]
+            .as_u64()
+            .unwrap();
+        (attempt, priority)
+    }
+    async fn carries(&self, task: &str) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT commit_sha,base_sha FROM review_authority_carry WHERE task_id=? ORDER BY created_at",
+        )
+        .bind(task)
+        .fetch_all(self.db.pool())
+        .await
+        .unwrap()
+    }
+}
+
+/// Importer row P6, Task still in `merging`: the old path rebased the
+/// reviewed commit cleanly and the server was upgraded before it reported.
+/// The queue checks the rebased commit and carries the passed review: one
+/// check run, one carry, no reviewer, no coder, and the Task never leaves
+/// `merging` before it is `done`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_imported_clean_rebase_is_checked_and_its_review_carried_without_a_new_review() {
+    let world = World::new().await;
+    let reviewed = world.legacy_task("six", "six.txt", "merging").await;
+    review_ci(&world, "six", &["test -f moved"]).await;
+    let contract = world.seed_passed_review("six", &["six.txt"]).await;
+    let rebased = world.old_path_rebase("six").await;
+    assert_ne!(reviewed, rebased);
+    world
+        .old_merge_step(
+            "six",
+            json!({"rebase_target": json!("main").to_string(), "rebase_outcome": json!({"kind":"rebased"}).to_string()}),
+        )
+        .await;
+    let (imported, priority) = world.imported("six").await;
+    assert_eq!(priority, 6);
+    assert_eq!(
+        (imported.state, imported.resume_state),
+        (S::Parked, Some(S::Checking))
+    );
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the rebased commit merges", || async {
+        world.task("six").await.status == "done"
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    assert_eq!(tip, rebased, "the commit the old path rebased, as it is");
+    let merged: String = world
+        .scalar(
+            "SELECT id FROM integration_attempt WHERE task_ref=? AND integrated_sha IS NOT NULL",
+            "six",
+        )
+        .await;
+    let merged = world.attempt(&merged).await;
+    assert_eq!(merged.original_candidate_sha.as_deref(), Some(reviewed.as_str()));
+    // Checked once, carried once against the reviewer's contract.
+    assert_eq!(
+        world
+            .step("six", IntegrationStepAction::RequestCheck)
+            .await
+            .len(),
+        1
+    );
+    assert_eq!(world.carries("six").await.len(), 1);
+    let carried: String = world
+        .scalar(
+            "SELECT contract_execution_id FROM review_authority_carry WHERE task_id=?",
+            "six",
+        )
+        .await;
+    assert_eq!(carried, contract);
+    // No bounce, no review, no repair.
+    let transitions = world.transitions("six").await;
+    assert_eq!(transitions.len(), 1, "{transitions:?}");
+    assert_eq!(
+        (transitions[0].0.as_str(), transitions[0].1.as_str()),
+        ("merging", "done")
+    );
+    assert!(world
+        .step("six", IntegrationStepAction::SendBack)
+        .await
+        .is_empty());
+}
+
+/// Importer row P9: the old path rebased, bounced and carried the review
+/// (a stored carry row), and the Task was back in `merging` when the server
+/// was upgraded. The carried commit is the reviewed object: it merges as it
+/// is, with no new check, no second carry and no review.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_imported_stored_carry_merges_the_carried_commit_as_it_is() {
+    let world = World::new().await;
+    world.legacy_task("nine", "nine.txt", "merging").await;
+    review_ci(&world, "nine", &["test -f moved"]).await;
+    let contract = world.seed_passed_review("nine", &["nine.txt"]).await;
+    let rebased = world.old_path_rebase("nine").await;
+    let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO review_authority_carry(id,task_id,contract_execution_id,commit_sha,base_sha,kind,changed_paths_json,created_at) VALUES('carry','nine',?,?,?,'clean_rebase','[\"nine.txt\"]',?)")
+        .bind(&contract).bind(&rebased).bind(&tip).bind(db::now_rfc3339())
+        .execute(world.db.pool()).await.unwrap();
+    let (imported, priority) = world.imported("nine").await;
+    assert_eq!(priority, 9, "{:?}", imported.failure_message);
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the carried commit merges", || async {
+        world.task("nine").await.status == "done"
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert_eq!(
+        git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap(),
+        rebased
+    );
+    assert!(world
+        .step("nine", IntegrationStepAction::RequestCheck)
+        .await
+        .is_empty());
+    assert_eq!(world.carries("nine").await, vec![(rebased, tip)]);
+    let transitions = world.transitions("nine").await;
+    assert_eq!(transitions.len(), 1, "{transitions:?}");
+}
+
+/// Importer row P6, the `merge_failed` half of the old bounce: the Task was
+/// between `merging` and its re-review on the `target_moved_rebase` bridge.
+/// The continuation writes nothing: the Task's own flow continues as before
+/// the upgrade (the dispatcher's mechanical hop to `review`, whose entry
+/// checks the rebased commit and carries the review), no coder is asked to
+/// "fix" a clean rebase by this step, and nothing can claim the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_imported_clean_rebase_parked_in_merge_failed_is_left_to_its_own_flow() {
+    let world = World::new().await;
+    world.legacy_task("pair", "pair.txt", "merge_failed").await;
+    world.seed_passed_review("pair", &["pair.txt"]).await;
+    world.old_path_rebase("pair").await;
+    sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,bridge_kind,created_at) VALUES('bounce','pair','merging','merge_failed','system:workflow','target moved; rebased','target_moved_rebase',?)")
+        .bind(db::now_rfc3339()).execute(world.db.pool()).await.unwrap();
+    let (imported, priority) = world.imported("pair").await;
+    assert_eq!(priority, 6);
+    assert_eq!(imported.state, S::Parked, "not claimable");
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the continuation settles", || async {
+        world
+            .db
+            .task_steps("pair")
+            .await
+            .unwrap()
+            .iter()
+            .any(|step| step.kind == INTEGRATION_STEP_KIND && step.status == "done")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert_eq!(world.task("pair").await.status, "merge_failed");
+    assert_eq!(world.transitions("pair").await.len(), 1);
+    assert_eq!(world.attempt(&imported.id).await.state, S::Parked);
+    assert!(world.carries("pair").await.is_empty());
+    // What continues it is the dispatcher's review-refresh hop, unchanged.
+    let last = db::TransitionLogRepo::list_by_task(&*world.db, "pair")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(last.bridge.is_review_refresh());
+}

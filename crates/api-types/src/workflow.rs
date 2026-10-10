@@ -14,10 +14,6 @@ pub enum TransitionBridgeKind {
     GateRejected,
     CiOnlyReviewPassed,
     ReviewCarry,
-    /// A Task that was between `merging` and its re-review on a mechanical
-    /// rebase when the integration queue was activated is returned to
-    /// `merging` once, to be admitted to the queue.
-    IntegrationImport,
 }
 
 impl TransitionBridgeKind {
@@ -33,7 +29,6 @@ impl TransitionBridgeKind {
             Self::GateRejected => "gate_rejected",
             Self::CiOnlyReviewPassed => "ci_only_review_passed",
             Self::ReviewCarry => "review_carry",
-            Self::IntegrationImport => "integration_import",
         }
     }
     pub const fn is_review_refresh(self) -> bool {
@@ -61,7 +56,6 @@ impl std::str::FromStr for TransitionBridgeKind {
             "gate_rejected" => Ok(Self::GateRejected),
             "ci_only_review_passed" => Ok(Self::CiOnlyReviewPassed),
             "review_carry" => Ok(Self::ReviewCarry),
-            "integration_import" => Ok(Self::IntegrationImport),
             _ => Err(format!("unknown transition bridge kind: {value}")),
         }
     }

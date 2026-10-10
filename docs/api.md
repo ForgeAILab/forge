@@ -2957,11 +2957,9 @@ agent default.
 `bridge_kind` and `bridge_payload` alongside the original human `trigger_reason`.
 Kinds are `review_refresh`, `target_moved_rebase`, `conflict_handoff`,
 `retry_window_reset`, `recovery`, `gate_skipped`, `gate_approved`, `gate_rejected`,
-`ci_only_review_passed`, `review_carry` and `integration_import`.
+`ci_only_review_passed` and `review_carry`.
 `target_moved_rebase` is history only: a clean rebase happens inside `merging`
-since the merge queue is active and writes no transition. `integration_import`
-marks the one transition that returned a Task to `merging` when an upgrade
-found it between a clean rebase and its re-review. Conflict payloads contain a `paths`
+since the merge queue is active and writes no transition. Conflict payloads contain a `paths`
 array; recovery/reset payloads contain the recorded `verb`. Ordinary history
 has null fields. Malformed legacy conflict paths retain the handoff kind with
 null payload. New reasons contain plain prose; historical reasons are preserved.
