@@ -8966,9 +8966,14 @@ An unreachable daemon keeps the run `uncertain` (slot and single-flight
 identity retained) until it confirms the stop, is removed, or passes the
 disconnected-owner bound. A Project is not deleted from under a live check
 run: the delete guard counts unfinished runs (`project_in_use`,
-`live_check_runs`), and a forced delete first cancels their consumers, settles
-queued runs and waits a bounded time for the worker to stop running ones
-(Project deletion, above). Should a run row disappear under its worker anyway,
+`live_check_runs`). A forced delete has two phases. First, without changing
+anything, it looks for a run dispatched to a daemon that is not connected and
+not removed (`TaskService::project_deletion_unreachable_machines`): such a
+run cannot be stopped now, so the request is refused naming the machine and
+nothing is cancelled. Only then does it cancel the consumers, settle queued
+runs and wait (four seconds for the whole request) for the worker to stop
+running ones. A machine that is gone for good is removed by its owner: the
+worker settles the runs of a removed machine and the delete goes through. Should a run row disappear under its worker anyway,
 the worker finds no consumer at its next look, tells the owner to stop (best
 effort) and drops the run.
 

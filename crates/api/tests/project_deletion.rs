@@ -1011,7 +1011,9 @@ async fn project_delete_counts_live_check_runs_and_force_settles_them_first() {
     );
 
     // Forced: the queued run is cancelled, the running one is not ours to
-    // settle and has not settled within the bound. Refused, nothing deleted.
+    // settle and has not settled within the bound. Refused, nothing deleted,
+    // and the answer comes within five seconds (it took about 18).
+    let asked = std::time::Instant::now();
     let forced = common::raw_empty_request(
         &harness.app,
         Method::DELETE,
@@ -1019,8 +1021,15 @@ async fn project_delete_counts_live_check_runs_and_force_settles_them_first() {
     )
     .await;
     let body: Value = common::parse_response(forced, StatusCode::CONFLICT).await;
+    assert!(
+        asked.elapsed() <= std::time::Duration::from_secs(5),
+        "the refusal took {:?}",
+        asked.elapsed()
+    );
     assert_eq!(body["code"], "project_in_use");
     assert_eq!(body["details"]["force_cancellation_incomplete"], true);
+    assert_eq!(body["details"]["cancelled"], true);
+    assert_eq!(body["details"]["unreachable_machines"], json!([]));
     assert_eq!(body["details"]["live_check_runs"], 1);
     assert!(project_exists(&harness, &project_id).await);
     assert_eq!(

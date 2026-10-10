@@ -30,12 +30,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   runner) is queued, running, stopping or of unknown result; `details` gain
   `live_check_runs`. Before, the delete went through and could leave the
   check's processes running on a machine with nothing left to stop them.
-  `?force=true` cancels queued runs, stops running ones on their machine and
-  waits a few seconds for them to settle; if one has not (its daemon is
-  unreachable), the answer stays `409` with `force_cancellation_incomplete`
-  and nothing is deleted. A refused forced delete has already cancelled the
-  check runs it could: their Tasks fail that review entry, as executions it
-  stopped stay stopped. Such a refusal can take up to about 18 seconds.
+  `?force=true` works in two phases. If a check run is on a daemon that is
+  not connected, the request is refused at once and nothing is cancelled
+  (`details.unreachable_machines` names the machines, `details.cancelled:
+  false`); reconnect the machine or remove it and delete again. Otherwise it
+  cancels queued runs, stops running ones on their machine and waits at most
+  four seconds for them to settle; if one has not, the answer stays `409`
+  with `force_cancellation_incomplete` and `details.cancelled: true`, nothing
+  is deleted, and the check runs it cancelled fail their Tasks' review entry.
+  A refusal answers within about five seconds.
 
 - **Review-entry CI runs on the durable check runner (3.3 stage D part 2).**
   The `ci_steps` a Task runs when it enters `review` are no longer executed

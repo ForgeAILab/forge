@@ -2343,15 +2343,29 @@ one is cancelled on the machine that runs it and Forge waits a few seconds for
 it to settle), and retries the same guarded deletion. A provider or database
 failure stops the request before authoritative deletion; if any execution,
 lease or check run is still live, the request remains a `409` (`details.
-force_cancellation_incomplete: true`) and the Project is left intact. That is
-the answer while a check runs on a daemon that cannot be reached: its stop is
-not confirmed, so the record that fences it is kept; retry once the daemon is
-back or the run has timed out. A refused forced delete has still cancelled what
-it could: executions it stopped stay stopped, and the Tasks whose check runs it
-cancelled fail that review entry (`review check did not finish`). The request
-waits up to three seconds per pass for running checks to settle, so a refusal
-for an unreachable daemon can take up to about 18 seconds. Force does not mean
-"delete anyway".
+force_cancellation_incomplete: true`) and the Project is left intact.
+
+A forced delete works in two phases, so that a request that is going to be
+refused changes nothing it does not have to:
+
+1. **Nothing is touched.** If a check run was dispatched to a daemon that is
+   not connected, its stop cannot be sent or confirmed and the record that
+   fences its process must stay. The request is refused at once:
+   `details.unreachable_machines` lists the hostnames, `details.cancelled` is
+   `false`, and no execution, lease or check was cancelled: the Tasks keep
+   their review entries. Reconnect the machine and delete again; if it is gone
+   for good, remove it (`DELETE /api/v1/daemons/{id}`): the runs of a removed
+   machine are settled and the delete then goes through.
+2. **Cancel and settle.** Otherwise executions are stopped, leases revoked and
+   check runs stopped. The request waits at most four seconds in all for
+   running checks to settle. If one has not (a reachable machine was slow to
+   confirm), the answer is the `409` above with `details.cancelled: true` and
+   `unreachable_machines: []`: executions it stopped stay stopped, and the
+   Tasks whose check runs it cancelled fail that review entry (`review check
+   did not finish`). The stop continues in the background; repeat the request.
+
+Either refusal answers within about five seconds. Force does not mean "delete
+anyway".
 
 Once admitted, it performs one guarded transaction that removes
 the Project-owned dependency graph before deleting the Project, including

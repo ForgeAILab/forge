@@ -421,6 +421,48 @@ pub async fn delete_project(
     require_project_admin(&state, &id, &user.user_id).await?;
 
     const MAX_FORCE_DELETE_ATTEMPTS: usize = 3;
+    /// What a forced delete waits, in all, for the check runs it stopped to
+    /// settle. A refusal answers within about this long.
+    const FORCE_SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(4);
+    if query.force {
+        // Phase one changes nothing. A check run on a machine that cannot
+        // be reached cannot be stopped or confirmed, so the delete would be
+        // refused after everything else had been cancelled: refuse first.
+        let unreachable = state
+            .task_service
+            .project_deletion_unreachable_machines(&id)
+            .await?;
+        if !unreachable.is_empty() {
+            let (running_executions, active_leases, live_check_runs) =
+                match ProjectRepo::ensure_deletable(&*state.db, &id).await {
+                    Err(db::DbError::ProjectInUse {
+                        running_executions,
+                        active_leases,
+                        live_check_runs,
+                        ..
+                    }) => (running_executions, active_leases, live_check_runs),
+                    Err(error) => return Err(error.into()),
+                    Ok(()) => (0, 0, 0),
+                };
+            return Err(ApiError::conflict_with_code_and_details(
+                "project_in_use",
+                format!(
+                    "project {id} has a check run on {} which cannot be reached, so the run cannot be stopped; nothing was cancelled and deletion was not performed. Reconnect the machine or remove it, then delete again",
+                    unreachable.join(", ")
+                ),
+                serde_json::json!({
+                    "project_id": id,
+                    "running_executions": running_executions,
+                    "active_leases": active_leases,
+                    "live_check_runs": live_check_runs,
+                    "force_cancellation_incomplete": true,
+                    "unreachable_machines": unreachable,
+                    "cancelled": false,
+                }),
+            ));
+        }
+    }
+    let settle_until = tokio::time::Instant::now() + FORCE_SETTLE_BOUND;
     let mut attempt = 0;
     let late_project_paths = loop {
         // Force retries are bounded so a continuously-admitted execution or
@@ -429,19 +471,17 @@ pub async fn delete_project(
         if query.force {
             // Force is an active cancellation request, not merely permission
             // to cascade away a still-live execution row. Provider failures
-            // leave the Project intact and are surfaced to the caller.
-            state.task_service.prepare_project_deletion(&id).await?;
+            // leave the Project intact and are surfaced to the caller. Work
+            // admitted after this pass is handled by the next attempt or by
+            // the final in-use CAS below.
+            state
+                .task_service
+                .prepare_project_deletion(&id, settle_until)
+                .await?;
         } else {
             // Run the guarded DB decision before touching any path. The final
             // delete below repeats this check to close the admission race.
             ProjectRepo::ensure_deletable(&*state.db, &id).await?;
-        }
-
-        if query.force {
-            // Re-check immediately before the final DB boundary. A new
-            // execution or lease admitted after the first cancellation pass
-            // is handled by this pass or by the final in-use CAS below.
-            state.task_service.prepare_project_deletion(&id).await?;
         }
 
         // The service has already terminalized/revoked force-mode activity.
@@ -472,6 +512,8 @@ pub async fn delete_project(
                         "active_leases": active_leases,
                         "live_check_runs": live_check_runs,
                         "force_cancellation_incomplete": true,
+                        "unreachable_machines": [],
+                        "cancelled": true,
                     }),
                 ));
             }
