@@ -293,9 +293,7 @@ impl HeadDriver {
     /// `None`: ask now.
     fn unknown_result_wait(&mut self, a: &IntegrationAttempt) -> Option<Duration> {
         let at = self.reconcile_at?;
-        let Some(intent) = a.effect_intent_json.as_ref() else {
-            return None;
-        };
+        let intent = a.effect_intent_json.as_ref()?;
         let link = self
             .w
             .owner
@@ -1618,7 +1616,7 @@ impl HeadDriver {
         }
         // Read after the settlement, so the facts are never older than it.
         let facts = self.facts(&a, queue).await;
-        if a.effect_intent_json.is_some() {
+        if let Some(intent) = a.effect_intent_json.clone() {
             // Unknown result. Nothing is guessed: the queue is quarantined
             // with a typed reason and the reconcile timer keeps asking.
             let message = "integration result unknown: the owner has no settled receipt";
@@ -1648,10 +1646,10 @@ impl HeadDriver {
             self.w.defer_reconcile(&self.queue_id);
             let now = self.w.clock.now();
             self.reconcile_at = Some(later(now, self.w.config.reconcile_interval));
-            self.owner_link = self.w.owner.owner_connection(
-                &a.effect_intent_json.as_ref().expect("checked")["request"]["fence"]
-                    ["target_owner"],
-            );
+            self.owner_link = self
+                .w
+                .owner
+                .owner_connection(&intent["request"]["fence"]["target_owner"]);
             return Ok(Pass::Wait(
                 self.w.config.poll.min(self.w.config.reconcile_interval),
             ));
