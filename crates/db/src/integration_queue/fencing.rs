@@ -20,6 +20,28 @@ pub struct IntegrationEffectRequest {
     pub witness: Value,
 }
 
+impl IntegrationEffectRequest {
+    /// The owner that performs this effect, journals it and is asked for its
+    /// receipt. The fence always names the queue's target owner (that is what
+    /// the claim is checked against). An effect performed by another owner
+    /// (the rebase of a Task whose checkout is on another machine than the
+    /// default checkout) records that owner as `witness.effect_owner`, in the
+    /// shape of `target_owner` with the Task's own repo location.
+    pub fn effect_owner(&self) -> &Value {
+        self.witness
+            .get("effect_owner")
+            .filter(|owner| owner.is_object())
+            .unwrap_or(&self.fence.target_owner)
+    }
+}
+
+/// SQL for one field of the performing owner of `effect_intent_json`.
+fn effect_owner_sql(field: &str) -> String {
+    format!(
+        "COALESCE(json_extract(effect_intent_json,'$.request.witness.effect_owner.{field}'),json_extract(effect_intent_json,'$.request.fence.target_owner.{field}'))"
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntegrationEffectReceipt {
     pub request: IntegrationEffectRequest,
@@ -47,7 +69,7 @@ async fn lock_owner(request: &IntegrationEffectRequest) -> Vec<tokio::sync::Owne
     use std::sync::{Arc, Mutex, OnceLock, Weak};
     type OwnerLocks = Mutex<std::collections::HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
     static LOCKS: OnceLock<OwnerLocks> = OnceLock::new();
-    let owner = &request.fence.target_owner;
+    let owner = request.effect_owner();
     let prefix = format!(
         "{}:{}:{}",
         owner["owner_kind"], owner["daemon_id"], owner["runtime_id"]
@@ -226,7 +248,10 @@ pub(crate) async fn settle_removed_integration_owner(
     location: Option<&str>,
     daemon: Option<&str>,
 ) -> Result<()> {
-    let rows: Vec<String> = sqlx::query_scalar("SELECT effect_intent_json FROM integration_attempt WHERE effect_intent_json IS NOT NULL AND ((? IS NOT NULL AND json_extract(effect_intent_json,'$.request.fence.target_owner.location_id')=?) OR (? IS NOT NULL AND json_extract(effect_intent_json,'$.request.fence.target_owner.daemon_id')=?))")
+    // Matched by the owner that performs the effect: a rebase in flight on a
+    // removed machine is settled even when the default checkout is elsewhere.
+    // Only the queues that target the removed owner are suspended below.
+    let rows: Vec<String> = sqlx::query_scalar(&format!("SELECT effect_intent_json FROM integration_attempt WHERE effect_intent_json IS NOT NULL AND ((? IS NOT NULL AND {}=?) OR (? IS NOT NULL AND {}=?))", effect_owner_sql("location_id"), effect_owner_sql("daemon_id")))
         .bind(location).bind(location).bind(daemon).bind(daemon).fetch_all(&mut **tx).await?;
     let message = if daemon.is_some() {
         "integration owner machine removed"
@@ -416,13 +441,14 @@ impl SqliteDb {
         }))
     }
 
-    /// Bounded restart/reconnect input, indexed by the retained owner witness.
+    /// Bounded restart/reconnect input, indexed by the retained owner witness:
+    /// the owner that performs each effect (`IntegrationEffectRequest::effect_owner`).
     pub async fn outstanding_integration_effects(
         &self,
         owner_kind: &str,
         daemon_id: Option<&str>,
     ) -> Result<Vec<IntegrationEffectRequest>> {
-        let rows: Vec<String> = sqlx::query_scalar("SELECT effect_intent_json FROM integration_attempt WHERE effect_intent_json IS NOT NULL AND json_extract(effect_intent_json,'$.request.fence.target_owner.owner_kind')=? AND (? IS NULL OR json_extract(effect_intent_json,'$.request.fence.target_owner.daemon_id')=?) ORDER BY updated_at,id LIMIT 128")
+        let rows: Vec<String> = sqlx::query_scalar(&format!("SELECT effect_intent_json FROM integration_attempt WHERE effect_intent_json IS NOT NULL AND {}=? AND (? IS NULL OR {}=?) ORDER BY updated_at,id LIMIT 128", effect_owner_sql("owner_kind"), effect_owner_sql("daemon_id")))
             .bind(owner_kind).bind(daemon_id).bind(daemon_id).fetch_all(self.pool()).await?;
         rows.into_iter()
             .map(|raw| {
@@ -637,7 +663,68 @@ impl SqliteDb {
     }
 }
 
+impl SqliteDb {
+    /// The owner of the repo location a placement's checkout lives in, in the
+    /// shape of a fence's `target_owner` (without a location generation).
+    /// This is `witness.effect_owner` of a rebase performed off the target's
+    /// owner.
+    pub async fn integration_placement_owner(&self, placement_id: &str) -> Result<Option<Value>> {
+        let row = sqlx::query("SELECT l.id,l.owner_kind,l.daemon_id,l.runtime_id FROM workspace_placement p JOIN repo_location l ON l.id=p.repo_location_id WHERE p.id=?")
+            .bind(placement_id)
+            .fetch_optional(self.pool())
+            .await?;
+        row.map(|row| {
+            Ok(serde_json::json!({
+                "location_id": row.try_get::<String, _>("id")?,
+                "owner_kind": row.try_get::<String, _>("owner_kind")?,
+                "daemon_id": row.try_get::<Option<String>, _>("daemon_id")?,
+                "runtime_id": row.try_get::<Option<String>, _>("runtime_id")?,
+            }))
+        })
+        .transpose()
+    }
+}
+
 impl IntegrationEffectGuard {
+    /// The server-held Task worktree of a rebase whose target is owned by
+    /// another machine. Same placement witness as `server_workspace_paths`,
+    /// without a default checkout on this host.
+    pub async fn server_worktree_path(&mut self) -> Result<Option<std::path::PathBuf>> {
+        let w = &self.request.witness["workspace"];
+        let row=sqlx::query("SELECT p.workspace_id,p.generation,p.owner_kind,p.workspace_handle,w.worktree_path FROM workspace_placement p JOIN workspace w ON w.id=p.workspace_id JOIN integration_attempt a ON a.task_ref=p.task_id JOIN integration_queue q ON q.id=a.queue_id WHERE p.id=? AND a.id=? AND p.state='ready' AND w.repo_id=q.repo_id AND q.target_branch=? AND (a.workspace_ref IS NULL OR a.workspace_ref=p.workspace_id) AND (a.placement_ref IS NULL OR a.placement_ref=p.id)")
+            .bind(w["placement_id"].as_str()).bind(&self.request.fence.attempt_id).bind(self.request.witness["target_branch"].as_str()).fetch_optional(&self.pool).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let workspace_id: String = row.try_get("workspace_id")?;
+        let generation: i64 = row.try_get("generation")?;
+        let owner: String = row.try_get("owner_kind")?;
+        let handle: Option<String> = row.try_get("workspace_handle")?;
+        if w["workspace_id"].as_str() != Some(&workspace_id)
+            || w["generation"].as_i64() != Some(generation)
+            || owner != "server"
+            || w["owner"]["kind"] != "server"
+            || w["handle"].as_str() != handle.as_deref()
+        {
+            return Ok(None);
+        }
+        Ok(Some(std::path::PathBuf::from(
+            row.try_get::<String, _>("worktree_path")?,
+        )))
+    }
+
+    /// The server-held default checkout of a fast-forward whose candidate was
+    /// brought by an outbound object transfer (the Task's checkout is on
+    /// another machine). The location is the queue's own target.
+    pub async fn server_target_path(&mut self) -> Result<Option<std::path::PathBuf>> {
+        if self.request.fence.target_owner["owner_kind"] != "server" {
+            return Ok(None);
+        }
+        let path: Option<String> = sqlx::query_scalar("SELECT l.path FROM integration_attempt a JOIN integration_queue q ON q.id=a.queue_id JOIN repo_location l ON l.id=q.target_location_id WHERE a.id=? AND q.id=? AND l.id=? AND l.owner_kind='server' AND l.status='ready' AND q.target_branch=?")
+            .bind(&self.request.fence.attempt_id).bind(&self.request.fence.queue_id).bind(self.request.fence.target_owner["location_id"].as_str()).bind(self.request.witness["target_branch"].as_str()).fetch_optional(&self.pool).await?;
+        Ok(path.map(std::path::PathBuf::from))
+    }
+
     /// Resolve owner-local paths from the retained placement under this guard.
     /// The requested witness cannot substitute another workspace or checkout.
     pub async fn server_workspace_paths(

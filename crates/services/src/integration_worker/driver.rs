@@ -129,6 +129,15 @@ fn target_owner(owner: Option<&serde_json::Value>) -> Option<EffectOwner> {
         _ => None,
     }
 }
+/// The owner that performs the effect of a stored intent (the Task's owner
+/// for a rebase off the target's owner, else the target's owner).
+fn intent_owner(intent: &serde_json::Value) -> &serde_json::Value {
+    let request = &intent["request"];
+    request["witness"]
+        .get("effect_owner")
+        .filter(|owner| owner.is_object())
+        .unwrap_or(&request["fence"]["target_owner"])
+}
 fn receipts(attempt: &IntegrationAttempt) -> Vec<IntegrationEffectReceipt> {
     serde_json::from_value(attempt.effect_receipts_json.clone()).unwrap_or_default()
 }
@@ -294,10 +303,7 @@ impl HeadDriver {
     fn unknown_result_wait(&mut self, a: &IntegrationAttempt) -> Option<Duration> {
         let at = self.reconcile_at?;
         let intent = a.effect_intent_json.as_ref()?;
-        let link = self
-            .w
-            .owner
-            .owner_connection(&intent["request"]["fence"]["target_owner"]);
+        let link = self.w.owner.owner_connection(intent_owner(intent));
         if link.is_some() && link != self.owner_link {
             return None;
         }
@@ -889,15 +895,22 @@ impl HeadDriver {
                     .await
             }
         }
-        // One fenced owner performs the rebase (in the Task's checkout) and
-        // the fast-forward (in the default checkout): the owner gate refuses
-        // an effect whose workspace it does not hold.
-        if Some(&facts.workspace.owner) != target_owner(queue.target_owner_json.as_ref()).as_ref() {
+        // The rebase is performed by the owner of the Task's checkout and
+        // the fast-forward by the owner of the default checkout. A default
+        // checkout on a daemon is fast-forwarded from a worktree of it only:
+        // a Task in any other checkout (another machine, or another clone on
+        // that daemon) parks typed instead of being asked of an owner that
+        // would refuse it.
+        if matches!(
+            target_owner(queue.target_owner_json.as_ref()),
+            Some(EffectOwner::Daemon { .. })
+        ) && !facts.shared_object_store
+        {
             return self
                 .park(
                     &a,
                     ParkReason::CrossOwner,
-                    "the Task's checkout and the default checkout are on different machines; place the Task on the machine that holds the default checkout",
+                    "the default checkout is on a daemon and the Task is in another checkout; place the Task in the default checkout's location, or make a server-owned location the default",
                 )
                 .await;
         }
@@ -1646,10 +1659,7 @@ impl HeadDriver {
             self.w.defer_reconcile(&self.queue_id);
             let now = self.w.clock.now();
             self.reconcile_at = Some(later(now, self.w.config.reconcile_interval));
-            self.owner_link = self
-                .w
-                .owner
-                .owner_connection(&intent["request"]["fence"]["target_owner"]);
+            self.owner_link = self.w.owner.owner_connection(intent_owner(&intent));
             return Ok(Pass::Wait(
                 self.w.config.poll.min(self.w.config.reconcile_interval),
             ));

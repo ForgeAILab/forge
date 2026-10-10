@@ -1490,7 +1490,7 @@ impl DaemonWorkspaceClient {
             .map_err(ServiceError::from)?
         {
             if location.is_some_and(|location| {
-                request.fence.target_owner["location_id"].as_str() != Some(location)
+                request.effect_owner()["location_id"].as_str() != Some(location)
             }) {
                 continue;
             }
@@ -1528,7 +1528,7 @@ impl DaemonWorkspaceClient {
                 integration,
                 workspace: WorkspaceHandleReference {
                     daemon_id: daemon_id.into(),
-                    runtime_id: request.fence.target_owner["runtime_id"]
+                    runtime_id: request.effect_owner()["runtime_id"]
                         .as_str()
                         .unwrap_or_default()
                         .into(),
@@ -1686,7 +1686,7 @@ impl DaemonWorkspaceClient {
         })?;
         self.reconcile_integration_attempts_on(
             daemon_id,
-            request.fence.target_owner["location_id"].as_str(),
+            request.effect_owner()["location_id"].as_str(),
         )
         .await?;
         let wire: WorkspaceIntegrationRequest =
@@ -1704,7 +1704,7 @@ impl DaemonWorkspaceClient {
         // undelivered announcement leaves no intent behind.
         self.announce_integration_fence(
             daemon_id,
-            request.fence.target_owner["runtime_id"]
+            request.effect_owner()["runtime_id"]
                 .as_str()
                 .unwrap_or_default(),
             &wire.fence,

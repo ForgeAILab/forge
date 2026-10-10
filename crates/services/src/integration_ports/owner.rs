@@ -1,5 +1,9 @@
-//! The head's fenced Git owner: the server for a server-owned target, the
-//! daemon that holds the default checkout for a daemon-owned one.
+//! The head's fenced Git owners. Each effect goes to the owner that holds
+//! what it works on: the rebase to the owner of the Task's checkout, the
+//! fast-forward to the owner of the default checkout. They are one owner in
+//! the usual case and two when the Task was placed on another machine; an
+//! effect is requested from, journaled by and reconciled with the owner that
+//! performs it (`IntegrationEffectRequest::effect_owner`).
 use crate::{
     daemon_transport::workspace_client::{DaemonWorkspaceClient, WorkspaceClientError},
     integration_effects::{EffectOwner, EffectWorkspace},
@@ -41,7 +45,8 @@ pub(crate) fn client_error(error: WorkspaceClientError) -> ServiceError {
     }
 }
 
-/// The daemon a fence's (or a queue's) `target_owner` names.
+/// The daemon an owner value (a fence's or queue's `target_owner`, or an
+/// effect's `effect_owner`) names.
 pub(crate) fn daemon_owner(owner: &serde_json::Value) -> Option<(String, String)> {
     (owner["owner_kind"] == "daemon")
         .then(|| {
@@ -74,6 +79,10 @@ impl DaemonFences {
             client,
             announced: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub(crate) fn db(&self) -> &Arc<SqliteDb> {
+        &self.db
     }
 
     /// Every queue this daemon may still be asked about.
@@ -128,7 +137,7 @@ impl DaemonFences {
     }
 }
 
-/// Dispatches each effect on the owner its fence names.
+/// Dispatches each effect on the owner that performs it.
 pub struct RoutingIntegrationOwner {
     server: Arc<ServerIntegrationOwner>,
     client: DaemonWorkspaceClient,
@@ -148,28 +157,26 @@ impl RoutingIntegrationOwner {
         }
     }
 
-    /// `None`: the workspace is not held by the daemon the fence names.
-    fn daemon_fence(
-        fence: &IntegrationOwnerFence,
+    /// The transport fence of an effect on the daemon that holds `workspace`.
+    fn workspace_fence(
         workspace: &EffectWorkspace,
         expected_head_sha: &str,
-    ) -> Option<(String, WorkspaceMutationFence)> {
-        let (daemon_id, runtime_id) = daemon_owner(&fence.target_owner)?;
-        if workspace.owner
-            != (EffectOwner::Daemon {
-                daemon_id: daemon_id.clone(),
-                runtime_id: runtime_id.clone(),
-            })
-        {
+    ) -> Option<(String, String, WorkspaceMutationFence)> {
+        let EffectOwner::Daemon {
+            daemon_id,
+            runtime_id,
+        } = &workspace.owner
+        else {
             return None;
-        }
+        };
         Some((
             daemon_id.clone(),
+            runtime_id.clone(),
             WorkspaceMutationFence {
                 // The attempt sink binds the request and its operation id.
                 integration: WorkspaceIntegrationBinding::TaskStep,
-                daemon_id,
-                runtime_id,
+                daemon_id: daemon_id.clone(),
+                runtime_id: runtime_id.clone(),
                 placement_id: workspace.placement_id.clone(),
                 operation_id: "assigned-by-attempt-sink".into(),
                 generation: workspace.generation.max(0) as u64,
@@ -180,20 +187,56 @@ impl RoutingIntegrationOwner {
         ))
     }
 
+    /// The owner of the Task's checkout when it is not the target's owner:
+    /// the `witness.effect_owner` of a rebase performed there. `Ok(None)`:
+    /// one owner holds both. `Err(())`: the placement names no such owner.
+    async fn off_target_owner(
+        &self,
+        fence: &IntegrationOwnerFence,
+        workspace: &EffectWorkspace,
+    ) -> Result<std::result::Result<Option<serde_json::Value>, ()>> {
+        let target = daemon_owner(&fence.target_owner);
+        let same = match (&workspace.owner, &target) {
+            (EffectOwner::Server, None) => true,
+            (EffectOwner::Daemon { daemon_id, .. }, Some((target, _))) => daemon_id == target,
+            _ => false,
+        };
+        if same {
+            return Ok(Ok(None));
+        }
+        let owner = self
+            .fences
+            .db()
+            .integration_placement_owner(&workspace.placement_id)
+            .await?;
+        Ok(match (owner, &workspace.owner) {
+            (
+                Some(owner),
+                EffectOwner::Daemon {
+                    daemon_id,
+                    runtime_id,
+                },
+            ) if owner["owner_kind"] == "daemon"
+                && owner["daemon_id"].as_str() == Some(daemon_id)
+                && owner["runtime_id"].as_str() == Some(runtime_id) =>
+            {
+                Ok(Some(owner))
+            }
+            _ => Err(()),
+        })
+    }
+
     async fn effect(
         &self,
         daemon_id: &str,
+        runtime_id: &str,
         request: IntegrationEffectRequest,
         method: &str,
         params: serde_json::Value,
         deadline: Duration,
     ) -> Result<IntegrationEffectReceipt> {
-        let runtime_id = request.fence.target_owner["runtime_id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
         self.fences
-            .announce(daemon_id, &runtime_id, &request.fence)
+            .announce(daemon_id, runtime_id, &request.fence)
             .await?;
         self.client
             .integration_effect(daemon_id, request, method, params, deadline + REPLY_SLACK)
@@ -218,14 +261,16 @@ fn undecodable<T>(receipt: &IntegrationEffectReceipt, not_performed: T) -> Resul
 #[async_trait]
 impl IntegrationOwnerPort for RoutingIntegrationOwner {
     async fn rebase(&self, request: OwnerRebaseRequest) -> Result<OwnerRebaseReceipt> {
-        if daemon_owner(&request.fence.target_owner).is_none() {
+        // By the owner of the Task's checkout, whoever owns the target.
+        let Some((daemon_id, runtime_id, fence)) =
+            Self::workspace_fence(&request.workspace, &request.expected_head_sha)
+        else {
             return IntegrationOwnerPort::rebase(&*self.server, request).await;
-        }
-        let Some((daemon_id, fence)) = Self::daemon_fence(
-            &request.fence,
-            &request.workspace,
-            &request.expected_head_sha,
-        ) else {
+        };
+        let Ok(effect_owner) = self
+            .off_target_owner(&request.fence, &request.workspace)
+            .await?
+        else {
             return Ok(OwnerRebaseReceipt::Refused {
                 reason: OwnerEffectRefusal::ForeignOwner,
             });
@@ -233,7 +278,13 @@ impl IntegrationOwnerPort for RoutingIntegrationOwner {
         let effect = IntegrationEffectRequest {
             fence: request.fence.clone(),
             kind: IntegrationOperationKind::Rebase,
-            witness: json!({"workspace":request.workspace,"target_branch":request.target_branch,"expected_head_sha":request.expected_head_sha,"expected_target_sha":request.expected_target_sha,"handoff_conflicts":request.handoff_conflicts,"deadline_nanos":request.deadline.as_nanos().to_string()}),
+            witness: {
+                let mut witness = json!({"workspace":request.workspace,"target_branch":request.target_branch,"expected_head_sha":request.expected_head_sha,"expected_target_sha":request.expected_target_sha,"handoff_conflicts":request.handoff_conflicts,"deadline_nanos":request.deadline.as_nanos().to_string()});
+                if let Some(owner) = effect_owner {
+                    witness["effect_owner"] = owner;
+                }
+                witness
+            },
         };
         let params = serde_json::to_value(WorkspaceOwnerOperationParams {
             fence,
@@ -253,7 +304,7 @@ impl IntegrationOwnerPort for RoutingIntegrationOwner {
                     "integration rebase reply abandoned; the owner's receipt decides",
                 ))
             }
-            receipt = self.effect(&daemon_id, effect, METHOD_WORKSPACE_RESET, params, request.deadline) => receipt?,
+            receipt = self.effect(&daemon_id, &runtime_id, effect, METHOD_WORKSPACE_RESET, params, request.deadline) => receipt?,
         };
         match serde_json::from_value(receipt.result.clone()) {
             Ok(decoded) => Ok(decoded),
@@ -262,11 +313,15 @@ impl IntegrationOwnerPort for RoutingIntegrationOwner {
     }
 
     async fn fast_forward(&self, request: OwnerFastForwardRequest) -> Result<OwnerMergeReceipt> {
-        if daemon_owner(&request.fence.target_owner).is_none() {
+        // By the owner of the default checkout. The server takes a candidate
+        // that an outbound transfer brought from another machine; a daemon
+        // fast-forwards from a worktree it holds.
+        let Some((target_daemon, _)) = daemon_owner(&request.fence.target_owner) else {
             return IntegrationOwnerPort::fast_forward(&*self.server, request).await;
-        }
-        let Some((daemon_id, fence)) =
-            Self::daemon_fence(&request.fence, &request.workspace, &request.candidate_sha)
+        };
+        let Some((daemon_id, runtime_id, fence)) =
+            Self::workspace_fence(&request.workspace, &request.candidate_sha)
+                .filter(|(daemon_id, _, _)| *daemon_id == target_daemon)
         else {
             return Ok(OwnerMergeReceipt::Refused {
                 reason: OwnerEffectRefusal::ForeignOwner,
@@ -296,6 +351,7 @@ impl IntegrationOwnerPort for RoutingIntegrationOwner {
         let receipt = self
             .effect(
                 &daemon_id,
+                &runtime_id,
                 effect,
                 METHOD_WORKSPACE_MERGE,
                 params,
@@ -309,7 +365,8 @@ impl IntegrationOwnerPort for RoutingIntegrationOwner {
     }
 
     async fn reconcile_effect(&self, request: &IntegrationEffectRequest) -> Result<()> {
-        match daemon_owner(&request.fence.target_owner) {
+        // The owner that performed the effect holds its receipt.
+        match daemon_owner(request.effect_owner()) {
             None => self.server.reconcile_effect(request).await,
             // A lookup, never the effect: the owner answers from its journal
             // and the receipt is recorded before it is acknowledged.
@@ -326,8 +383,8 @@ impl IntegrationOwnerPort for RoutingIntegrationOwner {
         self.server.reconcile_outstanding().await
     }
 
-    fn owner_connection(&self, target_owner: &serde_json::Value) -> Option<u64> {
-        match daemon_owner(target_owner) {
+    fn owner_connection(&self, effect_owner: &serde_json::Value) -> Option<u64> {
+        match daemon_owner(effect_owner) {
             None => Some(0),
             Some((daemon_id, _)) => self.client.connection_id(&daemon_id),
         }

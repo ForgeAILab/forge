@@ -83,7 +83,16 @@ impl DaemonWorkspaceBackend {
         else {
             return Ok(());
         };
-        let owner = &request.fence.target_owner;
+        // The owner that performs the effect. A rebase belongs to the owner
+        // of the Task's checkout: when the default checkout is on another
+        // machine the request names this daemon as `witness.effect_owner`,
+        // with the Task's own repo location. Nothing else is performed off
+        // the target's owner.
+        let off_target = request.off_target_owner();
+        if off_target && request.kind != WorkspaceIntegrationKind::Rebase {
+            return Err(refusal(IntegrationOwnerRefusal::ForeignOwner));
+        }
+        let owner = request.effect_owner();
         if owner["owner_kind"] != "daemon"
             || owner["daemon_id"].as_str() != Some(&self.daemon_id)
             || owner["runtime_id"].as_str() != Some(&fence.runtime_id)
@@ -158,9 +167,13 @@ impl DaemonWorkspaceBackend {
             fence.integration,
             WorkspaceIntegrationBinding::Attempt { .. }
         );
+        // Off the target's owner the location is the Task's own: the claim
+        // froze the target's generation, which the target's owner checks at
+        // the fast-forward.
         if location.daemon_id != fence.daemon_id
             || location.runtime_id != fence.runtime_id
             || (queue_claim
+                && !off_target
                 && (owner["generation"].as_i64() != Some(location.version)
                     || location.kind != DaemonRepoLocationKind::PrimaryCheckout))
         {
@@ -183,6 +196,7 @@ impl DaemonWorkspaceBackend {
             || witness["owner"]["kind"] != "daemon"
             || witness["owner"]["daemon_id"].as_str() != Some(&fence.daemon_id)
             || witness["owner"]["runtime_id"].as_str() != Some(&fence.runtime_id)
+            || (off_target && owned.repo_location_id != location_id)
         {
             return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
         }
@@ -296,18 +310,28 @@ impl DaemonWorkspaceBackend {
             .as_str()
             .ok_or_else(|| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
         let owned = self.workspace(&reference(fence, handle), false)?;
-        let location = {
-            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            state
-                .locations
-                .get(
-                    request.fence.target_owner["location_id"]
-                        .as_str()
-                        .unwrap_or_default(),
-                )
-                .cloned()
-        }
-        .ok_or_else(|| refusal(IntegrationOwnerRefusal::ForeignOwner))?;
+        // The default checkout, when this owner holds it. For a rebase off
+        // the target's owner it is on another machine and cannot be read:
+        // the inbound transfer's ref is then the only target witness.
+        let off_target = request.off_target_owner();
+        let location = if off_target {
+            None
+        } else {
+            Some(
+                {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state
+                        .locations
+                        .get(
+                            request.fence.target_owner["location_id"]
+                                .as_str()
+                                .unwrap_or_default(),
+                        )
+                        .cloned()
+                }
+                .ok_or_else(|| refusal(IntegrationOwnerRefusal::ForeignOwner))?,
+            )
+        };
         let head = witness["expected_head_sha"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -323,17 +347,22 @@ impl DaemonWorkspaceBackend {
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
-            if resolve_commit(&location.path, &format!("refs/heads/{branch}")).await? != expected {
-                return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
+            if let Some(location) = &location {
+                if resolve_commit(&location.path, &format!("refs/heads/{branch}")).await?
+                    != expected
+                {
+                    return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
+                }
             }
             // The Task's checkout must hold the target tip the claim read:
             // as its own target branch when it shares the default checkout's
             // refs, or, in another clone on this owner, as the ref this claim
             // generation's inbound object transfer bound.
             if request.kind == WorkspaceIntegrationKind::Rebase
-                && !resolve_commit(&owned.path, &format!("refs/heads/{branch}"))
-                    .await
-                    .is_ok_and(|own| own == expected)
+                && (off_target
+                    || !resolve_commit(&owned.path, &format!("refs/heads/{branch}"))
+                        .await
+                        .is_ok_and(|own| own == expected))
             {
                 let transferred = git::integration::transfer_ref(&object_transfer_key(
                     &request.fence.attempt_id,

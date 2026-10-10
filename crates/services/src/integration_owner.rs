@@ -444,17 +444,35 @@ impl ServerIntegrationOwner {
 
     pub async fn rebase(&self, input: ServerRebaseRequest<'_>) -> Result<OwnerRebaseReceipt> {
         // Owner mismatch is refused before any Git (including fact queries).
-        if input.workspace.owner != EffectOwner::Server
-            || input.fence.target_owner["owner_kind"] != "server"
-        {
+        // The rebase belongs to the owner of the Task's checkout. The default
+        // checkout may be on another machine: the witness then is the ref the
+        // inbound object transfer bound, and this owner is recorded as the
+        // effect's owner so that its receipt is asked for here.
+        if input.workspace.owner != EffectOwner::Server {
             return Ok(OwnerRebaseReceipt::Refused {
                 reason: OwnerEffectRefusal::ForeignOwner,
             });
         }
+        let cross_owner = input.fence.target_owner["owner_kind"] != "server";
+        let mut witness = json!({"workspace":input.workspace,"target_branch":input.target_branch,"expected_head_sha":input.expected_head_sha,"expected_target_sha":input.expected_target_sha,"handoff_conflicts":input.handoff_conflicts,"deadline_nanos":input.deadline.as_nanos().to_string()});
+        if cross_owner {
+            match self
+                .db
+                .integration_placement_owner(&input.workspace.placement_id)
+                .await?
+            {
+                Some(owner) if owner["owner_kind"] == "server" => witness["effect_owner"] = owner,
+                _ => {
+                    return Ok(OwnerRebaseReceipt::Refused {
+                        reason: OwnerEffectRefusal::ForeignOwner,
+                    })
+                }
+            }
+        }
         let request = IntegrationEffectRequest {
             fence: input.fence.clone(),
             kind: IntegrationOperationKind::Rebase,
-            witness: json!({"workspace":input.workspace,"target_branch":input.target_branch,"expected_head_sha":input.expected_head_sha,"expected_target_sha":input.expected_target_sha,"handoff_conflicts":input.handoff_conflicts,"deadline_nanos":input.deadline.as_nanos().to_string()}),
+            witness,
         };
         self.reconcile_checkout(Some(&request)).await?;
         let mut guard = match self.db.begin_integration_effect(request).await? {
@@ -473,7 +491,15 @@ impl ServerIntegrationOwner {
                 reason: refusal.into(),
             });
         }
-        let Some((path, target_path)) = guard.server_workspace_paths().await? else {
+        let paths = if cross_owner {
+            guard.server_worktree_path().await?.map(|path| (path, None))
+        } else {
+            guard
+                .server_workspace_paths()
+                .await?
+                .map(|(path, target)| (path, Some(target)))
+        };
+        let Some((path, target_path)) = paths else {
             let outcome = OwnerRebaseReceipt::Refused {
                 reason: OwnerEffectRefusal::WitnessMismatch,
             };
@@ -483,7 +509,7 @@ impl ServerIntegrationOwner {
         let operation = async {
             match verify_objects(
                 &path,
-                &target_path,
+                target_path.as_deref(),
                 input.target_branch,
                 input.expected_head_sha,
                 input.expected_target_sha,
@@ -534,9 +560,13 @@ impl ServerIntegrationOwner {
 /// clone, as the ref this claim generation's inbound object transfer bound
 /// (`refs/forge/integration/<attempt>-<generation>-in`). The rebase is onto
 /// that commit, never onto a branch name.
+///
+/// `target_path` is `None` when the default checkout is on another machine:
+/// its tip cannot be read here, and only the transferred ref is a witness
+/// (the fast-forward on the target's owner refuses a tip that moved since).
 async fn verify_objects(
     path: &Path,
-    target_path: &Path,
+    target_path: Option<&Path>,
     target: &str,
     head: &str,
     target_sha: &str,
@@ -545,16 +575,19 @@ async fn verify_objects(
     if head.is_empty() || target_sha.is_empty() {
         return Ok(false);
     }
-    if git::get_current_sha(path).await? != head
-        || integration_effects::merge::target_tip(target_path, target).await? != target_sha
-    {
+    if git::get_current_sha(path).await? != head {
         return Ok(false);
     }
-    if integration_effects::merge::target_tip(path, target)
-        .await
-        .is_ok_and(|own| own == target_sha)
-    {
-        return Ok(true);
+    if let Some(target_path) = target_path {
+        if integration_effects::merge::target_tip(target_path, target).await? != target_sha {
+            return Ok(false);
+        }
+        if integration_effects::merge::target_tip(path, target)
+            .await
+            .is_ok_and(|own| own == target_sha)
+        {
+            return Ok(true);
+        }
     }
     let Ok(transferred) = git::integration::transfer_ref(inbound_key) else {
         return Ok(false);
@@ -634,8 +667,13 @@ impl ServerIntegrationOwner {
     /// The caller supplies its frozen review permit. The owner gate protects
     /// physical identity and objects, and grants no new review/Task authority.
     pub async fn merge(&self, input: ServerMergeRequest<'_>) -> Result<OwnerMergeReceipt> {
-        if input.workspace.owner != EffectOwner::Server
-            || input.fence.target_owner["owner_kind"] != "server"
+        // The fast-forward belongs to the owner of the default checkout. A
+        // Task whose checkout is on another machine has no worktree here: its
+        // exact candidate was brought by this claim generation's outbound
+        // object transfer, and that ref is the candidate witness.
+        let from_transfer = input.workspace.owner != EffectOwner::Server;
+        if input.fence.target_owner["owner_kind"] != "server"
+            || (from_transfer && input.reviewed.is_none())
         {
             return Ok(OwnerMergeReceipt::Refused {
                 reason: OwnerEffectRefusal::ForeignOwner,
@@ -668,7 +706,15 @@ impl ServerIntegrationOwner {
                 reason: refusal.into(),
             });
         }
-        let outcome = match guard.server_workspace_paths().await? {
+        let paths = if from_transfer {
+            guard
+                .server_target_path()
+                .await?
+                .map(|target| (target.clone(), target))
+        } else {
+            guard.server_workspace_paths().await?
+        };
+        let outcome = match paths {
             None => OwnerMergeReceipt::Refused {
                 reason: OwnerEffectRefusal::WitnessMismatch,
             },
@@ -695,7 +741,17 @@ impl ServerIntegrationOwner {
                     biased;
                     _ = input.cancel.cancelled() => merge_interrupted(&target, false).await,
                     _ = deadline => merge_interrupted(&target, true).await,
-                    result = server_merge(&effect) => match result {
+                    result = async {
+                        if from_transfer {
+                            server_fast_forward_transferred(&effect, &api_types::object_transfer_key(
+                                &input.fence.attempt_id,
+                                input.fence.generation,
+                                api_types::ObjectTransferDirection::Outbound,
+                            )).await
+                        } else {
+                            server_merge(&effect).await
+                        }
+                    } => match result {
                         Ok(Some(outcome)) => OwnerMergeReceipt::Completed { outcome },
                         Ok(None) => OwnerMergeReceipt::Refused { reason: OwnerEffectRefusal::WitnessMismatch },
                         Err(e) => OwnerMergeReceipt::Infrastructure { message: integration_effects::check::tail_bytes(&e.to_string(), 4096) },
@@ -757,6 +813,72 @@ async fn server_merge(
     };
     let applied = apply_merge(input, already).await?;
     Ok(Some(merge_result(input, already, applied).await?))
+}
+
+/// The fast-forward of a candidate held by no worktree on this host. The
+/// candidate witness is the ref this claim generation's outbound transfer
+/// bound in the default checkout; the target witness is its unchanged tip.
+/// `None`: a witness does not hold (the driver reads the facts again).
+async fn server_fast_forward_transferred(
+    input: &integration_effects::merge::MergeEffectInput<'_>,
+    outbound_key: &str,
+) -> Result<Option<crate::MergeOutcome>> {
+    use integration_effects::merge::*;
+    let candidate = input.expected_head_sha;
+    if candidate.is_empty() || input.observed_target_sha.is_empty() {
+        return Ok(None);
+    }
+    let Ok(transferred) = git::integration::transfer_ref(outbound_key) else {
+        return Ok(None);
+    };
+    let bound = git::command_output(
+        input.repo_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{transferred}^{{commit}}"),
+        ],
+    )
+    .await?;
+    if !bound.status.success()
+        || String::from_utf8_lossy(&bound.stdout).trim() != candidate
+        || target_tip(input.repo_path, input.target_branch).await? != input.observed_target_sha
+    {
+        return Ok(None);
+    }
+    if !git::is_worktree_clean(input.repo_path).await? {
+        return Ok(Some(crate::MergeOutcome::TargetDirty {
+            files: git::status_porcelain(input.repo_path).await?,
+        }));
+    }
+    let applied = match git::integration::apply_merge(
+        input.repo_path,
+        input.target_branch,
+        candidate,
+        true,
+        false,
+        Some(input.observed_target_sha),
+        git::integration::FastForwardLimits {
+            deadline: Duration::from_secs(30),
+            output_bytes: ::review::contract::MAX_EVIDENCE_BYTES,
+        },
+    )
+    .await?
+    {
+        git::integration::MergeApplyOutcome::Applied => MergeApplyOutcome::Applied,
+        git::integration::MergeApplyOutcome::ManualFailed(error) => {
+            MergeApplyOutcome::ManualFailed(error)
+        }
+        git::integration::MergeApplyOutcome::ReviewRequired { reason } => {
+            MergeApplyOutcome::ReviewRequired { reason }
+        }
+        git::integration::MergeApplyOutcome::ExactObjectMismatch
+        | git::integration::MergeApplyOutcome::TargetMoved => {
+            MergeApplyOutcome::ExactObjectMismatch
+        }
+    };
+    Ok(Some(merge_result(input, false, applied).await?))
 }
 
 fn rebase_state(outcome: &OwnerRebaseReceipt) -> IntegrationOperationState {

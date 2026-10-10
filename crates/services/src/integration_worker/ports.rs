@@ -44,8 +44,9 @@ pub struct OwnerFastForwardRequest {
     pub deadline: Duration,
 }
 
-/// The fenced Git owner of a head's effects: the server for a server-owned
-/// target, the daemon that holds the default checkout for a daemon-owned one.
+/// The fenced Git owners of a head's effects: the rebase is performed by the
+/// owner of the Task's checkout, the fast-forward by the owner of the default
+/// checkout (one owner, or two when the Task is on another machine).
 /// Every effect is admitted by intent and answered by one receipt per
 /// `(fence, kind)`; a repeated call returns that receipt and runs no Git. An
 /// `Err` means the reply is missing, never that nothing ran: the driver then
@@ -58,11 +59,12 @@ pub trait IntegrationOwnerPort: Send + Sync {
     /// effects that share its checkout lock). Runs no Git effect.
     async fn reconcile_effect(&self, request: &IntegrationEffectRequest) -> Result<()>;
     async fn reconcile_outstanding(&self) -> Result<()>;
-    /// The live connection to the owner `target_owner` names: `None` while
-    /// it is not connected, another number after it reconnected. The server
-    /// is always connected. A head with an unknown result reads this to ask
-    /// for the receipt as soon as its owner is back.
-    fn owner_connection(&self, _target_owner: &serde_json::Value) -> Option<u64> {
+    /// The live connection to the owner that performs an effect
+    /// (`IntegrationEffectRequest::effect_owner`): `None` while it is not
+    /// connected, another number after it reconnected. The server is always
+    /// connected. A head with an unknown result reads this to ask for the
+    /// receipt as soon as that owner is back.
+    fn owner_connection(&self, _effect_owner: &serde_json::Value) -> Option<u64> {
         Some(0)
     }
 }

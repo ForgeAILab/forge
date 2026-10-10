@@ -225,6 +225,24 @@ pub struct WorkspaceIntegrationRequest {
 }
 
 impl WorkspaceIntegrationRequest {
+    /// The owner that performs this effect. The fence names the owner of the
+    /// queue's default checkout; a rebase of a Task whose checkout is on
+    /// another machine carries its own owner as `witness.effect_owner`
+    /// (`location_id`, `owner_kind`, `daemon_id`, `runtime_id`).
+    pub fn effect_owner(&self) -> &serde_json::Value {
+        self.witness
+            .get("effect_owner")
+            .filter(|owner| owner.is_object())
+            .unwrap_or(&self.fence.target_owner)
+    }
+
+    /// The effect is performed by another owner than the fence's target owner.
+    pub fn off_target_owner(&self) -> bool {
+        self.witness
+            .get("effect_owner")
+            .is_some_and(serde_json::Value::is_object)
+    }
+
     /// Stable attempt/effect/fence identity in the existing bounded journal.
     pub fn operation_id(&self) -> String {
         let kind = match self.kind {

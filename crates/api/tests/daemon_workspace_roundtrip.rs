@@ -5136,3 +5136,201 @@ async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second
         assert!(queue.head_attempt_id.is_none());
     }
 }
+
+// ----- cross-owner queue heads (3.2 D2a part 2) -----
+//
+// The Task's checkout and the repository's default checkout are held by
+// different owners. The rebase and the head check run on the Task's owner,
+// the fast-forward on the owner of the default checkout; each effect is
+// requested from, journaled by and reconciled with the owner that ran it.
+
+/// The check worker, as the server runtime starts it. `$stop` names the
+/// sender that stops it.
+macro_rules! start_check_worker {
+    ($fixture:expr, $stop:ident) => {
+        let check_state = $fixture.harness.state.clone();
+        let check_periodic =
+            services::worker_runtime::PeriodicWorkers::new(check_state.db.clone());
+        let ($stop, checks_stopped) = tokio::sync::watch::channel(false);
+        let _checks = Arc::new(services::check_runner::worker::CheckRunWorker::new(
+            check_state.db.clone(),
+            Arc::new(services::check_runner::owners::WorkspaceCheckOwners::new(
+                check_state.db.clone(),
+                check_state.daemon_connections.clone(),
+                Duration::from_secs(60),
+            )),
+        ))
+        .start(&check_periodic, checks_stopped);
+    };
+}
+
+/// Makes a server-owned clone of the fixture's repository its default
+/// checkout. The daemon-owned location the Task is placed in stays, no
+/// longer the default. Call before the candidate is committed: the clone
+/// then holds `main` only.
+async fn server_owned_default(fixture: &Fixture) -> PathBuf {
+    let database = fixture.harness.state.db.clone();
+    let clone = fixture.server_root.path().join("default-checkout");
+    git_sync(
+        fixture.server_root.path(),
+        &[
+            "clone",
+            "-q",
+            "--single-branch",
+            "--branch",
+            "main",
+            fixture.checkout.to_str().unwrap(),
+            "default-checkout",
+        ],
+    );
+    for (key, value) in [
+        ("user.name", "Forge"),
+        ("user.email", "forge@example.invalid"),
+    ] {
+        git_sync(&clone, &["config", key, value]);
+    }
+    let placement = &fixture.resolved.placement;
+    let repo_id = WorkspaceRepo::get_by_id(&*database, &placement.workspace_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .repo_id;
+    sqlx::query("UPDATE repo_location SET is_default=0 WHERE id=?")
+        .bind(&placement.repo_location_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let now = db::now_rfc3339();
+    RepoLocationRepo::create(
+        &*database,
+        CreateRepoLocation {
+            id: db::new_uuid_v4(),
+            repo_id,
+            owner_kind: RepoLocationOwnerKind::Server,
+            daemon_id: None,
+            runtime_id: None,
+            path: clone.to_string_lossy().into_owned(),
+            kind: RepoLocationKind::PrimaryCheckout,
+            is_default: true,
+            status: RepoLocationStatus::Ready,
+            last_verified_at: Some(now.clone()),
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("server-owned default location creates");
+    clone
+}
+
+fn integration_refs(path: &std::path::Path) -> String {
+    git_sync(
+        path,
+        &["for-each-ref", "--format=%(refname)", "refs/forge/"],
+    )
+}
+
+fn attempt_receipts(attempt: &db::IntegrationAttempt) -> Vec<db::IntegrationEffectReceipt> {
+    serde_json::from_value(attempt.effect_receipts_json.clone()).unwrap()
+}
+
+/// Receipts of `kind` and the daemon (or `None` for the server) that
+/// performed each.
+fn receipt_owners(
+    attempt: &db::IntegrationAttempt,
+    kind: db::IntegrationOperationKind,
+) -> Vec<(db::IntegrationOperationState, Option<String>)> {
+    attempt_receipts(attempt)
+        .into_iter()
+        .filter(|receipt| receipt.request.kind == kind)
+        .map(|receipt| {
+            (
+                receipt.operation_state,
+                receipt.request.effect_owner()["daemon_id"]
+                    .as_str()
+                    .map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+/// Task on a daemon, default checkout on the server. The target moved, so
+/// the head needs the whole path: the target tip goes to the daemon, the
+/// rebase and the real head check run there, the exact rebased commit goes
+/// to the server and is fast-forwarded there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn queue_worker_merges_a_daemon_placed_task_into_a_server_owned_default_checkout() {
+    use db::{IntegrationOperationKind as Kind, IntegrationOperationState as State};
+    let fixture = Fixture::file_backed("forge-queue-cross-daemon-server").await;
+    let default_checkout = server_owned_default(&fixture).await;
+    let head = admit_queue_head(&fixture, &["test -f feature.txt", "test -f outside.txt"]).await;
+    std::fs::write(default_checkout.join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&default_checkout, "outside").await.unwrap();
+    let moved_tip = git::get_current_sha(&default_checkout).await.unwrap();
+    let task_location_tip = git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]);
+    start_check_worker!(fixture, stop_checks);
+
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the Task to merge", {
+        task_status(&fixture, &head.task_id).await == "done"
+            && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
+    });
+    // The attempt left the slot: its transfer refs go on both ends.
+    queue_eventually!(&fixture, &head, "the transfer refs to be released", {
+        integration_refs(&default_checkout).is_empty()
+            && integration_refs(&fixture.checkout).is_empty()
+    });
+    let _ = stop.send(true);
+    let _ = stop_checks.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let attempt = queue_attempt(&fixture, &head).await;
+    assert!(
+        attempt.failure_message.is_none(),
+        "never parked: {:?}",
+        attempt.failure_message
+    );
+    // The default checkout holds exactly the checked candidate.
+    let tip = git_sync(&default_checkout, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(attempt.candidate_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(attempt.integrated_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(
+        attempt.integrated_before_sha.as_deref(),
+        Some(moved_tip.as_str())
+    );
+    assert_ne!(tip, head.candidate, "the queue rebased the candidate");
+    assert_eq!(git_sync(&default_checkout, &["rev-parse", "HEAD"]), tip);
+    for file in ["feature.txt", "outside.txt"] {
+        assert!(default_checkout.join(file).exists(), "{file}");
+    }
+    // The Task's own location was neither merged nor advanced.
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        task_location_tip
+    );
+    // One rebase, by the daemon; one fast-forward, by the server.
+    assert_eq!(
+        receipt_owners(&attempt, Kind::Rebase),
+        vec![(State::Succeeded, Some(fixture.daemon_id.clone()))]
+    );
+    assert_eq!(
+        receipt_owners(&attempt, Kind::FastForward),
+        vec![(State::Succeeded, None)]
+    );
+    let link = fixture.link.as_ref().unwrap();
+    assert_eq!(attempt_requests(link, METHOD_WORKSPACE_RESET).len(), 1);
+    assert!(attempt_requests(link, METHOD_WORKSPACE_MERGE).is_empty());
+    assert!(
+        !link.requests(METHOD_INTEGRATION_ANNOUNCE).is_empty(),
+        "the Task's owner was told the claim generation"
+    );
+    // The check ran on the rebased commit, on the daemon, and passed.
+    let checks: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id",
+    )
+    .fetch_all(fixture.harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(checks, vec![(tip, "pass".to_owned())]);
+}
