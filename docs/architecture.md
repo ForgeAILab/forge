@@ -5843,8 +5843,52 @@ lands in the default checkout:
 | Task's checkout | Through the queue |
 |---|---|
 | A worktree of the default checkout (server or daemon) | Rebased and fast-forwarded in place; no transfer. |
-| Another clone, same owner as the default checkout | The target tip is brought to the Task's clone and bound to `refs/forge/integration/<attempt>-<generation>-in`. That ref is the rebase witness on both owner gates (the clone's own target branch is not written and need not match), and the rebase is onto that commit. The exact rebased commit is then sent to the default checkout and fast-forwarded there. Proven end to end on a server-owned pair; the daemon gate has the same rule but a pair of clones on one daemon has no end-to-end test yet. |
-| Another owner than the default checkout (daemon-placed Task and server-owned default checkout, or the reverse) | **Not supported.** One fenced owner performs both effects of a head, so the head parks `cross_owner_unsupported` (owner action: place the Task on the machine that holds the default checkout). Today's path does merge such a Task (into its own location), so this is open before the cutover. |
+| Another clone, same owner as the default checkout | The target tip is brought to the Task's clone and bound to `refs/forge/integration/<attempt>-<generation>-in`. That ref is the rebase witness on both owner gates (the clone's own target branch is not written and need not match), and the rebase is onto that commit. The exact rebased commit is then sent to the default checkout (`...-out`) and fast-forwarded there from that ref. Proven end to end on a server-owned pair and on two clones on one daemon. |
+| Another owner than the default checkout (Task on a daemon and default checkout on the server, the reverse, or two daemons) | Two fenced owners, each doing only what it holds. The **rebase** and the head check run on the owner of the Task's checkout, onto the inbound transfer ref. The **fast-forward** runs on the owner of the default checkout, from the outbound transfer ref, with the target tip unchanged since the rebase as its witness. The Task's own location is not merged or advanced; the refs are released on both ends when the attempt leaves the slot. |
+
+**Two owners per head.** The claim's fence always names the owner of the
+default checkout (`target_owner`); the claim is verified against it. An effect
+performed by another owner records that owner in its request as
+`witness.effect_owner` (`location_id`, `owner_kind`, `daemon_id`,
+`runtime_id`; the Task's own repo location). `IntegrationEffectRequest::effect_owner`
+is that field, or `target_owner` when it is absent, and it is the one key for
+everything that asks "who performed this": the owner lock, the list of
+outstanding intents of an owner (`outstanding_integration_effects`, read at
+server start and on a daemon's reconnect), the lookup the worker's reconcile
+timer sends (`reconcile_effect`), the connection the held session watches, and
+the settlement when a machine or location is removed. A lost rebase reply is
+therefore asked of, and settled by, the Task's owner; a lost fast-forward
+reply by the target's owner. Both owners are told the claim generation
+(`integration.announce`) before their first effect or transfer of it.
+
+| Effect | Performed by | Candidate witness | Target witness |
+|---|---|---|---|
+| Rebase | owner of the Task's checkout | HEAD of the Task's worktree | same owner as the target: the default checkout's tip, and the Task clone's own branch or the `-in` ref; another owner: the `-in` ref alone |
+| Head check | owner of the Task's checkout (the check runner places by the attempt's `owner_kind` / `daemon_id`) | the rebased commit | n/a |
+| Fast-forward | owner of the default checkout | a worktree of the default checkout: its HEAD; any other checkout: the `-out` ref of this claim generation | the default checkout's tip is still the tip the rebase was onto |
+
+A daemon that holds the default checkout fast-forwards a transferred
+candidate with no worktree, handle or placement of the Task
+(`workspace.merge` with `candidate_transfer_key`); the server does the same
+from the ref in its own checkout. If the target moved between the rebase and
+the fast-forward, the target's owner refuses (`witness_mismatch` /
+`target_moved`) and the head starts a new round: new claim generation, new
+transfers, new rebase, new check. The worker reads a daemon-owned default
+checkout the Task is not placed in through the owner's read-only
+`integration.target_facts` (tip, "candidate already landed", dirty), so a
+dirty checkout parks `target_dirty` at once from any checkout.
+
+Removal: a removed machine or location settles the intents it was
+**performing** as failed. Only queues whose **target** it owned are suspended;
+a removed Task owner is handled by the existing removed-machine Task
+settlement.
+
+After a reconnect the Task's placement stays `disconnected` until the owner
+reconciliation of the server runtime has looked at it. A head whose rebase
+receipt has arrived waits in `rebasing` (bounded by the Task-step wait, then
+an infrastructure park) until the placement is `ready` before it asks for the
+head check: the check owner refuses a placement that is not ready, and a
+verdict of "no result after retries" is kept for the commit.
 
 **Location version.** A claim freezes `repo_location.version` as the
 target's `generation`, and a daemon owner refuses a claim whose generation is

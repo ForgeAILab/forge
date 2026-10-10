@@ -542,7 +542,12 @@ impl Job {
                     kind: api_types::DaemonRepoLocationKind::ManagedClone,
                     default_branch: self.repo.default_branch.clone(),
                     remote_url: self.repo.remote_url.clone(),
-                    expected_version: location.version,
+                    // The version this verification is stored as (the
+                    // write to `ready` below adds one), as
+                    // `RepoLocationService::verify` sends it: the owner
+                    // compares a queue claim's frozen location generation
+                    // with the number it keeps.
+                    expected_version: location.version + 1,
                     probe: None,
                 },
             )

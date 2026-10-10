@@ -4552,6 +4552,18 @@ Revision 6 adds the integration owner wire (not yet used by any merge):
 | `integration.import_objects` | `daemon_id`, `runtime_id`, `fence`, `key`, `repo_location_id`, `expected_tip_sha`, `max_bytes`, `chunk` (nullable: `total_bytes`, `sha256`, `offset`, `data`, `last`) | `{kind: absent}`, `{kind: receiving, received_bytes}` or `{kind: imported, receipt { key, tip_sha, ref_name, replayed }}` |
 | `integration.release_objects` | `daemon_id`, `runtime_id`, `key` | `key`, `removed` |
 
+Revision 7 extends that wire (still not used by any merge; the queue is
+passive until the cutover):
+
+| Method / field | Meaning |
+|---|---|
+| `integration.release_objects` `attempt { attempt_id, repo_location_id }` (nullable) | Also delete every ref the attempt imported in that checkout (`refs/forge/integration/<attempt>-*`) and its staging; the result adds `removed_refs`. |
+| `integration.target_facts` | Params `daemon_id`, `runtime_id`, `repo_location_id`, `target_branch`, `candidate_sha`; result `target_tip`, `candidate_in_target`, `dirty`. Read-only facts about a default checkout the daemon holds, for a queue head whose Task is in another checkout. A `candidate_sha` the checkout does not hold is not in the target. No lock, journal or fence. |
+| `workspace.read` Git query `target_status_porcelain` | `git status --porcelain` of the workspace's repo location checkout (the default checkout when the Task is placed in it), not of the Task's worktree. Empty output means clean. |
+| `repo_location.verify` `expected_version` | The `repo_location.version` this verification will be **stored as**: the server writes the verified row next, which adds one, so it sends its present version plus one. The daemon keeps this number and refuses a queue claim whose frozen location `generation` differs (`foreign_owner`). Both the scheduled verification and managed-clone provisioning send the stored version. |
+| `workspace.merge` `candidate_transfer_key` (optional) | Set only by a queue claim whose Task checkout is not a worktree of this default checkout (another machine, or another clone on this daemon). The candidate is then the commit bound to `refs/forge/integration/<key>` by this claim generation's outbound object transfer, not the HEAD of a worktree the daemon holds: `workspace_handle` and `placement_id` are empty, `generation` is 0, and the key must be exactly `<attempt>-<generation>-out`. The owner refuses `witness_mismatch` when that ref does not name `expected.sha` or the target branch is not at `expected_target_sha`. Its lookup (`operation: reconcile`) carries the same empty workspace reference. |
+| attempt witness `effect_owner { location_id, owner_kind, daemon_id, runtime_id }` (optional) | Present on a queue claim's `rebase` whose Task checkout is owned by another owner than the default checkout. The fence's `target_owner` still names the default checkout's owner; `effect_owner` names the owner that performs, journals and is looked up for the rebase (with the Task's own repo location). A daemon accepts it for a rebase only, when it names that daemon; the target witness is then the inbound transfer ref `refs/forge/integration/<attempt>-<generation>-in` alone. |
+
 A queue attempt lookup (`workspace.describe` with `operation: reconcile`)
 returns `owner_fence { queue_id, generation, attempt_id, intent }` (`null` for
 a Task-step lookup); `intent` is `retained`, `not_performed` or `unknown`.

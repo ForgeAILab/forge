@@ -91,7 +91,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `expected_version` the version the server stores the verification as (the
   present version plus one), and `workspace.read` has a new Git query,
   `target_status_porcelain` (the status of the checkout the workspace's repo
-  location names).
+  location names). Managed-clone provisioning sends the stored version too.
+  Revision 7 also gains, for a queue head whose Task is not in a worktree of
+  the default checkout: the read-only `integration.target_facts`
+  (`{target_tip, candidate_in_target, dirty}` of a default checkout the
+  daemon holds), an optional `candidate_transfer_key` on `workspace.merge`
+  (a queue claim fast-forwards the commit its outbound object transfer
+  brought, with an empty `workspace_handle` and `placement_id`), and an
+  optional `effect_owner` in an attempt's rebase witness (the daemon that
+  holds the Task's checkout performs the rebase although the claim's
+  `target_owner` names another owner). A daemon built before these
+  additions refuses such a head's effects (`foreign_owner` /
+  `unknown method`); upgrade daemons with the server.
 - **Daemon protocol revision 6 (3.2 stage D1c).** The minimum revision is 6:
   a revision-5 or older daemon is refused at the handshake with
   `daemon_upgrade_required` and cannot use any command RPC. Upgrade the
@@ -911,9 +922,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     location since), the queue asks for a verification and goes on instead
     of only parking.
   - A Task whose checkout is another clone than the default checkout, on
-    the same owner, now merges through the queue into the default checkout.
-    A Task on another machine than the default checkout still parks
-    (`cross_owner_unsupported`).
+    the same owner (server or daemon), now merges through the queue into the
+    default checkout.
+  - A Task on another machine than the default checkout (Task on a daemon
+    and default checkout on the server, the reverse, or two daemons) now
+    merges through the queue too: it is rebased and checked where the Task
+    is, and the exact checked commit is moved to the default checkout and
+    fast-forwarded there. The `cross_owner_unsupported` park is gone. A
+    lost reply is settled with the machine that ran that step.
+  - After a daemon reconnects, a queue head waits until the Task's checkout
+    is ready on it again before asking for the head check, instead of
+    parking on a check that could not start.
   - A queue head whose result is unknown keeps its place and is asked about
     every 60 s, and at once when its machine is back, instead of when a 60 s
     lease ran out.
