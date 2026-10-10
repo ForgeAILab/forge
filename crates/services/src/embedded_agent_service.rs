@@ -344,6 +344,11 @@ impl EmbeddedAgentService {
 
     /// Apply the server's optional public-search configuration to the shared
     /// provider used by all subsequently composed native sessions.
+    /// The Task service the server wired in, when there is one.
+    pub(crate) fn task_service_handle(&self) -> Option<Arc<crate::TaskService>> {
+        self.tool_provider.task_service_handle()
+    }
+
     pub fn set_public_search_config(&self, config: Option<PublicSearchConfig>) {
         self.tool_provider.set_public_search_config(config);
     }

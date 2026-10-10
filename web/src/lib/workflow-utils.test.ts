@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 
 import {
   blockedInterruption,
+  checkWait,
+  checkWaitNotice,
   deriveColumns,
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
@@ -258,6 +260,50 @@ describe('task interruption annotations', () => {
   })
 })
 
+
+describe('check wait conditions', () => {
+  const waiting = (phase: 'result' | 'slot' | 'infrastructure_exhausted') =>
+    taskListItem({
+      condition: {
+        kind: 'parked',
+        primary: { kind: 'check', wait: { phase, consumer_id: 'consumer', origin: 'entry' } },
+        additional: [], resume: { kind: 'reconcile' }, since: null,
+        details: {
+          failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false,
+          owner: phase === 'infrastructure_exhausted' ? 'user' : 'check_runner',
+          recovery: phase === 'infrastructure_exhausted' ? 'retry_check' : 'wait_for_check',
+        },
+      },
+    })
+
+  it('labels a result or slot wait as owned work, not a block or failure', () => {
+    for (const [phase, title] of [['result', 'Waiting for checks'], ['slot', 'Waiting for a check slot']] as const) {
+      const task = waiting(phase)
+      expect(checkWait(task)?.phase).toBe(phase)
+      expect(checkWaitNotice(task)).toMatchObject({ title, needsOwner: false })
+      expect(isTaskBlocked(task)).toBe(false)
+      expect(taskHasError(task)).toBe(false)
+      expect(matchesFilters(task, { types: [], blockedOnly: true })).toBe(false)
+    }
+  })
+
+  it('shows exhausted check retries as needing the owner without calling the change failed', () => {
+    const task = waiting('infrastructure_exhausted')
+    expect(checkWaitNotice(task)).toMatchObject({ title: 'Checks could not run', needsOwner: true })
+    expect(isTaskBlocked(task)).toBe(true)
+    expect(taskHasError(task)).toBe(false)
+    expect(matchesFilters(task, { types: [], blockedOnly: true })).toBe(true)
+  })
+
+  it('finds a check wait behind another owner and none on an ordinary Task', () => {
+    const held = waiting('result')
+    if (held.condition.kind !== 'parked') throw new Error('fixture')
+    held.condition.additional = [held.condition.primary]
+    held.condition.primary = { kind: 'held', actor: 'user' }
+    expect(checkWait(held)?.phase).toBe('result')
+    expect(checkWaitNotice(taskListItem({}))).toBeNull()
+  })
+})
 
 describe('integration conditions', () => {
   it('reads queue ownership without a manual block or failure', () => {

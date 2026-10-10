@@ -540,7 +540,9 @@ impl TaskDispatcher {
             // Skipped only where integration decides the Task's next step.
             // Under a self-clearing primary the admission is observed as
             // for any other Task, so that park can clear.
-            if !next_step::integration_decides(&p.read.condition, &p.facts) {
+            if !next_step::integration_decides(&p.read.condition, &p.facts)
+                && !next_step::check_decides(&p.read.condition, &p.facts)
+            {
                 refused |= Box::pin(self.observe_admission(p, project, agents, gate)).await;
             }
             p.machine_wait |= machine_wait;
@@ -940,6 +942,7 @@ impl TaskDispatcher {
                     || p.read.park_json.is_some()
                     || p.read.condition.is_blocked()
                     || p.read.condition.integration_wait().is_some()
+                    || p.read.condition.check_wait().is_some()
                     || p.read.executions.iter().any(|e| {
                         e.status == db::ExecutionStatus::Running && e.role != "interactive"
                     });

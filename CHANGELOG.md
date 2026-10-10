@@ -803,6 +803,40 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   check, fast-forward, takeover after a crash), but nothing starts it:
   merging works exactly as before. Moving commits between machines and
   targets on a daemon-owned checkout are not wired into it yet.
+- **Task conditions can say a Task is waiting on its checks (3.3 stage D
+  part 1).** The public Task condition gains the reason
+  `{ "kind": "check", "wait": { "phase", "consumer_id", "origin" } }` with
+  three phases: `result` (the checks are running), `slot` (the machine that
+  holds the checkout is at its run limit) and `infrastructure_exhausted` (the
+  checks produced no result after the automatic retries). The first two are
+  owned work, not a block or a failure: `details.owner = check_runner`,
+  `details.recovery = wait_for_check`, and only `cancel` is offered. The
+  third is not a verdict on the change: `details.owner = user`,
+  `details.recovery = retry_check`, and the Task offers `retry` (reason
+  `check_infrastructure_exhausted`: the same check is requested again with a
+  fresh infrastructure budget, no agent is relaunched and no retry budget is
+  spent) and `cancel`. `ConditionOwner` gains `check_runner`;
+  `ConditionRecovery` gains `wait_for_check` and `retry_check`. Clients that
+  match these enums exhaustively must add the new values. The web Task page
+  shows the wait ("Waiting for checks", "Waiting for a check slot", "Checks
+  could not run"), and the board's blocked filter includes a Task whose checks
+  could not run. Nothing requests the durable check runner in production yet
+  (review-entry and merge-path CI still run inline), so these values first
+  appear when review-entry CI moves onto it. The stored condition encoding
+  moves to mapping revision 6; every Task condition is recomputed once in the
+  background after upgrade, and an older build that reads a database written
+  by this one quarantines the Tasks it cannot read instead of guessing.
+  A Task whose checks could not run is also listed in
+  `GET /api/v1/operations/status` under `recent_errors` (entity type
+  `task_check_exhausted`, severity `attention`). `retry` on such a Task whose
+  candidate changed since the check was requested lifts the park and runs
+  nothing, so a superseded commit is never checked again.
+
+- **`make types` regenerates every TypeScript binding.** It ran only the
+  explicit `export_typescript` list and skipped the ts-rs export test of each
+  `#[ts(export)]` type, so a new or changed exported type was regenerated only
+  as a side effect of running the api-types test suite. It now runs both.
+
 - **Durable check runner, not yet used by any check (3.3 stage C).** The
   server now starts a `check-runs` worker and has a durable path for running a
   check: one run per identical request (same Project, repository, commit and
@@ -876,6 +910,65 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   - `workspace reset required for task <id>: recorded worktree path <path> runs through a symbolic link` / `… is a symbolic link` (new).
   - Lifecycle hooks: `worktree of workspace <id> is missing or is not a Git worktree; lifecycle hook OnTaskDone was not run` is now `worktree of workspace <id> is not usable (<reason>); lifecycle hook on_task_done was not run`.
   - Cleanup: `repository <path> is recorded for this workspace and is not reachable right now; workspace cleanup will be retried` (new).
+- **A worktree left off its Task branch recovers by itself (3.4 stage B,
+  part 2).** When a launch, review, check, hook or delivery finds the Task
+  worktree on another branch or a detached HEAD, Forge now puts it back
+  instead of failing the step with `workspace reset required`. If HEAD is
+  strictly ahead of the Task branch (the agent committed on a detached HEAD,
+  or after an interrupted rebase finished), the Task branch is advanced to
+  HEAD and checked out: no commit, file or uncommitted change is lost. If
+  HEAD and the Task branch have diverged, HEAD's commits are kept under
+  `refs/forge/rescued/<task id>/<UTC timestamp>` in the worktree's
+  repository, one Forge comment on the Task names the ref and the commit, and
+  the worktree returns to the Task branch so the step continues; those
+  commits are not part of what is reviewed and delivered until someone brings
+  them in. The checkout is never forced: if it would overwrite uncommitted
+  changes, nothing moves and the Task gets `workspace reset required` naming
+  the ref. A directory that is gone or is not a worktree was already
+  recreated from the Task branch inside the same step; that, and the repairs
+  above, spend no review or retry budget and happen at most once per step.
+  Unchanged: HEAD behind the Task branch is checked out only for a launch on
+  a clean tree. A HEAD that is ahead of the Task branch only by commits the
+  target branch already has (the target was checked out in the worktree) never
+  advances the Task branch, which would have made the Task look delivered with
+  nothing to review; it is handled like a HEAD behind the Task branch. Forge
+  keeps at most the five newest `refs/forge/rescued/<task id>/*` refs per Task
+  and deletes all of a Task's when its workspace is cleaned up (after the
+  usual retention); the comment naming a rescue ref is not loaded into agent
+  prompts.
+  Error text that changed or is new:
+  - `workspace reset required for task <id>: worktree HEAD is on <ref>, not on Task branch '<branch>'; its <n> commit(s) are kept under refs/forge/rescued/<task id>/<ts>, and checking the Task branch out failed (uncommitted changes would be overwritten)` (new).
+  - `… HEAD has <n> commit(s) that are not on the Task branch, so the branch was not checked out; move them onto the Task branch (or reset the workspace to discard them)` is no longer produced; the rare failures to advance the branch or write the ref say so instead.
+  - Task comment (new): `The Task worktree was on <ref> with <n> commit(s) that are not on Task branch '<branch>', which has <m> commit(s) they do not build on. Forge kept those commits under `refs/forge/rescued/…` (<sha>) and put the worktree back on the Task branch. …`
+- **Every launch checks the workspace the same way (3.4 stage B, part 2).**
+  A claim on a server-owned workspace that is already ready now goes through
+  `WorkspaceManager::ensure_valid` instead of the backend's own check, so CLI
+  executors get the guard native executors had (at launch the runner only
+  confirms on the filesystem that the claimed worktree is still there and
+  confined, starting no Git process, and falls back to the full check when it
+  is not): a deleted directory is recreated and an off-branch
+  worktree is put back before anything is started there. Before, a CLI
+  executor could be started on whatever HEAD the worktree was left on. The
+  healthy claim costs one Git process instead of three. The native executor's
+  own check now uses the server's workspace root and repository-cache locks.
+  The evidence-capture tool inspects the worktree first: a directory that is
+  present but is not the Task's worktree is refused with
+  `Task workspace is unavailable: its worktree is not usable`. The terminal is
+  unchanged: it opens in the recorded directory after its own path guardrail,
+  so a person can still look into a broken workspace. Plan,
+  staged-plan and execution-outbox files, which sit beside the worktree, are
+  read as before whether or not the worktree is there, except that a recorded
+  worktree path that is relative, contains `..`, has no Task root above it, or
+  is (or sits under a Task root that is) a symbolic link is refused before any
+  of those files is read, written or deleted. A worktree that belongs to a
+  repository other than the recorded one is used as it is only when it is
+  checked out on the Task branch and no recorded repository has that branch
+  (a worktree made before its Repo moved to another location); part 1 asked
+  for a reset there. On any other branch it is never used. No REST, MCP,
+  event or CLI shape changes.
+- **The "lifecycle hook was not run" comment stays out of agent prompts (3.4
+  stage B, part 2).** It was loaded into coder, worker and read-only prompts
+  with the Task's other comments. It is still on the Task.
 - **A lifecycle hook that could not run is recorded on the Task (3.4 stage B,
   part 1).** When a script hook is skipped because the Task worktree is not
   usable, or cannot be started on its workspace owner, Forge now adds one

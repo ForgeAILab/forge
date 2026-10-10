@@ -69,7 +69,8 @@ test results. Project code still needs to compile, and the full test suite
 still executes on every run.
 
 The Rust job also runs `make types`, which executes only the api-types
-`export_bindings_*` tests, then checks `web/src/types/generated/` for changed
+export tests (the ts-rs `export_bindings_*` test of every `#[ts(export)]` type
+and the ignored `export_typescript` list), then checks `web/src/types/generated/` for changed
 or untracked bindings. After changing Rust API types, run `make types` locally
 and commit the generated output in the same change. The sole export directory
 is `web/src/types/generated/bindings/`; ESLint and Prettier exclude those

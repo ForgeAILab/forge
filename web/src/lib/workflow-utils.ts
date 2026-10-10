@@ -1,5 +1,6 @@
 import type { TaskListItem as Task } from '@/types/generated'
 import type {
+  CheckWait,
   StateKind,
   TaskBlockingAnnotation,
   TaskExecutionObservability,
@@ -73,6 +74,50 @@ export function getTaskWorkflowWarning(
   }
 }
 
+/** The durable check this Task waits on, as primary or secondary reason. */
+export function checkWait(task: TaskAnnotationSummary): CheckWait | null {
+  const condition = task.condition
+  if (condition.kind !== 'parked' && condition.kind !== 'failed') return null
+  const first = condition.kind === 'parked' ? condition.primary : condition.failure
+  for (const reason of [first, ...condition.additional]) {
+    if (reason.kind === 'check') return reason.wait
+  }
+  return null
+}
+
+/**
+ * How a check wait reads. Waiting for a result or a slot is the check
+ * runner's own work, not a failure; only exhausted infrastructure retries
+ * need the owner (Retry or Cancel), and they are no verdict on the change.
+ */
+export function checkWaitNotice(
+  task: TaskAnnotationSummary,
+): { title: string; message: string; needsOwner: boolean } | null {
+  const wait = checkWait(task)
+  if (!wait) return null
+  switch (wait.phase) {
+    case 'result':
+      return {
+        title: 'Waiting for checks',
+        message: 'The checks for this change are running. The Task continues when their result arrives.',
+        needsOwner: false,
+      }
+    case 'slot':
+      return {
+        title: 'Waiting for a check slot',
+        message: 'The machine that holds this checkout is at its run limit. The checks start when a slot frees.',
+        needsOwner: false,
+      }
+    case 'infrastructure_exhausted':
+      return {
+        title: 'Checks could not run',
+        message:
+          'The checks produced no result after the automatic retries. This is not a failure of the change: retry the checks or cancel the Task.',
+        needsOwner: true,
+      }
+  }
+}
+
 const PARENT_WAIT_CAUSES: Record<string, string> = {
   held: 'is on hold',
   blocked: 'is blocked',
@@ -135,6 +180,7 @@ export function blockedInterruption(task: TaskAnnotationSummary) {
 
 export function isTaskBlocked(task: TaskAnnotationSummary): boolean {
   if (task.condition.details.blocked) return true
+  if (checkWait(task)?.phase === 'infrastructure_exhausted') return true
   return Boolean(getBlockingAnnotation(task))
 }
 
@@ -163,7 +209,13 @@ export function matchesFilters(
   task: Task,
   filters: { priorityMax?: number; priorityMin?: number; types: string[]; blockedOnly?: boolean },
 ): boolean {
-  if (filters.blockedOnly && !task.condition.details.blocked) return false
+  if (
+    filters.blockedOnly &&
+    !task.condition.details.blocked &&
+    checkWait(task)?.phase !== 'infrastructure_exhausted'
+  ) {
+    return false
+  }
   if (filters.priorityMin !== undefined && task.priority < filters.priorityMin) return false
   if (filters.priorityMax !== undefined && task.priority > filters.priorityMax) return false
   if (filters.types.length > 0 && !filters.types.includes(task.task_type)) return false

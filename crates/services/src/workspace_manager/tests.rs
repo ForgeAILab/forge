@@ -324,9 +324,10 @@ async fn worktree_of_another_repository_is_moved_aside_and_recreated() {
 }
 
 /// A worktree Git can still use is never left without its row. When it
-/// belongs to another repository and the recorded one no longer has the Task
-/// branch, the create-or-reuse path asks for the reset and keeps the row and
-/// the directory, with whatever work is in it.
+/// belongs to another repository and the recorded one does not have the Task
+/// branch (a worktree made before its Repo moved to another location), it is
+/// the only home of the Task's work: it is used as it is, as on base, with
+/// the row, the directory and whatever work is in it kept.
 #[tokio::test]
 async fn usable_worktree_of_another_repository_is_never_forgotten() {
     let fixture = Fixture::new().await;
@@ -342,13 +343,180 @@ async fn usable_worktree_of_another_repository_is_never_forgotten() {
         .ensure_valid_or_forget(&fixture.task, workspace, Purpose::Execute)
         .await;
 
-    assert_reset_required(result, "are both gone");
+    let valid = result.expect("the only worktree holding the Task branch is used");
+    assert_eq!(valid.repair(), Repair::None);
+    assert!(valid.on_task_branch());
     assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
     assert_eq!(fixture.siblings(), ["repo"]);
     assert_eq!(
         std::fs::read_to_string(fixture.path.join("uncommitted.txt")).unwrap(),
         "work in progress"
     );
+}
+
+/// A worktree of another repository that is not on the Task branch is not
+/// this Task's worktree, whatever the recorded repository has: nothing runs
+/// in it and a read-only use reports it absent.
+#[tokio::test]
+async fn worktree_of_another_repository_off_the_task_branch_is_never_used() {
+    let fixture = Fixture::new().await;
+    let _other = replace_with_worktree_of_another_repository(&fixture);
+    git(
+        &fixture.path,
+        &["checkout", "-q", "-b", "someone-elses-work"],
+    );
+    git(
+        fixture.repo_dir.path(),
+        &["update-ref", "-d", &fixture.task_ref()],
+    );
+
+    assert_absent(
+        fixture.check(Purpose::Inspect).await,
+        "not of the recorded repository",
+    );
+    for purpose in [Purpose::Execute, Purpose::Review, Purpose::Hook] {
+        assert!(
+            fixture.check(purpose).await.is_err(),
+            "{purpose:?}: a worktree of the wrong repository is not handed out"
+        );
+    }
+    assert!(
+        fixture.row().await.is_some(),
+        "the row is kept for the reset"
+    );
+}
+
+/// HEAD sits on the target branch's tip, ahead of a Task branch that has no
+/// commit of its own. Advancing the Task branch there would make the Task
+/// "already merged, zero diff": it is never moved. A clean launch returns to
+/// the Task branch; a step that may not move the candidate refuses.
+#[tokio::test]
+async fn head_on_target_history_never_fast_forwards_the_task_branch() {
+    for purpose in STEPS {
+        let fixture = Fixture::new().await;
+        let task_tip = git(&fixture.path, &["rev-parse", &fixture.task_ref()]);
+        git(
+            fixture.repo_dir.path(),
+            &["commit", "-q", "--allow-empty", "-m", "target moved on"],
+        );
+        let target_tip = git(fixture.repo_dir.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(target_tip, task_tip);
+        git(&fixture.path, &["checkout", "-q", "--detach", &target_tip]);
+
+        let result = fixture.check(purpose).await;
+        assert_eq!(
+            git(&fixture.path, &["rev-parse", &fixture.task_ref()]),
+            task_tip,
+            "{purpose:?}: the Task branch is not advanced to the target"
+        );
+        assert!(rescued_refs(&fixture).is_empty());
+        if purpose == Purpose::Execute {
+            let valid = result.expect("a clean launch returns to the Task branch");
+            assert_eq!(valid.repair(), Repair::CheckedOutTaskBranch);
+            assert_eq!(fixture.head_ref(), fixture.task_ref());
+        } else {
+            assert_reset_required(result, "not moved");
+        }
+    }
+}
+
+/// Rescue refs are bounded per Task and leave with the workspace.
+#[tokio::test]
+async fn rescue_refs_are_capped_per_task_and_deleted_with_the_workspace() {
+    let fixture = Fixture::new().await;
+    let namespace = format!("{RESCUED_REF_NAMESPACE}/{}", fixture.task.id);
+    let other_task = format!("{RESCUED_REF_NAMESPACE}/another-task/20260101T000000000Z");
+    git(&fixture.path, &["update-ref", &other_task, "HEAD"]);
+    for day in 1..=RESCUED_REFS_PER_TASK + 2 {
+        let name = format!("{namespace}/202601{day:02}T000000000Z");
+        git(&fixture.path, &["update-ref", &name, "HEAD"]);
+    }
+
+    prune_rescued_refs(&fixture.path, &namespace, RESCUED_REFS_PER_TASK).await;
+    let kept = rescued_refs_newest_first(&fixture.path, &namespace).await;
+    assert_eq!(kept.len(), RESCUED_REFS_PER_TASK);
+    assert!(kept[0].ends_with(&format!(
+        "202601{:02}T000000000Z",
+        RESCUED_REFS_PER_TASK + 2
+    )));
+    assert!(kept.iter().all(|name| !name.contains("20260101T")));
+
+    let resolved = fixture
+        .check(Purpose::Inspect)
+        .await
+        .expect("healthy")
+        .resolved()
+        .clone();
+    delete_rescued_refs(&fixture.root_path, &fixture.workspace, &resolved).await;
+    assert_eq!(
+        rescued_refs(&fixture),
+        [format!(
+            "{other_task} {}",
+            git(&fixture.path, &["rev-parse", "HEAD"])
+        )],
+        "only this Task's refs go"
+    );
+}
+
+/// The Task-root anchor (plan and outbox files beside the worktree) is
+/// refused before use when the recorded path could lead somewhere Forge did
+/// not create.
+#[test]
+fn task_root_anchor_refuses_paths_that_leave_the_task_root() {
+    let root = TempDir::new().unwrap();
+    let task_root = root.path().join("task");
+    std::fs::create_dir_all(task_root.join("repo")).unwrap();
+    assert_eq!(
+        confined_anchor(task_root.join("repo")).unwrap(),
+        task_root.join("repo")
+    );
+    // A worktree that is gone still anchors its Task root.
+    assert!(confined_anchor(task_root.join("gone")).is_ok());
+    for refused in [
+        PathBuf::from(".."),
+        PathBuf::from("task/repo"),
+        task_root
+            .join("repo")
+            .join("..")
+            .join("..")
+            .join("elsewhere"),
+        PathBuf::from("/repo"),
+    ] {
+        assert!(confined_anchor(refused.clone()).is_err(), "{refused:?}");
+    }
+    #[cfg(unix)]
+    {
+        let elsewhere = TempDir::new().unwrap();
+        std::fs::create_dir_all(elsewhere.path().join("repo")).unwrap();
+        let linked_root = root.path().join("linked-task");
+        std::os::unix::fs::symlink(elsewhere.path(), &linked_root).unwrap();
+        assert!(confined_anchor(linked_root.join("repo")).is_err());
+        let linked_worktree = task_root.join("linked-repo");
+        std::os::unix::fs::symlink(elsewhere.path().join("repo"), &linked_worktree).unwrap();
+        assert!(confined_anchor(linked_worktree).is_err());
+    }
+}
+
+/// The launch of a claimed execution starts no Git process for a worktree
+/// that is where the claim left it, and takes the full check (and its
+/// repair) when the directory is gone.
+#[tokio::test]
+async fn claimed_path_trusts_the_claim_and_repairs_a_vanished_directory() {
+    let fixture = Fixture::new().await;
+    let manager = WorkspaceManager::new(&fixture.db, &fixture.root_path, None, &fixture.router);
+    let valid = manager
+        .claimed_path(&fixture.task, fixture.workspace.clone())
+        .await
+        .expect("claimed worktree");
+    assert_eq!(valid.repair(), Repair::None);
+    assert_eq!(valid.path(), Some(fixture.path.as_path()));
+
+    std::fs::remove_dir_all(&fixture.path).unwrap();
+    let valid = manager
+        .claimed_path(&fixture.task, fixture.row().await.unwrap())
+        .await
+        .expect("recreated");
+    assert_recovered(&fixture, &valid);
 }
 
 /// Known gap, pinned so a change is deliberate: a directory that is a
@@ -448,37 +616,221 @@ async fn worktree_behind_the_task_branch_returns_to_it_only_for_a_clean_launch()
     assert_eq!(fixture.head_ref(), fixture.task_ref());
 }
 
-/// Commits made on a detached HEAD or another branch are not on the Task
-/// branch. Checking the Task branch out would leave them unreachable and the
-/// Task would finish without them, so no purpose does it.
+/// Every purpose a Task step uses: launch, review, check, hook, delivery.
+const STEPS: [Purpose; 5] = [
+    Purpose::Execute,
+    Purpose::Review,
+    Purpose::Check,
+    Purpose::Hook,
+    Purpose::Integrate,
+];
+
+async fn task_row(fixture: &Fixture) -> Task {
+    db::TaskRepo::get_by_id(&fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .expect("task row exists")
+}
+
+async fn forge_comments(fixture: &Fixture) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT content FROM task_comment WHERE task_id = ? AND author_type = 'system' \
+         ORDER BY created_at",
+    )
+    .bind(&fixture.task.id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap()
+}
+
+fn rescued_refs(fixture: &Fixture) -> Vec<String> {
+    git(
+        &fixture.path,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            RESCUED_REF_NAMESPACE,
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Commits made on a detached HEAD or another branch, on top of the Task
+/// branch: the branch is advanced to them and checked out. Nothing is lost,
+/// nothing is reset, uncommitted work stays, and the Task row (review and
+/// retry budgets included) is untouched.
 #[tokio::test]
-async fn commits_off_the_task_branch_are_never_left_behind_by_a_checkout() {
+async fn commits_ahead_of_the_task_branch_fast_forward_it_for_every_step() {
     for detach in [false, true] {
+        for purpose in STEPS {
+            let fixture = Fixture::new().await;
+            let before = task_row(&fixture).await;
+            let switch: &[&str] = if detach {
+                &["checkout", "-q", "--detach"]
+            } else {
+                &["checkout", "-q", "-b", "elsewhere"]
+            };
+            git(&fixture.path, switch);
+            std::fs::write(fixture.path.join("work.txt"), "the Task's work").unwrap();
+            git(&fixture.path, &["add", "work.txt"]);
+            git(
+                &fixture.path,
+                &["commit", "-q", "-m", "work off the branch"],
+            );
+            std::fs::write(fixture.path.join("uncommitted.txt"), "in progress").unwrap();
+            let commit = git(&fixture.path, &["rev-parse", "HEAD"]);
+
+            let valid = fixture.check(purpose).await.expect("fast-forwarded");
+            assert_eq!(
+                valid.repair(),
+                Repair::FastForwardedTaskBranch,
+                "{purpose:?}"
+            );
+            assert!(valid.on_task_branch());
+            assert_eq!(valid.rescued_ref(), None);
+            assert_eq!(fixture.head_ref(), fixture.task_ref());
+            assert_eq!(
+                git(&fixture.path, &["rev-parse", &fixture.task_ref()]),
+                commit,
+                "{purpose:?}: the Task branch holds the commit"
+            );
+            assert!(fixture.path.join("work.txt").exists());
+            assert_eq!(
+                std::fs::read_to_string(fixture.path.join("uncommitted.txt")).unwrap(),
+                "in progress"
+            );
+            assert!(rescued_refs(&fixture).is_empty());
+            assert!(forge_comments(&fixture).await.is_empty());
+            assert_eq!(task_row(&fixture).await, before, "{purpose:?}: no budget");
+
+            // The step's next check is the healthy path again.
+            let again = fixture.check(purpose).await.expect("healthy");
+            assert_eq!(again.repair(), Repair::None);
+        }
+    }
+}
+
+/// HEAD and the Task branch each have commits the other lacks: HEAD's are
+/// kept under a Forge ref, the Task is told, and the worktree returns to the
+/// Task branch so the step continues.
+#[tokio::test]
+async fn diverged_head_is_rescued_under_a_forge_ref_for_every_step() {
+    for purpose in STEPS {
         let fixture = Fixture::new().await;
-        let switch: &[&str] = if detach {
-            &["checkout", "-q", "--detach"]
-        } else {
-            &["checkout", "-q", "-b", "elsewhere"]
-        };
-        git(&fixture.path, switch);
-        std::fs::write(fixture.path.join("work.txt"), "the Task's work").unwrap();
-        git(&fixture.path, &["add", "work.txt"]);
+        let before = task_row(&fixture).await;
+        let base = git(&fixture.path, &["rev-parse", "HEAD"]);
         git(
             &fixture.path,
-            &["commit", "-q", "-m", "work off the branch"],
+            &["commit", "-q", "--allow-empty", "-m", "task work"],
         );
-        let off = fixture.head_ref();
-        let commit = git(&fixture.path, &["rev-parse", "HEAD"]);
+        let branch_tip = git(&fixture.path, &["rev-parse", "HEAD"]);
+        git(&fixture.path, &["checkout", "-q", "--detach", &base]);
+        std::fs::write(fixture.path.join("stray.txt"), "stray work").unwrap();
+        git(&fixture.path, &["add", "stray.txt"]);
+        git(&fixture.path, &["commit", "-q", "-m", "stray"]);
+        let stray = git(&fixture.path, &["rev-parse", "HEAD"]);
 
-        for purpose in [Purpose::Execute].into_iter().chain(CANDIDATE) {
-            assert_reset_required(
-                fixture.check(purpose).await,
-                "1 commit(s) that are not on the Task branch",
+        let valid = fixture.check(purpose).await.expect("rescued");
+        assert_eq!(
+            valid.repair(),
+            Repair::RescuedOffBranchCommits,
+            "{purpose:?}"
+        );
+        let kept = valid.rescued_ref().expect("the ref is reported").to_owned();
+        assert!(
+            kept.starts_with(&format!("refs/forge/rescued/{}/", fixture.task.id)),
+            "{kept}"
+        );
+        assert_eq!(git(&fixture.path, &["rev-parse", &kept]), stray);
+        assert_eq!(fixture.head_ref(), fixture.task_ref());
+        assert_eq!(git(&fixture.path, &["rev-parse", "HEAD"]), branch_tip);
+        assert!(!fixture.path.join("stray.txt").exists());
+        let comments = forge_comments(&fixture).await;
+        assert_eq!(comments.len(), 1, "{comments:?}");
+        assert!(comments[0].contains(&kept) && comments[0].contains(&stray));
+        assert_eq!(task_row(&fixture).await, before, "{purpose:?}: no budget");
+
+        let again = fixture.check(purpose).await.expect("healthy");
+        assert_eq!(again.repair(), Repair::None);
+        assert_eq!(rescued_refs(&fixture).len(), 1);
+        assert_eq!(forge_comments(&fixture).await.len(), 1);
+    }
+}
+
+/// The checkout after a rescue is never forced. Uncommitted changes it would
+/// overwrite stay where they are, the reason names the ref, and checking
+/// again writes no second ref and no second comment: there is no reset loop.
+#[tokio::test]
+async fn diverged_head_with_conflicting_local_changes_parks_once_with_the_ref_named() {
+    let fixture = Fixture::new().await;
+    let base = git(&fixture.path, &["rev-parse", "HEAD"]);
+    std::fs::write(fixture.path.join("shared.txt"), "task version").unwrap();
+    git(&fixture.path, &["add", "shared.txt"]);
+    git(&fixture.path, &["commit", "-q", "-m", "task work"]);
+    git(&fixture.path, &["checkout", "-q", "--detach", &base]);
+    std::fs::write(fixture.path.join("shared.txt"), "stray version").unwrap();
+    git(&fixture.path, &["add", "shared.txt"]);
+    git(&fixture.path, &["commit", "-q", "-m", "stray"]);
+    let stray = git(&fixture.path, &["rev-parse", "HEAD"]);
+    std::fs::write(fixture.path.join("shared.txt"), "uncommitted version").unwrap();
+
+    for purpose in STEPS.into_iter().chain(STEPS) {
+        assert_reset_required(
+            fixture.check(purpose).await,
+            "commit(s) are kept under refs/forge/rescued/",
+        );
+        assert_eq!(git(&fixture.path, &["rev-parse", "HEAD"]), stray);
+        assert_eq!(
+            std::fs::read_to_string(fixture.path.join("shared.txt")).unwrap(),
+            "uncommitted version"
+        );
+    }
+    assert_eq!(rescued_refs(&fixture).len(), 1);
+    assert_eq!(forge_comments(&fixture).await.len(), 1);
+    assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
+}
+
+/// A step that finds its directory gone, or not a worktree, gets it back
+/// from the Task branch in the same call and spends no budget. One call
+/// makes one attempt: when the Task branch is gone too the answer is the
+/// typed reset, again and again, with nothing recreated in between.
+#[tokio::test]
+async fn unusable_directory_is_recreated_once_per_step_without_budget() {
+    for purpose in STEPS {
+        for not_a_worktree in [false, true] {
+            let fixture = Fixture::new().await;
+            let before = task_row(&fixture).await;
+            std::fs::remove_dir_all(&fixture.path).unwrap();
+            if not_a_worktree {
+                std::fs::create_dir_all(&fixture.path).unwrap();
+                std::fs::write(fixture.path.join("left-over.txt"), "x").unwrap();
+            }
+            let valid = fixture.check(purpose).await.expect("recreated");
+            assert_recovered(&fixture, &valid);
+            assert_eq!(task_row(&fixture).await, before, "{purpose:?}: no budget");
+            assert_eq!(
+                fixture.check(purpose).await.expect("healthy").repair(),
+                Repair::None
             );
-            assert_eq!(fixture.head_ref(), off, "{purpose:?} never moves HEAD");
-            assert_eq!(git(&fixture.path, &["rev-parse", "HEAD"]), commit);
         }
-        assert!(fixture.path.join("work.txt").exists());
+
+        let fixture = Fixture::new().await;
+        std::fs::remove_dir_all(&fixture.path).unwrap();
+        git(fixture.repo_dir.path(), &["worktree", "prune"]);
+        git(
+            fixture.repo_dir.path(),
+            &["branch", "-D", &fixture.workspace.branch],
+        );
+        for _ in 0..2 {
+            let error = ServiceError::from(fixture.check(purpose).await.err().expect("parked"));
+            assert!(
+                matches!(error, ServiceError::WorkspaceResetRequired { .. }),
+                "{purpose:?}: {error}"
+            );
+            assert!(!fixture.path.exists(), "{purpose:?}: nothing is recreated");
+        }
         assert_eq!(fixture.row().await, Some(fixture.workspace.clone()));
     }
 }
@@ -777,10 +1129,15 @@ fn unavailable_outcomes_keep_the_service_errors_callers_match_on() {
 }
 
 /// Raw path getters: each hands out a recorded path that nothing has checked.
-const RAW_PATH_GETTERS: [&str; 3] = [
+/// The Task-root anchors are counted with them: they hand out the recorded
+/// path (confined, but not checked against Git) for the files beside the
+/// worktree, and must not become a way to get a directory to run in.
+const RAW_PATH_GETTERS: [&str; 5] = [
     ".embedded_path(",
     "embedded_worktree_path_for_backend(",
     "recorded_server_path(",
+    "task_root_anchor(",
+    "task_root_anchor_of(",
 ];
 
 /// Non-test uses of a raw path getter, per file, relative to `crates/`: an
@@ -795,24 +1152,55 @@ const RAW_PATH_GETTERS: [&str; 3] = [
 /// lower the entry when convenient.
 const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     // Manager and backend internals.
-    ("services/src/workspace_manager.rs", 2),
+    // (two of these are the anchor definitions themselves)
+    ("services/src/workspace_manager.rs", 7),
     ("services/src/task_service/workspace.rs", 2),
-    ("services/src/workspace_backend/embedded.rs", 5),
+    ("services/src/workspace_backend/embedded.rs", 4),
     ("services/src/workspace_backend/review.rs", 10),
     ("review/src/workspace.rs", 2),
     // Pending conversion: owned by another job while this one landed.
-    ("services/src/merge_service.rs", 2),          // 3.2 D
-    ("services/src/task_actions.rs", 1),           // 3.2 D
-    ("services/src/task_service/execution.rs", 1), // 3.4 C
-    ("services/src/task_service/execution/runner.rs", 7), // 3.4 C
-    // Pending conversion: 3.4 B part 2.
-    ("services/src/lifecycle/plugin.rs", 1),
-    ("services/src/native_tools.rs", 1),
+    ("services/src/merge_service.rs", 2), // 3.2 D
+    ("services/src/task_actions.rs", 1),  // 3.2 D
+    // Admission-failure cleanup: the path of a workspace this claim just
+    // created, captured to remove it. Nothing runs there.
+    // Plus one Task-root anchor (plan stage discard).
+    ("services/src/task_service.rs", 2),
+    // A terminal is how a person looks into a workspace, a broken one
+    // included: it opens in the recorded directory after the terminal
+    // service's own path guardrail, as it always has.
+    ("services/src/terminal_service.rs", 1),
+    // Task-root anchors only: plan and outbox files beside the worktree.
     ("services/src/plan_artifact.rs", 5),
     ("services/src/recovery.rs", 1),
-    ("services/src/task_service.rs", 2),
-    ("services/src/terminal_service.rs", 1),
+    ("services/src/task_service/execution.rs", 1),
 ];
+
+/// The exact production uses left, so a conversion that is undone, or a
+/// listed file that silently gains a use it had before, shows up here.
+#[test]
+fn raw_workspace_path_getter_uses_are_exactly_the_recorded_ones() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates directory");
+    let mut found = Vec::new();
+    for source in [
+        "services/src",
+        "api/src",
+        "mcp-server/src",
+        "review/src",
+        "executors/src",
+    ] {
+        scan_raw_path_uses(crates, &crates.join(source), &mut found);
+    }
+    found.sort();
+    let mut recorded = RAW_PATH_CALLERS
+        .iter()
+        .map(|(file, uses)| ((*file).to_owned(), *uses))
+        .collect::<Vec<_>>();
+    recorded.sort();
+    assert_eq!(found, recorded);
+    assert_eq!(found.iter().map(|(_, uses)| uses).sum::<usize>(), 38);
+}
 
 fn raw_path_uses(source: &str) -> usize {
     let lines = source.lines().collect::<Vec<_>>();

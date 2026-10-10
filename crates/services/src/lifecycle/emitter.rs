@@ -544,7 +544,8 @@ impl LifecycleEventEmitter {
                 role: None,
                 worklog_kind: None,
                 idempotency_key: Some(format!(
-                    "lifecycle-hook-not-run:{}:{scope}:{}",
+                    "{}{}:{scope}:{}",
+                    crate::lifecycle::HOOK_NOT_RUN_COMMENT_KEY,
                     lifecycle_event_name(event),
                     execution_id.unwrap_or("none")
                 )),

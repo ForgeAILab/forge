@@ -3154,6 +3154,31 @@ blocked diagnostic and `repair_integration` guidance. Guidance does not authoriz
 an action: stage A offers Hold/Cancel on integration waits, and preserves normal
 Release on an independent user hold. These variants are emitted only in tests
 until queue activation; there are no new routes, queue tables or worker yet.
+
+The durable check runner adds `ConditionReason::Check`, serialized as
+`{ "kind": "check", "wait": { "phase": "...", "consumer_id": "opaque-id", "origin": "entry" } }`,
+with `resume: { "kind": "reconcile" }`. `phase` is one of:
+
+| `phase` | Meaning | `details.owner` / `details.recovery` | Offered actions |
+|---|---|---|---|
+| `result` | the Task's checks are running; no result yet | `check_runner` / `wait_for_check` | `cancel` |
+| `slot` | the machine that holds the checkout is at its run limit | `check_runner` / `wait_for_check` | `cancel` |
+| `infrastructure_exhausted` | the checks produced no result after the automatic retries; not a verdict on the change | `user` / `retry_check` | `retry` (offer reason `check_infrastructure_exhausted`), `cancel` |
+
+A `result` or `slot` wait has no diagnostic or interruption and false
+`blocked`/`failed`/`human_wait` flags: it ends on its own. `retry` on an
+exhausted wait takes no parameters, relaunches no agent and spends no retry
+budget; it asks for the same check again with a fresh infrastructure budget,
+and the condition returns to `result`. `consumer_id` is an opaque identity and
+`origin` names the family that asked (`entry`, `integration`, ...). New enum
+values: `ConditionOwner::check_runner`, `ConditionRecovery::wait_for_check`
+and `retry_check`. No route changes. No production path requests the runner
+yet, so these values appear only once review-entry CI moves onto it. When the
+Task's candidate changed since the exhausted check was requested, `retry`
+lifts the park and requests nothing for the old commit. While a Task is parked
+as `infrastructure_exhausted`, `GET /api/v1/operations/status` carries a
+`recent_errors` item with `entity_type = "task_check_exhausted"`,
+`entity_id` = the Task id and severity `attention`.
 Private witnesses retain repair/review lineage through real running states; a
 Task with a live execution is always `running`, never parked on integration.
 

@@ -215,6 +215,12 @@ fn condition_park(condition: &TaskCondition) -> Next {
     };
     let (owner, action) = match reason {
         ParkReason::Integration { .. } => (Owner::IntegrationWorker, Action::WaitForOwner),
+        // The check runner answers a result or slot wait through the Task's
+        // own delivery step; only exhausted retries wait for the owner.
+        ParkReason::Check { wait } if wait.requires_intervention() => {
+            (Owner::User, Action::RetryChecks)
+        }
+        ParkReason::Check { .. } => (Owner::Worker, Action::WaitForOwner),
         ParkReason::Held { .. } => (Owner::User, Action::ReleaseHold),
         ParkReason::HumanDecision { .. } => (Owner::User, Action::ApproveOrMove),
         ParkReason::Capacity { .. } => (Owner::Scheduler, Action::FreeCapacity),
@@ -253,7 +259,20 @@ fn condition_park(condition: &TaskCondition) -> Next {
 /// capacity park is only ever the capacity reason's own, never one an
 /// integration wait raised.
 pub fn integration_decides(condition: &TaskCondition, f: &Facts) -> bool {
-    if condition.integration_wait().is_none() {
+    owner_wait_decides(condition, f, condition.integration_wait().is_some())
+}
+
+/// Whether a wait on the durable check runner decides this Task's next step,
+/// by the same rule as an integration wait: it does as the primary reason or
+/// behind a real owner blocker, and never under a self-clearing primary. A
+/// result or slot wait is therefore never a dispatch, an entry-hooks replay,
+/// a capacity-unpark demand or a human blocker; the delivery step ends it.
+pub fn check_decides(condition: &TaskCondition, f: &Facts) -> bool {
+    owner_wait_decides(condition, f, condition.check_wait().is_some())
+}
+
+fn owner_wait_decides(condition: &TaskCondition, f: &Facts, waits: bool) -> bool {
+    if !waits {
         return false;
     }
     let primary = match condition {
@@ -262,7 +281,7 @@ pub fn integration_decides(condition: &TaskCondition, f: &Facts) -> bool {
         _ => return false,
     };
     match primary {
-        ParkReason::Integration { .. } => true,
+        ParkReason::Integration { .. } | ParkReason::Check { .. } => true,
         ParkReason::Capacity { .. }
         | ParkReason::DispatchRefusal { .. }
         | ParkReason::OwnerOffline { .. }
@@ -300,7 +319,7 @@ pub fn next_step(s: &Snapshot<'_>) -> Next {
     // park names the primary's owner. It is never an execution, entry-hooks
     // lease or paused-integration retry. A self-clearing primary falls
     // through to its normal step (see `integration_decides`).
-    if integration_decides(s.condition, f) {
+    if integration_decides(s.condition, f) || check_decides(s.condition, f) {
         return condition_park(s.condition);
     }
     if f.queue_owned {
@@ -709,6 +728,81 @@ mod tests {
             ));
             assert!(matches!(condition, TaskCondition::Clear { .. }));
         }
+    }
+
+    #[test]
+    fn check_waits_park_on_their_owner_and_never_dispatch_or_demand_capacity() {
+        let workflow = WorkflowEngine::resolve_workflow("{}");
+        for state in workflow
+            .states
+            .iter()
+            .filter(|state| state.kind != StateKind::Terminal)
+        {
+            for condition in crate::task_actions::tests::check_conditions() {
+                let exhausted = condition.check_wait().unwrap().requires_intervention();
+                // Everything that would otherwise pick a step, replay entry
+                // hooks or raise a capacity park is set: the check wait wins.
+                let f = Facts {
+                    integrate: true,
+                    queued_recovery: true,
+                    review_ci_retry: true,
+                    missing_merge_entry: true,
+                    role_target: Some(("coder".into(), "agent".into())),
+                    refresh_placement: true,
+                    owner_expired: true,
+                    agent_full: true,
+                    disposition_current: true,
+                    ..Default::default()
+                };
+                assert!(check_decides(&condition, &f));
+                let next = next_step(&Snapshot {
+                    state: &state.name,
+                    condition: &condition,
+                    workflow: &workflow,
+                    facts: &f,
+                });
+                let Next::Park(park) = next else {
+                    panic!("{}: a check wait is never a step: {next:?}", state.name);
+                };
+                assert!(matches!(
+                    park.reason,
+                    Reason::Condition(ParkReason::Check { .. })
+                ));
+                assert_eq!(
+                    (park.owner, park.recovery),
+                    if exhausted {
+                        (Owner::User, Action::RetryChecks)
+                    } else {
+                        (Owner::Worker, Action::WaitForOwner)
+                    },
+                    "{}",
+                    state.name
+                );
+            }
+        }
+        // Behind a self-clearing primary the wait is retained and that
+        // primary keeps its own step, as for integration.
+        for mut condition in crate::task_actions::tests::check_conditions() {
+            let TaskCondition::Parked {
+                primary,
+                additional,
+                ..
+            } = &mut condition
+            else {
+                unreachable!()
+            };
+            let check = std::mem::replace(
+                primary,
+                ParkReason::Capacity {
+                    scope: db::ConditionCapacityScope::Machine,
+                },
+            );
+            additional.push(check);
+            assert!(condition.check_wait().is_some());
+            assert!(!check_decides(&condition, &Facts::default()));
+        }
+        // A Task with no check wait is unaffected.
+        assert!(!check_decides(&TaskCondition::default(), &Facts::default()));
     }
 
     #[test]

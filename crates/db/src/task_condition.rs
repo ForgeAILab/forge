@@ -242,6 +242,11 @@ pub enum ParkReason {
         definition_digest: String,
         cause: String,
     },
+    // --- durable check runner (plan 3.3 stage D) ---
+    /// Waiting on a durable check run, or parked by its exhausted retries.
+    Check {
+        wait: CheckWait,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -288,6 +293,8 @@ impl TaskCondition {
         matches!(self, Self::Failed { .. })
             || self.reasons().any(|r| match r {
                 ParkReason::Integration { reason } => reason.requires_intervention(),
+                // A result or slot wait is owned work that ends on its own.
+                ParkReason::Check { wait } => wait.requires_intervention(),
                 _ => true,
             })
     }
@@ -338,7 +345,7 @@ pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
 /// Revision of the mapping and of the stored encoding. A database whose
 /// recorded revision differs is recomputed once in the background, off the
 /// startup path. Bump it with every change to either.
-pub const MAPPING_REVISION: i64 = 5;
+pub const MAPPING_REVISION: i64 = 6;
 /// Protected `system_setting` key recording the revision last backfilled.
 pub const MAPPING_REVISION_KEY: &str = "task_condition_mapping_revision";
 
@@ -1288,7 +1295,13 @@ fn newer_encoding(value: &serde_json::Value) -> bool {
             .any(|witness| {
                 unknown_tag::<ConditionWitness>(Some(witness))
                     || unknown_tag::<IntegrationReason>(witness.get("reason"))
+                    || unknown_phase(witness.get("wait"))
             })
+}
+/// A check wait whose phase this build does not know.
+fn unknown_phase(wait: Option<&serde_json::Value>) -> bool {
+    wait.and_then(|wait| wait.get("phase"))
+        .is_some_and(|phase| serde_json::from_value::<CheckWaitPhase>(phase.clone()).is_err())
 }
 /// Classify stored bytes by their own shape. A database-wide newer revision
 /// is added by [`stored_condition`].
@@ -1485,13 +1498,10 @@ impl SqliteDb {
         task_id: &str,
         statement: &ConditionStatement,
     ) -> Result<()> {
-        if !matches!(
-            statement,
-            ConditionStatement::Integration { .. }
-                | ConditionStatement::IntegrationHandedOff { .. }
-                | ConditionStatement::IntegrationCleared { .. }
-        ) {
-            return Err(DbError::Check("expected an integration statement".into()));
+        if !statement.owner_stated() {
+            return Err(DbError::Check(
+                "expected an integration or check statement".into(),
+            ));
         }
         if !crate::task_writer::owns_task(task_id) {
             return Err(DbError::Check(
@@ -1544,6 +1554,7 @@ impl SqliteDb {
         condition: &TaskCondition,
     ) -> Result<()> {
         integration::validate(condition)?;
+        check::validate(condition)?;
         if !crate::task_writer::owns_task(task_id) {
             return Err(DbError::Check(
                 "set_condition requires the Task step lease".into(),
@@ -1584,11 +1595,19 @@ impl SqliteDb {
         };
         let before = stored_condition.as_ref().map(owned).unwrap_or_default();
         let after = owned(condition);
-        let unchanged = if matches!(condition, TaskCondition::Settled { .. }) {
+        // A check wait belongs to the status entry that asked: only one this
+        // entry still witnesses counts as owned.
+        let epoch: i64 = row.try_get(8)?;
+        let waits = |c: &TaskCondition| {
+            c.check_witness()
+                .filter(|(_, at)| *at == epoch)
+                .map(|(wait, _)| wait.clone())
+        };
+        let unchanged = (if matches!(condition, TaskCondition::Settled { .. }) {
             before.2 == after.2
         } else {
             before == after
-        };
+        }) && stored_condition.as_ref().and_then(waits) == waits(condition);
         if !unchanged {
             // Completed command bookkeeping may carry integration, never
             // introduce, replace or clear its independently owned statement.
@@ -1600,7 +1619,8 @@ impl SqliteDb {
                 // answers a conflict by writing under the version fence alone
                 // (`state_condition_in_tx`) must not write this one.
                 return Err(DbError::Check(
-                    "integration ownership cannot change under a completed Task step".into(),
+                    "integration or check ownership cannot change under a completed Task step"
+                        .into(),
                 ));
             }
         }
@@ -1628,7 +1648,7 @@ impl SqliteDb {
         // the two can only be compared without them.
         let agrees = |facts: ConditionFacts| {
             let expected = facts.condition(&bare);
-            if condition.integration_reason().is_some() {
+            if condition.integration_reason().is_some() || condition.check_witness().is_some() {
                 expected.typed() == condition.typed()
             } else {
                 expected == *condition
@@ -1765,8 +1785,10 @@ impl SqliteDb {
     }
 }
 
+mod check;
 mod checks;
 mod integration;
+pub use check::{CheckWait, CheckWaitPhase};
 pub use checks::{
     ConditionCheckPass, ConditionCheckState, ConditionCheckStatus, CONDITION_CHECK_PAGE,
 };
@@ -1781,6 +1803,8 @@ pub(crate) use producers::{
     sql_change, state, workflow_changed,
 };
 pub use statements::ConditionStatement;
+#[cfg(test)]
+mod check_tests;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]

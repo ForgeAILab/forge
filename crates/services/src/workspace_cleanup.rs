@@ -756,6 +756,10 @@ impl WorkspaceCleanupScheduler {
             placement,
             ..resolved
         };
+        // While the worktree can still reach its repository: the refs that
+        // kept off-branch commits for this Task go with its workspace.
+        crate::workspace_manager::delete_rescued_refs(&self.workspace_root, &workspace, &resolved)
+            .await;
         let ack = resolved.backend.cleanup(&resolved.placement).await?;
         if workspace.status == WorkspaceStatus::Cleaned {
             // Leftovers of a workspace that was reclaimed earlier. Its branch

@@ -466,9 +466,34 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-        let resolved = self.resolve_task_workspace(&workspace).await?;
-        let workspace_path = execution_workspace_path(&resolved)?;
-        let worktree_path = std::path::Path::new(&workspace_path);
+        // The claim checked this workspace against Git; the launch happens
+        // now. `claimed_path` confirms on the filesystem alone that the
+        // worktree is still there and confined (no Git process between the
+        // spawn and the executor) and falls back to the full check and its
+        // repairs when it is not. Every later use in this run (plan staging,
+        // outbox ingest and discard) takes this path.
+        let valid = crate::workspace_manager::WorkspaceManager::new(
+            &self.db,
+            &self.workspace_root,
+            self.repo_cache_locks.clone(),
+            &self.workspace_backend_router,
+        )
+        .claimed_path(&task, workspace)
+        .await?;
+        let worktree_path = valid
+            .path()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| {
+                ServiceError::from(
+                    crate::workspace_backend::WorkspaceBackendError::OwnerUnsupported {
+                        owner_kind: valid.resolved().placement.owner_kind.clone(),
+                    },
+                )
+            })?;
+        let resolved = valid.resolved().clone();
+        let workspace = valid.into_workspace();
+        let workspace_path = worktree_path.to_string_lossy().into_owned();
+        let worktree_path = worktree_path.as_path();
         // A Task-row mutation since lease issuance (role handoff, metadata
         // clear, concurrent transition) fails the exact-match verify; recover
         // once through the normal issuance path instead of hard-failing, and
@@ -779,21 +804,13 @@ impl TaskService {
         // exists.
         if plan_writing_role {
             if let Err(error) = crate::plan_artifact::prepare_execution_plan_outbox(
-                &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                    &self.db, &workspace,
-                )
-                .await?,
+                worktree_path,
                 &execution_id,
                 &execution.role,
                 task.plan.as_deref(),
             ) {
-                if let Some(outbox) = executors::execution_outbox_path(
-                    &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                        &self.db, &workspace,
-                    )
-                    .await?,
-                    &execution_id,
-                ) {
+                if let Some(outbox) = executors::execution_outbox_path(worktree_path, &execution_id)
+                {
                     let _ = std::fs::remove_dir_all(outbox);
                 }
                 let reason = format!("failed to prepare the execution plan outbox: {error}");
@@ -1257,14 +1274,7 @@ impl TaskService {
             if execution_outbox_disposition(&current_execution.status, false)
                 == ExecutionOutboxDisposition::Discard
             {
-                discard_execution_outbox_and_plan_stage(
-                    &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                        &self.db, &workspace,
-                    )
-                    .await?
-                    .to_string_lossy(),
-                    &execution_id,
-                );
+                discard_execution_outbox_and_plan_stage(&workspace_path, &execution_id);
             }
             if current_execution.status == ExecutionStatus::Cancelled {
                 let late_reports = result.usage_reports.clone();
@@ -1447,14 +1457,7 @@ impl TaskService {
                     execution_outbox_disposition(&execution.status, false)
                         == ExecutionOutboxDisposition::Discard
                 }) {
-                    discard_execution_outbox_and_plan_stage(
-                        &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                            &self.db, &workspace,
-                        )
-                        .await?
-                        .to_string_lossy(),
-                        &execution_id,
-                    );
+                    discard_execution_outbox_and_plan_stage(&workspace_path, &execution_id);
                 }
                 let current = current
                     .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
@@ -1493,7 +1496,7 @@ impl TaskService {
                             execution_id: &execution_id,
                             agent_id,
                             role: Some(updated.role.as_str()),
-                            worktree_path: &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(&self.db, &workspace).await?.to_string_lossy(),
+                            worktree_path: &workspace_path,
                         })
                         .await;
                     if report.worklog_entries > 0 || report.evidence_items > 0 {
@@ -1514,14 +1517,7 @@ impl TaskService {
                 }
             }
             ExecutionOutboxDisposition::Discard => {
-                discard_execution_outbox_and_plan_stage(
-                    &crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                        &self.db, &workspace,
-                    )
-                    .await?
-                    .to_string_lossy(),
-                    &execution_id,
-                );
+                discard_execution_outbox_and_plan_stage(&workspace_path, &execution_id);
             }
             ExecutionOutboxDisposition::Preserve => {
                 unreachable!("this runner won terminal settlement")
@@ -2276,9 +2272,32 @@ impl TaskService {
         ))
     }
 
-    async fn owner_execution_path(&self, resolved: &ResolvedWorkspace) -> Result<String> {
+    /// The provider's workspace argument at the placement boundary. A server
+    /// worktree is checked by the workspace manager at this launch; a daemon
+    /// path comes from the owner's retained preparation result.
+    async fn owner_execution_path(
+        &self,
+        task: &Task,
+        workspace: &Workspace,
+        resolved: &ResolvedWorkspace,
+    ) -> Result<String> {
         if resolved.placement.owner_kind == db::PlacementOwnerKind::Server {
-            return execution_workspace_path(resolved);
+            let valid = crate::workspace_manager::WorkspaceManager::new(
+                &self.db,
+                &self.workspace_root,
+                self.repo_cache_locks.clone(),
+                &self.workspace_backend_router,
+            )
+            .ensure_valid(
+                task,
+                workspace.clone(),
+                crate::workspace_manager::Purpose::Execute,
+            )
+            .await?;
+            return valid
+                .path()
+                .map(|path| path.to_string_lossy().into_owned())
+                .ok_or_else(|| ServiceError::invalid_operation("workspace has no server path"));
         }
         let placement = &resolved.placement;
         let daemon_id = placement
@@ -2330,7 +2349,9 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
         let resolved = self.resolve_task_workspace(&workspace).await?;
-        let workspace_path = self.owner_execution_path(&resolved).await?;
+        let workspace_path = self
+            .owner_execution_path(&task, &workspace, &resolved)
+            .await?;
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -2420,12 +2441,6 @@ impl TaskService {
             max_turns,
         })
     }
-}
-
-/// Resolve the provider's workspace argument at the placement boundary.
-/// Embedded execution requires a path on this host.
-fn execution_workspace_path(workspace: &ResolvedWorkspace) -> Result<String> {
-    Ok(workspace.embedded_path()?.to_string_lossy().into_owned())
 }
 
 fn prepared_owner_execution_path(

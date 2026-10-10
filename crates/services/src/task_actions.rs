@@ -314,7 +314,9 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 || action.verb() != "retry"
                 || matches!(
                     reason,
-                    "retry_budget_exhausted" | "execution_retry_exhausted"
+                    "retry_budget_exhausted"
+                        | "execution_retry_exhausted"
+                        | "check_infrastructure_exhausted"
                 ))
             && (task.status != "review"
                 || action.verb() != "retry"
@@ -327,6 +329,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                         | "owner_reconcile"
                         | "retry_budget_exhausted"
                         | "execution_retry_exhausted"
+                        | "check_infrastructure_exhausted"
                 ))
         {
             offers.push(Offer {
@@ -443,6 +446,32 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             "integration_wait",
             "Hold Task",
         );
+        return offers;
+    }
+    if let db::TaskCondition::Parked {
+        primary: db::ParkReason::Check { wait },
+        ..
+    } = &task.condition
+    {
+        // Waiting for a result or a slot is the check runner's own work:
+        // nothing to retry, approve or relaunch (Cancel is offered above).
+        // Exhausted infrastructure retries are no verdict on the candidate:
+        // the owner asks again, with a fresh infrastructure budget.
+        if wait.requires_intervention() {
+            offer(
+                TaskAction::Retry {
+                    reason: None,
+                    fresh_session: None,
+                    refresh_workspace: None,
+                    reset_budget: None,
+                    guidance: None,
+                },
+                &[],
+                &[Owner, ProjectAgent],
+                "check_infrastructure_exhausted",
+                "Retry Check",
+            );
+        }
         return offers;
     }
     // A running Task is held through its execution (below); a dispatch-wait
@@ -1912,6 +1941,66 @@ pub(crate) mod tests {
                 .condition(&db::LegacyConditionInput::default())
             })
             .collect()
+    }
+
+    pub(crate) fn check_conditions() -> Vec<db::TaskCondition> {
+        [
+            api_types::CheckWaitPhase::Result,
+            api_types::CheckWaitPhase::Slot,
+            api_types::CheckWaitPhase::InfrastructureExhausted,
+        ]
+        .into_iter()
+        .map(|phase| {
+            db::ConditionFacts {
+                task_id: "task".into(),
+                state: "review".into(),
+                check: Some((
+                    api_types::CheckWait {
+                        phase,
+                        consumer_id: "consumer".into(),
+                        origin: "entry".into(),
+                    },
+                    0,
+                )),
+                ..Default::default()
+            }
+            .condition(&db::LegacyConditionInput::default())
+        })
+        .collect()
+    }
+
+    #[test]
+    fn check_waits_offer_cancel_and_only_exhausted_retries_offer_retry() {
+        for state in ["review", "merging", "in_progress"] {
+            for condition in check_conditions() {
+                let exhausted = condition.check_wait().unwrap().requires_intervention();
+                let mut snapshot = snapshot(state, None);
+                snapshot.task.condition = condition.clone();
+                // A dispatcher wait cause must not hide the owner's retry.
+                for wait_cause in [None, Some(api_types::DeniedBy::IdentityPaused)] {
+                    snapshot.wait_cause = wait_cause;
+                    let offers = available_actions(&snapshot);
+                    let verbs: Vec<_> = offers.iter().map(|offer| offer.action.verb()).collect();
+                    assert_eq!(
+                        verbs,
+                        if exhausted {
+                            vec!["cancel", "retry"]
+                        } else {
+                            vec!["cancel"]
+                        },
+                        "{state} {condition:?}"
+                    );
+                    if exhausted {
+                        assert_eq!(offers[1].reason, "check_infrastructure_exhausted");
+                        assert!(offers[1].target_execution_id.is_none());
+                    }
+                }
+                // Not presented as a failure of the candidate.
+                assert!(condition.read().failure_kind.is_none());
+                assert!(!condition.read().hard_failure);
+                assert_eq!(condition.is_blocked(), exhausted);
+            }
+        }
     }
 
     #[test]

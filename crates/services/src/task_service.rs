@@ -514,6 +514,14 @@ pub struct LaunchExecutionResult {
 }
 
 impl TaskService {
+    /// The durable check runner's Task-step consumer contract, once the
+    /// runtime has composed it. Consumer families register through it.
+    pub fn check_consumers(
+        &self,
+    ) -> Option<Arc<crate::check_runner::consumer::TaskCheckConsumers>> {
+        self.check_consumers.get().cloned()
+    }
+
     /// Production services receive the runtime's shared owner router.
     pub fn new_with_router(
         db: Arc<SqliteDb>,
@@ -589,6 +597,10 @@ impl TaskService {
         self.test_workspace_backend = false;
         self.task_step_driver = Arc::default();
         self
+    }
+
+    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+        &self.workspace_root
     }
 
     pub fn workspace_backend_router(&self) -> Arc<WorkspaceBackendRouter> {
@@ -1943,11 +1955,11 @@ impl TaskService {
 
         if execution.status != ExecutionStatus::Completed {
             if let Some(workspace) = workspace.as_ref() {
-                if let Ok(path) =
-                    crate::workspace_backend::EmbeddedWorkspaceBackend::recorded_server_path(
-                        &self.db, workspace,
-                    )
+                // The plan stage sits in the Task root, beside the worktree.
+                if let Ok(path) = crate::workspace_backend::EmbeddedWorkspaceBackend::ensure_recorded_server_placement(&self.db, workspace)
                     .await
+                    .map_err(ServiceError::from)
+                    .and_then(|placement| crate::workspace_manager::task_root_anchor_of(&placement))
                 {
                     execution::discard_execution_plan_stage(&path.to_string_lossy(), &execution.id);
                 }
