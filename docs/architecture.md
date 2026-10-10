@@ -8442,6 +8442,20 @@ occupancy query (`db::machine_capacity`):
    admitted to its own slot once `k >= S`. With no Task waiting, checks may
    use every slot.
 
+Two approximations, both on the cautious side. Rule 1 counts every queued
+check with a live consumer, including one that will borrow its own Task's slot
+when the worker next looks at it, so a slot can be kept for one sweep (about a
+second) that nobody needed. Rule 3 reads any `task_schedule_wait` row naming
+the machine, which also covers a Task waiting for that machine's readiness or
+reconnect, so checks can be held to their share while no execution actually
+waits for a slot there.
+
+Known gap: a run-slot waiter is woken by the release of a slot (an edge). A
+Task whose wait is registered just after the release it should have seen is
+not looked at again until something else touches it; with one slot and no
+other activity that can be never. Pinned by the ignored model case
+`a_run_slot_wait_registered_after_the_release_is_still_woken`.
+
 Neither side starves. A queued check at the head of its queue is admitted at
 the first slot release after `k < S` (rule 1 keeps the slot from executions);
 one at position `p` after at most `p` further check completions, each bounded

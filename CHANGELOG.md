@@ -17,7 +17,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `?force=true` cancels queued runs, stops running ones on their machine and
   waits a few seconds for them to settle; if one has not (its daemon is
   unreachable), the answer stays `409` with `force_cancellation_incomplete`
-  and nothing is deleted.
+  and nothing is deleted. A refused forced delete has already cancelled the
+  check runs it could: their Tasks fail that review entry, as executions it
+  stopped stay stopped. Such a refusal can take up to about 18 seconds.
 
 - **Review-entry CI runs on the durable check runner (3.3 stage D part 2).**
   The `ci_steps` a Task runs when it enters `review` are no longer executed
@@ -2574,6 +2576,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   administrator.
 
 ### Known issues
+
+- **A Task can stay `Waiting for a Slot` on an idle machine.** A run-slot
+  waiter is woken when a slot is released. When the wait is recorded just
+  after the release it should have seen (the dispatcher read the machine as
+  full, the run ended, then the wait was written), nothing looks at the Task
+  again until something else changes it. Seen with `max_concurrent_runs: 1`
+  after a Project resume. Pinned by an ignored case in
+  `crates/api/tests/model_workflow.rs`.
 
 - A damaged worktree on a daemon owner is not repaired; the Task needs
   `reset_to_initial`. A deleted worktree is recreated from the Task branch.

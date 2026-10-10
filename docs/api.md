@@ -2346,7 +2346,12 @@ lease or check run is still live, the request remains a `409` (`details.
 force_cancellation_incomplete: true`) and the Project is left intact. That is
 the answer while a check runs on a daemon that cannot be reached: its stop is
 not confirmed, so the record that fences it is kept; retry once the daemon is
-back or the run has timed out. Force does not mean "delete anyway".
+back or the run has timed out. A refused forced delete has still cancelled what
+it could: executions it stopped stay stopped, and the Tasks whose check runs it
+cancelled fail that review entry (`review check did not finish`). The request
+waits up to three seconds per pass for running checks to settle, so a refusal
+for an unreachable daemon can take up to about 18 seconds. Force does not mean
+"delete anyway".
 
 Once admitted, it performs one guarded transaction that removes
 the Project-owned dependency graph before deleting the Project, including

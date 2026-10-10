@@ -952,7 +952,7 @@ async fn a_queued_check_gets_the_next_freed_slot_and_executions_keep_one() {
 async fn with_one_slot_the_queued_check_runs_before_the_next_new_run() {
     let (_temp, store, runner) = fixture().await;
     store.server_run_cap.set(Some(1), 1, "server-machine");
-    let mut stream = SlotStream {
+    let stream = SlotStream {
         store: store.clone(),
         started: 0,
     };
