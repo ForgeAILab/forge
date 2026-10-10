@@ -177,6 +177,17 @@ impl DbError {
                 || error.message().contains("FOREIGN KEY constraint failed"))
     }
 
+    /// SQLite refused or gave up on a lock (`SQLITE_BUSY`, `SQLITE_LOCKED`
+    /// and their extended codes): nothing was written, and the same
+    /// statement succeeds once the other writer has committed.
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Self::Sqlx(sqlx::Error::Database(error))
+            if error
+                .code()
+                .and_then(|code| code.parse::<i32>().ok())
+                .is_some_and(|code| matches!(code & 0xff, 5 | 6)))
+    }
+
     /// Worker retry classification, deliberately narrower than "any DB error".
     pub fn is_transient(&self) -> bool {
         match self {

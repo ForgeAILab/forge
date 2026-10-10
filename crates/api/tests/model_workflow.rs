@@ -663,13 +663,26 @@ impl World {
     /// the same database, the way `RuntimeSupervisor::start` does: crash
     /// recovery, then the dispatcher's startup reconciliation.
     async fn crash_and_restart(&mut self) -> Result<(), String> {
-        let old = self.live.take().expect("the server is up");
+        let mut old = self.live.take().expect("the server is up");
         old.script.alive.store(false, Ordering::SeqCst);
         old.script.waiting.lock().unwrap().clear();
         old.runtime.task_dispatcher.stop();
         old.checks.stop();
-        // Whatever the dead process still had in flight can no longer write.
-        let _ = tokio::time::timeout(Duration::from_secs(5), old.pool.close()).await;
+        // Whatever the dead process still had in flight can no longer write:
+        // its check worker is gone before the pool closes, and the pool is
+        // closed down to its last connection. `Pool::close` alone can leave
+        // one open, and a connection of the dead process that still held the
+        // write lock would make the new server wait out its busy timeout.
+        let _ = tokio::time::timeout(Duration::from_secs(5), &mut old.checks.job).await;
+        if tokio::time::timeout(Duration::from_secs(10), db::close_sqlite_pool(&old.pool))
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "model: the crashed server still holds {} database connection(s)",
+                old.pool.size()
+            );
+        }
         drop(old);
 
         let live = Self::boot(self.dir.path(), &self.shared).await;
