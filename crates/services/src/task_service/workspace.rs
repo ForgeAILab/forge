@@ -2923,6 +2923,7 @@ pub(crate) mod tests {
                         | 202610021500
                         | 202610060838
                         | 202610070507
+                        | 202610100137
                 ))
                 .then_some((version, path))
             })
@@ -3055,6 +3056,14 @@ pub(crate) mod tests {
             scheduler.split_once("\nCREATE TRIGGER").unwrap().1
         );
         sqlx::raw_sql(&triggers).execute(db.pool()).await.unwrap();
+        // Rebuilds `task_step` and re-creates the scheduler's step triggers,
+        // so it follows them here as it does in version order.
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610100137__integration_task_step.sql"
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
         let status: String =
             sqlx::query_scalar("SELECT status FROM repo_location WHERE repo_id = ?")
                 .bind(&repo_id)
