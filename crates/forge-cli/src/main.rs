@@ -498,14 +498,21 @@ async fn settle_workspace_root(db: &db::SqliteDb, config: &ForgeConfig) -> PathB
         explicit: config.workspace.root_explicit,
         data_dir: config.forge.data_dir.clone(),
         system_temp: std::env::temp_dir(),
+        migrate_command: migrate_command(config),
     };
     match services::workspace_root::settle(db, &choice).await {
         Ok(settled) => {
             if settled.in_system_temp {
                 warn!(
                     "{}",
-                    services::workspace_root::system_temp_warning(&settled.root)
+                    services::workspace_root::system_temp_warning(
+                        &settled.root,
+                        &choice.migrate_command
+                    )
                 );
+            }
+            for warning in &settled.warnings {
+                warn!("{warning}");
             }
             settled.root
         }
@@ -517,13 +524,22 @@ async fn settle_workspace_root(db: &db::SqliteDb, config: &ForgeConfig) -> PathB
     }
 }
 
+/// The move command as this server's operator types it.
+fn migrate_command(config: &ForgeConfig) -> String {
+    services::workspace_root::RootChoice::migrate_command_for(
+        &config.forge.data_dir,
+        &config::default_data_dir(),
+    )
+}
+
 /// `forge --migrate-workspace-root [NEW_ROOT]`: the process exit code. The
 /// caller holds the data directory's runtime lock, so no server is running.
 async fn migrate_workspace_root(config: &ForgeConfig, target: Option<PathBuf>) -> i32 {
     let opened = async {
         let data_dir = absolute_path(config.forge.data_dir.clone()).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-        let database_url = format!("sqlite:{}", data_dir.join("forge.db").display());
+        // The same file a start opens.
+        let database_url = format!("sqlite:{}", config.db_path().display());
         let pool = db::create_sqlite_pool(&database_url)
             .await
             .map_err(|e| e.to_string())?;
@@ -539,12 +555,21 @@ async fn migrate_workspace_root(config: &ForgeConfig, target: Option<PathBuf>) -
             return 1;
         }
     };
+    // No path given: where this configuration would start, so the next
+    // start is not refused for a root that is set and differs.
+    let target = target.or_else(|| {
+        config
+            .workspace
+            .root_explicit
+            .then(|| config.workspace.root.clone())
+    });
     let request = services::workspace_root::migrate::MigrateRequest::new(
         data_dir,
         target,
         std::env::temp_dir(),
         config.workspace.min_free_bytes,
-    );
+    )
+    .with_command(migrate_command(config));
     match services::workspace_root::migrate::migrate(&db, &request).await {
         Ok(report) => {
             print!("{report}");

@@ -39,7 +39,7 @@ const LOG_REMOVAL_BUDGET: Duration = Duration::from_secs(10);
 const RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
 /// Time one such pass may take: an admission waits for it.
 const RECLAIM_BUDGET: Duration = Duration::from_secs(20);
-const OWNER_KEY: &str = "workspace_gc_owner_id";
+pub const OWNER_KEY: &str = "workspace_gc_owner_id";
 /// What the last ownership check found, for operator status.
 pub const STATUS_KEY: &str = "workspace_gc_status";
 

@@ -211,6 +211,12 @@ impl SoloStartup {
         // server's, and a database that recorded another root with live
         // workspaces in it (a copied or relocated data root) is not started
         // on: its stored paths would point at the other root.
+        // Solo's data root is never the server's default one, so the
+        // command always names it.
+        let migrate_command = format!(
+            "forge --data-dir {} --migrate-workspace-root",
+            paths.root.display()
+        );
         let settled = services::workspace_root::settle(
             &db,
             &services::workspace_root::RootChoice {
@@ -218,15 +224,23 @@ impl SoloStartup {
                 explicit: true,
                 data_dir: paths.root.clone(),
                 system_temp: std::env::temp_dir(),
+                migrate_command: migrate_command.clone(),
             },
         )
         .await
-        .map_err(|error| StartupError::WorkspaceRoot(error.to_string()))?;
+        .map_err(|error| {
+            StartupError::WorkspaceRoot(format!(
+                "{error}. Solo has no move command of its own: the `forge` binary runs it on Solo's data root exactly as written above"
+            ))
+        })?;
         if settled.in_system_temp {
             tracing::warn!(
                 "{}",
-                services::workspace_root::system_temp_warning(&settled.root)
+                services::workspace_root::system_temp_warning(&settled.root, &migrate_command)
             );
+        }
+        for warning in &settled.warnings {
+            tracing::warn!("{warning}");
         }
 
         let runtime = Arc::new(

@@ -25,7 +25,9 @@ use tracing::info;
 use workspace::{RepoCacheLockManager, WorkspaceManager};
 
 mod gc;
-pub use gc::{GcSettings, LiveCheckCounter, STATUS_KEY as GC_STATUS_KEY};
+pub use gc::{
+    GcSettings, LiveCheckCounter, OWNER_KEY as GC_OWNER_KEY, STATUS_KEY as GC_STATUS_KEY,
+};
 
 const SWEEP_BUDGET: Duration = Duration::from_secs(60);
 /// The part of [`SWEEP_BUDGET`] the Task and repository backfill may use. The

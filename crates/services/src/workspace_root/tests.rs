@@ -36,6 +36,7 @@ impl Dirs {
             explicit: false,
             data_dir: self.data.path().to_path_buf(),
             system_temp: self.temp.path().to_path_buf(),
+            migrate_command: MIGRATE_COMMAND.to_owned(),
         }
     }
 
@@ -76,6 +77,7 @@ async fn a_fresh_data_dir_runs_on_its_own_worktrees_directory_and_records_it() {
             root: dirs.default_root(),
             in_system_temp: false,
             recorded_now: true,
+            warnings: Vec::new(),
         }
     );
     assert_eq!(recorded_root(&db).await.unwrap(), Some(dirs.default_root()));
@@ -119,6 +121,7 @@ async fn an_install_on_the_temp_default_keeps_it_records_it_and_reports_it() {
             root: legacy.clone(),
             in_system_temp: true,
             recorded_now: true,
+            warnings: Vec::new(),
         }
     );
     assert_eq!(recorded_root(&db).await.unwrap(), Some(legacy.clone()));
@@ -138,7 +141,7 @@ async fn an_install_on_the_temp_default_keeps_it_records_it_and_reports_it() {
         api_types::OperatorSeverity::Healthy
     );
     assert_eq!(
-        system_temp_warning(&legacy),
+        system_temp_warning(&legacy, MIGRATE_COMMAND),
         issue.error,
         "the log line and the operator entry say the same thing"
     );
@@ -301,7 +304,240 @@ async fn an_unfinished_move_refuses_the_start() {
             .contains("forge --migrate-workspace-root"),
         "{refused}"
     );
+    assert!(
+        refused.to_string().starts_with("migration in progress"),
+        "{refused}"
+    );
     assert_eq!(recorded_root(&db).await.unwrap(), None);
+}
+
+fn warnings_reported(status: &api_types::OperatorStatusResponse) -> Vec<String> {
+    status
+        .recent_errors
+        .iter()
+        .filter(|issue| issue.entity_type == "workspace_root")
+        .map(|issue| issue.error.clone())
+        .collect()
+}
+
+/// Upgrade shape (iii): the rows were written under another temp directory
+/// than this launch has (service manager and shell, `/tmp` and macOS's
+/// `/var/folders`). The root comes from the rows, never from today's temp.
+#[tokio::test]
+async fn an_install_written_under_another_temp_directory_keeps_its_root() {
+    let db = sqlite_db().await;
+    let dirs = Dirs::new();
+    let then = TempDir::new().unwrap();
+    let written_under = legacy_temp_root(then.path());
+    let workspace = seed_workspace_under(&db, &dirs, &written_under).await;
+    assert!(!is_under(&written_under, dirs.temp.path()));
+
+    let settled = settle(&db, &dirs.default_choice()).await.unwrap();
+    assert_eq!(settled.root, written_under);
+    assert!(settled.recorded_now && settled.in_system_temp);
+    assert!(settled.warnings.is_empty(), "{:?}", settled.warnings);
+    assert_eq!(
+        recorded_root(&db).await.unwrap(),
+        Some(written_under.clone())
+    );
+    assert!(Path::new(workspace.embedded_worktree_path_for_backend()).is_dir());
+    assert!(!dirs.default_root().exists());
+    // Still reported on the next start, whatever that launch's temp is.
+    let again = settle(&db, &dirs.default_choice()).await.unwrap();
+    assert!(again.in_system_temp && !again.recorded_now);
+    assert!(warnings_reported(&status(&db).await)[0].contains("system temp directory"));
+}
+
+/// Upgrade shape (iii), two roots in one database: no guess. The start
+/// runs on the root holding the most live workspaces, and says so.
+#[tokio::test]
+async fn rows_under_two_roots_start_on_the_one_holding_the_live_rows_and_warn() {
+    let db = sqlite_db().await;
+    let dirs = Dirs::new();
+    let (first, second) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let busy = legacy_temp_root(first.path());
+    let quiet = legacy_temp_root(second.path());
+    let repos = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    for (root, repo) in [(&busy, &repos[0]), (&quiet, &repos[1]), (&busy, &repos[2])] {
+        std::fs::create_dir_all(root).unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        prepare_workspace_for_test(&db, root, &task, &task.id, None)
+            .await
+            .expect("workspace creates");
+    }
+    let stored = stored_roots(&db).await.unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .map(|root| (root.root.clone(), root.workspaces))
+            .collect::<Vec<_>>(),
+        [
+            (busy.display().to_string(), 2),
+            (quiet.display().to_string(), 1)
+        ]
+    );
+    let settled = settle(&db, &dirs.default_choice()).await.unwrap();
+    assert_eq!(settled.root, busy);
+    assert_eq!(settled.warnings.len(), 1, "{:?}", settled.warnings);
+    let warning = &settled.warnings[0];
+    assert!(warning.contains(&quiet.display().to_string()), "{warning}");
+    assert!(warning.contains("1 workspace(s)"), "{warning}");
+    assert!(warning.contains(MIGRATE_COMMAND), "{warning}");
+    assert!(warnings_reported(&status(&db).await).contains(warning));
+}
+
+/// Upgrade shape (ii): a root set before the upgrade is recorded as it is,
+/// and rows the old release left elsewhere never refuse the start.
+#[tokio::test]
+async fn a_root_chosen_before_the_upgrade_is_recorded_and_never_refused() {
+    let db = sqlite_db().await;
+    let dirs = Dirs::new();
+    let chosen = dirs.data.path().join("chosen");
+    seed_workspace_under(&db, &dirs, &chosen).await;
+    // A workspace the temp default still holds from before the root was set.
+    let repo = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+    let task = seed_task(&db, &project_id, None).await;
+    std::fs::create_dir_all(dirs.legacy_root()).unwrap();
+    prepare_workspace_for_test(&db, &dirs.legacy_root(), &task, &task.id, None)
+        .await
+        .unwrap();
+    let settled = settle(&db, &dirs.explicit_choice(&chosen)).await.unwrap();
+    assert_eq!((settled.root, settled.recorded_now), (chosen, true));
+    assert!(!settled.in_system_temp);
+    assert_eq!(settled.warnings.len(), 1);
+    assert!(settled.warnings[0].contains(&dirs.legacy_root().display().to_string()));
+}
+
+/// Upgrade shape (v): the recorded root is gone (the system emptied its temp
+/// directory). The start goes on: the root is made again and the loss said.
+#[tokio::test]
+async fn a_recorded_root_the_system_emptied_is_made_again_and_reported() {
+    let db = sqlite_db().await;
+    let dirs = Dirs::new();
+    let legacy = dirs.legacy_root();
+    seed_workspace_under(&db, &dirs, &legacy).await;
+    settle(&db, &dirs.default_choice()).await.unwrap();
+    std::fs::remove_dir_all(dirs.temp.path().join("forge")).unwrap();
+
+    let settled = settle(&db, &dirs.default_choice()).await.unwrap();
+    assert_eq!(
+        (settled.root.clone(), settled.recorded_now),
+        (legacy.clone(), false)
+    );
+    assert!(legacy.is_dir());
+    assert_eq!(settled.warnings.len(), 1, "{:?}", settled.warnings);
+    assert!(
+        settled.warnings[0].contains("was missing"),
+        "{:?}",
+        settled.warnings
+    );
+    assert!(settled.warnings[0].contains("1 stored workspace(s)"));
+    assert!(warnings_reported(&status(&db).await).contains(&settled.warnings[0]));
+    // A fresh install's root that was never made is no loss and no warning.
+    let fresh = sqlite_db().await;
+    let other = Dirs::new();
+    settle(&fresh, &other.default_choice()).await.unwrap();
+    std::fs::remove_dir_all(other.default_root()).unwrap();
+    assert!(settle(&fresh, &other.default_choice())
+        .await
+        .unwrap()
+        .warnings
+        .is_empty());
+}
+
+/// Upgrade shape (vi): the data directory came from another machine or
+/// path, and its recorded root cannot even be created. The refusal names
+/// the exact command, with this data directory, and that command works.
+#[tokio::test]
+async fn a_recorded_root_that_cannot_exist_here_refuses_with_the_command_that_fixes_it() {
+    let db = sqlite_db().await;
+    let dirs = Dirs::new();
+    let blocker = dirs.data.path().join("not-a-directory");
+    std::fs::write(&blocker, "file").unwrap();
+    let elsewhere = blocker.join("forge/worktrees");
+    record_root(db.pool(), &elsewhere).await.unwrap();
+    let command = format!(
+        "forge --data-dir {} --migrate-workspace-root",
+        dirs.data.path().display()
+    );
+    assert_eq!(
+        RootChoice::migrate_command_for(dirs.data.path(), Path::new("/home/x/.forge")),
+        command
+    );
+    let choice = RootChoice {
+        migrate_command: command.clone(),
+        ..dirs.default_choice()
+    };
+    let refused = settle(&db, &choice).await.unwrap_err();
+    let WorkspaceRootError::Refused(message) = &refused else {
+        panic!("{refused:?}");
+    };
+    assert!(message.contains(&format!("`{command}`")), "{message}");
+    assert!(message.contains("cannot be created"), "{message}");
+
+    let report = migrate::migrate(
+        &db,
+        &migrate::MigrateRequest::new(
+            dirs.data.path().to_path_buf(),
+            None,
+            dirs.temp.path().to_path_buf(),
+            0,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.nothing_to_move, None);
+    let settled = settle(&db, &choice).await.unwrap();
+    assert_eq!(
+        settled.root,
+        dirs.data.path().canonicalize().unwrap().join("worktrees")
+    );
+}
+
+/// Upgrade shape (vi): a root another database adopted (two data
+/// directories shared the old temp default) is used as before, and said.
+#[tokio::test]
+async fn a_root_another_database_adopted_starts_and_is_reported() {
+    let db = sqlite_db().await;
+    let dirs = Dirs::new();
+    let legacy = dirs.legacy_root();
+    seed_workspace_under(&db, &dirs, &legacy).await;
+    let gc_dir = legacy.join(executors::gc::GC_DIR);
+    std::fs::create_dir_all(&gc_dir).unwrap();
+    std::fs::write(gc_dir.join(executors::gc::OWNER_FILE), "another-database").unwrap();
+    let settled = settle(&db, &dirs.default_choice()).await.unwrap();
+    assert_eq!(settled.root, legacy);
+    assert_eq!(settled.warnings.len(), 1, "{:?}", settled.warnings);
+    assert!(settled.warnings[0].contains("another-database"));
+}
+
+/// A configured root that differs from a recorded one that is gone: still
+/// the operator's move to make, and the refusal says nothing is left to
+/// move.
+#[tokio::test]
+async fn a_changed_root_whose_recorded_root_is_gone_says_so() {
+    let db = sqlite_db().await;
+    let dirs = Dirs::new();
+    let recorded = dirs.default_root();
+    settle(&db, &dirs.default_choice()).await.unwrap();
+    seed_workspace_under(&db, &dirs, &recorded).await;
+    std::fs::remove_dir_all(&recorded).unwrap();
+    let other = dirs.data.path().join("other-root");
+    let refused = settle(&db, &dirs.explicit_choice(&other))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("no longer exists"), "{refused}");
+    assert!(
+        refused.contains(&format!("{MIGRATE_COMMAND} {}", other.display())),
+        "{refused}"
+    );
 }
 
 #[cfg(unix)]

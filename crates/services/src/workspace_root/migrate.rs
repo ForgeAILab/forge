@@ -14,13 +14,14 @@
 //! finished move does not have.
 
 use super::{
-    is_under, real_dir, record_root, recorded_root, same_path, spellings, status_value, under_sql,
-    WorkspaceRootError, JOURNAL_FILE, MIGRATE_COMMAND, STATUS_KEY,
+    is_under, real_dir, record_root, recorded_root, same_path, spellings, status_value,
+    stored_roots, under_sql, WorkspaceRootError, JOURNAL_FILE, MIGRATE_COMMAND, STATUS_KEY,
 };
 use db::{now_rfc3339, SqliteDb};
 use executors::gc;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -45,10 +46,21 @@ const STORED_PATHS: [StoredPath; 13] = [
     StoredPath::plain("agent_context_scope", "workspace_path"),
     StoredPath::plain("agent_inquiry", "workspace_path"),
     StoredPath::plain("agent_inquiry", "findings_path"),
-    StoredPath::plain("runtime", "workspace_root"),
+    // A runtime row is a daemon's statement about its own root. Only the
+    // daemon inside the server process runs on the server's root; any other
+    // daemon keeps what it reported (one sharing the root keeps its Task
+    // roots in the old one) and reports again when it connects.
+    StoredPath::plain("runtime", "workspace_root")
+        .only("daemon_id IN (SELECT id FROM daemon WHERE machine_id LIKE 'embedded:%')"),
     StoredPath::plain("integration_attempt", "repo_location_ref"),
     // Durable steps carry the paths they act on inside their JSON; a step
-    // that has not run yet must act on the new root.
+    // that has not run yet must act on the new root. The value is replaced
+    // as text, not parsed: the old root is matched only where a `/` or the
+    // closing `"` of a JSON string follows it, and both needle and
+    // replacement are JSON-escaped, so a root that is a prefix of another
+    // path (`/data/wt` and `/data/wt2`) is never touched, the document
+    // stays valid JSON, and keys, numbers and other strings are unchanged
+    // (proved by the `/data/wt2` rows of the fixture).
     StoredPath::embedded("task_step", "payload_json"),
     StoredPath::embedded("task_step", "result_json"),
 ];
@@ -134,6 +146,24 @@ impl StoredPath {
     }
 }
 
+impl StoredPath {
+    /// Counts the rows of this column that still name the root bound as
+    /// `?1` (JSON-escaped for an embedded path), within the rows the
+    /// rewrite is limited to.
+    fn remaining_sql(&self) -> String {
+        let column = self.column;
+        let mut rows = if self.embedded {
+            format!("(instr({column}, ?1 || '/') > 0 OR instr({column}, ?1 || '\"') > 0)")
+        } else {
+            under_sql(column)
+        };
+        if let Some(only) = self.only {
+            rows = format!("{rows} AND {only}");
+        }
+        format!("SELECT COUNT(*) FROM {} WHERE {rows}", self.table)
+    }
+}
+
 /// `text` as it appears inside a JSON string.
 fn json_escaped(text: &str) -> String {
     let quoted = serde_json::Value::String(text.to_owned()).to_string();
@@ -163,9 +193,14 @@ pub struct MigrateRequest {
     target: Option<PathBuf>,
     system_temp: PathBuf,
     free_floor_bytes: u64,
+    /// The command as its operator types it, for messages.
+    command: String,
     always_copy: bool,
     #[cfg(test)]
     crash_at: Option<usize>,
+    /// A known column the rewrite "forgets", to prove the post-condition.
+    #[cfg(test)]
+    skip_column: Option<&'static str>,
 }
 
 impl MigrateRequest {
@@ -184,10 +219,27 @@ impl MigrateRequest {
             target,
             system_temp,
             free_floor_bytes,
+            command: MIGRATE_COMMAND.to_owned(),
             always_copy: false,
             #[cfg(test)]
             crash_at: None,
+            #[cfg(test)]
+            skip_column: None,
         }
+    }
+
+    /// The command as the operator types it (with `--data-dir` when the
+    /// data directory is not the default one): named by every message.
+    #[must_use]
+    pub fn with_command(mut self, command: String) -> Self {
+        self.command = command;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn skipping_column(mut self, column: &'static str) -> Self {
+        self.skip_column = Some(column);
+        self
     }
 
     /// Copy, compare and remove even on one filesystem.
@@ -225,6 +277,17 @@ pub struct MigrateReport {
     /// Text columns that still mention the old root (history, not paths
     /// Forge opens): `table.column` and how many rows.
     pub remaining_mentions: Vec<(String, i64)>,
+    /// Entries of the old root that are not Forge's (no stored path names
+    /// them, not a Task root, not a directory Forge makes): left there.
+    pub left_behind: Vec<String>,
+    /// Sockets, pipes and devices a copy cannot carry: left in the old root.
+    pub not_copied: Vec<PathBuf>,
+    /// Repositories outside the root (a user's own checkout) in which
+    /// `git worktree repair` re-registered worktrees that moved. Nothing
+    /// else in them was touched.
+    pub user_repositories: Vec<PathBuf>,
+    /// What the checks after the move found and did not block on.
+    pub warnings: Vec<String>,
     /// Garbage-collection ownership of the new root.
     pub gc_state: String,
     /// Every step this run went through, in order.
@@ -258,11 +321,37 @@ impl std::fmt::Display for MigrateReport {
                 "renamed (same filesystem)"
             }
         )?;
+        if self.copied {
+            writeln!(
+                formatter,
+                "  kept: contents, permissions, modification times, links (as links) and hard links within an entry; not kept: extended attributes"
+            )?;
+        }
         writeln!(
             formatter,
-            "  {} Git worktree(s) relinked and checked with `git status`",
+            "  {} Git worktree(s) relinked and checked with `git status`; every clone checked with `git fsck --connectivity-only`",
             self.worktrees.len()
         )?;
+        for repository in &self.user_repositories {
+            writeln!(
+                formatter,
+                "  `git worktree repair` was run in your repository {} so it finds its moved worktrees; nothing else there was touched",
+                repository.display()
+            )?;
+        }
+        for entry in &self.left_behind {
+            writeln!(formatter, "  left in the old root (not Forge's): {entry}")?;
+        }
+        for path in &self.not_copied {
+            writeln!(
+                formatter,
+                "  left in the old root (a socket, pipe or device cannot be copied): {}",
+                path.display()
+            )?;
+        }
+        for warning in &self.warnings {
+            writeln!(formatter, "  warning: {warning}")?;
+        }
         for (column, rows) in &self.rows {
             if *rows > 0 {
                 writeln!(formatter, "  {rows} row(s) rewritten in {column}")?;
@@ -281,7 +370,7 @@ impl std::fmt::Display for MigrateReport {
         )?;
         writeln!(
             formatter,
-            "  the old root keeps a {MOVED_MARKER} file and nothing else was deleted from it"
+            "  the old root keeps a {MOVED_MARKER} file; nothing was deleted from it except what was moved, and it is free for another Forge to adopt"
         )?;
         writeln!(
             formatter,
@@ -322,6 +411,15 @@ struct Journal {
     /// In the new root and gone from the old one.
     moved: Vec<String>,
     phase: Phase,
+    /// Top-level entries of the old root that are not Forge's: never moved.
+    #[serde(default)]
+    left_behind: Vec<String>,
+    /// Sockets, pipes and devices left in the old root by a copy.
+    #[serde(default)]
+    not_copied: Vec<String>,
+    /// The old root did not exist: only the database is pointed at the new.
+    #[serde(default)]
+    source_missing: bool,
 }
 
 impl Journal {
@@ -400,8 +498,8 @@ pub async fn migrate(
             if let Some(target) = &request.target {
                 if !same_path(target, Path::new(&journal.target)) {
                     return Err(WorkspaceRootError::Refused(format!(
-                        "a move from {} to {} did not finish; run `{MIGRATE_COMMAND}` without a target to finish it before moving anywhere else",
-                        journal.source, journal.target
+                        "a move from {} to {} did not finish; run `{}` without a target to finish it before moving anywhere else",
+                        journal.source, journal.target, request.command
                     )));
                 }
             }
@@ -430,12 +528,16 @@ pub async fn migrate(
     if run.journal.phase == Phase::Moving {
         move_units(&mut run, &source, &target)?;
     }
+    let (mut user_repositories, mut warnings) = (Vec::new(), Vec::new());
     // Idempotent, and cheap: repeated on every run that has not yet
     // rewritten the database, so a crash in the middle is never trusted.
     let worktrees = if run.journal.phase == Phase::Database {
         Vec::new()
     } else {
-        let worktrees = repair_worktrees(db, &run.journal, &target).await?;
+        let repaired = repair_worktrees(db, &run.journal, &target, &request.command).await?;
+        user_repositories = repaired.user_repositories;
+        warnings = repaired.warnings;
+        let worktrees = repaired.worktrees;
         run.step("repair".to_owned())?;
         run.journal.phase = Phase::Repaired;
         run.save()?;
@@ -501,6 +603,10 @@ pub async fn migrate(
         worktrees,
         rows,
         remaining_mentions,
+        left_behind: run.journal.left_behind.clone(),
+        not_copied: run.journal.not_copied.iter().map(PathBuf::from).collect(),
+        user_repositories: std::mem::take(&mut user_repositories),
+        warnings: std::mem::take(&mut warnings),
         gc_state,
         steps: run.steps,
     })
@@ -515,19 +621,23 @@ enum Planned {
 async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, WorkspaceRootError> {
     let default_target = config::default_workspace_root(&request.data_dir);
     let wanted = absolute(request.target.as_deref().unwrap_or(&default_target))?;
-    let legacy = super::legacy_temp_root(&request.system_temp);
+    let command = request.command.as_str();
+    // The root a start would run on: the recorded one, else the one this
+    // database's rows were written under (never today's temp directory).
     let source = match recorded_root(db).await? {
         Some(recorded) => recorded,
-        None if super::has_legacy_layout(db, &legacy).await? => legacy,
-        None => {
-            return Ok(Planned::Nothing(Box::new(MigrateReport {
+        None => match stored_roots(db).await?.first() {
+            Some(stored) => PathBuf::from(&stored.root),
+            None => {
+                return Ok(Planned::Nothing(Box::new(MigrateReport {
                 target: wanted,
                 nothing_to_move: Some(
                     "this database has no workspace root in use yet; the server records one at its first start".to_owned(),
                 ),
                 ..MigrateReport::default()
             })));
-        }
+            }
+        },
     };
     if same_path(&source, &wanted) {
         return Ok(Planned::Nothing(Box::new(MigrateReport {
@@ -549,7 +659,7 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
     let running = Running::read(db).await?;
     if !running.is_empty() {
         return refuse(format!(
-            "{running} recorded as running. Start Forge and let them finish (a start also settles runs a crash left behind), stop it, and run `{MIGRATE_COMMAND}` again"
+            "{running}. Start Forge and let them finish (a start also settles what a crash left behind), stop it, and run `{command}` again"
         ));
     }
     if is_under(&wanted, &source) {
@@ -566,15 +676,36 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
             wanted.display()
         ));
     }
-    let existed = match fs::symlink_metadata(&wanted) {
+    // A root reached through a link is still a root.
+    let source_exists = source.is_dir();
+    if !source_exists && fs::symlink_metadata(&source).is_ok() {
+        return refuse(format!(
+            "the old root {} is not a directory",
+            source.display()
+        ));
+    }
+    // The directories this run creates, deepest first: a refusal removes
+    // exactly these again.
+    let mut created: Vec<PathBuf> = Vec::new();
+    let mut above = Some(wanted.as_path());
+    while let Some(path) = above {
+        if fs::symlink_metadata(path).is_ok() {
+            break;
+        }
+        created.push(path.to_path_buf());
+        above = path.parent();
+    }
+    match fs::symlink_metadata(&wanted) {
         Ok(metadata) if metadata.file_type().is_dir() => {
-            if fs::read_dir(&wanted)?.next().is_some() {
+            // With the old root gone nothing is moved, so what the new one
+            // holds is not in the way: only the database is pointed at it
+            // (a data directory that was moved with its worktrees inside).
+            if source_exists && fs::read_dir(&wanted)?.next().is_some() {
                 return refuse(format!(
                     "the new root {} is not empty; the move only fills an empty or absent directory",
                     wanted.display()
                 ));
             }
-            true
         }
         Ok(_) => {
             return refuse(format!(
@@ -582,17 +713,22 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
                 wanted.display()
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
-    };
-    fs::create_dir_all(&wanted)?;
-    // From here a refusal removes the directory this run created.
+    }
+    // From here a refusal removes the directories this run created.
     let undo = |reason: String| {
-        if !existed {
-            let _ = fs::remove_dir(&wanted);
+        for made in &created {
+            let _ = fs::remove_dir(made);
         }
         refuse(reason)
     };
+    if let Err(error) = fs::create_dir_all(&wanted) {
+        return undo(format!(
+            "the new root {} cannot be created ({error})",
+            wanted.display()
+        ));
+    }
     let target = match fs::canonicalize(&wanted) {
         Ok(target) => target,
         Err(error) => {
@@ -615,14 +751,6 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
             target.display()
         ));
     }
-    // A root reached through a link is still a root.
-    let source_exists = source.is_dir();
-    if !source_exists && fs::symlink_metadata(&source).is_ok() {
-        return undo(format!(
-            "the old root {} is not a directory",
-            source.display()
-        ));
-    }
     let copy = request.always_copy || (source_exists && !same_filesystem(&source, &target));
     if copy && source_exists {
         let needed = tree_bytes(&fs::canonicalize(&source).unwrap_or_else(|_| source.clone()))
@@ -631,7 +759,7 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
             Some(space) if space.free >= needed => {}
             Some(space) => {
                 return undo(format!(
-                    "the filesystem of {} has {} bytes free and the copy needs {needed} (the old root's size plus the free-space floor of {})",
+                    "the filesystem of {} has {} bytes free and the copy needs {needed} (the old root's size, every hard link counted as a full file, plus the free-space floor of {})",
                     target.display(),
                     space.free,
                     request.free_floor_bytes
@@ -645,8 +773,9 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
             }
         }
     }
-    let units = if source_exists {
-        match list_units(&source) {
+    let source_spellings = spellings(&source);
+    let (units, left_behind) = if source_exists {
+        let listed = match list_units(&source) {
             Ok(units) => units,
             Err(error) => {
                 return undo(format!(
@@ -654,13 +783,32 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
                     source.display()
                 ))
             }
+        };
+        // Only what Forge made moves: anything else in the old root (a
+        // directory somebody else put in a shared temp directory) stays.
+        let (mut units, mut left_behind) = (Vec::new(), Vec::new());
+        for unit in listed {
+            if forge_made(&unit) || named_by_database(db, &source_spellings, &unit).await? {
+                units.push(unit);
+            } else {
+                left_behind.push(unit);
+            }
         }
+        (units, left_behind)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
+    if let Some(nested) = units.iter().find_map(|unit| {
+        nested_repository_with_absolute_link(&source.join(unit), &source_spellings)
+    }) {
+        return undo(format!(
+            "{} is a Git submodule or nested worktree whose link names the old root by absolute path; the move cannot repair it. Remove it or make its link relative (`git submodule absorbgitdirs`), then run `{command}` again",
+            nested.display()
+        ));
+    }
     Ok(Planned::Move(Box::new(Journal {
         version: 1,
-        source_spellings: spellings(&source),
+        source_spellings,
         source: source.to_string_lossy().into_owned(),
         target: target.to_string_lossy().into_owned(),
         copy,
@@ -668,40 +816,133 @@ async fn plan(db: &SqliteDb, request: &MigrateRequest) -> Result<Planned, Worksp
         copied: Vec::new(),
         moved: Vec::new(),
         phase: Phase::Moving,
+        left_behind,
+        not_copied: Vec::new(),
+        source_missing: !source_exists,
     })))
 }
 
-/// Runs the database records as in flight: nothing may be using a worktree.
+/// A top-level entry Forge makes by a fixed name, or a Task root.
+fn forge_made(unit: &str) -> bool {
+    const KNOWN: [&str; 4] = [".repos", "repos", ".forge-tmp", "main-agents"];
+    unit.starts_with(".forge/")
+        || KNOWN.contains(&unit)
+        || (unit.len() == 36 && uuid::Uuid::parse_str(unit).is_ok())
+}
+
+/// Whether any text column names `<old root>/<unit>` or a path inside it.
+/// The rewrite re-homes every such path, so its directory must move too.
+async fn named_by_database(
+    db: &SqliteDb,
+    source_spellings: &[String],
+    unit: &str,
+) -> Result<bool, sqlx::Error> {
+    for spelling in source_spellings {
+        let path = format!("{spelling}/{unit}");
+        let found = sweep(
+            db,
+            "({column} = ?1 OR instr({column}, ?1 || '/') > 0 OR instr({column}, ?2 || '/') > 0 OR instr({column}, ?2 || '\"') > 0)",
+            &[path.clone(), json_escaped(&path)],
+        )
+        .await?;
+        if !found.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A `.git` *file* below a worktree's top level (a submodule, or a worktree
+/// made inside a Task root) that names the old root by absolute path.
+/// Relative links, which Git writes for submodules, move unharmed.
+fn nested_repository_with_absolute_link(
+    unit: &Path,
+    source_spellings: &[String],
+) -> Option<PathBuf> {
+    fn walk(path: &Path, depth: usize, spellings: &[String]) -> Option<PathBuf> {
+        if depth > 6 || !real_dir(path) {
+            return None;
+        }
+        for entry in fs::read_dir(path).ok()?.flatten() {
+            let child = entry.path();
+            let name = entry.file_name();
+            if name == ".git" {
+                // Depth 2 is `<task>/<repository>/.git`: the worktree's
+                // own link, which the move repairs.
+                if depth > 2 && child.is_file() {
+                    let link = fs::read_to_string(&child).unwrap_or_default();
+                    let named = link.trim().strip_prefix("gitdir:").map(str::trim);
+                    if named.is_some_and(|named| {
+                        spellings
+                            .iter()
+                            .any(|old| named.starts_with(&format!("{old}/")))
+                    }) {
+                        return Some(child);
+                    }
+                }
+                continue;
+            }
+            if name == "node_modules" || name == "target" {
+                continue;
+            }
+            if let Some(found) = walk(&child, depth + 1, spellings) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let name = unit.file_name()?.to_string_lossy().into_owned();
+    (name.len() == 36 && uuid::Uuid::parse_str(&name).is_ok())
+        .then(|| walk(unit, 1, source_spellings))
+        .flatten()
+}
+
+/// What the database records as in flight or holding a worktree: nothing
+/// may be using one while it moves.
 #[derive(Debug, Default)]
 struct Running {
     executions: i64,
     checks: i64,
-    hooks: i64,
+    steps: i64,
+    integrations: i64,
+    leases: i64,
 }
 
 impl Running {
     async fn read(db: &SqliteDb) -> Result<Self, sqlx::Error> {
+        let count = |sql: &'static str| sqlx::query_scalar::<_, i64>(sql).fetch_one(db.pool());
         Ok(Self {
-            executions: sqlx::query_scalar(
-                "SELECT COUNT(*) FROM execution WHERE status = 'running'",
-            )
-            .fetch_one(db.pool())
-            .await?,
-            checks: sqlx::query_scalar(
+            executions: count("SELECT COUNT(*) FROM execution WHERE status = 'running'").await?,
+            checks: count(
                 "SELECT COUNT(*) FROM check_run WHERE state IN ('running', 'cancelling', 'cleaning')",
             )
-            .fetch_one(db.pool())
             .await?,
-            hooks: sqlx::query_scalar(
-                "SELECT COUNT(*) FROM task_step WHERE kind = 'hooks' AND status = 'claimed'",
+            // A claimed step is being run; a suspended one waits for a
+            // check it started in a worktree.
+            steps: count("SELECT COUNT(*) FROM task_step WHERE status IN ('claimed', 'suspended')")
+                .await?,
+            // An integration attempt carries its repository location and
+            // owner state through every state but the final and parked ones.
+            integrations: count(
+                "SELECT COUNT(*) FROM integration_attempt
+                 WHERE state NOT IN ('completed', 'cancelled', 'superseded', 'parked')",
             )
+            .await?,
+            leases: sqlx::query_scalar(
+                "SELECT COUNT(*) FROM workspace_lease WHERE status = 'active' AND expires_at > ?",
+            )
+            .bind(now_rfc3339())
             .fetch_one(db.pool())
             .await?,
         })
     }
 
     fn is_empty(&self) -> bool {
-        self.executions == 0 && self.checks == 0 && self.hooks == 0
+        self.executions == 0
+            && self.checks == 0
+            && self.steps == 0
+            && self.integrations == 0
+            && self.leases == 0
     }
 }
 
@@ -709,8 +950,8 @@ impl std::fmt::Display for Running {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{} execution(s), {} check run(s) and {} hook step(s) are",
-            self.executions, self.checks, self.hooks
+            "the database records work in flight: {} running execution(s), {} running check run(s), {} claimed or suspended task step(s), {} integration attempt(s) that are neither finished nor parked and {} active workspace lease(s)",
+            self.executions, self.checks, self.steps, self.integrations, self.leases
         )
     }
 }
@@ -814,8 +1055,13 @@ fn move_units(run: &mut Run<'_>, source: &Path, target: &Path) -> Result<(), Wor
                 }
                 // Whatever is there is a copy an earlier run did not finish.
                 remove_all(&to)?;
-                copy_tree(&from, &to)
-                    .map_err(|error| incomplete(format!("copying {}: {error}", from.display())))?;
+                copy_tree(&from, &to, &mut HashMap::new()).map_err(|error| {
+                    incomplete(format!(
+                        "copying {} to {}: {error}; nothing was removed from the old root",
+                        from.display(),
+                        to.display()
+                    ))
+                })?;
                 compare_trees(&from, &to).map_err(|difference| {
                     incomplete(format!(
                         "the copy of {} is not identical to it ({difference}); the original was not removed",
@@ -827,7 +1073,21 @@ fn move_units(run: &mut Run<'_>, source: &Path, target: &Path) -> Result<(), Wor
                 run.save()?;
                 run.step(format!("copied:{unit}"))?;
             }
-            remove_all(&from)?;
+            // Only what was copied is removed: a socket, pipe or device
+            // stays in the old root, with the directories above it.
+            let mut left = Vec::new();
+            remove_copied(&from, &mut left).map_err(|error| {
+                incomplete(format!(
+                    "removing the copied {} from the old root: {error}; its copy in the new root is complete",
+                    from.display()
+                ))
+            })?;
+            for path in left {
+                let path = path.to_string_lossy().into_owned();
+                if !run.journal.not_copied.contains(&path) {
+                    run.journal.not_copied.push(path);
+                }
+            }
             run.step(format!("remove:{unit}"))?;
         } else {
             match (from_exists, to_exists) {
@@ -898,6 +1158,46 @@ fn remove_all(path: &Path) -> Result<(), WorkspaceRootError> {
     Ok(())
 }
 
+/// Remove a tree that was copied and compared, leaving every socket, pipe
+/// and device (which the copy does not carry) and the directories above
+/// them. `Ok(true)`: `path` is gone.
+fn remove_copied(path: &Path, left: &mut Vec<PathBuf>) -> std::io::Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if special(&metadata) {
+        left.push(path.to_path_buf());
+        return Ok(false);
+    }
+    if !metadata.file_type().is_dir() {
+        fs::remove_file(path)?;
+        return Ok(true);
+    }
+    // A toolchain's read-only directory: its entries cannot be removed
+    // until its owner may write it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
+        }
+    }
+    let mut empty = true;
+    for entry in fs::read_dir(path)? {
+        empty &= remove_copied(&entry?.path(), left)?;
+    }
+    if empty {
+        fs::remove_dir(path)?;
+    } else {
+        // Kept for what stays in it, as it was.
+        fs::set_permissions(path, metadata.permissions())?;
+    }
+    Ok(empty)
+}
+
 fn tree_bytes(path: &Path) -> u64 {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return 0;
@@ -919,7 +1219,15 @@ fn tree_bytes(path: &Path) -> u64 {
 /// Copy a file, a link or a directory tree. Links are copied as links;
 /// permissions and modification times are kept. Sockets, pipes and devices
 /// (what a dead run left in its temp directory) are not copied.
-fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+///
+/// Two names of one file (a hard link: Git object stores and build output
+/// use them) stay two names of one file when both are inside the tree being
+/// copied; `links` remembers the first copy of each.
+fn copy_tree(
+    from: &Path,
+    to: &Path,
+    links: &mut HashMap<(u64, u64), PathBuf>,
+) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(from)?;
     let kind = metadata.file_type();
     if kind.is_symlink() {
@@ -931,6 +1239,20 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     if kind.is_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() > 1 {
+                let identity = (metadata.dev(), metadata.ino());
+                if let Some(first) = links.get(&identity) {
+                    if fs::hard_link(first, to).is_ok() {
+                        return Ok(());
+                    }
+                } else {
+                    links.insert(identity, to.to_path_buf());
+                }
+            }
+        }
         fs::copy(from, to)?;
         keep_modified(&metadata, to);
         return Ok(());
@@ -941,7 +1263,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     fs::create_dir(to)?;
     for entry in fs::read_dir(from)? {
         let entry = entry?;
-        copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        copy_tree(&entry.path(), &to.join(entry.file_name()), links)?;
     }
     fs::set_permissions(to, metadata.permissions())?;
     keep_modified(&metadata, to);
@@ -1086,14 +1408,21 @@ fn git(cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
 /// A worktree and its repository name each other by absolute path: the
 /// worktree's `.git` file names `<repository>/worktrees/<name>`, and that
 /// directory's `gitdir` file names the worktree's `.git`. Both are rewritten
-/// for the new root, `git worktree repair` is run from each repository, and
-/// the result is checked: both links name existing paths outside the old
-/// root, and `git status` works in the worktree.
+/// for the new root where both files moved (Forge's own clone and its
+/// worktree), `git worktree repair` is run from each repository, and the
+/// result is checked: both links name existing paths outside the old root,
+/// and `git status` works in the worktree.
+///
+/// A repository outside the root is a user's own checkout. Nothing in it is
+/// written by hand: `git worktree repair <moved worktrees>` run in it
+/// rewrites the `worktrees/<name>/gitdir` of exactly those worktrees, and
+/// the repository is named in the summary.
 async fn repair_worktrees(
     db: &SqliteDb,
     journal: &Journal,
     target: &Path,
-) -> Result<Vec<PathBuf>, WorkspaceRootError> {
+    command: &str,
+) -> Result<Repaired, WorkspaceRootError> {
     // Repositories that can hold a moved worktree: the clones under the
     // root, and every repository the database knows by a local path (a
     // user's own checkout stays where it is, but its worktrees moved).
@@ -1116,6 +1445,8 @@ async fn repair_worktrees(
     repositories.sort();
 
     let mut repaired = Vec::new();
+    let mut user_repositories = Vec::new();
+    let mut warnings = Vec::new();
     for repository in repositories {
         let Some(common) = git_common_dir(&repository) else {
             continue;
@@ -1123,6 +1454,24 @@ async fn repair_worktrees(
         let moved_repository = is_under(&repository, target);
         if moved_repository {
             rehome_git_config(&common, journal)?;
+            // Every object the clone's refs need is there. A clone that
+            // was damaged before the move must not make it unfinishable,
+            // so this is reported, not refused.
+            let fsck = git(
+                &repository,
+                &["fsck", "--connectivity-only", "--no-dangling"],
+            )?;
+            if !fsck.status.success() {
+                warnings.push(format!(
+                    "`git fsck --connectivity-only` reports problems in the clone {}: {}",
+                    repository.display(),
+                    String::from_utf8_lossy(&fsck.stderr)
+                        .lines()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
         }
         let Ok(entries) = fs::read_dir(common.join("worktrees")) else {
             continue;
@@ -1144,13 +1493,18 @@ async fn repair_worktrees(
                 // gone: Git prunes those, the move leaves them alone.
                 continue;
             }
-            if dot_git.to_string_lossy() != recorded.as_str() {
+            // Written by hand only where both ends are Forge's and moved:
+            // the clone's record of the worktree, and the worktree's link
+            // to a clone that moved. A user's repository is left to Git.
+            if moved_repository && dot_git.to_string_lossy() != recorded.as_str() {
                 fs::write(
                     admin.join("gitdir"),
                     format!("{}\n", dot_git.to_string_lossy()),
                 )?;
             }
-            fs::write(&dot_git, format!("gitdir: {}\n", admin.to_string_lossy()))?;
+            if moved_repository && moved_worktree {
+                fs::write(&dot_git, format!("gitdir: {}\n", admin.to_string_lossy()))?;
+            }
             worktrees.push((worktree, admin));
         }
         if worktrees.is_empty() {
@@ -1171,13 +1525,37 @@ async fn repair_worktrees(
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+        if !moved_repository {
+            user_repositories.push(repository.clone());
+        }
         for (worktree, admin) in worktrees {
             check_worktree(&worktree, &admin, journal)?;
+            if worktree.join(".gitmodules").is_file() {
+                let submodules = git(&worktree, &["submodule", "status", "--recursive"])?;
+                if !submodules.status.success() {
+                    warnings.push(format!(
+                        "`git submodule status` fails in the moved worktree {}: {}. Run `git submodule update --init --recursive` there",
+                        worktree.display(),
+                        String::from_utf8_lossy(&submodules.stderr).trim()
+                    ));
+                }
+            }
             repaired.push(worktree);
         }
     }
+    let _ = command;
     repaired.sort();
-    Ok(repaired)
+    Ok(Repaired {
+        worktrees: repaired,
+        user_repositories,
+        warnings,
+    })
+}
+
+struct Repaired {
+    worktrees: Vec<PathBuf>,
+    user_repositories: Vec<PathBuf>,
+    warnings: Vec<String>,
 }
 
 /// A clone's own configuration may name the old root (a remote that is a
@@ -1249,6 +1627,10 @@ async fn rewrite_database(
     for stored in &STORED_PATHS {
         let mut changed = 0;
         let sql = stored.update_sql();
+        #[cfg(test)]
+        if run.request.skip_column == Some(stored.column) {
+            continue;
+        }
         for old in &run.journal.source_spellings {
             let (old, new) = if stored.embedded {
                 (json_escaped(old), json_escaped(&new_root))
@@ -1272,6 +1654,8 @@ async fn rewrite_database(
     .bind(status_value(
         target,
         is_under(target, &run.request.system_temp),
+        &run.request.command,
+        &[],
     ))
     .bind(&now)
     .execute(&mut *tx)
@@ -1282,6 +1666,38 @@ async fn rewrite_database(
         .bind(crate::workspace_cleanup::GC_STATUS_KEY)
         .execute(&mut *tx)
         .await?;
+    // The post-condition, inside the transaction: no column that stores a
+    // path still names the old root. If one does, nothing is committed.
+    let mut pending = Vec::new();
+    for stored in &STORED_PATHS {
+        let sql = stored.remaining_sql();
+        for old in &run.journal.source_spellings {
+            let old = if stored.embedded {
+                json_escaped(old)
+            } else {
+                old.clone()
+            };
+            let left: i64 = sqlx::query_scalar(&sql)
+                .bind(old)
+                .fetch_one(&mut *tx)
+                .await?;
+            if left > 0 {
+                pending.push(format!(
+                    "{}.{} ({left} row(s))",
+                    stored.table, stored.column
+                ));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        tx.rollback().await?;
+        return Err(WorkspaceRootError::Incomplete(format!(
+            "db pending: every directory is in {} but the database was not changed, because after the rewrite {} would still name the old root. The move is unfinished and Forge will not start until it is: run `{}` again, and report this if it repeats",
+            run.journal.target,
+            pending.join(", "),
+            run.request.command
+        )));
+    }
     // A crash here loses the whole transaction, never half of it.
     run.step("database:uncommitted".to_owned())?;
     tx.commit().await?;
@@ -1293,6 +1709,17 @@ async fn rewrite_database(
 pub(crate) async fn mentions(
     db: &SqliteDb,
     needle: &str,
+) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    sweep(db, "instr({column}, ?1) > 0", &[needle.to_owned()]).await
+}
+
+/// Every text column of every table with rows matching `predicate`
+/// (`{column}` is the quoted column; `binds` are `?1`, `?2`, ...), as
+/// `table.column` and a row count.
+async fn sweep(
+    db: &SqliteDb,
+    predicate: &str,
+    binds: &[String],
 ) -> Result<Vec<(String, i64)>, sqlx::Error> {
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
@@ -1314,15 +1741,16 @@ pub(crate) async fn mentions(
                 continue;
             }
             let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
-            let Ok(count) = sqlx::query_scalar::<_, i64>(&format!(
-                "SELECT COUNT(*) FROM {} WHERE instr({}, ?1) > 0",
+            let sql = format!(
+                "SELECT COUNT(*) FROM {} WHERE {}",
                 quoted(&table),
-                quoted(&column)
-            ))
-            .bind(needle)
-            .fetch_one(db.pool())
-            .await
-            else {
+                predicate.replace("{column}", &quoted(&column))
+            );
+            let mut query = sqlx::query_scalar::<_, i64>(&sql);
+            for bind in binds {
+                query = query.bind(bind);
+            }
+            let Ok(count) = query.fetch_one(db.pool()).await else {
                 continue;
             };
             if count > 0 {
