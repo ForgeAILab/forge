@@ -148,7 +148,8 @@ impl CodingExecutorAdapter for CursorAdapter {
         };
 
         let mut command = Self::build_command(&config, &prompt);
-        crate::command::run_in_task_worktree(&mut command, &ctx);
+        // Owns the execution's temp directory until this execution returns.
+        let _run_scope = crate::command::run_in_task_worktree(&mut command, &ctx);
         let mut child = command.group_spawn()?;
 
         let stdout = match child.inner().stdout.take() {

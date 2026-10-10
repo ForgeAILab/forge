@@ -6,7 +6,11 @@ use tokio::process::Command;
 pub fn workspace_command(path: &Path, step: &str, env: &BTreeMap<String, String>) -> Command {
     let mut command = Command::new("bash");
     command.arg("-lc").arg(step).envs(env).current_dir(path);
-    executors::run_process::apply(&mut command, env);
+    executors::run_process::apply_sandboxed(
+        &mut command,
+        env,
+        &executors::sandbox::SandboxEnv::for_task(path),
+    );
     command
 }
 

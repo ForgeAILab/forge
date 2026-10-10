@@ -219,11 +219,11 @@ impl HookAction for RunBeforeWorkHooks {
                 }
             };
         let assigned_agent_id = target_role_agent_id(ctx).await;
-        let log_dir = std::env::temp_dir()
-            .join("forge")
-            .join("logs")
-            .join(&task.id)
-            .join("hooks");
+        let log_dir = crate::task_service::logs::task_hook_logs_dir(
+            &ctx.workspace_root,
+            &task.project_id,
+            &task.id,
+        );
         let hook_ctx = LifecycleHookContext {
             env: input.env,
             event: api_types::LifecycleEvent::BeforeWork,

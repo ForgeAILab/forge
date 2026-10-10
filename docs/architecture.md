@@ -825,8 +825,11 @@ checkout/branch context or integrating/publishing Git history. Every managed
 role, including a read-only reviewer, runs in the workspace-write sandbox with
 network access so it can install dependencies, build, and run tests. The
 sandbox excludes both `/tmp` and the inherited `TMPDIR`; beyond the worktree
-its only writable roots are one freshly reset Forge-owned `task-scratch`
-directory, the execution outbox, and the host's package-manager caches
+its only writable roots are the execution's own temp directory (see
+[Task-root layout and run environment](#task-root-layout-and-run-environment);
+a Task root Forge did not reserve keeps a freshly reset `task-scratch` inside
+the managed home), the Task's build directory `.forge-task/build`, the
+execution outbox, and the host's package-manager caches
 (`~/.npm`, Cargo `registry`/`git`, the Go module cache, the XDG cache, pnpm's
 store, and `~/Library/Caches` on macOS, each honoring its relocation
 variable). The Task directory that contains the worktree is not writable by
@@ -3251,6 +3254,118 @@ Task/identity/session/commitment/event state. They show needs-attention,
 review-ready and active work, embedded-agent health/current scope/focus,
 commitments, recent outcomes, and capacity; they do not introduce a second
 mutable Task or Agent truth.
+
+### Task-root layout and run environment
+
+The directory that contains a Task's worktree is its **Task root**:
+`<workspace root>/<task_id>/` on the server, `<root>/.forge/workspaces/<handle>/`
+on a daemon. The worktree stays where it was; Forge keeps one reserved
+directory beside it:
+
+```
+<task root>/
+  <repo name>/              the Git worktree (daemon: repo/)
+  .forge-outbox/<exec>/     execution outbox
+  .forge-task/              reserved
+    tmp/<run key>/          TMPDIR, TMP, TEMP of one run
+    home/codex/             managed Codex home
+    home/gemini/            Gemini API-key home
+    build/cargo/            CARGO_TARGET_DIR of the Task
+<task roots dir>/.forge-tmp/<run key>/   run temp dir when the path above is too long
+```
+
+`.forge-task` is outside the worktree, so `git status`, `git clean`, review
+dirt checks and worktree removal never see it, and it is removed with the Task
+root (read-only build output included). A repository named `.forge-task` is
+refused at worktree creation (`WorkspaceError::ReservedName`).
+
+A Task root is **reserved** when `.forge-task` exists in it as a real
+directory. Only the workspace owner creates it: the `workspace` crate when it
+creates or recovers a Task worktree, the services `WorkspaceManager` when it
+validates a workspace of the managed shape `<root>/<task_id>/<name>` for any
+purpose but inspection, and the daemon in `workspace.prepare`. A recorded
+path of any other shape, an exact-commit check checkout, a Project
+verification checkout and a chat sandbox are not reserved: runs there keep
+the environment they had before, and nothing is created beside them.
+
+`executors::sandbox::SandboxEnv` is the environment a run gets from its Task
+root, and `executors::run_process::apply_sandboxed(command, project_env,
+&sandbox)` is the one place it is applied, together with the build budget and
+niceness. Every path is a pure function of the worktree path and the run id,
+so the server and a daemon derive the same directories without a protocol
+field.
+
+| Run | Run id | Temp directory lives |
+|---|---|---|
+| CLI adapter execution (Codex, Claude, Cursor, Gemini, OpenCode, Smith), shell executor | execution id | until the adapter's `execute` returns (success, failure, cancel) |
+| Native command tool | fresh per command | until the command returns |
+| Lifecycle script hook | fresh per hook | until the hook returns or times out |
+| Check / CI command in the Task worktree, daemon `workspace.run` | fresh per command | until the command returns |
+| Environment check, daemon probe | fresh per command | until the command returns (only when it runs in a reserved Task root) |
+
+- `TMPDIR`, `TMP` and `TEMP` are set to the per-run directory over anything
+  inherited. A key the Project environment declares is left to the Project.
+  `HOME`, `XDG_CACHE_HOME`, `GOCACHE` and `npm_config_cache` are never
+  redirected: CLI logins and shared toolchain caches live there.
+- A Unix socket path is limited to 104 bytes on macOS, and tools create
+  sockets under `TMPDIR`. Forge never hands out a `TMPDIR` longer than 72
+  bytes: when `<task root>/.forge-task/tmp/<key>` is longer, the run uses
+  `<task roots dir>/.forge-tmp/<key>`; when that is too long as well, the run
+  keeps the inherited temp directory. With UUID Task ids the short directory
+  is the usual place.
+- A run that died with its process leaves its directory behind. Crash
+  recovery removes the directory of every execution it settles; at startup
+  the server (in crash recovery, for every ready server placement of the
+  managed shape) and the daemon sweep the rest
+  (`executors::sandbox::sweep_dead_runs`). Hooks, checks, tool commands and
+  probes are in no table, so the sweep is safe by construction, not by
+  ordering: it removes a directory only when this process did not create it
+  (an in-process registry of unsettled runs), it was last modified before
+  this process started, and its key belongs to no execution still recorded
+  as running. A sweep failure is logged and never stops recovery. Nothing
+  Forge reads after a run (outbox, plan, evidence, logs) lives in the
+  per-run directory.
+- Links are never followed. `.forge-task` that exists as a link or a file
+  makes worktree creation fail and is never a reserved root; a linked or
+  non-directory `.forge-task/tmp`, `.forge-tmp`, `.forge-task/home` or
+  `.forge-task/build` is not created through, removed through or handed to a
+  run (the run keeps the inherited temp directory, the previous home
+  location, and builds in the worktree); a linked Task-root entry is skipped
+  by the sweep.
+- A CLI that confines its own writes is handed only what it can write
+  (`cli_adapters::command::run_in_task_worktree_with`). A managed Codex Task
+  (workspace-write) gets the per-run directory and `.forge-task/build` as
+  writable roots, each only when it resolves where the Task root says, and
+  the build root only when the child really uses that `CARGO_TARGET_DIR`;
+  a Codex execution under `yolo` has no sandbox and gets everything; a Codex
+  execution that is not a managed Task uses the operator's own sandbox
+  configuration and gets nothing. Gemini launched with `--sandbox` (or
+  `GEMINI_SANDBOX`) gets nothing. Claude, Cursor, OpenCode, Smith, the shell
+  executor, the native command tool, hooks and checks run unsandboxed.
+- One build directory per Task root is shared by the coder, hooks and
+  in-worktree checks. Cargo serialises concurrent users with its own
+  build-directory lock, and its fingerprints (source content and mtime,
+  profile, flags, package path) decide what is rebuilt, so output left by
+  another commit can make a check slower or faster but cannot change its
+  result.
+- `CARGO_TARGET_DIR` is set to `<task root>/.forge-task/build/cargo` from
+  `executors::sandbox::BUILD_DIR_TABLE` (Rust only). Precedence: Project
+  environment, then a value the command already carries, then the operator's
+  process environment, then Forge. A Project environment value of `""`
+  disables it. Subtasks share their root's worktree and therefore its build
+  directory; review and CI commands in the Task worktree use the same one.
+  Checks in exact-commit checkouts get none.
+- The managed Codex home is `<task root>/.forge-task/home/codex`, so two
+  executions of different Tasks never share or reset one home (before, a
+  daemon derived one home for all executions from its flat log directory).
+  On first use after an upgrade the server-side per-Task home is moved from
+  `<root>/.forge/logs/<project>/<task>/.codex-managed-home` into the Task
+  root, so a resumed Task keeps its Codex sessions; the old shared daemon
+  home is left where it is and a fresh home is created. The move is one
+  rename and deletes nothing: a stray Codex process still holding the old
+  home keeps writing the files it has open, which are now in the new home.
+- Lifecycle hooks that run outside an execution log to
+  `<workspace root>/.forge/logs/<project_id>/<task_id>/hooks/`.
 
 ### Workspace placement
 

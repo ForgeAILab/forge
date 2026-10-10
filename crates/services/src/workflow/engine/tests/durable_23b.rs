@@ -285,11 +285,11 @@ async fn resumed_before_work_script_logs_step_and_rerun() {
     assert!(std::fs::read_to_string(&ran)
         .unwrap()
         .starts_with("first attempt\nrun\n"));
-    let log_dir = std::env::temp_dir()
-        .join("forge")
-        .join("logs")
-        .join(&fixture.task.id)
-        .join("hooks");
+    let log_dir = crate::task_service::logs::task_hook_logs_dir(
+        &fixture.engine.workspace_root,
+        &fixture.task.project_id,
+        &fixture.task.id,
+    );
     let entries = std::fs::read_dir(log_dir)
         .unwrap()
         .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())

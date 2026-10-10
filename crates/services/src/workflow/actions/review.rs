@@ -212,13 +212,11 @@ impl HookAction for RunCiSteps {
                         worktree_path: None,
                         agent_id: ctx.agent_id.clone(),
                         execution_id: ctx.execution_id.clone(),
-                        log_dir: Some(
-                            std::env::temp_dir()
-                                .join("forge")
-                                .join("logs")
-                                .join(&ctx.task_id)
-                                .join("hooks"),
-                        ),
+                        log_dir: Some(crate::task_service::logs::task_hook_logs_dir(
+                            &ctx.workspace_root,
+                            &ctx.project_id,
+                            &ctx.task_id,
+                        )),
                         env: Default::default(),
                     };
                     let mut log = entry.clone();

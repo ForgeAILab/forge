@@ -119,9 +119,17 @@ impl TaskExecutor for ShellExecutor {
         for (key, value) in &plan.env_set {
             command.env(key, value);
         }
-        crate::run_process::apply(
+        // Held until this execution returns: success, failure or cancel.
+        let run_scope = crate::sandbox::SandboxEnv::for_run(
+            std::path::Path::new(&ctx.worktree_path),
+            &ctx.execution_id,
+            crate::sandbox::RunPurpose::Execution,
+        )
+        .scoped();
+        crate::run_process::apply_sandboxed(
             &mut command,
             &crate::environment::task_environment(&ctx.agent_config),
+            run_scope.env(),
         );
         configure_process_group(&mut command);
 

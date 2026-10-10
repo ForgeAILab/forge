@@ -412,7 +412,9 @@ pub async fn run_environment_check(
     env: &BTreeMap<String, String>,
     check: &EnvironmentCheck,
 ) -> EnvironmentCheckResult {
-    let mut command = environment_check_command(worktree, env, check);
+    let run_scope =
+        crate::sandbox::SandboxEnv::for_command(worktree, crate::sandbox::RunPurpose::Probe);
+    let mut command = environment_check_command(worktree, env, check, run_scope.env());
     let outcome = tokio::time::timeout(
         Duration::from_secs(check_timeout_seconds(check)),
         command.output(),
@@ -481,6 +483,7 @@ fn environment_check_command(
     worktree: &Path,
     env: &BTreeMap<String, String>,
     check: &EnvironmentCheck,
+    sandbox: &crate::sandbox::SandboxEnv,
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("bash");
     command
@@ -489,7 +492,7 @@ fn environment_check_command(
         .envs(env)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    crate::run_process::apply(&mut command, env);
+    crate::run_process::apply_sandboxed(&mut command, env, sandbox);
     command
 }
 
@@ -824,7 +827,12 @@ mod run_budget_tests {
             roles: Vec::new(),
             timeout_seconds: 30,
         };
-        let command = environment_check_command(temp.path(), &env, &check);
+        let command = environment_check_command(
+            temp.path(),
+            &env,
+            &check,
+            &crate::sandbox::SandboxEnv::none(),
+        );
         let envs: std::collections::BTreeMap<_, _> = command
             .as_std()
             .get_envs()

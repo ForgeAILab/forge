@@ -262,8 +262,11 @@ impl<'a> WorkspaceManager<'a> {
         workspace: Workspace,
         purpose: Purpose,
     ) -> Result<ValidWorkspace, WorkspaceUnavailable> {
-        self.ensure_valid_inner(task, workspace, purpose, false)
-            .await
+        reserve_task_root(
+            purpose,
+            self.ensure_valid_inner(task, workspace, purpose, false)
+                .await,
+        )
     }
 
     /// [`Self::ensure_valid`] for the create-or-reuse path of the Task that
@@ -275,8 +278,11 @@ impl<'a> WorkspaceManager<'a> {
         workspace: Workspace,
         purpose: Purpose,
     ) -> Result<ValidWorkspace, WorkspaceUnavailable> {
-        self.ensure_valid_inner(task, workspace, purpose, true)
-            .await
+        reserve_task_root(
+            purpose,
+            self.ensure_valid_inner(task, workspace, purpose, true)
+                .await,
+        )
     }
 
     /// The directory an execution the claim just admitted starts in.
@@ -312,7 +318,10 @@ impl<'a> WorkspaceManager<'a> {
                     .await
                     .unwrap_or(false)
             {
-                return Ok(valid(workspace, resolved, path, Repair::None, true));
+                return reserve_task_root(
+                    Purpose::Execute,
+                    Ok(valid(workspace, resolved, path, Repair::None, true)),
+                );
             }
         }
         self.ensure_valid(task, workspace, Purpose::Execute).await
@@ -981,6 +990,38 @@ pub(crate) fn task_root_anchor_of(
         .map(PathBuf::from)
         .ok_or_else(|| ServiceError::invalid_operation("workspace has no server handle"))?;
     confined_anchor(path)
+}
+
+/// Reserve `.forge-task` in the Task root of a workspace a caller is about to
+/// run in, so every run there gets its temp directory, managed homes and
+/// build directory from [`executors::sandbox`].
+///
+/// Only a worktree of the managed shape `<root>/<task_id>/<name>` has a Task
+/// root: the manager has just confined it. Any other recorded path (a legacy
+/// row) is left alone, so nothing is ever created beside a directory Forge
+/// does not own, and its runs keep the environment they had. A read-only
+/// projection reserves nothing.
+fn reserve_task_root(
+    purpose: Purpose,
+    outcome: Result<ValidWorkspace, WorkspaceUnavailable>,
+) -> Result<ValidWorkspace, WorkspaceUnavailable> {
+    if let (true, Ok(valid)) = (purpose.repairs(), &outcome) {
+        let task_root = valid.path().and_then(Path::parent).filter(|task_root| {
+            task_root.file_name().and_then(|name| name.to_str())
+                == Some(valid.workspace.task_id.as_str())
+        });
+        if let Some(task_root) = task_root {
+            if let Err(error) = executors::sandbox::TaskRoot::reserve(task_root) {
+                tracing::warn!(
+                    task_id = %valid.workspace.task_id,
+                    path = %task_root.display(),
+                    %error,
+                    "could not reserve the Task root; runs keep the inherited temp directory"
+                );
+            }
+        }
+    }
+    outcome
 }
 
 fn valid(
