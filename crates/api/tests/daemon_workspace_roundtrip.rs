@@ -4466,6 +4466,7 @@ fn run_queue_worker(
         state.db.clone(),
         state.workspace_backend_router.clone(),
         state.daemon_connections.clone(),
+        state.repo_location_service.clone(),
         IntegrationWorkerConfig {
             poll: Duration::from_millis(20),
             sweep_interval: Duration::from_millis(100),
@@ -4659,7 +4660,9 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
         .lock()
         .unwrap()
         .insert(METHOD_WORKSPACE_RESET.into());
-    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(4));
+    // A lease far longer than this test: the retry of an unknown result is
+    // not the lease running out.
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(600));
     // The owner rebased; its reply never arrives.
     let rebased = async {
         loop {
@@ -4696,6 +4699,7 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
     assert_eq!(task_status(&fixture, &head.task_id).await, "merging");
 
     fixture.reconnect().await;
+    let reconnected = tokio::time::Instant::now();
     // The owner's receipt is read once and the head continues from it: the
     // rebased commit becomes the candidate without another rebase.
     let rebase_receipts = |attempt: &db::IntegrationAttempt| {
@@ -4722,6 +4726,18 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
                 )
         }
     );
+    // And the Task merges: the fast-forward that follows the reconnect is
+    // admitted by the owner (its record of the default checkout is the one
+    // the server stored with the reconnect verification).
+    queue_eventually!(&fixture, &head, "the Task to merge after the reconnect", {
+        task_status(&fixture, &head.task_id).await == "done"
+            && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
+    });
+    assert!(
+        reconnected.elapsed() < Duration::from_secs(30),
+        "merged {:?} after the reconnect: the session kept the slot and asked at once",
+        reconnected.elapsed()
+    );
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     let attempt = queue_attempt(&fixture, &head).await;
@@ -4732,28 +4748,99 @@ async fn daemon_disconnect_in_rebasing_reconciles_by_receipt_without_a_second_re
         db::IntegrationOperationState::Succeeded
     );
     assert_eq!(receipts[0].result["outcome"]["kind"], "rebased");
+    let link = fixture.link.as_ref().unwrap();
     assert_eq!(
-        attempt_requests(fixture.link.as_ref().unwrap(), METHOD_WORKSPACE_RESET).len(),
+        attempt_requests(link, METHOD_WORKSPACE_RESET).len(),
         0,
         "the rebase was not repeated after the reconnect"
     );
+    // Every effect ran once: one rebase receipt, one fast-forward receipt,
+    // and no refusal in between.
+    let all: Vec<db::IntegrationEffectReceipt> =
+        serde_json::from_value(attempt.effect_receipts_json.clone()).unwrap();
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert_eq!(fast_forward_receipts(&attempt), 1);
+    assert_eq!(attempt_requests(link, METHOD_WORKSPACE_MERGE).len(), 1);
     assert_eq!(
-        fixture
-            .resolved
-            .git_query(WorkspaceGitQuery::Head, false)
-            .await
-            .unwrap()
-            .unwrap()
-            .trim(),
-        rebased,
-        "the Task checkout still holds the one rebase"
+        attempt.candidate_sha.as_deref(),
+        Some(rebased.as_str()),
+        "the one rebase is what merged"
     );
-    // NOT covered here (found by this test, left for D2b): the fast-forward
-    // that follows a reconnect is refused `foreign_owner` by the owner on
-    // every later claim, so this Task does not reach `done` in this test.
-    // The head then parks and retries with backoff; it never merges on a
-    // guess. See `/Volumes/Data/tmp/refactor/32-d2a/d2b-checklist.md`.
-    assert_eq!(fast_forward_receipts(&attempt), 0);
+    assert_eq!(attempt.integrated_sha.as_deref(), Some(rebased.as_str()));
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        rebased
+    );
+    assert!(
+        attempt.failure_message.is_none(),
+        "never parked: {:?}",
+        attempt.failure_message
+    );
+}
+
+/// The server changed its record of the default checkout after the owner last
+/// verified it (a default toggle bumps the location version; the owner is not
+/// told). The owner refuses the claim `foreign_owner`. The worker asks for the
+/// location to be verified again and the head merges in a later round: it
+/// does not park.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn queue_worker_reverifies_a_default_checkout_its_owner_does_not_recognise() {
+    let fixture = Fixture::new("forge-queue-daemon-location").await;
+    let head = admit_queue_head(&fixture, &[]).await;
+    let location_id = fixture.resolved.placement.repo_location_id.clone();
+    sqlx::query("UPDATE repo_location SET version=version+1 WHERE id=?")
+        .bind(&location_id)
+        .execute(fixture.harness.state.db.pool())
+        .await
+        .unwrap();
+    let verified_before = fixture
+        .link
+        .as_ref()
+        .unwrap()
+        .requests(METHOD_REPO_LOCATION_VERIFY)
+        .len();
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the Task to merge", {
+        task_status(&fixture, &head.task_id).await == "done"
+            && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
+    });
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let attempt = queue_attempt(&fixture, &head).await;
+    let receipts: Vec<db::IntegrationEffectReceipt> =
+        serde_json::from_value(attempt.effect_receipts_json.clone()).unwrap();
+    let refused: Vec<_> = receipts
+        .iter()
+        .filter(|receipt| receipt.result["reason"] == "foreign_owner")
+        .collect();
+    assert_eq!(refused.len(), 1, "one refusal, then a verification: {receipts:?}");
+    assert_eq!(fast_forward_receipts(&attempt), 1);
+    let link = fixture.link.as_ref().unwrap();
+    assert_eq!(
+        link.requests(METHOD_REPO_LOCATION_VERIFY).len(),
+        verified_before + 1,
+        "the worker asked for one verification"
+    );
+    assert!(
+        attempt.failure_message.is_none(),
+        "never parked: {:?}",
+        attempt.failure_message
+    );
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        head.candidate
+    );
+    // The owner's record and the server's agree again.
+    let server: i64 = sqlx::query_scalar("SELECT version FROM repo_location WHERE id=?")
+        .bind(&location_id)
+        .fetch_one(fixture.harness.state.db.pool())
+        .await
+        .unwrap();
+    let claimed: Vec<i64> = receipts
+        .iter()
+        .filter_map(|receipt| receipt.request.fence.target_owner["generation"].as_i64())
+        .collect();
+    assert_eq!(claimed.last(), Some(&server), "{claimed:?}");
 }
 
 /// The daemon fast-forwards the default checkout but the reply is lost with
@@ -4771,7 +4858,9 @@ async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second
         .lock()
         .unwrap()
         .insert(METHOD_WORKSPACE_MERGE.into());
-    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(4));
+    // A lease far longer than this test: the retry of an unknown result is
+    // not the lease running out.
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(600));
     tokio::time::timeout(Duration::from_secs(30), async {
         while git::get_current_sha(&fixture.checkout).await.unwrap() != head.candidate {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4803,7 +4892,20 @@ async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second
     assert_eq!(task_status(&fixture, &head.task_id).await, "merging");
     let reflog = git_sync(&fixture.checkout, &["reflog", "--all"]);
 
+    // While its result is unknown the head keeps the slot under one claim.
+    let held = {
+        use db::IntegrationQueueRepo;
+        let database = &fixture.harness.state.db;
+        let queue = database
+            .integration_queue(&head.queue_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue.head_attempt_id.as_deref(), Some(head.attempt_id.as_str()));
+        queue.fence_generation
+    };
     fixture.reconnect().await;
+    let reconnected = tokio::time::Instant::now();
     queue_eventually!(
         &fixture,
         &head,
@@ -4814,6 +4916,11 @@ async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second
                     == db::IntegrationAttemptState::Completed
         }
     );
+    assert!(
+        reconnected.elapsed() < Duration::from_secs(30),
+        "done {:?} after the reconnect",
+        reconnected.elapsed()
+    );
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
     let attempt = queue_attempt(&fixture, &head).await;
@@ -4822,6 +4929,11 @@ async fn daemon_disconnect_in_ff_inflight_reconciles_by_receipt_without_a_second
         Some(head.candidate.as_str())
     );
     assert_eq!(fast_forward_receipts(&attempt), 1);
+    // The same claim finished the head: no takeover was needed.
+    let receipts: Vec<db::IntegrationEffectReceipt> =
+        serde_json::from_value(attempt.effect_receipts_json.clone()).unwrap();
+    assert_eq!(receipts.len(), 1, "{receipts:?}");
+    assert_eq!(receipts[0].request.fence.generation, held);
     assert_eq!(
         attempt_requests(fixture.link.as_ref().unwrap(), METHOD_WORKSPACE_MERGE).len(),
         0,

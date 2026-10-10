@@ -323,12 +323,30 @@ impl DaemonWorkspaceBackend {
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
-            if resolve_commit(&location.path, &format!("refs/heads/{branch}")).await? != expected
-                || (request.kind == WorkspaceIntegrationKind::Rebase
-                    && resolve_commit(&owned.path, &format!("refs/heads/{branch}")).await?
-                        != expected)
-            {
+            if resolve_commit(&location.path, &format!("refs/heads/{branch}")).await? != expected {
                 return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
+            }
+            // The Task's checkout must hold the target tip the claim read:
+            // as its own target branch when it shares the default checkout's
+            // refs, or, in another clone on this owner, as the ref this claim
+            // generation's inbound object transfer bound.
+            if request.kind == WorkspaceIntegrationKind::Rebase
+                && !resolve_commit(&owned.path, &format!("refs/heads/{branch}"))
+                    .await
+                    .is_ok_and(|own| own == expected)
+            {
+                let transferred = git::integration::transfer_ref(&object_transfer_key(
+                    &request.fence.attempt_id,
+                    request.fence.generation,
+                    ObjectTransferDirection::Inbound,
+                ))
+                .map_err(|_| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
+                if !resolve_commit(&owned.path, &transferred)
+                    .await
+                    .is_ok_and(|bound| bound == expected)
+                {
+                    return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
+                }
             }
         }
         Ok(())

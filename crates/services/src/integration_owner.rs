@@ -487,6 +487,11 @@ impl ServerIntegrationOwner {
                 input.target_branch,
                 input.expected_head_sha,
                 input.expected_target_sha,
+                &api_types::object_transfer_key(
+                    &input.fence.attempt_id,
+                    input.fence.generation,
+                    api_types::ObjectTransferDirection::Inbound,
+                ),
             )
             .await
             {
@@ -523,19 +528,48 @@ impl ServerIntegrationOwner {
         Ok(outcome)
     }
 }
+/// The rebase witness. The Task's checkout must hold the target tip the
+/// claim read in the default checkout: as its own target branch when it
+/// shares the default checkout's refs (a worktree of it), or, in another
+/// clone, as the ref this claim generation's inbound object transfer bound
+/// (`refs/forge/integration/<attempt>-<generation>-in`). The rebase is onto
+/// that commit, never onto a branch name.
 async fn verify_objects(
     path: &Path,
     target_path: &Path,
     target: &str,
     head: &str,
     target_sha: &str,
+    inbound_key: &str,
 ) -> Result<bool> {
     if head.is_empty() || target_sha.is_empty() {
         return Ok(false);
     }
-    Ok(git::get_current_sha(path).await? == head
-        && integration_effects::merge::target_tip(target_path, target).await? == target_sha
-        && integration_effects::merge::target_tip(path, target).await? == target_sha)
+    if git::get_current_sha(path).await? != head
+        || integration_effects::merge::target_tip(target_path, target).await? != target_sha
+    {
+        return Ok(false);
+    }
+    if integration_effects::merge::target_tip(path, target)
+        .await
+        .is_ok_and(|own| own == target_sha)
+    {
+        return Ok(true);
+    }
+    let Ok(transferred) = git::integration::transfer_ref(inbound_key) else {
+        return Ok(false);
+    };
+    let bound = git::command_output(
+        path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{transferred}^{{commit}}"),
+        ],
+    )
+    .await?;
+    Ok(bound.status.success() && String::from_utf8_lossy(&bound.stdout).trim() == target_sha)
 }
 async fn interrupted(path: &Path, timed_out: bool, message: Option<String>) -> OwnerRebaseReceipt {
     let (head_sha, rebase_in_progress) = tokio::time::timeout(Duration::from_secs(2), async {

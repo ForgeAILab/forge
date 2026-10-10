@@ -151,6 +151,9 @@ pub struct RepoLocationVerifyParams {
     pub kind: DaemonRepoLocationKind,
     pub default_branch: String,
     pub remote_url: Option<String>,
+    /// The location version this verification is stored as on the server.
+    /// The owner keeps it: a verification older than the one it holds is
+    /// refused, and a merge-queue claim must name exactly this version.
     pub expected_version: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<RepoLocationProbe>,

@@ -270,7 +270,7 @@ impl ObjectTransferPort for FakeTransfer {
             ));
         assert_eq!(request.target.repo_location_id, "l-r");
         assert_eq!(request.task.owner, EffectOwner::Server);
-        assert_eq!(request.have.len(), 1);
+        assert!(!request.have.is_empty() && !request.have.contains(&request.want));
         Ok(if self.too_large.load(Ordering::SeqCst) {
             ObjectTransferOutcome::TooLarge {
                 bytes: request.max_bytes + 1,
@@ -345,6 +345,7 @@ impl IntegrationFactsPort for GitFactsFake {
                 repo_location_id: format!("l-{}", queue.repo_id),
                 owner: EffectOwner::Server,
             },
+            task_target_tip: String::new(),
             target_in_candidate: ancestor(target_tip.clone(), candidate_head.clone()).await,
             candidate_in_target: ancestor(candidate_head.clone(), target_tip.clone()).await,
             worktree_dirty: !git::is_worktree_clean(&tree).await?,

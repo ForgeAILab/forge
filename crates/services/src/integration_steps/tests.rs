@@ -1261,6 +1261,7 @@ impl crate::integration_worker::IntegrationFactsPort for GitFacts {
             target_dirty: !git::is_worktree_clean(&repo).await?,
             rebase_in_progress: git::detect_rebase_in_progress(&tree).await?,
             shared_object_store: true,
+            task_target_tip: String::new(),
             workspace: EffectWorkspace {
                 workspace_id,
                 placement_id,
@@ -1452,6 +1453,13 @@ fn production_ports(
             world.db.clone(),
             router,
             daemons.clone(),
+            Arc::new(crate::repo_location::RepoLocationService::new(
+                world.db.clone(),
+                Arc::new(crate::repo_location::RemoteDaemonLocationVerifier::new(
+                    daemons.clone(),
+                    world.temp.path().join("probes"),
+                )),
+            )),
             config.clone(),
         ),
         daemons,
@@ -1617,6 +1625,184 @@ async fn real_ci_steps_decide_the_head_through_the_production_ports() {
         .unwrap()
         .head_attempt_id
         .is_none());
+}
+
+impl World {
+    fn clone_path(&self) -> PathBuf {
+        self.temp.path().join("clone-r")
+    }
+    /// A second server-owned checkout of the repo: its own clone, with its
+    /// own object store and refs, registered as a non-default location.
+    async fn add_clone(&self) {
+        let clone = self.clone_path();
+        git_out(
+            self.temp.path(),
+            &[
+                "clone",
+                "--quiet",
+                self.repo().to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        )
+        .await
+        .expect("clone");
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('l-c','r','server',?,'managed_clone',0,'ready',?,?)").bind(clone.to_str()).bind(&now).bind(&now).execute(self.db.pool()).await.unwrap();
+    }
+    /// Like `add_task`, but the Task's worktree belongs to the clone.
+    async fn add_task_in_clone(&self, task: &str, file: &str, content: &str) -> IntegrationAttempt {
+        let (clone, tree) = (self.clone_path(), self.tree(task));
+        let branch = format!("task-{task}");
+        git_out(
+            &clone,
+            &["worktree", "add", "-b", &branch, tree.to_str().unwrap()],
+        )
+        .await
+        .expect("worktree");
+        std::fs::write(tree.join(file), content).unwrap();
+        git::commit_all(&tree, task).await.unwrap();
+        let head = git::get_current_sha(&tree).await.unwrap();
+        let now = db::now_rfc3339();
+        let pool = self.db.pool();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,review_passed_at,created_at,updated_at) VALUES(?,'p',?,'merging',?,?,?)").bind(task).bind(task).bind(&now).bind(&now).bind(&now).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES(?,?,'r',?,?,'ready',?,?)").bind(format!("w-{task}")).bind(task).bind(tree.to_str()).bind(&branch).bind(&now).bind(&now).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES(?,?,?,'server','l-c',?,1,'ready','scheduler','{}',?,?)").bind(format!("pl-{task}")).bind(format!("w-{task}")).bind(task).bind(tree.to_str()).bind(&now).bind(&now).execute(pool).await.unwrap();
+        let queue = self
+            .db
+            .create_or_get_integration_queue("r", "main")
+            .await
+            .unwrap();
+        let mut attempt = IntegrationAttempt::new(
+            Some(queue.id),
+            task.into(),
+            "p".into(),
+            format!("admit-{task}"),
+            "merging".into(),
+            0,
+            1,
+        );
+        attempt.original_candidate_sha = Some(head);
+        self.db.admit_integration_attempt(attempt).await.unwrap()
+    }
+}
+
+/// Parity with today's merge path, which merges a Task placed in another
+/// clone than the default checkout (into that clone). Through the queue such
+/// a Task lands in the DEFAULT checkout: the target tip is brought to the
+/// Task's clone and bound to a ref, the rebase is onto that commit, the real
+/// check runs on the rebased commit, and the exact commit is sent to the
+/// default checkout and fast-forwarded there. Three Tasks in the clone: the
+/// first needs no rebase, the second is rebased and green, the third is
+/// rebased and red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn tasks_in_another_clone_merge_into_the_default_checkout_through_the_queue() {
+    let world = World::new().await;
+    world.add_clone().await;
+    let clone_main = git_out(&world.clone_path(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    let first = world.add_task_in_clone("one", "one.txt", "one\n").await;
+    let green = world.add_task_in_clone("two", "two.txt", "two\n").await;
+    let red = world.add_task_in_clone("three", "three.txt", "three\n").await;
+    review_ci(&world, "one", &["test -f one.txt"]).await;
+    review_ci(&world, "two", &["test -f one.txt", "test -f two.txt"]).await;
+    review_ci(&world, "three", &["test -f two.txt", "exit 3"]).await;
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the first two merge and the third is sent back", || async {
+        world.task("one").await.status == "done"
+            && world.task("two").await.status == "done"
+            && world.attempt(&red.id).await.state == S::Ejected
+            && world.task("three").await.status != "merging"
+    })
+    .await;
+    eventually("the merged attempts complete", || async {
+        world.attempt(&first.id).await.state == S::Completed
+            && world.attempt(&green.id).await.state == S::Completed
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let (one, two, three) = (
+        world.attempt(&first.id).await,
+        world.attempt(&green.id).await,
+        world.attempt(&red.id).await,
+    );
+    assert!(one.failure_message.is_none(), "{:?}", one.failure_message);
+    assert!(two.failure_message.is_none(), "{:?}", two.failure_message);
+    // The DEFAULT checkout holds the first two, the second rebased.
+    let tip = git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+        .await
+        .unwrap();
+    assert_eq!(two.integrated_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(one.integrated_sha, one.original_candidate_sha);
+    assert_ne!(two.integrated_sha, two.original_candidate_sha);
+    for (file, present) in [("one.txt", true), ("two.txt", true), ("three.txt", false)] {
+        assert_eq!(
+            git_out(&world.repo(), &["cat-file", "-e", &format!("{tip}:{file}")])
+                .await
+                .is_some(),
+            present,
+            "{file}"
+        );
+    }
+    // The exact commit the Task's clone holds is what landed.
+    assert_eq!(
+        git::get_current_sha(&world.tree("two")).await.unwrap(),
+        tip
+    );
+    // The clone's own target branch was never written.
+    assert_eq!(
+        git_out(&world.clone_path(), &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap(),
+        clone_main
+    );
+    // Commits moved through the owners, and each merged attempt's transfer
+    // refs are gone from both checkouts.
+    for attempt in [&one, &two] {
+        assert!(
+            attempt
+                .phase_timings
+                .as_ref()
+                .is_some_and(|timings| timings.transfer_ms.is_some()),
+            "{:?}",
+            attempt.phase_timings
+        );
+        for repo in [world.repo(), world.clone_path()] {
+            let refs = git_out(
+                &repo,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("refs/forge/integration/{}-*", attempt.id),
+                ],
+            )
+            .await
+            .unwrap_or_default();
+            assert!(refs.trim().is_empty(), "{refs}");
+        }
+    }
+    // The checks ran on the rebased commits in the clone.
+    let runs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id ORDER BY r.created_at",
+    )
+    .fetch_all(world.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        runs,
+        vec![
+            (two.candidate_sha.clone().unwrap(), "pass".to_owned()),
+            (three.candidate_sha.clone().unwrap(), "fail".to_owned()),
+        ],
+        "{runs:?}"
+    );
+    assert_eq!(
+        three.failure_kind,
+        Some(IntegrationFailureKind::CandidateCheckFailed)
+    );
 }
 
 /// A digest of every row of every table except the three the worker may

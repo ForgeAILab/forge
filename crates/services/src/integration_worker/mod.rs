@@ -164,6 +164,7 @@ pub struct IntegrationQueueWorker {
     pub(crate) steps: Arc<dyn IntegrationStepPort>,
     pub(crate) facts: Arc<dyn IntegrationFactsPort>,
     pub(crate) transfer: Arc<dyn ObjectTransferPort>,
+    pub(crate) locations: Option<Arc<dyn IntegrationLocationPort>>,
     pub(crate) clock: Arc<dyn WorkerClock>,
     pub(crate) config: IntegrationWorkerConfig,
     pub(crate) instance: String,
@@ -204,6 +205,7 @@ impl IntegrationQueueWorker {
             steps,
             facts,
             transfer,
+            locations: None,
             clock,
             config,
             instance: format!("integration-worker:{}", db::new_uuid_v4()),
@@ -212,6 +214,13 @@ impl IntegrationQueueWorker {
             #[cfg(test)]
             fault: Mutex::new(None),
         }
+    }
+
+    /// The location verification the worker requests when an owner refuses a
+    /// claim's target. Without it such a head parks and retries with backoff.
+    pub fn with_locations(mut self, locations: Arc<dyn IntegrationLocationPort>) -> Self {
+        self.locations = Some(locations);
+        self
     }
 
     #[cfg(test)]

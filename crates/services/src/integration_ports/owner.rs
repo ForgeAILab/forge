@@ -325,4 +325,11 @@ impl IntegrationOwnerPort for RoutingIntegrationOwner {
         // Daemon owners are asked on reconnect and by `reconcile_effect`.
         self.server.reconcile_outstanding().await
     }
+
+    fn owner_connection(&self, target_owner: &serde_json::Value) -> Option<u64> {
+        match daemon_owner(target_owner) {
+            None => Some(0),
+            Some((daemon_id, _)) => self.client.connection_id(&daemon_id),
+        }
+    }
 }

@@ -145,6 +145,8 @@ pub struct HeadDriver {
     result_checked: Option<DateTime<Utc>>,
     /// The ends of an object transfer this session made for the head.
     transferred: Option<ObjectTransferRelease>,
+    /// The claim generation whose inbound transfer this session made.
+    inbound_generation: Option<i64>,
     /// Permits this session could not use (they did not bind the head).
     refused_permits: u32,
     /// Deciding steps this session asked again because they settled without
@@ -152,6 +154,13 @@ pub struct HeadDriver {
     reasked: u32,
     /// When this session last asked for the head's check.
     check_asked: Option<DateTime<Utc>>,
+    /// While the head's result is unknown: when the owner is asked next, and
+    /// the owner connection the last ask saw (`None`: not connected).
+    reconcile_at: Option<DateTime<Utc>>,
+    owner_link: Option<u64>,
+    /// Location verifications this session requested after the owner refused
+    /// the claim's target.
+    verifications: u32,
     stop: CancellationToken,
 }
 
@@ -165,9 +174,13 @@ impl HeadDriver {
             since: None,
             result_checked: None,
             transferred: None,
+            inbound_generation: None,
             refused_permits: 0,
             reasked: 0,
             check_asked: None,
+            reconcile_at: None,
+            owner_link: None,
+            verifications: 0,
             stop: CancellationToken::new(),
         }
     }
@@ -262,12 +275,43 @@ impl HeadDriver {
             HeadAction::Reconcile => self.reconcile(a, &queue).await,
             HeadAction::AwaitResult => self.await_result(a, &queue).await,
             HeadAction::Requeue => {
+                if let Some(wait) = self.unknown_result_wait(&a) {
+                    return Ok(Pass::Wait(wait));
+                }
                 w.advance(&a.id, S::Reconciling, |_| {}).await?;
                 Ok(Pass::Progress)
             }
             // A released or terminal attempt cannot hold the slot.
             HeadAction::Released | HeadAction::Terminal => Ok(Pass::Lost),
         }
+    }
+
+    /// A head whose result is unknown keeps its slot and its lease (this
+    /// session stays, so every pass renews). The owner is asked again every
+    /// `reconcile_interval`, and at once when its receipt has arrived (the
+    /// reconnect lookup recorded it) or the owner is on a new connection.
+    /// `None`: ask now.
+    fn unknown_result_wait(&mut self, a: &IntegrationAttempt) -> Option<Duration> {
+        let at = self.reconcile_at?;
+        let Some(intent) = a.effect_intent_json.as_ref() else {
+            return None;
+        };
+        let link = self
+            .w
+            .owner
+            .owner_connection(&intent["request"]["fence"]["target_owner"]);
+        if link.is_some() && link != self.owner_link {
+            return None;
+        }
+        self.owner_link = link;
+        let now = self.w.clock.now();
+        (now < at).then(|| {
+            (at - now)
+                .to_std()
+                .unwrap_or_default()
+                .min(self.w.config.poll)
+                .max(Duration::from_millis(1))
+        })
     }
 
     fn timed_out(&self, timeout: HeadTimeout) -> bool {
@@ -517,19 +561,35 @@ impl HeadDriver {
     }
 
     /// The owner does not recognise the claim's target: its record of the
-    /// default checkout differs from the one the claim froze (the location
-    /// was verified again or changed since, for example on a daemon
-    /// reconnect). The refusal ran no Git. The head leaves the slot and
-    /// retries with backoff; each retry is a new claim, which re-reads the
-    /// target. Holding the lease and claiming again at once would only burn
-    /// rounds until the owner and the server agree.
-    async fn foreign_owner(&mut self, a: &IntegrationAttempt) -> Result<Pass> {
+    /// default checkout differs from the one the claim froze (the server
+    /// changed the location since the owner last verified it: a default
+    /// toggle, a provisioning note). The refusal ran no Git. The worker asks
+    /// for the location to be verified again, which gives the owner the
+    /// server's present record, and the head goes on in a new round (a new
+    /// claim generation re-reads the target). `Ok(None)`: verification was
+    /// requested, retry. After two requests in one session, or when the
+    /// verification cannot be requested, the head leaves the slot and
+    /// retries with backoff.
+    async fn foreign_owner(&mut self, a: &IntegrationAttempt) -> Result<Option<Pass>> {
+        let location = self.w.queue(&self.queue_id).await?.target_location_id;
+        if let (Some(locations), Some(location), true) =
+            (self.w.locations.as_ref(), location, self.verifications < 2)
+        {
+            self.verifications += 1;
+            match locations.verify_location(&location).await {
+                Ok(()) => return Ok(None),
+                Err(error) => {
+                    tracing::warn!(target: "services::integration_worker", queue_id = %self.queue_id, %location, %error, "location verification after an owner refusal failed");
+                }
+            }
+        }
         self.park(
             a,
             ParkReason::TargetNotReady,
             "the owner of the default checkout does not recognise this claim's target yet",
         )
         .await
+        .map(Some)
     }
 
     async fn send_back(
@@ -675,14 +735,30 @@ impl HeadDriver {
             return Ok(None);
         }
         let started = self.w.clock.now();
+        // `have` names commits the receiver holds, so the bundle carries only
+        // what is new. Inbound, the source is the default checkout: it does
+        // not know the candidate, but it knows the target commits the Task's
+        // clone already has (its own target branch, and the tip an earlier
+        // round of this attempt brought, whose ref is kept until release).
         let (have, want) = match direction {
-            ObjectTransferDirection::Inbound => {
-                (facts.candidate_head.clone(), facts.target_tip.clone())
-            }
-            ObjectTransferDirection::Outbound => {
-                (facts.target_tip.clone(), facts.candidate_head.clone())
-            }
+            ObjectTransferDirection::Inbound => (
+                vec![
+                    facts.candidate_head.clone(),
+                    facts.task_target_tip.clone(),
+                    a.target_tip_sha.clone().unwrap_or_default(),
+                ],
+                facts.target_tip.clone(),
+            ),
+            ObjectTransferDirection::Outbound => (
+                vec![facts.target_tip.clone()],
+                facts.candidate_head.clone(),
+            ),
         };
+        let mut seen = HashSet::new();
+        let have: Vec<String> = have
+            .into_iter()
+            .filter(|sha| !sha.is_empty() && *sha != want && seen.insert(sha.clone()))
+            .collect();
         let fence = self.fence(a).await?;
         let target = ObjectTransferEndpoint {
             repo_location_id: fence.target_owner["location_id"]
@@ -705,13 +781,16 @@ impl HeadDriver {
                 task: facts.task_location.clone(),
                 target,
                 target_branch: queue.target_branch.clone(),
-                have: vec![have],
+                have,
                 want,
                 max_bytes: self.w.config.transfer_cap_bytes,
             })
             .await;
         match outcome {
             Ok(ObjectTransferOutcome::Transferred { .. }) => {
+                if direction == ObjectTransferDirection::Inbound {
+                    self.inbound_generation = Some(self.generation);
+                }
                 let elapsed = millis(started, self.w.clock.now());
                 self.timings(&a.id, |timings| add(&mut timings.transfer_ms, elapsed))
                     .await?;
@@ -995,6 +1074,18 @@ impl HeadDriver {
                 .await?
                 .unwrap_or(Pass::Progress));
         }
+        // In another clone the rebase witness is the ref this generation's
+        // inbound transfer binds. Validation transferred under the generation
+        // it ran in; a later round of the same head transfers again here
+        // (a repeat of a key moves nothing).
+        if self.inbound_generation != Some(self.generation) {
+            if let Some(pass) = self
+                .transfer(&a, queue, &facts, ObjectTransferDirection::Inbound)
+                .await?
+            {
+                return Ok(pass);
+            }
+        }
         let fence = self.fence(&a).await?;
         self.w.fault(S::Rebasing, CrashPoint::BeforeEffect)?;
         let started = self.w.clock.now();
@@ -1140,7 +1231,16 @@ impl HeadDriver {
             } => Ok(Pass::Lost),
             OwnerRebaseReceipt::Refused {
                 reason: OwnerEffectRefusal::ForeignOwner,
-            } => self.foreign_owner(&a).await,
+            } => {
+                if let Some(pass) = self.foreign_owner(&a).await? {
+                    return Ok(pass);
+                }
+                let a = self.w.attempt(&a.id).await?;
+                Ok(self
+                    .new_round(&a, None, true)
+                    .await?
+                    .unwrap_or(Pass::Progress))
+            }
             OwnerRebaseReceipt::Refused { .. } | OwnerRebaseReceipt::NotPerformed {} => {
                 // The witness no longer holds (the target moved while this
                 // head held the slot) or this generation already has a rebase
@@ -1446,7 +1546,14 @@ impl HeadDriver {
                 reason: OwnerEffectRefusal::ForeignOwner,
             }) => {
                 let a = self.w.attempt(&a.id).await?;
-                self.foreign_owner(&a).await
+                if let Some(pass) = self.foreign_owner(&a).await? {
+                    return Ok(pass);
+                }
+                // The refusal is this generation's fast-forward receipt:
+                // reconciliation reads it as "not landed" and re-queues the
+                // head for a new round.
+                self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+                Ok(Pass::Progress)
             }
             Ok(OwnerMergeReceipt::Completed {
                 outcome: MergeOutcome::TargetMoved { .. },
@@ -1533,9 +1640,20 @@ impl HeadDriver {
                     a.failure_message = Some(message.into());
                 })
                 .await?;
+            // The slot and the lease stay with this session. Leaving here
+            // would make the lease expiry the retry clock.
             self.w.defer_reconcile(&self.queue_id);
-            return Ok(Pass::Lost);
+            let now = self.w.clock.now();
+            self.reconcile_at = Some(later(now, self.w.config.reconcile_interval));
+            self.owner_link = self
+                .w
+                .owner
+                .owner_connection(&a.effect_intent_json.as_ref().expect("checked")["request"]["fence"]["target_owner"]);
+            return Ok(Pass::Wait(
+                self.w.config.poll.min(self.w.config.reconcile_interval),
+            ));
         }
+        self.reconcile_at = None;
         // Settled. The newest receipt and a Git witness decide.
         let last = receipts(&a).into_iter().next_back();
         let merged = last.as_ref().and_then(|receipt| {

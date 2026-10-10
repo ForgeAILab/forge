@@ -50,6 +50,14 @@ impl DaemonWorkspaceClient {
         &self.registry
     }
 
+    /// The daemon's live connection, if it has one.
+    pub fn connection_id(&self, daemon_id: &str) -> Option<u64> {
+        self.registry
+            .get(daemon_id)
+            .filter(|connection| !connection.is_stale())
+            .map(|connection| connection.id())
+    }
+
     pub async fn machine_probe(
         &self,
         daemon_id: &str,

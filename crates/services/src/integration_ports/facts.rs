@@ -53,6 +53,7 @@ impl WorkspaceHeadFacts {
             target_dirty: false,
             rebase_in_progress: false,
             shared_object_store: true,
+            task_target_tip: String::new(),
             task_location: ObjectTransferEndpoint {
                 repo_location_id: queue.target_location_id.clone().unwrap_or_default(),
                 owner: EffectOwner::Server,
@@ -184,6 +185,22 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
             Some(path) => !git::is_worktree_clean(path).await?,
             None => false,
         };
+        let task_target_tip = if shared {
+            String::new()
+        } else {
+            resolved
+                .git_query(
+                    WorkspaceGitQuery::TargetHead {
+                        branch: queue.target_branch.clone(),
+                    },
+                    true,
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|tip| tip.trim().to_owned())
+                .unwrap_or_default()
+        };
         let workspace_witness = effect_workspace(placement);
         Ok(HeadFacts {
             gate: if paused {
@@ -205,6 +222,7 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
             target_dirty,
             rebase_in_progress,
             shared_object_store: shared,
+            task_target_tip,
         })
     }
 }

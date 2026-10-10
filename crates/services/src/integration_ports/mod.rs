@@ -26,9 +26,14 @@ use crate::{
     daemon_transport::{workspace_client::DaemonWorkspaceClient, DaemonConnectionRegistry},
     integration_owner::ServerIntegrationOwner,
     integration_steps::TaskStepIntegrationPort,
-    integration_worker::{IntegrationQueueWorker, IntegrationWorkerConfig, SystemClock},
+    integration_worker::{
+        IntegrationLocationPort, IntegrationQueueWorker, IntegrationWorkerConfig, SystemClock,
+    },
+    repo_location::RepoLocationService,
     workspace_backend::WorkspaceBackendRouter,
+    Result,
 };
+use async_trait::async_trait;
 use db::SqliteDb;
 use std::sync::Arc;
 
@@ -47,6 +52,7 @@ pub fn build_integration_worker(
     db: Arc<SqliteDb>,
     router: Arc<WorkspaceBackendRouter>,
     daemons: Arc<DaemonConnectionRegistry>,
+    locations: Arc<RepoLocationService>,
     config: IntegrationWorkerConfig,
 ) -> Arc<IntegrationQueueWorker> {
     let server = Arc::new(ServerIntegrationOwner::new(Arc::clone(&db)));
@@ -64,13 +70,23 @@ pub fn build_integration_worker(
         fences,
         &std::env::temp_dir().join("forge-integration-transfer"),
     ));
-    Arc::new(IntegrationQueueWorker::new(
-        Arc::clone(&db),
-        owner,
-        Arc::new(TaskStepIntegrationPort::new(Arc::clone(&db))),
-        Arc::new(WorkspaceHeadFacts::new(Arc::clone(&db), router)),
-        transfer,
-        Arc::new(SystemClock),
-        config,
-    ))
+    Arc::new(
+        IntegrationQueueWorker::new(
+            Arc::clone(&db),
+            owner,
+            Arc::new(TaskStepIntegrationPort::new(Arc::clone(&db))),
+            Arc::new(WorkspaceHeadFacts::new(Arc::clone(&db), router)),
+            transfer,
+            Arc::new(SystemClock),
+            config,
+        )
+        .with_locations(locations),
+    )
+}
+
+#[async_trait]
+impl IntegrationLocationPort for RepoLocationService {
+    async fn verify_location(&self, repo_location_id: &str) -> Result<()> {
+        self.reverify(repo_location_id).await.map(|_| ())
+    }
 }

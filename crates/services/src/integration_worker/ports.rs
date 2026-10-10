@@ -58,6 +58,20 @@ pub trait IntegrationOwnerPort: Send + Sync {
     /// effects that share its checkout lock). Runs no Git effect.
     async fn reconcile_effect(&self, request: &IntegrationEffectRequest) -> Result<()>;
     async fn reconcile_outstanding(&self) -> Result<()>;
+    /// The live connection to the owner `target_owner` names: `None` while
+    /// it is not connected, another number after it reconnected. The server
+    /// is always connected. A head with an unknown result reads this to ask
+    /// for the receipt as soon as its owner is back.
+    fn owner_connection(&self, _target_owner: &serde_json::Value) -> Option<u64> {
+        Some(0)
+    }
+}
+
+/// Asks for a repo location to be verified again. The service behind it
+/// writes `repo_location`; the worker never does.
+#[async_trait]
+pub trait IntegrationLocationPort: Send + Sync {
+    async fn verify_location(&self, repo_location_id: &str) -> Result<()>;
 }
 
 /// The actions of the `integration` Task-step kind the worker asks for.
@@ -211,6 +225,10 @@ pub struct HeadFacts {
     pub rebase_in_progress: bool,
     /// The Task's checkout shares the default checkout's object store.
     pub shared_object_store: bool,
+    /// In another clone: the tip of that clone's own target branch (empty
+    /// when it has none). The default checkout usually knows this commit, so
+    /// an inbound transfer names it as one the receiver already holds.
+    pub task_target_tip: String,
     /// The repo location the Task's checkout belongs to (the other end of an
     /// object transfer; the default checkout is the queue's target).
     pub task_location: ObjectTransferEndpoint,
