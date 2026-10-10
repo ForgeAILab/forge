@@ -1163,3 +1163,119 @@ async fn stop_route_stops_only_the_selected_side_session() {
     assert_eq!(after.error_annotation, before.error_annotation);
     assert_eq!(after.status, before.status);
 }
+
+/// D1b checklist item 13, at the API. A Cancel that arrives after the merge
+/// queue committed the Task's fast-forward is not applied: the protected
+/// `result` step is ahead of it, so the request is answered `409 task_busy`
+/// with the retry details, the Task stays in `merging`, and the attempt is
+/// never flagged for cancellation (the merge wins; the accepted Cancel stays
+/// queued behind it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_after_the_merge_queue_committed_the_fast_forward_answers_409_task_busy() {
+    use db::{IntegrationQueueRepo, TaskStepRepo};
+    let workspace_root = common::TestDir::new("ec-merge-busy");
+    let database = format!(
+        "sqlite://{}?mode=rwc",
+        workspace_root.path().join("busy.sqlite").display()
+    );
+    let harness = common::test_app_on(
+        workspace_root.path(),
+        "execution-controls-merge-busy",
+        &database,
+    )
+    .await;
+    let (project_id, repo_id, _agent_id) = setup(&harness, workspace_root.path()).await;
+    let task = create_task(&harness, &project_id, "merge in flight").await;
+    let db = &harness.state.db;
+    // The Task as the queue holds it once the permit is written: `merging`,
+    // its attempt the head with the fast-forward committed, and the
+    // protected `result` step waiting for the receipt.
+    sqlx::query("UPDATE task SET status='merging',status_epoch=status_epoch+1,review_passed_at=? WHERE id=?")
+        .bind(db::now_rfc3339())
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let (epoch, version): (i64, i64) =
+        sqlx::query_as("SELECT status_epoch,version FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let queue = db
+        .create_or_get_integration_queue(&repo_id, "main")
+        .await
+        .unwrap();
+    let mut attempt = db::IntegrationAttempt::new(
+        Some(queue.id.clone()),
+        task.id.clone(),
+        project_id.clone(),
+        format!("admit:{}:{epoch}", task.id),
+        "merging".into(),
+        epoch,
+        version,
+    );
+    attempt.original_candidate_sha = Some("c".repeat(40));
+    let attempt = db.admit_integration_attempt(attempt).await.unwrap();
+    sqlx::query("UPDATE integration_attempt SET state='ff_inflight',slot_generation=1,effect_seq=1,candidate_sha=original_candidate_sha,revision=revision+1 WHERE id=?")
+        .bind(&attempt.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut tx = db.pool().begin().await.unwrap();
+    db.enqueue_protected_integration_step_in_tx(
+        &mut tx,
+        &db::EnqueueTaskStep {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            kind: "integration".into(),
+            payload_json: json!({
+                "task_id": task.id, "queue_id": queue.id, "attempt_id": attempt.id,
+                "expected_epoch": epoch, "generation": 1, "effect_seq": 1, "action": "result"
+            })
+            .to_string(),
+            causation_step_id: None,
+            causation_key: format!("integration:{}:1:result", attempt.id),
+            chain_id: db::new_uuid_v4(),
+            chain_position: 1,
+            expected_status: "merging".into(),
+            expected_version: version,
+            expected_epoch: Some(epoch),
+            lane: "fast".into(),
+            available_at: (Utc::now() + Duration::hours(1)).to_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let uri = format!("/api/v1/tasks/{}/actions", task.id);
+    let response = common::raw_json_request(
+        &harness.app,
+        Method::POST,
+        &uri,
+        json!({ "version": common::task_action_version(&harness.app, &uri).await, "action": {"verb":"cancel"} }),
+    )
+    .await;
+    let error: ErrorResponse = common::parse_response(response, StatusCode::CONFLICT).await;
+    assert_eq!(error.code, api_types::TASK_BUSY, "{error:?}");
+    let details: api_types::TaskBusyDetails =
+        serde_json::from_value(error.details.clone().expect("retry details")).unwrap();
+    assert!(details.pending_steps >= 1, "{details:?}");
+
+    let current = TaskRepo::get_by_id(&**db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.status, "merging", "the Cancel was not applied");
+    let held = db.integration_attempt(&attempt.id).await.unwrap().unwrap();
+    assert!(held.cancel_requested_at.is_none(), "the merge is not flagged");
+    assert_eq!(held.state, db::IntegrationAttemptState::FfInflight);
+    // The protected step is still first in line.
+    let steps = db.task_steps(&task.id).await.unwrap();
+    let protected = steps
+        .iter()
+        .find(|step| step.kind == "integration")
+        .expect("protected result step");
+    assert_eq!(protected.status, "pending");
+}
