@@ -42,8 +42,9 @@ pub(crate) fn unbound(attempt: &IntegrationAttempt) -> bool {
 /// shadow row written before the queue was active), is superseded: the
 /// successor keeps the Task's place in line (`queue_seq`).
 ///
-/// `VersionConflict` (retried by the hook step with back-off): the earlier
-/// attempt still holds its queue slot, or another writer got in between.
+/// `VersionConflict`: the earlier attempt still holds its queue slot (it has
+/// been told to release; see [`admit_released`]), or another writer got in
+/// between.
 pub(crate) async fn admit(
     db: &Arc<SqliteDb>,
     merge_service: &MergeService,
@@ -87,7 +88,8 @@ pub(crate) async fn admit(
         // `original_candidate_sha` is the commit the review passed; the
         // worker checks any other commit before it may merge. It is the
         // admitted HEAD, except for a candidate the old merge path had
-        // already rebased (see `rebased_before_the_queue`).
+        // already rebased or an earlier attempt rebased (see
+        // `reviewed_before_rebase`).
         attempt.original_candidate_sha =
             Some(reviewed.unwrap_or(&facts.candidate_sha).to_owned());
         if reviewed.is_some() {
@@ -97,8 +99,12 @@ pub(crate) async fn admit(
     };
     for _ in 0..3 {
         let Some(current) = db.current_integration_attempt(&task.id).await? else {
+            let reviewed = reviewed_before_rebase(db, None, task, &facts.candidate_sha).await?;
             match db
-                .admit_integration_attempt(build(format!("admit:{}:{epoch}", task.id), None))
+                .admit_integration_attempt(build(
+                    format!("admit:{}:{epoch}", task.id),
+                    reviewed.as_deref(),
+                ))
                 .await
             {
                 Ok(attempt) => return Ok(attempt),
@@ -147,7 +153,8 @@ pub(crate) async fn admit(
             }
             return Err(DbError::VersionConflict.into());
         }
-        let reviewed = rebased_before_the_queue(db, &current, task, &facts.candidate_sha).await;
+        let reviewed =
+            reviewed_before_rebase(db, Some(&current), task, &facts.candidate_sha).await?;
         let successor = build(
             format!("admit:{}:{epoch}:{}", task.id, current.attempt_number + 1),
             reviewed.as_deref(),
@@ -159,49 +166,130 @@ pub(crate) async fn admit(
             Ok(attempt) => return Ok(attempt),
             Err(DbError::VersionConflict) => continue,
             Err(DbError::InvalidTransition) if same_status_entry => return Ok(current),
-            // Still the head of its queue, or an effect of it is unsettled:
-            // the worker releases it (the Task left that entry), then the
-            // retried hook supersedes it.
-            Err(DbError::InvalidTransition) => return Err(DbError::VersionConflict.into()),
+            // The attempt of an entry the Task has left is still the head of
+            // its queue (the head notices a Task that moved only at its next
+            // step, which can be a whole check away), or an effect of it is
+            // unsettled. It is told to release now, in the Cancel's own
+            // write; `admit_released` waits for the worker to do it.
+            Err(DbError::InvalidTransition) => {
+                let mut tx = db::begin_immediate(db.pool()).await?;
+                db::request_task_integration_cancel_in_tx(&mut tx, &task.id, &db::now_rfc3339())
+                    .await?;
+                tx.commit().await?;
+                return Err(DbError::VersionConflict.into());
+            }
             Err(error) => return Err(error.into()),
         }
     }
     Err(DbError::VersionConflict.into())
 }
 
-/// The reviewed commit of a candidate the old merge path rebased before the
-/// queue existed (importer row P6: a recorded clean rebase, or the Task
-/// between `merging` and its re-review on the `target_moved_rebase` bridge).
+/// How long an admission waits for the worker to release the attempt of an
+/// entry the Task has left. The release is one driver pass after the cancel
+/// flag (a poll, or the wake below); the bound only covers a worker that is
+/// not running. Shorter than a Task step's lease.
+const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`admit`], waiting for an older attempt of the Task to leave its queue
+/// slot instead of failing the caller's step.
 ///
-/// The review passed on the commit before that rebase, and the old path
-/// would have run the review checks on the rebased commit and carried the
-/// review. Admitting the rebased HEAD as "the reviewed commit" would skip
-/// the check and so cost a full review; naming the reviewed commit instead
-/// makes the worker check the rebased commit and lets `settle` carry the
-/// review by the same predicates the old review entry used. `None` for every
-/// other admission, and when no passed review pins a commit.
-async fn rebased_before_the_queue(
+/// A Task that re-enters `merging` while the attempt of its previous entry is
+/// still the head gets `VersionConflict` from [`admit`] until the worker has
+/// released that attempt. Returning that to the hook step would spend one of
+/// its attempts per look and, once they are gone, settle the entry as a
+/// workspace error although nothing is wrong. The wait here is deterministic:
+/// the old attempt is flagged, the worker is woken, and the admission is
+/// made as soon as the slot is free. After [`RELEASE_WAIT`] (no worker runs,
+/// or the old attempt's fast-forward has an unknown result and may not be
+/// released) the conflict is returned and the step retries with back-off.
+pub(crate) async fn admit_released(
     db: &Arc<SqliteDb>,
-    superseded: &IntegrationAttempt,
+    merge_service: &MergeService,
+    task: &db::Task,
+    worker: Option<&crate::integration_worker::IntegrationQueueWorker>,
+) -> Result<IntegrationAttempt> {
+    let deadline = tokio::time::Instant::now() + RELEASE_WAIT;
+    loop {
+        match admit(db, merge_service, task).await {
+            Err(ServiceError::Db(DbError::VersionConflict))
+                if tokio::time::Instant::now() < deadline =>
+            {
+                if let Some(worker) = worker {
+                    worker.notify_answered();
+                }
+                tokio::time::sleep(RELEASE_POLL).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// The commit the Task's review passed, when the admitted HEAD is a
+/// mechanical rebase of it that nothing has checked or reviewed since.
+/// `None`: the HEAD is the reviewed commit itself (every ordinary admission).
+///
+/// The worker merges `original_candidate_sha` without a new check when the
+/// target did not move, because that commit is what the review passed. Two
+/// admissions hold a HEAD that is not:
+///
+/// - **A commit an earlier attempt of this Task rebased** and that never
+///   merged: the Task left `merging` while that attempt was checking it, or
+///   the attempt parked and the owner retried. Admitting it as "the reviewed
+///   commit" would fast-forward a commit no check ever passed on. The
+///   successor keeps the earlier attempt's reviewed commit, so the head
+///   checks the rebased commit again.
+/// - **A commit the old merge path rebased before the queue existed**
+///   (importer row P6). The review passed on the commit before that rebase,
+///   and the old path would have run the review checks on the rebased commit
+///   and carried the review. Naming the reviewed commit makes the worker
+///   check it and lets `settle` carry the review by the same predicates
+///   (one check, no new review).
+///
+/// A passed review that already covers the HEAD (a re-review of the rebased
+/// commit, a stored carry) makes it the reviewed commit again.
+async fn reviewed_before_rebase(
+    db: &Arc<SqliteDb>,
+    superseded: Option<&IntegrationAttempt>,
     task: &db::Task,
     candidate_sha: &str,
-) -> Option<String> {
-    let mechanical = superseded
-        .import_source_json
-        .as_ref()
-        .is_some_and(|source| source["priority"].as_u64() == Some(6));
-    if !mechanical {
-        return None;
-    }
-    let mut tx = db.pool().begin().await.ok()?;
-    let base = db.attempt_carry_base_in_tx(&mut tx, &task.id).await;
-    let _ = tx.rollback().await;
-    match base {
-        Ok(Some(base)) if base.candidate.commit_sha != candidate_sha => {
-            Some(base.candidate.commit_sha)
+) -> Result<Option<String>> {
+    let authority = {
+        let mut tx = db.pool().begin().await.map_err(DbError::from)?;
+        let base = db.attempt_carry_base_in_tx(&mut tx, &task.id).await;
+        tx.rollback().await.map_err(DbError::from)?;
+        match base {
+            Ok(base) => base.map(|base| base.candidate.commit_sha),
+            // A fresh review is required anyway; `settle` says so.
+            Err(DbError::Check(_)) => None,
+            Err(error) => return Err(error.into()),
         }
-        _ => None,
+    };
+    if authority.as_deref() == Some(candidate_sha) {
+        return Ok(None);
     }
+    let rebased_by_queue: Option<String> = sqlx::query_scalar(
+        "SELECT original_candidate_sha FROM integration_attempt \
+         WHERE task_ref=? AND candidate_sha=? AND original_candidate_sha IS NOT NULL \
+           AND original_candidate_sha<>? AND integrated_sha IS NULL \
+         ORDER BY created_at DESC,id DESC LIMIT 1",
+    )
+    .bind(&task.id)
+    .bind(candidate_sha)
+    .bind(candidate_sha)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(DbError::from)?;
+    if rebased_by_queue.is_some() {
+        return Ok(rebased_by_queue);
+    }
+    let rebased_before_the_queue = superseded.is_some_and(|attempt| {
+        attempt
+            .import_source_json
+            .as_ref()
+            .is_some_and(|source| source["priority"].as_u64() == Some(6))
+    });
+    Ok(authority.filter(|_| rebased_before_the_queue))
 }
 
 /// State `waiting` for a freshly admitted attempt, under the hook step's
@@ -249,7 +337,13 @@ impl crate::TaskService {
         let task = db::TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let attempt = admit(&self.db, merge_service, &task).await?;
+        let attempt = admit_released(
+            &self.db,
+            merge_service,
+            &task,
+            self.integration_worker().as_deref(),
+        )
+        .await?;
         if let Some(worker) = self.integration_worker() {
             use crate::integration_worker::IntegrationEnqueuePort;
             worker.notify_enqueued(attempt.queue_id.as_deref().unwrap_or_default());

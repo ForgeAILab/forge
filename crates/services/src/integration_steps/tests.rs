@@ -2518,3 +2518,188 @@ async fn an_imported_clean_rebase_parked_in_merge_failed_is_left_to_its_own_flow
         .unwrap();
     assert!(last.bridge.is_review_refresh());
 }
+
+// ----- no wedge in `merging` (plan 3.2 stage D2b review) ---------------------
+
+/// A Task re-enters `merging` while the attempt of its previous entry is the
+/// head of the queue, in the middle of its check. The admission flags that
+/// attempt, the worker releases it at once, and the new entry is admitted
+/// without failing or retrying the caller's step. The commit the old attempt
+/// rebased was never checked: the new attempt keeps the reviewed commit, so
+/// the rebased commit is checked before it may merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_task_reentering_merging_takes_over_from_its_old_head_and_the_rebased_commit_is_still_checked(
+) {
+    let world = World::new().await;
+    let old = world.add_task("again", "again.txt", "again\n").await;
+    world.seed_execution("again", "executor", None).await;
+    // The target moved, so the head rebases and must check.
+    std::fs::write(world.repo().join("moved"), "moved\n").unwrap();
+    git::commit_all(&world.repo(), "target moved").await.unwrap();
+    let gate = world.temp.path().join("go");
+    review_ci(
+        &world,
+        "again",
+        &[&format!(
+            "while [ ! -f {} ]; do sleep 0.1; done",
+            gate.display()
+        )],
+    )
+    .await;
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the head waits for its check", || async {
+        world.attempt(&old.id).await.state == S::Checking
+    })
+    .await;
+    let reviewed = world.attempt(&old.id).await.original_candidate_sha;
+    let rebased = git::get_current_sha(&world.tree("again")).await.unwrap();
+    assert_ne!(reviewed.as_deref(), Some(rebased.as_str()));
+    // The Task leaves and re-enters `merging`: a new status entry.
+    sqlx::query("UPDATE task SET status_epoch=status_epoch+1 WHERE id='again'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let admitted = world
+        .service
+        .admit_to_integration_queue("again")
+        .await
+        .expect("admitted without a conflict for the caller");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_ne!(admitted.id, old.id);
+    assert_eq!(admitted.expected_epoch, 1);
+    let released = world.attempt(&old.id).await;
+    assert_eq!(released.state, S::Cancelled);
+    assert!(released.cancel_requested_at.is_some());
+    assert_eq!(
+        admitted.original_candidate_sha, reviewed,
+        "the reviewed commit, not the unchecked rebase"
+    );
+    assert_eq!(admitted.candidate_sha.as_deref(), Some(rebased.as_str()));
+    // Nothing merges before the check of the rebased commit has passed.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(world.task("again").await.status, "merging");
+    assert_ne!(
+        git_out(&world.repo(), &["rev-parse", "refs/heads/main"])
+            .await
+            .unwrap(),
+        rebased
+    );
+    std::fs::write(&gate, "go").unwrap();
+    eventually("the re-admitted Task merges", || async {
+        world.task("again").await.status == "done"
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let merged = world.attempt(&admitted.id).await;
+    assert_eq!(merged.integrated_sha.as_deref(), Some(rebased.as_str()));
+    assert_eq!(merged.checks_commit_sha.as_deref(), Some(rebased.as_str()));
+    assert!(world
+        .db
+        .task_steps("again")
+        .await
+        .unwrap()
+        .iter()
+        .all(|step| step.status != "failed" && step.attempts <= 2));
+}
+
+/// The Task's target branch changed between two entries of `merging`: the
+/// attempt in the old target's queue is flagged and cancelled, and the Task
+/// is admitted to the new target's queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_changed_target_cancels_the_old_queue_membership_and_admits_to_the_new_queue() {
+    let world = World::new().await;
+    let old = world.add_task("moved", "moved.txt", "moved\n").await;
+    world.seed_execution("moved", "executor", None).await;
+    git_out(&world.repo(), &["branch", "release"]).await.unwrap();
+    sqlx::query("UPDATE task SET merge_config=?,status_epoch=status_epoch+1 WHERE id='moved'")
+        .bind(json!({"target_branch":"release"}).to_string())
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let admitted = world
+        .service
+        .admit_to_integration_queue("moved")
+        .await
+        .unwrap();
+    let before = world.attempt(&old.id).await;
+    assert_eq!(before.state, S::Cancelled);
+    assert!(before.cancel_requested_at.is_some());
+    assert!(!before.current);
+    assert_ne!(admitted.queue_id, old.queue_id);
+    let queue = world
+        .db
+        .integration_queue(admitted.queue_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(queue.target_branch, "release");
+    assert_eq!(admitted.state, S::Queued);
+    assert!(admitted.current);
+    assert!(!super::admission::unbound(&admitted));
+    // The same entry again is the same row.
+    let again = world
+        .service
+        .admit_to_integration_queue("moved")
+        .await
+        .unwrap();
+    assert_eq!(again.id, admitted.id);
+    // And the queue of the new target merges it.
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("merged into the new target", || async {
+        world.task("moved").await.status == "done"
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert_eq!(
+        git_out(&world.repo(), &["rev-parse", "refs/heads/release"])
+            .await,
+        admitted.original_candidate_sha
+    );
+}
+
+/// A Task admitted while its repository has no default checkout: the queue
+/// is created suspended and the Task is told why. When the repository gets
+/// its default checkout the queue reopens and the Task merges on the
+/// worker's sweep alone: nothing notifies the worker and no Task event is
+/// needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_queue_suspended_for_a_missing_default_checkout_reopens_on_the_sweep_alone() {
+    let world = World::new().await;
+    sqlx::query("UPDATE repo_location SET is_default=0 WHERE id='l-r'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let waiting = world.add_task("late", "late.txt", "late\n").await;
+    let queue_id = waiting.queue_id.clone().unwrap();
+    let state = |world: &World| {
+        let (db, id) = (world.db.clone(), queue_id.clone());
+        async move { db.integration_queue(&id).await.unwrap().unwrap().state }
+    };
+    assert_eq!(state(&world).await, db::IntegrationQueueState::Suspended);
+    let production = Production::new(&world);
+    let running = production.run();
+    eventually("the Task is told its queue is suspended", || async {
+        !world.step("late", IntegrationStepAction::Park).await.is_empty()
+    })
+    .await;
+    assert_eq!(world.attempt(&waiting.id).await.state, S::Queued);
+    assert_eq!(world.task("late").await.status, "merging");
+    // The default checkout appears. A plain row write: no notify, no event.
+    sqlx::query("UPDATE repo_location SET is_default=1 WHERE id='l-r'")
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    eventually("the queue reopens and the Task merges", || async {
+        world.task("late").await.status == "done"
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    assert_eq!(state(&world).await, db::IntegrationQueueState::Open);
+    assert_eq!(world.attempt(&waiting.id).await.state, S::Completed);
+}

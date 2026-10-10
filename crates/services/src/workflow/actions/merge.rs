@@ -109,9 +109,15 @@ impl HookAction for RunMerge {
             // Unreadable here is unreadable for admission too, which reports it.
             Err(_) => {}
         }
-        let attempt =
-            match crate::integration_steps::admission::admit(&ctx.db, merge_service, &task).await {
-                Ok(attempt) => attempt,
+        let attempt = match crate::integration_steps::admission::admit_released(
+            &ctx.db,
+            merge_service,
+            &task,
+            ctx.task_service.integration_worker().as_deref(),
+        )
+        .await
+        {
+            Ok(attempt) => attempt,
                 Err(error) if crate::worker_runtime::queue::retryable(&error) => {
                     return failed(ctx, error)
                 }

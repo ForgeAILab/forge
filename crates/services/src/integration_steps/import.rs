@@ -400,7 +400,14 @@ impl IntegrationSteps {
         let Some(merge_service) = self.task_service.merge_service.as_ref() else {
             return Ok(StepOutcome::Skip("merge service not configured".into()));
         };
-        let attempt = match super::admission::admit(&self.db, merge_service, task).await {
+        let attempt = match super::admission::admit_released(
+            &self.db,
+            merge_service,
+            task,
+            self.task_service.integration_worker().as_deref(),
+        )
+        .await
+        {
             Ok(attempt) => attempt,
             Err(error) if crate::worker_runtime::queue::retryable(&error) => {
                 return Ok(StepOutcome::Retry(bounded(&error.to_string())))
