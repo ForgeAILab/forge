@@ -672,7 +672,10 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
             groups
                 .into_iter()
                 .map(process_supervisor::stop_group)
-                .fold(true, |all, stopped| all && stopped)
+                // Every group is stopped, also after one could not be.
+                .collect::<Vec<_>>()
+                .into_iter()
+                .all(|stopped| stopped)
         })
         .await
         .unwrap_or(false);
