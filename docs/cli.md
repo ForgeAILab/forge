@@ -397,6 +397,22 @@ local `max_concurrent_runs` in `daemon.yaml` beside its credentials. The same
 automatic default is computed on the daemon machine. Each registration/report
 sends the resolved typed value. Legacy session-cap labels are no longer read.
 
+Each report also sends the free bytes and inodes of the filesystem holding
+`--workspace-root`, and whether the daemon's garbage collector runs on that
+root. The reply carries the server's free-space floor
+(`workspace.min_free_*`, `workspace.gc_free_*` in the server's `forge.yaml`),
+which the daemon uses for its own collector; there is no daemon-side key for
+it. While the reading is under the floor the server places no new worktree
+on that machine; work already in a worktree there, checks included, carries
+on. The daemon checks its own disk as well: asked to make a worktree while
+its reading is under the floor, it refuses with `disk_pressure` and the Task
+waits. A reading older than five minutes (a daemon that stopped reporting)
+no longer counts.
+`forge-ctl daemon` tables print the reading in the `Disk` column: free space,
+or `LOW (bytes|inodes) <free>, floor <floor>` while the machine is under its
+floor, or `-` before the first reading. `--output json` carries the same as
+`disk` and `workspace_floor`.
+
 ### Linking an external daemon
 
 `forge-ctl daemon link` registers the current machine with a running Forge

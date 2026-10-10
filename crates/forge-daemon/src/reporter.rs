@@ -63,7 +63,11 @@ pub async fn report_once(
         active_executions,
     )
     .await;
-    report_with_retry(client, &request).await
+    let daemon = report_with_retry(client, &request).await?;
+    // The server holds every machine to one floor; the collector of this
+    // root evicts to it, and new worktrees are refused under it.
+    forge_client::daemon_workspace::gc::accept_floor(workspace_root, daemon.workspace_floor);
+    Ok(daemon)
 }
 
 pub async fn report_request(
@@ -74,6 +78,7 @@ pub async fn report_request(
 ) -> DaemonReportRequest {
     DaemonReportRequest {
         max_concurrent_runs: Some(max_concurrent_runs),
+        disk: forge_client::daemon_workspace::gc::disk_report(workspace_root),
         detected_clis: detect::detect_clis().await,
         runtimes: Some(vec![runtime_report(workspace_root)]),
         labels: Some(labels_value(labels)),

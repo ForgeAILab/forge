@@ -2119,7 +2119,7 @@ The daemon terminal contract transports the complete per-candidate usage
 vector and stable report IDs. A daemon retains its terminal notification until
 the server acknowledges the composite terminal/accounting transaction; a
 duplicate report is an idempotent no-op and a conflicting report is a
-conflict. The minimum command protocol revision is 6. A revision-5 or older daemon
+conflict. The minimum command protocol revision is 7. A revision-6 or older daemon
 receives `daemon_upgrade_required` with an instruction to install `forge-ctl`
 from the server's release (protocol revision 7 or newer). Every command RPC is
 refused, including execution, repository verification, `fs.list`, `fs.branches`,
@@ -3658,6 +3658,61 @@ There is no automatic or bulk replay endpoint.
 storage maintenance runs only in the background worker or offline conversion
 command.
 
+#### Machine disk facts and disk-pressure admission
+
+`POST /api/v1/daemons/{id}/report` accepts an optional `disk` object, the
+reading of the filesystem holding the daemon's workspace root taken for that
+report:
+
+```json
+{ "free_bytes": 52428800000, "total_bytes": 500000000000,
+  "free_inodes": 4000000, "total_inodes": 32000000,
+  "measured_at": "2026-10-10T12:00:00Z", "gc_state": "owned" }
+```
+
+`free_inodes` and `total_inodes` are `null` (or absent) on a filesystem that
+does not count them. The server stores the reading with `measured_at` set to
+its own clock at the report, and trusts it for five minutes: an older reading
+is still returned but its `pressure` is `null` and it refuses nothing. `gc_state` says whether the machine's workspace garbage
+collector runs on that root: `owned`, or `unclaimed`, `claimed_by_other`,
+`refused`. A report without `disk` keeps the last reading.
+
+Every daemon read (`POST .../report` reply, `GET /api/v1/daemons`,
+`GET /api/v1/daemons/{id}`, `PATCH /api/v1/daemons/{id}`) adds two nullable
+fields:
+
+- `disk`: the last reading with the floor applied: the fields above plus
+  `floor_bytes` (the byte floor on that filesystem) and `pressure` (`null`,
+  `"bytes"` or `"inodes"`). For the embedded server machine it is the
+  server's own reading of its workspace root. `null` until a reading exists.
+- `workspace_floor`: the floor the server holds the machine to,
+  `{ "min_free_bytes", "min_free_percent", "min_free_inode_percent",
+  "gc_free_bytes", "gc_free_percent" }` (the last two `null` when unset: the
+  collector mark is then twice the floor). A daemon applies it to its own
+  collector.
+
+Each Operations `daemon_pressure` entry adds the same nullable `disk`; an entry
+whose `disk.pressure` is set is a machine under its floor.
+
+While `pressure` is set, the machine starts no new worktree; a Task that
+already has a ready worktree there is not refused, and neither is a check
+run, which executes in its Task's existing worktree. A daemon also refuses
+`workspace.prepare` of a worktree it would have to make, and an exact-commit
+`check.run`, with the daemon error code `disk_pressure` when its own reading
+is under the floor; the server turns that into the same wait.
+Placement rejections carry the filter code `disk_pressure` in
+`rejected_candidates`. A Task for which every usable machine is short of disk
+is not failed: it keeps its state with a `machine_capacity` dispatch
+disposition whose `capacity_scope` is `"disk"`, its condition reason is
+`{ "kind": "capacity", "scope": "disk" }` (`ConditionCapacityScope` gains
+`disk`), and `workflow_health` reports `kind: "waiting_for_agent"`,
+`label: "Waiting for Disk Space"`, `stale_reason: "disk_pressure"` with a
+message naming the machines and, when nothing collects garbage on one of
+them, saying so. `stale_reason` and the `disk_pressure` entry of the Task's
+placement diagnostics follow `capacity_scope`, not the message. The wait
+clears without any request once a reading recovers: while a machine is under
+its floor the dispatcher reads waiting Tasks again every 30 seconds.
+
 Operations `daemon_pressure` lists one entry per execution machine, including
 `daemon_id: "server_host"` (the embedded daemon is included in that entry).
 Each entry reports `active_runs`, `max_concurrent_runs` (effective ceiling,
@@ -4410,7 +4465,7 @@ Workspace admission errors use HTTP `409`. `placement_unavailable` includes
 candidate names its repository location, owner, daemon/runtime and `filter_codes`.
 Codes include `owner_unreachable`, `daemon_upgrade_required`, `workspace_protocol_missing`,
 `location_not_ready`, `executor_unavailable`, `capability_missing`, `pin_mismatch`,
-`agent_capacity`, `machine_capacity`, `native_backend_unsupported`,
+`agent_capacity`, `machine_capacity`, `disk_pressure`, `native_backend_unsupported`,
 `run_purpose_denied`, `not_visible`, `environment_not_ready`,
 `environment_probe_pending`, `environment_unverified`, and `provision_failed`. Unverified is a
 deterministic, action-required refusal with machine-named Task Attention; it
@@ -4539,7 +4594,7 @@ Server-owned and verified shared-mount plan files retain their layout and
 
 Protocol revision 7 negotiates `workspace.v1` and is required for every command
 RPC, including execution, verification, filesystem browsing, and PTY terminals.
-Revision-5 and older daemons remain visible with `daemon_upgrade_required`. Upgrade-only
+Revision-6 and older daemons remain visible with `daemon_upgrade_required`. Upgrade-only
 Task admission refusals (as defined above) create no Execution and resume dispatch
 automatically after the daemon upgrade. Existing placements disconnect
 and wait at most `max_disconnect` (default 24 hours). The handshake includes per-executor adapter facts

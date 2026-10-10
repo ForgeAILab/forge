@@ -241,6 +241,12 @@ impl DaemonWorkspaceBackend {
                 {
                     WorkspaceBackendError::OwnerUnreachable { daemon_id }
                 }
+                api_types::DISK_PRESSURE => WorkspaceBackendError::DiskPressure {
+                    task_id: placement.task_id.clone(),
+                    repo_location_id: placement.repo_location_id.clone(),
+                    daemon_id,
+                    runtime_id: placement.runtime_id.clone(),
+                },
                 "version_conflict" => db::DbError::VersionConflict.into(),
                 // The shared backend error contract represents path refusals as InvalidOperation.
                 _ => ServiceError::invalid_operation(format!("{}: {}", error.code, error.message))
@@ -1048,6 +1054,35 @@ mod tests {
             Err(WorkspaceBackendError::StaleGeneration { expected: 1, actual: 2, placement_id })
                 if placement_id == "placement-test"));
         assert_eq!(daemon.requests().len(), 1);
+        daemon.finish().await;
+    }
+
+    /// The daemon's own refusal for disk is the same typed placement
+    /// refusal the server makes from the daemon's report: the Task takes
+    /// the self-clearing disk wait, never a failure.
+    #[tokio::test]
+    async fn daemon_disk_pressure_maps_to_the_disk_capacity_wait() {
+        let daemon = ScriptedDaemon::new(vec![rejection(
+            api_types::DISK_PRESSURE,
+            "the workspace filesystem of this machine is under its free-space floor",
+            Some(json!({ "kind": "bytes" })),
+        )]);
+        let backend = backend(&daemon).await;
+        let refused = backend
+            .describe(&placement())
+            .await
+            .expect_err("the daemon refused");
+        assert!(matches!(
+            &refused,
+            WorkspaceBackendError::DiskPressure { task_id, .. } if *task_id == placement().task_id
+        ));
+        let error = ServiceError::from(refused);
+        assert_eq!(
+            crate::placement::capacity_wait_of(&error),
+            Some(crate::placement::CapacityWait::Disk),
+            "{error:?}"
+        );
+        assert!(crate::placement::is_retryable_admission_refusal(&error));
         daemon.finish().await;
     }
 

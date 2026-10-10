@@ -120,10 +120,6 @@ pub fn refuse_root(root: &Path) -> Option<&'static str> {
     }
     None
 }
-/// Default free-space floor: the larger of this many bytes and
-/// [`DEFAULT_MIN_FREE_PERCENT`] of the filesystem.
-pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-pub const DEFAULT_MIN_FREE_PERCENT: u8 = 5;
 /// Entries one Task-root measurement may visit before it is abandoned.
 pub const MEASURE_ENTRY_LIMIT: usize = 500_000;
 
@@ -540,50 +536,114 @@ impl Sweep {
     }
 
     /// Remove per-run temp directories no live run owns; see
-    /// [`sandbox::sweep_stale_runs`].
-    pub fn run_dirs<'a>(&self, live: impl IntoIterator<Item = &'a str>, report: &mut GcReport) {
+    /// [`sandbox::sweep_stale_runs`]. `floor` shortens how long a dead
+    /// run's directory is kept while the disk is short
+    /// ([`Self::run_dir_age`]).
+    pub fn run_dirs<'a>(
+        &self,
+        live: impl IntoIterator<Item = &'a str>,
+        floor: &FreeFloor,
+        report: &mut GcReport,
+    ) {
         report.run_dirs_removed +=
-            sandbox::sweep_stale_runs(&self.task_roots, live, self.now, MAX_RUN_AGE);
+            sandbox::sweep_stale_runs(&self.task_roots, live, self.now, self.run_dir_age(floor));
+    }
+
+    /// How long a per-run temp directory nobody claims is kept:
+    /// [`MAX_RUN_AGE`], and under the free-space floor only as long as the
+    /// longest configured limit of a run that is in no table allows.
+    ///
+    /// What age protects is a run no table knows (a hook, a check, a
+    /// detached push); executions are kept by the live set whatever their
+    /// age. The one configured limit on such a run is the check-run wall
+    /// limit, and [`Sweep::check_checkout_age`] is that limit doubled plus
+    /// an hour, the age at which a check's own checkout is already taken as
+    /// dead. So under the floor the directories crashed runs leave behind
+    /// stop accumulating for a day: with the default 30-minute limit they go
+    /// after two hours. Never longer than [`MAX_RUN_AGE`].
+    pub fn run_dir_age(&self, floor: &FreeFloor) -> Duration {
+        if self.under_floor(floor) {
+            self.check_checkout_age.min(MAX_RUN_AGE)
+        } else {
+            MAX_RUN_AGE
+        }
+    }
+
+    /// The given Task roots that have build output, least recently used
+    /// first. `candidates` are Task-root names.
+    pub fn builds_by_last_use(&self, candidates: &[String]) -> Vec<String> {
+        let mut builds: Vec<(SystemTime, &String)> = candidates
+            .iter()
+            .filter(|name| plain_name(name))
+            .filter_map(|name| {
+                let task_root = self.task_roots.join(name);
+                sandbox::is_real_dir(&task_root).then_some(())?;
+                Some((build_last_used(&task_root)?, name))
+            })
+            .collect();
+        builds.sort();
+        builds.into_iter().map(|(_, name)| name.clone()).collect()
+    }
+
+    /// Whether the filesystem of the root is under `floor`. `false` when it
+    /// cannot be read: an unreadable disk evicts nothing.
+    pub fn under_floor(&self, floor: &FreeFloor) -> bool {
+        (self.disk_space)(&self.root)
+            .is_some_and(|space| floor.pressure(&space.facts(String::new(), None)).is_some())
+    }
+
+    /// Take the build output of one Task root the caller proved idle: moved
+    /// to the trash (one rename) and deleted later by [`Sweep::empty_trash`].
+    ///
+    /// The live-run check and the rename happen under the lock every run
+    /// start takes ([`sandbox::unless_live_run_in`]), so a run that starts
+    /// while this is deciding either is seen (and keeps its build output) or
+    /// starts after the rename and gets a fresh directory. It can never have
+    /// the directory deleted from under it. `false` when nothing was taken.
+    pub fn evict_build(&self, name: &str, report: &mut GcReport) -> bool {
+        let task_root = self.task_roots.join(name);
+        if !plain_name(name) || !sandbox::is_real_dir(&task_root) {
+            return false;
+        }
+        let build = task_root.join(TASK_DIR_NAME).join("build");
+        if !sandbox::is_real_dir(&task_root.join(TASK_DIR_NAME)) || !sandbox::is_real_dir(&build) {
+            return false;
+        }
+        let moved = sandbox::unless_live_run_in(&task_root, || self.trash(&build, report));
+        if moved == Some(true) {
+            report.builds_evicted += 1;
+            tracing::warn!(path = %build.display(), "disk is under its free-space floor: evicted the build output of an idle Task");
+            return true;
+        }
+        false
     }
 
     /// Free space by evicting the build output of the given Task roots,
     /// least recently used first, until the filesystem of the root is back
-    /// above `floor` bytes free. `candidates` are Task-root names the caller
+    /// above `floor` (bytes and inodes). `candidates` are Task-root names the caller
     /// proved idle; a root with a run of this process is skipped regardless.
+    /// For an owner whose table is its own lock (a daemon); the server evicts
+    /// one root at a time under the Task's lifecycle lock.
     pub fn evict_builds(&self, candidates: &[String], floor: &FreeFloor, report: &mut GcReport) {
-        let Some(space) = (self.disk_space)(&self.root) else {
-            return;
-        };
-        let floor = floor.bytes(space.total);
-        if space.free >= floor {
+        if !self.under_floor(floor) {
             return;
         }
-        let mut builds: Vec<(SystemTime, PathBuf)> = candidates
-            .iter()
-            .filter(|name| plain_name(name))
-            .map(|name| self.task_roots.join(name))
-            .filter(|task_root| sandbox::is_real_dir(task_root))
-            .filter_map(|task_root| Some((build_last_used(&task_root)?, task_root)))
-            .collect();
-        builds.sort();
-        for (_, task_root) in builds {
+        for name in self.builds_by_last_use(candidates) {
             if self.out_of_time() {
                 report.out_of_time = true;
                 return;
             }
-            // Checked last: a run may have started since the caller looked.
-            if sandbox::has_live_run_in(&task_root) {
+            if !self.evict_build(&name, report) {
                 continue;
             }
-            let build = task_root.join(TASK_DIR_NAME).join("build");
+            // Space comes back only when the trash is emptied.
             let before = report.removed;
-            self.remove(&build, report);
+            self.empty_trash(report);
+            // The build output itself is counted as an eviction.
             if report.removed > before {
-                report.removed = before;
-                report.builds_evicted += 1;
-                tracing::warn!(path = %build.display(), "disk is under its free-space floor: evicted the build output of an idle Task");
+                report.removed -= 1;
             }
-            if (self.disk_space)(&self.root).is_none_or(|space| space.free >= floor) {
+            if !self.under_floor(floor) {
                 return;
             }
         }
@@ -647,6 +707,8 @@ impl Sweep {
 
     /// Remove one entry of the managed root: a directory with everything in
     /// it (read-only trees included), a link or a file as the entry it is.
+    /// A tree too large for what is left of the pass is removed in part and
+    /// reported as `out_of_time`, never as an error.
     pub fn remove(&self, path: &Path, report: &mut GcReport) {
         if fs::symlink_metadata(path).is_err() {
             return;
@@ -656,7 +718,7 @@ impl Sweep {
             report.errors += 1;
             return;
         }
-        remove_entry(path, report);
+        remove_entry(path, report, Some(self.deadline));
     }
 
     /// `path` is strictly inside the managed root and its parent resolves
@@ -681,7 +743,7 @@ impl Sweep {
 /// any Task root). A link is removed as a link; its target is not touched.
 pub fn remove_exact(path: &Path, report: &mut GcReport) {
     if fs::symlink_metadata(path).is_ok() {
-        remove_entry(path, report);
+        remove_entry(path, report, None);
     }
 }
 
@@ -725,8 +787,14 @@ fn forge_made(task_root: &Path) -> bool {
     })
 }
 
-fn remove_entry(path: &Path, report: &mut GcReport) {
-    sandbox::remove_tree(path);
+/// Remove one entry. With a deadline the removal stops between entries when
+/// the pass is out of time: what is left stays where it is (in the trash, in
+/// quarantine, in its Task root) and the next pass carries on with it.
+fn remove_entry(path: &Path, report: &mut GcReport, deadline: Option<Instant>) {
+    if !sandbox::remove_tree_until(path, deadline) {
+        report.out_of_time = true;
+        return;
+    }
     if fs::symlink_metadata(path).is_ok() {
         tracing::warn!(path = %path.display(), "workspace garbage could not be removed");
         report.errors += 1;
@@ -751,39 +819,43 @@ fn unix_secs(time: SystemTime) -> u64 {
         .as_secs()
 }
 
-/// The free-space floor of one managed root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FreeFloor {
-    pub min_free_bytes: u64,
-    pub min_free_percent: u8,
+/// The free-space floor of one managed root: one type for the eviction here
+/// and for the admission refusal, so the two can never disagree.
+pub use api_types::DiskFloor as FreeFloor;
+
+/// One `statvfs` reading of the filesystem holding a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiskSpace {
+    /// Bytes free to an unprivileged process.
+    pub free: u64,
+    pub total: u64,
+    /// Inodes free to an unprivileged process; `None` on a filesystem that
+    /// does not count them.
+    pub free_inodes: Option<u64>,
+    pub total_inodes: Option<u64>,
 }
 
-impl Default for FreeFloor {
-    fn default() -> Self {
-        Self {
-            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
-            min_free_percent: DEFAULT_MIN_FREE_PERCENT,
+impl DiskSpace {
+    /// This reading as the fact a machine reports.
+    pub fn facts(
+        &self,
+        measured_at: String,
+        gc_state: Option<String>,
+    ) -> api_types::MachineDiskFacts {
+        api_types::MachineDiskFacts {
+            free_bytes: self.free,
+            total_bytes: self.total,
+            free_inodes: self.free_inodes,
+            total_inodes: self.total_inodes,
+            measured_at,
+            gc_state,
         }
     }
 }
 
-impl FreeFloor {
-    /// The larger of the byte floor and the percentage of `total`.
-    pub fn bytes(&self, total: u64) -> u64 {
-        let percent = u64::from(self.min_free_percent.min(100));
-        self.min_free_bytes.max(total / 100 * percent)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DiskSpace {
-    pub free: u64,
-    pub total: u64,
-}
-
-/// Free (to an unprivileged process) and total bytes of the filesystem
-/// holding `path`, from `statvfs`. `None` when it cannot be read; callers
-/// then leave everything alone.
+/// Free (to an unprivileged process) and total bytes and inodes of the
+/// filesystem holding `path`, from `statvfs`. `None` when it cannot be read;
+/// callers then leave everything alone.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub fn disk_space(path: &Path) -> Option<DiskSpace> {
@@ -799,15 +871,20 @@ pub fn disk_space(path: &Path) -> Option<DiskSpace> {
         stat.assume_init()
     };
     #[allow(clippy::unnecessary_cast)]
-    let (block, free, total) = (
+    let (block, free, total, inodes_free, inodes) = (
         stat.f_frsize as u64,
         stat.f_bavail as u64,
         stat.f_blocks as u64,
+        stat.f_favail as u64,
+        stat.f_files as u64,
     );
-    // A filesystem that reports no size reports nothing usable.
+    // A filesystem that reports no size reports nothing usable; one that
+    // reports no inodes simply does not count them.
     (block > 0 && total > 0).then(|| DiskSpace {
         free: free.saturating_mul(block),
         total: total.saturating_mul(block),
+        free_inodes: (inodes > 0).then_some(inodes_free),
+        total_inodes: (inodes > 0).then_some(inodes),
     })
 }
 
@@ -1195,6 +1272,82 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_larger_than_the_pass_is_removed_in_part_and_finished_by_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let big = task_root(&root, "big");
+        for sub in 0..3 {
+            let sub = big.join(format!("dir-{sub}"));
+            fs::create_dir_all(&sub).unwrap();
+            for file in 0..300 {
+                fs::write(sub.join(format!("f{file}")), "x").unwrap();
+            }
+        }
+        let small = task_root(&root, "small");
+        // Out of time from the start: the removal stops between entries.
+        let mut pass = sweep(&root);
+        pass.deadline = Instant::now();
+        let mut report = GcReport::default();
+        pass.remove(&big, &mut report);
+        assert!(report.out_of_time && big.exists());
+        assert_eq!((report.removed, report.errors), (0, 0));
+        let files = |path: &Path| {
+            (0..3)
+                .map(|sub| fs::read_dir(path.join(format!("dir-{sub}"))).map_or(0, Iterator::count))
+                .sum::<usize>()
+        };
+        assert!((1..900).contains(&files(&big)), "some of it went, not all");
+        // A small tree always goes whole, so every pass makes progress.
+        let mut report = GcReport::default();
+        pass.remove(&small, &mut report);
+        assert!(!small.exists() && !report.out_of_time);
+        // The next pass, with time, finishes the large one.
+        let mut report = GcReport::default();
+        sweep(&root).remove(&big, &mut report);
+        assert!(!big.exists());
+        assert_eq!((report.removed, report.out_of_time), (1, false));
+    }
+
+    /// A run that starts while eviction is deciding either is seen or gets
+    /// its build directory made again; the directory it runs with is never
+    /// deleted under it.
+    #[test]
+    fn a_run_starting_during_eviction_never_loses_its_build_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for round in 0..40 {
+            let name = format!("t{round}");
+            let worktree = root.join(&name).join("repo");
+            fs::create_dir_all(&worktree).unwrap();
+            let task_root = TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+            let build = task_root.build_dir();
+            fs::create_dir_all(build.join("cargo")).unwrap();
+            fs::write(build.join("cargo/.rustc_info.json"), "{}").unwrap();
+            // The environment is computed while the Task is idle, as the
+            // caller of the eviction saw it.
+            let env = SandboxEnv::for_run(&worktree, &format!("run{round}"), RunPurpose::Check);
+            let pass = sweep(&root);
+            let evictor = {
+                let name = name.clone();
+                std::thread::spawn(move || {
+                    let mut report = GcReport::default();
+                    pass.evict_build(&name, &mut report)
+                })
+            };
+            let run = env.prepared();
+            let evicted = evictor.join().unwrap();
+            if run.tmp_dir().is_some() && run.build_dir("CARGO_TARGET_DIR").is_some() {
+                assert!(build.is_dir(), "round {round}: evicted={evicted}");
+                // Live now: nothing takes it.
+                let mut report = GcReport::default();
+                assert!(!sweep(&root).evict_build(&name, &mut report));
+                assert!(build.is_dir());
+            }
+            run.settle();
+        }
+    }
+
+    #[test]
     fn check_checkout_goes_only_when_old_and_no_live_check_can_own_it() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -1236,10 +1389,11 @@ mod tests {
 
         let mut report = GcReport::default();
         // Now: the stale directory is younger than any allowed run.
-        sweep(&root).run_dirs([], &mut report);
+        let roomy = FreeFloor::of_bytes(0, 0);
+        sweep(&root).run_dirs([], &roomy, &mut report);
         assert!(stale.exists() && tmp.exists());
         // Much later it is older than any run; the live one still stands.
-        later(&root, 3 * DAY).run_dirs([], &mut report);
+        later(&root, 3 * DAY).run_dirs([], &roomy, &mut report);
         assert_eq!(report.run_dirs_removed, 1);
         assert!(!stale.exists());
         assert!(tmp.exists());
@@ -1272,28 +1426,100 @@ mod tests {
 
         // Plenty of room: nothing is evicted.
         let mut report = GcReport::default();
-        let none = FreeFloor {
-            min_free_bytes: 0,
-            min_free_percent: 0,
-        };
+        let none = FreeFloor::of_bytes(0, 0);
         sweep(&root).evict_builds(&names, &none, &mut report);
         assert_eq!(report.builds_evicted, 0);
         assert!(old.exists() && busy.exists());
 
-        // A floor no disk can meet: every idle build goes, the busy one stays
-        // whenever its run is visible to the registry.
-        let all = FreeFloor {
-            min_free_bytes: u64::MAX,
-            min_free_percent: 0,
-        };
+        // A floor no disk can meet: every idle build goes, the busy one
+        // stays, whether or not its run has a temp directory (this test's
+        // own root may be too long for one).
+        let all = FreeFloor::of_bytes(u64::MAX, 100);
         sweep(&root).evict_builds(&names, &all, &mut report);
         assert!(!old.exists());
-        if run.tmp_dir().is_some() {
-            assert!(busy.exists());
-            assert_eq!(report.builds_evicted, 1);
-        }
+        assert!(busy.exists());
+        assert_eq!(report.builds_evicted, 1);
         assert_eq!(report.removed, 0);
         run.settle();
+    }
+
+    /// Under the free-space floor a crashed run's temp directory is kept
+    /// only as long as the longest configured run limit allows, not for the
+    /// 25 hours it gets on a roomy disk; a live run keeps its own whatever
+    /// the disk says.
+    #[test]
+    fn under_the_floor_a_dead_run_dir_goes_after_the_configured_run_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let worktree = root.join("t").join("repo");
+        fs::create_dir_all(&worktree).unwrap();
+        TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let tmp_root = root.join("t").join(TASK_DIR_NAME).join("tmp");
+        let (dead, live) = (tmp_root.join("deadrun000"), tmp_root.join("liverun000"));
+        fs::create_dir_all(&dead).unwrap();
+        fs::create_dir_all(&live).unwrap();
+        let (roomy, short) = (
+            FreeFloor::of_bytes(0, 0),
+            FreeFloor::of_bytes(u64::MAX, 100),
+        );
+        let mut pass = later(&root, Duration::from_secs(3 * 60 * 60));
+        pass.check_checkout_age = check_checkout_age(30 * 60);
+        assert_eq!(pass.run_dir_age(&roomy), MAX_RUN_AGE);
+        assert_eq!(pass.run_dir_age(&short), Duration::from_secs(2 * 60 * 60));
+        // A limit longer than a day never lengthens the gate.
+        let mut long = pass.clone();
+        long.check_checkout_age = check_checkout_age(86_400);
+        assert_eq!(long.run_dir_age(&short), MAX_RUN_AGE);
+
+        let mut report = GcReport::default();
+        // Three hours old on a roomy disk: kept.
+        pass.run_dirs(["liverun000"], &roomy, &mut report);
+        assert_eq!(report.run_dirs_removed, 0);
+        // Under the floor: the dead one goes, the live one stays.
+        pass.run_dirs(["liverun000"], &short, &mut report);
+        assert_eq!(report.run_dirs_removed, 1);
+        assert!(!dead.exists() && live.exists());
+    }
+
+    /// A run with no per-run temp directory (its Task root is too long for
+    /// a socket path: the usual case on macOS) is in the live-run registry
+    /// all the same, so its build output is never evicted under it.
+    #[test]
+    fn a_run_without_a_temp_dir_still_keeps_its_build_output_from_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let worktree = root.join("t").join("repo");
+        fs::create_dir_all(&worktree).unwrap();
+        let reserved = TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let build = root.join("t").join(TASK_DIR_NAME).join("build");
+        fs::create_dir_all(build.join("cargo")).unwrap();
+        fs::write(build.join("cargo/.rustc_info.json"), "{}").unwrap();
+
+        let run = SandboxEnv::for_run(&worktree, "no-tmp-run", RunPurpose::Execution)
+            .without_tmp()
+            .prepared();
+        assert!(run.tmp_dir().is_none());
+        assert!(sandbox::has_live_run_in(reserved.path()));
+        // A second run of the same Task, settled first, does not end the
+        // first one's registration.
+        let other = SandboxEnv::for_run(&worktree, "other-run", RunPurpose::Hook)
+            .without_tmp()
+            .prepared();
+        other.settle();
+        assert!(sandbox::has_live_run_in(reserved.path()));
+        let mut report = GcReport::default();
+        assert!(!sweep(&root).evict_build("t", &mut report));
+        assert!(build.join("cargo/.rustc_info.json").exists());
+        // Nothing was created for the registration.
+        assert!(!root.join("t").join(TASK_DIR_NAME).join("live").exists());
+
+        // Settled by its starter, or by whoever settles the execution.
+        sandbox::settle_run(&worktree, "no-tmp-run");
+        assert!(!sandbox::has_live_run_in(reserved.path()));
+        run.settle();
+        assert!(sweep(&root).evict_build("t", &mut report));
+        assert_eq!(report.builds_evicted, 1);
+        assert!(!build.exists());
     }
 
     #[test]
@@ -1495,6 +1721,19 @@ mod tests {
         assert_eq!(floor.bytes(1000 * gib), 50 * gib);
         let space = disk_space(Path::new("/")).unwrap();
         assert!(space.total >= space.free && space.total > 0);
+        // Inodes are read with the bytes, where the filesystem counts them.
+        if let (Some(free), Some(total)) = (space.free_inodes, space.total_inodes) {
+            assert!(total >= free && total > 0);
+        }
+        let facts = space.facts("now".to_owned(), Some("owned".to_owned()));
+        assert_eq!(
+            (
+                facts.free_bytes,
+                facts.total_inodes,
+                facts.gc_state.as_deref()
+            ),
+            (space.free, space.total_inodes, Some("owned"))
+        );
         assert!(disk_space(Path::new("/no/such/place")).is_none());
         assert_eq!(check_checkout_age(60), CHECK_CHECKOUT_AGE);
         assert_eq!(check_checkout_age(7200), Duration::from_secs(5 * 3600));
@@ -1519,16 +1758,10 @@ mod tests {
             Some(DiskSpace {
                 free: 900,
                 total: 1000,
+                ..DiskSpace::default()
             })
         };
-        pass.evict_builds(
-            &names,
-            &FreeFloor {
-                min_free_bytes: 0,
-                min_free_percent: 5,
-            },
-            &mut report,
-        );
+        pass.evict_builds(&names, &FreeFloor::of_bytes(0, 5), &mut report);
         assert!(build.exists());
         assert_eq!(report, GcReport::default());
         // Under the floor.
@@ -1536,16 +1769,10 @@ mod tests {
             Some(DiskSpace {
                 free: 10,
                 total: 1000,
+                ..DiskSpace::default()
             })
         };
-        pass.evict_builds(
-            &names,
-            &FreeFloor {
-                min_free_bytes: 0,
-                min_free_percent: 5,
-            },
-            &mut report,
-        );
+        pass.evict_builds(&names, &FreeFloor::of_bytes(0, 5), &mut report);
         assert!(!build.exists());
         assert_eq!(
             (report.builds_evicted, report.removed, report.errors),

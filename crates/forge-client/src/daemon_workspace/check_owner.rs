@@ -177,6 +177,16 @@ impl DaemonWorkspaceBackend {
                 if location.runtime_id != *runtime_id || location.daemon_id != *daemon_id {
                     return Err(error(WRONG_OWNER, "check location owner mismatch"));
                 }
+                // An exact-commit check makes its own checkout: new disk,
+                // refused under the floor before anything is retained for
+                // the operation. A check in an existing workspace is not.
+                drop(state);
+                self.refuse_new_disk_under_pressure()?;
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                let location = state
+                    .locations
+                    .get(repo_location_id)
+                    .ok_or_else(|| error(INVALID_INPUT, "unknown check repository location"))?;
                 (
                     location.path.clone(),
                     runtime_id.clone(),

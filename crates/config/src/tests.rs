@@ -682,6 +682,9 @@ fn clear_forge_env() {
         "FORGE_WORKSPACE_LOG_RETENTION_DAYS",
         "FORGE_WORKSPACE_MIN_FREE_BYTES",
         "FORGE_WORKSPACE_MIN_FREE_PERCENT",
+        "FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT",
+        "FORGE_WORKSPACE_GC_FREE_BYTES",
+        "FORGE_WORKSPACE_GC_FREE_PERCENT",
         "FORGE_AGENT_MAX_CONCURRENT_TASKS",
         "FORGE_AGENT_HEARTBEAT_INTERVAL_SECONDS",
         "FORGE_AGENT_MAX_MISSED_HEARTBEATS",
@@ -767,6 +770,50 @@ fn workspace_gc_keys_default_and_obey_file_then_env() {
         (0, 2000, 12)
     );
     env::set_var("FORGE_WORKSPACE_MIN_FREE_PERCENT", "300");
+    assert!(ForgeConfig::load(Some(&path), test_overrides(dir.path())).is_err());
+    clear_forge_env();
+
+    // The inode floor and the mark at which the collector runs at once.
+    let floor = defaults;
+    assert_eq!(
+        (
+            floor.min_free_inode_percent,
+            floor.gc_free_bytes,
+            floor.gc_free_percent
+        ),
+        (5, None, None)
+    );
+    fs::write(
+        &path,
+        "workspace:\n  min_free_inode_percent: 3\n  gc_free_bytes: 4000\n  gc_free_percent: 20\n",
+    )
+    .expect("config writes");
+    let floor = ForgeConfig::load(Some(&path), test_overrides(dir.path()))
+        .expect("file loads")
+        .workspace;
+    assert_eq!(
+        (
+            floor.min_free_inode_percent,
+            floor.gc_free_bytes,
+            floor.gc_free_percent
+        ),
+        (3, Some(4000), Some(20))
+    );
+    env::set_var("FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT", "7");
+    env::set_var("FORGE_WORKSPACE_GC_FREE_BYTES", "9000");
+    env::set_var("FORGE_WORKSPACE_GC_FREE_PERCENT", "25");
+    let floor = ForgeConfig::load(Some(&path), test_overrides(dir.path()))
+        .expect("env loads")
+        .workspace;
+    assert_eq!(
+        (
+            floor.min_free_inode_percent,
+            floor.gc_free_bytes,
+            floor.gc_free_percent
+        ),
+        (7, Some(9000), Some(25))
+    );
+    env::set_var("FORGE_WORKSPACE_GC_FREE_PERCENT", "101");
     assert!(ForgeConfig::load(Some(&path), test_overrides(dir.path())).is_err());
     clear_forge_env();
 }

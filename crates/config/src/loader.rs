@@ -125,6 +125,15 @@ impl ForgeConfig {
             if let Some(min_free_percent) = workspace.min_free_percent {
                 self.workspace.min_free_percent = min_free_percent;
             }
+            if let Some(percent) = workspace.min_free_inode_percent {
+                self.workspace.min_free_inode_percent = percent;
+            }
+            if workspace.gc_free_bytes.is_some() {
+                self.workspace.gc_free_bytes = workspace.gc_free_bytes;
+            }
+            if workspace.gc_free_percent.is_some() {
+                self.workspace.gc_free_percent = workspace.gc_free_percent;
+            }
         }
 
         if let Some(agent) = file.agent {
@@ -315,6 +324,23 @@ impl ForgeConfig {
             self.workspace.min_free_percent =
                 u8::try_from(parse_env_u32("FORGE_WORKSPACE_MIN_FREE_PERCENT", &value)?)
                     .unwrap_or(u8::MAX);
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT") {
+            self.workspace.min_free_inode_percent = u8::try_from(parse_env_u32(
+                "FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT",
+                &value,
+            )?)
+            .unwrap_or(u8::MAX);
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_GC_FREE_BYTES") {
+            self.workspace.gc_free_bytes =
+                Some(parse_env_u64("FORGE_WORKSPACE_GC_FREE_BYTES", &value)?);
+        }
+        if let Some(value) = env_value("FORGE_WORKSPACE_GC_FREE_PERCENT") {
+            self.workspace.gc_free_percent = Some(
+                u8::try_from(parse_env_u32("FORGE_WORKSPACE_GC_FREE_PERCENT", &value)?)
+                    .unwrap_or(u8::MAX),
+            );
         }
         if let Some(value) = env_value("FORGE_AGENT_MAX_CONCURRENT_TASKS") {
             self.agent.max_concurrent_tasks =

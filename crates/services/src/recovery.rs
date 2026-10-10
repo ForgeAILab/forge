@@ -87,12 +87,14 @@ impl CrashRecovery {
         Self { db, event_bus }
     }
 
-    /// Remove the per-run temp directories the previous process left in
-    /// server-owned Task roots of the managed shape. Hooks, checks and tool
-    /// commands are in no table, so the sweep itself
-    /// ([`executors::sandbox::sweep_dead_runs`]) refuses every directory this
-    /// process created or that changed since it started; an execution still
-    /// recorded as running keeps its directory and loses it when it settles.
+    /// Remove the per-run temp directories dead runs left in server-owned
+    /// Task roots of the managed shape. Hooks, checks and tool commands are
+    /// in no table, and a run the previous process left detached (a
+    /// protected push, a check still settling) can still be alive after the
+    /// restart, so being older than this process condemns nothing: the sweep
+    /// ([`executors::sandbox::sweep_stale_runs`]) takes only a directory
+    /// older than the longest run. An execution still recorded as running
+    /// keeps its directory and loses it when it settles.
     async fn sweep_dead_run_temp_dirs(&self) -> Result<()> {
         let live: Vec<String> =
             sqlx::query_scalar("SELECT id FROM execution WHERE status = 'running'")
@@ -119,7 +121,12 @@ impl CrashRecovery {
             task_root_dirs
                 .iter()
                 .map(|dir| {
-                    executors::sandbox::sweep_dead_runs(dir, live.iter().map(String::as_str))
+                    executors::sandbox::sweep_stale_runs(
+                        dir,
+                        live.iter().map(String::as_str),
+                        std::time::SystemTime::now(),
+                        executors::gc::MAX_RUN_AGE,
+                    )
                 })
                 .sum::<usize>()
         })
@@ -4732,6 +4739,18 @@ pub(crate) mod tests {
         std::fs::create_dir_all(dead.join("leftover")).unwrap();
         std::fs::create_dir(&recent).unwrap();
         backdate(&dead);
+        // A run the previous process left detached (a protected push, a
+        // check still settling): made before this process, in nobody's
+        // table, and possibly still alive.
+        let detached = tmp.join("detachedrun");
+        std::fs::create_dir(&detached).unwrap();
+        std::fs::File::open(&detached)
+            .and_then(|file| {
+                file.set_modified(
+                    std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 60 * 60),
+                )
+            })
+            .expect("directory is back-dated");
         // Beside the legacy path: a user's directories, old or not.
         let user_short = legacy.path().join(".forge-tmp/olduser");
         let user_task = legacy.path().join("projects/.forge-task/tmp/olduser");
@@ -4748,6 +4767,10 @@ pub(crate) mod tests {
         assert!(!dead.exists(), "the dead run's directory is removed");
         assert!(hook_tmp.is_dir(), "a live hook keeps its directory");
         assert!(recent.is_dir(), "a directory made since start is kept");
+        assert!(
+            detached.is_dir(),
+            "a previous process's run that may still be alive keeps its directory"
+        );
         assert!(user_short.is_dir() && user_task.is_dir());
         drop(hook);
         assert!(!hook_tmp.exists());

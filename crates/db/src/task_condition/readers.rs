@@ -18,6 +18,44 @@ pub struct ConditionRefusal {
     pub blocker_digest: String,
     pub recorded_at: String,
     pub safe_message: String,
+    /// What a `machine_capacity` wait is for when it is not a run slot
+    /// (`disk`). The typed fact every reader decides on; the message is
+    /// for people only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_scope: Option<String>,
+}
+impl ConditionRefusal {
+    /// The wait this refusal is, as the stable reason readers show
+    /// (`workflow_health.stale_reason`, placement filter code), and its
+    /// message without the reason prefix. Decided by `capability` and
+    /// `capacity_scope`, never by what the message says.
+    pub fn capacity_reason(&self) -> (&str, &str) {
+        capacity_reason(
+            &self.capability,
+            self.capacity_scope.as_deref(),
+            &self.safe_message,
+        )
+    }
+}
+/// See [`ConditionRefusal::capacity_reason`].
+pub fn capacity_reason<'a>(
+    capability: &str,
+    capacity_scope: Option<&str>,
+    safe_message: &'a str,
+) -> (&'a str, &'a str) {
+    let (prefix, message) = match safe_message.split_once(": ") {
+        Some((prefix, message)) => (Some(prefix), message),
+        None => (None, safe_message),
+    };
+    let reason = match (capability, capacity_scope) {
+        ("machine_capacity", Some(api_types::CAPACITY_SCOPE_DISK)) => "disk_pressure",
+        ("machine_capacity", _) => "machine_capacity",
+        // A Project wait has two reasons and no typed scope yet: its
+        // message names which.
+        (_, _) if prefix == Some("project_waiting_on_owner") => "project_waiting_on_owner",
+        _ => "project_at_capacity",
+    };
+    (reason, message)
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConditionRetryDisplay {

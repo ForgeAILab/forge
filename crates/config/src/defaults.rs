@@ -21,3 +21,5 @@ pub const DEFAULT_LOG_RETENTION_DAYS: u32 = 30;
 /// Free-space floor of the workspace root's filesystem: the larger of these.
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub const DEFAULT_MIN_FREE_PERCENT: u8 = 5;
+/// Inode floor of the same filesystem, in percent of its inodes.
+pub const DEFAULT_MIN_FREE_INODE_PERCENT: u8 = 5;

@@ -219,14 +219,8 @@ impl TaskService {
         if !crate::placement::admission_refusal_is_retryable(&self.db, &task.id, error).await? {
             return Ok(false);
         }
-        if crate::placement::is_machine_capacity_refusal(error) {
-            crate::deferred_dispatch::record_dispatch_disposition(
-                &self.db,
-                task,
-                "machine_capacity",
-                "machine_capacity: waiting for a machine run slot",
-            )
-            .await?;
+        if let Some(wait) = crate::placement::capacity_wait_of(error) {
+            crate::deferred_dispatch::record_capacity_wait(&self.db, task, wait).await?;
             return Ok(true);
         }
         let daemon_id = match error {
@@ -384,12 +378,16 @@ impl TaskService {
         Ok(false)
     }
 
-    pub(crate) async fn machine_capacity_blocked(
+    /// What the Task would wait for if dispatched now: a run slot, or free
+    /// disk for a new worktree. Before a machine is counted as short of
+    /// disk, its garbage is collected once and its disk read again.
+    pub(crate) async fn capacity_wait_for(
         &self,
         task: &Task,
         agent: &Agent,
         role: Option<&str>,
-    ) -> Result<bool> {
+    ) -> Result<Option<crate::placement::CapacityWait>> {
+        self.reclaim_disk_before_refusing().await;
         crate::placement::machine_precheck::task_blocked(
             &self.db,
             task,
@@ -417,6 +415,14 @@ impl TaskService {
         .await
     }
 
+    /// The server's own root only: a daemon collects its garbage itself
+    /// before it reports a reading under the mark.
+    pub(crate) async fn reclaim_disk_before_refusing(&self) {
+        if let Some(scheduler) = self.cleanup_scheduler.as_ref() {
+            scheduler.reclaim_before_refusing().await;
+        }
+    }
+
     pub(super) async fn reserve_workspace_admission(
         &self,
         task: &Task,
@@ -425,6 +431,7 @@ impl TaskService {
         environment_admission: crate::placement::selection::EnvironmentAdmission,
     ) -> Result<WorkspaceAdmission> {
         use crate::placement::select_placement;
+        self.reclaim_disk_before_refusing().await;
         if agent.is_some() {
             self.ensure_project_not_paused(task).await?;
         }
@@ -926,6 +933,34 @@ impl TaskService {
         })
     }
 
+    /// The refusal of a worktree that would have to be made again on a
+    /// machine short of disk: the same `disk_pressure` placement refusal a
+    /// new worktree gets, so the Task takes the same self-clearing wait.
+    fn refuse_recreation_under_disk_pressure(
+        &self,
+        admission: &WorkspaceAdmission,
+        pressure: Option<api_types::DiskPressureKind>,
+    ) -> Result<()> {
+        if pressure.is_none() {
+            return Ok(());
+        }
+        let placement = &admission.placement;
+        Err(ServiceError::PlacementUnavailable(
+            crate::placement::PlacementUnavailable {
+                task_id: admission.claiming_task.id.clone(),
+                repo_id: admission.workspace.repo_id.clone(),
+                rejected_candidates: vec![crate::placement::CandidateRejection {
+                    failing_checks: Vec::new(),
+                    repo_location_id: placement.repo_location_id.clone(),
+                    owner_kind: placement.owner_kind.to_string(),
+                    daemon_id: placement.daemon_id.clone(),
+                    runtime_id: placement.runtime_id.clone(),
+                    filter_codes: vec![crate::placement::PlacementFilterCode::DiskPressure],
+                }],
+            },
+        ))
+    }
+
     pub(super) async fn prepare_claim_workspace(
         &self,
         mut admission: WorkspaceAdmission,
@@ -933,6 +968,23 @@ impl TaskService {
         if admission.placement.state == PlacementState::Ready
             && admission.placement.owner_kind == PlacementOwnerKind::Server
         {
+            // A ready placement is admitted under disk pressure because its
+            // worktree exists. One whose directory is gone (deleted, or
+            // cleaned and waiting for its next run) would be made again
+            // here: that is new disk, refused like a new worktree.
+            // A server placement's handle is its worktree directory.
+            if admission.workspace.status != WorkspaceStatus::Ready
+                || !admission
+                    .placement
+                    .workspace_handle
+                    .as_deref()
+                    .is_some_and(|worktree| Path::new(worktree).is_dir())
+            {
+                self.refuse_recreation_under_disk_pressure(
+                    &admission,
+                    self.db.disk_admission.server_pressure(),
+                )?;
+            }
             // The launch guard every executor family shares: the workspace
             // manager checks the recorded worktree against disk and Git and
             // repairs what it can, so a CLI executor is never started in a
@@ -1035,6 +1087,13 @@ impl TaskService {
                 }
             };
             if needs_recreation {
+                let pressure = match admission.placement.daemon_id.as_deref() {
+                    Some(daemon_id) => {
+                        db::machine_disk::daemon_pressure(&self.db, daemon_id).await?
+                    }
+                    None => self.db.disk_admission.server_pressure(),
+                };
+                self.refuse_recreation_under_disk_pressure(&admission, pressure)?;
                 admission.workspace = prepare_workspace(
                     &self.db,
                     &self.workspace_root,
@@ -1086,6 +1145,29 @@ impl TaskService {
         let prepared = match result {
             Ok(Ok(prepared)) => prepared,
             failure => {
+                // The owner's own disk reading is under the floor: it made
+                // nothing. The reservation is given back and the Task takes
+                // the disk wait, as when the server refuses from the
+                // owner's report. No retry budget is spent on it.
+                if let Ok(Err(crate::workspace_backend::WorkspaceBackendError::DiskPressure {
+                    ..
+                })) = &failure
+                {
+                    match crate::placement::admission::fail_preparation(
+                        &self.db,
+                        &admission.placement,
+                        db::PlacementFailureCause::PrepareFailed,
+                    )
+                    .await
+                    {
+                        Ok(()) | Err(ServiceError::Db(DbError::VersionConflict)) => {}
+                        Err(error) => return Err(error),
+                    }
+                    self.refuse_recreation_under_disk_pressure(
+                        &admission,
+                        Some(api_types::DiskPressureKind::Bytes),
+                    )?;
+                }
                 let (message, cause, refusal) = match failure {
                     Ok(Err(
                         error @ crate::workspace_backend::WorkspaceBackendError::StaleGeneration {
@@ -3739,10 +3821,11 @@ pub(crate) mod tests {
             .bind(new_uuid_v4()).bind(&busy.id).bind(&agent.id).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
         let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
             .with_placement_adapter_registry(Arc::new(executors::AdapterRegistry::new()));
-        assert!(!service
-            .machine_capacity_blocked(&task, &agent, None)
+        assert!(service
+            .capacity_wait_for(&task, &agent, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
         let refusal = service
             .reserve_claim_workspace(&task, Some(&agent), "coder")
             .await
@@ -3853,10 +3936,11 @@ pub(crate) mod tests {
         let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
             .with_workspace_root(root.path().to_path_buf())
             .with_daemon_connections(registry);
-        assert!(!service
-            .machine_capacity_blocked(&task, &agent, None)
+        assert!(service
+            .capacity_wait_for(&task, &agent, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
         let reserved = service
             .reserve_claim_workspace(&task, Some(&agent), "coder")
             .await
@@ -3890,13 +3974,14 @@ pub(crate) mod tests {
         let before: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM workspace_placement), (SELECT COUNT(*) FROM repo_location), (SELECT SUM(list_revision) FROM project)").fetch_one(db.pool()).await.unwrap();
         let service = TaskService::new(db.clone(), Arc::new(EventBus::default()));
         let writer = db::begin_immediate(db.pool()).await.unwrap();
-        assert!(!tokio::time::timeout(
+        assert!(tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            service.machine_capacity_blocked(&task, &agent, None)
+            service.capacity_wait_for(&task, &agent, None)
         )
         .await
         .unwrap()
-        .unwrap());
+        .unwrap()
+        .is_none());
         drop(writer);
         let after: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM workspace_placement), (SELECT COUNT(*) FROM repo_location), (SELECT SUM(list_revision) FROM project)").fetch_one(db.pool()).await.unwrap();
         assert_eq!(before, after);
@@ -3907,6 +3992,192 @@ pub(crate) mod tests {
                 .unwrap(),
             task
         );
+    }
+
+    /// The whole path of a disk refusal with an injected reading: refused for
+    /// a new worktree, recorded as the machine-capacity wait with scope
+    /// `disk`, kept by the dispatcher's precheck while the disk is short,
+    /// cleared by the same precheck once the reading recovers, and never
+    /// applied to a Task that already has its worktree.
+    #[tokio::test]
+    async fn disk_pressure_waits_with_scope_disk_and_clears_when_the_reading_recovers() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let db = Arc::new(sqlite_db().await);
+        let repo = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let agent = seed_unpinned_claim_agent(&db).await;
+        let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+            .with_workspace_root(root.path().to_path_buf());
+        let free = Arc::new(AtomicU64::new(10));
+        let reading = Arc::clone(&free);
+        db.disk_admission.configure(
+            api_types::DiskFloor::of_bytes(100, 0),
+            Arc::new(move || {
+                Some(api_types::MachineDiskFacts {
+                    free_bytes: reading.load(Ordering::SeqCst),
+                    total_bytes: 1_000,
+                    free_inodes: None,
+                    total_inodes: None,
+                    measured_at: now_rfc3339(),
+                    gc_state: Some("unclaimed".to_owned()),
+                })
+            }),
+        );
+        let reload = || async {
+            TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+
+        // Under the floor: no new worktree, and nothing was created.
+        let error = service
+            .reserve_claim_workspace(&task, Some(&agent), "coder")
+            .await
+            .err()
+            .expect("a new worktree is refused under the floor");
+        let ServiceError::PlacementUnavailable(refusal) = &error else {
+            panic!("{error:?}");
+        };
+        assert!(refusal.rejected_candidates.iter().all(|candidate| {
+            candidate.filter_codes == [crate::placement::PlacementFilterCode::DiskPressure]
+        }));
+        assert_eq!(
+            crate::placement::capacity_wait_of(&error),
+            Some(crate::placement::CapacityWait::Disk)
+        );
+        assert_eq!(execution_count(&db, &task.id).await, 0);
+
+        // The machine-capacity path, naming the disk.
+        assert!(service
+            .defer_placement_refusal(&task, &error)
+            .await
+            .unwrap());
+        let waiting = reload().await;
+        let disposition = crate::deferred_dispatch::dispatch_disposition(&waiting).unwrap();
+        assert_eq!(
+            (
+                disposition.capability.as_str(),
+                disposition.capacity_scope.as_deref()
+            ),
+            ("machine_capacity", Some("disk"))
+        );
+        assert!(
+            disposition.safe_message.starts_with(
+                "disk_pressure: waiting for free space on the workspace filesystem of Server host"
+            ),
+            "{}",
+            disposition.safe_message
+        );
+        // Nobody collects garbage on this root: the wait says so.
+        assert!(disposition
+            .safe_message
+            .contains("workspace garbage collection is not running on Server host"));
+        assert!(
+            format!("{:?}", waiting.condition).contains("Disk"),
+            "{:?}",
+            waiting.condition
+        );
+        let project = ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(project.system_pause_reason.is_none(), "no Project pause");
+
+        // Still short: the dispatcher's precheck keeps the wait.
+        assert!(crate::placement::machine_precheck::wait_before_dispatch(
+            &db,
+            &service,
+            &waiting,
+            &agent,
+            Some("coder")
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            crate::deferred_dispatch::dispatch_disposition(&reload().await),
+            Some(disposition)
+        );
+
+        // The reading recovers. No human action: the next precheck clears
+        // the wait and the Task is admitted.
+        free.store(500, Ordering::SeqCst);
+        db.disk_admission.refresh();
+        let waiting = reload().await;
+        assert!(!crate::placement::machine_precheck::wait_before_dispatch(
+            &db,
+            &service,
+            &waiting,
+            &agent,
+            Some("coder")
+        )
+        .await
+        .unwrap());
+        let cleared = reload().await;
+        assert!(crate::deferred_dispatch::dispatch_disposition(&cleared).is_none());
+        assert!(!format!("{:?}", cleared.condition).contains("Disk"));
+        let admission = service
+            .reserve_claim_workspace(&cleared, Some(&agent), "coder")
+            .await
+            .expect("admitted once the disk has room");
+        let prepared = service.prepare_claim_workspace(admission).await.unwrap();
+        assert_eq!(prepared.placement.state, PlacementState::Ready);
+
+        // Short again: a run in the worktree that already exists is admitted.
+        free.store(10, Ordering::SeqCst);
+        db.disk_admission.refresh();
+        let again = service
+            .reserve_claim_workspace(&cleared, Some(&agent), "coder")
+            .await
+            .expect("an existing valid worktree is never refused for disk");
+        assert_eq!(again.placement.id, prepared.placement.id);
+        let again = service.prepare_claim_workspace(again).await.unwrap();
+        // The same Task with its worktree gone: making it again is new disk,
+        // refused with the same code; it is made once the disk has room.
+        let worktree = PathBuf::from(again.placement.workspace_handle.as_deref().unwrap());
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let gone = service
+            .reserve_claim_workspace(&cleared, Some(&agent), "coder")
+            .await
+            .expect("the ready placement itself is still admitted");
+        let recreate = service
+            .prepare_claim_workspace(gone)
+            .await
+            .err()
+            .expect("a recreate is refused under the floor");
+        assert_eq!(
+            crate::placement::capacity_wait_of(&recreate),
+            Some(crate::placement::CapacityWait::Disk),
+            "{recreate:?}"
+        );
+        assert!(!worktree.exists());
+        free.store(500, Ordering::SeqCst);
+        db.disk_admission.refresh();
+        let gone = service
+            .reserve_claim_workspace(&cleared, Some(&agent), "coder")
+            .await
+            .unwrap();
+        service.prepare_claim_workspace(gone).await.unwrap();
+        assert!(worktree.is_dir());
+        free.store(10, Ordering::SeqCst);
+        db.disk_admission.refresh();
+        // A second Task, which would need a new worktree, still waits.
+        let other = seed_task(&db, &project_id, None).await;
+        assert!(matches!(
+            service
+                .reserve_claim_workspace(&other, Some(&agent), "coder")
+                .await,
+            Err(ServiceError::PlacementUnavailable(_))
+        ));
+        // Unreadable disk: nothing is refused.
+        db.disk_admission
+            .configure(api_types::DiskFloor::of_bytes(100, 0), Arc::new(|| None));
+        service
+            .reserve_claim_workspace(&other, Some(&agent), "coder")
+            .await
+            .expect("an unreadable disk refuses nothing");
     }
 
     #[tokio::test]

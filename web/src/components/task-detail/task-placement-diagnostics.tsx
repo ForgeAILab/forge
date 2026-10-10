@@ -7,6 +7,7 @@ const labels: Record<string, string> = {
   provision_failed:
     'Repository provisioning failed; reconnect or update placement settings to retry',
   machine_capacity: 'Machine run capacity reached',
+  disk_pressure: 'Workspace disk is under its free-space floor',
   executor_unavailable: 'Executor unavailable',
 }
 

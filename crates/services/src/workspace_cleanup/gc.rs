@@ -32,6 +32,13 @@ const EVICTION_CANDIDATES: i64 = 256;
 
 /// Legacy hook-log directories looked at per pass.
 const LEGACY_LOG_DIRS: usize = 256;
+/// Time one Task's expired logs may take to remove; what is left goes on
+/// the next sweep.
+const LOG_REMOVAL_BUDGET: Duration = Duration::from_secs(10);
+/// Garbage is collected ahead of its timer at most this often.
+const RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
+/// Time one such pass may take: an admission waits for it.
+const RECLAIM_BUDGET: Duration = Duration::from_secs(20);
 const OWNER_KEY: &str = "workspace_gc_owner_id";
 /// What the last ownership check found, for operator status.
 pub const STATUS_KEY: &str = "workspace_gc_status";
@@ -170,6 +177,9 @@ impl WorkspaceCleanupScheduler {
     /// Keep what the last check found where operator status reads it.
     /// Written only when it changes.
     async fn record_gc_status(&self, root: &Path, ownership: Ownership) {
+        if let Ok(mut state) = self.gc_state.write() {
+            *state = Some(ownership.as_str());
+        }
         let reason = match ownership {
             Ownership::Refused(reason) => Some(reason),
             _ => None,
@@ -193,6 +203,95 @@ impl WorkspaceCleanupScheduler {
         if let Err(error) = written {
             tracing::warn!(%error, "workspace gc status not recorded");
         }
+    }
+
+    /// Turn disk-pressure admission on for this server: the floor every
+    /// machine is held to, and the reading of this server's own workspace
+    /// root. Called once by the running server, never by a test builder, so
+    /// a scheduler nobody enabled it for refuses nothing.
+    pub fn enable_disk_admission(self: &Arc<Self>, floor: FreeFloor) {
+        let scheduler = Arc::downgrade(self);
+        let root = self.workspace_root.clone();
+        self.db.disk_admission.configure(
+            floor,
+            Arc::new(move || {
+                let space = gc::disk_space(&root)?;
+                let gc_state = scheduler
+                    .upgrade()
+                    .and_then(|scheduler| scheduler.gc_state.read().ok().and_then(|state| *state))
+                    .map(str::to_owned);
+                Some(space.facts(now_rfc3339(), gc_state))
+            }),
+        );
+    }
+
+    /// Collect garbage now when the server's root is under the mark at which
+    /// the collector should not wait for its timer, then read the disk
+    /// again. Admission calls this before it counts the server as short of
+    /// disk, and the cleanup tick calls it every minute; however often it is
+    /// asked, it collects at most once per [`RECLAIM_INTERVAL`]. `true` when
+    /// a pass ran.
+    pub async fn reclaim_under_pressure(&self) -> bool {
+        self.reclaim(false).await
+    }
+
+    /// [`Self::reclaim_under_pressure`] for an admission: only when the
+    /// server's root is under the floor itself, so the admission would be
+    /// refused. Between the floor and the collector mark nothing is refused
+    /// and no claim (and no dispatcher scan) pays for a collection; the
+    /// cleanup tick runs that one.
+    ///
+    /// What an admission can wait for is bounded: one pass of at most
+    /// [`RECLAIM_BUDGET`], for the one caller that finds the collector free
+    /// and no pass in the last [`RECLAIM_INTERVAL`]. Every other caller
+    /// returns at once, whether a pass is running or just ran. The pass
+    /// holds the collector's own cursor and, briefly and one at a time, the
+    /// lifecycle lock of a Task it evicts from; it holds nothing a claim of
+    /// another Task or on another machine takes.
+    pub async fn reclaim_before_refusing(&self) -> bool {
+        self.reclaim(true).await
+    }
+
+    async fn reclaim(&self, only_under_floor: bool) -> bool {
+        let admission = &self.db.disk_admission;
+        let Some(floor) = admission.floor() else {
+            return false;
+        };
+        let Some(facts) = admission.server_facts() else {
+            return false;
+        };
+        if !floor.wants_gc(&facts) || (only_under_floor && floor.pressure(&facts).is_none()) {
+            return false;
+        }
+        // The periodic sweep holds the cursor for its whole pass and is the
+        // same collection: an admission never waits behind it for a second
+        // one.
+        let Ok(mut cursor) = self.sweep_cursor.try_lock() else {
+            return false;
+        };
+        {
+            let mut last = self
+                .last_reclaim
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if last.is_some_and(|at| at.elapsed() < RECLAIM_INTERVAL) {
+                return false;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let report = self.gc_pass(&mut cursor, RECLAIM_BUDGET).await;
+        drop(cursor);
+        let after = admission.refresh();
+        tracing::info!(
+            ?report,
+            free_bytes_before = facts.free_bytes,
+            free_bytes_after = after.as_ref().map(|facts| facts.free_bytes),
+            still_under_floor = after
+                .as_ref()
+                .is_some_and(|facts| floor.pressure(facts).is_some()),
+            "workspace disk is short: garbage collected ahead of the timer"
+        );
+        true
     }
 
     /// Let the pass remove the legacy locations under the system temp
@@ -232,6 +331,12 @@ impl WorkspaceCleanupScheduler {
         if terminal_since + chrono::Duration::days(i64::from(days)) > chrono::Utc::now() {
             return;
         }
+        // Somebody is still looking at this Task: an open review reads its
+        // logs, and an open attention item points a person at them. An
+        // unreadable answer keeps the logs too.
+        if !matches!(self.task_logs_unreferenced(&task.id).await, Ok(true)) {
+            return;
+        }
         let Ok(root) = std::fs::canonicalize(&self.workspace_root) else {
             return;
         };
@@ -245,7 +350,7 @@ impl WorkspaceCleanupScheduler {
             .join("logs")
             .join(&task.project_id)
             .join(&task.id);
-        let sweep = Sweep::new(&root, &root, is_task_id, Duration::ZERO);
+        let sweep = Sweep::new(&root, &root, is_task_id, LOG_REMOVAL_BUDGET);
         let quiet = Duration::from_secs(u64::from(days) * 24 * 60 * 60);
         let report = blocking(move || {
             let mut report = GcReport::default();
@@ -261,6 +366,27 @@ impl WorkspaceCleanupScheduler {
         if report.removed > 0 {
             tracing::info!(task_id = %task.id, days, "logs of a terminal Task removed after their retention");
         }
+    }
+
+    /// No review of the Task is open (running or waiting for a person) and
+    /// no attention item about it is unresolved.
+    async fn task_logs_unreferenced(&self, task_id: &str) -> Result<bool> {
+        let referenced = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM review
+                WHERE task_id = ?1 AND status IN ('running', 'awaiting_human')
+             ) OR EXISTS (
+                SELECT 1 FROM attention_projection
+                WHERE status <> 'resolved'
+                  AND ((scope_type = 'task' AND scope_id = ?1)
+                       OR json_extract(details_json, '$.task_id') = ?1
+                       OR json_extract(details_json, '$.task.id') = ?1)
+             )",
+        )
+        .bind(task_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        Ok(referenced == 0)
     }
 
     pub(super) async fn gc_pass(&self, cursor: &mut SweepCursor, budget: Duration) -> GcReport {
@@ -345,9 +471,10 @@ impl WorkspaceCleanupScheduler {
                 _ => HashSet::new(),
             };
             let pass = sweep.clone();
+            let run_floor = settings.free_floor;
             let swept = blocking(move || {
                 let mut report = GcReport::default();
-                pass.run_dirs(running.iter().map(String::as_str), &mut report);
+                pass.run_dirs(running.iter().map(String::as_str), &run_floor, &mut report);
                 pass.check_checkouts(live_checks, &mut report);
                 // The legacy homes are shared by every run that still falls
                 // back to them, so they go only while nothing runs at all.
@@ -537,7 +664,12 @@ impl WorkspaceCleanupScheduler {
         })
     }
 
+    /// Terminal by its workflow state, or deleted: a deleted Task never runs
+    /// again, whatever state it was deleted in.
     async fn task_is_terminal(&self, task: &db::Task) -> Result<bool> {
+        if task.deleted_at.is_some() {
+            return Ok(true);
+        }
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(false);
         };
@@ -588,7 +720,9 @@ impl WorkspaceCleanupScheduler {
         let Some(task) = TaskRepo::get_by_id(&*self.db, name, true).await? else {
             return Ok(());
         };
-        let _guard = self.lock_task(&task).await;
+        let Some(_guard) = self.lock_task_for_gc(&task).await else {
+            return Ok(());
+        };
         let Some(task) = TaskRepo::get_by_id(&*self.db, name, true).await? else {
             return Ok(());
         };
@@ -660,19 +794,24 @@ impl WorkspaceCleanupScheduler {
         (ours && is_task_id(name)).then(|| name.to_owned())
     }
 
+    /// Evict build output, least recently used first, while the root is
+    /// under its floor. Each Task is decided and evicted under its lifecycle
+    /// lock, after reading its state again: what the candidate list said is
+    /// stale by the time its turn comes. The eviction itself is one rename
+    /// made under the lock every run start takes
+    /// ([`Sweep::evict_build`]); the delete happens after both are released.
     async fn gc_evict_builds(
         &self,
         sweep: &Sweep,
         floor: &FreeFloor,
         report: &mut GcReport,
     ) -> Result<()> {
-        let (root, floor, disk_space) = (sweep.root.clone(), *floor, sweep.disk_space);
-        let under_floor = blocking(move || {
-            disk_space(&root).is_some_and(|space| space.free < floor.bytes(space.total))
-        })
-        .await
-        .unwrap_or(false);
-        if !under_floor {
+        let (pass, floor) = (sweep.clone(), *floor);
+        let under_floor = {
+            let pass = pass.clone();
+            move || pass.under_floor(&floor)
+        };
+        if !blocking(under_floor.clone()).await.unwrap_or(false) {
             return Ok(());
         }
         let rows = sqlx::query_as::<_, (String, String)>(
@@ -682,30 +821,75 @@ impl WorkspaceCleanupScheduler {
         .bind(EVICTION_CANDIDATES)
         .fetch_all(self.db.pool())
         .await?;
-        let mut candidates = Vec::new();
+        let mut tasks = HashMap::new();
         for (task_id, worktree_path) in rows {
-            let Some(name) = self.task_root_name(&worktree_path) else {
+            if let Some(name) = self.task_root_name(&worktree_path) {
+                tasks.insert(name, task_id);
+            }
+        }
+        let names: Vec<String> = tasks.keys().cloned().collect();
+        let ordered = {
+            let pass = pass.clone();
+            blocking(move || pass.builds_by_last_use(&names))
+                .await
+                .unwrap_or_default()
+        };
+        for name in ordered {
+            if std::time::Instant::now() >= sweep.deadline {
+                report.out_of_time = true;
+                break;
+            }
+            let Some(task_id) = tasks.get(&name) else {
                 continue;
             };
-            let Some(task) = TaskRepo::get_by_id(&*self.db, &task_id, false).await? else {
+            let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, true).await? else {
+                continue;
+            };
+            // Never an unbounded wait: see `lock_task_for_gc`.
+            let Some(guard) = self.lock_task_for_gc(&task).await else {
+                continue;
+            };
+            let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, true).await? else {
                 continue;
             };
             // A terminal Task's build output goes with its Task root; a busy
             // Task keeps what it is building with.
-            if self.task_is_terminal(&task).await? || self.task_is_active(&task_id).await? {
+            if self.task_is_terminal(&task).await? || self.task_is_active(task_id).await? {
                 continue;
             }
-            candidates.push(name);
+            let evicted = {
+                let (pass, name) = (pass.clone(), name.clone());
+                blocking(move || {
+                    let mut report = GcReport::default();
+                    pass.evict_build(&name, &mut report);
+                    report
+                })
+                .await
+                .unwrap_or_default()
+            };
+            drop(guard);
+            report.merge(&evicted);
+            if evicted.builds_evicted == 0 {
+                continue;
+            }
+            // Space comes back only when the trash is emptied.
+            let emptied = {
+                let pass = pass.clone();
+                blocking(move || {
+                    let mut report = GcReport::default();
+                    pass.empty_trash(&mut report);
+                    // The build output itself is counted as an eviction.
+                    report.removed = report.removed.saturating_sub(1);
+                    report
+                })
+                .await
+                .unwrap_or_default()
+            };
+            report.merge(&emptied);
+            if !blocking(under_floor.clone()).await.unwrap_or(false) {
+                break;
+            }
         }
-        let pass = sweep.clone();
-        let done = blocking(move || {
-            let mut report = GcReport::default();
-            pass.evict_builds(&candidates, &floor, &mut report);
-            report
-        })
-        .await
-        .unwrap_or_default();
-        report.merge(&done);
         Ok(())
     }
 

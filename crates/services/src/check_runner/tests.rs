@@ -1053,6 +1053,56 @@ async fn a_cancel_between_prepare_and_the_dispatch_record_starts_no_operation() 
     assert_eq!(count.active_runs(), 0);
 }
 
+/// Every run this worker dispatches executes in its Task's existing
+/// worktree, so the disk floor never holds one back: a wait here would keep
+/// a reviewed Task from finishing (which is how its worktree is given back)
+/// and would end, after the 30-minute queued-run expiry, as an
+/// infrastructure failure. Under the floor the check is admitted at once,
+/// never waits for capacity, and runs.
+#[tokio::test]
+async fn a_check_in_an_existing_worktree_is_admitted_under_the_disk_floor() {
+    let (_temp, store, runner) = fixture().await;
+    store.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(|| {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: 10,
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: db::now_rfc3339(),
+                gc_state: None,
+            })
+        }),
+    );
+    assert_eq!(
+        store.disk_admission.server_pressure(),
+        Some(api_types::DiskPressureKind::Bytes)
+    );
+    let run = scheduled(runner.request(cacheable_request("disk-a")).await.unwrap());
+    let admitted = admit(&store, &run).await;
+    let record = store.check_worker_record(&run.id).await.unwrap();
+    assert!(record.admitted_at.is_some(), "admitted, not expired");
+    assert_eq!(
+        store.check_run_counts().await.unwrap().waiting_for_capacity,
+        0
+    );
+    let owner = Arc::new(TestOwner::default());
+    CheckRunWorker::new(store.clone(), owner.clone())
+        .drive(admitted)
+        .await
+        .unwrap();
+    assert_eq!(owner.runs.load(Ordering::SeqCst), 1);
+    let finished = store.check_run(&run.id).await.unwrap().unwrap().state;
+    assert!(
+        !matches!(
+            finished,
+            CheckRunState::Failed | CheckRunState::Cancelled | CheckRunState::Queued
+        ),
+        "{finished:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_check_borrows_the_same_tasks_reservation_and_keeps_its_slot_when_it_expires() {
     let (temp, store, runner) = fixture().await;

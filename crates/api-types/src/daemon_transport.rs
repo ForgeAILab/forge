@@ -46,11 +46,20 @@ pub const STALE_GENERATION: &str = "stale_generation";
 pub const WRONG_OWNER: &str = "wrong_owner";
 pub const PURPOSE_DENIED: &str = "purpose_denied";
 pub const OUTSIDE_WORKSPACE_ROOT: &str = "outside_workspace_root";
+/// `workspace.prepare` (a new or recreated worktree) and an exact-commit
+/// `check.run` refused because the daemon's own disk reading is under the
+/// free-space floor. Nothing was created; the same request is admitted once
+/// the machine has room.
+pub const DISK_PRESSURE: &str = "disk_pressure";
 pub const WORKSPACE_FILE_NOT_FOUND: &str = "workspace_file_not_found";
 
 /// Revision 6 added the integration owner wire: the fence announcement on
 /// lookup, `integration.announce`, and Git object export / import. Revision 7
-/// lets `integration.release_objects` delete the refs an attempt imported.
+/// (one unreleased revision, two changes) lets `integration.release_objects`
+/// delete the refs an attempt imported, and adds the disk facts of the
+/// workspace root to every daemon report and the free-space floor to its
+/// reply: a daemon that does not send them could fill its disk with work the
+/// server keeps placing there.
 pub const DAEMON_PROTOCOL_REVISION: u32 = 7;
 /// Every command RPC requires revision 7.
 pub const DAEMON_MIN_PROTOCOL_REVISION: u32 = 7;

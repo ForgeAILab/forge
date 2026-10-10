@@ -266,3 +266,133 @@ async fn machine_capacity_daemon_reports_and_admin_limit_over_local_socket() {
     )
     .await;
 }
+
+/// A daemon's report carries the disk facts of its workspace root; the reply
+/// carries the floor back; the machine reads and operator status show each
+/// machine's reading with the floor applied.
+#[tokio::test]
+async fn machine_disk_facts_arrive_with_the_report_and_show_on_every_machine_read() {
+    use api_types::{DiskFloor, DiskPressureKind, MachineDiskFacts};
+    let root = TestDir::new("machine-daemon-disk");
+    let (app, state) = settings_app(root.path()).await;
+    let registration: api_types::DaemonRegisterResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/daemons/register",
+        json!({"machine_id":"remote-disk","hostname":"Remote","os":"linux","arch":"x64"}),
+        StatusCode::OK,
+    )
+    .await;
+    let report_url = format!("/api/v1/daemons/{}/report", registration.daemon_id);
+    let reading = json!({"free_bytes":40,"total_bytes":1000,"free_inodes":5,"total_inodes":100,"measured_at":"2026-10-10T00:00:00Z","gc_state":"claimed_by_other"});
+
+    // Nothing built for a test turns admission on: the reading is kept, and
+    // no floor is applied or sent.
+    let quiet: DaemonResponse = json_request_with_bearer(
+        &app,
+        Method::POST,
+        &report_url,
+        &registration.registration_token,
+        json!({"detected_clis":[],"disk":reading}),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(quiet.disk.is_none() && quiet.workspace_floor.is_none());
+
+    // The running server configures the floor and reads its own root.
+    let floor = DiskFloor::of_bytes(100, 0);
+    state.db.disk_admission.configure(
+        floor,
+        Arc::new(|| {
+            Some(MachineDiskFacts {
+                free_bytes: 900,
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: "2026-10-10T00:00:00Z".to_owned(),
+                gc_state: Some("owned".to_owned()),
+            })
+        }),
+    );
+    let reported: DaemonResponse = json_request_with_bearer(
+        &app,
+        Method::POST,
+        &report_url,
+        &registration.registration_token,
+        json!({"detected_clis":[],"disk":reading}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        reported.workspace_floor,
+        Some(floor),
+        "the floor travels back"
+    );
+    let disk = reported
+        .disk
+        .expect("the reply shows the reading it carried");
+    assert_eq!(
+        (
+            disk.facts.free_bytes,
+            disk.facts.free_inodes,
+            disk.floor_bytes
+        ),
+        (40, Some(5), 100)
+    );
+    assert_eq!(disk.pressure, Some(DiskPressureKind::Bytes));
+    assert_eq!(disk.facts.gc_state.as_deref(), Some("claimed_by_other"));
+
+    // A report without a reading keeps the last one.
+    let kept: DaemonResponse = json_request_with_bearer(
+        &app,
+        Method::POST,
+        &report_url,
+        &registration.registration_token,
+        json!({"detected_clis":[]}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(kept.disk, Some(disk.clone()));
+    let read: DaemonResponse = empty_request_with_bearer(
+        &app,
+        Method::GET,
+        &format!("/api/v1/daemons/{}", registration.daemon_id),
+        &common::admin_jwt(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(read.disk, Some(disk));
+
+    // Operator status: the machine under its floor is visible as such, the
+    // server host is not.
+    let status = state
+        .operator_status_service
+        .compute_status()
+        .await
+        .unwrap();
+    let pressure = |id: &str| {
+        status
+            .daemon_pressure
+            .iter()
+            .find(|machine| machine.daemon_id == id)
+            .and_then(|machine| machine.disk.clone())
+            .map(|disk| disk.pressure)
+    };
+    assert_eq!(pressure("server_host"), Some(None));
+    assert_eq!(
+        pressure(&registration.daemon_id),
+        Some(Some(DiskPressureKind::Bytes))
+    );
+
+    // The next report shows the disk recovered: nothing else is needed.
+    let recovered: DaemonResponse = json_request_with_bearer(
+        &app,
+        Method::POST,
+        &report_url,
+        &registration.registration_token,
+        json!({"detected_clis":[],"disk":{"free_bytes":800,"total_bytes":1000,"measured_at":"2026-10-10T00:01:00Z"}}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(recovered.disk.unwrap().pressure, None);
+}

@@ -87,6 +87,10 @@ pub async fn report_daemon(
         .await
         .map_err(|_| ApiError::unauthorized("invalid daemon bearer token"))?;
 
+    // Kept before the report is ingested, so the reply already shows it.
+    if let Some(disk) = request.disk.as_ref() {
+        db::machine_disk::record_daemon_disk(&state.db, &id, disk).await?;
+    }
     let daemon = state
         .daemon_service
         .ingest_report(

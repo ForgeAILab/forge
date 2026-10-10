@@ -1,4 +1,10 @@
 import type { TaskCondition } from './bindings/TaskCondition'
+import type { MachineDisk } from './bindings/MachineDisk'
+import type { DiskFloor } from './bindings/DiskFloor'
+export type { MachineDisk } from './bindings/MachineDisk'
+export type { MachineDiskFacts } from './bindings/MachineDiskFacts'
+export type { DiskFloor } from './bindings/DiskFloor'
+export type { DiskPressureKind } from './bindings/DiskPressureKind'
 export type { TaskCondition } from './bindings/TaskCondition'
 export type { IntegrationAttemptId } from './bindings/IntegrationAttemptId'
 export type { IntegrationReason } from './bindings/IntegrationReason'
@@ -1176,6 +1182,10 @@ export interface Daemon {
   max_concurrent_runs: number | null
   run_limit: number | null
   effective_max_concurrent_runs: number | null
+  /** The machine's last disk reading with the free-space floor applied. */
+  disk?: MachineDisk | null
+  /** The free-space floor the server applies to this machine. */
+  workspace_floor?: DiskFloor | null
   id: string
   machine_id: string
   hostname: string
@@ -1643,6 +1653,8 @@ export interface DaemonPressureSummary {
   active_runs: number
   max_concurrent_runs: number | null
   at_capacity: boolean
+  /** While `disk.pressure` is set the machine starts no new worktree or check. */
+  disk?: MachineDisk | null
 }
 
 export interface AgentPressureSummary {

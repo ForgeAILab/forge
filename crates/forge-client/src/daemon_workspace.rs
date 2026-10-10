@@ -182,13 +182,17 @@ impl DaemonWorkspaceBackend {
         }
         let mut state: WorkspaceRegistry = journal.load_workspace_state()?;
         let gc_lock = gc::adopt_root(&workspace_root, &mut state, &journal);
-        // No run survives a daemon restart, so every per-run temp directory
-        // left under an owned Task root belongs to a dead run. That holds
-        // only for the one daemon on this root: another process that shares
-        // it has runs of its own, so only the holder of the root lock sweeps.
+        // A run this daemon left detached can outlive its restart, so a
+        // per-run temp directory goes only once it is older than the longest
+        // run. Another process that shares the root has runs of its own, so
+        // only the holder of the root lock sweeps.
         if gc_lock.is_some() {
-            let swept =
-                executors::sandbox::sweep_dead_runs(&workspace_root.join(WORKTREE_DIRECTORY), []);
+            let swept = executors::sandbox::sweep_stale_runs(
+                &workspace_root.join(WORKTREE_DIRECTORY),
+                [],
+                std::time::SystemTime::now(),
+                executors::gc::MAX_RUN_AGE,
+            );
             if swept > 0 {
                 tracing::info!(
                     swept,
@@ -602,6 +606,19 @@ impl DaemonWorkspaceBackend {
                 if !discard_plan || existing.is_some() {
                     self.workspace(&reference(&fence, handle), recreating)?;
                 }
+            }
+            // The backstop of disk admission: the server placed this from a
+            // report that may be old. A worktree that exists is never
+            // refused; making one (new, or again) under the floor is. The
+            // refusal comes before the operation is journaled: an outcome
+            // kept under this operation id would answer every retry of the
+            // same request with the refusal, long after the disk has room.
+            if method == METHOD_WORKSPACE_PREPARE
+                && !existing
+                    .as_ref()
+                    .is_some_and(|(_, workspace)| workspace.path.exists())
+            {
+                self.refuse_new_disk_under_pressure()?;
             }
             let operation = JournalOperation {
                 entry_id: operation_entry_id(&fence.operation_id),

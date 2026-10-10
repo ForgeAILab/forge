@@ -84,6 +84,9 @@ struct SweepCursor {
     root_name: String,
 }
 
+/// How long a garbage-collection pass waits for one Task's lifecycle lock.
+pub(crate) const GC_LOCK_WAIT: Duration = Duration::from_secs(1);
+
 pub struct WorkspaceCleanupScheduler {
     db: Arc<SqliteDb>,
     workspace_backend_router: RwLock<Arc<WorkspaceBackendRouter>>,
@@ -94,6 +97,10 @@ pub struct WorkspaceCleanupScheduler {
     lifecycle_locks: WorkspaceExecutionLockManager,
     sweep_cursor: Mutex<SweepCursor>,
     gc_settings: RwLock<GcSettings>,
+    /// What the last ownership check of the root found, for the disk reading.
+    gc_state: RwLock<Option<&'static str>>,
+    /// When garbage was last collected because the disk was short.
+    last_reclaim: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 #[async_trait]
@@ -130,6 +137,8 @@ impl WorkspaceCleanupScheduler {
             lifecycle_locks: WorkspaceExecutionLockManager::new(),
             sweep_cursor: Mutex::new(SweepCursor::default()),
             gc_settings: RwLock::new(GcSettings::default()),
+            gc_state: RwLock::new(None),
+            last_reclaim: std::sync::Mutex::new(None),
         }
     }
 
@@ -189,6 +198,18 @@ impl WorkspaceCleanupScheduler {
         self.lifecycle_locks
             .acquire(task.parent_task_id.as_deref().unwrap_or(&task.id))
             .await
+    }
+
+    /// [`Self::lock_task`] for the garbage collector, which must never wait
+    /// for long: a pass can run inside an admission (a claim that reclaims
+    /// before it is refused for disk), and whoever holds this Task's lock
+    /// may be that very claim, or a reopen waiting on the admission. A Task
+    /// whose lock is not free within [`GC_LOCK_WAIT`] is busy; the pass
+    /// skips it and the next one finds it again.
+    pub(crate) async fn lock_task_for_gc(&self, task: &db::Task) -> Option<OwnedMutexGuard<()>> {
+        tokio::time::timeout(GC_LOCK_WAIT, self.lock_task(task))
+            .await
+            .ok()
     }
 
     pub fn spawn(
@@ -462,6 +483,8 @@ impl WorkspaceCleanupScheduler {
     }
 
     pub(crate) async fn tick(&self) -> Result<()> {
+        // Short of disk: collect now instead of waiting for the sweep timer.
+        self.reclaim_under_pressure().await;
         let task_ids = sqlx::query_scalar::<_, String>(
             "SELECT task_id FROM workspace
              WHERE status != 'cleaned' AND (cleanup_after <= ? OR (status = 'cleaning' AND cleanup_after IS NULL))
@@ -573,7 +596,12 @@ impl WorkspaceCleanupScheduler {
             &project.workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
         );
+        // A deleted Task never runs again, whatever state it was deleted in:
+        // its directories are reclaimed like a terminal Task's. Deletion
+        // itself stops nothing, so a run still in flight is waited for below
+        // exactly as for a terminal Task.
         if terminal_only
+            && task.deleted_at.is_none()
             && workflow.state_kind(&task.status) != Some(api_types::StateKind::Terminal)
         {
             return self.clear_cleanup_after(task_id).await;
@@ -646,12 +674,50 @@ impl WorkspaceCleanupScheduler {
             );
             return Ok(());
         }
+        // A deleted Task can still have work in its worktree that no
+        // execution row or lease shows: a dispatched check run (entry or
+        // review CI; deleting cancels its consumers, the run itself goes on
+        // to its deadline) and any hook, check or tool command of this
+        // process. Neither is stopped by deletion; both end by themselves
+        // (a check by its wall limit, at most a day), and the cleanup comes
+        // due again every tick until they have.
+        let checking = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                SELECT 1 FROM check_consumer c JOIN check_run r ON r.id = c.run_id
+                WHERE c.task_id = ?
+                  AND r.state IN ('running', 'cancelling', 'cleaning', 'uncertain')
+             )",
+        )
+        .bind(task_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        // A server-owned Task root is `<workspace root>/<root Task id>`.
+        let task_root = self
+            .workspace_root
+            .join(task.parent_task_id.as_deref().unwrap_or(&task.id));
+        let live_run = executors::sandbox::has_live_run_in(&task_root)
+            || std::fs::canonicalize(&task_root)
+                .is_ok_and(|resolved| executors::sandbox::has_live_run_in(&resolved));
+        if checking != 0 || live_run {
+            info!(
+                task_id,
+                checking = checking != 0,
+                live_run,
+                "deferring Task cleanup while a check or a run of this server is live in its worktree"
+            );
+            if let Some(workspace) = workspace.as_ref() {
+                if workspace.status != WorkspaceStatus::Cleaned {
+                    self.schedule(&workspace.id, TICK_INTERVAL).await?;
+                }
+            }
+            return Ok(());
+        }
         let cleanup_result = if let Some(workspace) = workspace {
             let children = TaskRepo::list_subtasks_ordered(&*self.db, task_id).await?;
-            if children
-                .iter()
-                .any(|child| !crate::task_hierarchy::subtask_is_terminal(child, &workflow))
-            {
+            if children.iter().any(|child| {
+                child.deleted_at.is_none()
+                    && !crate::task_hierarchy::subtask_is_terminal(child, &workflow)
+            }) {
                 return Ok(());
             }
             let router = self.workspace_backend_router()?;
@@ -3199,19 +3265,10 @@ mod tests {
         }
         let hook = hook.unwrap();
         let scheduler = gc_scheduler(&db, &root).await;
-        let under = executors::gc::FreeFloor {
-            min_free_bytes: u64::MAX,
-            min_free_percent: 0,
-        };
+        let under = executors::gc::FreeFloor::of_bytes(u64::MAX, 100);
 
         // Plenty of room: nothing is evicted.
-        scheduler.set_gc_limits(
-            30,
-            executors::gc::FreeFloor {
-                min_free_bytes: 0,
-                min_free_percent: 0,
-            },
-        );
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::of_bytes(0, 0));
         assert_eq!(gc_at(&scheduler, Duration::ZERO).await.builds_evicted, 0);
 
         // Under the floor while a check runs somewhere: nothing is evicted.
@@ -3542,6 +3599,379 @@ mod tests {
         assert!(logs_dir(&root, &tasks[2]).join("execution.jsonl").exists());
         assert!(logs_dir(&root, &recent).join("execution.jsonl").exists());
         assert!(logs_dir(&root, &skewed).join("execution.jsonl").exists());
+    }
+
+    #[tokio::test]
+    async fn gc_eviction_takes_the_task_lifecycle_lock_and_reads_the_task_again() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, &root, WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        let task = set_fixture_status(&db, &task, "todo").await;
+        let task_root = worktree_path.parent().unwrap().to_path_buf();
+        executors::sandbox::TaskRoot::reserve(&task_root).unwrap();
+        let marker = task_root.join(".forge-task/build/cargo/marker");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "x").unwrap();
+        let scheduler = Arc::new(gc_scheduler(&db, &root).await);
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::of_bytes(u64::MAX, 100));
+
+        // The pass saw an idle Task. Something holds the Task's lifecycle
+        // lock; a run starts before the pass gets its turn.
+        let guard = scheduler.lock_task(&task).await;
+        let pass = tokio::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            async move { gc_at(&scheduler, Duration::ZERO).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!pass.is_finished(), "eviction waits for the lifecycle lock");
+        assert!(marker.exists());
+        let run = fixture_execution(&db, &task, &workspace_id, db::ExecutionStatus::Running).await;
+        drop(guard);
+        let report = pass.await.unwrap();
+        assert_eq!((report.builds_evicted, report.errors), (0, 0));
+        assert!(
+            marker.exists(),
+            "the run that started keeps its build output"
+        );
+
+        // Once the run is over the same Task is evicted.
+        sqlx::query("UPDATE execution SET status = 'failed' WHERE id = ?")
+            .bind(&run.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // A lock that stays held (the claim that asked for this very pass,
+        // a reopen in flight) never hangs the pass: the Task is skipped, and
+        // the pass does not run out its budget waiting.
+        let guard = scheduler.lock_task(&task).await;
+        let started = std::time::Instant::now();
+        let report =
+            tokio::time::timeout(Duration::from_secs(10), gc_at(&scheduler, Duration::ZERO))
+                .await
+                .expect("a held lifecycle lock does not hang the pass");
+        assert_eq!((report.builds_evicted, report.errors), (0, 0));
+        assert!(started.elapsed() >= GC_LOCK_WAIT);
+        assert!(marker.exists());
+        drop(guard);
+
+        let report = gc_at(&scheduler, Duration::ZERO).await;
+        assert_eq!((report.builds_evicted, report.errors), (1, 0));
+        assert!(!marker.exists());
+        assert!(worktree_path.exists(), "only the build output goes");
+    }
+
+    /// A burst of admissions on a short disk runs one collection, and the
+    /// rest neither run their own nor wait behind it.
+    #[tokio::test]
+    async fn a_burst_of_admissions_under_the_floor_runs_one_reclaim_and_nobody_queues() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let scheduler = Arc::new(gc_scheduler(&db, &root).await);
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(150));
+        let reading = Arc::clone(&free);
+        db.disk_admission.configure(
+            api_types::DiskFloor::of_bytes(100, 0),
+            Arc::new(move || {
+                Some(api_types::MachineDiskFacts {
+                    free_bytes: reading.load(std::sync::atomic::Ordering::SeqCst),
+                    total_bytes: 1_000,
+                    free_inodes: None,
+                    total_inodes: None,
+                    measured_at: now_rfc3339(),
+                    gc_state: Some("owned".to_owned()),
+                })
+            }),
+        );
+        // Over the floor but under the collector mark: an admission would
+        // not be refused, so it does not collect (the cleanup tick does).
+        assert!(!scheduler.reclaim_before_refusing().await);
+        // Under the floor: fifty admissions at once.
+        free.store(10, std::sync::atomic::Ordering::SeqCst);
+        db.disk_admission.refresh();
+        let started = std::time::Instant::now();
+        let mut burst = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let scheduler = Arc::clone(&scheduler);
+            burst.spawn(async move { scheduler.reclaim_before_refusing().await });
+        }
+        let mut ran = 0;
+        while let Some(result) = burst.join_next().await {
+            ran += usize::from(result.unwrap());
+        }
+        assert_eq!(ran, 1, "one pass for the whole burst");
+        assert!(started.elapsed() < Duration::from_secs(15));
+        // The same minute: nothing more, from an admission or from the tick.
+        assert!(!scheduler.reclaim_before_refusing().await);
+        assert!(!scheduler.reclaim_under_pressure().await);
+    }
+
+    /// Before the server is counted as short of disk its garbage is
+    /// collected once and its disk read again: reclaimable trash present
+    /// means the machine is admitted after the pass.
+    #[tokio::test]
+    async fn disk_pressure_collects_garbage_once_then_reads_the_disk_again() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let scheduler = gc_scheduler(&db, &root).await;
+        let trash = root.join(executors::gc::TRASH_DIR);
+        std::fs::create_dir_all(trash.join("condemned-1-0/target")).unwrap();
+        std::fs::write(trash.join("condemned-1-0/target/big"), "x").unwrap();
+        // The injected disk: short exactly while the trash holds something.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counted, watched) = (Arc::clone(&reads), trash.clone());
+        db.disk_admission.configure(
+            api_types::DiskFloor::of_bytes(100, 0),
+            Arc::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let full =
+                    std::fs::read_dir(&watched).is_ok_and(|mut entries| entries.next().is_some());
+                Some(api_types::MachineDiskFacts {
+                    free_bytes: if full { 10 } else { 900 },
+                    total_bytes: 1_000,
+                    free_inodes: None,
+                    total_inodes: None,
+                    measured_at: now_rfc3339(),
+                    gc_state: Some("owned".to_owned()),
+                })
+            }),
+        );
+        assert_eq!(
+            db.disk_admission.server_pressure(),
+            Some(api_types::DiskPressureKind::Bytes)
+        );
+        assert!(scheduler.reclaim_under_pressure().await, "a pass ran");
+        assert!(!trash.join("condemned-1-0").exists());
+        assert_eq!(
+            db.disk_admission.server_pressure(),
+            None,
+            "read again after the pass"
+        );
+        // Asked again at once: no second pass, whatever the disk says.
+        std::fs::create_dir_all(trash.join("condemned-2-0")).unwrap();
+        db.disk_admission.refresh();
+        assert!(!scheduler.reclaim_under_pressure().await);
+        assert!(trash.join("condemned-2-0").exists());
+        // With room to spare nothing is collected ahead of the timer.
+        let unconfigured = sqlite_db().await;
+        let idle = gc_scheduler(&unconfigured, &root).await;
+        assert!(!idle.reclaim_under_pressure().await);
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn deleted_task_is_reclaimed_like_a_terminal_one_once_its_run_has_stopped() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let (workspace_id, worktree_path) =
+            seed_workspace(&db, temp.path(), WorkspaceStatus::Ready).await;
+        let task = fixture_task(&db, &workspace_id).await;
+        let task = set_fixture_status(&db, &task, "todo").await;
+        let scheduler = WorkspaceCleanupScheduler::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            temp.path().to_path_buf(),
+        );
+        let status = || async {
+            WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+        };
+
+        // Not terminal and not deleted: untouched.
+        scheduler.cleanup_terminal_task(&task.id).await.unwrap();
+        assert!(worktree_path.exists());
+        assert_eq!(status().await, WorkspaceStatus::Ready);
+
+        // Deleting stops nothing by itself: a run still in flight keeps the
+        // directory until it has stopped.
+        let run = fixture_execution(&db, &task, &workspace_id, db::ExecutionStatus::Running).await;
+        let now = now_rfc3339();
+        TaskRepo::soft_delete(
+            &*db,
+            db::SoftDeleteTask {
+                id: task.id.clone(),
+                expected_version: task.version,
+                deleted_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("Task is deleted");
+        scheduler.cleanup_terminal_task(&task.id).await.unwrap();
+        assert!(worktree_path.exists(), "a running execution defers cleanup");
+        assert_eq!(status().await, WorkspaceStatus::Ready);
+
+        // The run stops; a lease on the workspace still holds it.
+        sqlx::query("UPDATE execution SET status = 'cancelled' WHERE id = ?")
+            .bind(&run.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let due = || async {
+            sqlx::query("UPDATE workspace SET cleanup_after = ? WHERE id = ?")
+                .bind(now_rfc3339())
+                .bind(&workspace_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        };
+        // A hook, check or tool command of this server that is live in the
+        // Task root (in no table at all) keeps it as well, with or without
+        // a temp directory of its own.
+        let live = executors::sandbox::SandboxEnv::for_run(
+            &worktree_path,
+            "deleted-task-hook",
+            executors::sandbox::RunPurpose::Hook,
+        )
+        .without_tmp()
+        .prepared();
+        due().await;
+        scheduler.tick().await.unwrap();
+        assert!(worktree_path.exists(), "a live run defers cleanup");
+        assert_eq!(status().await, WorkspaceStatus::Ready);
+        assert!(
+            WorkspaceRepo::get_by_id(&*db, &workspace_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .cleanup_after
+                .is_some(),
+            "and the cleanup comes due again"
+        );
+        live.settle();
+
+        // Everything has stopped; the deferred cleanup comes due.
+        due().await;
+        scheduler.tick().await.unwrap();
+        assert!(!worktree_path.exists());
+        assert_eq!(status().await, WorkspaceStatus::Cleaned);
+    }
+
+    #[tokio::test]
+    async fn log_retention_skips_a_task_with_an_open_review_or_attention_item() {
+        let db = sqlite_db().await;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (workspace_id, _) = seed_workspace(&db, &root, WorkspaceStatus::Cleaned).await;
+        let base = fixture_task(&db, &workspace_id).await;
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let task = seed_log_only_task(&db, &root, &base, new_uuid_v4(), None, "done").await;
+            sqlx::query("UPDATE task SET updated_at = ? WHERE id = ?")
+                .bind((chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339())
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            tasks.push(task);
+        }
+        let (reviewed, flagged, plain) = (&tasks[0], &tasks[1], &tasks[2]);
+        // A review a person has not decided yet.
+        let execution =
+            fixture_execution(&db, reviewed, &workspace_id, db::ExecutionStatus::Completed).await;
+        let now = now_rfc3339();
+        sqlx::query("INSERT INTO review (id, task_id, execution_id, attempt_number, status, step_results_json, started_at, created_at, updated_at) VALUES (?, ?, ?, 1, 'awaiting_human', '[]', ?, ?, ?)")
+            .bind(new_uuid_v4())
+            .bind(&reviewed.id)
+            .bind(&execution.id)
+            .bind(&now)
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // An attention item that points a person at the Task.
+        let mut transaction = db::begin_immediate(db.pool()).await.unwrap();
+        let event = db::DomainEventRepo::append_event_in_tx(
+            &*db,
+            &mut transaction,
+            &db::CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "task.needs_attention".to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: flagged.id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "project".to_owned(),
+                scope_id: flagged.project_id.clone(),
+                correlation_id: flagged.id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".to_owned(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        db.insert_attention_in_tx(
+            &mut transaction,
+            db::CreateAttentionProjection {
+                id: new_uuid_v4(),
+                attention_type: "progress_warning".to_owned(),
+                scope_type: "project".to_owned(),
+                scope_id: flagged.project_id.clone(),
+                identity_id: None,
+                source_event_id: event.id,
+                priority: 60,
+                status: "open".to_owned(),
+                summary: "look at this Task".to_owned(),
+                details_json: serde_json::json!({"task": {"id": flagged.id}}).to_string(),
+                dedupe_key: format!("test:{}", flagged.id),
+                occurred_at: now.clone(),
+                updated_at: now.clone(),
+                acknowledged_at: None,
+                snoozed_until: None,
+                resolved_at: None,
+                updated_by_user_id: None,
+                recommended_action: "inspect".to_owned(),
+                source_sequence: Some(event.sequence),
+            },
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        let scheduler = gc_scheduler(&db, &root).await;
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::default());
+        let age = |tasks: &[db::Task]| {
+            for task in tasks {
+                if logs_dir(&root, task).exists() {
+                    backdate(&logs_dir(&root, task), 60);
+                }
+            }
+        };
+        // The first sweep removes the legacy agent home from each log
+        // directory, which is a write to it: age them, then sweep again.
+        scheduler.sweep().await.unwrap();
+        age(&tasks);
+        scheduler.sweep().await.unwrap();
+        assert!(!logs_dir(&root, plain).exists());
+        assert!(logs_dir(&root, reviewed).join("execution.jsonl").exists());
+        assert!(logs_dir(&root, flagged).join("execution.jsonl").exists());
+
+        // Decided and resolved: both are ordinary old logs now.
+        sqlx::query("UPDATE review SET status = 'passed' WHERE task_id = ?")
+            .bind(&reviewed.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE attention_projection SET status = 'resolved' WHERE dedupe_key = ?")
+            .bind(format!("test:{}", flagged.id))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        age(&tasks);
+        scheduler.sweep().await.unwrap();
+        assert!(!logs_dir(&root, reviewed).exists());
+        assert!(!logs_dir(&root, flagged).exists());
     }
 
     #[cfg(unix)]

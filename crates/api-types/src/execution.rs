@@ -465,6 +465,14 @@ pub struct DaemonResponse {
     pub max_concurrent_runs: Option<i64>,
     pub run_limit: Option<u32>,
     pub effective_max_concurrent_runs: Option<i64>,
+    /// The machine's last disk reading with the floor applied. `None` until
+    /// the machine has reported one.
+    #[serde(default)]
+    pub disk: Option<crate::MachineDisk>,
+    /// The free-space floor the server applies to this machine. A daemon
+    /// uses it for its own garbage collector, so eviction and refusal agree.
+    #[serde(default)]
+    pub workspace_floor: Option<crate::DiskFloor>,
     pub id: String,
     pub machine_id: String,
     pub hostname: String,
@@ -514,6 +522,10 @@ pub struct DaemonRegisterResponse {
 pub struct DaemonReportRequest {
     #[serde(default)]
     pub max_concurrent_runs: Option<u32>,
+    /// Free bytes and inodes of the filesystem holding the workspace root,
+    /// read for this report.
+    #[serde(default)]
+    pub disk: Option<crate::MachineDiskFacts>,
     pub detected_clis: Vec<DetectedCli>,
     pub runtimes: Option<Vec<RuntimeReport>>,
     pub labels: Option<Value>,

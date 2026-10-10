@@ -90,7 +90,7 @@ describe('Project capacity waits on task surfaces', () => {
     )
     expect(screen.getByText('Needs owner')).toBeTruthy()
   })
-  it.each(['project_at_capacity', 'project_waiting_on_owner', 'machine_capacity'])(
+  it.each(['project_at_capacity', 'project_waiting_on_owner', 'machine_capacity', 'disk_pressure'])(
     'shows the %s message on a Kanban card',
     (reason) => {
       const task = queuedTask(reason)

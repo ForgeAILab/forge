@@ -154,6 +154,8 @@ pub struct SqliteDb {
     pub(crate) task_step_executor:
         Arc<std::sync::Mutex<Option<std::sync::Weak<dyn crate::task_writer::TaskStepExecutor>>>>,
     pub server_run_cap: Arc<crate::machine_capacity::MachineRunCap>,
+    /// Disk-pressure admission: off until the running server configures it.
+    pub disk_admission: Arc<crate::machine_disk::DiskAdmission>,
     pool: SqlitePool,
     pub(crate) task_step_activity:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
@@ -178,6 +180,7 @@ impl SqliteDb {
             readiness_decode_warnings: Default::default(),
             domain_event_hooks,
             server_run_cap: Arc::new(crate::machine_capacity::MachineRunCap::default()),
+            disk_admission: Default::default(),
         }
     }
 
@@ -455,6 +458,7 @@ fn map_workspace(row: SqliteRow) -> Result<Workspace> {
 
 fn map_daemon(row: SqliteRow) -> Result<Daemon> {
     Ok(Daemon {
+        disk_json: row.try_get("disk_json").unwrap_or(None),
         max_concurrent_runs: row.try_get("max_concurrent_runs")?,
         run_limit: row.try_get("run_limit")?,
         id: row.try_get("id")?,

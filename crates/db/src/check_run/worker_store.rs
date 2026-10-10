@@ -206,6 +206,14 @@ impl CheckWorkerRepo for SqliteDb {
             let capacity =
                 crate::machine_capacity::count_machine_capacity(&mut tx, machine, cap, &embedded)
                     .await?;
+            // Disk pressure is deliberately not asked here. Every run this
+            // worker dispatches executes in its Task's existing, ready
+            // worktree (`CheckDispatchTarget::{Server, Daemon}` both name a
+            // workspace; nothing here makes a checkout), and a run in an
+            // existing worktree is never refused for disk: finishing the
+            // review or the merge is how the worktree is given back. A wait
+            // here would also end in the queued-run expiry below, which
+            // settles the run as an infrastructure failure.
             // A slot of its own needs a free one that the checks queued ahead
             // of this run leave it, and room in the checks' share while a
             // Task waits for a run slot here. Borrowing needs none of it.

@@ -436,6 +436,9 @@ workspace:
   log_retention_days: 30        # logs of a terminal Task; 0 keeps them forever
   min_free_bytes: 10737418240   # free-space floor: the larger of this
   min_free_percent: 5           # and this share of the filesystem
+  min_free_inode_percent: 5     # and this share of its inodes; 0 turns it off
+  # gc_free_bytes: 21474836480  # collect at once under the larger of this
+  # gc_free_percent: 10         # and this; unset: twice the floor
 ```
 
 Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
@@ -443,10 +446,37 @@ Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
 root's filesystem has less free space than the floor, the periodic sweep
 deletes the build output (`.forge-task/build`) of idle, non-terminal Tasks,
 least recently used first; those Tasks rebuild on their next run. Running work
-is never touched. `FORGE_WORKSPACE_LOG_RETENTION_DAYS`,
-`FORGE_WORKSPACE_MIN_FREE_BYTES` and `FORGE_WORKSPACE_MIN_FREE_PERCENT`
-override the file values; all three take effect on restart. A daemon uses the
-default floor. No key turns garbage collection off.
+is never touched. A Task with an open review or an unresolved attention item
+keeps its logs until that is decided or resolved.
+
+The same floor decides admission. While a machine's workspace filesystem is
+under it (bytes or inodes), Forge starts no new worktree on that machine.
+Checks run in a Task's existing worktree and are not held back. On a
+filesystem smaller than twice `min_free_bytes` the byte floor is half the
+filesystem. Other machines stay eligible. A Task that already has its
+worktree there keeps running, and nothing running is stopped: finishing work
+is how space comes back. When every machine that could take a Task is short,
+the Task waits and says so ("Waiting for Disk Space"); it is dispatched by
+itself within about half a minute of a reading recovering. Nothing fails, no retry budget is spent
+and the Project is not paused. Before the server refuses, it collects its
+garbage once and reads the disk again, and under the collector mark
+(`gc_free_*`, default twice the floor) the collector runs at once instead of
+on its 10 minute timer. If the wait says garbage collection is not running on
+a machine, free space there by hand or fix the root's ownership (below):
+nothing will reclaim it automatically. A disk that cannot be read refuses
+nothing.
+
+`FORGE_WORKSPACE_LOG_RETENTION_DAYS`, `FORGE_WORKSPACE_MIN_FREE_BYTES`,
+`FORGE_WORKSPACE_MIN_FREE_PERCENT`, `FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT`,
+`FORGE_WORKSPACE_GC_FREE_BYTES` and `FORGE_WORKSPACE_GC_FREE_PERCENT` override
+the file values; all take effect on restart. A daemon has no floor of its own:
+it reports the free bytes and inodes of its workspace root with every report
+and takes the server's floor from the reply, for its own collector and for
+refusing to make a worktree while its own disk is under it. Until the first
+reply its collector uses the built-in default and logs that it does, and it
+refuses nothing. A daemon that stops reporting for five minutes is no longer
+counted as short of disk. No key turns
+garbage collection off.
 
 Garbage collection runs only on a workspace root this server's database owns.
 The server adopts its root at start-up by writing `.forge/gc/owner` under it,

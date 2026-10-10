@@ -258,6 +258,7 @@ async fn run() {
     runtime
         .cleanup_scheduler
         .set_legacy_temp_dir(std::env::temp_dir());
+    runtime.enable_disk_admission();
 
     let embedded_daemon = if cli.no_embedded_daemon {
         None

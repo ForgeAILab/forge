@@ -8060,11 +8060,12 @@ async fn machine_capacity_task_does_not_wait_for_its_own_slot() {
         .unwrap()
         .unwrap();
     let task = machine_capacity_task(&db, &running.id).await;
-    assert!(!dispatcher
+    assert!(dispatcher
         .task_service
-        .machine_capacity_blocked(&task, &agent, Some("coder"))
+        .capacity_wait_for(&task, &agent, Some("coder"))
         .await
-        .unwrap());
+        .unwrap()
+        .is_none());
     dispatcher.check_once_and_drain().await.unwrap();
     let task = machine_capacity_task(&db, &running.id).await;
     assert!(deferred_dispatch::dispatch_disposition(&task).is_none());
@@ -8088,9 +8089,249 @@ async fn machine_capacity_task_does_not_wait_for_its_own_slot() {
     assign_role(&db, &queued.id, "coder", &agent_id).await;
     assert!(dispatcher
         .task_service
-        .machine_capacity_blocked(&queued, &agent, Some("coder"))
+        .capacity_wait_for(&queued, &agent, Some("coder"))
         .await
-        .unwrap());
+        .unwrap()
+        .is_some());
+}
+
+/// Every machine under its free-space floor: the Task waits where it is with
+/// the machine-capacity wait naming the disk, raises nothing, and is
+/// dispatched by the next scan after the reading recovers. Nobody acts.
+#[tokio::test]
+async fn disk_pressure_waits_in_initial_state_then_starts_when_the_reading_recovers() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let agent_id = seed_agent(&db, 4, DaemonStatus::Online, AgentStatus::Idle).await;
+    let queued = seed_task(&db, &project_id, "WAIT", "todo", 0).await;
+    assign_role(&db, &queued.id, "coder", &agent_id).await;
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(10));
+    let reading = Arc::clone(&free);
+    db.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(move || {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: reading.load(std::sync::atomic::Ordering::SeqCst),
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: db::now_rfc3339(),
+                gc_state: Some("owned".to_owned()),
+            })
+        }),
+    );
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
+            .await
+            .unwrap(),
+        0
+    );
+    let waiting = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.status, queued.status);
+    let disposition = deferred_dispatch::current_dispatch_disposition(&waiting).unwrap();
+    assert_eq!(
+        (
+            disposition.capability.as_str(),
+            disposition.capacity_scope.as_deref()
+        ),
+        ("machine_capacity", Some("disk")),
+        "{}",
+        disposition.safe_message
+    );
+    assert!(
+        disposition
+            .safe_message
+            .starts_with("disk_pressure: waiting for free space"),
+        "{}",
+        disposition.safe_message
+    );
+    // The collector runs on this root, so the wait does not say otherwise.
+    assert!(!disposition.safe_message.contains("garbage collection"));
+    assert!(format!("{:?}", waiting.condition).contains("Disk"));
+    let health = crate::task_diagnostics::derive_workflow_health(
+        &waiting,
+        &workflow,
+        &[],
+        None,
+        None,
+        false,
+        None,
+    );
+    assert_eq!(health.kind, api_types::WorkflowHealthKind::WaitingForAgent);
+    assert_eq!(health.severity, api_types::HealthSeverity::Info);
+    assert_eq!(health.label, "Waiting for Disk Space");
+    assert_eq!(health.stale_reason.as_deref(), Some("disk_pressure"));
+    assert!(waiting.error_annotation.is_none() && waiting.failed_json.is_none());
+    let attention: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attention_projection WHERE scope_type = 'task' AND scope_id = ?",
+    )
+    .bind(&queued.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attention, 0);
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(project.system_pause_reason.is_none());
+    // Still short on the next scan: still waiting, nothing rewritten.
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &queued.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        waiting.version
+    );
+
+    // The reading recovers; the next scan dispatches the Task.
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    db.disk_admission.refresh();
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
+            .await
+            .unwrap(),
+        1
+    );
+    let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.task_id, queued.id);
+    let admitted = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(deferred_dispatch::current_dispatch_disposition(&admitted).is_none());
+    assert!(!format!("{:?}", admitted.condition).contains("Disk"));
+}
+
+/// The disk wait is level-triggered by a timer, not by a Task event: free
+/// disk comes back without any commit. The supervised loop's own tick
+/// (`tick(false)`, which only looks at what is dirty, due or kicked) reads a
+/// disk waiter again at its durable deadline, keeps the wait while the disk
+/// is short (a freed run slot does not clear it), and dispatches the Task
+/// after the reading recovers, across a server restart, with nothing else
+/// happening.
+#[tokio::test]
+async fn disk_wait_is_reread_by_the_loop_tick_on_a_timer_and_survives_a_restart() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let agent_id = seed_agent(&db, 4, DaemonStatus::Online, AgentStatus::Idle).await;
+    let queued = seed_task(&db, &project_id, "WAIT", "todo", 0).await;
+    assign_role(&db, &queued.id, "coder", &agent_id).await;
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(10));
+    let reading = Arc::clone(&free);
+    db.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(move || {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: reading.load(std::sync::atomic::Ordering::SeqCst),
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: db::now_rfc3339(),
+                gc_state: Some("owned".to_owned()),
+            })
+        }),
+    );
+    let deadline = || async {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT deadline FROM task_schedule_wait WHERE task_id = ?",
+        )
+        .bind(&queued.id)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+        .flatten()
+    };
+    let disk_wait = || async {
+        let task = TaskRepo::get_by_id(&*db, &queued.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        deferred_dispatch::current_dispatch_disposition(&task)
+            .and_then(|wait| wait.capacity_scope)
+            .as_deref()
+            == Some("disk")
+    };
+    let recheck = super::reconciliation::DISK_WAIT_RECHECK + Duration::from_millis(300);
+
+    let (dispatcher, _rx) = build_dispatcher(db.clone(), workspaces.path()).await;
+    assert_eq!(dispatcher.check_once_and_drain().await.unwrap(), 0);
+    assert!(disk_wait().await);
+    // Recording the wait dirtied the Task; the loop's next tick settles it.
+    assert_eq!(dispatcher.tick(false).await.unwrap(), 0);
+    dispatcher.drain_steps().await.unwrap();
+    assert!(disk_wait().await);
+    let rows: Vec<(Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT agent_id, daemon_id, deadline FROM task_schedule_wait")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    let first = deadline()
+        .await
+        .unwrap_or_else(|| panic!("a disk wait has a timer: {rows:?}"));
+    assert!(
+        dispatcher.schedule_sleep() <= super::reconciliation::DISK_WAIT_RECHECK,
+        "the loop wakes for it"
+    );
+
+    // Still short at the deadline. A run slot is freed at the same time
+    // (the cap changes, which kicks every machine waiter): the Task still
+    // waits for disk, and the timer is armed again.
+    tokio::time::sleep(recheck).await;
+    db.server_run_cap
+        .set(Some(8), 8, &config::embedded_machine_id());
+    assert_eq!(dispatcher.tick(false).await.unwrap(), 0);
+    dispatcher.drain_steps().await.unwrap();
+    assert!(disk_wait().await, "a freed slot does not clear a disk wait");
+    let second = deadline().await.expect("the timer is armed again");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&second).unwrap()
+            > chrono::DateTime::parse_from_rfc3339(&first).unwrap()
+    );
+
+    // The reading recovers. No Task changes, nothing is asked. The server
+    // restarts: a new dispatcher, whose loop ticks on its own.
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    db.disk_admission.refresh();
+    drop(dispatcher);
+    let (restarted, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
+    tokio::time::sleep(recheck).await;
+    restarted.startup_reconcile().await.unwrap();
+    restarted.drain_steps().await.unwrap();
+    restarted.tick(false).await.unwrap();
+    restarted.drain_steps().await.unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("dispatched by the timer alone")
+        .unwrap();
+    assert_eq!(started.task_id, queued.id);
+    assert!(!disk_wait().await);
 }
 
 #[tokio::test]
