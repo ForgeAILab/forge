@@ -4378,6 +4378,14 @@ recorded `rebase_target` without an outcome is finished by the
 interrupted-rebase rule it was started under (a conflict is handed to the
 Worker); anything else is admitted.
 
+Left from the old path, with no production caller: `MergeService::merge`
+and `merge_workspace`, the workspace backends' `merge` operation
+(`WorkspaceBackend::merge`, embedded and daemon) and `MergeSpec`. Only tests
+call them (`merge_service::tests`, `workspace_backend_characterization`,
+`daemon_workspace_roundtrip`). The queue's fast-forward goes through the
+integration owners (`ServerIntegrationOwner::merge`, the daemon's
+`workspace.merge` with a claim binding), not through these.
+
 Not built in this stage (stage D3): public queue reads (REST, MCP,
 `forge-ctl`), web labels, the `integration.updated` event, operator timing
 percentiles, the retention job, and the `409 integration_unresolved` deletion

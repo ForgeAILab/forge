@@ -4970,6 +4970,125 @@ fn fast_forward_receipts(attempt: &db::IntegrationAttempt) -> usize {
     .count()
 }
 
+/// Admission (the write of the `merging` entry hook) binds the attempt to
+/// the placement the Task merges from. Those fields are the authority for
+/// the owner that may rebase the candidate, so they are asserted for a Task
+/// placed off the default checkout's owner in both directions: a Task on a
+/// daemon, and a Task on the server whose repository's default checkout is
+/// a daemon's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_binds_the_attempt_to_the_placement_the_task_merges_from() {
+    let fixture = Fixture::file_backed("forge-queue-admission").await;
+    let state = &fixture.harness.state;
+    let database = state.db.clone();
+    let merging = |task_id: String| {
+        let database = database.clone();
+        async move {
+            let now = db::now_rfc3339();
+            sqlx::query(
+                "UPDATE task SET status='merging',review_passed_at=?,updated_at=? WHERE id=?",
+            )
+            .bind(&now)
+            .bind(&now)
+            .bind(&task_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        }
+    };
+
+    // A Task placed on a daemon.
+    let placement = fixture.resolved.placement.clone();
+    let candidate = fixture.candidate().await;
+    merging(placement.task_id.clone()).await;
+    let attempt = state
+        .task_service
+        .admit_to_integration_queue(&placement.task_id)
+        .await
+        .expect("a daemon-placed Task is admitted");
+    assert_eq!(attempt.state, db::IntegrationAttemptState::Queued);
+    assert_eq!(
+        attempt.workspace_id.as_deref(),
+        Some(placement.workspace_id.as_str())
+    );
+    assert_eq!(attempt.placement_id.as_deref(), Some(placement.id.as_str()));
+    assert_eq!(
+        attempt.repo_location_id.as_deref(),
+        Some(placement.repo_location_id.as_str())
+    );
+    assert_eq!(attempt.owner_kind, Some(db::IntegrationOwnerKind::Daemon));
+    assert_eq!(attempt.daemon_id, placement.daemon_id);
+    assert!(attempt.daemon_id.is_some());
+    assert_eq!(attempt.runtime_id, placement.runtime_id);
+    assert_eq!(attempt.placement_generation, Some(placement.generation));
+    assert_eq!(
+        attempt.original_candidate_sha.as_deref(),
+        Some(candidate.as_str())
+    );
+    // The same entry, placement and candidate: the same row.
+    let again = state
+        .task_service
+        .admit_to_integration_queue(&placement.task_id)
+        .await
+        .unwrap();
+    assert_eq!(again.id, attempt.id);
+
+    // A Task placed on the server, in another clone than the daemon-owned
+    // default checkout.
+    let (placement, _clone, candidate) = server_placed_task(&fixture).await;
+    ExecutionRepo::create(
+        &*database,
+        execution_input(
+            &db::new_uuid_v4(),
+            &placement.task_id,
+            &placement.workspace_id,
+            "executor",
+            ExecutionStatus::Completed,
+        ),
+    )
+    .await
+    .expect("implementation execution creates");
+    merging(placement.task_id.clone()).await;
+    let attempt = state
+        .task_service
+        .admit_to_integration_queue(&placement.task_id)
+        .await
+        .expect("a server-placed Task is admitted");
+    assert_eq!(
+        attempt.workspace_id.as_deref(),
+        Some(placement.workspace_id.as_str())
+    );
+    assert_eq!(attempt.placement_id.as_deref(), Some(placement.id.as_str()));
+    assert_eq!(
+        attempt.repo_location_id.as_deref(),
+        Some(placement.repo_location_id.as_str())
+    );
+    assert_eq!(attempt.owner_kind, Some(db::IntegrationOwnerKind::Server));
+    assert_eq!(attempt.daemon_id, None);
+    assert_eq!(attempt.runtime_id, None);
+    assert_eq!(attempt.placement_generation, Some(placement.generation));
+    assert_eq!(
+        attempt.original_candidate_sha.as_deref(),
+        Some(candidate.as_str())
+    );
+    // Both Tasks merge into the one queue of the repository's target, whose
+    // owner is the daemon that holds the default checkout.
+    use db::IntegrationQueueRepo;
+    let queue = database
+        .integration_queue(attempt.queue_id.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(Some(queue.id.as_str()), again.queue_id.as_deref());
+    assert_eq!(
+        queue
+            .target_owner_json
+            .as_ref()
+            .map(|owner| owner["owner_kind"].clone()),
+        Some(json!("daemon"))
+    );
+}
+
 /// A head on a daemon-owned target no longer parks: the queue worker drives
 /// the rebase, the check hand-off and the fast-forward through the daemon
 /// that holds the default checkout, with a real `ci_steps` command run by the

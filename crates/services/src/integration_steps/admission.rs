@@ -189,3 +189,25 @@ pub(crate) async fn state_waiting(db: &Arc<SqliteDb>, attempt: &IntegrationAttem
         Err(error) => Err(ServiceError::from(error)),
     }
 }
+
+impl crate::TaskService {
+    /// Admit a Task that is in a merge state to the integration queue of its
+    /// repository's target branch: the write the `run_merge` entry hook
+    /// performs, without the hook's legacy-effect reads or its statement.
+    /// Returns the Task's current attempt and wakes the queue worker.
+    pub async fn admit_to_integration_queue(&self, task_id: &str) -> Result<IntegrationAttempt> {
+        let merge_service = self
+            .merge_service
+            .as_ref()
+            .ok_or_else(|| ServiceError::invalid_operation("merge service not configured"))?;
+        let task = db::TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let attempt = admit(&self.db, merge_service, &task).await?;
+        if let Some(worker) = self.integration_worker() {
+            use crate::integration_worker::IntegrationEnqueuePort;
+            worker.notify_enqueued(attempt.queue_id.as_deref().unwrap_or_default());
+        }
+        Ok(attempt)
+    }
+}

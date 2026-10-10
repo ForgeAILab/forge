@@ -1498,6 +1498,49 @@ impl World {
                     wedge("no execution holds the slot its check waits for")
                 }
             }
+            // In the merge queue (`waiting`, `owned`, `applied`): the queue
+            // worker owns the Task and no owner action is needed, so none
+            // being offered is not a wedge. It is one when nothing can move
+            // the queue: its head check waits for a machine slot no run
+            // holds, or the queue has no live head and cannot be claimed.
+            (_, "integration")
+                if matches!(
+                    task["condition"]["primary"]["reason"]["kind"].as_str(),
+                    Some("waiting" | "owned" | "applied")
+                ) =>
+            {
+                let slot_wait = task["condition"]["additional"]
+                    .as_array()
+                    .is_some_and(|reasons| {
+                        reasons
+                            .iter()
+                            .any(|r| r["kind"] == "check" && r["wait"]["phase"] == "slot")
+                    });
+                if slot_wait {
+                    return if (0..self.tasks.len())
+                        .any(|other| other != index && self.waiting(other))
+                    {
+                        Ok(())
+                    } else {
+                        wedge("no execution holds the slot its head check waits for")
+                    };
+                }
+                let moving: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM integration_attempt a JOIN integration_queue q ON q.id=a.queue_id \
+                     WHERE a.task_ref = ? AND a.current = 1 \
+                       AND ((q.head_attempt_id IS NOT NULL AND julianday(q.lease_until) > julianday('now')) \
+                         OR (q.head_attempt_id IS NULL AND q.state = 'open' AND a.state = 'queued')))",
+                )
+                .bind(&self.tasks[index])
+                .fetch_one(&self.live().pool)
+                .await
+                .map_err(|error| error.to_string())?;
+                if moving {
+                    Ok(())
+                } else {
+                    wedge("the merge queue that owns it has no live head and cannot be claimed")
+                }
+            }
             // An accepted action refused admission by an unfinished
             // dependency waits for that Task; `cancel` stays on offer.
             (_, "dispatch_refusal")

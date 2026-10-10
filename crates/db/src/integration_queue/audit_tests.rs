@@ -782,3 +782,88 @@ resolver_row!(
 resolver_row!(resolver_no_default, "no_default");
 resolver_row!(resolver_two_defaults, "two_defaults");
 resolver_row!(resolver_not_ready, "not_ready");
+
+/// Migration `V202610101725`: the removed hook name is dropped from every
+/// hook list of stored Project workflows and retained step snapshots;
+/// every other key, state and hook stays, in order. Running it again
+/// changes nothing.
+#[tokio::test]
+async fn the_cutover_migration_drops_only_the_removed_hook_from_stored_workflows() {
+    const MIGRATION: &str = include_str!("../../migrations/V202610101725__integration_cutover.sql");
+    let db = fixture().await;
+    let stored = serde_json::json!({
+        "roles": [{"name": "coder"}],
+        "custom": {"kept": true},
+        "states": [
+            {"name": "todo", "hooks": {"on_enter": []}},
+            {"name": "merging", "kind": "gate", "hooks": {
+                "on_enter": [{"action": "run_merge", "params": {}}],
+                "after_enter": [
+                    {"action": "auto_cascade_on_merge_result", "params": {}, "applies_to": "all", "on_failure": "log"},
+                    {"action": "notify_role_holder", "params": {"x": 1}}
+                ]
+            }},
+            {"name": "custom", "hooks": {
+                "before_exit": [{"action": "auto_cascade_on_merge_result"}, {"action": "dependency_gate"}]
+            }},
+            {"name": "bare"}
+        ]
+    });
+    let untouched = serde_json::json!({"states": [{"name": "merging", "hooks": {"on_enter": [{"action": "run_merge"}]}}]}).to_string();
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id='p'")
+        .bind(stored.to_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO project(id,name,settings,workflow_definition,created_at,updated_at) VALUES('other','other','{}',?,?,?)")
+        .bind(&untouched)
+        .bind(FIXED_TIME)
+        .bind(FIXED_TIME)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO task_step_workflow(id,definition_json,last_used_at) VALUES('snapshot',?,?)",
+    )
+    .bind(stored.to_string())
+    .bind(FIXED_TIME)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        sqlx::raw_sql(MIGRATION).execute(db.pool()).await.unwrap();
+        let expected = serde_json::json!({
+            "roles": [{"name": "coder"}],
+            "custom": {"kept": true},
+            "states": [
+                {"name": "todo", "hooks": {"on_enter": []}},
+                {"name": "merging", "kind": "gate", "hooks": {
+                    "on_enter": [{"action": "run_merge", "params": {}}],
+                    "after_enter": [{"action": "notify_role_holder", "params": {"x": 1}}]
+                }},
+                {"name": "custom", "hooks": {"before_exit": [{"action": "dependency_gate"}]}},
+                {"name": "bare"}
+            ]
+        });
+        for sql in [
+            "SELECT workflow_definition FROM project WHERE id='p'",
+            "SELECT definition_json FROM task_step_workflow WHERE id='snapshot'",
+        ] {
+            let text: String = sqlx::query_scalar(sql).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).unwrap(),
+                expected,
+                "{sql}"
+            );
+        }
+        let other: String =
+            sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id='other'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            other, untouched,
+            "a definition without the hook is not rewritten"
+        );
+    }
+}
