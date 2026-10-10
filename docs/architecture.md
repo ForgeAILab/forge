@@ -5593,6 +5593,83 @@ Known limits: the first rebase of a head is always counted as a
 integrated, so a push from outside before the claim cannot be told apart);
 an `applied` head waits for its `result` step without a timer.
 
+### Integration Task steps (3.2 stage D, part 1b; not produced until D2)
+
+`services::integration_steps` is the Task-step side of the integration queue.
+Nothing enqueues one of its steps yet: `merging` still runs today's merge
+hooks, and the queue worker that would ask is not started until D2. The only
+live additions are a registered check consumer family that nobody requests
+from, and one write in the cancel transition (below).
+
+The worker never writes Task state. Each request is one Task step of kind
+`integration` with the payload `{task_id, queue_id, attempt_id,
+expected_epoch, generation, effect_seq, action}` and the causation key
+`integration:<attempt>:<effect_seq>:<action>`; `(task_id, causation_key)`
+makes the enqueue idempotent. The step answers by writing the attempt's
+`effect_ack_json` / `acknowledged_at` (and `permit_json` for a permit) in the
+same transaction as its Task write (`acknowledge_integration_step_in_tx`: a
+compare-and-set on the attempt's revision, `effect_seq` and, except for
+`result`, its slot generation).
+
+A step is enqueued before the attempt transition it belongs to. So every
+action first places itself: attempt not yet in the state it answers → retry
+with back-off (no write); attempt past its `effect_seq` or generation, or no
+longer current → finish without a write; same `(effect_seq, action)` already
+answered → finish without a write.
+
+| Action | Attempt state | Task effect | Answer |
+|---|---|---|---|
+| `request_check` | `checking` | Asks the check runner (origin `integration`, purpose queue-head CI: the review state's effective `ci_steps`) for the rebased commit; states `integration/owned/checking`. With nothing configured to run it settles at once. | None. The check's own delivery step (`apply_check_result`) writes the `settle` answer: verdict, check timing and, on a pass, the permit. |
+| `settle` | `awaiting_task_step` | Reads review authority; when the queue rebased the commit, carries the review by attempt lineage; pre-enqueues the protected `result` step; states `integration/owned/fast_forwarding`. | `settle`: `permit` + `permit_json`, or `needs_review`, `candidate_check_failed`, `infrastructure`, `task_left`. |
+| `result` | `applied` | Execution evidence, the "Changes merged to …" comment, `integration/applied`, the `paused_integration` marker cleared, and the `merging → done` cascade enqueued at priority 2: the writes today's merge success performs. | `result`: `done` (or `task_left`). |
+| `send_back` | `ejected`, `needs_review` | Conflict: today's conflict handoff to the Worker (annotation, comment, `merge.failed`, `conflict_handoff` bridge and budget). Red check: a merge failure under the merge-fix budget. Lost review: `review_refresh` through `merge_failed`. States the typed reason and the handoff. | `send_back`: `done`. |
+| `park` | `parked`, `quarantined`, `queued` | Level-triggered: states `integration/deferred` with the cause read from the attempt (or the suspended queue); `integration/waiting` again once the member is queued behind an open queue; nothing for a paused Project. An intervention cause appends `task.interruption_changed` in the same transaction. | `park`: `done`. |
+| `clear` | `cancelled` | Clears this attempt's integration statement. | None (the attempt is terminal). |
+
+The permit binds `candidate_sha`, `target_tip_sha`, `task_ref`,
+`expected_epoch` and `slot_generation`; storage refuses any other.
+
+**Protection and Cancel.** In the transaction that writes a permit, `settle`
+enqueues the `result` step identity-fenced and marked as started integration
+(`enqueue_protected_integration_step_in_tx`), due at its own deadline. From
+that commit a later Cancel, Hold or move can neither be claimed ahead of it
+nor supersede it. The other way round, `settle` writes no permit while an
+owner command is already queued for the Task: it yields, the command runs,
+and the Task leaves `merging`. Exactly one of the two wins. Kind
+`integration` is in the supersede list, so a pending unprotected step is
+dropped the moment a Cancel is enqueued; the protected `result` step never
+is. The Task's cancel transition calls
+`request_task_integration_cancel_in_tx` in its own transaction: a
+cancellable attempt gets `cancel_requested_at` with the Task write; in
+`ff_inflight`, `reconciling`, `applied` or `quarantined` the Cancel is
+refused as busy while the protected step is alive (it then runs after the
+result) and is not held back by an attempt nothing drives.
+
+**`result` cannot dead-letter.** It never settles `failed` or `parked`. If it
+cannot apply, the Task states `integration/deferred/unresolved_result`, the
+step stays pending far in the future, and the worker's `ready_result_step`
+re-arms it. Woken by its own deadline with the permit unused, it takes the
+permit back (`revoke_integration_permit_in_tx`, a compare-and-set against
+the worker's commit to `ff_inflight`) and finishes, which lets a waiting
+owner command run.
+
+**Carry by attempt lineage.** One rule decides whether a passed review may
+cover a mechanically changed commit, for a Task entering `review` on a
+mechanical bridge and for an attempt the queue rebased in `merging`:
+`gate_refuses_carry`, `task_carry_checks`, `carry_budget_refusal` and
+`carry_path_refusal` in `workflow::actions::carry`. The queue's carry is
+recorded by `settle_attempt_review_carry_in_tx` (a `review_authority_carry`
+row and one `review_carry` charge, with the permit); no Review row is opened
+because the Task never left `merging`.
+
+Storage: migration `V202610100137__integration_task_step.sql` adds the step
+kind (a data-preserving `task_step` rebuild; SQLite cannot alter a CHECK).
+
+Not here yet: the head's check result is not copied onto a Review row; after
+a queue reopens nothing asks for the `park` step that restores `waiting`;
+the cancel flag is not set for a board move into the cancellation state.
+
+
 ### Task condition actions
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.

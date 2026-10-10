@@ -798,6 +798,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **Merge queue Task steps, not produced yet (3.2 stage D, part 1b).** The
+  server can now apply what the merge queue decides to a Task (ask for the
+  check of a rebased commit, authorize the fast-forward, mark the Task done,
+  hand a conflict or a failed check back, say why a Task is waiting), but
+  nothing asks it to: merging works exactly as before. Upgrading rebuilds the
+  internal `task_step` table once to add the new step kind; no row is
+  changed.
 - **Integration queue worker, not started yet (3.2 stage D, part 1d).** The
   server has the worker that will drive the per-branch merge queue (rebase,
   check, fast-forward, takeover after a crash), but nothing starts it:
