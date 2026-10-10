@@ -450,12 +450,14 @@ is never touched. A Task with an open review or an unresolved attention item
 keeps its logs until that is decided or resolved.
 
 The same floor decides admission. While a machine's workspace filesystem is
-under it (bytes or inodes), Forge starts no new worktree and no check checkout
-on that machine. Other machines stay eligible. A Task that already has its
+under it (bytes or inodes), Forge starts no new worktree on that machine.
+Checks run in a Task's existing worktree and are not held back. On a
+filesystem smaller than twice `min_free_bytes` the byte floor is half the
+filesystem. Other machines stay eligible. A Task that already has its
 worktree there keeps running, and nothing running is stopped: finishing work
 is how space comes back. When every machine that could take a Task is short,
 the Task waits and says so ("Waiting for Disk Space"); it is dispatched by
-itself as soon as a reading recovers. Nothing fails, no retry budget is spent
+itself within about half a minute of a reading recovering. Nothing fails, no retry budget is spent
 and the Project is not paused. Before the server refuses, it collects its
 garbage once and reads the disk again, and under the collector mark
 (`gc_free_*`, default twice the floor) the collector runs at once instead of
@@ -469,8 +471,11 @@ nothing.
 `FORGE_WORKSPACE_GC_FREE_BYTES` and `FORGE_WORKSPACE_GC_FREE_PERCENT` override
 the file values; all take effect on restart. A daemon has no floor of its own:
 it reports the free bytes and inodes of its workspace root with every report
-and takes the server's floor from the reply, for its own collector. Until the
-first reply it uses the built-in default and logs that it does. No key turns
+and takes the server's floor from the reply, for its own collector and for
+refusing to make a worktree while its own disk is under it. Until the first
+reply its collector uses the built-in default and logs that it does, and it
+refuses nothing. A daemon that stops reporting for five minutes is no longer
+counted as short of disk. No key turns
 garbage collection off.
 
 Garbage collection runs only on a workspace root this server's database owns.

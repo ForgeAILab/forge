@@ -1057,6 +1057,35 @@ mod tests {
         daemon.finish().await;
     }
 
+    /// The daemon's own refusal for disk is the same typed placement
+    /// refusal the server makes from the daemon's report: the Task takes
+    /// the self-clearing disk wait, never a failure.
+    #[tokio::test]
+    async fn daemon_disk_pressure_maps_to_the_disk_capacity_wait() {
+        let daemon = ScriptedDaemon::new(vec![rejection(
+            api_types::DISK_PRESSURE,
+            "the workspace filesystem of this machine is under its free-space floor",
+            Some(json!({ "kind": "bytes" })),
+        )]);
+        let backend = backend(&daemon).await;
+        let refused = backend
+            .describe(&placement())
+            .await
+            .expect_err("the daemon refused");
+        assert!(matches!(
+            &refused,
+            WorkspaceBackendError::DiskPressure { task_id, .. } if *task_id == placement().task_id
+        ));
+        let error = ServiceError::from(refused);
+        assert_eq!(
+            crate::placement::capacity_wait_of(&error),
+            Some(crate::placement::CapacityWait::Disk),
+            "{error:?}"
+        );
+        assert!(crate::placement::is_retryable_admission_refusal(&error));
+        daemon.finish().await;
+    }
+
     #[tokio::test]
     async fn purpose_denied_maps_without_retrying_run() {
         let daemon = ScriptedDaemon::new(vec![

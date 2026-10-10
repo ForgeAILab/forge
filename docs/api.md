@@ -3658,7 +3658,9 @@ report:
 ```
 
 `free_inodes` and `total_inodes` are `null` (or absent) on a filesystem that
-does not count them. `gc_state` says whether the machine's workspace garbage
+does not count them. The server stores the reading with `measured_at` set to
+its own clock at the report, and trusts it for five minutes: an older reading
+is still returned but its `pressure` is `null` and it refuses nothing. `gc_state` says whether the machine's workspace garbage
 collector runs on that root: `owned`, or `unclaimed`, `claimed_by_other`,
 `refused`. A report without `disk` keeps the last reading.
 
@@ -3679,8 +3681,12 @@ fields:
 Each Operations `daemon_pressure` entry adds the same nullable `disk`; an entry
 whose `disk.pressure` is set is a machine under its floor.
 
-While `pressure` is set, the machine starts no new worktree and no check
-checkout; a Task that already has a ready worktree there is not refused.
+While `pressure` is set, the machine starts no new worktree; a Task that
+already has a ready worktree there is not refused, and neither is a check
+run, which executes in its Task's existing worktree. A daemon also refuses
+`workspace.prepare` of a worktree it would have to make, and an exact-commit
+`check.run`, with the daemon error code `disk_pressure` when its own reading
+is under the floor; the server turns that into the same wait.
 Placement rejections carry the filter code `disk_pressure` in
 `rejected_candidates`. A Task for which every usable machine is short of disk
 is not failed: it keeps its state with a `machine_capacity` dispatch
@@ -3689,9 +3695,10 @@ disposition whose `capacity_scope` is `"disk"`, its condition reason is
 `disk`), and `workflow_health` reports `kind: "waiting_for_agent"`,
 `label: "Waiting for Disk Space"`, `stale_reason: "disk_pressure"` with a
 message naming the machines and, when nothing collects garbage on one of
-them, saying so. The wait clears without any request once a reading recovers.
-A queued check run on such a machine is counted as waiting for capacity in
-the check-run counts, like a run waiting for a slot.
+them, saying so. `stale_reason` and the `disk_pressure` entry of the Task's
+placement diagnostics follow `capacity_scope`, not the message. The wait
+clears without any request once a reading recovers: while a machine is under
+its floor the dispatcher reads waiting Tasks again every 30 seconds.
 
 Operations `daemon_pressure` lists one entry per execution machine, including
 `daemon_id: "server_host"` (the embedded daemon is included in that entry).
