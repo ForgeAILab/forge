@@ -8777,6 +8777,13 @@ finds its Task has left the entry:
   workspace the Task has moved on from.
 - **Consumer.** It is cancelled, so a late delivery is `Stale` and is applied
   to nothing, whether or not the Task's status epoch moved (a Hold keeps it).
+  The consumer is cancelled *before* the run's dispatch record is read for the
+  remote fence above, and the check worker looks for a waiting consumer once
+  more after it has written that record and before it sends anything. A
+  cancel that lands while the owner prepares (no record yet, nothing to
+  fence) is therefore seen by the worker, which ends the run as cancelled
+  without starting an operation; one that lands later finds the record and
+  fences it. No ordering leaves a started remote operation unfenced.
 - **Task condition.** The check wait is cleared (in the Task's own step).
 - **Review attempt.** It is cancelled (`execution_retry.status =
   cancelled_authority_lost`).

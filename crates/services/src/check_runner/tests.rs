@@ -978,6 +978,81 @@ async fn with_one_slot_the_queued_check_runs_before_the_next_new_run() {
     assert!(one(stream.capacity().await).admits_execution());
 }
 
+/// An owner whose `prepare` is the window in question: the consumer's Task
+/// is cancelled while the owner prepares, before any dispatch record exists.
+struct CancelledWhilePreparing {
+    store: Arc<SqliteDb>,
+    inner: TestOwner,
+}
+#[async_trait::async_trait]
+impl CheckOwnerPort for CancelledWhilePreparing {
+    async fn prepare(&self, run: &StoredCheckRun) -> Result<CheckDispatchIntent> {
+        // The canceller looked for a dispatch to fence and found none.
+        assert!(self
+            .store
+            .check_worker_record(&run.id)
+            .await
+            .unwrap()
+            .dispatch
+            .is_none());
+        sqlx::query("UPDATE check_consumer SET cancelled_at=? WHERE run_id=?")
+            .bind(db::now_rfc3339())
+            .bind(&run.id)
+            .execute(self.store.pool())
+            .await
+            .unwrap();
+        self.inner.prepare(run).await
+    }
+    async fn run(
+        &self,
+        record: &CheckWorkerRecord,
+        cancel: &CancellationToken,
+    ) -> Result<DaemonCheckResult> {
+        self.inner.run(record, cancel).await
+    }
+    async fn lookup(&self, record: &CheckWorkerRecord) -> Result<DaemonCheckResult> {
+        self.inner.lookup(record).await
+    }
+    async fn cancel(&self, record: &CheckWorkerRecord) -> Result<DaemonCheckResult> {
+        self.inner.cancel(record).await
+    }
+    async fn owner_gone(&self, record: &CheckWorkerRecord) -> Result<bool> {
+        self.inner.owner_gone(record).await
+    }
+    async fn acknowledge(&self, record: &CheckWorkerRecord) -> Result<()> {
+        self.inner.acknowledge(record).await
+    }
+}
+
+/// A cancel between the worker's prepare and its dispatch record cannot
+/// fence the operation (there is no record to read yet). The worker looks
+/// for a waiting consumer again after it wrote the record and before it
+/// sends anything: the operation never starts, so there is nothing to fence.
+#[tokio::test]
+async fn a_cancel_between_prepare_and_the_dispatch_record_starts_no_operation() {
+    let (_temp, store, runner) = fixture().await;
+    let run = scheduled(runner.request(request("cancel-in-prepare")).await.unwrap());
+    let owner = Arc::new(CancelledWhilePreparing {
+        store: store.clone(),
+        inner: TestOwner::default(),
+    });
+    CheckRunWorker::new(store.clone(), owner.clone())
+        .drive(admit(&store, &run).await)
+        .await
+        .unwrap();
+    assert_eq!(owner.inner.runs.load(Ordering::SeqCst), 0, "dispatched");
+    let record = store.check_worker_record(&run.id).await.unwrap();
+    assert_eq!(record.run.state, CheckRunState::Cancelled);
+    assert!(record.receipt.is_none());
+    // The slot is free again.
+    let mut tx = db::begin_immediate(store.pool()).await.unwrap();
+    let count =
+        db::machine_capacity::count_machine_capacity(&mut tx, None, Some(1), "server-machine")
+            .await
+            .unwrap();
+    assert_eq!(count.active_runs(), 0);
+}
+
 #[tokio::test]
 async fn a_check_borrows_the_same_tasks_reservation_and_keeps_its_slot_when_it_expires() {
     let (temp, store, runner) = fixture().await;
