@@ -295,6 +295,8 @@ struct GitFactsFake {
     transfer: Arc<FakeTransfer>,
     fail: AtomicBool,
     paused: AtomicBool,
+    /// The Task's placement is not `ready` (its owner just reconnected).
+    placement_down: AtomicBool,
 }
 #[async_trait]
 impl IntegrationFactsPort for GitFactsFake {
@@ -356,7 +358,7 @@ impl IntegrationFactsPort for GitFactsFake {
             worktree_dirty: !git::is_worktree_clean(&tree).await?,
             target_dirty: !git::is_worktree_clean(&repo).await?,
             rebase_in_progress: git::detect_rebase_in_progress(&tree).await?,
-            placement_ready: true,
+            placement_ready: !self.placement_down.load(Ordering::SeqCst),
             shared_object_store: !self
                 .transfer
                 .remote
@@ -411,6 +413,7 @@ impl World {
                 transfer: transfer.clone(),
                 fail: AtomicBool::new(false),
                 paused: AtomicBool::new(false),
+                placement_down: AtomicBool::new(false),
             }),
             temp,
             db,
@@ -1429,6 +1432,78 @@ async fn a_paused_project_parks_with_backoff_and_one_task_step() {
     world.facts.paused.store(false, Ordering::SeqCst);
     world.settle(&mut pump).await;
     assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+}
+
+/// After its owner reconnects, a Task's placement stays `disconnected` until
+/// the owner reconciliation has looked at it, and a check asked for
+/// meanwhile is refused for good. A head whose rebase is done waits in
+/// `rebasing` until the placement is ready: the receipt is kept and adopted,
+/// the rebase is not repeated, and no check is asked for. The wait is
+/// bounded by the Task-step wait; then the head parks as infrastructure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rebased_head_waits_for_a_ready_placement_before_it_asks_for_the_check() {
+    let rebases = |attempt: &IntegrationAttempt| {
+        serde_json::from_value::<Vec<db::IntegrationEffectReceipt>>(
+            attempt.effect_receipts_json.clone(),
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|receipt| receipt.request.kind == db::IntegrationOperationKind::Rebase)
+        .count()
+    };
+    for becomes_ready in [true, false] {
+        let world = World::new().await;
+        let a = world.add_task("r", "a", "a.txt", "a\n").await;
+        world.external_commit("r", "outside").await;
+        world.facts.placement_down.store(true, Ordering::SeqCst);
+        let mut pump = Pump::new(world.worker());
+        for _ in 0..2 {
+            world.settle(&mut pump).await;
+            let waiting = world.attempt(&a.id).await;
+            assert_eq!(waiting.state, S::Rebasing);
+            assert!(waiting.effect_intent_json.is_none());
+            assert_eq!(rebases(&waiting), 1, "rebased once, receipt kept");
+            assert!(!world
+                .steps
+                .actions("a")
+                .contains(&IntegrationStepAction::RequestCheck));
+        }
+        if becomes_ready {
+            world.facts.placement_down.store(false, Ordering::SeqCst);
+            world.settle(&mut pump).await;
+            let merged = world.attempt(&a.id).await;
+            assert_eq!(merged.state, S::Completed);
+            assert_eq!(rebases(&merged), 1, "the rebase was not repeated");
+            assert!(world
+                .steps
+                .actions("a")
+                .contains(&IntegrationStepAction::RequestCheck));
+        } else {
+            // In steps shorter than the lease, so the session keeps it.
+            let step = (pump.worker.config.renew_every.as_secs() as i64).max(1);
+            let mut waited = 0;
+            while waited <= pump.worker.config.step_wait.as_secs() as i64 {
+                world.clock.advance(step);
+                waited += step;
+                world.settle(&mut pump).await;
+            }
+            let parked = world.attempt(&a.id).await;
+            assert_eq!(parked.state, S::Parked);
+            assert_eq!(
+                parked.failure_kind,
+                Some(IntegrationFailureKind::Infrastructure)
+            );
+            assert!(
+                parked
+                    .failure_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("not ready on its machine")),
+                "{:?}",
+                parked.failure_message
+            );
+            assert!(parked.available_at.is_some(), "retried by the sweep");
+        }
+    }
 }
 
 /// state x crash point -> expected recovery. `moved`: the target moved
