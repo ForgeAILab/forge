@@ -1514,7 +1514,14 @@ impl DaemonWorkspaceClient {
             let wire: WorkspaceIntegrationRequest =
                 serde_json::from_value(serde_json::to_value(&request).expect("request serializes"))
                     .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-            let workspace = &request.witness["workspace"];
+            // A transferred fast-forward ran in the default checkout alone:
+            // its lookup names no worktree of the owner.
+            let no_workspace = serde_json::json!({});
+            let workspace = if request.witness["candidate_transfer_key"].is_string() {
+                &no_workspace
+            } else {
+                &request.witness["workspace"]
+            };
             let operation_id = request.witness["operation_id"]
                 .as_str()
                 .map(str::to_owned)
@@ -2100,6 +2107,29 @@ impl DaemonWorkspaceClient {
         if let Err(error) = released {
             tracing::warn!(target: "services::daemon_transport", %daemon_id, %key, %error, "object transfer staging was not released");
         }
+    }
+
+    /// Read-only facts about a default checkout a daemon holds: the target
+    /// branch's tip, whether `candidate_sha` has landed in it, and whether
+    /// the checkout has uncommitted changes.
+    pub async fn target_facts(
+        &self,
+        target: DaemonObjectEndpoint<'_>,
+        target_branch: &str,
+        candidate_sha: &str,
+    ) -> Result<IntegrationTargetFactsResult> {
+        self.integration_request(
+            target.daemon_id,
+            METHOD_INTEGRATION_TARGET_FACTS,
+            &IntegrationTargetFactsParams {
+                daemon_id: target.daemon_id.into(),
+                runtime_id: target.runtime_id.into(),
+                repo_location_id: target.repo_location_id.into(),
+                target_branch: target_branch.into(),
+                candidate_sha: candidate_sha.into(),
+            },
+        )
+        .await
     }
 
     /// Delete every ref an attempt imported in one checkout of an owner

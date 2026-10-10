@@ -629,6 +629,7 @@ impl WorkspaceBackend for DaemonWorkspaceBackend {
             reviewed_commit_sha: contract
                 .as_ref()
                 .map(|contract| contract.commit_sha.clone()),
+            candidate_transfer_key: None,
         };
         let daemon_id = self.owner(placement)?.0;
 

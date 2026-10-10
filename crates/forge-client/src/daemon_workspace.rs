@@ -266,6 +266,7 @@ impl DaemonWorkspaceBackend {
                 | METHOD_INTEGRATION_EXPORT_OBJECTS
                 | METHOD_INTEGRATION_IMPORT_OBJECTS
                 | METHOD_INTEGRATION_RELEASE_OBJECTS
+                | METHOD_INTEGRATION_TARGET_FACTS
         )
     }
 
@@ -290,6 +291,9 @@ impl DaemonWorkspaceBackend {
             }
             METHOD_INTEGRATION_RELEASE_OBJECTS => {
                 return encode(self.release_objects(decode(params)?).await?)
+            }
+            METHOD_INTEGRATION_TARGET_FACTS => {
+                return encode(self.target_facts(decode(params)?).await?)
             }
             _ => {}
         }
@@ -558,9 +562,33 @@ impl DaemonWorkspaceBackend {
             _ => unreachable!("workspace read methods returned above"),
         }
         validate_id(&fence.operation_id)?;
-        let existing = self.workspace_for_placement(&fence.placement_id);
+        // A queue claim's fast-forward of a candidate that an outbound object
+        // transfer brought: this owner holds the default checkout but no
+        // worktree of the Task, so no handle or placement is involved.
+        let transferred = method == METHOD_WORKSPACE_MERGE
+            && params
+                .get("candidate_transfer_key")
+                .is_some_and(Value::is_string);
+        if transferred
+            && !matches!(
+                fence.integration,
+                WorkspaceIntegrationBinding::Attempt { .. }
+            )
+        {
+            return Err(error(
+                INVALID_INPUT,
+                "only a queue claim fast-forwards a transferred candidate",
+            ));
+        }
+        let existing = if transferred {
+            None
+        } else {
+            self.workspace_for_placement(&fence.placement_id)
+        };
         let handle = if method == METHOD_WORKSPACE_PREPARE {
             existing.as_ref().map(|(handle, _)| handle.as_str())
+        } else if transferred {
+            None
         } else {
             params.get("workspace_handle").and_then(Value::as_str)
         };
@@ -665,6 +693,10 @@ impl DaemonWorkspaceBackend {
                     self.prepare(decode(params.clone())?).await.and_then(encode)
                 }
                 METHOD_WORKSPACE_RUN => self.run(decode(params.clone())?).await.and_then(encode),
+                METHOD_WORKSPACE_MERGE if transferred => self
+                    .merge_transferred(decode(params.clone())?)
+                    .await
+                    .and_then(encode),
                 METHOD_WORKSPACE_MERGE => {
                     self.merge(decode(params.clone())?).await.and_then(encode)
                 }
@@ -1887,6 +1919,118 @@ impl DaemonWorkspaceBackend {
         };
         owned.version += 1;
         self.save_workspace(&params.workspace_handle, owned)?;
+        Ok(WorkspaceMergeResult {
+            entry_id: operation_entry_id(&params.fence.operation_id),
+            operation_id: params.fence.operation_id,
+            outcome,
+            diffstat,
+        })
+    }
+
+    /// The fast-forward of the default checkout to a candidate held by no
+    /// worktree of this owner. Admission and `verify_integration_objects`
+    /// bound the candidate to this claim generation's outbound transfer ref
+    /// and the target to the tip the claim read; both are read again here,
+    /// under the checkout lock.
+    async fn merge_transferred(
+        &self,
+        reviewed: WorkspaceReviewedMergeParams,
+    ) -> CommandResult<WorkspaceMergeResult> {
+        let params = reviewed.merge;
+        let (location, target) = self.location_path(&params.repo_location_id).await?;
+        if location.kind != DaemonRepoLocationKind::PrimaryCheckout {
+            return Err(error(
+                INVALID_INPUT,
+                "workspace.merge requires a verified primary_checkout",
+            ));
+        }
+        validate_branch(&target, &params.target_branch).await?;
+        let (WorkspaceOperationExpected::BaseSha { sha: head }, Some(key)) =
+            (&params.fence.expected, &reviewed.candidate_transfer_key)
+        else {
+            return Err(error(
+                INVALID_INPUT,
+                "a transferred fast-forward names its candidate commit and transfer key",
+            ));
+        };
+        let transferred = git::integration::transfer_ref(key)
+            .map_err(|_| error(INVALID_INPUT, "invalid candidate transfer key"))?;
+        let outcome = if reviewed.reviewed_commit_sha.as_deref() != Some(head.as_str())
+            || !resolve_commit(&target, &transferred)
+                .await
+                .is_ok_and(|bound| &bound == head)
+        {
+            WorkspaceMergeOutcome::ReviewRequired {
+                reason: "the transferred candidate is not the reviewed commit".into(),
+            }
+        } else if !git::is_worktree_clean(&target).await.map_err(git_error)? {
+            WorkspaceMergeOutcome::TargetDirty {
+                files: git::status_porcelain(&target).await.map_err(git_error)?,
+            }
+        } else {
+            let target_sha =
+                resolve_commit(&target, &format!("refs/heads/{}", params.target_branch)).await?;
+            if local_git(&target, &["merge-base", "--is-ancestor", head, &target_sha])
+                .await
+                .is_ok()
+            {
+                WorkspaceMergeOutcome::Done {
+                    before_sha: params.expected_target_sha.clone(),
+                    after_sha: head.clone(),
+                    branch: params.target_branch.clone(),
+                }
+            } else if target_sha != params.expected_target_sha {
+                WorkspaceMergeOutcome::TargetMoved {
+                    reason: "integration target changed since the rebase".into(),
+                    target_branch: params.target_branch.clone(),
+                }
+            } else {
+                match git::integration::apply_merge(
+                    &target,
+                    &params.target_branch,
+                    head,
+                    true,
+                    false,
+                    Some(&params.expected_target_sha),
+                    git::integration::FastForwardLimits {
+                        deadline: Duration::from_secs(30),
+                        output_bytes: MAX_DIFF_BYTES,
+                    },
+                )
+                .await
+                .map_err(git_error)?
+                {
+                    git::integration::MergeApplyOutcome::Applied => WorkspaceMergeOutcome::Done {
+                        before_sha: params.expected_target_sha.clone(),
+                        after_sha: git::get_current_sha(&target).await.map_err(git_error)?,
+                        branch: params.target_branch.clone(),
+                    },
+                    git::integration::MergeApplyOutcome::ReviewRequired { reason } => {
+                        WorkspaceMergeOutcome::ReviewRequired { reason }
+                    }
+                    git::integration::MergeApplyOutcome::TargetMoved
+                    | git::integration::MergeApplyOutcome::ExactObjectMismatch => {
+                        WorkspaceMergeOutcome::TargetMoved {
+                            reason: "integration target changed during the fast-forward".into(),
+                            target_branch: params.target_branch.clone(),
+                        }
+                    }
+                    git::integration::MergeApplyOutcome::ManualFailed(error) => {
+                        return Err(git_error(error))
+                    }
+                }
+            }
+        };
+        let diffstat = if let WorkspaceMergeOutcome::Done {
+            before_sha,
+            after_sha,
+            ..
+        } = &outcome
+        {
+            Some(merge_diffstat(&target, before_sha, after_sha).await?)
+        } else {
+            None
+        };
         Ok(WorkspaceMergeResult {
             entry_id: operation_entry_id(&params.fence.operation_id),
             operation_id: params.fence.operation_id,

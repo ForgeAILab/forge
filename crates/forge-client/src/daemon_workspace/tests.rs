@@ -597,6 +597,7 @@ async fn reviewed_merge_fast_forwards_the_verified_primary_and_replays_its_resul
             expected_target_sha: before.clone(),
             handed_off_paths: Vec::new(),
         },
+        candidate_transfer_key: None,
     })
     .unwrap();
     let result = fixture

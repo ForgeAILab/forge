@@ -58,7 +58,19 @@ impl DaemonWorkspaceBackend {
                 });
             }
         }
-        let owned = self.workspace(&params.workspace, false)?;
+        // The lookup of a transferred fast-forward names no worktree: the
+        // effect ran in the default checkout alone.
+        let transferred = matches!(
+            &params.integration,
+            WorkspaceIntegrationBinding::Attempt { request }
+                if request.witness["candidate_transfer_key"].is_string()
+        );
+        let owned = if transferred {
+            self.check_owner(&params.workspace.daemon_id, &params.workspace.runtime_id)?;
+            None
+        } else {
+            Some(self.workspace(&params.workspace, false)?)
+        };
         let mut operation = match self
             .journal
             .operation(&params.operation_id)
@@ -81,10 +93,11 @@ impl DaemonWorkspaceBackend {
                     != Some(&params.workspace.daemon_id)
                     || request.effect_owner()["runtime_id"].as_str()
                         != Some(&params.workspace.runtime_id)
-                    || request.witness["workspace"]["placement_id"].as_str()
-                        != Some(&params.workspace.placement_id)
-                    || request.witness["workspace"]["handle"].as_str()
-                        != Some(&params.workspace.workspace_handle)
+                    || (!transferred
+                        && (request.witness["workspace"]["placement_id"].as_str()
+                            != Some(&params.workspace.placement_id)
+                            || request.witness["workspace"]["handle"].as_str()
+                                != Some(&params.workspace.workspace_handle)))
                 {
                     return Err(error(
                         WRONG_OWNER,
@@ -190,7 +203,9 @@ impl DaemonWorkspaceBackend {
         {
             return Err(error(WRONG_OWNER, "operation belongs to another workspace"));
         }
-        self.check_generation(fence.generation, owned.generation, false)?;
+        if let Some(owned) = &owned {
+            self.check_generation(fence.generation, owned.generation, false)?;
+        }
         let integration = matches!(
             operation.fence.integration,
             WorkspaceIntegrationBinding::Attempt { .. }
@@ -215,7 +230,7 @@ impl DaemonWorkspaceBackend {
                 ))
             } else if operation.method == METHOD_WORKSPACE_MERGE {
                 match self
-                    .recover_merge(&owned, decode(operation.request.clone())?)
+                    .recover_merge(owned.as_ref(), decode(operation.request.clone())?)
                     .await
                 {
                     Ok(result) => encode(result),
@@ -262,7 +277,7 @@ impl DaemonWorkspaceBackend {
 
     async fn recover_merge(
         &self,
-        owned: &OwnedWorkspace,
+        owned: Option<&OwnedWorkspace>,
         reviewed: WorkspaceReviewedMergeParams,
     ) -> CommandResult<WorkspaceMergeResult> {
         let params = reviewed.merge;
@@ -289,12 +304,15 @@ impl DaemonWorkspaceBackend {
                 "merge target is not a verified primary checkout",
             ));
         }
-        let (_, source) = self.location_path(&owned.repo_location_id).await?;
-        if git_common_dir(&source).await? != git_common_dir(&target).await? {
-            return Err(error(
-                INVALID_INPUT,
-                "merge target is a different repository",
-            ));
+        // A transferred candidate has no source worktree on this owner.
+        if let Some(owned) = owned {
+            let (_, source) = self.location_path(&owned.repo_location_id).await?;
+            if git_common_dir(&source).await? != git_common_dir(&target).await? {
+                return Err(error(
+                    INVALID_INPUT,
+                    "merge target is a different repository",
+                ));
+            }
         }
         validate_branch(&target, &params.target_branch).await?;
         let target_ref = format!("refs/heads/{}", params.target_branch);

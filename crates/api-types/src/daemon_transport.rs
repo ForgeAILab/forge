@@ -714,6 +714,14 @@ pub struct WorkspaceReviewedMergeParams {
     #[serde(flatten)]
     pub merge: WorkspaceMergeParams,
     pub reviewed_commit_sha: Option<String>,
+    /// Set by a queue claim whose Task checkout is not a worktree of this
+    /// default checkout (another machine, or another clone): the candidate
+    /// is the commit this claim generation's outbound object transfer bound
+    /// (`refs/forge/integration/<key>`), not the HEAD of a worktree this
+    /// owner holds. `workspace_handle` and `placement_id` are then empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub candidate_transfer_key: Option<String>,
 }
 
 /// Finish an interrupted run/merge intent without executing it again. A merge
@@ -1924,6 +1932,7 @@ pub const METHOD_INTEGRATION_ANNOUNCE: &str = "integration.announce";
 pub const METHOD_INTEGRATION_EXPORT_OBJECTS: &str = "integration.export_objects";
 pub const METHOD_INTEGRATION_IMPORT_OBJECTS: &str = "integration.import_objects";
 pub const METHOD_INTEGRATION_RELEASE_OBJECTS: &str = "integration.release_objects";
+pub const METHOD_INTEGRATION_TARGET_FACTS: &str = "integration.target_facts";
 /// Error code of a typed object-transfer refusal; `details.refusal` is an
 /// [`ObjectTransferRefusal`].
 pub const OBJECT_TRANSFER_REFUSED: &str = "object_transfer_refused";
@@ -2115,6 +2124,31 @@ pub struct ReleaseObjectsResult {
     /// Imported refs deleted for `attempt`.
     #[serde(default)]
     pub removed_refs: u32,
+}
+
+/// Read-only facts about a default checkout this owner holds, for a queue
+/// head whose Task is placed in another checkout. Nothing is written.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct IntegrationTargetFactsParams {
+    pub daemon_id: String,
+    pub runtime_id: String,
+    pub repo_location_id: String,
+    pub target_branch: String,
+    /// The head's candidate commit. It may be unknown to this checkout.
+    pub candidate_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationTargetFactsResult {
+    /// Tip of `target_branch` in the checkout.
+    pub target_tip: String,
+    /// The candidate is known here and is an ancestor of the tip.
+    pub candidate_in_target: bool,
+    /// The checkout has uncommitted changes.
+    pub dirty: bool,
 }
 
 /// `inbound` brings the target tip to the Task's checkout before a rebase;

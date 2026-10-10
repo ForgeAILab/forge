@@ -52,8 +52,6 @@ pub enum ParkReason {
     TransferTooLarge,
     ExternalMovesExhausted,
     RoundsExhausted,
-    /// The Task's checkout and the default checkout have different owners.
-    CrossOwner,
     /// A deciding Task step settled without answering, again after re-asks.
     StepFailed,
 }
@@ -79,7 +77,6 @@ impl ParkReason {
             Self::TransferTooLarge => "transfer_too_large",
             Self::ExternalMovesExhausted => "external_target_moves_exhausted",
             Self::RoundsExhausted => "rounds_exhausted",
-            Self::CrossOwner => "cross_owner_unsupported",
             Self::StepFailed => "task_step_failed",
         }
     }
@@ -894,25 +891,6 @@ impl HeadDriver {
                     .park(&a, ParkReason::ProjectPaused, "the Project is paused")
                     .await
             }
-        }
-        // The rebase is performed by the owner of the Task's checkout and
-        // the fast-forward by the owner of the default checkout. A default
-        // checkout on a daemon is fast-forwarded from a worktree of it only:
-        // a Task in any other checkout (another machine, or another clone on
-        // that daemon) parks typed instead of being asked of an owner that
-        // would refuse it.
-        if matches!(
-            target_owner(queue.target_owner_json.as_ref()),
-            Some(EffectOwner::Daemon { .. })
-        ) && !facts.shared_object_store
-        {
-            return self
-                .park(
-                    &a,
-                    ParkReason::CrossOwner,
-                    "the default checkout is on a daemon and the Task is in another checkout; place the Task in the default checkout's location, or make a server-owned location the default",
-                )
-                .await;
         }
         let admitted = a
             .candidate_sha

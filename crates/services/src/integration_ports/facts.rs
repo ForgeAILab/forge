@@ -1,6 +1,8 @@
 //! The head's read-only facts: the Task gate from storage, the Git state
 //! from the owner of the Task's checkout.
+use super::owner::client_error;
 use crate::{
+    daemon_transport::workspace_client::{DaemonObjectEndpoint, DaemonWorkspaceClient},
     integration_effects::{EffectOwner, EffectWorkspace},
     integration_worker::{HeadFacts, IntegrationFactsPort, ObjectTransferEndpoint, TaskGate},
     workspace_backend::{effect_workspace, WorkspaceBackendRouter},
@@ -18,18 +20,30 @@ use std::{path::PathBuf, sync::Arc};
 /// - Git: read through the Task's workspace placement, so a daemon-placed
 ///   Task is read on its daemon. The Task's checkout is a worktree of its
 ///   repo location, so when that location is the queue's target the target
-///   branch is read there too; otherwise the target is read from the
-///   server-owned default checkout.
+///   branch is read there too. Otherwise the target is read where the
+///   default checkout is: on this host for a server-owned location, by the
+///   owner's read-only `integration.target_facts` for a daemon-owned one.
 ///
 /// It writes nothing and holds no Task, Review or event capability.
 pub struct WorkspaceHeadFacts {
     db: Arc<SqliteDb>,
     router: Arc<WorkspaceBackendRouter>,
+    daemons: Option<DaemonWorkspaceClient>,
 }
 
 impl WorkspaceHeadFacts {
     pub fn new(db: Arc<SqliteDb>, router: Arc<WorkspaceBackendRouter>) -> Self {
-        Self { db, router }
+        Self {
+            db,
+            router,
+            daemons: None,
+        }
+    }
+
+    /// Reads of a daemon-owned default checkout the Task is not placed in.
+    pub fn with_daemons(mut self, client: DaemonWorkspaceClient) -> Self {
+        self.daemons = Some(client);
+        self
     }
 
     /// A Task that left its entry has no checkout this worker may rely on
@@ -114,17 +128,46 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
             }
         };
         let candidate_head = read(WorkspaceGitQuery::Head, "the Task checkout has no HEAD").await?;
-        // The default checkout, when it is a path on this host.
-        let target_path: Option<PathBuf> = match queue.target_location_id.as_deref() {
-            Some(location_id) => sqlx::query_scalar::<_, String>(
-                "SELECT path FROM repo_location WHERE id=? AND owner_kind='server'",
-            )
-            .bind(location_id)
-            .fetch_optional(self.db.pool())
-            .await
-            .map_err(db::DbError::from)?
-            .map(PathBuf::from),
-            None => None,
+        // The default checkout: a path on this host, or a daemon's.
+        let target_row: Option<(String, String, Option<String>, Option<String>)> =
+            match queue.target_location_id.as_deref() {
+                Some(location_id) => sqlx::query_as(
+                    "SELECT path,owner_kind,daemon_id,runtime_id FROM repo_location WHERE id=?",
+                )
+                .bind(location_id)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db::DbError::from)?,
+                None => None,
+            };
+        let target_path: Option<PathBuf> = target_row
+            .as_ref()
+            .filter(|(_, owner_kind, _, _)| owner_kind == "server")
+            .map(|(path, _, _, _)| PathBuf::from(path));
+        // Another owner's default checkout is read by that owner, once.
+        let remote = match (&target_row, &self.daemons) {
+            (Some((_, owner_kind, Some(daemon_id), Some(runtime_id))), Some(client))
+                if !shared && owner_kind == "daemon" =>
+            {
+                Some(
+                    client
+                        .target_facts(
+                            DaemonObjectEndpoint {
+                                daemon_id,
+                                runtime_id,
+                                repo_location_id: queue
+                                    .target_location_id
+                                    .as_deref()
+                                    .unwrap_or_default(),
+                            },
+                            &queue.target_branch,
+                            &candidate_head,
+                        )
+                        .await
+                        .map_err(client_error)?,
+                )
+            }
+            _ => None,
         };
         let target_tip = if shared {
             read(
@@ -134,6 +177,8 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
                 "the target branch has no tip",
             )
             .await?
+        } else if let Some(remote) = &remote {
+            remote.target_tip.clone()
         } else {
             let path = target_path.as_deref().ok_or_else(|| {
                 unreadable(
@@ -159,6 +204,8 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
         let target_in_candidate = ancestor(target_tip.clone(), candidate_head.clone()).await?;
         let candidate_in_target = if shared {
             ancestor(candidate_head.clone(), target_tip.clone()).await?
+        } else if let Some(remote) = &remote {
+            remote.candidate_in_target
         } else {
             let path = target_path.as_deref().expect("read above");
             git::command_output(
@@ -179,12 +226,12 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
             .git_query(WorkspaceGitQuery::RebaseInProgress, false)
             .await?
             .is_some_and(|value| value.trim() == "true");
-        // A daemon-owned default checkout is read on its daemon, through the
-        // Task's placement when the Task is placed in it. From another clone
-        // of that daemon it is not readable here; the owner then refuses a
-        // fast-forward into a dirty checkout itself.
+        // A daemon-owned default checkout is read on its daemon: through the
+        // Task's placement when the Task is placed in it, by the owner's
+        // target facts otherwise.
         let target_dirty = match target_path.as_deref() {
             Some(path) => !git::is_worktree_clean(path).await?,
+            None if remote.is_some() => remote.as_ref().is_some_and(|remote| remote.dirty),
             None if shared => !resolved
                 .git_query(WorkspaceGitQuery::TargetStatusPorcelain, false)
                 .await?

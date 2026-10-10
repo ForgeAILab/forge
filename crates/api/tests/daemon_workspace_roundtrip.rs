@@ -3637,6 +3637,7 @@ async fn daemon_merge_rebase_and_check_primitives_write_no_server_tables_or_even
                         handed_off_paths: vec![],
                     },
                     reviewed_commit_sha: Some(candidate.clone()),
+                    candidate_transfer_key: None,
                 })
                 .unwrap(),
             ),
@@ -3810,6 +3811,7 @@ async fn integration_attempt_lost_reply_across_real_reconnect_settles_once() {
             handed_off_paths: Vec::new(),
         },
         reviewed_commit_sha: Some(candidate.clone()),
+        candidate_transfer_key: None,
     })
     .unwrap();
     let client = services::daemon_transport::workspace_client::DaemonWorkspaceClient::new(
@@ -4464,10 +4466,21 @@ struct QueueHead {
 /// The fixture's Task, with a candidate commit, in `merging` with a passed
 /// review and admitted to its repository's `main` queue.
 async fn admit_queue_head(fixture: &Fixture, ci_steps: &[&str]) -> QueueHead {
-    use db::IntegrationQueueRepo;
     let candidate = fixture.candidate().await;
+    admit_placed_head(fixture, &fixture.resolved.placement, candidate, ci_steps).await
+}
+
+/// The Task of `placement`, whose checkout holds `candidate`, in `merging`
+/// with a passed review and admitted to its repository's `main` queue.
+async fn admit_placed_head(
+    fixture: &Fixture,
+    placement: &db::WorkspacePlacement,
+    candidate: String,
+    ci_steps: &[&str],
+) -> QueueHead {
+    use db::IntegrationQueueRepo;
     let database = fixture.harness.state.db.clone();
-    let placement = fixture.resolved.placement.clone();
+    let placement = placement.clone();
     let workspace = WorkspaceRepo::get_by_id(&*database, &placement.workspace_id)
         .await
         .unwrap()
@@ -4511,7 +4524,11 @@ async fn admit_queue_head(fixture: &Fixture, ci_steps: &[&str]) -> QueueHead {
     attempt.placement_ref = Some(placement.id.clone());
     attempt.repo_location_id = Some(placement.repo_location_id.clone());
     attempt.repo_location_ref = Some(placement.repo_location_id.clone());
-    attempt.owner_kind = Some(db::IntegrationOwnerKind::Daemon);
+    attempt.owner_kind = Some(if placement.daemon_id.is_some() {
+        db::IntegrationOwnerKind::Daemon
+    } else {
+        db::IntegrationOwnerKind::Server
+    });
     attempt.daemon_id = placement.daemon_id.clone();
     attempt.runtime_id = placement.runtime_id.clone();
     attempt.placement_generation = Some(placement.generation);
@@ -5333,4 +5350,609 @@ async fn queue_worker_merges_a_daemon_placed_task_into_a_server_owned_default_ch
     .await
     .unwrap();
     assert_eq!(checks, vec![(tip, "pass".to_owned())]);
+}
+
+/// A second Task of the fixture's Project, in `review`, with its workspace
+/// row. The worktree path is filled in by the caller's placement.
+async fn second_task(fixture: &Fixture, worktree_path: &str) -> (db::Task, db::Workspace) {
+    let database = fixture.harness.state.db.clone();
+    let first = TaskRepo::get_by_id(&*database, &fixture.resolved.placement.task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let repo_id = WorkspaceRepo::get_by_id(&*database, &fixture.resolved.placement.workspace_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .repo_id;
+    let now = db::now_rfc3339();
+    let task = TaskRepo::create(
+        &*database,
+        CreateTask {
+            id: db::new_uuid_v4(),
+            project_id: first.project_id,
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Task in another checkout".into(),
+            description: None,
+            task_type: "task".into(),
+            status: "review".into(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("second task creates");
+    let workspace = WorkspaceRepo::create(
+        &*database,
+        CreateWorkspace {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            repo_id,
+            worktree_path: worktree_path.to_owned(),
+            branch: workspace::task_branch_name(&task.id),
+            status: WorkspaceStatus::Creating,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("second workspace creates");
+    (task, workspace)
+}
+
+fn clone_main(from: &std::path::Path, parent: &std::path::Path, name: &str) -> PathBuf {
+    git_sync(
+        parent,
+        &[
+            "clone",
+            "-q",
+            "--single-branch",
+            "--branch",
+            "main",
+            from.to_str().unwrap(),
+            name,
+        ],
+    );
+    let clone = parent.join(name);
+    for (key, value) in [
+        ("user.name", "Forge"),
+        ("user.email", "forge@example.invalid"),
+    ] {
+        git_sync(&clone, &["config", key, value]);
+    }
+    clone
+}
+
+/// A Task placed on the server, in a worktree of a server-owned clone of the
+/// fixture's repository (not the default checkout), with a candidate commit.
+/// Returns its placement, the clone and the candidate.
+async fn server_placed_task(fixture: &Fixture) -> (db::WorkspacePlacement, PathBuf, String) {
+    let database = fixture.harness.state.db.clone();
+    let clone = clone_main(&fixture.checkout, fixture.server_root.path(), "task-clone");
+    let worktree = fixture
+        .server_root
+        .path()
+        .join("workspaces")
+        .join("cross-owner-task");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    let (task, workspace) = second_task(fixture, worktree.to_str().unwrap()).await;
+    git_sync(
+        &clone,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &workspace.branch,
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let now = db::now_rfc3339();
+    let location = RepoLocationRepo::create(
+        &*database,
+        CreateRepoLocation {
+            id: db::new_uuid_v4(),
+            repo_id: workspace.repo_id.clone(),
+            owner_kind: RepoLocationOwnerKind::Server,
+            daemon_id: None,
+            runtime_id: None,
+            path: clone.to_string_lossy().into_owned(),
+            kind: RepoLocationKind::PrimaryCheckout,
+            is_default: false,
+            status: RepoLocationStatus::Ready,
+            last_verified_at: Some(now.clone()),
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("server-owned Task location creates");
+    let placement = WorkspacePlacementRepo::create(
+        &*database,
+        CreateWorkspacePlacement {
+            id: db::new_uuid_v4(),
+            workspace_id: workspace.id.clone(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            owner_kind: PlacementOwnerKind::Server,
+            daemon_id: None,
+            runtime_id: None,
+            repo_location_id: location.id,
+            execution_daemon_id: None,
+            workspace_handle: Some(worktree.to_string_lossy().into_owned()),
+            generation: 1,
+            state: PlacementState::Ready,
+            selected_by: PlacementSelectedBy::Scheduler,
+            selection_reason: "{}".into(),
+            reserved_until: None,
+            disconnected_at: None,
+            failure_cause: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("server placement creates");
+    WorkspaceRepo::update_status(
+        &*database,
+        &workspace.id,
+        WorkspaceStatus::Ready,
+        None,
+        &now,
+    )
+    .await
+    .expect("workspace is ready");
+    std::fs::write(worktree.join("feature.txt"), "candidate\n").unwrap();
+    git_sync(&worktree, &["add", "feature.txt"]);
+    git_sync(&worktree, &["commit", "-q", "-m", "candidate"]);
+    let candidate = git_sync(&worktree, &["rev-parse", "HEAD"]);
+    (placement, clone, candidate)
+}
+
+/// A second connected daemon with its own workspace root.
+struct ExtraDaemon {
+    link: Option<DaemonLink>,
+    runtime: Arc<DaemonRuntime>,
+    daemon_id: String,
+    runtime_id: String,
+    token: String,
+    root: TestDir,
+}
+
+async fn extra_daemon(fixture: &Fixture, suite: &str) -> ExtraDaemon {
+    let harness = &fixture.harness;
+    let root = TestDir::new(&format!("{suite}-second-owner"));
+    let registration =
+        common::fake_daemon::register_daemon(&harness.app, &db::new_uuid_v4(), suite).await;
+    common::fake_daemon::report_remote_daemon_shell(
+        &harness.app,
+        &registration.daemon_id,
+        &registration.registration_token,
+        root.path(),
+        suite,
+    )
+    .await;
+    let runtime_id = RuntimeRepo::get_by_daemon_id(&*harness.state.db, &registration.daemon_id)
+        .await
+        .expect("runtime loads")
+        .expect("runtime exists")
+        .id;
+    let (outbound, _discarded) = mpsc::unbounded_channel();
+    let runtime = DaemonRuntime::new_owned(
+        outbound,
+        root.path().to_path_buf(),
+        ActiveExecutionTracker::default(),
+        registration.daemon_id.clone(),
+        WorkspaceRunPolicy {
+            allowed_purposes: vec![
+                WorkspaceRunPurpose::CiStep,
+                WorkspaceRunPurpose::Hook,
+                WorkspaceRunPurpose::EnvironmentSetup,
+            ],
+        },
+    )
+    .expect("second owner runtime starts");
+    let link = DaemonLink::connect(
+        &fixture.server,
+        &registration.daemon_id,
+        &registration.registration_token,
+        Arc::clone(&runtime),
+    )
+    .await;
+    ExtraDaemon {
+        link: Some(link),
+        runtime,
+        daemon_id: registration.daemon_id,
+        runtime_id,
+        token: registration.registration_token,
+        root,
+    }
+}
+
+/// A Task placed on a daemon, in a worktree of a clone of the fixture's
+/// repository under `root` (a location of that daemon, not the default
+/// checkout), prepared by the daemon, with a candidate commit.
+async fn daemon_clone_task(
+    fixture: &Fixture,
+    daemon_id: &str,
+    runtime_id: &str,
+    root: &std::path::Path,
+) -> (ResolvedWorkspace, PathBuf, String) {
+    let database = fixture.harness.state.db.clone();
+    let clone = clone_main(&fixture.checkout, root, "task-clone");
+    let (task, workspace) = second_task(
+        fixture,
+        &fixture
+            .server_root
+            .path()
+            .join("missing-checkout/second")
+            .to_string_lossy(),
+    )
+    .await;
+    let now = db::now_rfc3339();
+    let location = RepoLocationRepo::create(
+        &*database,
+        CreateRepoLocation {
+            id: db::new_uuid_v4(),
+            repo_id: workspace.repo_id.clone(),
+            owner_kind: RepoLocationOwnerKind::Daemon,
+            daemon_id: Some(daemon_id.to_owned()),
+            runtime_id: Some(runtime_id.to_owned()),
+            path: clone.to_string_lossy().into_owned(),
+            kind: RepoLocationKind::PrimaryCheckout,
+            is_default: false,
+            status: RepoLocationStatus::Ready,
+            last_verified_at: Some(now.clone()),
+            last_error: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("second daemon location creates");
+    let placement = WorkspacePlacementRepo::create(
+        &*database,
+        CreateWorkspacePlacement {
+            id: db::new_uuid_v4(),
+            workspace_id: workspace.id.clone(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            owner_kind: PlacementOwnerKind::Daemon,
+            daemon_id: Some(daemon_id.to_owned()),
+            runtime_id: Some(runtime_id.to_owned()),
+            repo_location_id: location.id.clone(),
+            execution_daemon_id: Some(daemon_id.to_owned()),
+            workspace_handle: None,
+            generation: 1,
+            state: PlacementState::Preparing,
+            selected_by: PlacementSelectedBy::Scheduler,
+            selection_reason: "{}".into(),
+            reserved_until: None,
+            disconnected_at: None,
+            failure_cause: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("second daemon placement creates");
+    let backend = fixture
+        .harness
+        .state
+        .workspace_backend_router
+        .for_placement(&placement)
+        .expect("daemon backend is installed");
+    backend
+        .daemon_client()
+        .expect("owner client")
+        .verify_location(
+            daemon_id,
+            RepoLocationVerifyParams {
+                repo_location_id: location.id,
+                daemon_id: daemon_id.to_owned(),
+                runtime_id: runtime_id.to_owned(),
+                path: clone.to_string_lossy().into_owned(),
+                kind: DaemonRepoLocationKind::PrimaryCheckout,
+                default_branch: "main".into(),
+                remote_url: None,
+                expected_version: location.version,
+                probe: None,
+            },
+        )
+        .await
+        .expect("owner verifies the Task's clone");
+    let prepared = backend
+        .prepare(
+            &placement,
+            &PrepareSpec {
+                base_ref: "main".into(),
+            },
+        )
+        .await
+        .expect("owner prepares a worktree in the clone");
+    let placement = WorkspacePlacementRepo::update(
+        &*database,
+        UpdateWorkspacePlacement {
+            id: placement.id,
+            expected_version: placement.version,
+            agent_id: None,
+            owner_kind: None,
+            daemon_id: None,
+            runtime_id: None,
+            repo_location_id: None,
+            execution_daemon_id: None,
+            workspace_handle: Some(Some(prepared.handle)),
+            generation: None,
+            state: Some(PlacementState::Ready),
+            selected_by: None,
+            selection_reason: None,
+            reserved_until: None,
+            disconnected_at: None,
+            failure_cause: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("prepared handle persists");
+    WorkspaceRepo::update_status(
+        &*database,
+        &workspace.id,
+        WorkspaceStatus::Ready,
+        None,
+        &now,
+    )
+    .await
+    .expect("workspace is ready");
+    let resolved = ResolvedWorkspace { placement, backend };
+    let committed = resolved
+        .backend
+        .run(
+            &resolved.placement,
+            &RunSpec {
+                purpose: WorkspaceRunPurpose::CiStep,
+                command:
+                    "printf 'candidate\\n' > feature.txt; git add feature.txt; git commit -m candidate"
+                        .into(),
+                env: BTreeMap::new(),
+                timeout_secs: 0,
+                max_output_bytes: usize::MAX,
+            },
+        )
+        .await
+        .expect("owner command succeeds");
+    assert_eq!(committed.exit_code, 0);
+    let candidate = resolved
+        .git_query(WorkspaceGitQuery::Head, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .trim()
+        .to_owned();
+    (resolved, clone, candidate)
+}
+
+/// What every merged cross-checkout head must show: the default checkout
+/// holds exactly the checked candidate, and the transfer refs are gone.
+async fn assert_landed_exactly(
+    fixture: &Fixture,
+    head: &QueueHead,
+    default_checkout: &std::path::Path,
+    moved_tip: &str,
+) -> db::IntegrationAttempt {
+    let attempt = queue_attempt(fixture, head).await;
+    assert!(
+        attempt.failure_message.is_none(),
+        "never parked: {:?}",
+        attempt.failure_message
+    );
+    let tip = git_sync(default_checkout, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(attempt.candidate_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(attempt.integrated_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(attempt.integrated_before_sha.as_deref(), Some(moved_tip));
+    assert_ne!(tip, head.candidate, "the queue rebased the candidate");
+    assert_eq!(git_sync(default_checkout, &["rev-parse", "HEAD"]), tip);
+    for file in ["feature.txt", "outside.txt"] {
+        assert!(default_checkout.join(file).exists(), "{file}");
+    }
+    assert!(integration_refs(default_checkout).is_empty());
+    attempt
+}
+
+/// The reverse: Task on the server, default checkout on a daemon. The
+/// rebase runs on the server against the transferred target tip; the daemon
+/// fast-forwards its checkout from the transferred candidate, without a
+/// worktree of the Task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn queue_worker_merges_a_server_placed_task_into_a_daemon_owned_default_checkout() {
+    use db::{IntegrationOperationKind as Kind, IntegrationOperationState as State};
+    let fixture = Fixture::file_backed("forge-queue-cross-server-daemon").await;
+    let (placement, task_clone, candidate) = server_placed_task(&fixture).await;
+    let head = admit_placed_head(
+        &fixture,
+        &placement,
+        candidate,
+        &["test -f feature.txt", "test -f outside.txt"],
+    )
+    .await;
+    std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&fixture.checkout, "outside").await.unwrap();
+    let moved_tip = git::get_current_sha(&fixture.checkout).await.unwrap();
+    let task_location_tip = git_sync(&task_clone, &["rev-parse", "refs/heads/main"]);
+    start_check_worker!(fixture, stop_checks);
+
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the Task to merge", {
+        task_status(&fixture, &head.task_id).await == "done"
+            && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
+    });
+    queue_eventually!(&fixture, &head, "the transfer refs to be released", {
+        integration_refs(&fixture.checkout).is_empty() && integration_refs(&task_clone).is_empty()
+    });
+    let _ = stop.send(true);
+    let _ = stop_checks.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let attempt = assert_landed_exactly(&fixture, &head, &fixture.checkout, &moved_tip).await;
+    assert_eq!(
+        git_sync(&task_clone, &["rev-parse", "refs/heads/main"]),
+        task_location_tip,
+        "the Task's own location was not advanced"
+    );
+    // One rebase, by the server; one fast-forward, by the daemon.
+    assert_eq!(
+        receipt_owners(&attempt, Kind::Rebase),
+        vec![(State::Succeeded, None)]
+    );
+    assert_eq!(
+        receipt_owners(&attempt, Kind::FastForward),
+        vec![(State::Succeeded, Some(fixture.daemon_id.clone()))]
+    );
+    let link = fixture.link.as_ref().unwrap();
+    assert!(attempt_requests(link, METHOD_WORKSPACE_RESET).is_empty());
+    let merges = attempt_requests(link, METHOD_WORKSPACE_MERGE);
+    assert_eq!(merges.len(), 1, "{merges:?}");
+    assert!(merges[0]["candidate_transfer_key"].is_string());
+    assert_eq!(merges[0]["workspace_handle"], "");
+}
+
+/// Two daemons: the Task on one, the default checkout on the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn queue_worker_merges_across_two_daemons() {
+    use db::{IntegrationOperationKind as Kind, IntegrationOperationState as State};
+    let fixture = Fixture::file_backed("forge-queue-cross-two-daemons").await;
+    let second = extra_daemon(&fixture, "forge-queue-cross-two-daemons").await;
+    let (resolved, task_clone, candidate) = daemon_clone_task(
+        &fixture,
+        &second.daemon_id,
+        &second.runtime_id,
+        second.root.path(),
+    )
+    .await;
+    let head = admit_placed_head(
+        &fixture,
+        &resolved.placement,
+        candidate,
+        &["test -f feature.txt", "test -f outside.txt"],
+    )
+    .await;
+    std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&fixture.checkout, "outside").await.unwrap();
+    let moved_tip = git::get_current_sha(&fixture.checkout).await.unwrap();
+    let task_location_tip = git_sync(&task_clone, &["rev-parse", "refs/heads/main"]);
+    start_check_worker!(fixture, stop_checks);
+
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the Task to merge", {
+        task_status(&fixture, &head.task_id).await == "done"
+            && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
+    });
+    queue_eventually!(&fixture, &head, "the transfer refs to be released", {
+        integration_refs(&fixture.checkout).is_empty() && integration_refs(&task_clone).is_empty()
+    });
+    let _ = stop.send(true);
+    let _ = stop_checks.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let attempt = assert_landed_exactly(&fixture, &head, &fixture.checkout, &moved_tip).await;
+    assert_eq!(
+        git_sync(&task_clone, &["rev-parse", "refs/heads/main"]),
+        task_location_tip,
+        "the Task's own location was not advanced"
+    );
+    assert_eq!(
+        receipt_owners(&attempt, Kind::Rebase),
+        vec![(State::Succeeded, Some(second.daemon_id.clone()))]
+    );
+    assert_eq!(
+        receipt_owners(&attempt, Kind::FastForward),
+        vec![(State::Succeeded, Some(fixture.daemon_id.clone()))]
+    );
+    // Each owner was asked for its own effect only, after it was told the
+    // claim generation.
+    let target = fixture.link.as_ref().unwrap();
+    let tasks = second.link.as_ref().unwrap();
+    assert!(attempt_requests(target, METHOD_WORKSPACE_RESET).is_empty());
+    assert_eq!(attempt_requests(target, METHOD_WORKSPACE_MERGE).len(), 1);
+    assert_eq!(attempt_requests(tasks, METHOD_WORKSPACE_RESET).len(), 1);
+    assert!(attempt_requests(tasks, METHOD_WORKSPACE_MERGE).is_empty());
+    for link in [target, tasks] {
+        assert!(!link.requests(METHOD_INTEGRATION_ANNOUNCE).is_empty());
+    }
+    // The check ran where the Task is.
+    assert!(!tasks.requests(METHOD_CHECK_RUN).is_empty());
+    assert!(target.requests(METHOD_CHECK_RUN).is_empty());
+    let _ = (&second.runtime, &second.token);
+}
+
+/// Two clones on ONE daemon: the Task in one, the default checkout in the
+/// other. One owner performs both effects; the fast-forward takes the
+/// candidate from the transferred ref (the clones share no Git common dir).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn queue_worker_merges_between_two_clones_on_one_daemon() {
+    use db::{IntegrationOperationKind as Kind, IntegrationOperationState as State};
+    let fixture = Fixture::file_backed("forge-queue-cross-clone-daemon").await;
+    let runtime_id = fixture.resolved.placement.runtime_id.clone().unwrap();
+    let (resolved, task_clone, candidate) = daemon_clone_task(
+        &fixture,
+        &fixture.daemon_id,
+        &runtime_id,
+        fixture._daemon_root.path(),
+    )
+    .await;
+    let head = admit_placed_head(
+        &fixture,
+        &resolved.placement,
+        candidate,
+        &["test -f feature.txt", "test -f outside.txt"],
+    )
+    .await;
+    std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&fixture.checkout, "outside").await.unwrap();
+    let moved_tip = git::get_current_sha(&fixture.checkout).await.unwrap();
+    let task_location_tip = git_sync(&task_clone, &["rev-parse", "refs/heads/main"]);
+    start_check_worker!(fixture, stop_checks);
+
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &head, "the Task to merge", {
+        task_status(&fixture, &head.task_id).await == "done"
+            && queue_attempt(&fixture, &head).await.state == db::IntegrationAttemptState::Completed
+    });
+    queue_eventually!(&fixture, &head, "the transfer refs to be released", {
+        integration_refs(&fixture.checkout).is_empty() && integration_refs(&task_clone).is_empty()
+    });
+    let _ = stop.send(true);
+    let _ = stop_checks.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let attempt = assert_landed_exactly(&fixture, &head, &fixture.checkout, &moved_tip).await;
+    assert_eq!(
+        git_sync(&task_clone, &["rev-parse", "refs/heads/main"]),
+        task_location_tip,
+        "the Task's own clone was not advanced"
+    );
+    let owner = Some(fixture.daemon_id.clone());
+    assert_eq!(
+        receipt_owners(&attempt, Kind::Rebase),
+        vec![(State::Succeeded, owner.clone())]
+    );
+    assert_eq!(
+        receipt_owners(&attempt, Kind::FastForward),
+        vec![(State::Succeeded, owner)]
+    );
+    let link = fixture.link.as_ref().unwrap();
+    assert_eq!(attempt_requests(link, METHOD_WORKSPACE_RESET).len(), 1);
+    let merges = attempt_requests(link, METHOD_WORKSPACE_MERGE);
+    assert_eq!(merges.len(), 1, "{merges:?}");
+    assert!(merges[0]["candidate_transfer_key"].is_string());
 }

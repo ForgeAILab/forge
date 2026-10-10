@@ -78,6 +78,7 @@ pub(super) fn merge_params(
             expected_target_sha: target.into(),
             handed_off_paths: Vec::new(),
         },
+        candidate_transfer_key: None,
     }
 }
 

@@ -179,26 +179,54 @@ impl DaemonWorkspaceBackend {
         {
             return Err(refusal(IntegrationOwnerRefusal::ForeignOwner));
         }
-        let witness = &request.witness["workspace"];
-        let handle = params["workspace_handle"]
-            .as_str()
-            .ok_or_else(|| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
-        let owned = state
-            .handles
-            .get(handle)
-            .ok_or_else(|| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
-        if owned.cleaned
-            || witness["placement_id"].as_str() != Some(&owned.placement_id)
-            || witness["handle"].as_str() != Some(handle)
-            || witness["generation"].as_u64() != Some(owned.generation)
-            || owned.generation != fence.generation
-            || owned.runtime_id != fence.runtime_id
-            || witness["owner"]["kind"] != "daemon"
-            || witness["owner"]["daemon_id"].as_str() != Some(&fence.daemon_id)
-            || witness["owner"]["runtime_id"].as_str() != Some(&fence.runtime_id)
-            || (off_target && owned.repo_location_id != location_id)
-        {
-            return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
+        // A fast-forward of a transferred candidate involves no worktree of
+        // this owner: its candidate witness is the outbound transfer ref of
+        // exactly this claim generation, checked against Git before the
+        // effect starts (`verify_integration_objects`).
+        let transferred = params
+            .get("candidate_transfer_key")
+            .is_some_and(Value::is_string);
+        let witnessed_transfer = request.witness["candidate_transfer_key"].as_str();
+        if transferred {
+            let key = object_transfer_key(
+                &request.fence.attempt_id,
+                request.fence.generation,
+                ObjectTransferDirection::Outbound,
+            );
+            if !queue_claim
+                || request.kind != WorkspaceIntegrationKind::FastForward
+                || params["candidate_transfer_key"].as_str() != Some(&key)
+                || witnessed_transfer != Some(&key)
+                || params["workspace_handle"].as_str() != Some("")
+                || !fence.placement_id.is_empty()
+            {
+                return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
+            }
+        } else if witnessed_transfer.is_some() {
+            return Err(refusal(IntegrationOwnerRefusal::RequestConflict));
+        }
+        if !transferred {
+            let witness = &request.witness["workspace"];
+            let handle = params["workspace_handle"]
+                .as_str()
+                .ok_or_else(|| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
+            let owned = state
+                .handles
+                .get(handle)
+                .ok_or_else(|| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;
+            if owned.cleaned
+                || witness["placement_id"].as_str() != Some(&owned.placement_id)
+                || witness["handle"].as_str() != Some(handle)
+                || witness["generation"].as_u64() != Some(owned.generation)
+                || owned.generation != fence.generation
+                || owned.runtime_id != fence.runtime_id
+                || witness["owner"]["kind"] != "daemon"
+                || witness["owner"]["daemon_id"].as_str() != Some(&fence.daemon_id)
+                || witness["owner"]["runtime_id"].as_str() != Some(&fence.runtime_id)
+                || (off_target && owned.repo_location_id != location_id)
+            {
+                return Err(refusal(IntegrationOwnerRefusal::WitnessMismatch));
+            }
         }
         // The transport request must perform exactly the effect frozen by the
         // recorder, not merely reuse its attempt identity with different input.
@@ -306,6 +334,43 @@ impl DaemonWorkspaceBackend {
             return Ok(());
         }
         let witness = &request.witness;
+        if let Some(key) = witness["candidate_transfer_key"].as_str() {
+            // The candidate is the commit the outbound transfer of this claim
+            // generation bound in the default checkout, and the target is
+            // still the tip the rebase was onto.
+            let mismatch = || refusal(IntegrationOwnerRefusal::WitnessMismatch);
+            let location = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                state
+                    .locations
+                    .get(
+                        request.fence.target_owner["location_id"]
+                            .as_str()
+                            .unwrap_or_default(),
+                    )
+                    .cloned()
+            }
+            .ok_or_else(|| refusal(IntegrationOwnerRefusal::ForeignOwner))?;
+            let text = |name: &str| witness[name].as_str().filter(|value| !value.is_empty());
+            let (Some(head), Some(branch), Some(expected)) = (
+                text("expected_head_sha"),
+                text("target_branch"),
+                text("expected_target_sha"),
+            ) else {
+                return Err(mismatch());
+            };
+            let transferred = git::integration::transfer_ref(key).map_err(|_| mismatch())?;
+            if !resolve_commit(&location.path, &transferred)
+                .await
+                .is_ok_and(|bound| bound == head)
+                || !resolve_commit(&location.path, &format!("refs/heads/{branch}"))
+                    .await
+                    .is_ok_and(|tip| tip == expected)
+            {
+                return Err(mismatch());
+            }
+            return Ok(());
+        }
         let handle = witness["workspace"]["handle"]
             .as_str()
             .ok_or_else(|| refusal(IntegrationOwnerRefusal::WitnessMismatch))?;

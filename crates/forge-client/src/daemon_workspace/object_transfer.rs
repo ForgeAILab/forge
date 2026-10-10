@@ -336,6 +336,42 @@ impl DaemonWorkspaceBackend {
         Ok(imported(receipt))
     }
 
+    /// Read-only facts about a default checkout this owner holds, for a
+    /// queue head whose Task is placed elsewhere.
+    pub(super) async fn target_facts(
+        &self,
+        params: IntegrationTargetFactsParams,
+    ) -> CommandResult<IntegrationTargetFactsResult> {
+        self.check_owner(&params.daemon_id, &params.runtime_id)?;
+        let (_, repo) = self.location_path(&params.repo_location_id).await?;
+        validate_branch(&repo, &params.target_branch).await?;
+        let target_tip =
+            resolve_commit(&repo, &format!("refs/heads/{}", params.target_branch)).await?;
+        // An object this checkout does not hold is not an ancestor.
+        let object_id = matches!(params.candidate_sha.len(), 40 | 64)
+            && params
+                .candidate_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit());
+        let candidate_in_target = object_id
+            && local_git(
+                &repo,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &params.candidate_sha,
+                    &target_tip,
+                ],
+            )
+            .await
+            .is_ok();
+        Ok(IntegrationTargetFactsResult {
+            target_tip,
+            candidate_in_target,
+            dirty: !git::is_worktree_clean(&repo).await.map_err(git_error)?,
+        })
+    }
+
     pub(super) async fn release_objects(
         &self,
         params: ReleaseObjectsParams,

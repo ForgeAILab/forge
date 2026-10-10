@@ -313,39 +313,80 @@ impl IntegrationOwnerPort for RoutingIntegrationOwner {
     }
 
     async fn fast_forward(&self, request: OwnerFastForwardRequest) -> Result<OwnerMergeReceipt> {
-        // By the owner of the default checkout. The server takes a candidate
-        // that an outbound transfer brought from another machine; a daemon
-        // fast-forwards from a worktree it holds.
-        let Some((target_daemon, _)) = daemon_owner(&request.fence.target_owner) else {
+        // By the owner of the default checkout. A Task in a worktree of that
+        // checkout is fast-forwarded from the worktree; a Task anywhere else
+        // (another machine, or another clone on the same one) from the ref
+        // this claim generation's outbound transfer bound there.
+        let Some((daemon_id, runtime_id)) = daemon_owner(&request.fence.target_owner) else {
             return IntegrationOwnerPort::fast_forward(&*self.server, request).await;
-        };
-        let Some((daemon_id, runtime_id, fence)) =
-            Self::workspace_fence(&request.workspace, &request.candidate_sha)
-                .filter(|(daemon_id, _, _)| *daemon_id == target_daemon)
-        else {
-            return Ok(OwnerMergeReceipt::Refused {
-                reason: OwnerEffectRefusal::ForeignOwner,
-            });
         };
         let location_id = request.fence.target_owner["location_id"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        let in_default_checkout = matches!(
+            &request.workspace.owner,
+            EffectOwner::Daemon { daemon_id: holder, .. } if *holder == daemon_id
+        ) && self
+            .fences
+            .db()
+            .integration_placement_owner(&request.workspace.placement_id)
+            .await?
+            .is_some_and(|owner| owner["location_id"].as_str() == Some(&location_id));
+        let transfer_key = (!in_default_checkout).then(|| {
+            api_types::object_transfer_key(
+                &request.fence.attempt_id,
+                request.fence.generation,
+                api_types::ObjectTransferDirection::Outbound,
+            )
+        });
+        let fence = match &transfer_key {
+            None => {
+                let Some((_, _, fence)) =
+                    Self::workspace_fence(&request.workspace, &request.candidate_sha)
+                else {
+                    return Ok(OwnerMergeReceipt::Refused {
+                        reason: OwnerEffectRefusal::ForeignOwner,
+                    });
+                };
+                fence
+            }
+            Some(_) => WorkspaceMutationFence {
+                integration: WorkspaceIntegrationBinding::TaskStep,
+                daemon_id: daemon_id.clone(),
+                runtime_id: runtime_id.clone(),
+                placement_id: String::new(),
+                operation_id: "assigned-by-attempt-sink".into(),
+                generation: 0,
+                expected: WorkspaceOperationExpected::BaseSha {
+                    sha: request.candidate_sha.clone(),
+                },
+            },
+        };
+        let mut witness = json!({"workspace":request.workspace,"target_branch":request.target_branch,"task_branch":request.task_branch,"expected_head_sha":request.candidate_sha,"expected_target_sha":request.target_sha,"reviewed":{"commit_sha":request.candidate_sha,"base_sha":request.target_sha},"deadline_nanos":request.deadline.as_nanos().to_string()});
+        if let Some(key) = &transfer_key {
+            witness["candidate_transfer_key"] = json!(key);
+        }
         let effect = IntegrationEffectRequest {
             fence: request.fence.clone(),
             kind: IntegrationOperationKind::FastForward,
-            witness: json!({"workspace":request.workspace,"target_branch":request.target_branch,"task_branch":request.task_branch,"expected_head_sha":request.candidate_sha,"expected_target_sha":request.target_sha,"reviewed":{"commit_sha":request.candidate_sha,"base_sha":request.target_sha},"deadline_nanos":request.deadline.as_nanos().to_string()}),
+            witness,
         };
         let params = serde_json::to_value(WorkspaceReviewedMergeParams {
             merge: WorkspaceMergeParams {
                 fence,
-                workspace_handle: request.workspace.handle.clone(),
+                workspace_handle: if transfer_key.is_some() {
+                    String::new()
+                } else {
+                    request.workspace.handle.clone()
+                },
                 repo_location_id: location_id,
                 target_branch: request.target_branch.clone(),
                 expected_target_sha: request.target_sha.clone(),
                 handed_off_paths: Vec::new(),
             },
             reviewed_commit_sha: Some(request.candidate_sha.clone()),
+            candidate_transfer_key: transfer_key,
         })
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         let receipt = self

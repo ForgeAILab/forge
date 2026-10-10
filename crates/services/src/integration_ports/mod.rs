@@ -5,9 +5,9 @@
 //!
 //! | worker port | here | over |
 //! |---|---|---|
-//! | `IntegrationOwnerPort` | [`RoutingIntegrationOwner`] | `ServerIntegrationOwner`, or `DaemonWorkspaceClient::integration_effect` for a daemon-owned target |
+//! | `IntegrationOwnerPort` | [`RoutingIntegrationOwner`] | `ServerIntegrationOwner`, or `DaemonWorkspaceClient::integration_effect`: the rebase on the owner of the Task's checkout, the fast-forward on the owner of the default checkout |
 //! | `ObjectTransferPort` | [`OwnerObjectTransfer`] | the owners' `imported_objects` / `export_objects` / `import_objects` / `release_objects` |
-//! | `IntegrationFactsPort` | [`WorkspaceHeadFacts`] | storage and the workspace placement's Git reads |
+//! | `IntegrationFactsPort` | [`WorkspaceHeadFacts`] | storage, the workspace placement's Git reads, and the target owner's read-only facts |
 //! | `IntegrationStepPort` | `integration_steps::TaskStepIntegrationPort` | the Task-step queue |
 //!
 //! [`build_integration_worker`] assembles them. Nothing calls it from the
@@ -63,6 +63,7 @@ pub fn build_integration_worker(
         client.clone(),
         Arc::clone(&fences),
     ));
+    let facts_client = client.clone();
     let transfer = Arc::new(OwnerObjectTransfer::new(
         Arc::clone(&db),
         server,
@@ -75,7 +76,7 @@ pub fn build_integration_worker(
             Arc::clone(&db),
             owner,
             Arc::new(TaskStepIntegrationPort::new(Arc::clone(&db))),
-            Arc::new(WorkspaceHeadFacts::new(Arc::clone(&db), router)),
+            Arc::new(WorkspaceHeadFacts::new(Arc::clone(&db), router).with_daemons(facts_client)),
             transfer,
             Arc::new(SystemClock),
             config,
