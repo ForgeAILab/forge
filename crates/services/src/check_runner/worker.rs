@@ -277,7 +277,17 @@ impl CheckRunWorker {
                             // cancel exchange: its reply settles it, anything
                             // else leaves it uncertain for reconciliation.
                             cancel.cancel();
-                            run=self.store.transition_check_run(&fence(&run),CheckRunState::Cancelling,&db::now_rfc3339()).await?;
+                            run=match self.store.transition_check_run(&fence(&run),CheckRunState::Cancelling,&db::now_rfc3339()).await {
+                                Ok(run)=>run,
+                                Err(error)=> {
+                                    // The run row is gone (its Project was
+                                    // deleted) or no longer this worker's.
+                                    // Nobody waits either way: the owner is
+                                    // still told to stop, once, bounded.
+                                    let _=tokio::time::timeout(OWNER_RPC_BOUND,self.owners.cancel(&record)).await;
+                                    return Err(error.into());
+                                }
+                            };
                             break self.bounded_cancel(&mut run,&record).await;
                         }
                     }

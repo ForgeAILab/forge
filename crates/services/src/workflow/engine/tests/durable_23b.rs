@@ -1099,7 +1099,11 @@ async fn hold_while_review_ci_is_suspended_closes_the_wait_and_frees_the_slot() 
         1
     );
     assert_eq!(
-        count(&fixture, "SELECT COUNT(*) FROM task_step WHERE status='suspended'").await,
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_step WHERE status='suspended'"
+        )
+        .await,
         0
     );
     assert_eq!(
@@ -1180,10 +1184,12 @@ async fn a_suspended_step_whose_consumer_is_lost_fails_instead_of_waiting_foreve
         .await
         .unwrap();
     // The deadline passes.
-    sqlx::query("UPDATE task_step SET suspended_until='2000-01-01T00:00:00Z' WHERE status='suspended'")
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE task_step SET suspended_until='2000-01-01T00:00:00Z' WHERE status='suspended'",
+    )
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
     fixture.db.domain_event_notify().notify_waiters();
     tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
@@ -1230,11 +1236,12 @@ async fn delivery_of(
                 .await
                 .unwrap();
         if let Some(step) = step {
-            let payload: String = sqlx::query_scalar("SELECT payload_json FROM task_step WHERE id=?")
-                .bind(&step)
-                .fetch_one(fixture.db.pool())
-                .await
-                .unwrap();
+            let payload: String =
+                sqlx::query_scalar("SELECT payload_json FROM task_step WHERE id=?")
+                    .bind(&step)
+                    .fetch_one(fixture.db.pool())
+                    .await
+                    .unwrap();
             let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
             assert_eq!(payload["operation"], "apply_check_result");
             return (
@@ -1362,7 +1369,10 @@ async fn a_check_delivery_is_never_consumed_by_the_other_family() {
         .await
         .unwrap();
     let integration_id = requested.consumer.id.clone();
-    assert_ne!(integration_id, entry_id, "one consumer per family and authority");
+    assert_ne!(
+        integration_id, entry_id,
+        "one consumer per family and authority"
+    );
     let (integration_step, integration_delivery) =
         delivery_of(&fixture, &checks, &integration_id).await;
     assert_ne!(integration_step, entry_step);

@@ -8491,7 +8491,10 @@ live consumer (`CONSUMER_LIVENESS_INTERVAL`; the lease is renewed every 15 s)
 and cancels a run nobody waits for, so its machine slot is freed promptly.
 An unreachable daemon keeps the run `uncertain` (slot and single-flight
 identity retained) until it confirms the stop, is removed, or passes the
-disconnected-owner bound.
+disconnected-owner bound. Deleting the Project removes the Task, its
+steps (the suspended one included) and its check rows by cascade; the worker
+driving the run finds no consumer at its next look, tells the owner to stop
+(best effort when the run row is already gone) and drops the run.
 
 **Liveness of the wait.** Every way the answer can fail to arrive ends in a
 resume or a typed condition, never a silent wait:

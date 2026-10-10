@@ -5291,8 +5291,10 @@ async fn task_step_suspended_migration_preserves_populated_steps_indexes_and_tri
         "the rebuild follows the integration task-step migration directly"
     );
     assert!(
-        include_str!("../src/migration.rs")
-            .contains(&format!("Embedded migration bundle revision: V{}", versions.last().unwrap())),
+        include_str!("../src/migration.rs").contains(&format!(
+            "Embedded migration bundle revision: V{}",
+            versions.last().unwrap()
+        )),
         "the bundle comment names the newest migration"
     );
 
@@ -5321,7 +5323,10 @@ async fn task_step_suspended_migration_preserves_populated_steps_indexes_and_tri
     run_migrations_from(&pool, &dir).await.unwrap();
 
     let after: String = sqlx::query_scalar(ROWS).fetch_one(&pool).await.unwrap();
-    assert_eq!(after, before, "every step row survives the rebuild unchanged");
+    assert_eq!(
+        after, before,
+        "every step row survives the rebuild unchanged"
+    );
     assert_eq!(after.lines().count(), 4);
     let empty: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task_step WHERE suspended_until IS NULL AND awaited_consumer_id IS NULL",
