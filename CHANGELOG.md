@@ -36,6 +36,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   directory (a Codex execution that is not a managed Task, Gemini with
   `--sandbox`) are unchanged.
 
+- **Daemon protocol revision 7 (3.2 stage D2a).** The minimum revision is 7.
+  `integration.release_objects` takes an optional `attempt`
+  (`{attempt_id, repo_location_id}`) and then also deletes every ref that
+  attempt imported in that checkout (`refs/forge/integration/<attempt>-*`)
+  and the attempt's remaining transfer staging; the result adds
+  `removed_refs`. A revision-6 daemon is refused with
+  `daemon_upgrade_required`. Upgrade the server first, then each daemon.
+  Nothing calls the new form yet: the merge queue is still not started.
 - **Daemon protocol revision 6 (3.2 stage D1c).** The minimum revision is 6:
   a revision-5 or older daemon is refused at the handshake with
   `daemon_upgrade_required` and cannot use any command RPC. Upgrade the
@@ -828,6 +836,26 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     schema and authentication failures fail on attempt one.
 
 ### Changed
+
+- **Merge queue: production ports, still not started (3.2 stage D2a).**
+  Everything the queue worker needs to run against real machines now exists;
+  nothing starts it and merging works as before.
+  - A queue head on a daemon-owned default checkout is rebased, checked and
+    fast-forwarded through that daemon instead of parking. A lost reply is
+    settled from the daemon's receipt after it reconnects; the effect is
+    never sent twice.
+  - Commits move between a Task's checkout and the default checkout through
+    the owners when they do not share an object store, and the refs a
+    transfer leaves are deleted when the attempt leaves the queue slot and
+    swept at start.
+  - The daemon journal's record bound (1024) now counts only entries the
+    server has not acknowledged. Acknowledged merge-queue receipts are kept
+    for duplicates and pruned by age (7 days), by a newer claim, or as the
+    oldest past 1024.
+  - Queue waits that used to end only at a timeout now end by themselves: a
+    retried or re-opened queue member shows "waiting" again, a failed queue
+    step is asked again, and a merge that landed but could not be recorded
+    is retried every 30 s instead of every 10 min.
 
 - **Merge queue Task steps, not produced yet (3.2 stage D, part 1b).** The
   server can now apply what the merge queue decides to a Task (ask for the

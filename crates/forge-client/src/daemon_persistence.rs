@@ -1570,17 +1570,18 @@ mod tests {
         assert_eq!(entries, 1);
     }
 
-    /// Two thousand acknowledged attempt receipts on a journal bounded at
-    /// four records: none of them takes a slot, so the bound keeps meaning
-    /// "work the server has not acknowledged". The fifth unacknowledged entry
-    /// is refused, no acknowledged or unacknowledged receipt is evicted to
-    /// make room, and a restart counts the same way.
+    /// Four hundred acknowledged attempt receipts on a journal bounded at
+    /// four records (each write is several fsyncs, so the count is kept to
+    /// what runs in seconds): none of them takes a slot, so the bound keeps
+    /// meaning "work the server has not acknowledged". The fifth
+    /// unacknowledged entry is refused, no acknowledged or unacknowledged
+    /// receipt is evicted to make room, and a restart counts the same way.
     #[test]
     fn acknowledged_attempt_receipts_never_fill_the_record_bound() {
         let dir = tempfile::tempdir().unwrap();
         let store = DaemonJournal::with_limits(dir.path(), 4, MAX_JOURNAL_BYTES);
         store.initialize().unwrap();
-        for index in 0..2000 {
+        for index in 0..400 {
             let operation = attempt_receipt_on(&format!("queue-{index}"), 1);
             store
                 .retain_entry(&JournalEntry::Operation {
@@ -1593,7 +1594,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!(store.acknowledged_attempt_ages().unwrap().len(), 2000);
+        assert_eq!(store.acknowledged_attempt_ages().unwrap().len(), 400);
         let unacknowledged: Vec<JournalOperation> = (0..4)
             .map(|index| attempt_receipt_on(&format!("pending-{index}"), 1))
             .collect();
@@ -1617,7 +1618,7 @@ mod tests {
         restarted.initialize().unwrap();
         assert!(refused(&restarted).contains("record bound"));
         assert_eq!(restarted.pending().unwrap().len(), 4);
-        assert_eq!(restarted.acknowledged_attempt_ages().unwrap().len(), 2000);
+        assert_eq!(restarted.acknowledged_attempt_ages().unwrap().len(), 400);
         // Nothing was evicted: every receipt, acknowledged or not, is there.
         for operation in &unacknowledged {
             assert!(
@@ -1648,11 +1649,17 @@ mod tests {
             .unwrap();
         // The owner's rule prunes by number: the oldest go first.
         let ages = restarted.acknowledged_attempt_ages().unwrap();
-        assert_eq!(ages.len(), 2001);
+        assert_eq!(ages.len(), 401);
+        // (Ages only grow between the listing and the prune, so a few more
+        // than the 201 strictly older ones may go; never an unacknowledged one.)
         let removed = restarted
-            .prune_acknowledged_attempts(|_, age| age > ages[999])
+            .prune_acknowledged_attempts(|_, age| age > ages[199])
             .unwrap();
-        assert!(removed.len() <= 1001 && !removed.is_empty());
+        assert!(removed.len() >= 201, "{}", removed.len());
+        assert_eq!(
+            restarted.acknowledged_attempt_ages().unwrap().len(),
+            401 - removed.len()
+        );
         assert_eq!(restarted.pending().unwrap().len(), 4);
     }
 

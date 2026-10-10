@@ -516,6 +516,22 @@ impl HeadDriver {
         Ok(Pass::Released)
     }
 
+    /// The owner does not recognise the claim's target: its record of the
+    /// default checkout differs from the one the claim froze (the location
+    /// was verified again or changed since, for example on a daemon
+    /// reconnect). The refusal ran no Git. The head leaves the slot and
+    /// retries with backoff; each retry is a new claim, which re-reads the
+    /// target. Holding the lease and claiming again at once would only burn
+    /// rounds until the owner and the server agree.
+    async fn foreign_owner(&mut self, a: &IntegrationAttempt) -> Result<Pass> {
+        self.park(
+            a,
+            ParkReason::TargetNotReady,
+            "the owner of the default checkout does not recognise this claim's target yet",
+        )
+        .await
+    }
+
     async fn send_back(
         &mut self,
         a: &IntegrationAttempt,
@@ -1120,8 +1136,11 @@ impl HeadDriver {
                 }
             }
             OwnerRebaseReceipt::Refused {
-                reason: OwnerEffectRefusal::StaleFence | OwnerEffectRefusal::ForeignOwner,
+                reason: OwnerEffectRefusal::StaleFence,
             } => Ok(Pass::Lost),
+            OwnerRebaseReceipt::Refused {
+                reason: OwnerEffectRefusal::ForeignOwner,
+            } => self.foreign_owner(&a).await,
             OwnerRebaseReceipt::Refused { .. } | OwnerRebaseReceipt::NotPerformed {} => {
                 // The witness no longer holds (the target moved while this
                 // head held the slot) or this generation already has a rebase
@@ -1421,8 +1440,14 @@ impl HeadDriver {
                 Ok(Pass::Progress)
             }
             Ok(OwnerMergeReceipt::Refused {
-                reason: OwnerEffectRefusal::StaleFence | OwnerEffectRefusal::ForeignOwner,
+                reason: OwnerEffectRefusal::StaleFence,
             }) => Ok(Pass::Lost),
+            Ok(OwnerMergeReceipt::Refused {
+                reason: OwnerEffectRefusal::ForeignOwner,
+            }) => {
+                let a = self.w.attempt(&a.id).await?;
+                self.foreign_owner(&a).await
+            }
             Ok(OwnerMergeReceipt::Completed {
                 outcome: MergeOutcome::TargetMoved { .. },
             })
