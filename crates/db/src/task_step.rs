@@ -164,7 +164,7 @@ impl TaskStepRepo for SqliteDb {
                 .bind(&i.id)
                 .execute(&mut **tx)
                 .await?;
-            superseded = sqlx::query("UPDATE task_step SET status='superseded',last_error='preempted by owner command',completed_at=?,updated_at=? WHERE task_id=? AND seq<(SELECT seq FROM task_step WHERE id=?) AND priority=0 AND integration_started_at IS NULL AND entry_fenced=1 AND status='pending' AND kind IN ('hooks','cascade','command','mutation')")
+            superseded = sqlx::query("UPDATE task_step SET status='superseded',last_error='preempted by owner command',completed_at=?,updated_at=? WHERE task_id=? AND seq<(SELECT seq FROM task_step WHERE id=?) AND priority=0 AND integration_started_at IS NULL AND entry_fenced=1 AND status='pending' AND kind IN ('hooks','cascade','command','mutation','integration')")
                 .bind(&now).bind(&now).bind(&i.task_id).bind(&i.id).execute(&mut **tx).await?.rows_affected();
         }
         // An enqueued hooks step may become the entry's owner; a preempting
@@ -513,6 +513,45 @@ impl SqliteDb {
             .bind(outcome).bind(&step.id).bind(hook).bind(script).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+    /// Enqueue an `integration` step that a later owner command can neither
+    /// overtake nor supersede: identity-fenced and marked as started
+    /// integration from the moment it exists. The `settle` step calls this in
+    /// the transaction that writes the permit, so the protected `result` step
+    /// and the permit commit together. Idempotent on the causation key.
+    pub async fn enqueue_protected_integration_step_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: &EnqueueTaskStep,
+    ) -> Result<String> {
+        if input.kind != "integration" {
+            return Err(DbError::Check(
+                "only an integration step is protected at enqueue".into(),
+            ));
+        }
+        let id = self.enqueue_step_in_tx(tx, input).await?;
+        sqlx::query("UPDATE task_step SET entry_fenced=0,integration_started_at=COALESCE(integration_started_at,?) WHERE id=? AND status='pending'")
+            .bind(now_rfc3339())
+            .bind(&id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(id)
+    }
+    /// Make a pending `integration` step of this Task runnable now, by its
+    /// causation key. `false`: no such pending step (not an error).
+    pub async fn ready_integration_step(&self, task_id: &str, causation_key: &str) -> Result<bool> {
+        let now = now_rfc3339();
+        let n = sqlx::query("UPDATE task_step SET available_at=?,updated_at=? WHERE task_id=? AND causation_key=? AND kind='integration' AND status='pending' AND available_at>?")
+            .bind(&now)
+            .bind(&now)
+            .bind(task_id)
+            .bind(causation_key)
+            .bind(&now)
+            .execute(self.pool())
+            .await?
+            .rows_affected();
+        self.domain_event_notify().notify_waiters();
+        Ok(n == 1)
     }
     pub fn hold_task_step(&self, step: &TaskStep) -> TaskStepActivity {
         self.task_step_activity

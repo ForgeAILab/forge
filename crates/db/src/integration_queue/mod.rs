@@ -41,7 +41,11 @@ mod audit_tests;
 mod fencing;
 pub use activation::*;
 mod importer;
+mod steps;
+#[cfg(test)]
+mod steps_tests;
 pub use fencing::*;
+pub use steps::*;
 pub(crate) mod shadow;
 #[cfg(test)]
 mod tests;
