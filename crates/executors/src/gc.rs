@@ -25,21 +25,101 @@ use std::{
 /// Quarantine and sweep state under the managed root.
 pub const GC_DIR: &str = ".forge/gc";
 /// The file in [`GC_DIR`] naming the one owner allowed to sweep this root.
+/// It is also Forge's marker: a root without it is never swept, and only an
+/// explicit start-up step ([`Sweep::adopt`]) writes it.
 pub const OWNER_FILE: &str = "owner";
+/// The marker of a daemon's handle table. A server and its embedded daemon
+/// share one root and sweep different directories of it (`<root>/<task id>`
+/// and `<root>/.forge/workspaces/workspace-<id>`), so each has its own.
+pub const DAEMON_OWNER_FILE: &str = "daemon-owner";
+/// Directories already condemned (renamed out of their place under the
+/// owner's lock) and waiting to be deleted outside it.
+pub const TRASH_DIR: &str = ".forge/gc/trash";
 /// Exact-commit check checkouts.
 pub const CHECKS_DIR: &str = ".forge/build/checks";
 /// An unknown Task-root directory is kept this long after it was quarantined.
 pub const QUARANTINE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// A directory younger than this is never quarantined: whoever is creating it
-/// may not have recorded it yet.
-pub const ORPHAN_GRACE: Duration = Duration::from_secs(10 * 60);
+/// may not have recorded it yet. A create by this process is excluded outright
+/// through the create registry (`Sweep::creating`), so this only has to cover
+/// what no registry can see, and a large clone can take hours.
+pub const ORPHAN_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 /// A `<name>.broken-<ms>` copy left by a worktree recovery is kept this long.
 pub const BROKEN_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// No run is allowed to take longer than this; a per-run temp directory that
-/// no table knows and that is older belongs to nothing alive.
+/// A per-run temp directory that no table knows and that was not touched for
+/// this long belongs to nothing alive. This is not a bound on how long a run
+/// may take (an execution deadline is set per agent and has no ceiling): a
+/// run of any length is kept by the live set and by this process's registry,
+/// never by its age.
 pub const MAX_RUN_AGE: Duration = Duration::from_secs(25 * 60 * 60);
-/// Longest check wall time (1800 s) plus its cleanup phase and a margin.
+/// Default age of a dead check checkout: see [`check_checkout_age`].
 pub const CHECK_CHECKOUT_AGE: Duration = Duration::from_secs(2 * 60 * 60);
+/// A legacy location outside the workspace root goes only after nothing
+/// touched it for this long: another Forge on the machine may still use it.
+pub const LEGACY_UNTOUCHED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The age after which a check checkout nobody holds is dead, for a check
+/// wall limit of `timeout_seconds`: twice the limit (the run and its cleanup
+/// phase) plus an hour, and never under [`CHECK_CHECKOUT_AGE`].
+pub fn check_checkout_age(timeout_seconds: u64) -> Duration {
+    CHECK_CHECKOUT_AGE.max(Duration::from_secs(
+        timeout_seconds.saturating_mul(2).saturating_add(3600),
+    ))
+}
+
+/// Who may sweep a managed root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// The marker names this owner.
+    Mine,
+    /// The marker names somebody else (another database, another daemon
+    /// state). Nothing is swept until an operator re-claims the root.
+    Other,
+    /// No marker: the root was never adopted by a running Forge.
+    Unclaimed,
+    /// The directory must never be swept, whatever any marker says.
+    Refused(&'static str),
+}
+
+impl Ownership {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mine => "owned",
+            Self::Other => "claimed_by_other",
+            Self::Unclaimed => "unclaimed",
+            Self::Refused(_) => "refused",
+        }
+    }
+}
+
+/// Why `root` can never be a managed root, if it cannot: it is not a
+/// resolved real directory, it is too close to the filesystem root, it is or
+/// contains the home directory, or it is a git repository.
+pub fn refuse_root(root: &Path) -> Option<&'static str> {
+    if !sandbox::is_real_dir(root) || fs::canonicalize(root).ok().as_deref() != Some(root) {
+        return Some("it is not a resolved real directory (a link on the way, or missing)");
+    }
+    let depth = root
+        .components()
+        .filter(|part| matches!(part, Component::Normal(_)))
+        .count();
+    if depth < 2 {
+        return Some("it is the filesystem root or one of its top-level directories");
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute());
+    if let Some(home) = home {
+        let resolved = fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
+        if home.starts_with(root) || resolved.starts_with(root) {
+            return Some("it is the home directory or a parent of it");
+        }
+    }
+    if fs::symlink_metadata(root.join(".git")).is_ok() {
+        return Some("it is a git repository");
+    }
+    None
+}
 /// Default free-space floor: the larger of this many bytes and
 /// [`DEFAULT_MIN_FREE_PERCENT`] of the filesystem.
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -105,6 +185,16 @@ pub struct Sweep {
     /// the server, a workspace handle on a daemon). Every other name, in the
     /// Task-root directory and in quarantine, is invisible to the pass.
     pub shaped: fn(&str) -> bool,
+    /// The marker file in [`GC_DIR`] that names this pass's owner.
+    pub owner_file: &'static str,
+    /// Whether a create of this process is in flight for a Task-root path.
+    /// Such a directory is never quarantined, whatever its age.
+    pub creating: fn(&Path) -> bool,
+    /// Free and total bytes of the filesystem holding a path; `None` when
+    /// unreadable, and then nothing is evicted.
+    pub disk_space: fn(&Path) -> Option<DiskSpace>,
+    /// Age after which a check checkout nobody holds is dead.
+    pub check_checkout_age: Duration,
     pub now: SystemTime,
     pub deadline: Instant,
 }
@@ -115,6 +205,10 @@ impl Sweep {
             root: root.to_path_buf(),
             task_roots: task_roots.to_path_buf(),
             shaped,
+            owner_file: OWNER_FILE,
+            creating: |_| false,
+            disk_space,
+            check_checkout_age: CHECK_CHECKOUT_AGE,
             now: SystemTime::now(),
             deadline: Instant::now() + budget,
         }
@@ -128,33 +222,98 @@ impl Sweep {
         self.root.join(GC_DIR)
     }
 
-    /// Claim the root for `owner_id`, or confirm an earlier claim.
+    /// Whether `owner_id` may sweep this root. Read-only: nothing is created.
     ///
     /// A sweep decides from one owner's table what is unknown or dead. Two
     /// owners with different tables on one root (two servers with different
-    /// databases, a test beside a running server) would each see the other's
-    /// live directories as garbage, so only the first to write
-    /// `<root>/.forge/gc/owner` ever sweeps it. Everyone else gets `false`
-    /// and must touch nothing.
-    pub fn claim(&self, owner_id: &str) -> bool {
-        let gc_dir = self.gc_dir();
-        if owner_id.is_empty() || !self.prepare_gc_dir(&gc_dir) {
-            return false;
+    /// databases, a daemon whose state was wiped, a test beside a running
+    /// server) would each see the other's live directories as garbage, so
+    /// only the owner named in `<root>/.forge/gc/owner` ever sweeps it, and a
+    /// root without that file is not swept at all.
+    pub fn ownership(&self, owner_id: &str) -> Ownership {
+        if let Some(reason) = refuse_root(&self.root) {
+            return Ownership::Refused(reason);
         }
-        let marker = gc_dir.join(OWNER_FILE);
+        let gc_dir = self.gc_dir();
+        let marker = gc_dir.join(self.owner_file);
         match fs::symlink_metadata(&marker) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                fs::read_to_string(&marker).is_ok_and(|owner| owner.trim() == owner_id)
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && gc_dir.parent().is_some_and(sandbox::is_real_dir)
+                    && sandbox::is_real_dir(&gc_dir) =>
+            {
+                match fs::read_to_string(&marker) {
+                    Ok(owner) if !owner_id.is_empty() && owner.trim() == owner_id => {
+                        Ownership::Mine
+                    }
+                    _ => Ownership::Other,
+                }
             }
             // A link or a directory there is not a claim anyone can hold.
-            Ok(_) => false,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&marker)
-                .and_then(|mut file| std::io::Write::write_all(&mut file, owner_id.as_bytes()))
-                .is_ok(),
-            Err(_) => false,
+            Ok(_) => Ownership::Other,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ownership::Unclaimed,
+            Err(_) => Ownership::Other,
+        }
+    }
+
+    /// Adopt the root for `owner_id` when nobody has: the one step that
+    /// writes Forge's marker. Called once by a running server or daemon at
+    /// start-up, never by a sweep. The marker appears whole or not at all
+    /// (written beside its place, then hard-linked into it), and of two
+    /// owners starting together exactly one gets it.
+    pub fn adopt(&self, owner_id: &str) -> Ownership {
+        match self.ownership(owner_id) {
+            Ownership::Unclaimed if !owner_id.is_empty() => {}
+            settled => return settled,
+        }
+        if let Some(staged) = self.stage_owner(owner_id) {
+            let _ = fs::hard_link(&staged, self.gc_dir().join(self.owner_file));
+            let _ = fs::remove_file(&staged);
+        }
+        self.ownership(owner_id)
+    }
+
+    /// Replace the marker with `owner_id`. Only ever run on an operator's
+    /// explicit request: the previous owner's live directories become
+    /// unknown to the sweep (quarantined, then deleted a day later).
+    pub fn reclaim(&self, owner_id: &str) -> Ownership {
+        if owner_id.is_empty() || refuse_root(&self.root).is_some() {
+            return self.ownership(owner_id);
+        }
+        if let Some(staged) = self.stage_owner(owner_id) {
+            let _ = fs::rename(&staged, self.gc_dir().join(self.owner_file));
+            let _ = fs::remove_file(&staged);
+        }
+        self.ownership(owner_id)
+    }
+
+    /// The owner id written in full to a private file beside the marker.
+    fn stage_owner(&self, owner_id: &str) -> Option<PathBuf> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let gc_dir = self.gc_dir();
+        if !self.prepare_gc_dir(&gc_dir) {
+            return None;
+        }
+        let staged = gc_dir.join(format!(
+            ".owner-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_file(&staged);
+        let written = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .and_then(|mut file| {
+                std::io::Write::write_all(&mut file, owner_id.as_bytes())?;
+                file.sync_all()
+            });
+        match written {
+            Ok(()) => Some(staged),
+            Err(_) => {
+                let _ = fs::remove_file(&staged);
+                None
+            }
         }
     }
 
@@ -189,24 +348,35 @@ impl Sweep {
     ///
     /// A name that is not in `states` is skipped: it appeared after the
     /// caller read its table.
-    pub fn task_roots(&self, states: &HashMap<String, RootState>, report: &mut GcReport) {
+    ///
+    /// Returns the last name it finished, in name order. The deadline is
+    /// checked after each entry, so a pass always finishes at least one and
+    /// the caller's cursor always moves: one slow entry cannot starve the
+    /// names after it.
+    pub fn task_roots(
+        &self,
+        states: &HashMap<String, RootState>,
+        report: &mut GcReport,
+    ) -> Option<String> {
         let mut names: Vec<&String> = states.keys().collect();
         names.sort();
-        for name in names {
-            if self.out_of_time() {
-                report.out_of_time = true;
-                return;
-            }
+        let mut finished = None;
+        for (index, name) in names.iter().enumerate() {
             let path = self.task_roots.join(name);
-            if !plain_name(name) || !(self.shaped)(name) || !sandbox::is_real_dir(&path) {
-                continue;
+            if plain_name(name) && (self.shaped)(name) && sandbox::is_real_dir(&path) {
+                match states[*name] {
+                    RootState::Unknown => self.quarantine(name, &path, report),
+                    RootState::Cleaned => self.remove(&path, report),
+                    RootState::Live => self.broken_copies(&path, report),
+                }
             }
-            match states[name] {
-                RootState::Unknown => self.quarantine(name, &path, report),
-                RootState::Cleaned => self.remove(&path, report),
-                RootState::Live => self.broken_copies(&path, report),
+            finished = Some((*name).clone());
+            if self.out_of_time() && index + 1 < names.len() {
+                report.out_of_time = true;
+                break;
             }
         }
+        finished
     }
 
     fn quarantine(&self, name: &str, path: &Path, report: &mut GcReport) {
@@ -214,7 +384,10 @@ impl Sweep {
             .and_then(|metadata| metadata.modified())
             .map(|modified| age(self.now, modified) < ORPHAN_GRACE)
             .unwrap_or(true);
-        if fresh || !self.confined(path) {
+        // A create in flight in this process, and anything that does not
+        // look like a Task root Forge made (a directory a user happened to
+        // give such a name), is left exactly where it is.
+        if fresh || (self.creating)(path) || !forge_made(path) || !self.confined(path) {
             return;
         }
         let gc_dir = self.gc_dir();
@@ -226,6 +399,8 @@ impl Sweep {
         if fs::symlink_metadata(&target).is_ok() {
             return;
         }
+        // A rename only: across filesystems it fails and the directory stays.
+        // There is no copy-and-delete fallback and nothing is deleted here.
         match fs::rename(path, &target) {
             Ok(()) => {
                 tracing::warn!(path = %path.display(), quarantine = %target.display(), "unknown Task-root directory quarantined; it is deleted after 24 hours");
@@ -356,7 +531,7 @@ impl Sweep {
             else {
                 continue;
             };
-            if age(self.now, modified) >= CHECK_CHECKOUT_AGE
+            if age(self.now, modified) >= self.check_checkout_age
                 && (live_check_operations == 0 || modified < started)
             {
                 self.remove(&path, report);
@@ -376,7 +551,7 @@ impl Sweep {
     /// above `floor` bytes free. `candidates` are Task-root names the caller
     /// proved idle; a root with a run of this process is skipped regardless.
     pub fn evict_builds(&self, candidates: &[String], floor: &FreeFloor, report: &mut GcReport) {
-        let Some(space) = disk_space(&self.root) else {
+        let Some(space) = (self.disk_space)(&self.root) else {
             return;
         };
         let floor = floor.bytes(space.total);
@@ -408,7 +583,63 @@ impl Sweep {
                 report.builds_evicted += 1;
                 tracing::warn!(path = %build.display(), "disk is under its free-space floor: evicted the build output of an idle Task");
             }
-            if disk_space(&self.root).is_none_or(|space| space.free >= floor) {
+            if (self.disk_space)(&self.root).is_none_or(|space| space.free >= floor) {
+                return;
+            }
+        }
+    }
+
+    /// Move a condemned directory out of its place into
+    /// `<root>/.forge/gc/trash`, to be deleted by [`Sweep::empty_trash`]. A
+    /// rename, so a caller may do it under a lock it must not hold for the
+    /// length of a delete. `false` when it could not be moved; it then stays.
+    pub fn trash(&self, path: &Path, report: &mut GcReport) -> bool {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if fs::symlink_metadata(path).is_err() {
+            return false;
+        }
+        let gc_dir = self.gc_dir();
+        let trash = self.root.join(TRASH_DIR);
+        let name = path.file_name().and_then(|name| name.to_str());
+        let (Some(name), true) = (
+            name,
+            self.confined(path)
+                && self.prepare_gc_dir(&gc_dir)
+                && sandbox::create_private_dir(&trash).is_ok()
+                && sandbox::is_real_dir(&trash),
+        ) else {
+            report.errors += 1;
+            return false;
+        };
+        let target = trash.join(format!(
+            "{name}-{}-{}",
+            self.now
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if fs::symlink_metadata(&target).is_ok() || fs::rename(path, &target).is_err() {
+            report.errors += 1;
+            return false;
+        }
+        true
+    }
+
+    /// Delete everything in the trash. Each entry was condemned by its owner
+    /// before it was moved there, so nothing is decided again.
+    pub fn empty_trash(&self, report: &mut GcReport) {
+        let trash = self.root.join(TRASH_DIR);
+        if !sandbox::is_real_dir(&self.gc_dir()) || !sandbox::is_real_dir(&trash) {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&trash) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            self.remove(&entry.path(), report);
+            if self.out_of_time() {
+                report.out_of_time = true;
                 return;
             }
         }
@@ -452,6 +683,46 @@ pub fn remove_exact(path: &Path, report: &mut GcReport) {
     if fs::symlink_metadata(path).is_ok() {
         remove_entry(path, report);
     }
+}
+
+/// Whether `path` and everything directly inside it were last modified at
+/// least `quiet` before `now`. `false` when it cannot be read.
+pub fn untouched_for(path: &Path, now: SystemTime, quiet: Duration) -> bool {
+    let old = |path: &Path| {
+        fs::symlink_metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| age(now, modified) >= quiet)
+    };
+    if !old(path) {
+        return false;
+    }
+    if !sandbox::is_real_dir(path) {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().take(4096).all(|entry| old(&entry.path()))
+}
+
+/// Whether a directory looks like a Task root Forge made: it carries the
+/// reserved `.forge-task` directory or an outbox, or one of its children is a
+/// linked git worktree (a directory whose `.git` is a file). A plain
+/// directory a user created under a Task-shaped name has none of these.
+fn forge_made(task_root: &Path) -> bool {
+    if sandbox::is_real_dir(&task_root.join(TASK_DIR_NAME))
+        || sandbox::is_real_dir(&task_root.join(".forge-outbox"))
+    {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir(task_root) else {
+        return false;
+    };
+    entries.flatten().take(256).any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && fs::symlink_metadata(entry.path().join(".git"))
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+    })
 }
 
 fn remove_entry(path: &Path, report: &mut GcReport) {
@@ -510,37 +781,39 @@ pub struct DiskSpace {
     pub total: u64,
 }
 
-/// Free and total bytes of the filesystem holding `path`, from `df -Pk`.
-/// `None` when it cannot be read; callers then leave everything alone.
+/// Free (to an unprivileged process) and total bytes of the filesystem
+/// holding `path`, from `statvfs`. `None` when it cannot be read; callers
+/// then leave everything alone.
+#[cfg(unix)]
+#[allow(unsafe_code)]
 pub fn disk_space(path: &Path) -> Option<DiskSpace> {
-    let output = std::process::Command::new("df")
-        .arg("-Pk")
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_df(&String::from_utf8_lossy(&output.stdout))
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `path` is a valid NUL-terminated string and `stat` is a
+    // writable `statvfs` that the call fills in when it returns 0.
+    let stat = unsafe {
+        if libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stat.assume_init()
+    };
+    #[allow(clippy::unnecessary_cast)]
+    let (block, free, total) = (
+        stat.f_frsize as u64,
+        stat.f_bavail as u64,
+        stat.f_blocks as u64,
+    );
+    // A filesystem that reports no size reports nothing usable.
+    (block > 0 && total > 0).then(|| DiskSpace {
+        free: free.saturating_mul(block),
+        total: total.saturating_mul(block),
+    })
 }
 
-fn parse_df(output: &str) -> Option<DiskSpace> {
-    // Filesystem 1024-blocks Used Available Capacity Mounted on
-    let fields: Vec<&str> = output.lines().nth(1)?.split_whitespace().collect();
-    // The filesystem name comes first and may itself contain spaces.
-    let numbers: Vec<u64> = fields
-        .iter()
-        .skip(1)
-        .skip_while(|field| field.parse::<u64>().is_err())
-        .map_while(|field| field.parse::<u64>().ok())
-        .collect();
-    let (total, free) = (*numbers.first()?, *numbers.get(2)?);
-    Some(DiskSpace {
-        free: free.saturating_mul(1024),
-        total: total.saturating_mul(1024),
-    })
+#[cfg(not(unix))]
+pub fn disk_space(_path: &Path) -> Option<DiskSpace> {
+    None
 }
 
 /// When the build output of `task_root` was last used: the newest
@@ -654,6 +927,7 @@ mod tests {
     fn task_root(root: &Path, name: &str) -> PathBuf {
         let path = root.join(name);
         fs::create_dir_all(path.join("repo")).unwrap();
+        fs::create_dir_all(path.join(TASK_DIR_NAME)).unwrap();
         fs::write(path.join("repo/file"), "content").unwrap();
         path
     }
@@ -671,8 +945,13 @@ mod tests {
         assert!(orphan.exists());
         assert_eq!(report, GcReport::default());
 
+        // Eleven hours on a slow clone may still be writing below it.
+        later(&root, 11 * 3600 * Duration::from_secs(1)).task_roots(&unknown, &mut report);
+        assert!(orphan.exists());
+        assert_eq!(report, GcReport::default());
+
         // First sight after the grace period: moved aside, not deleted.
-        let first = later(&root, Duration::from_secs(3600));
+        let first = later(&root, 25 * Duration::from_secs(3600));
         first.task_roots(&unknown, &mut report);
         assert_eq!(report.quarantined, 1);
         assert!(!orphan.exists());
@@ -689,12 +968,12 @@ mod tests {
 
         // Still there 23 hours on.
         let mut report = GcReport::default();
-        later(&root, Duration::from_secs(24 * 3600))
+        later(&root, Duration::from_secs(48 * 3600))
             .quarantine_settle(&HashSet::new(), &mut report);
         assert_eq!(report.removed, 0);
         assert!(kept.path().exists());
 
-        later(&root, Duration::from_secs(26 * 3600))
+        later(&root, Duration::from_secs(50 * 3600))
             .quarantine_settle(&HashSet::new(), &mut report);
         assert_eq!(report.removed, 1);
         assert!(!kept.path().exists());
@@ -706,7 +985,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         task_root(&root, "late");
         task_root(&root, "taken");
-        let pass = later(&root, Duration::from_secs(3600));
+        let pass = later(&root, 2 * DAY);
         let mut report = GcReport::default();
         pass.task_roots(
             &states(&[("late", RootState::Unknown), ("taken", RootState::Unknown)]),
@@ -894,16 +1173,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let cleaned = task_root(&root, "cleaned");
+        let later_root = task_root(&root, "later");
+        let both = states(&[("cleaned", RootState::Cleaned), ("later", RootState::Cleaned)]);
         let mut pass = sweep(&root);
         pass.deadline = Instant::now();
         let mut report = GcReport::default();
-        pass.task_roots(&states(&[("cleaned", RootState::Cleaned)]), &mut report);
+        // Out of time from the start: one entry is still finished, so a
+        // cursor always moves, and the pass says it did not get to the rest.
+        let finished = pass.task_roots(&both, &mut report);
         assert!(report.out_of_time);
-        assert!(cleaned.exists());
+        assert_eq!(finished.as_deref(), Some("cleaned"));
+        assert!(!cleaned.exists() && later_root.exists());
         // The next pass, with time, finishes the work.
         let mut report = GcReport::default();
-        sweep(&root).task_roots(&states(&[("cleaned", RootState::Cleaned)]), &mut report);
-        assert!(!report.out_of_time && !cleaned.exists());
+        let finished = sweep(&root).task_roots(&both, &mut report);
+        assert_eq!(finished.as_deref(), Some("later"));
+        assert!(!report.out_of_time && !later_root.exists());
     }
 
     #[test]
@@ -1009,19 +1294,164 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_owner_to_claim_a_root_may_sweep_it() {
+    fn only_an_adopted_root_has_an_owner_and_only_an_operator_changes_it() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let pass = sweep(&root);
-        assert!(pass.claim("first"));
-        assert!(pass.claim("first"));
-        assert!(!pass.claim("second"));
-        assert!(!pass.claim(""));
-        // The claim is not a quarantine entry.
+        // Asking never claims: no marker, no `.forge` directory.
+        assert_eq!(pass.ownership("first"), Ownership::Unclaimed);
+        assert!(!root.join(".forge").exists());
+        assert_eq!(pass.adopt(""), Ownership::Unclaimed);
+        assert_eq!(pass.adopt("first"), Ownership::Mine);
+        assert_eq!(pass.adopt("first"), Ownership::Mine);
+        assert_eq!(pass.adopt("second"), Ownership::Other);
+        assert_eq!(pass.ownership("second"), Ownership::Other);
+        assert_eq!(pass.ownership(""), Ownership::Other);
+        assert_eq!(fs::read_to_string(root.join(GC_DIR).join(OWNER_FILE)).unwrap(), "first");
+        // Nothing staged is left behind, and the claim is not a quarantine entry.
+        assert_eq!(fs::read_dir(root.join(GC_DIR)).unwrap().count(), 1);
         assert!(pass.quarantined_names().is_empty());
-        // A root that does not exist cannot be claimed (or created).
-        assert!(!sweep(&root.join("missing")).claim("first"));
+        // An explicit re-claim is the only way the owner changes.
+        assert_eq!(pass.reclaim("second"), Ownership::Mine);
+        assert_eq!(pass.ownership("first"), Ownership::Other);
+        assert_eq!(fs::read_dir(root.join(GC_DIR)).unwrap().count(), 1);
+        // A root that does not exist cannot be adopted (or created).
+        assert!(matches!(
+            sweep(&root.join("missing")).adopt("first"),
+            Ownership::Refused(_)
+        ));
         assert!(!root.join("missing").exists());
+    }
+
+    #[test]
+    fn two_owners_adopting_together_leave_exactly_one_whole_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let (root, barrier) = (root.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    sweep(&root).adopt(&format!("owner-{index}")) == Ownership::Mine
+                })
+            })
+            .collect();
+        let winners = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+        let owner = fs::read_to_string(root.join(GC_DIR).join(OWNER_FILE)).unwrap();
+        assert!(owner.starts_with("owner-") && owner.len() == 7, "{owner}");
+        assert_eq!(fs::read_dir(root.join(GC_DIR)).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_is_a_home_a_repository_a_link_or_the_top_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        for path in [Path::new("/"), Path::new("/Volumes"), Path::new("/tmp"), Path::new("/usr")] {
+            assert!(refuse_root(path).is_some(), "{}", path.display());
+        }
+        // The home directory of this test process, and every parent of it.
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        if let Ok(home) = home.canonicalize() {
+            assert!(refuse_root(&home).is_some());
+            assert!(refuse_root(home.parent().unwrap()).is_some());
+        }
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        assert_eq!(sweep(&repo).adopt("owner"), Ownership::Refused("it is a git repository"));
+        assert!(!repo.join(".forge").exists());
+        // A root reached through a link is not the directory that was adopted.
+        let real = base.join("real");
+        fs::create_dir_all(&real).unwrap();
+        assert_eq!(sweep(&real).adopt("owner"), Ownership::Mine);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(matches!(sweep(&link).ownership("owner"), Ownership::Refused(_)));
+        // A marker that is a link, or a `.forge/gc` that is one, is no claim.
+        let planted = base.join("planted");
+        fs::create_dir_all(planted.join(".forge")).unwrap();
+        std::os::unix::fs::symlink(real.join(GC_DIR), planted.join(GC_DIR)).unwrap();
+        assert_eq!(sweep(&planted).ownership("owner"), Ownership::Other);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_directory_with_a_task_shaped_name_is_never_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // The user's own: plain files, and a full clone (`.git` is a directory).
+        fs::create_dir_all(root.join("mine/photos")).unwrap();
+        fs::create_dir_all(root.join("mine/clone/.git")).unwrap();
+        fs::create_dir_all(root.join("line\nbreak/repo")).unwrap();
+        // Forge's own, three ways.
+        task_root(&root, "reserved");
+        fs::create_dir_all(root.join("worktree/repo")).unwrap();
+        fs::write(root.join("worktree/repo/.git"), "gitdir: elsewhere").unwrap();
+        fs::create_dir_all(root.join("outbox/.forge-outbox")).unwrap();
+        // In flight in this process, however old.
+        task_root(&root, "creating");
+        let mut pass = later(&root, 30 * DAY);
+        pass.creating = |path| path.ends_with("creating");
+        let names = ["mine", "line\nbreak", "reserved", "worktree", "outbox", "creating", "/etc", "..", "a/b"];
+        let unknown: HashMap<String, RootState> = names
+            .iter()
+            .map(|name| ((*name).to_owned(), RootState::Unknown))
+            .collect();
+        let mut report = GcReport::default();
+        pass.task_roots(&unknown, &mut report);
+        assert_eq!((report.quarantined, report.removed, report.errors), (3, 0, 0));
+        assert!(root.join("mine/photos").exists() && root.join("mine/clone/.git").exists());
+        assert!(root.join("line\nbreak/repo").exists() && root.join("creating/repo/file").exists());
+        let mut held = pass.quarantined_names();
+        held.sort();
+        assert_eq!(held, ["outbox", "reserved", "worktree"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_never_goes_through_a_linked_gc_directory_and_never_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let (root, elsewhere) = (base.join("root"), base.join("elsewhere"));
+        fs::create_dir_all(&elsewhere).unwrap();
+        let orphan = task_root(&root, "orphan");
+        fs::create_dir_all(root.join(".forge")).unwrap();
+        // `.forge/gc` points at another place (another filesystem, say).
+        std::os::unix::fs::symlink(&elsewhere, root.join(GC_DIR)).unwrap();
+        let pass = later(&root, 30 * DAY);
+        let mut report = GcReport::default();
+        pass.task_roots(&states(&[("orphan", RootState::Unknown)]), &mut report);
+        assert!(!pass.trash(&orphan, &mut report));
+        assert_eq!((report.quarantined, report.removed, report.errors), (0, 0, 2));
+        assert!(orphan.join("repo/file").exists());
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn trash_is_a_rename_and_is_emptied_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cleaned = task_root(&root, "cleaned");
+        let pass = sweep(&root);
+        let mut report = GcReport::default();
+        assert!(pass.trash(&cleaned, &mut report));
+        assert!(!cleaned.exists());
+        assert_eq!(report, GcReport::default());
+        // Condemned directories are not quarantine entries.
+        assert!(pass.quarantined_names().is_empty());
+        pass.quarantine_settle(&HashSet::new(), &mut report);
+        assert_eq!(fs::read_dir(root.join(TRASH_DIR)).unwrap().count(), 1);
+        pass.empty_trash(&mut report);
+        assert_eq!((report.removed, report.errors), (1, 0));
+        assert_eq!(fs::read_dir(root.join(TRASH_DIR)).unwrap().count(), 0);
+        // Outside the root: refused.
+        assert!(!pass.trash(dir.path().parent().unwrap(), &mut report));
     }
 
     #[test]
@@ -1030,18 +1460,49 @@ mod tests {
         let gib = 1024 * 1024 * 1024;
         assert_eq!(floor.bytes(100 * gib), 10 * gib);
         assert_eq!(floor.bytes(1000 * gib), 50 * gib);
-        let space = parse_df(
-            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk1 1000 400 600 40% /\n",
-        )
-        .unwrap();
-        assert_eq!(
-            space,
-            DiskSpace {
-                free: 600 * 1024,
-                total: 1000 * 1024
-            }
-        );
-        assert!(disk_space(Path::new("/")).is_some_and(|space| space.total >= space.free));
+        let space = disk_space(Path::new("/")).unwrap();
+        assert!(space.total >= space.free && space.total > 0);
+        assert!(disk_space(Path::new("/no/such/place")).is_none());
+        assert_eq!(check_checkout_age(60), CHECK_CHECKOUT_AGE);
+        assert_eq!(check_checkout_age(7200), Duration::from_secs(5 * 3600));
+    }
+
+    #[test]
+    fn nothing_is_evicted_when_the_disk_cannot_be_read_and_the_reading_decides() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let build = root.join("idle").join(TASK_DIR_NAME).join("build");
+        fs::create_dir_all(build.join("cargo")).unwrap();
+        fs::write(build.join("cargo/.rustc_info.json"), "{}").unwrap();
+        let names = ["idle".to_owned(), "../idle".to_owned()];
+        let floor = FreeFloor::default();
+        let mut report = GcReport::default();
+        let mut pass = sweep(&root);
+        // Unreadable: no eviction, whatever the floor.
+        pass.disk_space = |_| None;
+        pass.evict_builds(&names, &floor, &mut report);
+        // Plenty of room.
+        pass.disk_space = |_| Some(DiskSpace { free: 900, total: 1000 });
+        pass.evict_builds(&names, &FreeFloor { min_free_bytes: 0, min_free_percent: 5 }, &mut report);
+        assert!(build.exists());
+        assert_eq!(report, GcReport::default());
+        // Under the floor.
+        pass.disk_space = |_| Some(DiskSpace { free: 10, total: 1000 });
+        pass.evict_builds(&names, &FreeFloor { min_free_bytes: 0, min_free_percent: 5 }, &mut report);
+        assert!(!build.exists());
+        assert_eq!((report.builds_evicted, report.removed, report.errors), (1, 0, 0));
+    }
+
+    #[test]
+    fn legacy_location_counts_as_untouched_only_when_nothing_in_it_is_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(home.join("inner")).unwrap();
+        let now = SystemTime::now();
+        assert!(!untouched_for(&home, now, LEGACY_UNTOUCHED));
+        assert!(!untouched_for(&home, now + 6 * DAY, LEGACY_UNTOUCHED));
+        assert!(untouched_for(&home, now + 8 * DAY, LEGACY_UNTOUCHED));
+        assert!(!untouched_for(&dir.path().join("missing"), now + 8 * DAY, LEGACY_UNTOUCHED));
     }
 
     #[cfg(unix)]

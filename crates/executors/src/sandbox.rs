@@ -432,14 +432,15 @@ pub fn sweep_dead_runs<'a>(task_roots: &Path, live: impl IntoIterator<Item = &'a
 /// running for a while.
 ///
 /// A per-run directory is removed when this process does not hold it, its key
-/// belongs to no run id in `live`, and either rule holds:
+/// belongs to no run id in `live`, and it was last modified more than
+/// `max_run_age` before `now`.
 ///
-/// - it predates this process (the rule of [`sweep_dead_runs`]); or
-/// - it was last modified more than `max_run_age` before `now`: longer than
-///   any run is allowed to take, so not even a run of another process that
-///   shares this root can still own it.
-///
-/// Age alone never removes a directory younger than `max_run_age`.
+/// Unlike the start-up sweep it does not take "older than this process" as
+/// proof of death: a run a previous process started and left detached (a
+/// protected push, a check still settling) can outlive a restart, and only
+/// the start-up sweep's caller knows which of those it re-adopted. Age alone
+/// never removes a directory younger than `max_run_age`, and a run longer
+/// than that is kept by `live` and by this process's registry.
 pub fn sweep_stale_runs<'a>(
     task_roots: &Path,
     live: impl IntoIterator<Item = &'a str>,
@@ -449,7 +450,7 @@ pub fn sweep_stale_runs<'a>(
     let aged = now
         .checked_sub(max_run_age)
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    sweep_dead_runs_older_than(task_roots, live, (*PROCESS_START).max(aged))
+    sweep_dead_runs_older_than(task_roots, live, aged)
 }
 
 fn sweep_dead_runs_older_than<'a>(
