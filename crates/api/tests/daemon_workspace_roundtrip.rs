@@ -5589,8 +5589,25 @@ async fn daemon_clone_task(
     runtime_id: &str,
     root: &std::path::Path,
 ) -> (ResolvedWorkspace, PathBuf, String) {
+    daemon_task(fixture, daemon_id, runtime_id, Some(root), "feature.txt").await
+}
+
+/// A second Task placed on a daemon with a candidate commit that adds
+/// `file`: in a worktree of a new clone under `clone_root` (a location of
+/// that daemon, not the default checkout), or, without one, in another
+/// worktree of the fixture's own location.
+async fn daemon_task(
+    fixture: &Fixture,
+    daemon_id: &str,
+    runtime_id: &str,
+    clone_root: Option<&std::path::Path>,
+    file: &str,
+) -> (ResolvedWorkspace, PathBuf, String) {
     let database = fixture.harness.state.db.clone();
-    let clone = clone_main(&fixture.checkout, root, "task-clone");
+    let clone = match clone_root {
+        Some(root) => clone_main(&fixture.checkout, root, "task-clone"),
+        None => fixture.checkout.clone(),
+    };
     let (task, workspace) = second_task(
         fixture,
         &fixture
@@ -5601,26 +5618,36 @@ async fn daemon_clone_task(
     )
     .await;
     let now = db::now_rfc3339();
-    let location = RepoLocationRepo::create(
-        &*database,
-        CreateRepoLocation {
-            id: db::new_uuid_v4(),
-            repo_id: workspace.repo_id.clone(),
-            owner_kind: RepoLocationOwnerKind::Daemon,
-            daemon_id: Some(daemon_id.to_owned()),
-            runtime_id: Some(runtime_id.to_owned()),
-            path: clone.to_string_lossy().into_owned(),
-            kind: RepoLocationKind::PrimaryCheckout,
-            is_default: false,
-            status: RepoLocationStatus::Ready,
-            last_verified_at: Some(now.clone()),
-            last_error: None,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("second daemon location creates");
+    let location_id = match clone_root {
+        None => fixture.resolved.placement.repo_location_id.clone(),
+        Some(_) => {
+            RepoLocationRepo::create(
+                &*database,
+                CreateRepoLocation {
+                    id: db::new_uuid_v4(),
+                    repo_id: workspace.repo_id.clone(),
+                    owner_kind: RepoLocationOwnerKind::Daemon,
+                    daemon_id: Some(daemon_id.to_owned()),
+                    runtime_id: Some(runtime_id.to_owned()),
+                    path: clone.to_string_lossy().into_owned(),
+                    kind: RepoLocationKind::PrimaryCheckout,
+                    is_default: false,
+                    status: RepoLocationStatus::Ready,
+                    last_verified_at: Some(now.clone()),
+                    last_error: None,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("second daemon location creates")
+            .id
+        }
+    };
+    let location = RepoLocationRepo::get_by_id(&*database, &location_id)
+        .await
+        .unwrap()
+        .unwrap();
     let placement = WorkspacePlacementRepo::create(
         &*database,
         CreateWorkspacePlacement {
@@ -5653,25 +5680,27 @@ async fn daemon_clone_task(
         .workspace_backend_router
         .for_placement(&placement)
         .expect("daemon backend is installed");
-    backend
-        .daemon_client()
-        .expect("owner client")
-        .verify_location(
-            daemon_id,
-            RepoLocationVerifyParams {
-                repo_location_id: location.id,
-                daemon_id: daemon_id.to_owned(),
-                runtime_id: runtime_id.to_owned(),
-                path: clone.to_string_lossy().into_owned(),
-                kind: DaemonRepoLocationKind::PrimaryCheckout,
-                default_branch: "main".into(),
-                remote_url: None,
-                expected_version: location.version,
-                probe: None,
-            },
-        )
-        .await
-        .expect("owner verifies the Task's clone");
+    if clone_root.is_some() {
+        backend
+            .daemon_client()
+            .expect("owner client")
+            .verify_location(
+                daemon_id,
+                RepoLocationVerifyParams {
+                    repo_location_id: location.id,
+                    daemon_id: daemon_id.to_owned(),
+                    runtime_id: runtime_id.to_owned(),
+                    path: clone.to_string_lossy().into_owned(),
+                    kind: DaemonRepoLocationKind::PrimaryCheckout,
+                    default_branch: "main".into(),
+                    remote_url: None,
+                    expected_version: location.version,
+                    probe: None,
+                },
+            )
+            .await
+            .expect("owner verifies the Task's clone");
+    }
     let prepared = backend
         .prepare(
             &placement,
@@ -5721,9 +5750,9 @@ async fn daemon_clone_task(
             &resolved.placement,
             &RunSpec {
                 purpose: WorkspaceRunPurpose::CiStep,
-                command:
-                    "printf 'candidate\\n' > feature.txt; git add feature.txt; git commit -m candidate"
-                        .into(),
+                command: format!(
+                    "printf 'candidate\\n' > {file}; git add {file}; git commit -m candidate"
+                ),
                 env: BTreeMap::new(),
                 timeout_secs: 0,
                 max_output_bytes: usize::MAX,
@@ -6547,4 +6576,90 @@ async fn cross_owner_ports_write_only_queue_attempt_and_task_step() {
         .unwrap()
         .unwrap();
     assert_eq!(attempt_receipts(&attempt).len(), 2);
+}
+
+/// Two Tasks in ONE queue on a daemon-owned default checkout, both in
+/// worktrees of it. They are taken in order: the first is rebased, checked
+/// green and merged; the second is then rebased onto the first one's merge,
+/// its check is red, and it is sent back. The default checkout holds the
+/// first Task only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn two_tasks_in_one_queue_on_a_daemon_owned_target_merge_green_then_eject_red_in_order() {
+    use db::IntegrationOperationKind as Kind;
+    let fixture = Fixture::file_backed("forge-queue-daemon-two-tasks").await;
+    let runtime_id = fixture.resolved.placement.runtime_id.clone().unwrap();
+    let first = admit_queue_head(&fixture, &["test -f feature.txt", "test -f outside.txt"]).await;
+    let (second_workspace, _, second_candidate) =
+        daemon_task(&fixture, &fixture.daemon_id, &runtime_id, None, "second.txt").await;
+    // Red only once it sits on top of the first Task's merge.
+    let second = admit_placed_head(
+        &fixture,
+        &second_workspace.placement,
+        second_candidate,
+        &["test -f second.txt", "! test -f feature.txt"],
+    )
+    .await;
+    assert_eq!(first.queue_id, second.queue_id, "one queue");
+    std::fs::write(fixture.checkout.join("outside.txt"), "outside\n").unwrap();
+    git::commit_all(&fixture.checkout, "outside").await.unwrap();
+    start_check_worker!(fixture, stop_checks);
+
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    queue_eventually!(&fixture, &first, "the first Task to merge", {
+        task_status(&fixture, &first.task_id).await == "done"
+            && queue_attempt(&fixture, &first).await.state
+                == db::IntegrationAttemptState::Completed
+    });
+    queue_eventually!(&fixture, &second, "the second Task to be sent back", {
+        queue_attempt(&fixture, &second).await.state == db::IntegrationAttemptState::Ejected
+            && task_status(&fixture, &second.task_id).await != "merging"
+    });
+    let _ = stop.send(true);
+    let _ = stop_checks.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+
+    let merged = queue_attempt(&fixture, &first).await;
+    let ejected = queue_attempt(&fixture, &second).await;
+    assert!(merged.queue_seq < ejected.queue_seq);
+    let tip = git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(merged.integrated_sha.as_deref(), Some(tip.as_str()));
+    assert!(fixture.checkout.join("feature.txt").exists());
+    assert!(!fixture.checkout.join("second.txt").exists());
+    // The second head was rebased onto the first one's merge, then checked.
+    assert_eq!(ejected.target_tip_sha.as_deref(), Some(tip.as_str()));
+    assert_eq!(
+        ejected.failure_kind,
+        Some(db::IntegrationFailureKind::CandidateCheckFailed)
+    );
+    assert_ne!(task_status(&fixture, &second.task_id).await, "done");
+    assert_eq!(succeeded(&merged, Kind::Rebase).len(), 1);
+    assert_eq!(succeeded(&merged, Kind::FastForward).len(), 1);
+    assert_eq!(succeeded(&ejected, Kind::Rebase).len(), 1);
+    assert!(receipt_owners(&ejected, Kind::FastForward).is_empty());
+    // Green first, red second, each on its own rebased commit.
+    let checks: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id ORDER BY r.created_at, r.id",
+    )
+    .fetch_all(fixture.harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        checks,
+        vec![
+            (tip, "pass".to_owned()),
+            (ejected.candidate_sha.clone().unwrap(), "fail".to_owned())
+        ]
+    );
+    {
+        use db::IntegrationQueueRepo;
+        let queue = fixture
+            .harness
+            .state
+            .db
+            .integration_queue(&first.queue_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(queue.head_attempt_id.is_none(), "the slot is free");
+    }
 }
