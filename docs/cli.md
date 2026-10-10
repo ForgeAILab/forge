@@ -413,6 +413,43 @@ or `LOW (bytes|inodes) <free>, floor <floor>` while the machine is under its
 floor, or `-` before the first reading. `--output json` carries the same as
 `disk` and `workspace_floor`.
 
+### Moving the server workspace root
+
+This is a flag of the server binary (`forge`), not of `forge-ctl`: it works
+on the data directory with the server stopped.
+
+```text
+forge [--data-dir <DIR>] --migrate-workspace-root [<NEW_ROOT>]
+```
+
+Moves the server's workspace root (Task worktrees, repository clones under
+`.repos/`, execution logs under `.forge/logs/`, garbage-collection state) to
+`<NEW_ROOT>`, or to `<data dir>/worktrees` when no path is given, then exits.
+It cannot be combined with `--demo`, `--no-mcp`, `--no-embedded-daemon`,
+`--reclaim-workspace-gc` or `--convert-db-to-incremental-vacuum`.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Moved, or nothing to move (no root in use yet, or already there). A summary is printed. |
+| `1` | Refused (nothing changed) or interrupted (run the same command again). The reason is on stderr. |
+
+It refuses while a Forge server or another maintenance command holds the
+data directory, while an execution, check run or hook step is recorded as
+running, when `<NEW_ROOT>` is not empty, is a file, is inside the old root or
+contains it, cannot be a workspace root (the home directory or a parent of
+it, a Git repository, a top-level directory), or, for a move across
+filesystems, has less free space than the old root's size plus
+`workspace.min_free_bytes`.
+
+Every file is kept, Git worktree links are repaired and checked, and every
+stored path is rewritten in one transaction. The old root keeps a `MOVED`
+file. Daemon-owned workspaces are not touched. An interrupted run leaves
+`<data dir>/workspace-root-migration.json`; the server refuses to start until
+the command is run again and finishes. See
+[getting started](getting-started.md#where-the-server-keeps-workspaces-and-how-to-move-them)
+for when a move is needed. Forge Solo has no such flag: its root always
+follows its data root.
+
 ### Linking an external daemon
 
 `forge-ctl daemon link` registers the current machine with a running Forge

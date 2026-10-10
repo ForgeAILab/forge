@@ -8,6 +8,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **New installs keep the workspace root in the data directory (3.4 D1).**
+  A server that never set `workspace.root` / `FORGE_WORKSPACE_ROOT` now uses
+  `<data dir>/worktrees` (`~/.forge/worktrees`) instead of
+  `<system temp>/forge/worktrees`, where the operating system deleted
+  worktrees and uncommitted work. Existing installs do not move by
+  themselves: one that has workspaces in the temp directory keeps using it,
+  logs a warning at start and shows a `workspace_root` entry in operator
+  status until `forge --migrate-workspace-root` is run.
+- **The workspace root is recorded, and a start that would switch roots with
+  live data is refused (3.4 D1).** The root in use is written to
+  `system_setting.workspace_root` at the first start. A configured root that
+  differs from it is accepted only when no workspace that is not `cleaned`,
+  no repository clone and no running run is under the recorded root;
+  otherwise the server exits with a message naming both directories and
+  `forge --migrate-workspace-root`. Before, a changed root silently left
+  every worktree and clone behind. A server also refuses to start while
+  `<data dir>/workspace-root-migration.json` (an unfinished move) exists.
+  Forge Solo records its root the same way and refuses a data root whose
+  database recorded another root with live workspaces in it.
 - **A machine under its free-space floor starts no new work (3.4 stage E).**
   With the default floor (10 GiB or 5 % of the workspace filesystem,
   whichever is larger, or 5 % of its inodes; on a filesystem under 20 GiB
@@ -2067,6 +2086,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- **`forge --migrate-workspace-root [<new root>]` moves the server's
+  workspace root and keeps every file (3.4 D1).** Run with the server
+  stopped; the default target is `<data dir>/worktrees`. Entries are renamed
+  on one filesystem, otherwise copied, compared byte for byte and only then
+  removed; Git worktree links (of Forge's clones and of your own
+  repositories) are repaired and checked with `git status`; every stored
+  path is rewritten in one transaction; garbage collection adopts the new
+  root; the old root keeps a `MOVED` file. It refuses, changing nothing,
+  while a run is recorded running, into a non-empty or unsuitable
+  directory, or without room for a cross-filesystem copy, and exits
+  non-zero. An interrupted move is finished by running the command again
+  (the server will not start in between). Operator status gains a
+  `workspace_root` entry under `recent_errors` while the root is in the
+  system temp directory. See
+  [getting started](docs/getting-started.md#where-the-server-keeps-workspaces-and-how-to-move-them).
 
 - **Opt-in shared compiler cache (3.4 stage F).** Each Task builds into its
   own `CARGO_TARGET_DIR`, so each Task builds cold. If a compiler-cache

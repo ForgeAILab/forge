@@ -1051,6 +1051,41 @@ mod tests {
         assert!(sandbox.build_dir("CARGO_TARGET_DIR").is_some());
     }
 
+    /// The default workspace root is `<data dir>/worktrees`. A Task root
+    /// under it is too long for a temp directory of its own, and the short
+    /// directory beside the Task roots fits: a run gets a Forge temp
+    /// directory, which the old macOS temp-directory default never allowed.
+    #[test]
+    fn a_root_in_the_data_directory_gets_the_short_temp_directory() {
+        let task = "0d9d6a3e-5f0b-4c57-9d4e-1f2a3b4c5d6e";
+        let run = "7b0c9f6e-1234";
+        for root in [
+            "/Users/forge-operator/.forge/worktrees",
+            "/home/forge/.forge/worktrees",
+            "/Volumes/Data/codes/ai/open-forge/test/worktrees",
+        ] {
+            let root = Path::new(root);
+            let inside = root.join(task).join(TASK_DIR_NAME).join("tmp/7b0c9f6e12");
+            assert!(inside.as_os_str().len() > SAFE_TMPDIR_BYTES, "{root:?}");
+            let tmp = TaskRoot(root.join(task)).run_tmp(run).unwrap();
+            assert_eq!(tmp, root.join(SHORT_TMP_DIR_NAME).join("7b0c9f6e12"));
+            assert!(tmp.as_os_str().len() <= SAFE_TMPDIR_BYTES);
+        }
+        // The short directory costs 22 bytes: a root of up to 50 fits.
+        let longest = format!("/{}", "r".repeat(49));
+        assert_eq!(
+            TaskRoot(Path::new(&longest).join(task))
+                .run_tmp(run)
+                .map(|tmp| tmp.as_os_str().len()),
+            Some(SAFE_TMPDIR_BYTES)
+        );
+        let too_long = format!("/{}", "r".repeat(50));
+        assert_eq!(TaskRoot(Path::new(&too_long).join(task)).run_tmp(run), None);
+        // Where macOS put the old default: no Forge temp directory at all.
+        let legacy = Path::new("/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/forge/worktrees");
+        assert_eq!(TaskRoot(legacy.join(task)).run_tmp(run), None);
+    }
+
     #[test]
     fn cargo_target_dir_is_set_overridden_and_disabled() {
         let (_dir, worktree) = reserved();
