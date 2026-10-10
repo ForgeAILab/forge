@@ -314,7 +314,9 @@ async fn mapping_table_preserves_known_unknown_and_combined_conditions() {
                 None,
                 None,
                 None,
-                Some(json!({"dispatch_disposition":{"capability":"machine_capacity","capacity_scope":"disk"}})),
+                Some(
+                    json!({"dispatch_disposition":{"capability":"machine_capacity","capacity_scope":"disk"}}),
+                ),
             ),
             "parked",
             Some("capacity"),

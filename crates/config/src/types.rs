@@ -3,8 +3,8 @@ use crate::{
     DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
     DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CORS_ORIGIN,
     DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_DISCONNECT_SECONDS, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
-    DEFAULT_MIN_FREE_BYTES, DEFAULT_MIN_FREE_INODE_PERCENT, DEFAULT_MIN_FREE_PERCENT, DEFAULT_SCAFFOLD_COMMAND,
-    DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    DEFAULT_MIN_FREE_BYTES, DEFAULT_MIN_FREE_INODE_PERCENT, DEFAULT_MIN_FREE_PERCENT,
+    DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -435,7 +435,11 @@ impl ForgeConfig {
                 message: "workspace.min_free_inode_percent must be between 0 and 100".to_owned(),
             });
         }
-        if self.workspace.gc_free_percent.is_some_and(|percent| percent > 100) {
+        if self
+            .workspace
+            .gc_free_percent
+            .is_some_and(|percent| percent > 100)
+        {
             return Err(ConfigError::InvalidConfig {
                 message: "workspace.gc_free_percent must be between 0 and 100".to_owned(),
             });

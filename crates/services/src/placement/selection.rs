@@ -852,15 +852,12 @@ pub(crate) fn filter_candidate(
                 | CapabilityMissing
                 | RunPurposeDenied
         ) && filters.contains(&OwnerUnreachable)
-    }) || filters
-        .iter()
-        .all(|code| {
-            matches!(
-                code,
-                LocationNotReady | AgentCapacity | MachineCapacity | DiskPressure
-            )
-        })
-    {
+    }) || filters.iter().all(|code| {
+        matches!(
+            code,
+            LocationNotReady | AgentCapacity | MachineCapacity | DiskPressure
+        )
+    }) {
         if let Some(code) = environment_filter(context, candidate) {
             filters.insert(code);
         }

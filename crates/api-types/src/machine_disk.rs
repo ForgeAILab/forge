@@ -190,17 +190,26 @@ mod tests {
         };
         assert_eq!(floor.bytes(1_000), 100);
         assert_eq!(floor.bytes(10_000), 500);
-        assert_eq!(floor.pressure(&facts(499, 10_000, None)), Some(DiskPressureKind::Bytes));
+        assert_eq!(
+            floor.pressure(&facts(499, 10_000, None)),
+            Some(DiskPressureKind::Bytes)
+        );
         assert_eq!(floor.pressure(&facts(500, 10_000, None)), None);
         // Plenty of bytes, no inodes left.
         assert_eq!(
             floor.pressure(&facts(9_000, 10_000, Some((49, 1_000)))),
             Some(DiskPressureKind::Inodes)
         );
-        assert_eq!(floor.pressure(&facts(9_000, 10_000, Some((50, 1_000)))), None);
+        assert_eq!(
+            floor.pressure(&facts(9_000, 10_000, Some((50, 1_000)))),
+            None
+        );
         // A filesystem that counts no inodes has no inode floor.
         assert_eq!(floor.pressure(&facts(9_000, 10_000, Some((0, 0)))), None);
-        let off = DiskFloor { min_free_inode_percent: 0, ..floor };
+        let off = DiskFloor {
+            min_free_inode_percent: 0,
+            ..floor
+        };
         assert_eq!(off.pressure(&facts(9_000, 10_000, Some((0, 1_000)))), None);
     }
 

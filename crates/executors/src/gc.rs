@@ -814,7 +814,11 @@ pub struct DiskSpace {
 
 impl DiskSpace {
     /// This reading as the fact a machine reports.
-    pub fn facts(&self, measured_at: String, gc_state: Option<String>) -> api_types::MachineDiskFacts {
+    pub fn facts(
+        &self,
+        measured_at: String,
+        gc_state: Option<String>,
+    ) -> api_types::MachineDiskFacts {
         api_types::MachineDiskFacts {
             free_bytes: self.free,
             total_bytes: self.total,
@@ -1621,7 +1625,11 @@ mod tests {
         }
         let facts = space.facts("now".to_owned(), Some("owned".to_owned()));
         assert_eq!(
-            (facts.free_bytes, facts.total_inodes, facts.gc_state.as_deref()),
+            (
+                facts.free_bytes,
+                facts.total_inodes,
+                facts.gc_state.as_deref()
+            ),
             (space.free, space.total_inodes, Some("owned"))
         );
         assert!(disk_space(Path::new("/no/such/place")).is_none());
@@ -1651,11 +1659,7 @@ mod tests {
                 ..DiskSpace::default()
             })
         };
-        pass.evict_builds(
-            &names,
-            &FreeFloor::of_bytes(0, 5),
-            &mut report,
-        );
+        pass.evict_builds(&names, &FreeFloor::of_bytes(0, 5), &mut report);
         assert!(build.exists());
         assert_eq!(report, GcReport::default());
         // Under the floor.
@@ -1666,11 +1670,7 @@ mod tests {
                 ..DiskSpace::default()
             })
         };
-        pass.evict_builds(
-            &names,
-            &FreeFloor::of_bytes(0, 5),
-            &mut report,
-        );
+        pass.evict_builds(&names, &FreeFloor::of_bytes(0, 5), &mut report);
         assert!(!build.exists());
         assert_eq!(
             (report.builds_evicted, report.removed, report.errors),

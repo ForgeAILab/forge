@@ -776,7 +776,11 @@ fn workspace_gc_keys_default_and_obey_file_then_env() {
     // The inode floor and the mark at which the collector runs at once.
     let floor = defaults;
     assert_eq!(
-        (floor.min_free_inode_percent, floor.gc_free_bytes, floor.gc_free_percent),
+        (
+            floor.min_free_inode_percent,
+            floor.gc_free_bytes,
+            floor.gc_free_percent
+        ),
         (5, None, None)
     );
     fs::write(
@@ -788,7 +792,11 @@ fn workspace_gc_keys_default_and_obey_file_then_env() {
         .expect("file loads")
         .workspace;
     assert_eq!(
-        (floor.min_free_inode_percent, floor.gc_free_bytes, floor.gc_free_percent),
+        (
+            floor.min_free_inode_percent,
+            floor.gc_free_bytes,
+            floor.gc_free_percent
+        ),
         (3, Some(4000), Some(20))
     );
     env::set_var("FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT", "7");
@@ -798,7 +806,11 @@ fn workspace_gc_keys_default_and_obey_file_then_env() {
         .expect("env loads")
         .workspace;
     assert_eq!(
-        (floor.min_free_inode_percent, floor.gc_free_bytes, floor.gc_free_percent),
+        (
+            floor.min_free_inode_percent,
+            floor.gc_free_bytes,
+            floor.gc_free_percent
+        ),
         (7, Some(9000), Some(25))
     );
     env::set_var("FORGE_WORKSPACE_GC_FREE_PERCENT", "101");

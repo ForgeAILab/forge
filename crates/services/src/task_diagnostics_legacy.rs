@@ -210,6 +210,8 @@ pub fn derive_workflow_health(
                 "Waiting on Owner"
             } else if reason == "machine_capacity" {
                 "Waiting for a Machine Slot"
+            } else if reason == "disk_pressure" {
+                "Waiting for Disk Space"
             } else {
                 "Waiting for a Slot"
             };

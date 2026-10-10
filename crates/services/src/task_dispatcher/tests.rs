@@ -8035,6 +8035,138 @@ async fn machine_capacity_waits_in_initial_state_then_starts_after_run_ends() {
     assert!(deferred_dispatch::current_dispatch_disposition(&admitted).is_none());
 }
 
+/// Every machine under its free-space floor: the Task waits where it is with
+/// the machine-capacity wait naming the disk, raises nothing, and is
+/// dispatched by the next scan after the reading recovers. Nobody acts.
+#[tokio::test]
+async fn disk_pressure_waits_in_initial_state_then_starts_when_the_reading_recovers() {
+    let db = Arc::new(sqlite_db().await);
+    let repo = TempDir::new().unwrap();
+    let workspaces = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo.path()).await;
+    let agent_id = seed_agent(&db, 4, DaemonStatus::Online, AgentStatus::Idle).await;
+    let queued = seed_task(&db, &project_id, "WAIT", "todo", 0).await;
+    assign_role(&db, &queued.id, "coder", &agent_id).await;
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(10));
+    let reading = Arc::clone(&free);
+    db.disk_admission.configure(
+        api_types::DiskFloor::of_bytes(100, 0),
+        Arc::new(move || {
+            Some(api_types::MachineDiskFacts {
+                free_bytes: reading.load(std::sync::atomic::Ordering::SeqCst),
+                total_bytes: 1_000,
+                free_inodes: None,
+                total_inodes: None,
+                measured_at: db::now_rfc3339(),
+                gc_state: Some("owned".to_owned()),
+            })
+        }),
+    );
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let (dispatcher, mut rx) = build_dispatcher(db.clone(), workspaces.path()).await;
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
+            .await
+            .unwrap(),
+        0
+    );
+    let waiting = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(waiting.status, queued.status);
+    let disposition = deferred_dispatch::current_dispatch_disposition(&waiting).unwrap();
+    assert_eq!(
+        (
+            disposition.capability.as_str(),
+            disposition.capacity_scope.as_deref()
+        ),
+        ("machine_capacity", Some("disk")),
+        "{}",
+        disposition.safe_message
+    );
+    assert!(
+        disposition
+            .safe_message
+            .starts_with("disk_pressure: waiting for free space"),
+        "{}",
+        disposition.safe_message
+    );
+    // The collector runs on this root, so the wait does not say otherwise.
+    assert!(!disposition.safe_message.contains("garbage collection"));
+    assert!(format!("{:?}", waiting.condition).contains("Disk"));
+    let health = crate::task_diagnostics::derive_workflow_health(
+        &waiting,
+        &workflow,
+        &[],
+        None,
+        None,
+        false,
+        None,
+    );
+    assert_eq!(health.kind, api_types::WorkflowHealthKind::WaitingForAgent);
+    assert_eq!(health.severity, api_types::HealthSeverity::Info);
+    assert_eq!(health.label, "Waiting for Disk Space");
+    assert_eq!(health.stale_reason.as_deref(), Some("disk_pressure"));
+    assert!(waiting.error_annotation.is_none() && waiting.failed_json.is_none());
+    let attention: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attention_projection WHERE scope_type = 'task' AND scope_id = ?",
+    )
+    .bind(&queued.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attention, 0);
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(project.system_pause_reason.is_none());
+    // Still short on the next scan: still waiting, nothing rewritten.
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &queued.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .version,
+        waiting.version
+    );
+
+    // The reading recovers; the next scan dispatches the Task.
+    free.store(900, std::sync::atomic::Ordering::SeqCst);
+    db.disk_admission.refresh();
+    assert_eq!(
+        dispatcher
+            .dispatch_initial_tasks_and_drain(&project, &workflow)
+            .await
+            .unwrap(),
+        1
+    );
+    let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.task_id, queued.id);
+    let admitted = TaskRepo::get_by_id(&*db, &queued.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(deferred_dispatch::current_dispatch_disposition(&admitted).is_none());
+    assert!(!format!("{:?}", admitted.condition).contains("Disk"));
+}
+
 #[tokio::test]
 async fn machine_capacity_active_waiter_is_parked_at_final_version() {
     let db = Arc::new(sqlite_db().await);

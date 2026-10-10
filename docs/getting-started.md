@@ -436,6 +436,9 @@ workspace:
   log_retention_days: 30        # logs of a terminal Task; 0 keeps them forever
   min_free_bytes: 10737418240   # free-space floor: the larger of this
   min_free_percent: 5           # and this share of the filesystem
+  min_free_inode_percent: 5     # and this share of its inodes; 0 turns it off
+  # gc_free_bytes: 21474836480  # collect at once under the larger of this
+  # gc_free_percent: 10         # and this; unset: twice the floor
 ```
 
 Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
@@ -443,10 +446,32 @@ Logs under `<workspace root>/.forge/logs/<project>/<task>` are deleted
 root's filesystem has less free space than the floor, the periodic sweep
 deletes the build output (`.forge-task/build`) of idle, non-terminal Tasks,
 least recently used first; those Tasks rebuild on their next run. Running work
-is never touched. `FORGE_WORKSPACE_LOG_RETENTION_DAYS`,
-`FORGE_WORKSPACE_MIN_FREE_BYTES` and `FORGE_WORKSPACE_MIN_FREE_PERCENT`
-override the file values; all three take effect on restart. A daemon uses the
-default floor. No key turns garbage collection off.
+is never touched. A Task with an open review or an unresolved attention item
+keeps its logs until that is decided or resolved.
+
+The same floor decides admission. While a machine's workspace filesystem is
+under it (bytes or inodes), Forge starts no new worktree and no check checkout
+on that machine. Other machines stay eligible. A Task that already has its
+worktree there keeps running, and nothing running is stopped: finishing work
+is how space comes back. When every machine that could take a Task is short,
+the Task waits and says so ("Waiting for Disk Space"); it is dispatched by
+itself as soon as a reading recovers. Nothing fails, no retry budget is spent
+and the Project is not paused. Before the server refuses, it collects its
+garbage once and reads the disk again, and under the collector mark
+(`gc_free_*`, default twice the floor) the collector runs at once instead of
+on its 10 minute timer. If the wait says garbage collection is not running on
+a machine, free space there by hand or fix the root's ownership (below):
+nothing will reclaim it automatically. A disk that cannot be read refuses
+nothing.
+
+`FORGE_WORKSPACE_LOG_RETENTION_DAYS`, `FORGE_WORKSPACE_MIN_FREE_BYTES`,
+`FORGE_WORKSPACE_MIN_FREE_PERCENT`, `FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT`,
+`FORGE_WORKSPACE_GC_FREE_BYTES` and `FORGE_WORKSPACE_GC_FREE_PERCENT` override
+the file values; all take effect on restart. A daemon has no floor of its own:
+it reports the free bytes and inodes of its workspace root with every report
+and takes the server's floor from the reply, for its own collector. Until the
+first reply it uses the built-in default and logs that it does. No key turns
+garbage collection off.
 
 Garbage collection runs only on a workspace root this server's database owns.
 The server adopts its root at start-up by writing `.forge/gc/owner` under it,
@@ -1357,12 +1382,12 @@ or cancel. Cleanup remains `cleaning` until the owner acknowledges it. See
 For containers sharing server workspaces, register a server-owned `shared_mount`
 location instead. Forge verifies a server-written probe through the daemon at
 the same path before using it as an execution provider. Matching absolute paths
-alone are insufficient. Daemon ownership requires revision 6 with `workspace.v1`.
+alone are insufficient. Daemon ownership requires revision 7 with `workspace.v1`.
 
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 6 or newer), restarting each with its existing
+release (protocol revision 7 or newer), restarting each with its existing
 `--workspace-root`.
-A connection below revision 6 receives `daemon_upgrade_required` and cannot use any
+A connection below revision 7 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -1373,7 +1398,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 6, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 7, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.

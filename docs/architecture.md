@@ -3409,10 +3409,10 @@ directly under the server workspace root, or `workspace-<uuid>` under
 | Quarantined directory whose record appears later | Moved back when its place is still empty, otherwise left in quarantine. Never deleted. |
 | Task root whose workspace rows are all `cleaned` (daemon: handle marked cleaned) | Renamed into `<root>/.forge/gc/trash/` under the Task's lifecycle lock (daemon: the handle's owner lock), only while the Task is terminal and has no running execution, active lease, run or create of this process; deleted after the lock is released, in the same pass or the next. |
 | `<name>.broken-<ms>` in a live Task root | 7 days after the time in its name; earlier with its Task root. |
-| Per-run temp directory `.forge-task/tmp/<key>` or `<task roots dir>/.forge-tmp/<key>` | When this process does not hold it, its key belongs to no running execution, and it was last modified more than 25 hours ago. That is not a bound on a run: an execution deadline is set per agent and has no ceiling, and a longer run is kept by the first two conditions. Directories a previous process left are removed at start-up, not by this pass. |
+| Per-run temp directory `.forge-task/tmp/<key>` or `<task roots dir>/.forge-tmp/<key>` | When this process does not hold it, its key belongs to no running execution, and it was last modified more than 25 hours ago. That is not a bound on a run: an execution deadline is set per agent and has no ceiling, and a longer run is kept by the first two conditions. The sweep at start-up uses the same rule: a run a previous process left detached (a protected push, a check still settling) can still be alive after the restart and is in nobody's table, so being older than this process condemns nothing. |
 | `.forge/build/checks/check-*` | Last modified longer ago than twice `server.check_run_timeout_seconds` plus an hour (never under 2 hours; a daemon uses 2 hours), and either the owner's check table (the server check runner's live operations, the daemon's running commands) is empty or the checkout predates this process. |
-| `.forge-task/build` of a live, non-terminal Task | Only while the root's filesystem is under the free-space floor (`workspace.min_free_bytes` or `workspace.min_free_percent`, whichever is larger; default 10 GiB or 5 %), least recently used first, until it is back above the floor. Never for a Task with a running execution, an active lease, or a hook, check or tool command of this process in its root; never while any check operation is live. A terminal Task's build output goes with its Task root. |
-| `.forge/logs/<project>/<task>` (server only) | `workspace.log_retention_days` (default 30, `0` keeps logs forever) after a terminal Task last changed and after the last write to the directory, whichever is later, by the terminal-Task sweep, on a root this database owns. A reopened Task is not terminal and keeps its logs; a Task whose record carries an old or future timestamp keeps logs written inside the retention. |
+| `.forge-task/build` of a live, non-terminal Task | Only while the root's filesystem is under the free-space floor (`workspace.min_free_bytes` or `workspace.min_free_percent`, whichever is larger, default 10 GiB or 5 %; or `workspace.min_free_inode_percent` of its inodes, default 5 %), least recently used first, until it is back above the floor. Never for a Task with a running execution, an active lease, or a hook, check or tool command of this process in its root; never while any check operation is live. The server decides each Task under its lifecycle lock after reading its state again, and the eviction is one rename into `<root>/.forge/gc/trash/` made under the lock every run start takes (the sandbox's live-run registry): a run that starts meanwhile is either seen, and keeps its build output, or starts after the rename and gets the directory made again. The delete happens after both locks are released. A terminal Task's build output goes with its Task root. |
+| `.forge/logs/<project>/<task>` (server only) | `workspace.log_retention_days` (default 30, `0` keeps logs forever) after a terminal Task last changed and after the last write to the directory, whichever is later, by the terminal-Task sweep, on a root this database owns. A reopened Task is not terminal and keeps its logs; a Task whose record carries an old or future timestamp keeps logs written inside the retention; a Task with an open review (running or waiting for a person) or an unresolved attention item about it keeps its logs until that is decided or resolved. |
 | Legacy: `<root>/.forge/logs/<project>/<task>/.codex-managed-home` | With its terminal Task (unchanged). |
 | Legacy: the daemon's shared `<root>/.forge-daemon/execution-logs/.codex-managed-home` | When the daemon runs no execution and no command. |
 | Legacy: `<system temp>/forge/logs/<task id>/hooks` and `<system temp>/forge-gemini-api-key-home` | By the running server only, when it runs no execution and nothing touched the location for 7 days; a hook-log directory only when `<task id>` is a Task of this database. The system temp directory is shared by every Forge on the machine, and one server cannot know what another runs. These are exact paths; nothing else in the temp directory is removed. |
@@ -3461,8 +3461,77 @@ What the pass never touches:
   start-up, because the first one's runs are invisible to it.
 
 A pass always finishes at least one Task root and moves its cursor past it,
-so an entry that takes the whole budget cannot starve the ones after it. Free
-space is read with `statvfs`; when it cannot be read nothing is evicted.
+so an entry that takes the whole budget cannot starve the ones after it.
+Removing a tree is itself bounded by the pass: the removal looks at the
+deadline every 256 entries and stops between entries when the pass is out of
+time. What is left stays where it was (in the trash, in quarantine, in its
+Task root), the pass reports `out_of_time`, not an error, and the next pass
+carries on. A tree smaller than that always goes whole. Free space and free
+inodes are read with `statvfs`; when they cannot be read nothing is evicted.
+
+A deleted Task is reclaimed like a terminal one, whatever state it was
+deleted in: deleting schedules its cleanup, and the cleanup waits, as for a
+terminal Task, until no execution of it runs and no lease on it is active.
+Deleting stops nothing by itself (a Task can only be deleted from an inactive
+state), so a run still in flight keeps its directory until it has stopped.
+
+### Disk-pressure admission
+
+A full disk must never silently kill work. The filesystem holding each
+machine's workspace root is read for free bytes and free inodes: the server
+reads its own root at admission (one reading answers for five seconds), and a
+daemon reads its root for every report and sends the reading with it. All
+machines are held to the server's floor, the same one the collector evicts
+to, so eviction and refusal cannot disagree: `workspace.min_free_bytes` or
+`workspace.min_free_percent` of the filesystem, whichever is larger, and
+`workspace.min_free_inode_percent` of its inodes. A daemon receives the floor
+in the reply to its report and uses it for its own collector; it has no floor
+of its own.
+
+Under the floor a machine starts no new disk-consuming work:
+
+- **Placement.** A candidate whose owner is under the floor is rejected with
+  the filter code `disk_pressure`, beside `machine_capacity`. Other machines
+  stay eligible and are chosen. A Task that already has a ready worktree
+  there (its own, or the root's a subtask shares) is never refused: finishing
+  work is how space comes back. A ready placement whose directory is gone
+  would be made again at claim, which is new disk: that recreate is refused
+  with the same code. A running execution is never stopped for disk.
+- **The wait.** When every machine that could take the Task is short of disk,
+  the Task takes the machine-capacity path: a recorded `machine_capacity`
+  dispatch disposition carrying `capacity_scope: "disk"`, no annotation, no
+  Attention, no failure, no retry-budget charge and no Project pause. The
+  dispatcher re-evaluates it on every scan like a run-slot wait, so it clears
+  by itself when a reading recovers. The Task's condition is `capacity` with
+  scope `disk`; `workflow_health.stale_reason` is `disk_pressure`. When a
+  machine with room on its disk exists but has no free run slot, the wait is
+  the ordinary one for a slot: one reason at a time, the nearer exit.
+- **Checks.** A check always needs a new checkout, so check admission asks
+  the same question for the check's machine. Under the floor the run stays
+  queued with the typed slot wait it has for a full machine (told to its
+  consumers once, no wall time charged) and is admitted by the sweep that
+  finds the reading recovered. It is never failed for it.
+- **Reclaim first.** Before the server is counted as short, its garbage is
+  collected once (trash, quarantine past its age, cleaned leftovers, build
+  eviction) and its disk is read again; at most one such pass a minute, with
+  a 20 second budget. The same happens on the cleanup tick whenever free
+  space is under the collector mark (`workspace.gc_free_bytes` or
+  `workspace.gc_free_percent`, default twice the floor) instead of waiting
+  for the 10 minute timer. A daemon looks at its disk every 30 seconds and
+  sweeps at once under the mark (at most once a minute), so its next report
+  already carries what it reclaimed. When nothing collects on a root (the
+  server's `workspace_gc` state, or a daemon's reported `gc_state`, is not
+  `owned`), the wait says so: no automatic reclaim will end it.
+- **Unreadable disk.** A reading that cannot be taken refuses nothing, on the
+  server (logged once as a warning until it can be read again) and for a
+  daemon that sent none. A scheduler nobody enabled admission for (every test
+  and tool) knows no floor and never reports pressure; only a running server
+  (`forge`, Solo) turns it on, beside adopting its workspace root.
+
+Machine reads show the reading with the floor applied: `disk` on a daemon
+(`GET /api/v1/daemons`), and on every `daemon_pressure` entry of operator
+status, where `disk.pressure` (`bytes` or `inodes`) marks a machine that is
+under its floor. `forge-ctl daemon` tables print it in the `Disk` column.
 
 Each pass also measures live server-owned Task roots (32 per pass, least
 recently measured first; disk blocks, links not followed) and writes
@@ -3689,6 +3758,12 @@ same component. CLI `project env-status` reads these Project readiness facts;
 Machine saturation does not downgrade Agent availability or Project execution
 setup; the Agent availability precheck uses only its identity quota.
 
+A candidate rejected only for `disk_pressure` (its workspace filesystem is
+under the free-space floor, see Disk-pressure admission above) is the same
+kind of wait: where this section says `machine_capacity` for a rejection, a
+rejection for `disk_pressure`, or for both, takes the same path, and the
+recorded disposition names the disk.
+
 A Task with no eligible machine and at least one candidate rejected only for
 `machine_capacity` records a `machine_capacity` queued dispatch disposition,
 without an annotation, Attention, failure or retry-budget charge. Initial
@@ -3912,9 +3987,11 @@ local policy purposes, `environment_probe` and `repo_provision`, and refusal is
 Upgrade the server first: a daemon that opts into these new purposes needs a
 server from this release; an older server rejects the handshake because its
 run-purpose enum does not recognize them. These capabilities did not change
-the protocol revision; the current revision is 6.
+the protocol revision; the current revision is 7. Revision 7 adds the disk
+facts of the workspace root to every daemon report and the free-space floor to
+its reply (Disk-pressure admission, above).
 
-Protocol revision 6 negotiates `workspace.v1` for `repo_location.verify`,
+Protocol revision 7 negotiates `workspace.v1` for `repo_location.verify`,
 `workspace.prepare`, `workspace.describe`, `workspace.run`, `workspace.diff`,
 `workspace.read`, `workspace.merge`, `workspace.reset`, and `workspace.cleanup`.
 Plan-writing roles on a daemon-owned workspace require `execution.plan_transport`.
@@ -3924,9 +4001,9 @@ placement refusals record a structured Task annotation naming the machine and
 missing capability. Dispatch waits until eligibility facts change, then clears
 the refusal and retries.
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 6 or newer), restarting each with its existing
+release (protocol revision 7 or newer), restarting each with its existing
 `--workspace-root`.
-A connection below revision 6 receives `daemon_upgrade_required` and cannot use any
+A connection below revision 7 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -3937,7 +4014,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 6, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 7, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.

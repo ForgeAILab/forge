@@ -42,7 +42,10 @@ pub fn accept_floor(floor: Option<FreeFloor>) {
     };
     let mut current = SERVER_FLOOR.write().unwrap_or_else(|p| p.into_inner());
     if *current != Some(floor) {
-        tracing::info!(?floor, "workspace free-space floor received from the server");
+        tracing::info!(
+            ?floor,
+            "workspace free-space floor received from the server"
+        );
         *current = Some(floor);
     }
 }

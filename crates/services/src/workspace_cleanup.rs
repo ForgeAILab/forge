@@ -3215,10 +3215,7 @@ mod tests {
         let under = executors::gc::FreeFloor::of_bytes(u64::MAX, 0);
 
         // Plenty of room: nothing is evicted.
-        scheduler.set_gc_limits(
-            30,
-            executors::gc::FreeFloor::of_bytes(0, 0),
-        );
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::of_bytes(0, 0));
         assert_eq!(gc_at(&scheduler, Duration::ZERO).await.builds_evicted, 0);
 
         // Under the floor while a check runs somewhere: nothing is evicted.
@@ -3566,10 +3563,7 @@ mod tests {
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, "x").unwrap();
         let scheduler = Arc::new(gc_scheduler(&db, &root).await);
-        scheduler.set_gc_limits(
-            30,
-            executors::gc::FreeFloor::of_bytes(u64::MAX, 0),
-        );
+        scheduler.set_gc_limits(30, executors::gc::FreeFloor::of_bytes(u64::MAX, 0));
 
         // The pass saw an idle Task. Something holds the Task's lifecycle
         // lock; a run starts before the pass gets its turn.
@@ -3581,12 +3575,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!pass.is_finished(), "eviction waits for the lifecycle lock");
         assert!(marker.exists());
-        let run =
-            fixture_execution(&db, &task, &workspace_id, db::ExecutionStatus::Running).await;
+        let run = fixture_execution(&db, &task, &workspace_id, db::ExecutionStatus::Running).await;
         drop(guard);
         let report = pass.await.unwrap();
         assert_eq!((report.builds_evicted, report.errors), (0, 0));
-        assert!(marker.exists(), "the run that started keeps its build output");
+        assert!(
+            marker.exists(),
+            "the run that started keeps its build output"
+        );
 
         // Once the run is over the same Task is evicted.
         sqlx::query("UPDATE execution SET status = 'failed' WHERE id = ?")
@@ -3619,7 +3615,8 @@ mod tests {
             api_types::DiskFloor::of_bytes(100, 0),
             Arc::new(move || {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let full = std::fs::read_dir(&watched).is_ok_and(|mut entries| entries.next().is_some());
+                let full =
+                    std::fs::read_dir(&watched).is_ok_and(|mut entries| entries.next().is_some());
                 Some(api_types::MachineDiskFacts {
                     free_bytes: if full { 10 } else { 900 },
                     total_bytes: 1_000,
@@ -3636,7 +3633,11 @@ mod tests {
         );
         assert!(scheduler.reclaim_under_pressure().await, "a pass ran");
         assert!(!trash.join("condemned-1-0").exists());
-        assert_eq!(db.disk_admission.server_pressure(), None, "read again after the pass");
+        assert_eq!(
+            db.disk_admission.server_pressure(),
+            None,
+            "read again after the pass"
+        );
         // Asked again at once: no second pass, whatever the disk says.
         std::fs::create_dir_all(trash.join("condemned-2-0")).unwrap();
         db.disk_admission.refresh();
@@ -3677,8 +3678,7 @@ mod tests {
 
         // Deleting stops nothing by itself: a run still in flight keeps the
         // directory until it has stopped.
-        let run =
-            fixture_execution(&db, &task, &workspace_id, db::ExecutionStatus::Running).await;
+        let run = fixture_execution(&db, &task, &workspace_id, db::ExecutionStatus::Running).await;
         let now = now_rfc3339();
         TaskRepo::soft_delete(
             &*db,

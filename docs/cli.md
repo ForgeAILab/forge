@@ -397,6 +397,18 @@ local `max_concurrent_runs` in `daemon.yaml` beside its credentials. The same
 automatic default is computed on the daemon machine. Each registration/report
 sends the resolved typed value. Legacy session-cap labels are no longer read.
 
+Each report also sends the free bytes and inodes of the filesystem holding
+`--workspace-root`, and whether the daemon's garbage collector runs on that
+root. The reply carries the server's free-space floor
+(`workspace.min_free_*`, `workspace.gc_free_*` in the server's `forge.yaml`),
+which the daemon uses for its own collector; there is no daemon-side key for
+it. While the reading is under the floor the server places no new worktree
+and no check on that machine; work already in a worktree there carries on.
+`forge-ctl daemon` tables print the reading in the `Disk` column: free space,
+or `LOW (bytes|inodes) <free>, floor <floor>` while the machine is under its
+floor, or `-` before the first reading. `--output json` carries the same as
+`disk` and `workspace_floor`.
+
 ### Linking an external daemon
 
 `forge-ctl daemon link` registers the current machine with a running Forge
@@ -455,9 +467,9 @@ The daemon reads `workspace.run.allow` from `daemon.yaml` beside its credentials
 This dispatch policy has the trust limits described above.
 
 Upgrade the server first, then every daemon using `forge-ctl` from that server
-release (protocol revision 6 or newer), restarting each with its existing
+release (protocol revision 7 or newer), restarting each with its existing
 `--workspace-root`.
-A connection below revision 6 receives `daemon_upgrade_required` and cannot use any
+A connection below revision 7 receives `daemon_upgrade_required` and cannot use any
 command RPC: execution, repository verification, filesystem browsing
 (`fs.list`/`fs.branches`), workspace operations, or PTY terminals. Operator status
 shows `upgrade_required`; pinned Agents and refused Task admissions carry
@@ -468,7 +480,7 @@ when an otherwise eligible owner is blocked solely by the upgrade (disregarding
 facts absent from the older handshake), and no owner is blocked solely by
 capacity or a transient condition. It creates no Execution or retry-budget charge.
 Upgrade refusals are cleared by the heartbeat sweep once a refused daemon
-reconnects at revision 6, waking Task dispatch automatically. Upgrading the daemon
+reconnects at revision 7, waking Task dispatch automatically. Upgrading the daemon
 is the required human action. The old daemon logs the instruction through its
 existing warning handler; a new binary also prints it to stderr on connect.
 A socket awaiting its handshake is `daemon_not_ready`, not an upgrade refusal.

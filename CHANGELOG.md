@@ -8,6 +8,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Daemon protocol revision 7: upgrade every daemon with the server (3.4
+  stage E).** A daemon now sends the free bytes and inodes of its workspace
+  root with every report and takes the server's free-space floor from the
+  reply. The minimum protocol revision is 7: a revision-6 daemon is refused
+  every command RPC with `daemon_upgrade_required` until it is replaced by
+  `forge-ctl` from the server's release and restarted with the same
+  `--workspace-root`. Upgrade the server first, then every daemon.
+- **A machine under its free-space floor starts no new work (3.4 stage E).**
+  With the default floor (10 GiB or 5 % of the workspace filesystem,
+  whichever is larger, or 5 % of its inodes) a server or daemon that is that
+  short of disk no longer gets new worktrees or check checkouts; Tasks wait
+  ("Waiting for Disk Space") and are dispatched by themselves when space
+  comes back. Lower `workspace.min_free_bytes` / `min_free_percent` /
+  `min_free_inode_percent` in `forge.yaml` to admit work on a fuller disk.
+- **A deleted Task's worktree and build output are removed (3.4 stage E).**
+  Deleting a Task now schedules the cleanup a terminal Task gets, once
+  nothing runs for it. Before, the directories of a Task deleted in a
+  non-terminal state stayed on disk indefinitely.
+
 - **Logs of terminal Tasks are deleted after 30 days (3.4 stage D).** The
   directory `<workspace root>/.forge/logs/<project>/<task>` (execution JSONL
   logs and hook logs) is removed `workspace.log_retention_days` days after a
@@ -1932,6 +1951,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **Disk-pressure admission (3.4 stage E).** A full disk no longer silently
+  kills work. Each machine's workspace filesystem is read for free bytes and
+  inodes (the server reads its own root; a daemon reports its root). Under
+  the floor a machine is rejected for new worktrees with the placement filter
+  code `disk_pressure` while other machines stay eligible, a Task with a
+  ready worktree there keeps running, and nothing running is stopped. When
+  every usable machine is short the Task waits on the machine-capacity path
+  with capacity scope `disk` (`ConditionCapacityScope` gains `disk`;
+  `workflow_health.stale_reason` is `disk_pressure`) and clears by itself: no
+  failure, no retry-budget charge, no Project pause. Checks wait the same
+  way and are never failed for it. Before refusing, the server collects its
+  garbage once and reads the disk again, and the wait says when nothing
+  collects garbage on a machine. A disk that cannot be read refuses nothing.
+- **Inode floor and collector mark.** `workspace.min_free_inode_percent`
+  (default 5, `0` off; `FORGE_WORKSPACE_MIN_FREE_INODE_PERCENT`) joins the
+  byte floor for eviction and admission. `workspace.gc_free_bytes` /
+  `workspace.gc_free_percent` (`FORGE_WORKSPACE_GC_FREE_*`; default twice the
+  floor) is the free space under which the garbage collector runs at once
+  instead of on its 10 minute timer, on the server and on daemons.
+- **Machine disk facts on the API and CLI.** Daemon reads add `disk` (the
+  last reading, `floor_bytes` and `pressure`) and `workspace_floor`;
+  Operations `daemon_pressure` entries add `disk`; `forge-ctl daemon` tables
+  add a `Disk` column.
+
 - **Remove a machine that will never return.** `DELETE /api/v1/daemons/{id}`,
   `forge-ctl daemon remove <id>` and a Remove button with a confirmation on the
   machines settings page. Only a disconnected machine can be removed
@@ -2092,6 +2135,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **Garbage collection could take a build directory from a run that had just
+  started, and other collector safety gaps (3.4 stage E).** Build eviction is
+  now decided per Task under its lifecycle lock after reading its state
+  again, and the eviction is one rename made under the lock every run start
+  takes; a run starting meanwhile keeps its build output or gets the
+  directory made again. Log retention skips a Task with an open review or an
+  unresolved attention item. Removing a very large tree stops when the pass
+  is out of time and resumes on the next pass instead of overrunning it. The
+  sweep of run directories at start-up no longer removes the directory of a
+  run a previous process left detached and still alive (server and daemon):
+  it is age-gated like the periodic sweep.
 
 - **Three waits that showed nothing, or lost what they waited for, are now
   typed and visible.** (1) A Task whose Agent is paused or unreachable kept a

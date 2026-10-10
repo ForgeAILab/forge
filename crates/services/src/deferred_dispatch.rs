@@ -462,9 +462,7 @@ pub(crate) async fn disk_wait_message(db: &db::SqliteDb) -> String {
     let unowned: Vec<&db::machine_disk::MachineDiskRow> = under
         .iter()
         .copied()
-        .filter(|row| {
-            row.disk.facts.gc_state.as_deref() != Some(api_types::WORKSPACE_GC_OWNED)
-        })
+        .filter(|row| row.disk.facts.gc_state.as_deref() != Some(api_types::WORKSPACE_GC_OWNED))
         .collect();
     if !unowned.is_empty() {
         message.push_str(&format!(

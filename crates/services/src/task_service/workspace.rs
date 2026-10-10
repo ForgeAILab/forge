@@ -378,15 +378,6 @@ impl TaskService {
         Ok(false)
     }
 
-    pub(crate) async fn machine_capacity_blocked(
-        &self,
-        task: &Task,
-        agent: &Agent,
-        role: Option<&str>,
-    ) -> Result<bool> {
-        Ok(self.capacity_wait_for(task, agent, role).await?.is_some())
-    }
-
     /// What the Task would wait for if dispatched now: a run slot, or free
     /// disk for a new worktree. Before a machine is counted as short of
     /// disk, its garbage is collected once and its disk read again.
@@ -3801,10 +3792,11 @@ pub(crate) mod tests {
             .bind(new_uuid_v4()).bind(&busy.id).bind(&agent.id).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
         let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
             .with_placement_adapter_registry(Arc::new(executors::AdapterRegistry::new()));
-        assert!(!service
-            .machine_capacity_blocked(&task, &agent, None)
+        assert!(service
+            .capacity_wait_for(&task, &agent, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
         let refusal = service
             .reserve_claim_workspace(&task, Some(&agent), "coder")
             .await
@@ -3915,10 +3907,11 @@ pub(crate) mod tests {
         let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
             .with_workspace_root(root.path().to_path_buf())
             .with_daemon_connections(registry);
-        assert!(!service
-            .machine_capacity_blocked(&task, &agent, None)
+        assert!(service
+            .capacity_wait_for(&task, &agent, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
         let reserved = service
             .reserve_claim_workspace(&task, Some(&agent), "coder")
             .await
@@ -3952,13 +3945,14 @@ pub(crate) mod tests {
         let before: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM workspace_placement), (SELECT COUNT(*) FROM repo_location), (SELECT SUM(list_revision) FROM project)").fetch_one(db.pool()).await.unwrap();
         let service = TaskService::new(db.clone(), Arc::new(EventBus::default()));
         let writer = db::begin_immediate(db.pool()).await.unwrap();
-        assert!(!tokio::time::timeout(
+        assert!(tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            service.machine_capacity_blocked(&task, &agent, None)
+            service.capacity_wait_for(&task, &agent, None)
         )
         .await
         .unwrap()
-        .unwrap());
+        .unwrap()
+        .is_none());
         drop(writer);
         let after: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM workspace_placement), (SELECT COUNT(*) FROM repo_location), (SELECT SUM(list_revision) FROM project)").fetch_one(db.pool()).await.unwrap();
         assert_eq!(before, after);
@@ -4028,7 +4022,10 @@ pub(crate) mod tests {
         assert_eq!(execution_count(&db, &task.id).await, 0);
 
         // The machine-capacity path, naming the disk.
-        assert!(service.defer_placement_refusal(&task, &error).await.unwrap());
+        assert!(service
+            .defer_placement_refusal(&task, &error)
+            .await
+            .unwrap());
         let waiting = reload().await;
         let disposition = crate::deferred_dispatch::dispatch_disposition(&waiting).unwrap();
         assert_eq!(
@@ -4039,9 +4036,9 @@ pub(crate) mod tests {
             ("machine_capacity", Some("disk"))
         );
         assert!(
-            disposition
-                .safe_message
-                .starts_with("disk_pressure: waiting for free space on the workspace filesystem of Server host"),
+            disposition.safe_message.starts_with(
+                "disk_pressure: waiting for free space on the workspace filesystem of Server host"
+            ),
             "{}",
             disposition.safe_message
         );

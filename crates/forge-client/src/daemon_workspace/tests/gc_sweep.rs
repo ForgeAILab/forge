@@ -58,7 +58,9 @@ async fn a_daemon_whose_state_was_lost_never_sweeps_the_root_the_old_state_owns(
     let first = backend_on(&root, &old_state);
     assert!(first.gc_lock.is_some());
     assert_eq!(
-        gc::disk_report(&root).and_then(|facts| facts.gc_state).as_deref(),
+        gc::disk_report(&root)
+            .and_then(|facts| facts.gc_state)
+            .as_deref(),
         Some("owned"),
         "the daemon reports that its collector runs on this root"
     );
@@ -137,11 +139,7 @@ async fn build_output_is_evicted_under_the_floor_but_never_for_a_busy_handle() {
     // Plenty of room: nothing goes even when idle.
     let report = fixture
         .backend
-        .gc_sweep_at(
-            &[],
-            SystemTime::now(),
-            FreeFloor::of_bytes(0, 0),
-        )
+        .gc_sweep_at(&[], SystemTime::now(), FreeFloor::of_bytes(0, 0))
         .await;
     assert_eq!(report.builds_evicted, 0);
     // Idle and under the floor.

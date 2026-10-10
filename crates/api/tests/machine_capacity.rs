@@ -275,7 +275,14 @@ async fn machine_disk_facts_arrive_with_the_report_and_show_on_every_machine_rea
     use api_types::{DiskFloor, DiskPressureKind, MachineDiskFacts};
     let root = TestDir::new("machine-daemon-disk");
     let (app, state) = settings_app(root.path()).await;
-    let registration: api_types::DaemonRegisterResponse = json_request(&app, Method::POST, "/api/v1/daemons/register", json!({"machine_id":"remote-disk","hostname":"Remote","os":"linux","arch":"x64"}), StatusCode::OK).await;
+    let registration: api_types::DaemonRegisterResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/daemons/register",
+        json!({"machine_id":"remote-disk","hostname":"Remote","os":"linux","arch":"x64"}),
+        StatusCode::OK,
+    )
+    .await;
     let report_url = format!("/api/v1/daemons/{}/report", registration.daemon_id);
     let reading = json!({"free_bytes":40,"total_bytes":1000,"free_inodes":5,"total_inodes":100,"measured_at":"2026-10-10T00:00:00Z","gc_state":"claimed_by_other"});
 
@@ -316,10 +323,20 @@ async fn machine_disk_facts_arrive_with_the_report_and_show_on_every_machine_rea
         StatusCode::OK,
     )
     .await;
-    assert_eq!(reported.workspace_floor, Some(floor), "the floor travels back");
-    let disk = reported.disk.expect("the reply shows the reading it carried");
     assert_eq!(
-        (disk.facts.free_bytes, disk.facts.free_inodes, disk.floor_bytes),
+        reported.workspace_floor,
+        Some(floor),
+        "the floor travels back"
+    );
+    let disk = reported
+        .disk
+        .expect("the reply shows the reading it carried");
+    assert_eq!(
+        (
+            disk.facts.free_bytes,
+            disk.facts.free_inodes,
+            disk.floor_bytes
+        ),
         (40, Some(5), 100)
     );
     assert_eq!(disk.pressure, Some(DiskPressureKind::Bytes));

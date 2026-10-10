@@ -131,9 +131,9 @@ pub(crate) fn capacity_only_wait(refusal: &super::PlacementUnavailable) -> bool 
         && refusal.rejected_candidates.iter().all(|r| {
             super::capacity_codes_only(&r.filter_codes)
                 || (r.filter_codes.contains(&EnvironmentNotReady)
-                    && r.filter_codes.iter().all(|c| {
-                        matches!(c, MachineCapacity | DiskPressure | EnvironmentNotReady)
-                    }))
+                    && r.filter_codes
+                        .iter()
+                        .all(|c| matches!(c, MachineCapacity | DiskPressure | EnvironmentNotReady)))
         })
 }
 

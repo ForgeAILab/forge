@@ -648,9 +648,7 @@ pub(crate) fn remove_tree_until(path: &Path, deadline: Option<Instant>) -> bool 
             stuck.insert(dir);
         }
         removed += 1;
-        if !stack.is_empty()
-            && removed.is_multiple_of(REMOVE_STRIDE)
-            && Instant::now() >= deadline
+        if !stack.is_empty() && removed.is_multiple_of(REMOVE_STRIDE) && Instant::now() >= deadline
         {
             return false;
         }

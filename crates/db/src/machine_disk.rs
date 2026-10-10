@@ -133,7 +133,10 @@ pub async fn record_daemon_disk(
 }
 
 /// A daemon's last reported reading.
-pub async fn daemon_disk(db: &crate::SqliteDb, daemon_id: &str) -> Result<Option<MachineDiskFacts>> {
+pub async fn daemon_disk(
+    db: &crate::SqliteDb,
+    daemon_id: &str,
+) -> Result<Option<MachineDiskFacts>> {
     let json: Option<Option<String>> =
         sqlx::query_scalar("SELECT disk_json FROM daemon WHERE id = ?")
             .bind(daemon_id)
