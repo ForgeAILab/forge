@@ -412,7 +412,9 @@ impl TaskStepWorker {
     /// until that check has an answer, then applies its delivery and the
     /// woken step like any other. A wait with no verdict to come (the
     /// consumer was cancelled, or infrastructure is exhausted and the Task
-    /// is parked) ends the drain.
+    /// is parked) ends the drain. So does a check queued behind a full
+    /// machine, once the Task states that it waits for a slot: only a run
+    /// ending elsewhere frees one, and the check worker admits it then.
     pub async fn drain(&self, task_id: &str) -> Result<db::Task> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
         let checks = self.task_service.check_worker_or_embedded();
@@ -426,17 +428,29 @@ impl TaskStepWorker {
                 })
             {
                 if self.db.awaited_check_is_open(task_id).await? {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(ServiceError::invalid_operation(
-                            "task step drain timed out waiting for a check",
-                        ));
-                    }
                     let mut jobs = JoinSet::new();
                     checks.sweep(&mut jobs).await?;
                     while let Some(job) = jobs.join_next().await {
                         job.map_err(|_| {
                             ServiceError::invalid_operation("check job stopped during drain")
                         })??;
+                    }
+                    // The sweep just tried to admit the run. One still queued
+                    // behind a full machine is answered only when a run ends
+                    // elsewhere: once the Task's step has stated that wait,
+                    // nothing here can advance it.
+                    if self.db.pending_steps(task_id).await? == 0
+                        && self.db.awaited_check_waits_for_slot(task_id).await?
+                    {
+                        return TaskRepo::get_by_id(&*self.db, task_id, false)
+                            .await?
+                            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()));
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ServiceError::invalid_operation(format!(
+                            "task step drain timed out waiting for a check: {}",
+                            self.db.awaited_check_summary(task_id).await?
+                        )));
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;

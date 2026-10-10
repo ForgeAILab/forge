@@ -500,6 +500,31 @@ impl SqliteDb {
             .await?)
     }
 
+    /// Every open check wait of this Task (see [`Self::awaited_check_is_open`])
+    /// is a run queued behind a full machine: no slot was free when the check
+    /// worker last tried to admit it. Only a run or check ending elsewhere
+    /// frees one. `false` when the Task has no open check wait.
+    pub async fn awaited_check_waits_for_slot(&self, task_id: &str) -> Result<bool> {
+        const OPEN: &str = "FROM task_step s JOIN task t ON t.id=s.task_id JOIN check_consumer c ON c.id=s.awaited_consumer_id LEFT JOIN check_run r ON r.id=c.run_id WHERE s.task_id=?1 AND s.status='suspended' AND s.expected_status=t.status AND s.expected_epoch=t.status_epoch AND c.cancelled_at IS NULL AND c.delivery_step_id IS NULL";
+        const SLOT: &str = "r.state='queued' AND r.capacity_wait_since IS NOT NULL";
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 {OPEN}) AND NOT EXISTS(SELECT 1 {OPEN} AND NOT COALESCE({SLOT},0))"
+        ))
+        .bind(task_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
+    /// What the open check waits of this Task wait on, for a report: each
+    /// suspended step's consumer and the state of the run it joined.
+    pub async fn awaited_check_summary(&self, task_id: &str) -> Result<String> {
+        let rows: Vec<String> = sqlx::query_scalar("SELECT json_object('step',s.id,'consumer',c.id,'request_key',c.request_key,'result',c.result_id,'run',c.run_id,'run_state',r.state,'run_lease_until',r.lease_until,'run_updated_at',r.updated_at,'slot_wait_since',r.capacity_wait_since,'machine',r.machine_id) FROM task_step s JOIN check_consumer c ON c.id=s.awaited_consumer_id LEFT JOIN check_run r ON r.id=c.run_id WHERE s.task_id=? AND s.status='suspended' ORDER BY s.seq")
+            .bind(task_id)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows.join(", "))
+    }
+
     /// Check consumers awaited by steps of this Task that will never read
     /// their result: the step was superseded while suspended.
     pub async fn abandoned_check_waits(&self, task_id: &str) -> Result<Vec<(String, String)>> {

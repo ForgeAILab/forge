@@ -24,6 +24,13 @@
 //! them; every seed is printed. Reproduce one case with
 //! `FORGE_MODEL_SEED=<n>` (a comma list runs several). `FORGE_MODEL_LONG=1`
 //! runs longer sequences (`FORGE_MODEL_STEPS` sets the length).
+//! `FORGE_MODEL_NO_SHRINK=1` reports a failure as found, without replaying
+//! shorter sequences (each replay of a stall costs its full patience).
+//!
+//! The server's run cap is pinned (`MODEL_RUN_CAP`, or `FORGE_MODEL_RUN_CAP=<n>`)
+//! instead of derived from the host's cores, so a 4-core CI runner and a
+//! workstation walk the same histories. It is the automatic cap of a small
+//! machine: runs, and review checks, do wait for a slot in these sequences.
 #![allow(dead_code)]
 mod common;
 
@@ -452,6 +459,9 @@ const QUIESCENCE_PATIENCE: Duration = Duration::from_secs(90);
 /// pending; on a loaded 4-core runner (eight tests, four workers each) that
 /// task can wait tens of milliseconds for a thread.
 const QUIESCENCE_FLOOR: Duration = Duration::from_millis(250);
+/// The server's run cap in every model stack: what a 4-core machine resolves
+/// on its own (`config::automatic_run_cap_for_cores`).
+const MODEL_RUN_CAP: u32 = 2;
 const BUSY_RETRIES: usize = 8;
 const SETTLE_ROUNDS: usize = 20;
 const INITIAL: [&str; 2] = ["backlog", "todo"];
@@ -480,6 +490,8 @@ impl World {
         let workspaces = dir.join("workspaces");
         let mut config = config::ForgeConfig::with_data_dir(dir.join("data"));
         config.workspace.root = workspaces.clone();
+        config.server.max_concurrent_runs =
+            Some(env_number("FORGE_MODEL_RUN_CAP").map_or(MODEL_RUN_CAP, |cap| cap as u32));
         let runtime = Arc::new(
             services::ForgeRuntimeBuilder::from_config(
                 Arc::clone(&db),
@@ -1120,7 +1132,25 @@ impl World {
             .await
             .map_err(|error| error.to_string())?;
             if awaiting > 0 {
-                unowned.push(format!("task {index} waits for a check result"));
+                // A check queued behind a full machine is owed nothing until
+                // a slot frees: it waits for a run the model can finish, like
+                // a Task parked on capacity. With no such run, the slot it
+                // waits for is held by nothing the model can end.
+                let slot = self
+                    .live()
+                    .state
+                    .db
+                    .awaited_check_waits_for_slot(id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let held = (0..self.tasks.len()).any(|other| other != index && self.waiting(other));
+                if !slot {
+                    unowned.push(format!("task {index} waits for a check result"));
+                } else if !held {
+                    unowned.push(format!(
+                        "task {index} waits for a check slot that no execution holds"
+                    ));
+                }
             }
             print.push_str(&format!("{index}:{status}@{version}+{pending}~{awaiting}["));
             for (execution, role, status) in self.executions(index).await? {
@@ -1459,6 +1489,15 @@ impl World {
                     wedge("no execution holds the capacity it waits for")
                 }
             }
+            // Review-entry CI queued behind a full machine: the exit is a run
+            // ending, which frees the slot the check worker then gives it.
+            (_, "check") if task["condition"]["primary"]["wait"]["phase"] == "slot" => {
+                if (0..self.tasks.len()).any(|other| other != index && self.waiting(other)) {
+                    Ok(())
+                } else {
+                    wedge("no execution holds the slot its check waits for")
+                }
+            }
             // An accepted action refused admission by an unfinished
             // dependency waits for that Task; `cancel` stays on offer.
             (_, "dispatch_refusal")
@@ -1579,6 +1618,8 @@ impl World {
                         reason,
                         "dependencies" | "children" | "capacity" | "parent" | "agent"
                     )
+                    || (reason == "check"
+                        && task["condition"]["primary"]["wait"]["phase"] == "slot")
                 {
                     continue;
                 }
@@ -1783,7 +1824,11 @@ async fn shrink(sequence: Vec<Step>, failure: Failure, avoid: bool) -> (Vec<Step
         sequence.truncate(step + 1);
     }
     let mut replays = 0;
-    let mut index = sequence.len();
+    let mut index = if std::env::var("FORGE_MODEL_NO_SHRINK").is_ok() {
+        0
+    } else {
+        sequence.len()
+    };
     while index > 0 && replays < 40 {
         index -= 1;
         let mut candidate = sequence.clone();
@@ -2286,6 +2331,38 @@ async fn a_task_sent_back_by_review_under_a_busy_agent_shows_why_it_waits() {
         vec![
             step(Create),
             step(Offer(0, 0)),
+            step(Create),
+            step(Create),
+            step(Finish(2, Outcome::Fail)),
+            step(Finish(2, Outcome::Success)),
+            step(Create),
+            step(Create),
+            step(Create),
+            step(Verdict(3, false)),
+            step(Finish(1, Outcome::Conflict)),
+        ],
+    )])
+    .await;
+}
+
+/// The case above, as CI minimized it when it failed there (next/v0.14
+/// `a3a08e50`, a 4-core runner: run cap 2): "task step drain timed out
+/// waiting for a check". Task 1 passes review, loses the merge race to a
+/// moved target, is rebased and enters `review` a second time. By then the
+/// dispatcher has given the freed run slot to the next Task, so the second
+/// entry's CI run is queued behind a full machine. That is a wait the Task
+/// states (`check`, phase `slot`) and the check worker ends when a run does;
+/// it was the drain helper that kept sweeping for a slot nothing in a drain
+/// can free (`TaskStepWorker::drain`, `services/src/worker_runtime/queue.rs`).
+/// The drain now returns on a stated slot wait, and the settle phase proves
+/// the second entry's CI runs and the Task merges once a run ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_rebased_after_merge_contention_runs_its_review_entry_again() {
+    use Action::{Create, Finish, Verdict};
+    run_cases(vec![(
+        "second review entry after a mechanical rebase".to_owned(),
+        vec![
+            step(Create),
             step(Create),
             step(Create),
             step(Finish(2, Outcome::Fail)),

@@ -715,6 +715,118 @@ async fn restart_while_review_ci_is_suspended_settles_the_same_review_attempt() 
     );
 }
 
+// The machine's only run slot is held by another Task's run when this Task
+// enters review. Its CI run is queued, the Task states that it waits for a
+// slot, and a drain ends there instead of sweeping for a slot nothing in it
+// can free (on a 4-core CI runner, run cap 2, that sweep ran out the drain's
+// clock: next/v0.14 a3a08e50). When the other run ends, the same consumer's
+// run is admitted, runs and settles the same review attempt.
+#[tokio::test]
+async fn review_ci_behind_a_full_machine_waits_for_a_slot_and_runs_when_one_frees() {
+    let fixture = failed_ci_fixture(3, FailurePolicy::Block).await;
+    fixture
+        .db
+        .server_run_cap
+        .set(Some(1), 1, "slot-test-machine");
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,priority,created_at,updated_at) VALUES ('slot-holder',?,'holder','in_progress',0,?,?)")
+        .bind(&fixture.task.project_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES ('slot-holder-run','slot-holder','coder','running',?,?)")
+        .bind(&now)
+        .bind(&now)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+
+    let result = enter_review(&fixture, "CI entry").await;
+    assert_eq!(result.pending_steps, 1);
+    let started = std::time::Instant::now();
+    let waiting = drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(120),
+        "the drain ends on the stated slot wait, not on its clock"
+    );
+    assert_eq!(waiting.status, "review");
+    let (wait, _) = waiting
+        .condition
+        .check_witness()
+        .expect("the Task states its check wait");
+    assert_eq!(wait.phase, api_types::CheckWaitPhase::Slot);
+    assert!(fixture
+        .db
+        .awaited_check_waits_for_slot(&fixture.task.id)
+        .await
+        .unwrap());
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_run WHERE state='queued' AND capacity_wait_since IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_step WHERE status='suspended'"
+        )
+        .await,
+        1
+    );
+    let reviews = db::ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, db::ReviewStatus::Running);
+    // Still full: another drain changes nothing and ends as quickly.
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 1);
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM check_result").await,
+        0
+    );
+
+    // The other run ends: the slot is free.
+    sqlx::query("UPDATE execution SET status='completed' WHERE id='slot-holder-run'")
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    drain(fixture.engine.clone(), &fixture.task.id).await;
+    let settled = db::ReviewRepo::list_by_task(&*fixture.db, &fixture.task.id)
+        .await
+        .unwrap();
+    assert_eq!(settled.len(), 1, "the same review attempt is settled");
+    assert_eq!(settled[0].id, reviews[0].id);
+    assert_eq!(settled[0].status, db::ReviewStatus::Failed);
+    assert_eq!(count(&fixture, "SELECT COUNT(*) FROM check_run").await, 1);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_result WHERE outcome='fail'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM task_step WHERE status='suspended'"
+        )
+        .await,
+        0
+    );
+    assert!(!fixture
+        .db
+        .awaited_check_waits_for_slot(&fixture.task.id)
+        .await
+        .unwrap());
+}
+
 // A second review entry of the same commit in the same worktree asks again
 // and is answered from the stored result: no second run.
 #[tokio::test]
