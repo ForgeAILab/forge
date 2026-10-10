@@ -3540,7 +3540,10 @@ Under the floor a machine starts no new disk-consuming work:
   is still short). The deadline is durable, so a restarted server reads the
   waiters again at once. A freed run slot re-evaluates a disk waiter like
   any machine waiter and leaves the disk wait in place while the disk is
-  short. Cancelling or holding the Task ends the wait like any other park.
+  short. A daemon that disconnects or is removed while Tasks wait for its
+  disk stops counting within five minutes (its reading goes stale) or at
+  once (removal), and the next timer tick moves those Tasks to another
+  machine or to the owner wait.
 - **Checks.** A check run is never held for disk. Every run the check worker
   dispatches (entry CI, review CI, the merge queue's checks) executes in its
   Task's existing worktree on the server or the daemon and makes no checkout,
