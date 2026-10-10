@@ -2138,6 +2138,19 @@ async fn pause_while_the_entry_check_is_pending(
     kind: PauseKind,
     keep_one_slot: bool,
 ) -> Result<Vec<String>, String> {
+    // Pinned: the case starts with two Tasks running side by side.
+    PINNED_RUN_CAP
+        .scope(
+            Some(MODEL_RUN_CAP),
+            pause_with_two_slots_then_one(kind, keep_one_slot),
+        )
+        .await
+}
+
+async fn pause_with_two_slots_then_one(
+    kind: PauseKind,
+    keep_one_slot: bool,
+) -> Result<Vec<String>, String> {
     let mut world = World::new().await;
     let outcome: Result<(), String> = async {
         // Two Tasks run. The machine then has one slot, which the second
@@ -2310,6 +2323,13 @@ enum RestartPoint {
 }
 
 async fn restart_while_the_entry_check_is_awaited(point: RestartPoint) {
+    // Pinned: the case starts with two Tasks running side by side.
+    PINNED_RUN_CAP
+        .scope(Some(MODEL_RUN_CAP), restart_with_two_slots_then_one(point))
+        .await;
+}
+
+async fn restart_with_two_slots_then_one(point: RestartPoint) {
     let mut world = World::new().await;
     let outcome: Result<(), String> = async {
         // As in the pause tests: the first Task's check waits for the one
@@ -2970,6 +2990,13 @@ async fn a_task_rebased_after_merge_contention_runs_its_review_entry_again() {
 /// the check runs, settles, and the Task merges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_second_review_entry_after_a_rebase_requests_runs_and_settles_its_check() {
+    // Pinned: both Tasks run side by side and branch from the same target.
+    PINNED_RUN_CAP
+        .scope(Some(MODEL_RUN_CAP), second_review_entry_after_a_rebase())
+        .await;
+}
+
+async fn second_review_entry_after_a_rebase() {
     let mut world = World::new().await;
     let outcome: Result<(), String> = async {
         for action in [
