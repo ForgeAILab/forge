@@ -6763,3 +6763,175 @@ async fn two_tasks_in_one_queue_on_a_daemon_owned_target_merge_green_then_eject_
         assert!(queue.head_attempt_id.is_none(), "the slot is free");
     }
 }
+
+/// The head's claim, taken by this test instead of a running worker, and the
+/// production owner and facts ports to drive it by hand.
+async fn claimed_head(
+    fixture: &Fixture,
+    head: &QueueHead,
+) -> (
+    IntegrationOwnerFence,
+    services::integration_ports::RoutingIntegrationOwner,
+    services::integration_worker::HeadFacts,
+) {
+    use db::IntegrationQueueRepo;
+    use services::{
+        daemon_transport::workspace_client::DaemonWorkspaceClient,
+        integration_owner::ServerIntegrationOwner,
+        integration_ports::{DaemonFences, RoutingIntegrationOwner, WorkspaceHeadFacts},
+        integration_worker::IntegrationFactsPort,
+    };
+    let state = fixture.harness.state.clone();
+    let database = state.db.clone();
+    let queue = database
+        .integration_queue(&head.queue_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let queue = database
+        .claim_integration_queue(
+            &queue.id,
+            queue.revision,
+            "wire-worker",
+            &db::now_rfc3339(),
+            "2099-01-01T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    let fence = database
+        .integration_owner_fence(&head.attempt_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let client = DaemonWorkspaceClient::new(state.daemon_connections.clone())
+        .with_receipts(database.clone());
+    let owner = RoutingIntegrationOwner::new(
+        Arc::new(ServerIntegrationOwner::new(database.clone())),
+        client.clone(),
+        Arc::new(DaemonFences::new(database.clone(), client.clone())),
+    );
+    let facts = WorkspaceHeadFacts::new(database.clone(), state.workspace_backend_router.clone())
+        .with_daemons(client)
+        .head_facts(&queue_attempt(fixture, head).await, &queue)
+        .await
+        .unwrap();
+    (fence, owner, facts)
+}
+
+/// R5, daemon side: a daemon that holds the default checkout fast-forwards a
+/// candidate from another machine only from the ref this claim generation's
+/// outbound transfer bound. Asked without that transfer, it refuses before
+/// any Git effect, with a receipt, and its checkout does not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_daemon_refuses_to_fast_forward_a_candidate_it_was_not_sent() {
+    use services::{
+        integration_owner::{OwnerEffectRefusal, OwnerMergeReceipt},
+        integration_worker::{IntegrationOwnerPort, OwnerFastForwardRequest},
+    };
+    let fixture = Fixture::file_backed("forge-queue-cross-ff-unsent").await;
+    let (placement, _task_clone, candidate) = server_placed_task(&fixture).await;
+    let head = admit_placed_head(&fixture, &placement, candidate.clone(), &[]).await;
+    let (fence, owner, facts) = claimed_head(&fixture, &head).await;
+    assert_eq!(facts.candidate_head, candidate);
+    assert!(!facts.candidate_in_target, "read on the target's daemon");
+    let before = git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(facts.target_tip, before);
+    let reflog = git_sync(&fixture.checkout, &["reflog", "--all"]);
+
+    let refused = owner
+        .fast_forward(OwnerFastForwardRequest {
+            fence,
+            workspace: facts.workspace.clone(),
+            target_branch: "main".into(),
+            task_branch: facts.task_branch.clone(),
+            candidate_sha: candidate.clone(),
+            target_sha: facts.target_tip.clone(),
+            deadline: Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
+    // The owner's gate refused before the effect started: its receipt says
+    // the fast-forward was not performed.
+    assert!(
+        matches!(
+            refused,
+            OwnerMergeReceipt::NotPerformed {}
+                | OwnerMergeReceipt::Refused {
+                    reason: OwnerEffectRefusal::WitnessMismatch
+                }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        before
+    );
+    assert_eq!(git_sync(&fixture.checkout, &["reflog", "--all"]), reflog);
+    // It was asked as a transferred fast-forward, and answered by receipt.
+    let merges = attempt_requests(fixture.link.as_ref().unwrap(), METHOD_WORKSPACE_MERGE);
+    assert_eq!(merges.len(), 1);
+    assert!(merges[0]["candidate_transfer_key"].is_string());
+    let attempt = queue_attempt(&fixture, &head).await;
+    assert_eq!(
+        receipt_owners(&attempt, db::IntegrationOperationKind::FastForward),
+        vec![(
+            db::IntegrationOperationState::Failed,
+            Some(fixture.daemon_id.clone())
+        )]
+    );
+    assert!(attempt.effect_intent_json.is_none(), "settled, not unknown");
+}
+
+/// R5, server side: the server fast-forwards a daemon-placed Task's
+/// candidate only from the outbound transfer ref of the claim generation.
+/// Without it nothing is merged, and the refusal is a settled receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_server_refuses_to_fast_forward_a_candidate_it_was_not_sent() {
+    use services::{
+        integration_owner::{OwnerEffectRefusal, OwnerMergeReceipt},
+        integration_worker::{IntegrationOwnerPort, OwnerFastForwardRequest},
+    };
+    let fixture = Fixture::file_backed("forge-queue-cross-ff-unsent-server").await;
+    let default_checkout = server_owned_default(&fixture).await;
+    let head = admit_queue_head(&fixture, &[]).await;
+    let (fence, owner, facts) = claimed_head(&fixture, &head).await;
+    let before = git_sync(&default_checkout, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(facts.target_tip, before);
+
+    let refused = owner
+        .fast_forward(OwnerFastForwardRequest {
+            fence,
+            workspace: facts.workspace.clone(),
+            target_branch: "main".into(),
+            task_branch: facts.task_branch.clone(),
+            candidate_sha: head.candidate.clone(),
+            target_sha: facts.target_tip.clone(),
+            deadline: Duration::from_secs(30),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            refused,
+            OwnerMergeReceipt::Refused {
+                reason: OwnerEffectRefusal::WitnessMismatch
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        git_sync(&default_checkout, &["rev-parse", "refs/heads/main"]),
+        before
+    );
+    assert!(git_sync(&default_checkout, &["status", "--porcelain"]).is_empty());
+    // The Task's daemon was not asked to merge anything.
+    assert!(
+        attempt_requests(fixture.link.as_ref().unwrap(), METHOD_WORKSPACE_MERGE).is_empty()
+    );
+    let attempt = queue_attempt(&fixture, &head).await;
+    assert_eq!(
+        receipt_owners(&attempt, db::IntegrationOperationKind::FastForward),
+        vec![(db::IntegrationOperationState::Failed, None)]
+    );
+    assert!(attempt.effect_intent_json.is_none(), "settled, not unknown");
+}

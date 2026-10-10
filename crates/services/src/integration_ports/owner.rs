@@ -64,8 +64,9 @@ pub(crate) fn daemon_owner(owner: &serde_json::Value) -> Option<(String, String)
 /// frame of an older generation is refused there, and an owner that later
 /// says it has no intent for this generation proves the effect never ran.
 /// `live_queue_ids` lets the owner drop fences of queues that left it; the
-/// list always covers every queue that still targets the daemon and every
-/// queue with an outstanding intent on it.
+/// list always covers every queue that still targets the daemon, every queue
+/// whose head's Task is placed on it, and every queue with an outstanding
+/// intent on it.
 pub struct DaemonFences {
     db: Arc<SqliteDb>,
     client: DaemonWorkspaceClient,
@@ -94,6 +95,18 @@ impl DaemonFences {
         .fetch_all(self.db.pool())
         .await
         .map_err(db::DbError::from)?;
+        // Queues whose head's Task is placed on this daemon: it performs
+        // their rebase although their default checkout is elsewhere, and a
+        // claim it was told of must not be dropped by another queue's
+        // announcement before that rebase is asked for.
+        let heads: Vec<String> = sqlx::query_scalar(
+            "SELECT q.id FROM integration_queue q JOIN integration_attempt a ON a.id=q.head_attempt_id WHERE q.state!='closed' AND a.daemon_id=?",
+        )
+        .bind(daemon_id)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+        live.extend(heads);
         live.extend(
             self.db
                 .outstanding_integration_effects("daemon", Some(daemon_id))
