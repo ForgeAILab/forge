@@ -121,6 +121,7 @@ mod provider_authorization;
 mod repo;
 mod repo_location;
 mod review;
+pub use review::AttemptCarryBase;
 mod runtime;
 mod schedule;
 mod shared_media;

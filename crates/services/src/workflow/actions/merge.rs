@@ -631,7 +631,7 @@ const MAX_CONFLICT_HANDOFFS: i64 = db::budget::Kind::ConflictHandoff.default_lim
 /// with its markers. Send the Task to `merge_failed` so its Worker reconciles
 /// the marked files — editing files is all that takes, and the Worker cannot
 /// run the rebase itself — after which the repair gets a fresh review.
-async fn conflict_handoff_result(
+pub(crate) async fn conflict_handoff_result(
     ctx: &HookContext,
     task: &db::Task,
     target_branch: &str,
@@ -704,7 +704,7 @@ async fn conflict_handoff_result(
     }
 }
 
-pub(super) async fn merge_failure_result(
+pub(crate) async fn merge_failure_result(
     ctx: &HookContext,
     task: &db::Task,
     reason: String,
@@ -826,6 +826,32 @@ pub(super) async fn merge_failure_result(
             bridge: Default::default(),
         }
     }
+}
+
+/// Shared with the integration queue's `send_back` step (plan 3.2 stage D1b):
+/// the failure annotation and `merge.failed` event `run_merge` records before
+/// it hands a failed integration on, with the optional system comment first.
+pub(crate) async fn record_integration_failure(
+    ctx: &HookContext,
+    task: &db::Task,
+    kind: api_types::FailureKind,
+    details: &str,
+    comment: Option<String>,
+) -> db::Result<db::Task> {
+    if let Some(comment) = comment {
+        create_system_comment(ctx, comment).await?;
+    }
+    let task = persist_merge_error(ctx, task, kind, details).await?;
+    ctx.event_bus.publish(ForgeEvent {
+        event_type: "merge.failed".to_string(),
+        entity_id: ctx.task_id.clone(),
+        timestamp: event_timestamp(),
+        context: EventContext::MergeFailed {
+            task_id: ctx.task_id.clone(),
+            reason: details.to_owned(),
+        },
+    });
+    Ok(task)
 }
 
 /// A `run_merge` failure. A transient one (the step queue's own retry

@@ -567,6 +567,239 @@ fn redaction_leaves_short_edge_matches_alone_and_masks_cut_secrets() {
     );
 }
 
+async fn git(path: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success(), "fixture Git command failed");
+}
+async fn candidate() -> (tempfile::TempDir, String) {
+    let temp = tempfile::tempdir().unwrap();
+    git(temp.path(), &["init", "-q"]).await;
+    git(temp.path(), &["config", "user.name", "Check test"]).await;
+    git(
+        temp.path(),
+        &["config", "user.email", "check@example.invalid"],
+    )
+    .await;
+    std::fs::write(temp.path().join("tracked"), "one\n").unwrap();
+    std::fs::write(temp.path().join(".gitignore"), "ignored\n").unwrap();
+    git(temp.path(), &["add", "."]).await;
+    git(temp.path(), &["commit", "-q", "-m", "candidate"]).await;
+    let head = git::get_current_sha(temp.path()).await.unwrap();
+    (temp, head)
+}
+fn canonical_spec(steps: &[&str]) -> CheckSpec {
+    let mut spec = legacy_ci_bundle(
+        &steps.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+        &BTreeMap::new(),
+        0,
+        false,
+    );
+    spec.execution_policy = CANONICAL_CI_POLICY.into();
+    for command in &mut spec.commands {
+        command.cacheability = CheckCacheability::DeclaredControlledInputs;
+    }
+    spec
+}
+async fn canonical_run(
+    path: &Path,
+    spec: &CheckSpec,
+    env: &BTreeMap<String, String>,
+    seconds: u64,
+) -> CheckReceipt {
+    let inputs = ServerCheckExecutionInputs {
+        toolchain_revision: "t".into(),
+        environment_revision: "e".into(),
+        asset_revisions: BTreeMap::new(),
+        secret_revisions: BTreeMap::new(),
+        shell_revision: "s".into(),
+        runner_revision: "r".into(),
+    };
+    execute(CheckExecution {
+        operation_id: "canonical",
+        spec,
+        target: CheckoutTarget::Workspace(path),
+        owner: owner(),
+        input_revisions: Some(&inputs),
+        environment: env,
+        deadline: Some(Instant::now() + Duration::from_secs(seconds)),
+        cancel: &CancellationToken::new(),
+        permit: &CheckPermit::already_admitted(),
+        cleanup: CleanupPlan {
+            commands: &[],
+            timeout: Duration::from_millis(250),
+        },
+        output_limit: 4096,
+    })
+    .await
+}
+#[tokio::test]
+async fn a_canonical_run_on_a_clean_checkout_returns_the_full_witness_and_attestation() {
+    let (temp, head) = candidate().await;
+    // An ignored build product is not a change to the checkout.
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec(&["echo built > ignored"]),
+        &BTreeMap::new(),
+        30,
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(receipt.prepared_head.as_deref(), Some(head.as_str()));
+    assert_eq!(receipt.finished_head, receipt.prepared_head);
+    assert_eq!(receipt.tracked_changes, Some(false));
+    assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
+    assert!(matches!(
+        receipt.execution_inputs,
+        CheckEnvironmentIdentity::Attested { .. }
+    ));
+}
+/// Decision A: a canonical step inherits the owner's environment, exactly as
+/// a frozen-policy step does. Nothing is cleared.
+#[tokio::test]
+async fn a_canonical_step_inherits_the_owner_environment_and_the_project_values() {
+    let (temp, _) = candidate().await;
+    // Set by the test harness for this process and declared by nobody.
+    let ambient = ["CARGO_MANIFEST_DIR", "CARGO_PKG_NAME"]
+        .into_iter()
+        .find(|key| std::env::var_os(key).is_some())
+        .expect("cargo sets its package variables for a test process");
+    let env = BTreeMap::from([("DECLARED".to_owned(), "project-value".to_owned())]);
+    let script = format!(
+        "test -n \"${{{ambient}+x}}\" && test \"$DECLARED\" = project-value && command -v git >/dev/null"
+    );
+    let receipt = canonical_run(temp.path(), &canonical_spec(&[&script]), &env, 30).await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    // The same variable is in what the owner attests, by name and value...
+    let inherited = inherited_environment().await.expect("login shell answers");
+    assert!(inherited.values.get(ambient) == std::env::var(ambient).ok().as_ref());
+    assert!(inherited.identity_values().contains_key(ambient));
+    assert!(!inherited.shell_revision.is_empty());
+    // ...and the per-process shell bookkeeping is not.
+    assert!(inherited.values.contains_key("PWD") && inherited.values.contains_key("SHLVL"));
+    for key in ENVIRONMENT_IDENTITY_DENYLIST {
+        assert!(!inherited.identity_values().contains_key(key));
+    }
+    // A Project value the request did not declare still reaches the step: the
+    // run uses the environment in force, and its owner decides reusability.
+    let mut spec = canonical_spec(&["test \"$LATER\" = added"]);
+    spec.commands[0].environment_keys = ["GONE".to_owned()].into();
+    let env = BTreeMap::from([("LATER".to_owned(), "added".to_owned())]);
+    let receipt = canonical_run(temp.path(), &spec, &env, 30).await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+}
+/// The Forge host's profile is known to replace the login shell's exit code
+/// from its logout script, and a profile may print. Neither fails the probe;
+/// a profile that never lets the shell answer does, without hanging.
+#[tokio::test]
+async fn the_environment_probe_survives_a_noisy_profile_and_a_clobbered_exit_code() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join(".bash_profile"),
+        "echo profile noise\nexport FORGE_PROBE_FROM_PROFILE='two words'\n",
+    )
+    .unwrap();
+    std::fs::write(home.path().join(".bash_logout"), "echo bye\nexit 7\n").unwrap();
+    let inherited = probe_environment(Some(home.path()))
+        .await
+        .expect("a clobbered exit code is not a failed probe");
+    assert_eq!(
+        inherited
+            .values
+            .get("FORGE_PROBE_FROM_PROFILE")
+            .map(String::as_str),
+        Some("two words")
+    );
+    // A profile that ends the shell before it answers: nothing is attested.
+    std::fs::write(home.path().join(".bash_profile"), "exit 0\n").unwrap();
+    assert!(probe_environment(Some(home.path())).await.is_none());
+}
+#[tokio::test]
+async fn a_canonical_witness_reports_a_dirty_start_a_tracked_change_and_a_moved_head() {
+    // Untracked work the commit does not contain: not a clean checkout.
+    let (temp, _) = candidate().await;
+    std::fs::write(temp.path().join("uncommitted"), "x").unwrap();
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec(&["true"]),
+        &BTreeMap::new(),
+        30,
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(receipt.tracked_changes, Some(true));
+    // A step that rewrites a tracked file still passes; the witness says so.
+    let (temp, _) = candidate().await;
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec(&["echo two >> tracked"]),
+        &BTreeMap::new(),
+        30,
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(receipt.tracked_changes, Some(true));
+    // A step that commits moves HEAD.
+    let (temp, head) = candidate().await;
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec(&["git commit -q --allow-empty -m moved"]),
+        &BTreeMap::new(),
+        30,
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(receipt.prepared_head.as_deref(), Some(head.as_str()));
+    assert_ne!(receipt.finished_head, receipt.prepared_head);
+}
+/// Decision B: a service one step starts is there for the next step, and the
+/// whole run's process tree is stopped, and verified stopped, when the run
+/// ends.
+#[tokio::test]
+async fn a_canonical_service_survives_to_the_next_step_and_is_stopped_at_run_end() {
+    let (temp, _) = candidate().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let pid = scratch.path().join("service.pid");
+    let start = format!("sleep 300 >/dev/null 2>&1 & echo $! > '{}'", pid.display());
+    // Step 2 runs well after step 1's shell exited and needs the service.
+    let uses = format!("sleep 1; kill -0 \"$(cat '{}')\"", pid.display());
+    let receipt = canonical_run(
+        temp.path(),
+        &canonical_spec(&[&start, &uses]),
+        &BTreeMap::new(),
+        30,
+    )
+    .await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    assert_eq!(receipt.commands.len(), 2);
+    assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
+    let service = std::fs::read_to_string(&pid).unwrap();
+    assert!(!alive(service.trim()), "the run ended: its tree is stopped");
+    assert_eq!(receipt.tracked_changes, Some(false));
+
+    // The same at a failed and at a timed-out end.
+    for (last, seconds, outcome) in [
+        ("false", 30, CheckExecutionOutcome::Failed),
+        ("sleep 30", 2, CheckExecutionOutcome::TimedOut),
+    ] {
+        let _ = std::fs::remove_file(&pid);
+        let receipt = canonical_run(
+            temp.path(),
+            &canonical_spec(&[&start, last]),
+            &BTreeMap::new(),
+            seconds,
+        )
+        .await;
+        assert_eq!(receipt.outcome, outcome);
+        assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
+        let service = std::fs::read_to_string(&pid).unwrap();
+        assert!(!alive(service.trim()));
+    }
+}
 #[tokio::test]
 async fn check_in_a_task_worktree_gets_a_task_root_tmpdir_removed_after_pass_fail_and_cancel() {
     let temp = tempfile::tempdir().unwrap();

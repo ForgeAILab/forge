@@ -647,6 +647,7 @@ dependencies = [
  "executors",
  "git",
  "process-supervisor",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

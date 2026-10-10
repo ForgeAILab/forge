@@ -1407,6 +1407,10 @@ pub struct MoveTaskIdentity {
 #[derive(Debug, Clone)]
 pub struct CompareAndMoveTask {
     pub post_commit_step: Option<crate::EnqueueTaskStep>,
+    /// The move enters the workflow's cancellation state: ask the integration
+    /// queue to release the Task's attempt in the move's own transaction, as
+    /// the cancel transition does (`request_task_integration_cancel_in_tx`).
+    pub integration_cancel: bool,
     pub operation_id: String,
     pub project_id: String,
     pub task_id: String,

@@ -1,6 +1,6 @@
 pub(crate) mod carry;
 mod common;
-pub(crate) use common::review_ci_steps;
+pub(crate) use common::{review_ci_steps, system_comment, with_comment_key};
 mod dispatch;
 mod gates;
 mod lifecycle;
@@ -20,6 +20,7 @@ pub use lifecycle::{
 };
 #[cfg(test)]
 pub(crate) use merge::test_faults as merge_test_faults;
+pub(crate) use merge::{conflict_handoff_result, merge_failure_result, record_integration_failure};
 pub use merge::{
     AutoCascadeOnMergeResult, CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge,
 };

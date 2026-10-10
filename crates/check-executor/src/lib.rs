@@ -16,23 +16,171 @@ pub const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// with the same few bytes as some environment value.
 const SECRET_FRAGMENT_BYTES: usize = 4;
 const WITNESS_TIMEOUT: Duration = Duration::from_secs(2);
+/// `git status` walks the worktree; a large one needs longer than a HEAD read.
+const CLEAN_WITNESS_TIMEOUT: Duration = Duration::from_secs(20);
 const LEGACY_SERVER: &str = "legacy-server/1";
 const LEGACY_DAEMON: &str = "legacy-daemon/1";
 fn legacy(policy: &str) -> bool {
     matches!(policy, LEGACY_SERVER | LEGACY_DAEMON)
 }
+fn canonical(policy: &str) -> bool {
+    policy == CANONICAL_CI_POLICY
+}
+
+/// The environment a canonical step inherits on this owner, as a login shell
+/// resolves it right now: the owner process's environment after the login
+/// profile ran. Read by a probe built like a step (same shell, same inherited
+/// environment, same removed Git variables), without the Project values and
+/// without the build budget Forge adds per run.
+pub struct InheritedEnvironment {
+    pub values: BTreeMap<String, String>,
+    pub shell_revision: String,
+}
+/// Variables left out of the environment identity: a login shell or the
+/// session that started the owner sets them per process, and no build reads
+/// its inputs from them. Everything else a step inherits is in the identity,
+/// by name and value.
+///
+/// - `PWD`, `OLDPWD`: the shell's own directory bookkeeping; the step runs in
+///   the checkout, the probe does not.
+/// - `SHLVL`, `_`: set by every shell for itself.
+/// - `COLUMNS`, `LINES`: the size of whatever terminal started the owner.
+/// - `TERM_SESSION_ID`, `ITERM_SESSION_ID`, `SECURITYSESSIONID`,
+///   `XDG_SESSION_ID`, `WINDOWID`, `TMUX`, `TMUX_PANE`, `STY`: the id of the
+///   terminal, multiplexer or login session the owner was started from.
+/// - `SSH_CLIENT`, `SSH_CONNECTION`, `SSH_TTY`: the address and port of the
+///   SSH connection the owner was started over.
+/// - `INVOCATION_ID`, `JOURNAL_STREAM`, `SYSTEMD_EXEC_PID`: per-start ids a
+///   service manager gives the owner.
+///
+/// Not listed because the probe never has them: the build-budget variables
+/// Forge adds per run when neither the operator nor the Project sets them
+/// (`executors::run_process::BUILD_ENV_KEYS`; they only set parallelism), and
+/// the Project values (in the identity through the request).
+pub const ENVIRONMENT_IDENTITY_DENYLIST: [&str; 20] = [
+    "COLUMNS",
+    "INVOCATION_ID",
+    "ITERM_SESSION_ID",
+    "JOURNAL_STREAM",
+    "LINES",
+    "OLDPWD",
+    "PWD",
+    "SECURITYSESSIONID",
+    "SHLVL",
+    "SSH_CLIENT",
+    "SSH_CONNECTION",
+    "SSH_TTY",
+    "STY",
+    "SYSTEMD_EXEC_PID",
+    "TERM_SESSION_ID",
+    "TMUX",
+    "TMUX_PANE",
+    "WINDOWID",
+    "XDG_SESSION_ID",
+    "_",
+];
+impl InheritedEnvironment {
+    /// What the environment identity is computed over.
+    pub fn identity_values(&self) -> BTreeMap<&str, &str> {
+        self.values
+            .iter()
+            .filter(|(key, _)| !ENVIRONMENT_IDENTITY_DENYLIST.contains(&key.as_str()))
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
+    }
+}
+const PROBE_START: &str = "forge-inherited-environment-start";
+const PROBE_END: &str = "forge-inherited-environment-end";
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const PROBE_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Read the inherited environment. One login shell per call, at most
+/// [`PROBE_TIMEOUT`]; its process group is stopped when the bound passes.
+///
+/// `None` when the shell did not answer completely (a profile that hangs,
+/// exits early or prints more than the bound). The caller then attests
+/// nothing and the run is not reusable; steps run as they always did. The
+/// shell's exit status is deliberately not read: a logout script may replace
+/// it. Values are never logged.
+pub async fn inherited_environment() -> Option<InheritedEnvironment> {
+    probe_environment(None).await
+}
+/// `home` replaces the inherited `HOME`, so a test can supply a profile.
+async fn probe_environment(home: Option<&Path>) -> Option<InheritedEnvironment> {
+    // `compgen -e`: the exported names. Works on bash 3.2.
+    let script = format!(
+        "printf '%s\\0' {PROBE_START} \"$BASH_VERSION\"; for k in $(compgen -e); do printf '%s=%s\\0' \"$k\" \"${{!k}}\"; done; printf '%s\\0' {PROBE_END}"
+    );
+    let mut probe = Command::new("bash");
+    probe
+        .arg("-lc")
+        .arg(script)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    if let Some(home) = home {
+        probe.env("HOME", home);
+    }
+    let output = process_supervisor::run(
+        &mut probe,
+        process_supervisor::Capture::Prefix(PROBE_OUTPUT_BYTES),
+        Some(Instant::now() + PROBE_TIMEOUT),
+        &CancellationToken::new(),
+        process_supervisor::CompletionPolicy::StopDescendants,
+    )
+    .await
+    .ok()?;
+    if output.termination != process_supervisor::Termination::Exited || output.stdout_truncated {
+        return None;
+    }
+    // A profile may print before the probe does, and a logout script after.
+    let mut fields = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .skip_while(|field| !field.ends_with(PROBE_START.as_bytes()));
+    fields.next()?;
+    let shell_revision = String::from_utf8(fields.next()?.to_vec()).ok()?;
+    let mut values = BTreeMap::new();
+    let mut complete = false;
+    for field in fields {
+        if field == PROBE_END.as_bytes() {
+            complete = true;
+            break;
+        }
+        let field = String::from_utf8(field.to_vec()).ok()?;
+        let (key, value) = field.split_once('=')?;
+        values.insert(key.to_owned(), value.to_owned());
+    }
+    (complete && !shell_revision.is_empty()).then_some(InheritedEnvironment {
+        values,
+        shell_revision,
+    })
+}
+
 /// What happens to a command's descendants once it exits normally.
 ///
 /// Neither the server nor the daemon ever stopped a CI step's descendants: a
 /// step may start a service that a later step uses. Both frozen policies keep
 /// that, with the post-exit drain bounded (as the daemon's always was) so a
-/// service that kept the output pipe cannot stall the step. Every canonical
-/// policy stops the step's process group.
+/// service that kept the output pipe cannot stall the step. The canonical CI
+/// policy keeps it too, and stops every step's process group when the run
+/// ends (see `execute`). Any other policy stops a step's group when it exits.
 fn completion(policy: &str) -> process_supervisor::CompletionPolicy {
-    if legacy(policy) {
+    if legacy(policy) || canonical(policy) {
         process_supervisor::CompletionPolicy::DrainFor(process_supervisor::POST_EXIT_DRAIN)
     } else {
         process_supervisor::CompletionPolicy::StopDescendants
+    }
+}
+
+/// The process groups of a canonical run's finished steps. A run that is
+/// dropped before its end (its owner was interrupted) still stops them, off
+/// the runtime and unverified: no receipt is produced on that path.
+struct RunTree(Vec<u32>);
+impl Drop for RunTree {
+    fn drop(&mut self) {
+        for group in std::mem::take(&mut self.0) {
+            std::thread::spawn(move || process_supervisor::stop_group(group));
+        }
     }
 }
 
@@ -139,9 +287,15 @@ fn redacted(
     let shortened = text.len() > limit;
     (tail(&text, limit), truncated || shortened)
 }
-/// Build a command using only the spec's declared keys. The two frozen legacy
-/// policies retain ambient shell environment for equivalent caller migration.
-/// All newly defined policies clear it. Both use the owner's current budget.
+/// Build a command. The two frozen legacy policies and the canonical CI
+/// policy inherit the owner's environment through a login shell, with the
+/// Project values on top; every other policy clears it and sees only the
+/// spec's declared keys. All use the owner's current budget.
+///
+/// Legacy policies pass the declared keys and refuse when one is missing. The
+/// canonical policy passes the Project environment in force now, whole: a
+/// value that changed since the request makes the run a verdict that is not
+/// reusable (its owner attests nothing), never a refusal.
 pub fn command(
     path: &Path,
     spec: &CheckCommandSpec,
@@ -172,20 +326,24 @@ fn sandboxed_command(
     if spec.shell != "bash -lc" {
         return Err("unsupported check shell".into());
     }
-    let env: BTreeMap<_, _> = environment
-        .iter()
-        .filter(|(key, _)| spec.environment_keys.contains(*key))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let env: BTreeMap<_, _> = if canonical(policy) {
+        environment.clone()
+    } else {
+        environment
+            .iter()
+            .filter(|(key, _)| spec.environment_keys.contains(*key))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
     if spec
         .environment_keys
         .iter()
-        .any(|key| !env.contains_key(key))
+        .any(|key| !env.contains_key(key) && !canonical(policy))
     {
         return Err("missing declared check environment key".into());
     }
     let mut command = Command::new("bash");
-    if !legacy(policy) {
+    if !legacy(policy) && !canonical(policy) {
         command.env_clear().arg("--noprofile");
     }
     command
@@ -216,6 +374,20 @@ pub async fn run_command(
     cancel: &CancellationToken,
     limit: usize,
 ) -> Result<CheckCommandReceipt, String> {
+    run_command_group(path, spec, environment, policy, deadline, cancel, limit)
+        .await
+        .map(|(receipt, _)| receipt)
+}
+/// Also returns the command's process group, when one was started.
+async fn run_command_group(
+    path: &Path,
+    spec: &CheckCommandSpec,
+    environment: &BTreeMap<String, String>,
+    policy: &str,
+    deadline: Option<Instant>,
+    cancel: &CancellationToken,
+    limit: usize,
+) -> Result<(CheckCommandReceipt, Option<u32>), String> {
     let started_at = now();
     let start = Instant::now();
     // Removed when this command returns: pass, fail, timeout or cancel.
@@ -230,7 +402,7 @@ pub async fn run_command(
         (a, b) => a.or(b),
     };
     if cancel.is_cancelled() || deadline.is_some_and(|d| d <= start) {
-        return Ok(CheckCommandReceipt {
+        let receipt = CheckCommandReceipt {
             id: spec.id.clone(),
             command: spec.shell_text.clone(),
             exit_code: None,
@@ -249,7 +421,8 @@ pub async fn run_command(
             process_tree_stopped: true,
             started_at,
             finished_at: now(),
-        });
+        };
+        return Ok((receipt, None));
     }
     let output = process_supervisor::run(
         &mut command,
@@ -282,7 +455,8 @@ pub async fn run_command(
         &env,
         limit,
     );
-    Ok(CheckCommandReceipt {
+    let group = output.group;
+    let receipt = CheckCommandReceipt {
         id: spec.id.clone(),
         command: spec.shell_text.clone(),
         // A command stopped by its limit or by cancellation has no verdict of
@@ -302,7 +476,8 @@ pub async fn run_command(
         process_tree_stopped: output.descendants_stopped,
         started_at,
         finished_at: now(),
-    })
+    };
+    Ok((receipt, group))
 }
 
 /// The receipt of a run that never reached its checkout: nothing was spawned
@@ -447,6 +622,17 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
         receipt.outcome = CheckExecutionOutcome::Infrastructure;
         receipt.infrastructure_message = Some(error);
     }
+    // The canonical policy runs in the Task worktree, which is only a clean
+    // checkout of the commit when nothing is modified, staged or untracked
+    // there before the first command. `None`: the witness could not be taken.
+    // Ignored files (build output, installed dependencies) are not looked at:
+    // they are the worktree's own, which is why a canonical identity names
+    // its worktree.
+    let mut clean_before = None;
+    let is_canonical = canonical(&input.spec.execution_policy);
+    // Every canonical step's process group: a step may leave a service for
+    // the next one, and the whole run's tree is stopped when the run ends.
+    let mut groups = RunTree(Vec::new());
     if receipt.outcome == CheckExecutionOutcome::Passed {
         if let Some(path) = path.as_ref() {
             if witnessed {
@@ -456,9 +642,20 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
                         .ok()
                         .and_then(Result::ok);
             }
+            if canonical(&input.spec.execution_policy) {
+                clean_before = tokio::time::timeout(
+                    CLEAN_WITNESS_TIMEOUT,
+                    git::command_output(path, &["status", "--porcelain"]),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .filter(|output| output.status.success())
+                .map(|output| output.stdout.is_empty());
+            }
             let mut sequence = CheckSequence::new(input.spec.clone());
             while let Some((_, spec)) = sequence.next_command() {
-                match run_command(
+                match run_command_group(
                     path,
                     spec,
                     input.environment,
@@ -469,7 +666,10 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
                 )
                 .await
                 {
-                    Ok(command) => {
+                    Ok((command, group)) => {
+                        if is_canonical {
+                            groups.0.extend(group);
+                        }
                         let outcome = command.outcome;
                         receipt.commands.push(command);
                         if outcome != CheckExecutionOutcome::Passed {
@@ -486,6 +686,27 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
             }
         }
     }
+    if is_canonical {
+        // Run end, whatever the outcome: stop what the steps left running,
+        // before the last witness so nothing writes to the checkout after it.
+        // `process_tree_stopped` then says what was verified, for every step:
+        // no member of any step's process group is left.
+        let groups = std::mem::take(&mut groups.0);
+        let stopped = tokio::task::spawn_blocking(move || {
+            groups
+                .into_iter()
+                .map(process_supervisor::stop_group)
+                // Every group is stopped, also after one could not be.
+                .collect::<Vec<_>>()
+                .into_iter()
+                .all(|stopped| stopped)
+        })
+        .await
+        .unwrap_or(false);
+        for command in &mut receipt.commands {
+            command.process_tree_stopped = stopped;
+        }
+    }
     if let Some(path) = path.as_ref().filter(|_| witnessed) {
         let evidence = tokio::time::timeout(WITNESS_TIMEOUT, async {
             (
@@ -500,6 +721,17 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
         if let Ok((head, tracked)) = evidence {
             receipt.finished_head = head;
             receipt.tracked_changes = tracked;
+        }
+        if canonical(&input.spec.execution_policy) {
+            // One witness for the consumer: the commands ran on a clean
+            // checkout and left no tracked change. A checkout that was not
+            // clean before is reported as changed, and an unknown start as
+            // unknown, so neither can certify a reusable result.
+            receipt.tracked_changes = match (clean_before, receipt.tracked_changes) {
+                (Some(true), after) => after,
+                (Some(false), _) => Some(true),
+                (None, _) => None,
+            };
         }
     }
     if let Some(path) = path.as_ref() {

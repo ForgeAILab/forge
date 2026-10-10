@@ -573,6 +573,99 @@ impl SqliteDb {
     }
 }
 
+/// What a carry recorded for an integration attempt builds on.
+#[derive(Debug, Clone)]
+pub struct AttemptCarryBase {
+    pub contract: api_types::ReviewContract,
+    /// The commit and target tip the authority covers now (the contract's
+    /// own, or the newest carry's).
+    pub candidate: crate::ReviewCandidate,
+    pub carries_since_review: i64,
+}
+
+impl SqliteDb {
+    /// The passed review an attempt in `merging` may carry forward, read in
+    /// the settle step's transaction. `Ok(None)`: the Task needs no reviewed
+    /// object (no agent reviewer, or the owner passed it by hand).
+    /// `DbError::Check` names why a fresh review is required.
+    pub async fn attempt_carry_base_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        task_id: &str,
+    ) -> Result<Option<AttemptCarryBase>> {
+        let (contract, candidate) =
+            crate::review_integration_authority_in_tx(&mut *tx, task_id).await?;
+        let (Some(contract), Some(candidate)) = (contract, candidate) else {
+            return Ok(None);
+        };
+        let carries_since_review: i64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT spent FROM task_budget WHERE task_id = ? AND kind='review_carry'),0)",
+        )
+        .bind(task_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(Some(AttemptCarryBase {
+            contract,
+            candidate,
+            carries_since_review,
+        }))
+    }
+
+    /// The integration queue's carry: the candidate an attempt rebased (or
+    /// its Worker repaired) is recorded against the passed contract, and the
+    /// `review_carry` allowance is charged, in the settle step's transaction
+    /// with the permit. No Review row is opened or settled: the Task never
+    /// left `merging`. Idempotent per attempt and commit.
+    pub async fn settle_attempt_review_carry_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        attempt_id: &str,
+        carry: &crate::NewReviewAuthorityCarry,
+        occurred_at: &str,
+    ) -> Result<()> {
+        let recorded: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM review_authority_carry WHERE task_id=? AND contract_execution_id=? AND commit_sha=? AND base_sha=?)")
+            .bind(&carry.task_id)
+            .bind(&carry.contract_execution_id)
+            .bind(&carry.commit_sha)
+            .bind(&carry.base_sha)
+            .fetch_one(&mut **tx)
+            .await?;
+        if recorded {
+            return Ok(());
+        }
+        crate::budget::apply(
+            tx,
+            &carry.task_id,
+            crate::budget::Mutation::Charge {
+                key: crate::budget::Kind::ReviewCarry.key().into(),
+                limit: i64::from(crate::budget::Kind::ReviewCarry.default_limit()),
+                step: format!("carry:attempt:{attempt_id}:{}", carry.commit_sha),
+            },
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO review_authority_carry
+                (id, task_id, contract_execution_id, commit_sha, base_sha, kind,
+                 changed_paths_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(new_uuid_v4())
+        .bind(&carry.task_id)
+        .bind(&carry.contract_execution_id)
+        .bind(&carry.commit_sha)
+        .bind(&carry.base_sha)
+        .bind(carry.kind.to_string())
+        .bind(
+            serde_json::to_string(&carry.changed_paths)
+                .map_err(|error| DbError::Check(error.to_string()))?,
+        )
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl ReviewRepo for SqliteDb {
     async fn create(&self, input: CreateReview) -> Result<Review> {

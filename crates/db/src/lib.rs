@@ -62,8 +62,8 @@ pub use pagination::*;
 pub use repository::*;
 pub use review_conformance::*;
 pub use sqlite::{
-    supported_main_baseline_revision, DeadLetter, DeadLetterAction, DeadLetterPage,
-    EventSubscription, ScheduleRead, SqliteDb, TaskListRead, WorkerDeadLetterIssue,
+    supported_main_baseline_revision, AttemptCarryBase, DeadLetter, DeadLetterAction,
+    DeadLetterPage, EventSubscription, ScheduleRead, SqliteDb, TaskListRead, WorkerDeadLetterIssue,
     WorkerDiagnostic,
 };
 pub use sqlx::{Sqlite, SqlitePool};

@@ -39,6 +39,7 @@ pub mod external_sync;
 pub mod integration_effects;
 pub mod integration_owner;
 pub mod integration_service;
+pub mod integration_steps;
 pub mod integration_worker;
 pub mod lifecycle;
 pub mod main_chat_topic;

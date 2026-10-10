@@ -5780,6 +5780,101 @@ Known limits: the first rebase of a head is always counted as a
 integrated, so a push from outside before the claim cannot be told apart);
 an `applied` head waits for its `result` step without a timer.
 
+### Integration Task steps (3.2 stage D, part 1b; not produced until D2)
+
+`services::integration_steps` is the Task-step side of the integration queue.
+Nothing enqueues one of its steps yet: `merging` still runs today's merge
+hooks, and the queue worker that would ask is not started until D2. The only
+live additions are a registered check consumer family that nobody requests
+from, and one write in the cancel transition (below).
+
+The worker never writes Task state. Each request is one Task step of kind
+`integration` with the payload `{task_id, queue_id, attempt_id,
+expected_epoch, generation, effect_seq, action}` and the causation key
+`integration:<attempt>:<effect_seq>:<action>`; `(task_id, causation_key)`
+makes the enqueue idempotent. The step answers by writing the attempt's
+`effect_ack_json` / `acknowledged_at` (and `permit_json` for a permit) in the
+same transaction as its Task write (`acknowledge_integration_step_in_tx`: a
+compare-and-set on the attempt's revision, `effect_seq` and, except for
+`result`, its slot generation).
+
+A step is enqueued before the attempt transition it belongs to. So every
+action first places itself: attempt not yet in the state it answers → retry
+with back-off (no write); attempt past its `effect_seq` or generation, or no
+longer current → finish without a write; same `(effect_seq, action)` already
+answered → finish without a write.
+
+| Action | Attempt state | Task effect | Answer |
+|---|---|---|---|
+| `request_check` | `checking` | Asks the check runner (origin `integration`, purpose queue-head CI: the review state's effective `ci_steps`) for the rebased commit; states `integration/owned/checking`. With nothing configured to run it settles at once. | None. The check's own delivery step (`apply_check_result`) writes the `settle` answer: verdict, check timing and, on a pass, the permit. |
+| `settle` | `awaiting_task_step` | Reads review authority; when the queue rebased the commit, carries the review by attempt lineage; pre-enqueues the protected `result` step; states `integration/owned/fast_forwarding`. | `settle`: `permit` + `permit_json`, or `needs_review`, `candidate_check_failed`, `infrastructure`, `task_left`. |
+| `result` | `applied` | Execution evidence, the "Changes merged to …" comment, `integration/applied`, the `paused_integration` marker cleared, and the `merging → done` cascade enqueued at priority 2: the writes today's merge success performs. | `result`: `done` (or `task_left`). |
+| `send_back` | `ejected`, `needs_review` | Conflict: today's conflict handoff to the Worker (annotation, comment, `merge.failed`, `conflict_handoff` bridge and budget). Red check: a merge failure under the merge-fix budget. Lost review: `review_refresh` through `merge_failed`. States the typed reason and the handoff. | `send_back`: `done`. |
+| `park` | `parked`, `quarantined`, `queued` | Level-triggered: states `integration/deferred` with the cause read from the attempt (or the suspended queue); `integration/waiting` again once the member is queued behind an open queue; nothing for a paused Project. An intervention cause appends `task.interruption_changed` in the same transaction. | `park`: `done`. |
+| `clear` | `cancelled` | Clears this attempt's integration statement. | None (the attempt is terminal). |
+
+The permit binds `candidate_sha`, `target_tip_sha`, `task_ref`,
+`expected_epoch` and `slot_generation`; storage refuses any other.
+
+**Protection and Cancel.** In the transaction that writes a permit, `settle`
+enqueues the `result` step identity-fenced and marked as started integration
+(`enqueue_protected_integration_step_in_tx`), due at its own deadline. From
+that commit a later Cancel, Hold or move can neither be claimed ahead of it
+nor supersede it. The other way round, `settle` writes no permit while an
+owner command is already queued for the Task: it yields, the command runs,
+and the Task leaves `merging`. Exactly one of the two wins. Kind
+`integration` is in the supersede list, so a pending unprotected step is
+dropped the moment a Cancel is enqueued; the protected `result` step never
+is. The Task's cancel transition calls
+`request_task_integration_cancel_in_tx` in its own transaction: a
+cancellable attempt gets `cancel_requested_at` with the Task write; in
+`ff_inflight`, `reconciling`, `applied` or `quarantined` the Cancel is
+refused as busy while the protected step is alive (it then runs after the
+result) and is not held back by an attempt nothing drives. A board move into
+the cancellation state does the same through the same function
+(`CompareAndMoveTask.integration_cancel`, inside the move's transaction), so
+the flag has one writer. The call never fails a Cancel for a reason of its
+own: an attempt row or request time storage refuses counts as an attempt
+nothing drives. Storage refuses a permit for an attempt that carries the
+flag, and `settle` answers `task_left` instead of asking for one.
+
+**Redelivery.** Every action is safe to deliver twice. `settle`, `result`,
+`park` and `clear` write only in their final transaction. `send_back` writes
+its comment, annotation, block and `merge.failed` event before that
+transaction, as today's merge hook does; the comments are keyed by the step
+(`with_comment_key`), the annotation, block and cleared approval are the same
+values again, and the budget is charged by the cascade enqueued in the
+transaction, so a step that stops before its commit and runs again leaves one
+comment, one charge and one transition. The `merge.failed` and `task.blocked`
+bus events are not durable and can repeat. `request_check` asked again for a
+commit whose verdict already exists (applied for an earlier `effect_seq`, or a
+delivery whose application failed part-way and is not run again) applies the
+stored verdict itself.
+
+**`result` cannot dead-letter.** It never settles `failed` or `parked`. If it
+cannot apply, the Task states `integration/deferred/unresolved_result`, the
+step stays pending far in the future, and the worker's `ready_result_step`
+re-arms it. Woken by its own deadline with the permit unused, it takes the
+permit back (`revoke_integration_permit_in_tx`, a compare-and-set against
+the worker's commit to `ff_inflight`) and finishes, which lets a waiting
+owner command run.
+
+**Carry by attempt lineage.** One rule decides whether a passed review may
+cover a mechanically changed commit, for a Task entering `review` on a
+mechanical bridge and for an attempt the queue rebased in `merging`:
+`gate_refuses_carry`, `task_carry_checks`, `carry_budget_refusal` and
+`carry_path_refusal` in `workflow::actions::carry`. The queue's carry is
+recorded by `settle_attempt_review_carry_in_tx` (a `review_authority_carry`
+row and one `review_carry` charge, with the permit); no Review row is opened
+because the Task never left `merging`.
+
+Storage: migration `V202610100137__integration_task_step.sql` adds the step
+kind (a data-preserving `task_step` rebuild; SQLite cannot alter a CHECK).
+
+Not here yet: the head's check result is not copied onto a Review row; after
+a queue reopens nothing asks for the `park` step that restores `waiting`.
+
+
 ### Task condition actions
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
@@ -7970,7 +8065,9 @@ its retained intent reports `interrupted`, never a pass or permission to rerun.
 
 New execution policies clear ambient environment, disable login-profile loading
 and pass only declared keys plus the receiving machine's existing five build
-budget variables and niceness. The explicit frozen `legacy-server/1` and
+budget variables and niceness. The canonical CI policy is the exception: it
+clears nothing and runs a step exactly as the frozen server policy does (see
+"Reusable results" below). The explicit frozen `legacy-server/1` and
 `legacy-daemon/1` policies preserve existing login-shell/environment/Git-variable
 behavior during caller migration: the child inherits the owner process
 environment (PATH, HOME, toolchain variables), then the Project environment and
@@ -8233,13 +8330,147 @@ the runner.** Merge-path and review-entry CI, manual `ReviewRunner`,
 conformance, before-work and other checks retain their current inline
 orchestration, limits and verdicts; the conditions above are therefore
 produced only by tests until a family moves. The 3.2 integration queue stays
-inactive. Still pending: the review-entry cutover (3.3 stage D part 1, scope
-2), the merge-path cutover (3.2 D1b), canonical PATH/HOME declaration and
-managed-checkout/canonical-policy activation. Current owner dispatch uses the
-frozen legacy workspace policy and supplies no new server input attestation;
-configured checks remain uncacheable. A reusable result has no expiry: reuse
-ends only when the commit, spec digest or audited execution revision differs.
-No historical review or legacy CI row is promoted to cache.
+inactive. Still pending: the review-entry cutover (3.3 stage D part 2, scope
+2), the merge-path cutover (3.2 D1b) and managed-checkout activation. The
+owners execute the frozen legacy policies and the canonical CI policy below;
+only the canonical one attests its inputs and may be reused. A reusable result
+has no expiry: reuse ends only when the commit, spec digest, owner environment
+identity or audited execution revision differs. No historical review or legacy
+CI row is promoted to cache.
+
+#### Reusable results: the canonical CI policy (3.3 stage D part 2, scope 1)
+
+`canonical-ci/1` (`api_types::CANONICAL_CI_POLICY`) is the execution policy
+under which a CI bundle's result may stand for a later request. **No
+production family requests it yet**: review-entry CI still runs inline under
+`legacy-server/1` / `legacy-daemon/1` until the review-entry cutover, so no
+Project's behaviour changes with this stage.
+
+**A canonical step runs exactly as an inline CI step runs today.** `bash -lc`
+in the Task worktree; the owner process's environment, inherited, after the
+login profile ran; the Project environment values on top; the machine build
+budget and niceness; `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` removed.
+Nothing is cleared and nothing has to be declared, so a step that relies on a
+variable from the server's environment or from a profile keeps working. A
+service one step starts is still there for the next step. The policy does not
+restrict what a step sees; it records it, and a result is reused only when
+everything recorded is the same.
+
+`build_check_spec` builds it when the caller sets `canonical_policy`, for the
+entry-CI bundle in a server-owned Task worktree. A daemon-owned checkout, or a
+bundle with no worktree, gets its owner's frozen policy instead (a clean
+fallback at spec-build time: the check always runs and is never reused).
+Asking for the canonical policy for any other family is a caller error.
+
+What two runs with the same identity can still differ in:
+
+| Input | How it is bound |
+|---|---|
+| Commit | In the identity (`commit_sha`). Witnessed: the owner re-reads HEAD before it starts (a moved HEAD is an infrastructure failure, as before), the executor records `prepared_head` before the first command and `finished_head` after the last. |
+| Tracked changes | Witnessed. `git status --porcelain` must be empty before the first command and `git diff --quiet HEAD` clean after the last. Otherwise the result is the asking Task's verdict and is not reusable. |
+| Untracked files Git does not ignore | Witnessed by the same `git status` before the first command: a run that starts with one is not reusable. A file a step leaves behind makes the next run on that worktree not reusable. |
+| Ignored files (build output, installed dependencies) | In the identity, by worktree: a canonical spec is scoped to its workspace and placement generation (`CheckScope::Workspace`), so a result only ever answers for the worktree that produced it. Accepted limit: within that worktree, ignored files that changed since the run are not seen. The run is deliberately in the Task worktree and not in a clean checkout, because a cold build on every review is the cost this work removes. |
+| Commands, order, working directory, per-command limit, stop rule, policy revision | In the identity (the spec digest). |
+| Project environment values | In the identity twice: each declared key as an opaque salted revision, and the whole Project environment inside the environment revision below. |
+| The owner's inherited environment | In the identity: `environment_revision` is a salted digest over every variable a login shell on the owner exports, by name and value, minus the denylist below. Read by one login shell per request and once more by the owner right before the run. |
+| Shell version, OS, architecture | In the identity (`shell_revision`; `ServerCheckExecutionInputs::identity`). |
+| Forge version | In the identity: `runner_revision` is the policy name and the workspace version, so every release starts with no reusable result. |
+| Machine | Not named. Only the server owner runs the policy, and every digest is keyed with a salt that lives in this installation's database, so a result cannot be found from another installation. A database moved to another machine reuses a result only if the whole inherited environment is identical there. |
+| Tool versions behind an unchanged `PATH` | Accepted limit: not probed. A compiler upgraded in place is not seen until the Forge version, the environment or the commit changes. |
+| The login profile's own non-determinism | Accepted limit: the probe and each step run the profile separately. A profile that exports something different on each run makes every run a miss if it does so in an exported variable, and is not seen otherwise. |
+| Time and network (a step that downloads `latest`, a test that depends on the date) | Accepted limit: not seen. There is no per-Project switch to turn reuse off yet; one would be an optional field of the review config and is left to the cutover, where it first has an effect. |
+| Machine build budget (five variables Forge adds when neither the operator nor the Project sets them) and niceness | Not in the identity: they bound how fast a step runs. If the operator, the profile or the Project sets one of the variables, that value is in the identity like any other. |
+| Whole-run wall limit | Not in the identity (fixed per run when scheduled). A run stopped by it is never reusable. |
+
+Left out of the environment digest (`check_executor::
+ENVIRONMENT_IDENTITY_DENYLIST`), because a shell or the session that started
+the server sets them per process and no build takes an input from them:
+
+| Variables | Why |
+|---|---|
+| `PWD`, `OLDPWD` | the shell's own directory bookkeeping; the step runs in the checkout, the probe does not |
+| `SHLVL`, `_` | set by every shell for itself |
+| `COLUMNS`, `LINES` | the size of the terminal the server was started from |
+| `TERM_SESSION_ID`, `ITERM_SESSION_ID`, `SECURITYSESSIONID`, `XDG_SESSION_ID`, `WINDOWID`, `TMUX`, `TMUX_PANE`, `STY` | the id of the terminal, multiplexer or login session the server was started from |
+| `SSH_CLIENT`, `SSH_CONNECTION`, `SSH_TTY` | the address and port of the SSH connection the server was started over |
+| `INVOCATION_ID`, `JOURNAL_STREAM`, `SYSTEMD_EXEC_PID` | per-start ids a service manager gives the server |
+
+Everything else is in the digest, including `TMPDIR`, `SSH_AUTH_SOCK` and
+anything else that changes when the server is restarted from a different
+session: a restart into a different environment loses the stored results (a
+miss) and nothing else.
+
+**Values never leave the machine.** The digests are keyed with a random salt
+the server creates on first use and keeps in `system_setting`
+(`check_value_revision_salt`). Creation is one `INSERT OR IGNORE` followed by
+a read, so concurrent first users agree on one salt. The key is not listed by
+and cannot be written or deleted through the admin settings API, which is the
+only surface that reads `system_setting` rows generically; it is in no event,
+export, log line or MCP result. It survives a restart. Losing it changes
+every identity: stored results are not found again and nothing else happens.
+The probe's output is parsed in memory and never logged.
+
+**The login-shell probe** (`check_executor::inherited_environment`) costs one
+login shell, the same as one step, per request and per run. It is bounded at
+ten seconds and its process group is stopped when the bound passes. A profile
+that hangs, ends the shell early or prints more than 4 MiB makes the probe
+answer nothing: the request is then unattested, the check runs exactly as
+before and its result is not reusable (one warning is logged, with no
+values). The probe does not read the shell's exit status, because a logout
+script may replace it; it reads its own start and end marks, so profile and
+logout output around them is ignored.
+
+**A changed environment is a miss, never a refusal.** Right before a run the
+owner computes the environment revision again from what the steps are about
+to inherit. If it is not the one the request named (a Project value was
+edited while the run was queued, the server restarted into another
+environment, the login shell did not answer), the run still executes with the
+environment in force, as entry CI always did, and the receipt attests
+nothing. `validate_receipt` accepts an unattested canonical receipt as a
+verdict and marks it not reusable; it still refuses a receipt that attests
+something other than the request named.
+
+**The process tree is stopped when the run ends**, not after each step. Each
+step runs in its own process group and its descendants are left running when
+it exits. After the last step (pass, fail, timeout or cancellation) and
+before the final Git witness, the executor stops every step's group (TERM,
+500 ms, KILL) and checks that no member is left
+(`process_supervisor::stop_group`). `process_tree_stopped` on every command
+of a canonical receipt is that verified answer for the whole run. A run whose
+tree was not verified stopped is a verdict and is not reusable. Limits: a
+descendant that left its group (`setsid`) is neither seen nor stopped, and a
+server that dies mid-run leaves the tree to the operating system, as before.
+
+**Verdict and reuse are separate.** `CheckResultEvidence.reusable` is set by
+`validate_receipt` only for a pass that is attested, fully witnessed and
+verified stopped; `finish_check_run` stores `check_result.cacheable` as "run
+cacheable, certified and reusable". Everything else is delivered once to the
+consumers of that run and never found by a later request:
+
+| Request (same worktree, commit, spec, environment) | Outcome |
+|---|---|
+| earlier reusable pass | `Hit`: no run row, no slot, no process |
+| a run is in flight | `Joined`: one run, one result per consumer |
+| the same request key again, after its run ended | `Joined` to its own run and answered by that run's result, whatever it was |
+| earlier pass was not reusable (tracked change, untracked file at the start, moved HEAD, unattested, tree not stopped) | `Scheduled` |
+| earlier run failed, timed out, was cancelled or failed infrastructure | `Scheduled`: a red result is never reused, so a re-review of a red commit runs again and a flaky failure does not stick |
+| another worktree, commit, command, Project value, inherited variable, shell, Forge version or policy | `Scheduled`: its own identity |
+
+A consumer that joins a run in flight gets that run's verdict even when the
+run turns out not to be reusable. Because the identity names the worktree,
+only requests for the same worktree can join.
+
+**Daemon placements** are never canonical. The builder falls back to
+`legacy-daemon/1` and `CheckOwnerPort::prepare` refuses a canonical run on a
+daemon placement as a second guard. For parity a daemon would have to probe
+and attest its own inherited environment with a salt it keeps, return that
+attestation with the receipt, and run the run-end tree stop; the attestation
+is a change of the wire shape and therefore a daemon protocol bump.
+
+Neither the spec revision nor the digest schema changes: the policy string is
+already a digest input, so no stored result of a legacy policy can satisfy a
+canonical request. No result was ever stored under `canonical-ci/1` before
+this definition, so the policy revision stays `1`.
 
 The owner supervision guarantees tested here cover normal cancellation, dropped
 futures, retained receipts and restart reconciliation. Abrupt process death

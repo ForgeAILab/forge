@@ -108,6 +108,7 @@ mod tests {
         assert!(matches!(renewed, crate::ExecutionLeaseMutation::Updated(_)));
         let input = crate::CompareAndMoveTask {
             post_commit_step: None,
+            integration_cancel: false,
             operation_id: new_uuid_v4(),
             project_id: "heartbeat-project".to_owned(),
             task_id: "moved".to_owned(),

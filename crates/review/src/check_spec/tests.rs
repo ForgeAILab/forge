@@ -22,6 +22,7 @@ fn config<'a>(
         event: LifecycleEvent::BeforeWork,
         role: "coder",
         owner_is_daemon: false,
+        canonical_policy: false,
         workspace: Some(CheckWorkspaceIdentity {
             workspace_id: "w",
             generation: 1,
@@ -510,4 +511,63 @@ fn blank_steps_are_dropped_recorded_and_an_all_blank_list_is_the_empty_auto_pass
         (spec.configured_commands, spec.blank_commands),
         (1, vec![0])
     );
+}
+
+#[test]
+fn the_canonical_policy_keeps_the_steps_and_is_its_own_worktree_scoped_identity() {
+    let source = source();
+    let environment: ProjectEnvironment =
+        serde_json::from_value(json!({"env":{"TOKEN":"not-in-spec"}})).unwrap();
+    let mut cfg = config(&source, &environment, &[]);
+    let frozen = build_check_spec(CheckPurpose::EntryCi, &cfg).unwrap();
+    cfg.canonical_policy = true;
+    let canonical = build_check_spec(CheckPurpose::EntryCi, &cfg).unwrap();
+    assert_eq!(canonical.execution_policy, CANONICAL_CI_POLICY);
+    assert_eq!(commands(&canonical), commands(&frozen));
+    assert!(canonical.cacheable() && !frozen.cacheable());
+    for (command, old) in canonical.commands.iter().zip(&frozen.commands) {
+        // Nothing is cleared, so nothing more is declared: the Project keys,
+        // the limit and the failure rule are the frozen policy's.
+        assert_eq!(command.environment_keys, BTreeSet::from(["TOKEN".into()]));
+        assert_eq!(command.environment_keys, old.environment_keys);
+        assert_eq!(command.timeout_seconds, None);
+        assert_eq!(command.failure_policy, CheckFailurePolicy::StopBundle);
+    }
+    // The run sees its worktree's ignored files: the worktree is in the
+    // identity, so a result never answers for another checkout.
+    assert_eq!(frozen.scope, CheckScope::Commit);
+    assert_eq!(
+        canonical.scope,
+        CheckScope::Workspace {
+            workspace_id: "w".into(),
+            generation: 1
+        }
+    );
+    // No steps is still the empty auto-pass: nothing runs, nothing is reused.
+    let mut none = source.clone();
+    none["task_scope"]["config"]["review"]["ci_steps"] = json!([]);
+    let mut empty = config(&none, &environment, &[]);
+    empty.canonical_policy = true;
+    let empty = build_check_spec(CheckPurpose::EntryCi, &empty).unwrap();
+    assert!(empty.commands.is_empty() && !empty.cacheable());
+    // Only entry CI has the canonical policy: asking elsewhere is an error.
+    assert!(build_check_spec(CheckPurpose::ReviewCi, &cfg).is_err());
+    assert!(build_check_spec(CheckPurpose::Conformance, &cfg).is_err());
+    // A daemon-owned checkout, or no worktree, is an ordinary placement: the
+    // spec is built with its owner's frozen policy, which always runs.
+    let mut daemon = config(&source, &environment, &[]);
+    daemon.owner_is_daemon = true;
+    let plain = build_check_spec(CheckPurpose::EntryCi, &daemon).unwrap();
+    daemon.canonical_policy = true;
+    let fallback = build_check_spec(CheckPurpose::EntryCi, &daemon).unwrap();
+    assert_eq!(fallback, plain);
+    assert_eq!(fallback.execution_policy, "legacy-daemon/1");
+    assert!(!fallback.cacheable());
+    cfg.workspace = None;
+    let bare = build_check_spec(CheckPurpose::EntryCi, &cfg).unwrap();
+    assert_eq!(bare.execution_policy, "legacy-server/1");
+    assert_eq!(bare, {
+        cfg.canonical_policy = false;
+        build_check_spec(CheckPurpose::EntryCi, &cfg).unwrap()
+    });
 }
