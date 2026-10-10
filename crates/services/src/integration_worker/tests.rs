@@ -257,6 +257,9 @@ impl IntegrationStepPort for FakeSteps {
 struct FakeTransfer {
     remote: Mutex<HashSet<String>>,
     too_large: AtomicBool,
+    /// The next transfer's reply is lost: the port answers with an error
+    /// although the objects may have arrived.
+    lose_reply: AtomicBool,
     calls: Mutex<Vec<ObjectTransferDirection>>,
     keys: Mutex<Vec<String>>,
     released: Mutex<Vec<ObjectTransferRelease>>,
@@ -276,6 +279,11 @@ impl ObjectTransferPort for FakeTransfer {
         assert_eq!(request.target.repo_location_id, "l-r");
         assert_eq!(request.task.owner, EffectOwner::Server);
         assert!(!request.have.is_empty() && !request.have.contains(&request.want));
+        if self.lose_reply.swap(false, Ordering::SeqCst) {
+            return Err(ServiceError::invalid_operation(
+                "daemon request timed out: integration.import_objects",
+            ));
+        }
         Ok(if self.too_large.load(Ordering::SeqCst) {
             ObjectTransferOutcome::TooLarge {
                 bytes: request.max_bytes + 1,
@@ -1981,6 +1989,139 @@ async fn a_head_whose_task_machine_is_removed_mid_rebase_does_not_stall_the_queu
     );
     assert_eq!(ff_successes(&world, &a.id).await, 0);
     assert!(world.queue_of(&a).await.head_attempt_id.is_none());
+}
+
+/// The session that made a head's transfers dies after the fast-forward.
+/// The session that takes the head over makes no transfer itself, but it is
+/// the one that releases the head: it takes the two ends from the attempt's
+/// durable owner fields and the queue's target, so the refs do not stay
+/// until the next server start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_takeover_session_releases_the_transfer_refs_of_the_head_it_finishes() {
+    let world = World::new().await;
+    let now = db::now_rfc3339();
+    // The Task's own (non-default) location, as admission records it.
+    sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,path,kind,is_default,status,created_at,updated_at) VALUES('l-task','r','server',?,'managed_clone',0,'ready',?,?)")
+        .bind(world.temp.path().join("clone-task").to_str())
+        .bind(&now)
+        .bind(&now)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    let a = world.add_task("r", "a", "a.txt", "a\n").await;
+    sqlx::query("UPDATE integration_attempt SET repo_location_id='l-task',owner_kind='server' WHERE id=?")
+        .bind(&a.id)
+        .execute(world.db.pool())
+        .await
+        .unwrap();
+    world.transfer.remote.lock().unwrap().insert("a".into());
+    world.external_commit("r", "outside").await;
+    let worker = world.worker();
+    let fired = arm(&worker, S::FfInflight, CrashPoint::AfterEffectReceipt);
+    let mut pump = Pump::new(worker);
+    assert!(world.pump(&mut pump).await.is_some(), "the session dies");
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(!world.transfer.calls.lock().unwrap().is_empty());
+    assert!(world.transfer.released.lock().unwrap().is_empty());
+    drop(pump);
+    world.clock.advance(120);
+    let transfers = world.transfer.calls.lock().unwrap().len();
+    let mut pump = Pump::new(world.worker());
+    world.settle(&mut pump).await;
+    assert_eq!(world.attempt(&a.id).await.state, S::Completed);
+    assert_eq!(ff_successes(&world, &a.id).await, 1);
+    assert_eq!(
+        world.transfer.calls.lock().unwrap().len(),
+        transfers,
+        "the takeover moved nothing itself"
+    );
+    let released = world.transfer.released.lock().unwrap().clone();
+    assert_eq!(released.len(), 1, "{}", released.len());
+    assert_eq!(released[0].attempt_id, a.id);
+    assert_eq!(released[0].task.repo_location_id, "l-task");
+    assert_eq!(released[0].task.owner, EffectOwner::Server);
+    assert_eq!(released[0].target.repo_location_id, "l-r");
+    assert_eq!(released[0].target.owner, EffectOwner::Server);
+}
+
+/// The reply to an object transfer is lost (inbound, then outbound). The
+/// objects may or may not have arrived, and the worker does not guess: the
+/// head leaves the slot as a counted infrastructure retry, whatever the
+/// transfer left on either end is released, and the retry transfers under
+/// the key of its own claim generation. The Task is rebased and merged once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_transfer_reply_releases_both_ends_and_the_retry_moves_under_a_new_key() {
+    for lost in [
+        ObjectTransferDirection::Inbound,
+        ObjectTransferDirection::Outbound,
+    ] {
+        let world = World::new().await;
+        let a = world.add_task("r", "a", "a.txt", "a\n").await;
+        world.transfer.remote.lock().unwrap().insert("a".into());
+        world.external_commit("r", "outside").await;
+        let mut pump = Pump::new(world.worker());
+        if lost == ObjectTransferDirection::Inbound {
+            world.transfer.lose_reply.store(true, Ordering::SeqCst);
+        } else {
+            // Run up to the permit, then lose the outbound reply.
+            for _ in 0..400 {
+                if world.attempt(&a.id).await.state == S::ReadyFf {
+                    break;
+                }
+                let mut drivers = pump.worker.sweep_once().await.unwrap();
+                pump.drivers.append(&mut drivers);
+                for driver in pump.drivers.iter_mut() {
+                    if world.attempt(&a.id).await.state == S::ReadyFf {
+                        break;
+                    }
+                    let _ = driver.pass().await.unwrap();
+                }
+                world.steps.answer(&world.db).await;
+            }
+            assert_eq!(world.attempt(&a.id).await.state, S::ReadyFf);
+            world.transfer.lose_reply.store(true, Ordering::SeqCst);
+        }
+        world.settle(&mut pump).await;
+        let parked = world.attempt(&a.id).await;
+        assert_eq!(parked.state, S::Parked, "{lost:?}");
+        assert_eq!(
+            parked.failure_kind,
+            Some(IntegrationFailureKind::Infrastructure)
+        );
+        assert!(parked.available_at.is_some());
+        assert_eq!(ff_successes(&world, &a.id).await, 0);
+        let released = world.transfer.released.lock().unwrap().len();
+        assert_eq!(released, 1, "{lost:?}: both ends released with the park");
+        let lost_key = world.transfer.keys.lock().unwrap().last().cloned().unwrap();
+
+        world.clock.advance(601);
+        world.settle(&mut pump).await;
+        let merged = world.attempt(&a.id).await;
+        assert_eq!(merged.state, S::Completed, "{lost:?}");
+        assert_eq!(ff_successes(&world, &a.id).await, 1);
+        assert_eq!(Some(world.tip("r").await), merged.candidate_sha);
+        let rebases = receipts_of(&world, &a.id)
+            .await
+            .into_iter()
+            .filter(|receipt| {
+                receipt.request.kind == IntegrationOperationKind::Rebase
+                    && receipt.operation_state == db::IntegrationOperationState::Succeeded
+            })
+            .count();
+        assert_eq!(rebases, 1, "{lost:?}: the Task was rebased once");
+        let keys = world.transfer.keys.lock().unwrap().clone();
+        let after: Vec<&String> = keys
+            .iter()
+            .skip_while(|key| **key != lost_key)
+            .skip(1)
+            .collect();
+        assert!(!after.is_empty(), "{lost:?}: the retry transferred again");
+        assert!(
+            after.iter().all(|key| **key != lost_key),
+            "{lost:?}: the retry used its own generation's key: {keys:?}"
+        );
+        assert_eq!(world.transfer.released.lock().unwrap().len(), 2);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
