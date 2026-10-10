@@ -21,7 +21,127 @@ fn quarantined(root: &Path) -> Vec<String> {
     entries
         .flatten()
         .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("workspace-"))
         .collect()
+}
+
+fn backend_on(root: &Path, journal: &Path) -> DaemonWorkspaceBackend {
+    DaemonWorkspaceBackend::new(
+        root.to_owned(),
+        "daemon-1".into(),
+        crate::daemon_config::DaemonConfig::default().run_policy(),
+        Arc::new(DaemonJournal::new(journal)),
+    )
+    .unwrap()
+}
+
+/// A handle directory Forge made, with build output, and no handle.
+fn forge_made_orphan(root: &Path) -> PathBuf {
+    let orphan = root
+        .join(WORKTREE_DIRECTORY)
+        .join(format!("workspace-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(orphan.join(".forge-task/build/cargo")).unwrap();
+    std::fs::write(orphan.join(".forge-task/build/cargo/marker"), "x").unwrap();
+    orphan
+}
+
+#[tokio::test]
+async fn a_daemon_whose_state_was_lost_never_sweeps_the_root_the_old_state_owns() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let (old_state, new_state) = (dir.path().join("old"), dir.path().join("new"));
+    for path in [&root, &old_state, &new_state] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let root = root.canonicalize().unwrap();
+    // The first daemon adopts the root; its directories are live to it.
+    let first = backend_on(&root, &old_state);
+    assert!(first.gc_lock.is_some());
+    let live = forge_made_orphan(&root);
+    drop(first);
+
+    // Same root, empty handle table: every directory is unknown to it.
+    let amnesiac = backend_on(&root, &new_state);
+    assert!(amnesiac.gc_lock.is_none());
+    let report = sweep_at(&amnesiac, &[], 30 * 24 * HOUR).await;
+    assert_eq!(report, GcReport::default());
+    assert!(live.join(".forge-task/build/cargo/marker").exists());
+    assert!(quarantined(&root).is_empty());
+
+    // The old state, back again, still owns it and sweeps.
+    drop(amnesiac);
+    let back = backend_on(&root, &old_state);
+    assert!(back.gc_lock.is_some());
+    assert_eq!(sweep_at(&back, &[], 30 * 24 * HOUR).await.quarantined, 1);
+}
+
+#[tokio::test]
+async fn a_root_that_is_a_repository_is_never_adopted_or_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let orphan = forge_made_orphan(&root);
+    let backend = backend_on(&root, &root);
+    assert!(backend.gc_lock.is_none());
+    assert!(!root.join(GC_DIR).exists());
+    assert_eq!(
+        sweep_at(&backend, &[], 30 * 24 * HOUR).await,
+        GcReport::default()
+    );
+    assert!(orphan.exists());
+}
+
+#[tokio::test]
+async fn build_output_is_evicted_under_the_floor_but_never_for_a_busy_handle() {
+    let fixture = Fixture::new().await;
+    let handle = fixture.prepared.workspace.workspace_handle.clone();
+    let task_root = fixture.path().parent().unwrap().to_path_buf();
+    let build = task_root.join(".forge-task/build");
+    std::fs::create_dir_all(build.join("cargo")).unwrap();
+    std::fs::write(build.join("cargo/marker"), "x").unwrap();
+    let execution = "exec-busy".to_owned();
+    fixture
+        .backend
+        .state
+        .lock()
+        .unwrap()
+        .handles
+        .get_mut(&handle)
+        .unwrap()
+        .execution_ids
+        .push(execution.clone());
+    let under = FreeFloor {
+        min_free_bytes: u64::MAX,
+        min_free_percent: 0,
+    };
+    let sweep = |active: Vec<String>| {
+        let backend = &fixture.backend;
+        async move { backend.gc_sweep_at(&active, SystemTime::now(), under).await }
+    };
+
+    // An execution of the handle is running.
+    assert_eq!(sweep(vec![execution.clone()]).await.builds_evicted, 0);
+    assert!(build.join("cargo/marker").exists());
+    // A hook of this process is running in it.
+    let hook = executors::sandbox::SandboxEnv::for_command(
+        fixture.path(),
+        executors::sandbox::RunPurpose::Hook,
+    );
+    if hook.env().tmp_dir().is_some() {
+        assert_eq!(sweep(Vec::new()).await.builds_evicted, 0);
+        assert!(build.join("cargo/marker").exists());
+    }
+    drop(hook);
+    // Plenty of room: nothing goes even when idle.
+    let report = fixture
+        .backend
+        .gc_sweep_at(&[], SystemTime::now(), FreeFloor { min_free_bytes: 0, min_free_percent: 0 })
+        .await;
+    assert_eq!(report.builds_evicted, 0);
+    // Idle and under the floor.
+    assert_eq!(sweep(Vec::new()).await.builds_evicted, 1);
+    assert!(!build.exists());
+    assert!(fixture.path().join("README.md").exists());
 }
 
 #[tokio::test]
@@ -40,6 +160,11 @@ async fn gc_quarantines_a_directory_without_a_handle_and_deletes_it_a_day_later(
         std::fs::create_dir_all(path).unwrap();
         std::fs::write(path.join("file"), "content").unwrap();
     }
+    // What makes it a directory Forge made, and not a user's.
+    std::fs::create_dir_all(orphan.join(".forge-task")).unwrap();
+    // A handle-shaped directory with nothing of Forge's in it is a user's.
+    let users = roots.join(format!("workspace-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(users.join("photos")).unwrap();
 
     // Made a moment ago: a prepare may be about to record it.
     assert_eq!(
@@ -50,11 +175,19 @@ async fn gc_quarantines_a_directory_without_a_handle_and_deletes_it_a_day_later(
     );
     assert!(orphan.exists());
 
-    let report = sweep_at(&fixture.backend, &[], HOUR).await;
+    // Eleven hours old: a slow clone may still be filling it.
+    assert_eq!(
+        sweep_at(&fixture.backend, &[], 11 * HOUR).await.quarantined,
+        0
+    );
+    assert!(orphan.exists());
+
+    let report = sweep_at(&fixture.backend, &[], 25 * HOUR).await;
     assert_eq!(
         (report.quarantined, report.removed, report.errors),
         (1, 0, 0)
     );
+    assert!(users.join("photos").exists());
     assert!(!orphan.exists());
     assert_eq!(quarantined(&root).len(), 1);
     // The prepared workspace and everything that is not handle-shaped stay.
@@ -63,9 +196,10 @@ async fn gc_quarantines_a_directory_without_a_handle_and_deletes_it_a_day_later(
         assert!(path.join("file").exists(), "{} was touched", path.display());
     }
 
-    assert_eq!(sweep_at(&fixture.backend, &[], 24 * HOUR).await.removed, 0);
-    assert_eq!(sweep_at(&fixture.backend, &[], 26 * HOUR).await.removed, 1);
+    assert_eq!(sweep_at(&fixture.backend, &[], 48 * HOUR).await.removed, 0);
+    assert_eq!(sweep_at(&fixture.backend, &[], 50 * HOUR).await.removed, 1);
     assert!(quarantined(&root).is_empty());
+    assert!(users.join("photos").exists());
     assert!(fixture.path().join("README.md").exists());
 }
 
@@ -109,6 +243,10 @@ async fn second_backend_on_the_same_root_does_not_sweep_the_first_ones_live_dire
         fixture.path(),
         executors::sandbox::RunPurpose::Hook,
     );
+
+    // Only one backend holds the root's sweeper lock.
+    assert!(fixture.backend.gc_lock.is_some());
+    assert!(second.gc_lock.is_none());
 
     // Long after any grace period or run age, the second backend sweeps.
     let report = sweep_at(&second, &[], 3 * 24 * HOUR).await;

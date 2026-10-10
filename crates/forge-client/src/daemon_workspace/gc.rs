@@ -9,9 +9,17 @@
 //!
 //! Every other name under the root is invisible to it. A daemon has no log
 //! retention rule: its execution logs are not kept per Task.
+//!
+//! Only one sweeper per root. The handle table carries an owner id, the root
+//! carries it in `<root>/.forge/gc/daemon-owner` (written once, when the backend is
+//! built on a root nobody owns), and the backend holds an exclusive lock on
+//! `<root>/.forge/gc/daemon.lock` for its whole life. A daemon whose state
+//! was lost, and a second daemon process on the same root, sweep nothing.
 
 use super::*;
-use executors::gc::{FreeFloor, GcReport, RootState, Sweep};
+use executors::gc::{
+    FreeFloor, GcReport, Ownership, RootState, Sweep, DAEMON_OWNER_FILE, GC_DIR,
+};
 use std::time::SystemTime;
 
 /// How often a running daemon sweeps its root.
@@ -25,6 +33,59 @@ const LEGACY_CODEX_HOME: &str = ".forge-daemon/execution-logs/.codex-managed-hom
 fn is_handle(name: &str) -> bool {
     name.strip_prefix("workspace-")
         .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+}
+
+/// Give the handle table an owner id, adopt the root for it when nobody owns
+/// the root, and take the root's sweeper lock. `None` when this backend must
+/// never sweep: the root is owned by another table, cannot be a workspace
+/// root, or another live backend holds the lock.
+pub(super) fn adopt_root(
+    workspace_root: &Path,
+    state: &mut WorkspaceRegistry,
+    journal: &DaemonJournal,
+) -> Option<std::fs::File> {
+    if state.gc_owner_id.is_none() {
+        let mut updated = state.clone();
+        updated.gc_owner_id = Some(uuid::Uuid::new_v4().to_string());
+        // An id that was not persisted is not an identity.
+        journal.save_workspace_state(&updated).ok()?;
+        *state = updated;
+    }
+    let owner_id = state.gc_owner_id.clone()?;
+    let mut sweep = Sweep::new(
+        workspace_root,
+        &workspace_root.join(WORKTREE_DIRECTORY),
+        is_handle,
+        Duration::ZERO,
+    );
+    sweep.owner_file = DAEMON_OWNER_FILE;
+    match sweep.adopt(&owner_id) {
+        Ownership::Mine => {}
+        ownership => {
+            tracing::warn!(
+                root = %workspace_root.display(),
+                state = ownership.as_str(),
+                "workspace garbage collection is off for this daemon: its workspace root is owned by another daemon state or cannot be a workspace root. Nothing is reclaimed and the disk can fill. If the root belongs to this daemon (its state was reset), stop it and delete .forge/gc/daemon-owner under the root"
+            );
+            return None;
+        }
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(workspace_root.join(GC_DIR).join("daemon.lock"))
+        .ok()?;
+    match lock.try_lock() {
+        Ok(()) => Some(lock),
+        Err(_) => {
+            tracing::warn!(
+                root = %workspace_root.display(),
+                "another daemon is running on this workspace root; this one leaves garbage collection to it"
+            );
+            None
+        }
+    }
 }
 
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
@@ -78,8 +139,26 @@ impl DaemonWorkspaceBackend {
         let task_roots = self.workspace_root.join(WORKTREE_DIRECTORY);
         let mut sweep = Sweep::new(&self.workspace_root, &task_roots, is_handle, GC_BUDGET);
         sweep.now = now;
+        sweep.creating = workspace::is_creating;
+        sweep.owner_file = DAEMON_OWNER_FILE;
         let mut report = GcReport::default();
         let out_of_time = |sweep: &Sweep| std::time::Instant::now() >= sweep.deadline;
+        // Only the holder of the root lock sweeps, and only while the root
+        // still names this handle table as its owner.
+        let owner_id = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .gc_owner_id
+            .clone();
+        let (Some(_), Some(owner_id)) = (&self.gc_lock, owner_id) else {
+            return report;
+        };
+        let pass = sweep.clone();
+        if blocking(move || pass.ownership(&owner_id)).await != Some(Ownership::Mine) {
+            tracing::warn!(root = %self.workspace_root.display(), "workspace gc: this daemon no longer owns its workspace root; nothing swept");
+            return report;
+        }
 
         // Directory names first, the table second: a prepare records its
         // handle before it creates the directory, so a directory seen here
@@ -114,18 +193,23 @@ impl DaemonWorkspaceBackend {
             }
         }
         let pass = sweep.clone();
-        let done = blocking(move || {
+        let (done, finished) = blocking(move || {
             let mut report = GcReport::default();
-            pass.task_roots(&states, &mut report);
-            report
+            let finished = pass.task_roots(&states, &mut report);
+            // Condemned under a handle's lock above, deleted outside it.
+            pass.empty_trash(&mut report);
+            (report, finished)
         })
         .await
         .unwrap_or_default();
         report.merge(&done);
-        if !done.out_of_time && !out_of_time(&sweep) {
+        {
+            // Resume after the last name this pass finished, so one slow
+            // entry never starves the names after it.
             let mut cursor = self.gc_cursor.lock().unwrap_or_else(|p| p.into_inner());
-            match names.last() {
-                Some(last) if names.len() >= GC_PAGE => cursor.clone_from(last),
+            match (finished, names.last()) {
+                (Some(finished), _) if done.out_of_time => *cursor = finished,
+                (_, Some(last)) if names.len() >= GC_PAGE => cursor.clone_from(last),
                 _ => cursor.clear(),
             }
         }
@@ -182,8 +266,9 @@ impl DaemonWorkspaceBackend {
         report
     }
 
-    /// Leftovers of a handle that was cleaned: removed under the handle's
-    /// owner lock, after reading the table again.
+    /// Leftovers of a handle that was cleaned: moved to the trash under the
+    /// handle's owner lock, after reading the table again. The move is one
+    /// rename; the delete happens after the lock is released.
     async fn gc_cleaned_root(
         &self,
         sweep: &Sweep,
@@ -207,8 +292,8 @@ impl DaemonWorkspaceBackend {
         );
         let done = blocking(move || {
             let mut report = GcReport::default();
-            if !executors::sandbox::has_live_run_in(&path) {
-                pass.remove(&path, &mut report);
+            if !executors::sandbox::has_live_run_in(&path) && !workspace::is_creating(&path) {
+                pass.trash(&path, &mut report);
             }
             report
         })
