@@ -82,6 +82,14 @@ impl ServerIntegrationOwner {
         self.reconcile_checkout(None).await
     }
 
+    /// Reconcile the outstanding effects that share an owner lock with
+    /// `request` (its own included). The queue worker's reconcile timer calls
+    /// this for its head, so one head never waits behind an unrelated
+    /// checkout's running effect.
+    pub async fn reconcile_effect(&self, request: &IntegrationEffectRequest) -> Result<()> {
+        self.reconcile_checkout(Some(request)).await
+    }
+
     async fn reconcile_checkout(&self, current: Option<&IntegrationEffectRequest>) -> Result<()> {
         for request in self
             .db
@@ -119,6 +127,15 @@ impl ServerIntegrationOwner {
                 continue;
             }
             let result = self.server_reconciliation_result(&request).await;
+            // A queue claim's effect has no step recovery behind it, so this
+            // owner settles what it can prove while it holds the checkout
+            // lock: no effect of this process is running under it.
+            if !matches!(result, Ok(Some(_))) && !db::is_task_step(&request) {
+                if let Some((result, state)) = self.queue_effect_settlement(&request).await {
+                    guard.record(result, state).await?;
+                    continue;
+                }
+            }
             let (result, state) = match result {
                 Ok(Some(result)) => (result, IntegrationOperationState::Succeeded),
                 // This owner holds the checkout lock, so a Task-step guard is
@@ -129,13 +146,144 @@ impl ServerIntegrationOwner {
                     (db::superseded_result(), IntegrationOperationState::Failed)
                 }
                 Ok(None) | Err(_) => (
-                    json!({"kind":"infrastructure","message":"owner effect has no exact completion proof","head_sha":null,"rebase_in_progress":true}),
+                    json!({"kind":"infrastructure","message":"owner effect has no exact completion proof","head_sha":null,"rebase_in_progress":true,"since":self.uncertain_since(&request).await}),
                     IntegrationOperationState::Uncertain,
                 ),
             };
             guard.record(result, state).await?;
         }
         Ok(())
+    }
+
+    /// When this effect was first found unproven (kept across lookups).
+    async fn uncertain_since(&self, request: &IntegrationEffectRequest) -> String {
+        self.db
+            .integration_effect_receipt(request)
+            .await
+            .ok()
+            .flatten()
+            .filter(|receipt| receipt.operation_state == IntegrationOperationState::Uncertain)
+            .and_then(|receipt| receipt.result["since"].as_str().map(str::to_owned))
+            .unwrap_or_else(db::now_rfc3339)
+    }
+
+    /// Settlement of a started queue-claim effect that has no exact completion
+    /// proof. Called under the effect's own owner lock, so the Git facts are
+    /// read with no effect of this process running. `None`: still unknown.
+    ///
+    /// - fast-forward: the target ref still names the expected tip, so the
+    ///   ref was never moved: not performed. (A Git child of a dead server
+    ///   that lands later lands the exact candidate; the next validation
+    ///   reads it as already merged.)
+    /// - rebase: HEAD still names the expected commit and no rebase is
+    ///   stopped: not performed. HEAD moved onto the expected target: done.
+    ///   A rebase still stopped after the effect's own deadline is aborted
+    ///   and settled as timed out.
+    async fn queue_effect_settlement(
+        &self,
+        request: &IntegrationEffectRequest,
+    ) -> Option<(serde_json::Value, IntegrationOperationState)> {
+        let not_performed = || {
+            Some((
+                json!({"kind":"not_performed","reason":"ref_unmoved"}),
+                IntegrationOperationState::Failed,
+            ))
+        };
+        let witness = &request.witness;
+        let text = |key: &str| witness[key].as_str().filter(|value| !value.is_empty());
+        let head = text("expected_head_sha")?;
+        let target = text("expected_target_sha")?;
+        let since = self.uncertain_since(request).await;
+        let facts = async {
+            match request.kind {
+                IntegrationOperationKind::Rebase => {
+                    let handle = witness["workspace"]["handle"].as_str()?;
+                    let path = Path::new(handle);
+                    let now = git::get_current_sha(path).await.ok()?;
+                    if git::detect_rebase_in_progress(path).await.ok()? {
+                        let bound = witness["deadline_nanos"]
+                            .as_str()
+                            .and_then(|nanos| nanos.parse::<u64>().ok())
+                            .map_or(Duration::from_secs(120), Duration::from_nanos);
+                        let stopped = chrono::DateTime::parse_from_rfc3339(&since)
+                            .ok()
+                            .and_then(|since| {
+                                (chrono::Utc::now() - since.with_timezone(&chrono::Utc))
+                                    .to_std()
+                                    .ok()
+                            })
+                            .is_some_and(|age| age > bound);
+                        if !stopped {
+                            return None;
+                        }
+                        // Nothing of this owner runs under the lock and the
+                        // effect's own deadline has passed: put the branch
+                        // back, so the next round starts from the candidate.
+                        let aborted = git::abort_rebase(path).await.is_ok();
+                        let outcome = OwnerRebaseReceipt::TimedOut {
+                            head_sha: if aborted {
+                                git::get_current_sha(path).await.ok()
+                            } else {
+                                Some(now)
+                            },
+                            rebase_in_progress: !aborted,
+                        };
+                        return Some((json!(outcome), IntegrationOperationState::Failed));
+                    }
+                    if now == head {
+                        return not_performed();
+                    }
+                    if !git::command_output(path, &["merge-base", "--is-ancestor", target, "HEAD"])
+                        .await
+                        .ok()?
+                        .status
+                        .success()
+                    {
+                        return None;
+                    }
+                    let paths = if witness["handoff_conflicts"] == true {
+                        git::paths_adding_conflict_markers(path, target, "HEAD")
+                            .await
+                            .ok()?
+                    } else {
+                        Vec::new()
+                    };
+                    let outcome = if paths.is_empty() {
+                        WorkspaceOwnerOperationOutcome::Rebased
+                    } else {
+                        WorkspaceOwnerOperationOutcome::Conflict {
+                            details: "resumed committed conflict handoff".into(),
+                            conflict_paths: paths,
+                        }
+                    };
+                    Some((
+                        json!(OwnerRebaseReceipt::Completed { outcome }),
+                        IntegrationOperationState::Succeeded,
+                    ))
+                }
+                IntegrationOperationKind::FastForward | IntegrationOperationKind::Merge => {
+                    let branch = text("target_branch")?;
+                    let path: String = sqlx::query_scalar(
+                        "SELECT path FROM repo_location WHERE id=? AND owner_kind='server'",
+                    )
+                    .bind(request.fence.target_owner["location_id"].as_str())
+                    .fetch_optional(self.db.pool())
+                    .await
+                    .ok()??;
+                    let tip = integration_effects::merge::target_tip(Path::new(&path), branch)
+                        .await
+                        .ok()?;
+                    (tip == target && head != target)
+                        .then(not_performed)
+                        .flatten()
+                }
+                _ => None,
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), facts)
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn server_reconciliation_result(

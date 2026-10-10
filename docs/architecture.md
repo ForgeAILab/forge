@@ -3563,9 +3563,9 @@ directory from a transient Git failure):
 |---|---|---|
 | Linked worktree, HEAD on the Task branch (or mid-rebase) | valid; a stale cleanup deadline is cleared | valid |
 | Directory missing, or present and unusable by Git | repaired or recreated from the Task branch (as above) | `Absent`; disk and the workspace row are untouched (a legacy row with no placement still gets its server placement recorded) |
-| Linked worktree of a repository other than the recorded one | moved aside as `<name>.broken-<ms>` and recreated from the Task branch; never relinked | `Absent` |
+| Linked worktree of a repository other than the recorded one | moved aside as `<name>.broken-<ms>` and recreated from the Task branch; never relinked. When no recorded repository has the Task branch and the worktree is checked out on exactly that branch (a worktree made before its Repo moved to another location), the worktree is the only home of the Task's work and is used as it is; on any other branch it is never used | `Absent`, or valid in the same exception |
 | The worktree path, or its Task root, is a symbolic link | `ResetRequired`; nothing is used, moved or deleted | `Absent` |
-| HEAD on another branch or detached, Task branch exists, no rebase in progress | Decided by what a checkout would lose. HEAD has commits the Task branch lacks: `ResetRequired` for every purpose, naming the count, because a checkout would leave them unreachable from the branch Forge reviews and delivers. HEAD is the Task branch's own commit: `git checkout <Task branch>` for every purpose, since no file changes and local changes are kept. HEAD is behind the Task branch: `Execute` checks the branch out when the tree is clean, else `ResetRequired`; the others return `ResetRequired`, so a candidate is never moved under them. `Reset` is the exception to all three: it returns the worktree as it is, flagged off-branch, for the caller's `git reset --hard HEAD` | valid, flagged off-branch |
+| HEAD on another branch or detached, Task branch exists, no rebase in progress | Put back on the Task branch without losing a commit. HEAD is the Task branch's own commit: `git checkout <Task branch>`; no file changes and local changes are kept. HEAD is strictly ahead of the Task branch (commits made on a detached HEAD, or after an interrupted rebase finished): the Task branch is advanced to HEAD with a compare-and-swap `git update-ref` and checked out; no file changes, local changes are kept (`Repair::FastForwardedTaskBranch`). The exception: when HEAD is already contained in the Repo's default branch (local or `origin`), its extra commits are the target's, not the Task's, and the Task branch is never advanced to them; that state is handled like HEAD behind the Task branch. HEAD and the Task branch have diverged: HEAD's commit is kept under `refs/forge/rescued/<task id>/<UTC timestamp>` in the worktree's repository, one Forge comment on the Task names the ref and the commit, and the Task branch is checked out (`Repair::RescuedOffBranchCommits`); the checkout is never forced, so when it would overwrite uncommitted changes nothing moves and the result is `ResetRequired` naming the ref. One ref and one comment per rescued commit, however often the state is seen; at most the five newest refs per Task are kept, all of a Task's are deleted when its workspace is cleaned up, and the comment is not loaded into agent prompts. HEAD is behind the Task branch: `Execute` checks the branch out when the tree is clean, else `ResetRequired`; the others return `ResetRequired`. `Reset` is the exception to all of these: it returns the worktree as it is, flagged off-branch, for the caller's `git reset --hard HEAD` | valid, flagged off-branch |
 | Worktree and Task branch both gone | `ResetRequired`; the row is kept, except on the owning Task's launch path, which forgets it so the next launch starts from the default branch. A worktree of another repository that Git can still use is never forgotten | `Absent` |
 | Row not `ready` | `workspace for task … is not ready` | reports the disk as above |
 
@@ -3577,29 +3577,64 @@ deleted (a workspace outlives it); only a repair needs the row and reports
 `repo not found`. A Repo row of another Project is refused for every state. A directory that is a repository of its own, rather than a linked
 worktree, is not rejected yet. Daemon-owned placements keep the describe /
 prepare contract described above; the manager never interprets their handle.
-Callers: every `prepare_workspace` path (`Execute`: workspace creation, the
-reviewer cascade, retry-entry refresh, and claim when the owner reports the
-workspace missing), the native executor at the start of a turn (`Execute`),
-reassignment reset (`Reset`), review entry CI (`Check`), review rerun
-(`Review`), blocking `before_work` hooks (`Hook`), merge delivery and
-target-moved rebase (`Integrate`), and the lifecycle emitter (`Inspect`). A
-claim on a placement that is already `ready` still asks the backend's
-`describe` and does not go through the manager when the workspace exists. One
-Task run makes about four to eight manager calls (a blocking `before_work`
-hook, entry CI, a native turn start per execution, delivery, a rebase when the
-target moved, and one `Inspect` per lifecycle event that has script hooks).
-`ResetRequired` is never repaired by the caller: each one records its existing
-typed result (the `workspace_reset_required` annotation, the CI interruption
-with its entry barrier, a failed hook, a merge failure) and stops, so there is
-no reset-and-retry loop and no automatic recreation; the explicit workspace
-reset clears it. A source-scan test,
+Callers: every claim on a `ready` server placement (`Execute`; the launch guard
+all executor families share, CLI executors included), every `prepare_workspace`
+path (`Execute`: workspace creation, the reviewer cascade, retry-entry
+refresh), the provider start parameters (`Execute`), the execution runner at
+launch (`claimed_path`: a filesystem-only confirmation that the worktree the
+claim just checked is still there and confined, no Git process, falling back
+to `Execute` when it is not), the native executor at the start of a turn (`Execute`, with the
+Task service's workspace root and repository-cache locks), reassignment reset
+(`Reset`), review entry CI (`Check`), review rerun (`Review`), blocking
+`before_work` hooks (`Hook`), merge delivery and target-moved rebase
+(`Integrate`), and two read-only users (`Inspect`): the lifecycle emitter and evidence
+capture from a worktree file. The terminal does not go through the manager: it
+opens in the recorded directory after its own path guardrail, so a broken
+workspace can still be looked into.
+A claim on a daemon placement still asks its owner's `describe`. One Task run
+with one coding execution and one review makes about seven to ten manager
+calls, each one Git process on a healthy worktree: claim (1, replacing the
+three Git processes of the backend `describe` it used before), runner launch
+(0), native turn start (1 per turn, native executors only), a blocking
+`before_work` hook (1), entry CI (1), review rerun or reviewer cascade (1),
+delivery (1), a rebase when the target moved (1), and one `Inspect` per
+lifecycle event that has script hooks.
+
+Repairs happen inside the call, once: a step that finds its directory gone or
+unusable gets it recreated from the Task branch and proceeds; a worktree off
+the Task branch is put back as in the table. None of this writes a Task row,
+so no review or retry budget is spent. What is left as `ResetRequired` cannot
+be repaired without losing something or without an operator decision (the
+Task branch is gone too, a symbolic link in the path, HEAD behind the Task
+branch under a step that must not move the tree, a checkout that would
+overwrite uncommitted changes). Callers do not retry it: each records its
+existing typed result and stops, so there is no reset loop. A claim fails the
+Task with `workspace_reset_required` / `workspace_failed`; a blocking
+`before_work` hook records the `workspace_reset_required` annotation and
+fails; review entry CI records the CI interruption with its entry barrier
+without charging the CI infrastructure budget; delivery and rebase return a
+merge failure of kind `workspace_error`. The explicit workspace reset, then
+the Task's `retry`, clears it.
+
+Files that sit beside the worktree in the Task root (the canonical plan,
+staged plans, execution outboxes) are located through
+`workspace_manager::task_root_anchor`. They outlive the worktree, so they are
+read and discarded whether or not the worktree is usable; the readers confine
+each file to the Task root themselves. The anchor refuses a recorded path
+that is relative, contains `..`, has no Task root above it, or is (or sits
+under a Task root that is) a symbolic link. It does not compare the path with
+the configured workspace root, because rows outlive a changed root. The
+anchors are counted by the same source-scan gate as the raw getters. A source-scan test,
 `workspace_manager::tests::raw_workspace_path_getters_have_no_new_callers`,
 records an upper bound per file for the remaining non-test uses of the raw
 path getters (`ResolvedWorkspace::embedded_path`,
-`Workspace::embedded_worktree_path_for_backend`,
-`EmbeddedWorkspaceBackend::recorded_server_path`). It fails when a file that
+`Workspace::embedded_worktree_path_for_backend`;
+`EmbeddedWorkspaceBackend::recorded_server_path` no longer exists). It fails when a file that
 is not listed uses one, or a listed file uses more than recorded; fewer uses
-pass.
+pass. `raw_workspace_path_getter_uses_are_exactly_the_recorded_ones` pins the
+exact set: the manager and the owner-local backends, plus `merge_service.rs`
+(2), `task_actions.rs` (1) and the admission-failure cleanup in
+`task_service.rs` (1).
 
 States progress from `reserved` to `preparing` to `ready`,
 which can become `disconnected`, then back to `ready` after reconciliation.
@@ -5443,6 +5478,121 @@ move to `queued` from `reconciling` or `quarantined` is refused while the
 attempt has an effect intent or a running / uncertain operation, so `queued`
 is never a way around an unknown result.
 
+### Integration queue worker (3.2 stage D, part 1d; not started until D2)
+
+`services::integration_worker` is the queue worker. Nothing constructs or
+starts it yet: `merging` still runs today's merge hooks, and the runtime gains
+no worker until D2 wires it. The module writes `integration_queue` and
+`integration_attempt` rows only. It calls no Git and writes no Task, Review,
+budget or event row; a source test (`worker_sources_stay_inside_the_boundary`)
+holds that line.
+
+Parts:
+
+- **Supervised loop** (`IntegrationQueueWorker::start` / `run`): one sweep per
+  wake (an enqueue notification, a head leaving its slot, or every 30 s), then
+  one driver task per claimed queue, at most 16 at a time. Claims rotate after
+  the queue claimed last, so no queue starves when more are claimable than the
+  cap. Shutdown stops each driver at its next await; a started fast-forward is
+  awaited to its receipt. An idle install is read-only.
+- **Sweeps** (each restarts its keyset cursor): cancel requests on attempts
+  that hold no slot; due `parked` attempts back to `queued`; expired heads
+  (takeover) and unleased queues with work. A quarantined queue is claimed
+  when its head is `reconciling` / `ff_inflight`; a `quarantined` head is put
+  back to `reconciling` once per reconcile interval (60 s); a head that
+  resolved before the queue was re-opened is re-opened with its stored
+  witness first. A quarantined queue with no head (an imported quarantine)
+  is re-opened with a `NoEffect` witness as soon as the storage agrees that
+  no member holds an unknown result; the pinned attempt stays `quarantined`
+  for its owner's Retry. A suspended queue is tried again on every sweep
+  (the claim re-resolves the target, one small write per try); its head and
+  each queued member get one `park` step so the Task shows why it waits.
+- **Head driver** (`HeadDriver`): a table-driven state machine (`HEAD_TABLE`:
+  per state the action, success edges, failure edges, timeout, cancel rule and
+  what a restart finds). Every attempt transition goes through one function
+  that re-reads the row first (a receipt, a timings write and a cancel request
+  all bump `revision`) and refuses an edge the table does not have. The lease
+  (60 s) is renewed when 15 s of it are used, re-reading the queue each time
+  because an admission bumps the queue revision.
+
+| Head state | Worker action | Leaves to |
+|---|---|---|
+| `queued` | stamp `started_at`, count the round | `validating`; `parked` past 9 rounds |
+| `validating` | read facts; move commits in when the Task is on another checkout | `applied` (already landed), `awaiting_task_step` (target unchanged: no check), `rebasing`, `needs_review` (candidate changed), `parked`, `cancelled` |
+| `rebasing` | fenced owner rebase with conflict handoff, or adopt a receipt recorded before a crash | `checking`, `ejected` (conflict paths), `parked`, `reconciling`, `cancelled` |
+| `checking` | wait for the verdict the `request_check` step asked for (check timeout + 300 s) | `awaiting_task_step`, `ejected` (red check), `parked`, `cancelled` |
+| `awaiting_task_step` | wait for the `settle` step's permit (300 s) | `ready_ff`, `needs_review`, `ejected`, `parked`, `cancelled` |
+| `ready_ff` | move commits out if needed; cancel-or-commit compare-and-set (permit lifetime 120 s) | `ff_inflight`, `awaiting_task_step`, `cancelled` |
+| `ff_inflight` | fenced owner fast-forward of the exact candidate | `applied`; `rebasing` in a new round when the target moved; `reconciling` otherwise |
+| `reconciling` | ask the owner to settle the head's own effect, then read the newest receipt and a Git witness | `applied`, `queued` (proven not landed), `rebasing` (a finished rebase to adopt), `quarantined` (unknown) |
+| `applied` | ready the `result` step; wait for its acknowledgment or for the Task to leave `merging` | `completed` |
+
+Rules the driver enforces:
+
+- A check runs only when the commit was rebased by the queue. An unchanged
+  target sends the reviewed commit straight to authorization and records
+  `Skipped { TargetUnchanged }`.
+- A rebase needed when the head gets the slot is recorded as a `queue_member`
+  lost race and is free. A target that moves while the head holds the slot can
+  only have been moved from outside Forge: it is recorded as `external`, starts
+  a new round (`start_integration_round`), and the sixth one parks the attempt
+  with `external_target_moves_exhausted`.
+- An unknown result is never guessed, and only the owner settles an admitted
+  effect. `ServerIntegrationOwner::reconcile_effect` runs under the effect's
+  own checkout lock and, for a started queue-claim effect with no receipt,
+  records: the exact reviewed merge when the target names the candidate;
+  `not_performed` when the target ref (fast-forward) or the Task's HEAD
+  (rebase, none stopped) never moved; `completed` when HEAD already sits on
+  the expected target (a rebase that finished without its receipt, conflict
+  hand-off paths included); `timed_out` after aborting a rebase that is still
+  stopped once its own deadline has passed since the first lookup. Anything
+  else stays uncertain: the queue is quarantined with `needs_fact`, the head
+  becomes `quarantined`, the lookup repeats every 60 s, and the queue
+  re-opens only with a settled receipt (or `NoEffect`) that the storage
+  re-verifies. The lock covers effects of this process; a Git child that
+  outlives a killed server is covered by the lease (takeover is at least one
+  lease later) and by content: a late fast-forward lands the exact candidate,
+  which the next validation reads as already merged.
+- Cancel against the permit: both are compare-and-set writes on the attempt
+  row and a cancel request is refused once `ff_inflight` is stored, so exactly
+  one wins. Before that point a cancel request wins even over a written permit.
+- Deciding steps (`request_check`, `settle`) are always asked under a fresh
+  `effect_seq`, and a step is enqueued before the attempt transition it
+  belongs to, so a crash between the two leaves a step, not a silent attempt.
+- Infrastructure parks retry after 30 s, 2 min and 10 min, then wait for the
+  owner. A wait with no end of its own (paused Project, target not ready) is
+  retried with a doubling gap up to 10 min, and only its first park is a Task
+  step. A permit that does not bind the head is asked for three times, then
+  the attempt parks. The park history is kept in `operation_receipts_json`
+  (entries `{"kind":"worker_park",...}`, newest 64): nothing else writes that
+  column, and the evidence pruner empties it only on terminal attempts that
+  are no longer current, which the worker never reads.
+- A rebase or fast-forward is bounded by the owner (120 s / 30 s), not by a
+  worker timer. A cancel request that arrives while `git rebase` runs stops
+  the process group; the head is released after the cancelled receipt.
+
+Ports (`integration_worker::ports`). Consumed, and to be implemented by D2:
+`IntegrationStepPort` (enqueue an `integration` Task step by causation key
+`integration:<attempt>:<effect_seq>:<action>`; make the protected `result`
+step runnable), `IntegrationFactsPort` (read-only Task gate and Git facts of
+the head, and the repo location of its checkout), `ObjectTransferPort`
+(`transfer`: commits between a non-default checkout and the default checkout,
+256 MiB cap, keyed by attempt, claim generation and direction; `release`: drop
+the attempt's transfer refs on both checkouts when it leaves the slot). The
+real transfer over the owner operations is not written yet. Provided: `IntegrationEnqueuePort`
+(wake the sweep after an admission) and `IntegrationSnapshotPort` (queue,
+members in order with position, state, timings; the read surface is built on
+it). Steps answer by writing `effect_ack_json` / `acknowledged_at` (and
+`permit_json`) on the attempt; the worker only reads them.
+
+Not in this part: daemon-owned targets (the head parks with
+`daemon_owner_unwired`, no automatic retry), the production
+`ObjectTransferPort`, Task conditions, and the Task-step consumer itself.
+Known limits: the first rebase of a head is always counted as a
+`queue_member` lost race (the queue does not store the commit it last
+integrated, so a push from outside before the claim cannot be told apart);
+an `applied` head waits for its `result` step without a timer.
+
 ### Task condition actions
 
 `services::available_actions(&TaskSnapshot)` is the sole pure Task action resolver. The one snapshot builder loads Task, bounded execution authority, latest Review, role assignments, transition history, the typed condition and its normalized read presentation, entry/queue ownership, placement and Agent/Project availability, and caller authority. REST and MCP Task list projections carry no actions and obtain offers on demand. The admitted native `work.read` projection includes live offers for the bound Project Agent. The function performs no database or workspace I/O. REST, diagnostics, execution controls, MCP, native coordination, Attention, and Solo consume its offers.
@@ -5659,7 +5809,8 @@ another repository or sits behind a symbolic link, the hook is not run, the
 emitter reports `workspace reset required`, and Forge adds one system comment
 to the Task saying which hook was not run and why (one per event, workspace and
 execution; a hook that could not be started on its owner is recorded the same
-way). It never runs in the user's own checkout instead.
+way). It never runs in the user's own checkout instead. That comment is for
+the Task record; agent prompt loading leaves it out.
 The primary-checkout context is used only where no worktree is expected: before
 the workspace is prepared, and when the directory is gone while or after Forge
 reclaims it (workspace `cleaning` or `cleaned`). Hooks run from the event bus

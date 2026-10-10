@@ -13,12 +13,23 @@ pub trait LifecyclePlugin: Send + Sync {
         ctx: &LifecycleHookContext,
         workspace: &crate::workspace_backend::ResolvedWorkspace,
     ) -> Result<PluginResult, PluginError> {
-        let path = workspace.embedded_path().map_err(|error| PluginError {
-            message: error.to_string(),
-        })?;
-        let mut ctx = ctx.clone();
-        ctx.worktree_path = Some(path.to_string_lossy().into_owned());
-        self.execute(&ctx).await
+        // The emitter hands a plugin the worktree its workspace-manager
+        // inspection just accepted, as `ctx.worktree_path`; a plugin runs on
+        // the Forge host only.
+        if workspace.placement.owner_kind != db::PlacementOwnerKind::Server {
+            return Err(PluginError {
+                message: crate::workspace_backend::WorkspaceBackendError::OwnerUnsupported {
+                    owner_kind: workspace.placement.owner_kind.clone(),
+                }
+                .to_string(),
+            });
+        }
+        if ctx.worktree_path.is_none() {
+            return Err(PluginError {
+                message: "lifecycle plugin has no validated worktree to run in".to_owned(),
+            });
+        }
+        self.execute(ctx).await
     }
 }
 

@@ -930,7 +930,70 @@ impl TaskService {
         &self,
         mut admission: WorkspaceAdmission,
     ) -> Result<WorkspaceAdmission> {
+        if admission.placement.state == PlacementState::Ready
+            && admission.placement.owner_kind == PlacementOwnerKind::Server
+        {
+            // The launch guard every executor family shares: the workspace
+            // manager checks the recorded worktree against disk and Git and
+            // repairs what it can, so a CLI executor is never started in a
+            // directory that is gone or off the Task branch.
+            let workspace = if admission.workspace.status == WorkspaceStatus::Ready {
+                let manager = crate::workspace_manager::WorkspaceManager::new(
+                    &self.db,
+                    &self.workspace_root,
+                    self.repo_cache_locks.clone(),
+                    &self.workspace_backend_router,
+                );
+                let workspace = admission.workspace.clone();
+                // Only the Task that owns the row may forget it when its
+                // branch is gone too; a subtask never drops the shared root.
+                let valid = if workspace.task_id == admission.claiming_task.id {
+                    manager
+                        .ensure_valid_or_forget(
+                            &admission.claiming_task,
+                            workspace,
+                            Purpose::Execute,
+                        )
+                        .await
+                } else {
+                    manager
+                        .ensure_valid(&admission.claiming_task, workspace, Purpose::Execute)
+                        .await
+                }?;
+                if valid.repair() != crate::workspace_manager::Repair::None {
+                    info!(
+                        task_id = %admission.claiming_task.id,
+                        workspace_id = %valid.workspace().id,
+                        placement_id = %admission.placement.id,
+                        repair = ?valid.repair(),
+                        rescued_ref = valid.rescued_ref().unwrap_or(""),
+                        "workspace repaired at claim"
+                    );
+                }
+                valid.into_workspace()
+            } else {
+                // A row that is not `ready` (a cleaned workspace awaiting its
+                // next run) is rebuilt by the create-or-reuse path.
+                prepare_workspace(
+                    &self.db,
+                    &self.workspace_root,
+                    &admission.claiming_task,
+                    &admission.claiming_task.id,
+                    self.repo_cache_locks.clone(),
+                    &self.workspace_backend_router,
+                )
+                .await?
+            };
+            admission.workspace = clear_workspace_cleanup_after(&self.db, workspace).await?;
+            admission.placement =
+                WorkspacePlacementRepo::get_by_id(&*self.db, &admission.placement.id)
+                    .await?
+                    .ok_or(DbError::NotFound)?;
+            return Ok(admission);
+        }
         if admission.placement.state == PlacementState::Ready {
+            // A daemon answers for its own placement; Forge never interprets
+            // its handle.
             let needs_recreation = match async {
                 let backend = self
                     .workspace_backend_router
@@ -940,12 +1003,6 @@ impl TaskService {
             .await
             {
                 Ok(state) => !state.exists,
-                Err(error)
-                    if admission.placement.owner_kind == PlacementOwnerKind::Server
-                        && worktree_describe_needs_recreation(&error) =>
-                {
-                    true
-                }
                 Err(error) => {
                     let cause = match &error {
                         crate::workspace_backend::WorkspaceBackendError::StaleGeneration {
@@ -1339,17 +1396,11 @@ async fn ensure_valid_for(
             placement_id = %valid.resolved().placement.id,
             purpose = ?purpose,
             repair = ?valid.repair(),
+            rescued_ref = valid.rescued_ref().unwrap_or(""),
             "workspace repaired before use"
         );
     }
     Ok(valid.into_workspace())
-}
-
-fn worktree_describe_needs_recreation(
-    error: &crate::workspace_backend::WorkspaceBackendError,
-) -> bool {
-    matches!(error, crate::workspace_backend::WorkspaceBackendError::Other(error)
-        if matches!(&**error, ServiceError::Git(_)))
 }
 
 /// Prepare a workspace and report whether this call won creation ownership.
@@ -3154,6 +3205,95 @@ pub(crate) mod tests {
             .unwrap(),
             sha
         );
+    }
+
+    /// The claim is the launch guard every executor family shares (a CLI
+    /// executor has no later check of its own): a worktree left off the
+    /// Task branch is put back on it before anything is started there, and
+    /// no commit is lost.
+    #[tokio::test]
+    async fn placement_claim_returns_an_off_branch_worktree_to_the_task_branch() {
+        fn git_in(cwd: &Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env("GIT_AUTHOR_NAME", "Forge Test")
+                .env("GIT_AUTHOR_EMAIL", "forge@example.com")
+                .env("GIT_COMMITTER_NAME", "Forge Test")
+                .env("GIT_COMMITTER_EMAIL", "forge@example.com")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        for diverged in [false, true] {
+            let db = Arc::new(sqlite_db().await);
+            let repo = TempDir::new().unwrap();
+            let root = TempDir::new().unwrap();
+            let (project_id, _) = seed_project_with_real_repo(&db, repo.path()).await;
+            let task = seed_task(&db, &project_id, None).await;
+            let agent = seed_unpinned_claim_agent(&db).await;
+            let service = TaskService::new(db.clone(), Arc::new(EventBus::default()))
+                .with_workspace_root(root.path().to_path_buf());
+            let admission = service
+                .reserve_claim_workspace(&task, Some(&agent), "coder")
+                .await
+                .unwrap();
+            let prepared = service.prepare_claim_workspace(admission).await.unwrap();
+            let path = PathBuf::from(prepared.placement.workspace_handle.clone().unwrap());
+            let branch = prepared.workspace.branch.clone();
+            let task_ref = format!("refs/heads/{branch}");
+            let base = git_in(&path, &["rev-parse", "HEAD"]);
+            if diverged {
+                git_in(&path, &["commit", "-q", "--allow-empty", "-m", "task work"]);
+            }
+            let branch_tip = git_in(&path, &["rev-parse", "HEAD"]);
+            git_in(&path, &["checkout", "-q", "--detach", &base]);
+            git_in(&path, &["commit", "-q", "--allow-empty", "-m", "stray"]);
+            let stray = git_in(&path, &["rev-parse", "HEAD"]);
+            let before = TaskRepo::get_by_id(&*db, &task.id, false).await.unwrap();
+
+            let admission = service
+                .reserve_claim_workspace(&task, Some(&agent), "coder")
+                .await
+                .unwrap();
+            let claimed = service.prepare_claim_workspace(admission).await.unwrap();
+
+            assert_eq!(claimed.workspace.id, prepared.workspace.id);
+            assert_eq!(claimed.placement.generation, prepared.placement.generation);
+            assert_eq!(
+                git_in(&path, &["rev-parse", "--symbolic-full-name", "HEAD"]),
+                task_ref
+            );
+            let rescued = git_in(
+                &path,
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname)",
+                    "refs/forge/rescued",
+                ],
+            );
+            if diverged {
+                assert_eq!(git_in(&path, &["rev-parse", "HEAD"]), branch_tip);
+                assert_eq!(rescued, stray, "the stray commit stays reachable");
+            } else {
+                assert_eq!(git_in(&path, &["rev-parse", "HEAD"]), stray);
+                assert_eq!(rescued, "", "a fast-forward needs no rescue");
+            }
+            assert_eq!(
+                TaskRepo::get_by_id(&*db, &task.id, false).await.unwrap(),
+                before,
+                "the repair spends no budget and changes no Task row"
+            );
+        }
     }
 
     #[tokio::test]

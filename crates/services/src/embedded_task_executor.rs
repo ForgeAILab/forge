@@ -400,11 +400,19 @@ impl EmbeddedTaskExecutor {
         let task = TaskRepo::get_by_id(&*self.db, &ctx.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", ctx.task_id.clone()))?;
-        let workspace_root = crate::task_service::workspace::default_workspace_root();
+        // The Task service's own root and repository-cache locks, so a
+        // recreate here is serialized with every other user of that cache.
+        let task_service = self.embedded_agents.task_service_handle();
+        let workspace_root = task_service.as_ref().map_or_else(
+            crate::task_service::workspace::default_workspace_root,
+            |service| service.workspace_root().to_path_buf(),
+        );
         let valid = crate::workspace_manager::WorkspaceManager::new(
             &self.db,
             &workspace_root,
-            None,
+            task_service
+                .as_ref()
+                .and_then(|service| service.repo_cache_locks.clone()),
             &self.workspace_backend_router,
         )
         .ensure_valid(&task, workspace, crate::workspace_manager::Purpose::Execute)

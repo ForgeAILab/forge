@@ -764,7 +764,8 @@ impl TaskService {
         if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
             return Ok(crate::native_tools::ExecutionOutboxReport::default());
         }
-        let path = resolved.embedded_path()?;
+        // The outbox sits in the Task root, beside the worktree.
+        let path = crate::workspace_manager::task_root_anchor(&resolved)?;
         let report = embedded
             .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
                 task_id: &task.id,

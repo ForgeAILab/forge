@@ -216,24 +216,6 @@ impl EmbeddedWorkspaceBackend {
         Self::ensure_placement(db, workspace, None).await
     }
 
-    pub(crate) async fn recorded_server_path(
-        db: &SqliteDb,
-        workspace: &Workspace,
-    ) -> Result<PathBuf> {
-        let placement = Self::ensure_recorded_server_placement(db, workspace).await?;
-        if placement.owner_kind != PlacementOwnerKind::Server {
-            return Err(WorkspaceBackendError::OwnerUnsupported {
-                owner_kind: placement.owner_kind,
-            });
-        }
-        placement
-            .workspace_handle
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                crate::ServiceError::invalid_operation("workspace has no server handle").into()
-            })
-    }
-
     async fn ensure_placement(
         db: &SqliteDb,
         workspace: &Workspace,
