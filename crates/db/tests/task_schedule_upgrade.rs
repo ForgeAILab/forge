@@ -1,7 +1,8 @@
 //! Replay the scheduler migration on a database written before it, with
 //! queued and claimed steps and running executions in flight: every legacy
-//! row is byte-identical afterwards (but for the two rederived columns), nothing is marked dirty by the upgrade
-//! itself, and a second run is a no-op.
+//! row is byte-identical afterwards in every column it had (but for the two
+//! rederived columns), a column a later migration added is empty on it,
+//! nothing is marked dirty by the upgrade itself, and a second run is a no-op.
 use db::{create_sqlite_pool, new_uuid_v4, run_migrations_from};
 use std::path::PathBuf;
 
@@ -27,16 +28,36 @@ fn scratch(name: &str) -> PathBuf {
 /// the fingerprint), and each rewrite moves the Project's list revision.
 const REDERIVED: &[(&str, &str)] = &[("task", "condition_json"), ("project", "list_revision")];
 
-/// A fingerprint of every other column of every row, in rowid order.
-async fn digest(pool: &db::SqlitePool) -> Vec<(String, i64, String)> {
+/// Columns later migrations add to these tables. A legacy row holds nothing
+/// in them: each is NULL after the upgrade. A column added without being
+/// named here fails the test, so what it holds on a legacy row is decided.
+const ADDED: &[(&str, &str)] = &[
+    // V202610100820: set only while a step is `suspended`.
+    ("task_step", "suspended_until"),
+    ("task_step", "awaited_consumer_id"),
+];
+
+/// Every table's columns, in declaration order.
+async fn columns(pool: &db::SqlitePool) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     for table in TABLES {
-        let columns: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
-        ))
-        .fetch_all(pool)
-        .await
-        .unwrap();
+        out.push(
+            sqlx::query_scalar(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .fetch_all(pool)
+            .await
+            .unwrap(),
+        );
+    }
+    out
+}
+
+/// A fingerprint of the given columns (but the rederived ones) of every row,
+/// in rowid order.
+async fn digest(pool: &db::SqlitePool, columns: &[Vec<String>]) -> Vec<(String, i64, String)> {
+    let mut out = Vec::new();
+    for (table, columns) in TABLES.iter().zip(columns) {
         let expr = columns
             .iter()
             .filter(|c| !REDERIVED.contains(&(*table, c.as_str())))
@@ -154,14 +175,43 @@ async fn upgrade_keeps_every_legacy_row_and_marks_nothing() {
         .await
         .unwrap();
 
-    let before = digest(&pool).await;
+    let legacy = columns(&pool).await;
+    let before = digest(&pool, &legacy).await;
     assert_eq!(before[1].1, 6, "six Tasks");
     assert_eq!(before[2].1, 12, "twelve steps in flight");
     run_migrations_from(&pool, &full).await.unwrap();
     assert_eq!(
         before,
-        digest(&pool).await,
-        "legacy rows are byte-identical after the migration"
+        digest(&pool, &legacy).await,
+        "legacy rows are byte-identical, in every column they had, after the migration"
+    );
+    // No legacy column is gone or moved, and every column added since is one
+    // this test knows and is NULL on every legacy row.
+    let mut added = Vec::new();
+    for ((table, old), new) in TABLES.iter().zip(&legacy).zip(columns(&pool).await) {
+        assert_eq!(
+            old[..],
+            new[..old.len()],
+            "{table} keeps its legacy columns in place"
+        );
+        for column in &new[old.len()..] {
+            let filled: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL"
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(filled, 0, "{table}.{column} is NULL on every legacy row");
+            added.push((*table, column.clone()));
+        }
+    }
+    assert_eq!(
+        added,
+        ADDED
+            .iter()
+            .map(|(table, column)| (*table, column.to_string()))
+            .collect::<Vec<_>>(),
+        "the columns added to legacy tables are the known ones"
     );
     // The upgrade marks nothing: the first lap of the sweep finds every open
     // Task, in pages, behind dispatch.
@@ -197,7 +247,7 @@ async fn upgrade_keeps_every_legacy_row_and_marks_nothing() {
     assert_eq!(integrity, "ok");
     // A second run is a no-op, and the kicks work on the upgraded rows.
     run_migrations_from(&pool, &full).await.unwrap();
-    assert_eq!(before, digest(&pool).await);
+    assert_eq!(before, digest(&pool, &legacy).await);
     sqlx::query("UPDATE task SET status='done', version=version+1 WHERE id='t1'")
         .execute(&pool)
         .await

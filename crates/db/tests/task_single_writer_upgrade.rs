@@ -208,11 +208,25 @@ async fn single_writer_upgrade_on_populated_next_database() {
         .await
         .unwrap();
     assert_eq!(fk_on, 1);
-    let indexes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='task_step' AND name LIKE 'task_step_%'")
-        .fetch_one(&pool)
+    // Every rebuild of `task_step` since must recreate these, by name.
+    let indexes: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='task_step' AND name LIKE 'task_step_%' ORDER BY name")
+        .fetch_all(&pool)
         .await
         .unwrap();
-    assert_eq!(indexes, 7);
+    assert_eq!(
+        indexes,
+        [
+            "task_step_chain",
+            "task_step_expired",
+            "task_step_lane_ready",
+            "task_step_next",
+            "task_step_settled",
+            // V202610100820: suspended steps by their own wake time.
+            "task_step_suspended",
+            "task_step_task_lease",
+            "task_step_workflow_ref",
+        ]
+    );
     // Idempotent re-run.
     run_migrations(&pool).await.unwrap();
     // The upgraded step queue still deletes cleanly with its Task.
