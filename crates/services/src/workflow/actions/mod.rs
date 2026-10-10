@@ -24,7 +24,9 @@ pub(crate) use merge::{conflict_handoff_result, merge_failure_result, record_int
 pub use merge::{
     AutoCascadeOnMergeResult, CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge,
 };
-pub use review::{AutoCascadeOnReviewPass, AutoCascadeOnUnconfiguredReview, RunCiSteps};
+pub use review::{
+    run_ci_steps_in_step, AutoCascadeOnReviewPass, AutoCascadeOnUnconfiguredReview, RunCiSteps,
+};
 pub use subtasks::{
     CancelPendingSubtasks, PropagateDoneToSubtasks, SatisfyDependents, SubtaskSequenceComplete,
 };

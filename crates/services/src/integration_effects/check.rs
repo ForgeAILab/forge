@@ -1,12 +1,7 @@
-//! Command effects and the CI sequence; all storage belongs to the consumer.
-use super::{EffectWorkspace, RunResult, RunSpec};
+//! Command effects; all storage belongs to the consumer.
+use super::{RunResult, RunSpec};
 use crate::{workspace_backend::Result, ServiceError};
-use api_types::CheckCommandOutcome;
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{path::Path, time::Instant};
 
 /// Embedded commands share timeout, stdin, Git environment and output semantics.
 pub async fn run_at(path: &Path, spec: &RunSpec) -> Result<RunResult> {
@@ -170,117 +165,6 @@ async fn run_bounded_environment(path: &Path, spec: &RunSpec) -> Result<RunResul
         stderr_tail: String::from_utf8_lossy(&stderr?).into_owned(),
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
-}
-
-pub struct CheckRunInput<'a> {
-    pub workspace: &'a EffectWorkspace,
-    pub commands: &'a [String],
-    pub purpose: api_types::WorkspaceRunPurpose,
-    pub environment: &'a BTreeMap<String, String>,
-    pub deadline: Option<Duration>,
-    pub max_output_bytes: usize,
-}
-
-pub struct CheckCommand {
-    pub index: usize,
-    pub spec: RunSpec,
-    pub started_at: String,
-}
-
-pub struct CheckRunFailure {
-    pub error: crate::workspace_backend::WorkspaceBackendError,
-    pub completed_steps: usize,
-    pub commands: Vec<CheckCommandOutcome>,
-}
-
-pub struct CheckRunOutcome {
-    pub commands: Vec<CheckCommandOutcome>,
-    pub failed_step_index: Option<usize>,
-}
-
-/// A sequence yields one effect at a time so an owner reply can be recorded
-/// and acknowledged at the old site before the next command is issued.
-pub struct CheckRun<'a> {
-    input: CheckRunInput<'a>,
-    outcome: CheckRunOutcome,
-    sequence: check_executor::CheckSequence,
-}
-
-impl<'a> CheckRun<'a> {
-    pub fn new(input: CheckRunInput<'a>) -> Self {
-        let capacity = input.commands.len();
-        let spec = check_executor::legacy_ci_bundle(
-            input.commands,
-            input.environment,
-            0,
-            input.workspace.owner != super::EffectOwner::Server,
-        );
-        Self {
-            sequence: check_executor::CheckSequence::new(spec),
-            input,
-            outcome: CheckRunOutcome {
-                commands: Vec::with_capacity(capacity),
-                failed_step_index: None,
-            },
-        }
-    }
-    pub fn next_command(&self) -> Option<CheckCommand> {
-        let (index, step) = self.sequence.next_command()?;
-        Some(CheckCommand {
-            index,
-            started_at: chrono::Utc::now().to_rfc3339(),
-            spec: RunSpec {
-                purpose: self.input.purpose,
-                command: step.shell_text.clone(),
-                env: self.input.environment.clone(),
-                timeout_secs: self.input.deadline.map_or(0, |deadline| {
-                    deadline
-                        .as_secs()
-                        .saturating_add(u64::from(deadline.subsec_nanos() != 0))
-                        .max(1)
-                }),
-                max_output_bytes: self.input.max_output_bytes,
-            },
-        })
-    }
-    pub fn completed(&mut self, command: CheckCommand, output: RunResult) {
-        let finished_at = chrono::Utc::now().to_rfc3339();
-        let result = check_executor::command_outcome(
-            command.index,
-            command.spec.command,
-            check_executor::LegacyCommandOutput {
-                exit_code: Some(output.exit_code),
-                stdout: &output.stdout_tail,
-                stderr: &output.stderr_tail,
-            },
-            self.input.environment,
-            command.started_at,
-            finished_at,
-        );
-        let exit_code = result.exit_code;
-        self.sequence.completed(if exit_code == 0 {
-            api_types::CheckExecutionOutcome::Passed
-        } else {
-            api_types::CheckExecutionOutcome::Failed
-        });
-        self.outcome.commands.push(result);
-        if exit_code != 0 {
-            self.outcome.failed_step_index = Some(command.index);
-        }
-    }
-    pub fn infrastructure_failed(
-        self,
-        error: crate::workspace_backend::WorkspaceBackendError,
-    ) -> CheckRunFailure {
-        CheckRunFailure {
-            error,
-            completed_steps: self.outcome.commands.len(),
-            commands: self.outcome.commands,
-        }
-    }
-    pub fn outcome(self) -> CheckRunOutcome {
-        self.outcome
-    }
 }
 
 pub fn tail_bytes(text: &str, max_bytes: usize) -> String {

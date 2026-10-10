@@ -27,12 +27,21 @@ use tower::ServiceExt;
 pub struct StepWorkerGuard {
     stop: tokio::sync::watch::Sender<bool>,
     job: tokio::task::JoinHandle<()>,
+    /// Review-entry CI is a check the durable runner executes: without its
+    /// worker a Task entering review would wait for a result forever.
+    checks: Option<tokio::task::JoinHandle<()>>,
 }
 impl StepWorkerGuard {
     pub fn start(state: &AppState) -> Self {
         let (stop, signal) = tokio::sync::watch::channel(false);
         Self {
             stop,
+            checks: state.task_service.check_worker().map(|worker| {
+                worker.start(
+                    &state.operator_status_service.periodic_workers(),
+                    signal.clone(),
+                )
+            }),
             job: state.task_service.task_step_worker().start(signal),
         }
     }
@@ -41,6 +50,21 @@ impl StepWorkerGuard {
     pub fn stop(&self) {
         let _ = self.stop.send(true);
         self.job.abort();
+        if let Some(checks) = &self.checks {
+            checks.abort();
+        }
+    }
+}
+impl StepWorkerGuard {
+    /// Stop only the check worker: a test that settles its check runs by
+    /// hand must not race the real one for them.
+    pub async fn stop_checks(&self) {
+        if let Some(checks) = &self.checks {
+            checks.abort();
+            while !checks.is_finished() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
     }
 }
 impl Drop for StepWorkerGuard {
@@ -50,7 +74,7 @@ impl Drop for StepWorkerGuard {
 }
 
 pub struct Harness {
-    _step_worker: StepWorkerGuard,
+    pub step_worker: StepWorkerGuard,
     pub app: Router,
     pub state: Arc<AppState>,
     _web_dist_dir: TestDir,
@@ -58,7 +82,7 @@ pub struct Harness {
 
 impl Harness {
     pub fn stop_step_worker(&self) {
-        self._step_worker.stop();
+        self.step_worker.stop();
     }
 }
 
@@ -142,7 +166,7 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
     Harness {
-        _step_worker: StepWorkerGuard::start(&state),
+        step_worker: StepWorkerGuard::start(&state),
         app,
         state,
         _web_dist_dir: web_dist_dir,

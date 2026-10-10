@@ -3782,7 +3782,7 @@ async fn subtask_user_override_into_merging_without_merge_service_completes() {
 #[tokio::test]
 async fn system_review_ci_placement_error_retries_without_review_rejection() {
     use crate::workspace_backend as ws;
-    struct UnreachableOnce(std::sync::atomic::AtomicBool);
+    struct UnreachableOnce(std::sync::atomic::AtomicBool, Arc<dyn ws::WorkspaceBackend>);
     #[async_trait::async_trait]
     impl ws::WorkspaceBackend for UnreachableOnce {
         async fn prepare(
@@ -3792,26 +3792,23 @@ async fn system_review_ci_placement_error_retries_without_review_rejection() {
         ) -> ws::Result<ws::PreparedWorkspace> {
             unreachable!()
         }
-        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
-            unreachable!()
+        // Review-entry CI is asked of the check runner; the hook itself only
+        // reads the checkout's HEAD from its owner, so the outage is met there.
+        async fn describe(&self, p: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
+            if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Err(ws::WorkspaceBackendError::OwnerUnreachable {
+                    daemon_id: "review-owner".into(),
+                })
+            } else {
+                self.1.describe(p).await
+            }
         }
         async fn run(
             &self,
             _: &db::WorkspacePlacement,
             _: &ws::RunSpec,
         ) -> ws::Result<ws::RunResult> {
-            if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                Err(ws::WorkspaceBackendError::OwnerUnreachable {
-                    daemon_id: "review-owner".into(),
-                })
-            } else {
-                Ok(ws::RunResult {
-                    exit_code: 0,
-                    stdout_tail: String::new(),
-                    stderr_tail: String::new(),
-                    duration_ms: 1,
-                })
-            }
+            unreachable!()
         }
         async fn diff(&self, _: &db::WorkspacePlacement, _: &ws::DiffSpec) -> ws::Result<ws::Diff> {
             unreachable!()
@@ -3865,8 +3862,23 @@ async fn system_review_ci_placement_error_retries_without_review_rejection() {
         .execute(fixture.db.pool())
         .await
         .unwrap();
+    // The reconnected owner answers for the real checkout, where the check
+    // runner then runs a passing step.
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(json!({"retry_budgets":{"review":1},"review":{"ci_steps":["true"]}}).to_string())
+        .bind(&fixture.task.id)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let owner = fixture
+        .engine
+        .workspace_backend_router
+        .resolve(&fixture.db, &fixture.workspace)
+        .await
+        .unwrap()
+        .backend;
     fixture.engine.workspace_backend_router = Arc::new(ws::WorkspaceBackendRouter::new(Arc::new(
-        UnreachableOnce(std::sync::atomic::AtomicBool::new(true)),
+        UnreachableOnce(std::sync::atomic::AtomicBool::new(true), owner),
     )));
     let result = fixture
         .engine
@@ -3937,23 +3949,8 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
         task_id: String,
         authority_loss: bool,
     }
-    #[async_trait::async_trait]
-    impl ws::WorkspaceBackend for ReviewCiFault {
-        async fn prepare(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::PrepareSpec,
-        ) -> ws::Result<ws::PreparedWorkspace> {
-            unreachable!()
-        }
-        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
-            unreachable!()
-        }
-        async fn run(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::RunSpec,
-        ) -> ws::Result<ws::RunResult> {
+    impl ReviewCiFault {
+        async fn outage(&self) -> ws::Result<ws::RunResult> {
             if self.authority_loss {
                 sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
                     .bind(&self.task_id)
@@ -3974,7 +3971,29 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
                 })
             }
         }
-
+    }
+    #[async_trait::async_trait]
+    impl ws::WorkspaceBackend for ReviewCiFault {
+        async fn prepare(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::PrepareSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        // Review-entry CI is asked of the check runner; the hook itself only
+        // reads the checkout's HEAD from its owner, so the outage is met there.
+        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
+            self.outage().await?;
+            unreachable!("the injected owner never answers")
+        }
+        async fn run(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::RunSpec,
+        ) -> ws::Result<ws::RunResult> {
+            unreachable!()
+        }
         async fn diff(&self, _: &db::WorkspacePlacement, _: &ws::DiffSpec) -> ws::Result<ws::Diff> {
             unreachable!()
         }
@@ -5048,23 +5067,8 @@ async fn review_ci_infrastructure_second_entry_gets_full_allowance() {
         task_id: String,
         authority_loss: bool,
     }
-    #[async_trait::async_trait]
-    impl ws::WorkspaceBackend for ReviewCiFault {
-        async fn prepare(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::PrepareSpec,
-        ) -> ws::Result<ws::PreparedWorkspace> {
-            unreachable!()
-        }
-        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
-            unreachable!()
-        }
-        async fn run(
-            &self,
-            _: &db::WorkspacePlacement,
-            _: &ws::RunSpec,
-        ) -> ws::Result<ws::RunResult> {
+    impl ReviewCiFault {
+        async fn outage(&self) -> ws::Result<ws::RunResult> {
             if self.authority_loss {
                 sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
                     .bind(&self.task_id)
@@ -5085,7 +5089,29 @@ async fn review_ci_infrastructure_second_entry_gets_full_allowance() {
                 })
             }
         }
-
+    }
+    #[async_trait::async_trait]
+    impl ws::WorkspaceBackend for ReviewCiFault {
+        async fn prepare(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::PrepareSpec,
+        ) -> ws::Result<ws::PreparedWorkspace> {
+            unreachable!()
+        }
+        // Review-entry CI is asked of the check runner; the hook itself only
+        // reads the checkout's HEAD from its owner, so the outage is met there.
+        async fn describe(&self, _: &db::WorkspacePlacement) -> ws::Result<ws::WorkspaceState> {
+            self.outage().await?;
+            unreachable!("the injected owner never answers")
+        }
+        async fn run(
+            &self,
+            _: &db::WorkspacePlacement,
+            _: &ws::RunSpec,
+        ) -> ws::Result<ws::RunResult> {
+            unreachable!()
+        }
         async fn diff(&self, _: &db::WorkspacePlacement, _: &ws::DiffSpec) -> ws::Result<ws::Diff> {
             unreachable!()
         }

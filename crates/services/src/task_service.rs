@@ -423,6 +423,11 @@ pub struct TaskService {
     /// check results through it.
     pub(crate) check_consumers:
         Arc<std::sync::OnceLock<Arc<crate::check_runner::consumer::TaskCheckConsumers>>>,
+    /// Bound once by the runtime: the worker that executes requested
+    /// checks. A harness that starts the Task-step worker on its own starts
+    /// this one with it, or no check a step asks for is ever answered.
+    pub(crate) check_worker:
+        Arc<std::sync::OnceLock<Arc<crate::check_runner::worker::CheckRunWorker>>>,
     pub(crate) db: Arc<SqliteDb>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) merge_service: Option<Arc<MergeService>>,
@@ -516,6 +521,46 @@ pub struct LaunchExecutionResult {
 impl TaskService {
     /// The durable check runner's Task-step consumer contract, once the
     /// runtime has composed it. Consumer families register through it.
+    pub fn check_worker(&self) -> Option<Arc<crate::check_runner::worker::CheckRunWorker>> {
+        self.check_worker.get().cloned()
+    }
+    /// The check worker `drain` drives. The runtime composes the real one
+    /// (with its daemon owners) before any step runs; a service built
+    /// without a runtime gets a server-only check runtime here, so a
+    /// drained Task's review-entry CI still runs in its embedded worktree.
+    pub fn check_worker_or_embedded(&self) -> Arc<crate::check_runner::worker::CheckRunWorker> {
+        if let Some(worker) = self.check_worker() {
+            return worker;
+        }
+        let consumers = self.check_consumers.get_or_init(|| {
+            let consumers = Arc::new(crate::check_runner::consumer::TaskCheckConsumers::new(
+                self.db.clone(),
+                Arc::new(crate::check_runner::CheckRunner::new(self.db.clone())),
+            ));
+            consumers.register(
+                db::CheckConsumerOrigin::Entry,
+                Arc::new(crate::check_runner::review_entry::ReviewEntryChecks::new(
+                    self.db.clone(),
+                )),
+            );
+            consumers
+        });
+        let _ = consumers;
+        self.check_worker
+            .get_or_init(|| {
+                Arc::new(crate::check_runner::worker::CheckRunWorker::new(
+                    self.db.clone(),
+                    Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
+                        self.db.clone(),
+                        Arc::new(
+                            crate::daemon_transport::DaemonConnectionRegistry::without_handlers(),
+                        ),
+                        std::time::Duration::from_secs(60),
+                    )),
+                ))
+            })
+            .clone()
+    }
     pub fn check_consumers(
         &self,
     ) -> Option<Arc<crate::check_runner::consumer::TaskCheckConsumers>> {
@@ -540,6 +585,7 @@ impl TaskService {
             task_step_driver: Arc::default(),
             task_step_replies: Arc::default(),
             check_consumers: Arc::default(),
+            check_worker: Arc::default(),
             event_bus,
             merge_service: None,
             cleanup_scheduler: None,

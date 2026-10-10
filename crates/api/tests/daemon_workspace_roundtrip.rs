@@ -1693,22 +1693,14 @@ async fn task_projection(fixture: &Fixture) -> (String, Vec<(String, String)>, i
 }
 
 #[tokio::test]
-async fn remote_ci_pass_failure_and_infrastructure_record_review_receipts_and_events() {
-    use services::workflow::{
-        actions::RunCiSteps, default_workflow, HookAction, HookContext, HookResult,
-    };
-    for case in ["pass", "fail", "infrastructure"] {
-        let fixture = if case == "infrastructure" {
-            Fixture::with_policy(
-                "forge-ci-infrastructure-characterization",
-                WorkspaceRunPolicy {
-                    allowed_purposes: vec![WorkspaceRunPurpose::Hook],
-                },
-            )
-            .await
-        } else {
-            Fixture::new("forge-ci-characterization").await
-        };
+async fn remote_ci_pass_and_failure_record_reviews_and_events() {
+    use services::workflow::{default_workflow, HookContext, HookResult};
+    // Review-entry CI of a daemon-placed Task is a check the durable runner
+    // executes on that daemon (legacy policy: always runs, never reused). A
+    // run the daemon cannot execute is no verdict and parks the Task on the
+    // typed check condition; that path is covered by the check-runner tests.
+    for case in ["pass", "fail"] {
+        let fixture = Fixture::new("forge-ci-characterization").await;
         let state = &fixture.harness.state;
         let task_id = &fixture.resolved.placement.task_id;
         let task = TaskRepo::get_by_id(&*state.db, task_id, false)
@@ -1752,7 +1744,11 @@ async fn remote_ci_pass_failure_and_infrastructure_record_review_receipts_and_ev
             execution_id: Some(fixture.execution_id.clone()),
             state_config: json!({"ci_steps": [command, "printf second"]}),
         };
-        let result = RunCiSteps.execute(&ctx).await;
+        let worker = state
+            .task_service
+            .check_worker()
+            .expect("the runtime composes the check worker");
+        let result = services::workflow::actions::run_ci_steps_in_step(&ctx, &worker).await;
         let reviews = ReviewRepo::list_by_task(&*state.db, task_id).await.unwrap();
         assert_eq!(reviews.len(), 1, "{case}: {result:?}");
         let details: Value = serde_json::from_str(&reviews[0].step_results_json).unwrap();
@@ -1777,33 +1773,8 @@ async fn remote_ci_pass_failure_and_infrastructure_record_review_receipts_and_ev
                 assert_eq!(details["ci_steps"][0]["output_tail"], "failure\ndiagnostic");
                 assert!(task.review_passed_at.is_none());
             }
-            _ => {
-                assert!(matches!(result, HookResult::Failed { .. }));
-                assert_eq!(reviews[0].status, ReviewStatus::Cancelled);
-                assert!(task.review_passed_at.is_none());
-            }
+            _ => unreachable!(),
         }
-        let expected_commands = if case == "pass" { 2 } else { 1 };
-        let requests = fixture
-            .link
-            .as_ref()
-            .unwrap()
-            .requests(METHOD_WORKSPACE_RUN);
-        assert_eq!(requests.len(), expected_commands);
-        assert_eq!(requests[0]["timeout_secs"], 0);
-        assert_eq!(requests[0]["max_output_bytes"], json!(u64::MAX));
-        let receipt = fixture.receipt(METHOD_WORKSPACE_RUN).await;
-        assert_eq!(
-            receipt["metadata"]["status"],
-            if case == "infrastructure" {
-                "error"
-            } else {
-                "result"
-            }
-        );
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type='workspace.operation_recorded' AND scope_id=? AND json_extract(payload_json,'$.method')=? AND json_extract(payload_json,'$.status') IN ('result','error')")
-            .bind(task_id).bind(METHOD_WORKSPACE_RUN).fetch_one(state.db.pool()).await.unwrap();
-        assert_eq!(count, expected_commands as i64);
         let comments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_comment WHERE task_id=?")
             .bind(task_id)
             .fetch_one(state.db.pool())
@@ -1820,8 +1791,7 @@ async fn remote_ci_pass_failure_and_infrastructure_record_review_receipts_and_ev
             review_events,
             match case {
                 "pass" => vec!["review.passed"],
-                "fail" => vec!["review.failed"],
-                _ => vec![],
+                _ => vec!["review.failed"],
             }
         );
         assert_eq!(

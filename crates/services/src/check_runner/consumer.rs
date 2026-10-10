@@ -260,6 +260,36 @@ impl TaskCheckConsumers {
             .await
     }
 
+    /// The verdict a consumer has been answered with, read by the step that
+    /// asked once it is woken. `None` while its run has produced no result,
+    /// or when the consumer was cancelled.
+    pub async fn verdict(&self, consumer_id: &str) -> Result<Option<CheckVerdict>> {
+        let Some(state) = self.store.check_consumer_delivery(consumer_id).await? else {
+            return Ok(None);
+        };
+        if state.cancelled_at.is_some() {
+            return Ok(None);
+        }
+        let Some(result_id) = state.consumer.result_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(result) = self.store.check_result(result_id).await? else {
+            return Ok(None);
+        };
+        if result.identity_key != state.consumer.identity_key {
+            return Err(ServiceError::invalid_operation(
+                "check consumer holds a result for another identity",
+            ));
+        }
+        Ok(Some(
+            if result.outcome == CheckResultOutcome::InfrastructureFailed {
+                CheckVerdict::InfrastructureExhausted(result)
+            } else {
+                CheckVerdict::Result(result)
+            },
+        ))
+    }
+
     /// The `apply_check_result` Task step. `step_id` is the claimed step:
     /// only the step recorded as the consumer's delivery may apply, once.
     /// An error means the envelope is not this consumer's delivery (the step

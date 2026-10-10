@@ -814,6 +814,12 @@ impl ForgeRuntimeBuilder {
                 (*task_service).clone(),
             )),
         );
+        check_consumers.register(
+            db::CheckConsumerOrigin::Entry,
+            Arc::new(crate::check_runner::review_entry::ReviewEntryChecks::new(
+                self.db.clone(),
+            )),
+        );
         let check_owners = Arc::new(crate::check_runner::owners::WorkspaceCheckOwners::new(
             self.db.clone(),
             daemon_connections.clone(),
@@ -823,6 +829,7 @@ impl ForgeRuntimeBuilder {
             self.db.clone(),
             check_owners,
         ));
+        let _ = task_service.check_worker.set(check_worker.clone());
         let plugin_registry = lifecycle_plugin_registry();
         let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new_with_router(
             Arc::clone(&self.db),

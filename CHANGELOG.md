@@ -8,6 +8,48 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Review-entry CI runs on the durable check runner (3.3 stage D part 2).**
+  The `ci_steps` a Task runs when it enters `review` are no longer executed
+  inside the Task's hooks step: the step asks the check runner and waits
+  suspended while the runner executes them. What changes for a Project:
+  - **Each run has a 3600 s wall limit.** The inline path had none. A run
+    that reaches it is stopped; the review attempt is cancelled and the
+    entry fails with `review command timed out`, exactly as a CI timeout was
+    already handled. A cancelled run fails the entry with `review check did
+    not finish`.
+  - **A step's background processes are stopped when the run ends.** A
+    `ci_steps` command that leaves a process behind (a dev server, a
+    watcher) no longer leaves it running after the checks finish.
+  - **Blank `ci_steps` entries are neither run nor listed.** An empty or
+    whitespace-only entry used to run `bash -lc ""` and appear in the Review
+    evidence; it is now dropped. A list with only blank entries auto-passes
+    with no run, like an empty list.
+  - **Review CI entries no longer carry `rerun_after_interruption`.** A
+    restart no longer re-runs the sequence from inside the hook: the check
+    run itself survives the restart and the hook reads its result, so there
+    is one review attempt and one run. (Before-work script log entries keep
+    the field.)
+  - The CI steps run with the same environment as before (the Project
+    environment over the server's login-shell environment). Each review
+    entry costs one extra login-shell start, used to attest that
+    environment.
+  - **A re-review of an unchanged commit in the same worktree runs no CI.**
+    The earlier passing result is reused. Reuse is per worktree, per Forge
+    version and per server environment: a changed commit, a dirty tree, a
+    changed command, a changed Project environment value or a changed
+    inherited variable always runs. Limits: Forge cannot see a tool upgraded
+    in place under the same path, files ignored by Git, the passage of time,
+    or anything a step reads from the network, so a check that depends on
+    one of those may be reused when it would now give another answer.
+  - **Daemon-placed Tasks always run**: their result is never reused.
+  - While the checks run the Task shows the typed check wait
+    (`condition.primary.kind = "check"`) and its hooks step has the new step
+    status `suspended` (not `pending`): Cancel and Hold no longer wait for
+    the running command, they supersede the suspended step, the review
+    attempt is cancelled and the run is stopped once the Task has left the
+    status entry. A run that produces no verdict after its automatic
+    infrastructure retries parks the Task on the check condition, which
+    offers `retry` and `cancel`.
 - **The managed Codex home and Task hook logs moved (3.4 stage C part 1).**
   The Forge-owned Codex home of a Task is now
   `<task root>/.forge-task/home/codex` instead of

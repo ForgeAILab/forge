@@ -3,6 +3,7 @@ pub mod consumer;
 pub mod owners;
 pub mod policy;
 mod receipt;
+pub mod review_entry;
 pub mod worker;
 
 use crate::{Result, ServiceError};

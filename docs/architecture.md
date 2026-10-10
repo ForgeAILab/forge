@@ -6317,8 +6317,11 @@ checkpoint indexes. These scripts already run on
 entries to planning, in_progress, review and merge_failed: retrying or sending a
 Task back runs them again, so they already must be repeatable and crash resumption
 adds no new requirement. A resumed script's hook log includes
-rerun_after_interruption: true and its step_id; resumed CI command entries carry
-the same evidence. CI may restart the entire check sequence after a crash.
+rerun_after_interruption: true and its step_id. Review-entry CI is not run by
+the hook itself (see "Review-entry CI on the check runner"): after a crash the
+check run is reconciled by the check worker and the woken hook reads its
+result, so CI command entries carry their `step_id` but never
+`rerun_after_interruption`.
 
 All runtime writes to an existing Task's workflow state execute through a claimed
 Task step. Owner commands, claims, execution settlement, dispatcher effects,
@@ -7079,7 +7082,8 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
   projection, and `WorkspaceCleanupScheduler`.
 - **review** — the workflow's `run_ci_steps` hook prepares the Workspace and
-  runs configured checks before ordinary reviewer dispatch. `ReviewRunner`
+  asks the durable check runner for the configured checks before ordinary
+  reviewer dispatch; its hooks step waits `suspended` for the result. `ReviewRunner`
   owns explicit reviewer/auditor reruns. Task configuration
   overrides the Project's `default_review_config`; otherwise the Project
   defaults are inherited. A ready Project Agent can replace both
@@ -8399,6 +8403,72 @@ Neither the spec revision nor the digest schema changes: the policy string is
 already a digest input, so no stored result of a legacy policy can satisfy a
 canonical request. No result was ever stored under `canonical-ci/1` before
 this definition, so the policy revision stays `1`.
+
+#### Review-entry CI on the check runner (3.3 stage D part 2)
+
+`run_ci_steps` no longer runs commands. In its hooks step it
+
+1. opens the review attempt (hook effect `ci_review`; a woken or redelivered
+   step continues that attempt and never opens a second),
+2. builds the `EntryCi` check spec with `canonical_policy: true` and the
+   worktree identity (a daemon placement gets its legacy policy from the
+   builder and is never reused; blank `ci_steps` entries are dropped, and a
+   spec with no command passes with no request), and asks
+   `TaskCheckConsumers::request` once (hook effect `ci_consumer`) with
+   origin `entry`, authority = the review attempt id and a 3600 s wall limit,
+3. reads `TaskCheckConsumers::verdict`. A `Hit` already carries its result
+   and is settled in the same invocation. Otherwise the hook asks the engine
+   to suspend the step (`durable::suspend_hook`).
+
+**A suspended hooks step is its own durable state.** `task_step.status =
+'suspended'` (V202610100820) with `suspended_until` (the latest time it looks
+again: wall limit + 120 s) and `awaited_consumer_id`. The step gives up its
+lease, keeps its open hook checkpoint and is not charged the attempt. Readers:
+
+| Reader | Suspended step |
+|---|---|
+| claim (`claim_step_lane`), predecessor ordering, `queued_admissions` | never a candidate, never blocks a later step: the delivery step, owner commands and queued effects run while CI runs |
+| `pending_steps`, `TaskStepWorker::drain`, `TaskBusy` counts, operator queue depth | not counted: nothing in the step queue can advance it |
+| `entry_hooks_pending`, the condition producer's hooks owner, `schedule_reads.queue_owned`, `schedule_has_owner`, stranded-hooks sweep, a preempting command's `preempting_hooks` | counted: the entry is still owned and its checks have not settled |
+| `due_schedule_tasks` | due at `suspended_until` |
+| preempting Cancel/Hold (`enqueue_step_in_tx`) | superseded like a pending entry-fenced step |
+| retention (`prune_steps`) | never pruned |
+
+Wakes move it back to `pending`: the awaited consumer's delivery
+(`ReviewEntryChecks::apply` → `wake_suspended_hooks`, by consumer id), or,
+ahead of every claim, `wake_due_suspended` for a passed deadline or a Task
+that left the step's status entry (the ordinary entry fence then supersedes
+it). The woken step runs `run_ci_steps` again; it reads the verdict itself,
+because a delivery step cannot write into a step it has not claimed. The
+delivery step no longer needs a priority to pass the waiting step, so check
+deliveries are ordinary priority-0 steps again.
+
+Settlement is unchanged: the result's commands become the Review's
+`ci_steps` (same fields, 4096-byte tails; a result row that would exceed its
+262144-byte cap gets shorter tails), then the same Review/Task projection,
+comment and events as before. `TimedOut` and `Cancelled` cancel the review
+attempt and fail the hook. Exhausted infrastructure is no verdict: the Task
+is parked on the typed check condition and the step re-suspends at each
+deadline until the owner's `retry` produces a result.
+
+A step superseded while suspended (Cancel, Hold, any transition out of the
+entry) leaves an open review attempt behind:
+`review_entry::abandon_superseded_waits` cancels it (`execution_retry.status =
+cancelled_authority_lost`). The consumer is cancelled by the check worker once
+the Task's status epoch has moved, and a run with no live consumer is stopped.
+
+Review entry and the integration queue share the one check-witness slot of a
+Task. They never collide: a consumer row carries its origin and is delivered
+only to that origin's family, each family's `current_authority` names a
+different object (the running review attempt with no CI evidence; the
+`checking` integration attempt of that epoch), and the two occur in
+different Task statuses, so a late delivery of one is `Stale` (epoch or
+authority) before either family's `apply` runs.
+
+`TaskStepWorker::drain` (tests and service utilities) drives the check
+worker's sweep itself while the drained Task awaits an undelivered check, so
+a drain still ends with the entry settled. A `TaskService` built without the
+runtime gets a server-only check runtime on first drain.
 
 The owner supervision guarantees tested here cover normal cancellation, dropped
 futures, retained receipts and restart reconciliation. Abrupt process death
