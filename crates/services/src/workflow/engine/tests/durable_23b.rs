@@ -1214,6 +1214,248 @@ async fn a_suspended_step_whose_consumer_is_lost_fails_instead_of_waiting_foreve
     worker.await.unwrap();
 }
 
+/// Sweep the check worker until `consumer_id` has its delivery step, and
+/// return that step's id and envelope. The step is not executed.
+async fn delivery_of(
+    fixture: &FailedCiFixture,
+    checks: &Arc<crate::check_runner::worker::CheckRunWorker>,
+    consumer_id: &str,
+) -> (String, db::CheckResultDelivery) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let step: Option<String> =
+            sqlx::query_scalar("SELECT delivery_step_id FROM check_consumer WHERE id=?")
+                .bind(consumer_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap();
+        if let Some(step) = step {
+            let payload: String = sqlx::query_scalar("SELECT payload_json FROM task_step WHERE id=?")
+                .bind(&step)
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(payload["operation"], "apply_check_result");
+            return (
+                step,
+                serde_json::from_value(payload["arguments"].clone()).unwrap(),
+            );
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no delivery step for {consumer_id}"
+        );
+        let mut jobs = tokio::task::JoinSet::new();
+        checks.sweep(&mut jobs).await.unwrap();
+        while let Some(job) = jobs.join_next().await {
+            job.unwrap().unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+// The cross-family fence, at the delivery: review entry and the integration
+// queue share the one check-witness slot of a Task status entry. A delivery
+// is applied only through its own consumer's family and step, under that
+// family's current authority. An integration delivery that arrives while
+// review entry waits is stale and leaves the entry untouched; neither
+// envelope can be re-labelled for, or carried by the step of, the other.
+#[tokio::test]
+async fn a_check_delivery_is_never_consumed_by_the_other_family() {
+    use crate::check_runner::consumer::{CheckApplyOutcome, CheckStaleReason, TaskCheckRequest};
+    let fixture = approval_ci_fixture(json!(["echo reviewed"])).await;
+    enter_review(&fixture, "CI entry").await;
+    let checks = fixture.engine.check_worker_or_embedded();
+    let consumers = fixture
+        .engine
+        .check_consumers()
+        .expect("the check runtime is composed");
+    let (stop, signal) = tokio::sync::watch::channel(false);
+    let worker = Arc::new(TaskStepWorker::new(fixture.engine.clone())).start(signal);
+    let suspended = "SELECT COUNT(*) FROM task_step WHERE kind='hooks' AND status='suspended'";
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while count(&fixture, suspended).await != 1 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hooks step suspends on its check");
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+
+    let entry_id: String = sqlx::query_scalar("SELECT id FROM check_consumer WHERE origin='entry'")
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap();
+    let (entry_step, entry_delivery) = delivery_of(&fixture, &checks, &entry_id).await;
+    assert_eq!(entry_delivery.origin, db::CheckConsumerOrigin::Entry);
+
+    // The integration family asks for the same commit under its own
+    // authority, from a claimed step of the Task, in the same status entry.
+    let task = TaskRepo::get_by_id(&*fixture.db, &fixture.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let epoch = db::CheckDeliveryRepo::live_task_epoch(&*fixture.db, &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let run = db::CheckWorkerRepo::check_worker_record(&*fixture.db, &entry_delivery.run_id)
+        .await
+        .unwrap()
+        .run;
+    let asking = new_uuid_v4();
+    db::TaskStepRepo::enqueue_step(
+        &*fixture.db,
+        &db::EnqueueTaskStep {
+            kind: "command".to_owned(),
+            id: asking.clone(),
+            task_id: task.id.clone(),
+            payload_json: "{}".to_owned(),
+            causation_step_id: None,
+            causation_key: asking.clone(),
+            chain_id: asking.clone(),
+            chain_position: 1,
+            expected_status: task.status.clone(),
+            expected_version: task.version,
+            expected_epoch: None,
+            lane: "fast".to_owned(),
+            available_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task_step SET status='claimed',claimed_by='integration-asker',lease_until=? WHERE id=?")
+        .bind(db::task_writer::lease_deadline())
+        .bind(&asking)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let step = fixture
+        .db
+        .task_steps(&task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|step| step.id == asking)
+        .unwrap();
+    let requested = db::task_writer::in_task_step(
+        step,
+        consumers.request(TaskCheckRequest {
+            task_id: task.id.clone(),
+            status_epoch: epoch,
+            authority: "integration-attempt-1".to_owned(),
+            origin: db::CheckConsumerOrigin::Integration,
+            purpose: api_types::CheckPurpose::QueueHeadCi,
+            identity: run.identity.clone(),
+            workspace_id: run.workspace_id.clone(),
+            machine_id: None,
+            wall_timeout_seconds: 60,
+        }),
+    )
+    .await
+    .expect("the integration family asks");
+    sqlx::query("DELETE FROM task_step WHERE id=?")
+        .bind(&asking)
+        .execute(fixture.db.pool())
+        .await
+        .unwrap();
+    let integration_id = requested.consumer.id.clone();
+    assert_ne!(integration_id, entry_id, "one consumer per family and authority");
+    let (integration_step, integration_delivery) =
+        delivery_of(&fixture, &checks, &integration_id).await;
+    assert_ne!(integration_step, entry_step);
+
+    // Neither envelope can be re-labelled for the other family ...
+    assert!(consumers
+        .apply(
+            &entry_step,
+            &db::CheckResultDelivery {
+                origin: db::CheckConsumerOrigin::Integration,
+                ..entry_delivery.clone()
+            },
+        )
+        .await
+        .is_err());
+    assert!(consumers
+        .apply(
+            &integration_step,
+            &db::CheckResultDelivery {
+                origin: db::CheckConsumerOrigin::Entry,
+                ..integration_delivery.clone()
+            },
+        )
+        .await
+        .is_err());
+    // ... nor carried by the other consumer's delivery step.
+    assert!(consumers
+        .apply(&integration_step, &entry_delivery)
+        .await
+        .is_err());
+    assert!(consumers
+        .apply(&entry_step, &integration_delivery)
+        .await
+        .is_err());
+
+    // The integration delivery arrives while review entry waits: the Task is
+    // in `review`, the integration family names no authority, so it is stale
+    // and the waiting entry is not touched by it.
+    assert_eq!(
+        consumers
+            .apply(&integration_step, &integration_delivery)
+            .await
+            .unwrap(),
+        CheckApplyOutcome::Stale(CheckStaleReason::Authority)
+    );
+    assert_eq!(count(&fixture, suspended).await, 1, "the entry still waits");
+    let reviews = db::ReviewRepo::list_by_task(&*fixture.db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, db::ReviewStatus::Running);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_consumer WHERE applied_at IS NOT NULL"
+        )
+        .await,
+        0
+    );
+
+    // The entry's own delivery wakes the entry's step, and only that.
+    assert_eq!(
+        consumers.apply(&entry_step, &entry_delivery).await.unwrap(),
+        CheckApplyOutcome::Applied
+    );
+    assert_eq!(count(&fixture, suspended).await, 0);
+    assert_eq!(
+        consumers.apply(&entry_step, &entry_delivery).await.unwrap(),
+        CheckApplyOutcome::AlreadyApplied
+    );
+    let settled = drain(fixture.engine.clone(), &task.id).await;
+    assert_eq!(settled.status, "review");
+    let reviews = db::ReviewRepo::list_by_task(&*fixture.db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, db::ReviewStatus::AwaitingHuman);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM check_consumer WHERE origin='integration' AND applied_at IS NOT NULL"
+        )
+        .await,
+        0,
+        "the integration answer was applied to nothing"
+    );
+    assert!(
+        settled.condition.check_witness().is_none(),
+        "the shared witness slot is free once both deliveries are handled: {:?}",
+        settled.condition
+    );
+}
+
 // A Log-policy effect failure settles its step `failed` and is logged; it
 // writes no Task annotation and does not block, as before durable hooks.
 #[tokio::test]
