@@ -21,7 +21,7 @@
 //! and a run can be settled by a caller that never saw its [`SandboxEnv`].
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap},
     ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
@@ -67,15 +67,32 @@ pub const BUILD_DIR_TABLE: [(&str, &str); 1] = [("CARGO_TARGET_DIR", "cargo")];
 /// Per-run temp directories this process created and has not yet removed.
 /// [`sweep_dead_runs`] never touches one: a hook, check, tool command or
 /// execution running in this process is live whatever any table says.
-static LIVE_RUN_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+///
+/// Each maps to the Task root it belongs to (the per-run directory itself may
+/// live in the short directory beside the Task roots), so the garbage
+/// collector can tell which Task roots have a run in this process.
+static LIVE_RUN_DIRS: LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> = LazyLock::new(Mutex::default);
 /// First use of this module by the process. A directory modified after it was
 /// not left by a previous process, so the sweep leaves it alone.
 static PROCESS_START: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
 
-fn live_run_dirs() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+fn live_run_dirs() -> std::sync::MutexGuard<'static, HashMap<PathBuf, PathBuf>> {
     LIVE_RUN_DIRS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether a hook, check, tool command, probe or execution started by this
+/// process is running in `task_root` right now. Covers every run that got a
+/// per-run temp directory; a run without one is not visible here, so callers
+/// that reclaim something a run uses add their own table as well.
+pub fn has_live_run_in(task_root: &Path) -> bool {
+    live_run_dirs().values().any(|root| root == task_root)
+}
+
+/// When this process first used the sandbox. Nothing it runs is older.
+pub fn process_start() -> SystemTime {
+    *PROCESS_START
 }
 
 /// A Task root the workspace owner reserved for Forge.
@@ -166,6 +183,8 @@ impl TaskRoot {
 /// The environment Forge adds to one run from its Task root.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxEnv {
+    /// The Task root this run belongs to, for the live-run registry.
+    root: Option<PathBuf>,
     tmp: Option<PathBuf>,
     build: Vec<(&'static str, PathBuf)>,
 }
@@ -179,6 +198,7 @@ impl SandboxEnv {
     /// The environment of run `run_id` in `task_root`.
     pub fn for_task_root(task_root: &TaskRoot, run_id: &str, purpose: RunPurpose) -> Self {
         Self {
+            root: Some(task_root.0.clone()),
             tmp: task_root.run_tmp(run_id),
             build: if purpose == RunPurpose::Probe {
                 Vec::new()
@@ -207,6 +227,7 @@ impl SandboxEnv {
     pub fn for_task(worktree: &Path) -> Self {
         TaskRoot::of_worktree(worktree)
             .map(|root| Self {
+                root: None,
                 tmp: None,
                 build: Self::build_dirs(&root),
             })
@@ -259,7 +280,7 @@ impl SandboxEnv {
         if let Some(tmp) = &self.tmp {
             LazyLock::force(&PROCESS_START);
             // Live before it exists, so a concurrent sweep cannot take it.
-            live_run_dirs().insert(tmp.clone());
+            live_run_dirs().insert(tmp.clone(), self.root.clone().unwrap_or_default());
             if let Err(error) = prepare_run_tmp(tmp) {
                 live_run_dirs().remove(tmp);
                 tracing::warn!(path = %tmp.display(), %error, "per-run temp directory could not be created; run keeps the inherited one");
@@ -372,7 +393,7 @@ pub fn settle_run(worktree: &Path, run_id: &str) {
         return;
     };
     if let Some(tmp) = task_root.run_tmp(run_id) {
-        if !live_run_dirs().contains(&tmp) {
+        if !live_run_dirs().contains_key(&tmp) {
             remove_run_tmp(&tmp);
         }
     }
@@ -405,6 +426,30 @@ fn remove_run_tmp(tmp: &Path) {
 /// `.forge-task`, `tmp` or `.forge-tmp`. Returns the number removed.
 pub fn sweep_dead_runs<'a>(task_roots: &Path, live: impl IntoIterator<Item = &'a str>) -> usize {
     sweep_dead_runs_older_than(task_roots, live, *PROCESS_START)
+}
+
+/// The periodic form of [`sweep_dead_runs`], for a process that has been
+/// running for a while.
+///
+/// A per-run directory is removed when this process does not hold it, its key
+/// belongs to no run id in `live`, and either rule holds:
+///
+/// - it predates this process (the rule of [`sweep_dead_runs`]); or
+/// - it was last modified more than `max_run_age` before `now`: longer than
+///   any run is allowed to take, so not even a run of another process that
+///   shares this root can still own it.
+///
+/// Age alone never removes a directory younger than `max_run_age`.
+pub fn sweep_stale_runs<'a>(
+    task_roots: &Path,
+    live: impl IntoIterator<Item = &'a str>,
+    now: SystemTime,
+    max_run_age: std::time::Duration,
+) -> usize {
+    let aged = now
+        .checked_sub(max_run_age)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    sweep_dead_runs_older_than(task_roots, live, (*PROCESS_START).max(aged))
 }
 
 fn sweep_dead_runs_older_than<'a>(
@@ -440,7 +485,7 @@ fn sweep_dead_runs_older_than<'a>(
                 .is_ok_and(|modified| modified < cutoff);
             if !old
                 || live.iter().any(|key| OsStr::new(key) == name)
-                || live_run_dirs().contains(&path)
+                || live_run_dirs().contains_key(&path)
             {
                 continue;
             }
@@ -476,11 +521,11 @@ fn fits(path: &Path) -> bool {
     path.as_os_str().len() <= SAFE_TMPDIR_BYTES
 }
 
-fn is_real_dir(path: &Path) -> bool {
+pub(crate) fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -522,7 +567,7 @@ fn prepare_run_tmp(tmp: &Path) -> io::Result<()> {
 
 /// Remove a directory tree, including directories a run left read-only.
 /// Symbolic links are removed, never followed.
-fn remove_tree(path: &Path) {
+pub(crate) fn remove_tree(path: &Path) {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
     };

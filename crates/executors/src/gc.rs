@@ -1,0 +1,1068 @@
+//! Filesystem mechanics of the workspace garbage collector.
+//!
+//! The server and each daemon run the same sweep over their own managed
+//! root. Everything here is synchronous, takes no database and decides
+//! nothing about ownership: the caller classifies each Task root from its own
+//! table (workspace rows on the server, the persisted handle table on a
+//! daemon) and this module does the directory work.
+//!
+//! Rules that hold for every function:
+//!
+//! - Symbolic links are never followed. A link (or a file) found where a
+//!   directory is expected is removed as an entry or skipped.
+//! - Nothing is removed unless its parent resolves inside the managed root.
+//! - An error on one entry is counted and the pass continues.
+//! - A pass stops at its deadline and reports that it did not finish.
+
+use crate::sandbox::{self, TASK_DIR_NAME};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Component, Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+/// Quarantine and sweep state under the managed root.
+pub const GC_DIR: &str = ".forge/gc";
+/// The file in [`GC_DIR`] naming the one owner allowed to sweep this root.
+pub const OWNER_FILE: &str = "owner";
+/// Exact-commit check checkouts.
+pub const CHECKS_DIR: &str = ".forge/build/checks";
+/// An unknown Task-root directory is kept this long after it was quarantined.
+pub const QUARANTINE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// A directory younger than this is never quarantined: whoever is creating it
+/// may not have recorded it yet.
+pub const ORPHAN_GRACE: Duration = Duration::from_secs(10 * 60);
+/// A `<name>.broken-<ms>` copy left by a worktree recovery is kept this long.
+pub const BROKEN_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// No run is allowed to take longer than this; a per-run temp directory that
+/// no table knows and that is older belongs to nothing alive.
+pub const MAX_RUN_AGE: Duration = Duration::from_secs(25 * 60 * 60);
+/// Longest check wall time (1800 s) plus its cleanup phase and a margin.
+pub const CHECK_CHECKOUT_AGE: Duration = Duration::from_secs(2 * 60 * 60);
+/// Default free-space floor: the larger of this many bytes and
+/// [`DEFAULT_MIN_FREE_PERCENT`] of the filesystem.
+pub const DEFAULT_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const DEFAULT_MIN_FREE_PERCENT: u8 = 5;
+/// Entries one Task-root measurement may visit before it is abandoned.
+pub const MEASURE_ENTRY_LIMIT: usize = 500_000;
+
+/// What the owner's table says about one Task-root directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootState {
+    /// A recorded, live workspace: only its dead leftovers are touched.
+    Live,
+    /// Its workspace was reclaimed: whatever is left is removed.
+    Cleaned,
+    /// No record of any kind: quarantined, never deleted on sight.
+    Unknown,
+}
+
+/// What one pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GcReport {
+    pub quarantined: usize,
+    pub restored: usize,
+    pub removed: usize,
+    pub run_dirs_removed: usize,
+    pub builds_evicted: usize,
+    pub errors: usize,
+    /// The pass ran out of time; the caller keeps its cursor.
+    pub out_of_time: bool,
+}
+
+impl GcReport {
+    pub fn merge(&mut self, other: &Self) {
+        self.quarantined += other.quarantined;
+        self.restored += other.restored;
+        self.removed += other.removed;
+        self.run_dirs_removed += other.run_dirs_removed;
+        self.builds_evicted += other.builds_evicted;
+        self.errors += other.errors;
+        self.out_of_time |= other.out_of_time;
+    }
+
+    pub fn did_something(&self) -> bool {
+        self.quarantined
+            + self.restored
+            + self.removed
+            + self.run_dirs_removed
+            + self.builds_evicted
+            + self.errors
+            > 0
+    }
+}
+
+/// One pass over a managed root.
+#[derive(Debug, Clone)]
+pub struct Sweep {
+    /// The managed root. Nothing outside it is ever removed.
+    pub root: PathBuf,
+    /// The directory whose children are Task roots: the root itself on the
+    /// server, `<root>/.forge/workspaces` on a daemon.
+    pub task_roots: PathBuf,
+    /// Whether a directory name is a Task root of this owner (a Task id on
+    /// the server, a workspace handle on a daemon). Every other name, in the
+    /// Task-root directory and in quarantine, is invisible to the pass.
+    pub shaped: fn(&str) -> bool,
+    pub now: SystemTime,
+    pub deadline: Instant,
+}
+
+impl Sweep {
+    pub fn new(root: &Path, task_roots: &Path, shaped: fn(&str) -> bool, budget: Duration) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            task_roots: task_roots.to_path_buf(),
+            shaped,
+            now: SystemTime::now(),
+            deadline: Instant::now() + budget,
+        }
+    }
+
+    fn out_of_time(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    fn gc_dir(&self) -> PathBuf {
+        self.root.join(GC_DIR)
+    }
+
+    /// Claim the root for `owner_id`, or confirm an earlier claim.
+    ///
+    /// A sweep decides from one owner's table what is unknown or dead. Two
+    /// owners with different tables on one root (two servers with different
+    /// databases, a test beside a running server) would each see the other's
+    /// live directories as garbage, so only the first to write
+    /// `<root>/.forge/gc/owner` ever sweeps it. Everyone else gets `false`
+    /// and must touch nothing.
+    pub fn claim(&self, owner_id: &str) -> bool {
+        let gc_dir = self.gc_dir();
+        if owner_id.is_empty() || !self.prepare_gc_dir(&gc_dir) {
+            return false;
+        }
+        let marker = gc_dir.join(OWNER_FILE);
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::read_to_string(&marker).is_ok_and(|owner| owner.trim() == owner_id)
+            }
+            // A link or a directory there is not a claim anyone can hold.
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, owner_id.as_bytes()))
+                .is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Names of real directories under the Task-root directory that are
+    /// Task-root shaped, in name order after `after`, at most `limit`. Links,
+    /// files and every name that is not Forge-shaped are not listed, so no
+    /// rule ever sees them.
+    pub fn task_root_names(&self, after: &str, limit: usize) -> Vec<String> {
+        let shaped = self.shaped;
+        let Ok(entries) = fs::read_dir(&self.task_roots) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            // `file_type` does not follow a link.
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.as_str() > after && shaped(name))
+            .collect();
+        names.sort();
+        names.truncate(limit);
+        names
+    }
+
+    /// Apply the Task-root rules to `states`:
+    ///
+    /// - `Unknown`: renamed into `<root>/.forge/gc/<name>-<unix
+    ///   seconds>` once it is older than [`ORPHAN_GRACE`]. Never deleted here.
+    /// - `Cleaned`: removed.
+    /// - `Live`: `<name>.broken-<ms>` copies older than
+    ///   [`BROKEN_RETENTION`] are removed; nothing else is touched.
+    ///
+    /// A name that is not in `states` is skipped: it appeared after the
+    /// caller read its table.
+    pub fn task_roots(&self, states: &HashMap<String, RootState>, report: &mut GcReport) {
+        let mut names: Vec<&String> = states.keys().collect();
+        names.sort();
+        for name in names {
+            if self.out_of_time() {
+                report.out_of_time = true;
+                return;
+            }
+            let path = self.task_roots.join(name);
+            if !plain_name(name) || !(self.shaped)(name) || !sandbox::is_real_dir(&path) {
+                continue;
+            }
+            match states[name] {
+                RootState::Unknown => self.quarantine(name, &path, report),
+                RootState::Cleaned => self.remove(&path, report),
+                RootState::Live => self.broken_copies(&path, report),
+            }
+        }
+    }
+
+    fn quarantine(&self, name: &str, path: &Path, report: &mut GcReport) {
+        let fresh = fs::symlink_metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| age(self.now, modified) < ORPHAN_GRACE)
+            .unwrap_or(true);
+        if fresh || !self.confined(path) {
+            return;
+        }
+        let gc_dir = self.gc_dir();
+        if !self.prepare_gc_dir(&gc_dir) {
+            report.errors += 1;
+            return;
+        }
+        let target = gc_dir.join(format!("{name}-{}", unix_secs(self.now)));
+        if fs::symlink_metadata(&target).is_ok() {
+            return;
+        }
+        match fs::rename(path, &target) {
+            Ok(()) => {
+                tracing::warn!(path = %path.display(), quarantine = %target.display(), "unknown Task-root directory quarantined; it is deleted after 24 hours");
+                report.quarantined += 1;
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "unknown Task-root directory could not be quarantined");
+                report.errors += 1;
+            }
+        }
+    }
+
+    /// `.forge` and `.forge/gc` as real directories, created one level at a
+    /// time and never through a link.
+    fn prepare_gc_dir(&self, gc_dir: &Path) -> bool {
+        let Some(forge) = gc_dir.parent() else {
+            return false;
+        };
+        [forge, gc_dir]
+            .into_iter()
+            .all(|dir| sandbox::create_private_dir(dir).is_ok() && sandbox::is_real_dir(dir))
+    }
+
+    /// The names (without the timestamp) of everything in quarantine.
+    pub fn quarantined_names(&self) -> Vec<String> {
+        self.quarantine_entries()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    fn quarantine_entries(&self) -> Vec<(String, u64, PathBuf)> {
+        let gc_dir = self.gc_dir();
+        if !sandbox::is_real_dir(&gc_dir) {
+            return Vec::new();
+        }
+        let Ok(entries) = fs::read_dir(&gc_dir) else {
+            return Vec::new();
+        };
+        let mut found: Vec<_> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let file_name = entry.file_name().into_string().ok()?;
+                let (name, at) = file_name.rsplit_once('-')?;
+                // Another owner may share this root; its entries are its own.
+                (self.shaped)(name).then_some(())?;
+                Some((name.to_owned(), at.parse::<u64>().ok()?, entry.path()))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Settle the quarantine. An entry whose name is in `known` (its record
+    /// appeared after it was quarantined) is moved back when its place is
+    /// still empty and otherwise left where it is; it is never deleted. Any
+    /// other entry is deleted [`QUARANTINE_RETENTION`] after it was
+    /// quarantined.
+    pub fn quarantine_settle(&self, known: &HashSet<String>, report: &mut GcReport) {
+        for (name, at, path) in self.quarantine_entries() {
+            if self.out_of_time() {
+                report.out_of_time = true;
+                return;
+            }
+            if known.contains(&name) {
+                let home = self.task_roots.join(&name);
+                if plain_name(&name)
+                    && sandbox::is_real_dir(&path)
+                    && fs::symlink_metadata(&home).is_err()
+                    && fs::rename(&path, &home).is_ok()
+                {
+                    tracing::info!(path = %home.display(), "quarantined Task root restored: its record appeared");
+                    report.restored += 1;
+                }
+                continue;
+            }
+            let quarantined_at = UNIX_EPOCH + Duration::from_secs(at);
+            if age(self.now, quarantined_at) >= QUARANTINE_RETENTION {
+                self.remove(&path, report);
+            }
+        }
+    }
+
+    fn broken_copies(&self, task_root: &Path, report: &mut GcReport) {
+        let Ok(entries) = fs::read_dir(task_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(made) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.rsplit_once(".broken-"))
+                .and_then(|(_, millis)| millis.parse::<u64>().ok())
+                .map(|millis| UNIX_EPOCH + Duration::from_millis(millis))
+            else {
+                continue;
+            };
+            if age(self.now, made) >= BROKEN_RETENTION {
+                self.remove(&entry.path(), report);
+            }
+        }
+    }
+
+    /// Remove `check-*` checkouts under `<root>/.forge/build/checks` that no
+    /// live check can own: last modified more than [`CHECK_CHECKOUT_AGE`]
+    /// ago, and either the owner's table holds no live check operation or
+    /// the checkout predates this process (every operation in the table was
+    /// started by it).
+    pub fn check_checkouts(&self, live_check_operations: usize, report: &mut GcReport) {
+        let checks = self.root.join(CHECKS_DIR);
+        if !sandbox::is_real_dir(&checks) {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(&checks) else {
+            return;
+        };
+        let started = sandbox::process_start();
+        for entry in entries.flatten() {
+            if self.out_of_time() {
+                report.out_of_time = true;
+                return;
+            }
+            if !entry.file_name().to_string_lossy().starts_with("check-") {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(modified) = fs::symlink_metadata(&path).and_then(|metadata| metadata.modified())
+            else {
+                continue;
+            };
+            if age(self.now, modified) >= CHECK_CHECKOUT_AGE
+                && (live_check_operations == 0 || modified < started)
+            {
+                self.remove(&path, report);
+            }
+        }
+    }
+
+    /// Remove per-run temp directories no live run owns; see
+    /// [`sandbox::sweep_stale_runs`].
+    pub fn run_dirs<'a>(&self, live: impl IntoIterator<Item = &'a str>, report: &mut GcReport) {
+        report.run_dirs_removed +=
+            sandbox::sweep_stale_runs(&self.task_roots, live, self.now, MAX_RUN_AGE);
+    }
+
+    /// Free space by evicting the build output of the given Task roots,
+    /// least recently used first, until the filesystem of the root is back
+    /// above `floor` bytes free. `candidates` are Task-root names the caller
+    /// proved idle; a root with a run of this process is skipped regardless.
+    pub fn evict_builds(&self, candidates: &[String], floor: &FreeFloor, report: &mut GcReport) {
+        let Some(space) = disk_space(&self.root) else {
+            return;
+        };
+        let floor = floor.bytes(space.total);
+        if space.free >= floor {
+            return;
+        }
+        let mut builds: Vec<(SystemTime, PathBuf)> = candidates
+            .iter()
+            .filter(|name| plain_name(name))
+            .map(|name| self.task_roots.join(name))
+            .filter(|task_root| sandbox::is_real_dir(task_root))
+            .filter_map(|task_root| Some((build_last_used(&task_root)?, task_root)))
+            .collect();
+        builds.sort();
+        for (_, task_root) in builds {
+            if self.out_of_time() {
+                report.out_of_time = true;
+                return;
+            }
+            // Checked last: a run may have started since the caller looked.
+            if sandbox::has_live_run_in(&task_root) {
+                continue;
+            }
+            let build = task_root.join(TASK_DIR_NAME).join("build");
+            let before = report.removed;
+            self.remove(&build, report);
+            if report.removed > before {
+                report.removed = before;
+                report.builds_evicted += 1;
+                tracing::warn!(path = %build.display(), "disk is under its free-space floor: evicted the build output of an idle Task");
+            }
+            if disk_space(&self.root).is_none_or(|space| space.free >= floor) {
+                return;
+            }
+        }
+    }
+
+    /// Remove one entry of the managed root: a directory with everything in
+    /// it (read-only trees included), a link or a file as the entry it is.
+    pub fn remove(&self, path: &Path, report: &mut GcReport) {
+        if fs::symlink_metadata(path).is_err() {
+            return;
+        }
+        if !self.confined(path) {
+            tracing::warn!(path = %path.display(), "refusing to remove a path outside the managed workspace root");
+            report.errors += 1;
+            return;
+        }
+        remove_entry(path, report);
+    }
+
+    /// `path` is strictly inside the managed root and its parent resolves
+    /// there too, so removing the entry cannot reach outside through a link.
+    fn confined(&self, path: &Path) -> bool {
+        if path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        {
+            return false;
+        }
+        let (Some(parent), Ok(root)) = (path.parent(), fs::canonicalize(&self.root)) else {
+            return false;
+        };
+        path != self.root
+            && path.starts_with(&self.root)
+            && fs::canonicalize(parent).is_ok_and(|parent| parent.starts_with(root))
+    }
+}
+
+/// Remove one exact path the caller owns outright (a legacy location outside
+/// any Task root). A link is removed as a link; its target is not touched.
+pub fn remove_exact(path: &Path, report: &mut GcReport) {
+    if fs::symlink_metadata(path).is_ok() {
+        remove_entry(path, report);
+    }
+}
+
+fn remove_entry(path: &Path, report: &mut GcReport) {
+    sandbox::remove_tree(path);
+    if fs::symlink_metadata(path).is_ok() {
+        tracing::warn!(path = %path.display(), "workspace garbage could not be removed");
+        report.errors += 1;
+    } else {
+        report.removed += 1;
+    }
+}
+
+/// A directory name with no separator and no traversal.
+fn plain_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none()
+}
+
+fn age(now: SystemTime, then: SystemTime) -> Duration {
+    now.duration_since(then).unwrap_or_default()
+}
+
+fn unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The free-space floor of one managed root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreeFloor {
+    pub min_free_bytes: u64,
+    pub min_free_percent: u8,
+}
+
+impl Default for FreeFloor {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+            min_free_percent: DEFAULT_MIN_FREE_PERCENT,
+        }
+    }
+}
+
+impl FreeFloor {
+    /// The larger of the byte floor and the percentage of `total`.
+    pub fn bytes(&self, total: u64) -> u64 {
+        let percent = u64::from(self.min_free_percent.min(100));
+        self.min_free_bytes.max(total / 100 * percent)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskSpace {
+    pub free: u64,
+    pub total: u64,
+}
+
+/// Free and total bytes of the filesystem holding `path`, from `df -Pk`.
+/// `None` when it cannot be read; callers then leave everything alone.
+pub fn disk_space(path: &Path) -> Option<DiskSpace> {
+    let output = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_df(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_df(output: &str) -> Option<DiskSpace> {
+    // Filesystem 1024-blocks Used Available Capacity Mounted on
+    let fields: Vec<&str> = output.lines().nth(1)?.split_whitespace().collect();
+    // The filesystem name comes first and may itself contain spaces.
+    let numbers: Vec<u64> = fields
+        .iter()
+        .skip(1)
+        .skip_while(|field| field.parse::<u64>().is_err())
+        .map_while(|field| field.parse::<u64>().ok())
+        .collect();
+    let (total, free) = (*numbers.first()?, *numbers.get(2)?);
+    Some(DiskSpace {
+        free: free.saturating_mul(1024),
+        total: total.saturating_mul(1024),
+    })
+}
+
+/// When the build output of `task_root` was last used: the newest
+/// modification time among `.forge-task/build` and what lies two levels
+/// below it (toolchains rewrite a marker there on every invocation). `None`
+/// when there is no build output to evict.
+pub fn build_last_used(task_root: &Path) -> Option<SystemTime> {
+    let build = task_root.join(TASK_DIR_NAME).join("build");
+    if !sandbox::is_real_dir(&task_root.join(TASK_DIR_NAME)) || !sandbox::is_real_dir(&build) {
+        return None;
+    }
+    let mut newest = None;
+    let mut pending = vec![(build, 0_u8)];
+    let mut entries_seen = 0_usize;
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            entries_seen += 1;
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if let Ok(modified) = metadata.modified() {
+                newest = newest.max(Some(modified));
+            }
+            if metadata.file_type().is_dir() && depth < 2 && entries_seen < 4096 {
+                pending.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    // An empty build directory holds nothing worth evicting.
+    newest
+}
+
+/// Disk bytes under `path`, never following a link. `None` when the walk
+/// passes `deadline` or [`MEASURE_ENTRY_LIMIT`]: a partial number is not a
+/// measurement.
+pub fn measure(path: &Path, deadline: Instant) -> Option<u64> {
+    let root = fs::symlink_metadata(path).ok()?;
+    if !root.file_type().is_dir() {
+        return None;
+    }
+    let mut bytes = disk_bytes(&root);
+    let mut visited = 0_usize;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MEASURE_ENTRY_LIMIT
+                || (visited.is_multiple_of(256) && Instant::now() >= deadline)
+            {
+                return None;
+            }
+            // `DirEntry::metadata` does not follow a link.
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            bytes = bytes.saturating_add(disk_bytes(&metadata));
+            if metadata.file_type().is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Some(bytes)
+}
+
+#[cfg(unix)]
+fn disk_bytes(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn disk_bytes(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::{RunPurpose, SandboxEnv, TaskRoot};
+
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    fn shaped(name: &str) -> bool {
+        !name.starts_with('.') && name != "main-agents" && name != "notes"
+    }
+
+    fn sweep(root: &Path) -> Sweep {
+        Sweep::new(root, root, shaped, Duration::from_secs(30))
+    }
+
+    /// The same pass, run `later` from now.
+    fn later(root: &Path, later: Duration) -> Sweep {
+        let mut sweep = sweep(root);
+        sweep.now += later;
+        sweep
+    }
+
+    fn states(entries: &[(&str, RootState)]) -> HashMap<String, RootState> {
+        entries
+            .iter()
+            .map(|(name, state)| ((*name).to_owned(), *state))
+            .collect()
+    }
+
+    fn task_root(root: &Path, name: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::create_dir_all(path.join("repo")).unwrap();
+        fs::write(path.join("repo/file"), "content").unwrap();
+        path
+    }
+
+    #[test]
+    fn unknown_root_is_quarantined_then_deleted_only_after_a_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let orphan = task_root(&root, "orphan");
+        let unknown = states(&[("orphan", RootState::Unknown)]);
+
+        // Created a moment ago: a create may be in progress.
+        let mut report = GcReport::default();
+        sweep(&root).task_roots(&unknown, &mut report);
+        assert!(orphan.exists());
+        assert_eq!(report, GcReport::default());
+
+        // First sight after the grace period: moved aside, not deleted.
+        let first = later(&root, Duration::from_secs(3600));
+        first.task_roots(&unknown, &mut report);
+        assert_eq!(report.quarantined, 1);
+        assert!(!orphan.exists());
+        assert_eq!(first.quarantined_names(), ["orphan"]);
+        let kept = fs::read_dir(root.join(GC_DIR))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(kept.path().join("repo/file")).unwrap(),
+            "content"
+        );
+
+        // Still there 23 hours on.
+        let mut report = GcReport::default();
+        later(&root, Duration::from_secs(24 * 3600))
+            .quarantine_settle(&HashSet::new(), &mut report);
+        assert_eq!(report.removed, 0);
+        assert!(kept.path().exists());
+
+        later(&root, Duration::from_secs(26 * 3600))
+            .quarantine_settle(&HashSet::new(), &mut report);
+        assert_eq!(report.removed, 1);
+        assert!(!kept.path().exists());
+    }
+
+    #[test]
+    fn quarantined_root_whose_record_appears_is_restored_or_left_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        task_root(&root, "late");
+        task_root(&root, "taken");
+        let pass = later(&root, Duration::from_secs(3600));
+        let mut report = GcReport::default();
+        pass.task_roots(
+            &states(&[("late", RootState::Unknown), ("taken", RootState::Unknown)]),
+            &mut report,
+        );
+        assert_eq!(report.quarantined, 2);
+        // `taken` was created again while its old directory sat in quarantine.
+        fs::create_dir_all(root.join("taken/new")).unwrap();
+
+        let known: HashSet<String> = ["late".to_owned(), "taken".to_owned()].into();
+        let mut report = GcReport::default();
+        later(&root, 30 * DAY).quarantine_settle(&known, &mut report);
+        assert_eq!((report.restored, report.removed), (1, 0));
+        assert_eq!(
+            fs::read_to_string(root.join("late/repo/file")).unwrap(),
+            "content"
+        );
+        assert!(root.join("taken/new").exists());
+        // The older copy of `taken` is left in quarantine.
+        assert_eq!(pass.quarantined_names(), ["taken"]);
+    }
+
+    #[test]
+    fn names_that_are_not_forge_shaped_and_links_are_never_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in [
+            ".forge",
+            ".forge-tmp",
+            ".repos",
+            "main-agents",
+            "notes",
+            "task-1",
+        ] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        fs::write(root.join("task-file"), "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("notes"), root.join("task-link")).unwrap();
+        let pass = sweep(&root);
+        assert_eq!(pass.task_root_names("", 10), ["task-1"]);
+        assert!(pass.task_root_names("task-1", 10).is_empty());
+
+        // Even when the owner's table calls one of them unknown, a name that
+        // is not Task-root shaped is never quarantined or removed, and a
+        // quarantine entry of another owner is not this pass's to settle.
+        fs::create_dir_all(root.join(GC_DIR).join("notes-1000")).unwrap();
+        let mut report = GcReport::default();
+        let pass = later(&root, 30 * DAY);
+        pass.task_roots(
+            &states(&[
+                ("notes", RootState::Unknown),
+                (".repos", RootState::Cleaned),
+            ]),
+            &mut report,
+        );
+        pass.quarantine_settle(&HashSet::new(), &mut report);
+        assert_eq!(report, GcReport::default());
+        assert!(root.join("notes").exists() && root.join(".repos").exists());
+        assert!(root.join(GC_DIR).join("notes-1000").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_removed_as_entries_and_nothing_outside_the_root_is_touched() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("user")).unwrap();
+        fs::write(outside.join("user/data"), "keep").unwrap();
+
+        // A cleaned Task root holding a link out of the root.
+        let cleaned = task_root(&root, "cleaned");
+        symlink(&outside, cleaned.join("escape")).unwrap();
+        // A link planted as a broken copy, a quarantine entry and a check checkout.
+        let live = task_root(&root, "live");
+        symlink(&outside, live.join("repo.broken-1000")).unwrap();
+        fs::create_dir_all(root.join(GC_DIR)).unwrap();
+        symlink(&outside, root.join(GC_DIR).join("gone-1000")).unwrap();
+        fs::create_dir_all(root.join(CHECKS_DIR)).unwrap();
+        symlink(&outside, root.join(CHECKS_DIR).join("check-link")).unwrap();
+        // A Task root reached through a link is not a Task root.
+        symlink(&outside, root.join("linked")).unwrap();
+
+        let pass = later(&root, 30 * DAY);
+        let mut report = GcReport::default();
+        pass.task_roots(
+            &states(&[
+                ("cleaned", RootState::Cleaned),
+                ("live", RootState::Live),
+                ("linked", RootState::Cleaned),
+                ("../outside", RootState::Cleaned),
+            ]),
+            &mut report,
+        );
+        pass.quarantine_settle(&HashSet::new(), &mut report);
+        pass.check_checkouts(0, &mut report);
+        // Outside the root, and through a link into it: refused.
+        pass.remove(&outside.join("user"), &mut report);
+        pass.remove(&root.join("linked/user"), &mut report);
+
+        assert_eq!(report.errors, 2);
+        assert!(!cleaned.exists());
+        assert!(!live.join("repo.broken-1000").exists());
+        assert!(live.join("repo/file").exists());
+        assert!(fs::symlink_metadata(root.join(GC_DIR).join("gone-1000")).is_err());
+        assert!(fs::symlink_metadata(root.join(CHECKS_DIR).join("check-link")).is_err());
+        assert!(fs::symlink_metadata(root.join("linked")).is_ok());
+        assert_eq!(
+            fs::read_to_string(outside.join("user/data")).unwrap(),
+            "keep"
+        );
+
+        // An exact legacy path that is a link goes as a link.
+        let legacy = base.join("legacy-home");
+        symlink(&outside, &legacy).unwrap();
+        remove_exact(&legacy, &mut report);
+        assert!(fs::symlink_metadata(&legacy).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("user/data")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_tree_is_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cleaned = task_root(&root, "cleaned");
+        let module = cleaned.join("pkg/mod/example@v1");
+        fs::create_dir_all(&module).unwrap();
+        fs::write(module.join("go.mod"), "module example").unwrap();
+        for path in [&module, &cleaned.join("pkg/mod"), &cleaned.join("pkg")] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let mut report = GcReport::default();
+        sweep(&root).task_roots(&states(&[("cleaned", RootState::Cleaned)]), &mut report);
+        assert_eq!((report.removed, report.errors), (1, 0));
+        assert!(!cleaned.exists());
+    }
+
+    #[test]
+    fn broken_copy_is_kept_seven_days_and_a_live_root_keeps_everything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let live = task_root(&root, "live");
+        let made = unix_secs(SystemTime::now()) * 1000;
+        let broken = live.join(format!("repo.broken-{made}"));
+        fs::create_dir_all(broken.join("src")).unwrap();
+        fs::create_dir_all(live.join("notes.broken-soon")).unwrap();
+        let live_state = states(&[("live", RootState::Live)]);
+
+        let mut report = GcReport::default();
+        later(&root, 6 * DAY).task_roots(&live_state, &mut report);
+        assert!(broken.exists());
+        later(&root, 8 * DAY).task_roots(&live_state, &mut report);
+        assert_eq!(report.removed, 1);
+        assert!(!broken.exists());
+        assert!(live.join("repo/file").exists());
+        assert!(live.join("notes.broken-soon").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_that_cannot_be_removed_does_not_stop_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        task_root(&root, "a-escapes");
+        task_root(&root, "b-cleaned");
+        let mut report = GcReport::default();
+        // `a/../..` is refused; the pass goes on to the next root.
+        let pass = sweep(&root);
+        pass.remove(&root.join("a-escapes/../.."), &mut report);
+        pass.task_roots(&states(&[("b-cleaned", RootState::Cleaned)]), &mut report);
+        assert_eq!((report.errors, report.removed), (1, 1));
+        assert!(root.join("a-escapes").exists());
+    }
+
+    #[test]
+    fn pass_stops_at_its_deadline_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let cleaned = task_root(&root, "cleaned");
+        let mut pass = sweep(&root);
+        pass.deadline = Instant::now();
+        let mut report = GcReport::default();
+        pass.task_roots(&states(&[("cleaned", RootState::Cleaned)]), &mut report);
+        assert!(report.out_of_time);
+        assert!(cleaned.exists());
+        // The next pass, with time, finishes the work.
+        let mut report = GcReport::default();
+        sweep(&root).task_roots(&states(&[("cleaned", RootState::Cleaned)]), &mut report);
+        assert!(!report.out_of_time && !cleaned.exists());
+    }
+
+    #[test]
+    fn check_checkout_goes_only_when_old_and_no_live_check_can_own_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // The checkout below is made by this process, after it started.
+        let _ = sandbox::process_start();
+        std::thread::sleep(Duration::from_millis(1100));
+        let checkout = root.join(CHECKS_DIR).join("check-abc");
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::create_dir_all(root.join(CHECKS_DIR).join("target")).unwrap();
+        let mut report = GcReport::default();
+        // Young: a check may be running in it.
+        sweep(&root).check_checkouts(0, &mut report);
+        // Old, but created by this process while a check operation is live.
+        later(&root, DAY).check_checkouts(1, &mut report);
+        assert!(checkout.exists());
+        assert_eq!(report.removed, 0);
+        later(&root, DAY).check_checkouts(0, &mut report);
+        assert_eq!(report.removed, 1);
+        assert!(!checkout.exists());
+        // Not a checkout: left alone.
+        assert!(root.join(CHECKS_DIR).join("target").exists());
+    }
+
+    #[test]
+    fn live_run_temp_dir_survives_every_pass_and_a_stale_one_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let worktree = root.join("t").join("repo");
+        fs::create_dir_all(&worktree).unwrap();
+        let reserved = TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let run = SandboxEnv::for_run(&worktree, "live-run", RunPurpose::Hook).prepared();
+        let Some(tmp) = run.tmp_dir().map(Path::to_path_buf) else {
+            // The test temp dir is too long for a per-run directory.
+            return;
+        };
+        assert!(sandbox::has_live_run_in(reserved.path()));
+        let stale = tmp.parent().unwrap().join("stalerun00");
+        fs::create_dir_all(&stale).unwrap();
+
+        let mut report = GcReport::default();
+        // Now: the stale directory is younger than any allowed run.
+        sweep(&root).run_dirs([], &mut report);
+        assert!(stale.exists() && tmp.exists());
+        // Much later it is older than any run; the live one still stands.
+        later(&root, 3 * DAY).run_dirs([], &mut report);
+        assert_eq!(report.run_dirs_removed, 1);
+        assert!(!stale.exists());
+        assert!(tmp.exists());
+
+        run.settle();
+        assert!(!sandbox::has_live_run_in(reserved.path()));
+    }
+
+    #[test]
+    fn build_output_is_evicted_least_recently_used_first_and_never_under_a_live_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let build = |name: &str| {
+            let worktree = root.join(name).join("repo");
+            fs::create_dir_all(&worktree).unwrap();
+            TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+            let build = root.join(name).join(TASK_DIR_NAME).join("build");
+            fs::create_dir_all(build.join("cargo")).unwrap();
+            fs::write(build.join("cargo/.rustc_info.json"), "{}").unwrap();
+            (worktree, build)
+        };
+        let (_, old) = build("old");
+        std::thread::sleep(Duration::from_millis(1100));
+        let (busy_worktree, busy) = build("busy");
+        fs::create_dir_all(root.join("empty").join(TASK_DIR_NAME).join("build")).unwrap();
+        assert!(build_last_used(&root.join("empty")).is_none());
+        assert!(build_last_used(&root.join("old")) < build_last_used(&root.join("busy")));
+        let run = SandboxEnv::for_run(&busy_worktree, "busy-run", RunPurpose::Check).prepared();
+        let names = ["busy".to_owned(), "old".to_owned(), "empty".to_owned()];
+
+        // Plenty of room: nothing is evicted.
+        let mut report = GcReport::default();
+        let none = FreeFloor {
+            min_free_bytes: 0,
+            min_free_percent: 0,
+        };
+        sweep(&root).evict_builds(&names, &none, &mut report);
+        assert_eq!(report.builds_evicted, 0);
+        assert!(old.exists() && busy.exists());
+
+        // A floor no disk can meet: every idle build goes, the busy one stays
+        // whenever its run is visible to the registry.
+        let all = FreeFloor {
+            min_free_bytes: u64::MAX,
+            min_free_percent: 0,
+        };
+        sweep(&root).evict_builds(&names, &all, &mut report);
+        assert!(!old.exists());
+        if run.tmp_dir().is_some() {
+            assert!(busy.exists());
+            assert_eq!(report.builds_evicted, 1);
+        }
+        assert_eq!(report.removed, 0);
+        run.settle();
+    }
+
+    #[test]
+    fn only_the_first_owner_to_claim_a_root_may_sweep_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let pass = sweep(&root);
+        assert!(pass.claim("first"));
+        assert!(pass.claim("first"));
+        assert!(!pass.claim("second"));
+        assert!(!pass.claim(""));
+        // The claim is not a quarantine entry.
+        assert!(pass.quarantined_names().is_empty());
+        // A root that does not exist cannot be claimed (or created).
+        assert!(!sweep(&root.join("missing")).claim("first"));
+        assert!(!root.join("missing").exists());
+    }
+
+    #[test]
+    fn free_floor_is_the_larger_of_bytes_and_percent() {
+        let floor = FreeFloor::default();
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(floor.bytes(100 * gib), 10 * gib);
+        assert_eq!(floor.bytes(1000 * gib), 50 * gib);
+        let space = parse_df(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk1 1000 400 600 40% /\n",
+        )
+        .unwrap();
+        assert_eq!(
+            space,
+            DiskSpace {
+                free: 600 * 1024,
+                total: 1000 * 1024
+            }
+        );
+        assert!(disk_space(Path::new("/")).is_some_and(|space| space.total >= space.free));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn measure_is_bounded_and_does_not_follow_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("big"), vec![1_u8; 1024 * 1024]).unwrap();
+        let task = task_root(&root, "task");
+        fs::write(task.join("repo/data"), vec![1_u8; 64 * 1024]).unwrap();
+        std::os::unix::fs::symlink(&outside, task.join("link")).unwrap();
+        let far = Instant::now() + Duration::from_secs(30);
+        let bytes = measure(&task, far).unwrap();
+        assert!((64 * 1024..512 * 1024).contains(&bytes), "{bytes}");
+        assert!(measure(&task.join("link"), far).is_none());
+        // Over budget: no number rather than a partial one.
+        for index in 0..600 {
+            fs::write(task.join(format!("repo/f{index}")), "x").unwrap();
+        }
+        assert!(measure(&task, Instant::now()).is_none());
+    }
+}
