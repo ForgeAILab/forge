@@ -790,7 +790,7 @@ pub(crate) fn filter_candidate(
     if !candidate.provisioning
         && candidate
             .machine_capacity
-            .is_none_or(|capacity| !capacity.has_capacity())
+            .is_none_or(|capacity| !capacity.admits_execution())
     {
         filters.insert(MachineCapacity);
     }

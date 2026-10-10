@@ -72,6 +72,9 @@ pub struct MachineCapacity {
     pub check_runs: i64,
     /// Informational: these checks share an already occupied Task slot.
     pub borrowed_check_runs: i64,
+    /// Queued checks on this machine that a consumer still waits for. They
+    /// hold no slot; an execution admission leaves room for them.
+    pub queued_checks: i64,
     pub max_concurrent_runs: Option<i64>,
 }
 
@@ -83,10 +86,54 @@ impl MachineCapacity {
             .saturating_add(self.check_runs)
     }
 
+    /// A free slot, whoever takes it. This is the check runner's question and
+    /// what Operations shows; an execution asks [`Self::admits_execution`].
     pub fn has_capacity(self) -> bool {
         self.max_concurrent_runs
             .filter(|limit| *limit > 0)
             .is_none_or(|limit| self.active_runs() < limit)
+    }
+
+    /// The slots checks may hold on their own while a Task waits for a run
+    /// slot here: all but one, and the one slot of a machine that has one.
+    pub fn check_share(self) -> Option<i64> {
+        self.max_concurrent_runs
+            .filter(|limit| *limit > 0)
+            .map(|limit| (limit - 1).max(1))
+    }
+
+    /// Free slots a new execution must leave for queued checks: work closer
+    /// to done goes first, up to the check share.
+    pub fn slots_kept_for_checks(self) -> i64 {
+        self.check_share().map_or(0, |share| {
+            self.queued_checks
+                .min(share.saturating_sub(self.check_runs).max(0))
+        })
+    }
+
+    /// Whether a new execution (reservation or start) may take a slot.
+    pub fn admits_execution(self) -> bool {
+        self.max_concurrent_runs
+            .filter(|limit| *limit > 0)
+            .is_none_or(|limit| {
+                self.active_runs()
+                    .saturating_add(self.slots_kept_for_checks())
+                    < limit
+            })
+    }
+
+    /// Whether a queued check may take a slot of its own. `queued_ahead`:
+    /// the checks before it in the queue, which get the free slots first.
+    /// `run_waiters`: a Task waits for a run slot on this machine, so checks
+    /// stay within their share and one slot keeps turning over for executions.
+    pub fn admits_check(self, queued_ahead: i64, run_waiters: bool) -> bool {
+        self.max_concurrent_runs
+            .filter(|limit| *limit > 0)
+            .is_none_or(|limit| self.active_runs().saturating_add(queued_ahead) < limit)
+            && !(run_waiters
+                && self
+                    .check_share()
+                    .is_some_and(|share| self.check_runs >= share))
     }
 }
 
@@ -160,7 +207,8 @@ pub async fn count_machine_capacity(
 ) -> Result<MachineCapacity> {
     let sql = format!("{} SELECT COALESCE(SUM(running_executions), 0) AS running_executions,
         COALESCE(SUM(reservations), 0) AS reservations, COALESCE(SUM(active_chat_turns), 0) AS active_chat_turns,
-        COALESCE(SUM(check_runs), 0) AS check_runs, COALESCE(SUM(borrowed_check_runs), 0) AS borrowed_check_runs
+        COALESCE(SUM(check_runs), 0) AS check_runs, COALESCE(SUM(borrowed_check_runs), 0) AS borrowed_check_runs,
+        COALESCE(SUM(queued_checks), 0) AS queued_checks
         FROM occupancy WHERE machine_key = COALESCE(?, 'server_host')", include_str!("machine_occupancy.sql"));
     let row = sqlx::query(&sql)
         .bind(embedded_machine_id)
@@ -173,6 +221,7 @@ pub async fn count_machine_capacity(
         active_chat_turns: row.try_get("active_chat_turns")?,
         check_runs: row.try_get("check_runs")?,
         borrowed_check_runs: row.try_get("borrowed_check_runs")?,
+        queued_checks: row.try_get("queued_checks")?,
         max_concurrent_runs,
     })
 }
@@ -194,6 +243,46 @@ pub async fn check_borrows_machine_slot(
         .await?)
 }
 
+/// How many queued checks of the same machine are ahead of this one. Checks
+/// are admitted in queue order: a later one takes a slot only when the
+/// earlier ones still leave it one.
+pub async fn checks_queued_ahead(
+    tx: &mut Transaction<'_, Sqlite>,
+    run_id: &str,
+    embedded_machine_id: &str,
+) -> Result<i64> {
+    let sql = format!(
+        "{} SELECT COUNT(*) FROM check_queue me JOIN check_queue other
+            ON other.machine_key=me.machine_key AND other.id<>me.id AND other.queue_rank IS NOT NULL
+            AND (other.queue_rank, other.created_at, other.id) < (COALESCE(me.queue_rank, 2), me.created_at, me.id)
+            WHERE me.id=?",
+        include_str!("machine_occupancy.sql")
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(embedded_machine_id)
+        .bind(run_id)
+        .fetch_one(&mut **tx)
+        .await?)
+}
+
+/// Whether a Task waits for a run slot this machine could give: the
+/// scheduler's own wait rows (`'*'` is a slot on whichever machine fits).
+pub async fn run_slot_waiters(
+    tx: &mut Transaction<'_, Sqlite>,
+    machine: Option<&str>,
+    embedded_machine_id: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM task_schedule_wait w WHERE w.daemon_id='*'
+            OR CASE WHEN w.daemon_id IN (SELECT id FROM daemon WHERE machine_id=?)
+                THEN 'server_host' ELSE w.daemon_id END = COALESCE(?, 'server_host'))",
+    )
+    .bind(embedded_machine_id)
+    .bind(machine)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 #[derive(Debug)]
 pub struct MachineCapacityRow {
     pub daemon_id: Option<String>,
@@ -213,7 +302,8 @@ pub async fn list_machine_capacity(
         UNION ALL SELECT id, id, hostname, max_concurrent_runs, run_limit FROM daemon WHERE removed_at IS NULL AND id NOT IN (SELECT id FROM embedded)
     ) SELECT m.*, COALESCE(o.running_executions, 0) AS running_executions,
         COALESCE(o.reservations, 0) AS reservations, COALESCE(o.active_chat_turns, 0) AS active_chat_turns,
-        COALESCE(o.check_runs, 0) AS check_runs, COALESCE(o.borrowed_check_runs, 0) AS borrowed_check_runs
+        COALESCE(o.check_runs, 0) AS check_runs, COALESCE(o.borrowed_check_runs, 0) AS borrowed_check_runs,
+        COALESCE(o.queued_checks, 0) AS queued_checks
         FROM machines m LEFT JOIN occupancy o USING(machine_key)", include_str!("machine_occupancy.sql"));
     let rows = sqlx::query(&sql)
         .bind(embedded_machine_id)
@@ -231,6 +321,7 @@ pub async fn list_machine_capacity(
                     active_chat_turns: row.try_get("active_chat_turns")?,
                     check_runs: row.try_get("check_runs")?,
                     borrowed_check_runs: row.try_get("borrowed_check_runs")?,
+                    queued_checks: row.try_get("queued_checks")?,
                     max_concurrent_runs: effective_machine_cap(
                         row.try_get("reported")?,
                         row.try_get("admin")?,
@@ -243,6 +334,56 @@ pub async fn list_machine_capacity(
 
 #[cfg(test)]
 mod tests {
+    use super::MachineCapacity;
+
+    fn machine(cap: i64, executions: i64, checks: i64, queued: i64) -> MachineCapacity {
+        MachineCapacity {
+            running_executions: executions,
+            check_runs: checks,
+            queued_checks: queued,
+            max_concurrent_runs: Some(cap),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn executions_leave_room_for_queued_checks_up_to_the_check_share() {
+        // No queued check: plain capacity.
+        assert!(machine(2, 1, 0, 0).admits_execution());
+        assert!(!machine(2, 2, 0, 0).admits_execution());
+        // A queued check keeps the free slot of a two-slot machine...
+        assert!(!machine(2, 1, 0, 1).admits_execution());
+        // ...until checks hold their share (all but one slot).
+        assert!(machine(2, 0, 1, 3).admits_execution());
+        assert_eq!(machine(4, 0, 1, 5).slots_kept_for_checks(), 2);
+        assert!(machine(4, 0, 1, 5).admits_execution());
+        assert!(!machine(4, 1, 1, 5).admits_execution());
+        // One slot: the queued check is first.
+        assert!(!machine(1, 0, 0, 1).admits_execution());
+        assert!(machine(1, 0, 0, 0).admits_execution());
+        // Unlimited machines reserve nothing.
+        let unlimited = MachineCapacity {
+            queued_checks: 9,
+            ..Default::default()
+        };
+        assert!(unlimited.admits_execution() && unlimited.admits_check(9, true));
+    }
+
+    #[test]
+    fn checks_keep_queue_order_and_their_share() {
+        // A free slot, nobody ahead.
+        assert!(machine(2, 1, 0, 1).admits_check(0, true));
+        // The one free slot belongs to the check ahead.
+        assert!(!machine(2, 1, 0, 2).admits_check(1, false));
+        // Two free slots: the second in the queue runs as well.
+        assert!(machine(2, 0, 0, 2).admits_check(1, false));
+        // Checks hold their share and a Task waits for a run slot.
+        assert!(!machine(2, 0, 1, 1).admits_check(0, true));
+        assert!(machine(2, 0, 1, 1).admits_check(0, false));
+        assert!(machine(1, 0, 0, 1).admits_check(0, true));
+        assert!(!machine(3, 0, 2, 1).admits_check(0, true));
+    }
+
     #[tokio::test]
     async fn bare_database_has_unlimited_capacity() {
         let db = crate::SqliteDb::new(crate::create_sqlite_pool("sqlite::memory:").await.unwrap());

@@ -37,7 +37,7 @@ pub(crate) async fn task_blocked(
     if snapshot(db)
         .await?
         .iter()
-        .all(|row| row.capacity.has_capacity())
+        .all(|row| row.capacity.admits_execution())
     {
         return Ok(false);
     }

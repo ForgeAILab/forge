@@ -2187,9 +2187,9 @@ Server host occupancy combines placements with no execution daemon and those
 routed to this host's embedded daemon; chats of unpinned or embedded-daemon
 Agents use that same slot pool. Workspace-less executions use their frozen
 executor daemon id, falling back to the Agent pin. Ready placements use no slot. Capacity is rechecked at start; a refusal
-leaves the workspace ready and parks the Task for a later tick. Review check runs and merges do not consume slots: running checks
-currently have no durable record to count. This is a known limit pending the
-workflow refactor.
+leaves the workspace ready and parks the Task for a later tick. Check runs on the
+durable check runner count in the same occupancy and go ahead of new
+executions when a slot frees; merges consume no slot.
 
 The resolved server configuration initializes one shared `MachineRunCap`
 plain handle defined by `db` during runtime composition. Bare `SqliteDb::new`
@@ -3724,7 +3724,9 @@ admissions wait.
 There is no fairness guarantee across Projects: Projects are scanned oldest first,
 active work is scanned before `todo`, and follow-ups or chat turns can take a freed
 slot before the next dispatcher tick. Waiters resume on that tick. Review check
-runs and merges take no slot because there is no durable running-check record.
+runs take a slot through the durable check runner, and queued checks are
+admitted before new executions (see "Who gets a freed slot" under the durable
+check runner); merges take no slot.
 
 Automatic dispatch keeps transient owner-unreachable, capacity, and
 `environment_probe_pending` refusals queued. Initial dispatch reads the same
@@ -8410,6 +8412,39 @@ Running, cancelling, cleaning and uncertain admitted checks retain occupancy;
 queued checks do not. Slot release is observed by the periodic scan without a
 notification race. Operations includes admitted, borrowed and capacity-wait
 counts; per-machine `active_runs` includes exclusive check slots.
+
+**Who gets a freed slot.** Work closer to done goes first. On a machine with a
+run cap `C`, let `k` be the checks that hold a slot of their own, `q` the
+queued checks a consumer still waits for, and `S = max(C - 1, 1)` the checks'
+share. Three rules, all evaluated in the admission transactions on the shared
+occupancy query (`db::machine_capacity`):
+
+1. **An execution leaves room for queued checks.** A reservation, an execution
+   start and the dispatcher's precheck are refused (`machine_capacity`) while
+   `active + min(q, max(S - k, 0)) >= C`: free slots are kept for the queue
+   until checks hold their share. A queued check reserves nothing durable; the
+   count is read each time.
+2. **Checks are admitted in queue order**: review-entry checks, then
+   integration head checks, then any other origin, oldest first within each. A
+   check takes a slot of its own only when the checks ahead of it in that
+   machine's queue still leave it one (`active + ahead < C`), so a sweep that
+   reaches a later check first does not let it jump the queue. A check that
+   borrows its own Task's slot is not subject to the order.
+3. **Checks stay within their share while a Task waits for a run slot** on
+   that machine (a `task_schedule_wait` row naming it or `'*'`): no check is
+   admitted to its own slot once `k >= S`. With no Task waiting, checks may
+   use every slot.
+
+Neither side starves. A queued check at the head of its queue is admitted at
+the first slot release after `k < S` (rule 1 keeps the slot from executions);
+one at position `p` after at most `p` further check completions, each bounded
+by the run's wall limit. For `C >= 2` executions always keep one slot turning
+over (rule 3), so a waiting Task is dispatched at the next release of that
+slot. For `C = 1` the single slot goes to the queued check first; an execution
+waits for at most the checks queued at that moment plus the one a running job
+can still produce, because a check is only ever requested by a Task entering
+review or its integration attempt, and no new run means no new check. Among
+executions the dispatcher's existing order is unchanged.
 
 Result delivery enqueues an entry-fenced `apply_check_result` Task command with
 consumer/result/run identities, exact commit and spec digest. The consumer's

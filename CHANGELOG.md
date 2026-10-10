@@ -941,6 +941,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **A freed machine slot goes to a queued review check before a new run.**
+  A queued check reserved nothing, so under sustained load the dispatcher
+  could give every freed slot to a new execution and a Task in `review` waited
+  without bound. Now: a new execution (reservation, start) is refused with the
+  ordinary `machine_capacity` wait while a queued check still needs a slot;
+  queued checks are admitted in order (review entry, then integration head,
+  oldest first); and while a Task waits for a run slot on the machine, checks
+  hold at most all but one of its slots (the one slot of a one-slot machine),
+  so executions keep progressing. A Task may therefore show `Waiting for a
+  Slot` although the machine has a free slot: that slot is kept for a check.
+
 - **Merge queue: production ports, still not started (3.2 stage D2a).**
   Everything the queue worker needs to run against real machines now exists;
   nothing starts it and merging works as before.
